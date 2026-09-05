@@ -124,6 +124,20 @@ ContentId: which content? StorageId: which encrypted representation?).
 Minting a drive (drawing the randomness) is a sync/owner concern; the
 format layer only carries the identifier."
 );
+define_id!(
+    DeviceId,
+    "A Nostr x-only secp256k1 public key naming one device. Immutable for
+the device's life: rotating means remove-and-readmit. Opaque 32 bytes at
+the format layer; full BIP-340 key validation (lift_x) belongs to the
+sync layer (trust.md, decision T11)."
+);
+define_id!(
+    TransitionId,
+    "The domain-separated BLAKE3 of a membership transition's signing
+preimage concatenated with its signature. Stable because BIP-340 nonces
+are deterministic. Distinct from ContentId by type: membership
+transitions are sealed documents, not content-addressed objects."
+);
 
 impl ContentId {
     /// Derive the Content ID for plaintext of the given kind. The identity

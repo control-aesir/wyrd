@@ -30,6 +30,7 @@ Three distinct concerns, never collapsed:
 | **DriveId** | random 256-bit, minted once per drive | namespaces everything: manifests, announcements, signatures | drive members; harmless if leaked |
 | **ContentId** | `BLAKE3-derive_key("wyrd content v1/<kind>", plaintext)` | Merkle trees, snapshots, local dedup | drive members only |
 | **StorageId** | `BLAKE3-derive_key("wyrd storage v1", ciphertext)` | object placement, fetch addresses | everyone, including vaults |
+| **TransitionId** | `BLAKE3-derive_key("wyrd transition id v1", signing preimage ‖ signature)` | membership log, snapshot authorization | drive members only |
 
 Device identity is **not** a Wyrd invention: a device is a Nostr secp256k1
 public key, and snapshots carry BIP-340 Schnorr signatures — but
@@ -234,6 +235,24 @@ Snapshot {
   canonical history, SUPERSEDED, STRANDED — where only REJECTED means
   "invalid"; the others are valid historical objects that cannot advance
   canonical state.
+
+**Canonical payload encoding (snapshots):**
+
+```
+parents:     u32 LE count + SnapshotIds (ordered, may be empty)
+tree:        ContentId (32 bytes)
+author:      DeviceId (Nostr x-only pubkey, 32 bytes)
+membership:  TransitionId (32 bytes)
+epoch:       u64 LE
+flags:       u8 (bit 0 = recovery; all other bits reserved 0)
+timestamp:   u64 LE ms
+signature:   64 bytes (BIP-340 over the drive-bound signing message)
+```
+
+Decoders reject truncation, trailing bytes, and nonzero reserved flag
+bits. Signature validity and `epoch == membership.epoch` are authorization
+concerns (`epochs.md`), not decode checks — the transition body is not
+part of the snapshot.
 - **Heads** are snapshots with no descendants. The set of heads is the drive's
   true state.
 - **"Current" is a policy, not a fact:** a single head renders as the live
@@ -309,3 +328,4 @@ will ride on iroh-blobs' verified streaming rather than duplicating it).
 | 14 | Membership = append-only owner-signed transition chain, authorized by the **pre-transition** owner set, resulting state derived from `prev` + `changes`; superseded/stranded forks never advance state; adoption forbidden without an owner-signed recovery snapshot | deterministic authorization everywhere; owner-set changes and last-owner removal stay expressible; a removed device's writes fail closed |
 | 15 | Manifest mappings record their encryption epoch; cross-epoch reuse only with a matching capability; mappings are **untrusted hints** — acted on only after authenticated decryption | re-encryption under a new epoch yields a new StorageId for the same ContentId; a mapping is useful only if the recipient can decrypt the referenced representation, and a false hint must never corrupt state |
 | 16 | Snapshots carry a `flags` byte (bit 0 = recovery snapshot) | recovery is a distinct, auditable, authenticated operation — not inferable from shape; v0 keeps it a fixed-width field, no optionality |
+| 17 | `Change` canonical encoding: tag bytes 0x00 Admit, 0x01 Remove, 0x02 Rotate, 0x03 SetOwners (counted `u32` vector); a membership transition's canonical serialization is its **signing preimage ‖ signature** (no envelope kind — sealed documents, not CAS objects); `TransitionId` is its own type, distinct from `ContentId` | byte-exact BIP-340 needs one declared field order (trust.md); transitions travel sealed to the drive, so envelope framing would add nothing; the type system keeps sealed documents out of the content world |

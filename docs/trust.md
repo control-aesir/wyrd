@@ -318,6 +318,19 @@ signature (stable, because signatures are deterministic). Key validation
 verification equations) is a protocol requirement enforced by the conformant
 library; verification must never bypass or weaken it.
 
+BIP-340 signs a 32-byte message; the Wyrd **challenge** is pinned so all
+implementations agree byte-for-byte:
+
+```
+challenge_snapshot  = BLAKE3-derive_key("wyrd snapshot challenge v1",  M_snapshot)
+challenge_membership = BLAKE3-derive_key("wyrd membership challenge v1", M_membership)
+```
+
+Signatures use **canonical BIP-340 nonces** (no auxiliary randomness), so
+the same (key, message) always yields the same signature and ids stay
+stable. Verification must use the same challenge derivation and full key
+validation.
+
 `timestamp` is display/tiebreak metadata only: it MUST NOT participate in
 authorization, conflict resolution, membership ordering, or key
 derivation.

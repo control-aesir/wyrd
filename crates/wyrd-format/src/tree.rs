@@ -21,7 +21,7 @@
 //!   symlink:  u32 LE + bytes        target (UTF-8)
 //! ```
 
-use crate::identity::{ContentId, ObjectKind};
+use crate::identity::{ContentId, ObjectKind, ID_LEN};
 use crate::store::ObjectStore;
 use std::cmp::Ordering;
 use thiserror::Error;
@@ -137,8 +137,6 @@ pub struct Tree {
 pub enum TreeError {
     #[error("payload shorter than the declared encoding")]
     Truncated,
-    #[error("entry count declares more entries than the payload holds")]
-    CountMismatch,
     #[error("payload holds bytes beyond the last declared entry")]
     TrailingBytes,
     #[error("entries are not sorted by component bytes (non-canonical)")]
@@ -151,7 +149,7 @@ pub enum TreeError {
     InvalidComponent(#[from] ComponentError),
     #[error("payload text is not valid UTF-8")]
     InvalidUtf8,
-    #[error("duplicate component {0:?} — names within a tree are unique")]
+    #[error("duplicate component {0:?}: names within a tree are unique")]
     DuplicateComponent(String),
 }
 
@@ -283,13 +281,13 @@ impl Tree {
                     let chunk_count = u32le(payload, pos) as usize;
                     pos += 4;
                     let chunk_bytes = chunk_count
-                        .checked_mul(32)
-                        .ok_or(TreeError::CountMismatch)?;
+                        .checked_mul(ID_LEN)
+                        .ok_or(TreeError::Truncated)?;
                     need(pos, chunk_bytes)?;
                     let chunks = payload[pos..pos + chunk_bytes]
-                        .chunks_exact(32)
+                        .chunks_exact(ID_LEN)
                         .map(|bytes| {
-                            ContentId::from_bytes(bytes.try_into().expect("chunks_exact(32)"))
+                            ContentId::from_bytes(bytes.try_into().expect("chunks_exact(ID_LEN)"))
                         })
                         .collect();
                     pos += chunk_bytes;
@@ -300,11 +298,13 @@ impl Tree {
                     }
                 }
                 0x01 => {
-                    need(pos, 32)?;
+                    need(pos, ID_LEN)?;
                     let subtree = ContentId::from_bytes(
-                        payload[pos..pos + 32].try_into().expect("bounds checked"),
+                        payload[pos..pos + ID_LEN]
+                            .try_into()
+                            .expect("bounds checked"),
                     );
-                    pos += 32;
+                    pos += ID_LEN;
                     EntryContent::Dir { subtree }
                 }
                 0x02 => {

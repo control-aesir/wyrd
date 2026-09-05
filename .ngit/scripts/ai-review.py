@@ -305,7 +305,16 @@ def post_pr_comment(pr_id: str, comment: str) -> bool:
 
 
 def main():
+    # In act the checkout is in GITHUB_WORKSPACE; steps may run outside it
+    ws = os.environ.get("GITHUB_WORKSPACE")
+    if ws and Path(ws).exists():
+        try:
+            os.chdir(ws)
+            print(f"Working directory: {ws}", file=sys.stderr)
+        except Exception as e:
+            print(f"chdir to GITHUB_WORKSPACE failed: {e}", file=sys.stderr)
     print("Starting AI code review (ngit version)...")
+    print(f"pwd={Path.cwd()} GITHUB_WORKSPACE={ws}", file=sys.stderr)
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:

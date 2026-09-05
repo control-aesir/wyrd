@@ -17,18 +17,20 @@ Governing principle:
 ## Identity: the Nostr boundary
 
 Wyrd does not define a device identity system. A Wyrd device identity **is**
-a Nostr secp256k1 public key; snapshot authorship and membership
-authorization use **BIP-340 Schnorr signatures** (secp256k1, 32-byte x-only
-public keys, 64-byte signatures, standard BIP-340 tagged-hash challenge over
-the Wyrd message bytes — no Nostr event serialization, no SHA-256 event IDs,
-no auxiliary-randomness requirements beyond BIP-340's own).
+a secp256k1 public key using Nostr-compatible key identity conventions;
+snapshot authorship and membership authorization use **BIP-340 Schnorr
+signatures** (secp256k1, 32-byte x-only public keys, 64-byte signatures,
+standard BIP-340 tagged-hash challenge over the Wyrd message bytes, with
+**deterministic nonces** — no auxiliary random input, which also makes the
+signature — and therefore any id derived over it — a stable function of the
+key and message). No Nostr event serialization, no SHA-256 event IDs.
 
 The boundary, stated as a rule:
 
 > **Nostr answers "who are you?" Wyrd answers "what are you authorized to
 > decrypt?"**
 
-- **Nostr cryptography: yes. Nostr event format: no.** Snapshots remain Wyrd
+- **secp256k1 + BIP-340: yes. Nostr event format: no.** Snapshots remain Wyrd
   canonical objects (`wyrd ‖ version ‖ kind ‖ payload`, BLAKE3 domain
   separation). We reuse the keypair and BIP-340 signature scheme, not
   Nostr's event serialization or its SHA-256 event IDs.
@@ -114,12 +116,15 @@ a prerequisite for the storage architecture.
 
 Membership epochs are the revocation primitive. A **membership change
 creates a new epoch**; keys are derived from the *epoch secret*. The root is
-**custody and authority, not the top of a KDF tree** — the hierarchy is:
+**custody, not authority**: it protects drive-level cryptographic custody
+and recovery material. Membership-transition authorization is provided by
+the owner's Nostr signing key — the root never signs or derives
+transitions. The shape is:
 
 ```
 Drive Root Key (random, passphrase-wrapped at rest; owner/recovery custody)
-    │  authorizes and protects membership transitions — never derives
-    ▼  epoch material
+    │  protects custody and recovery material — never derives epoch
+    ▼  material, never signs transitions
 Epoch Secret (fresh random 256-bit per membership epoch, minted by the owner)
     ├─ ManifestKey  = KDF(epoch secret, "manifest", ...)
     └─ ObjectKey    = KDF(epoch secret, "object", ContentId, kind, version)
@@ -127,9 +132,11 @@ Epoch Secret (fresh random 256-bit per membership epoch, minted by the owner)
 ```
 
 **Epoch secrets are fresh random secrets** — not `KDF(DriveRootKey, N)` and
-not derivable from each other. The owner generates a new one at every
-transition and distributes it inside wrapped capabilities. This is what makes
-the revocation boundary exact:
+not derivable from each other. A new uniformly random 256-bit secret is
+generated for every transition; implementations MUST NOT intentionally
+reuse an epoch secret across transitions (accidental collision is
+negligible by construction). The owner distributes each new secret inside
+wrapped capabilities. This is what makes the revocation boundary exact:
 
 - **Forward secrecy against revocation:** possession of epoch N secrets does
   not permit computing epoch N+1 secrets.
@@ -231,9 +238,10 @@ Snapshot {
     author:     Nostr public key (the DeviceId)
     membership: hash of the MembershipTransition whose state authorizes it
     epoch:      u64 — must equal the referenced transition's epoch
+    flags:      u8 (bit 0 = recovery snapshot; see epochs.md)
     timestamp:  u64 (ms, HLC-ordered, display/tiebreak only)
     signature:  BIP-340 signature over
-                "wyrd snapshot v1" || DriveId || canonical bytes (sans signature)
+                "wyrd snapshot v1" || DriveId || signing preimage (below)
 }
 ```
 
@@ -241,21 +249,30 @@ An epoch number says *when*; the membership reference says **which
 authorization state**. Both are covered by the snapshot signature.
 
 **Exact signing construction.** BIP-340 is byte-exact, so the message is
-too — all fields fixed-width little-endian, canonical envelope order, with
-`sans signature` meaning the signature field is omitted entirely (no
-placeholder, no length prefix — lengths are implied by the fixed layout):
+too. The message is defined over a **signing preimage** — a dedicated
+canonical encoding of the signed fields, *not* "the envelope minus the
+signature" (that would leave two parseable schemas and a reconstruction
+hazard). The preimage is fully self-delimiting: every vector is a `u32`
+little-endian element count followed by exactly that many canonical
+elements; every other field is fixed-width little-endian; fields appear in
+the declared order:
 
 ```
 M_snapshot   = ASCII("wyrd snapshot v1") || DriveId(32 bytes)
-               || canonical snapshot envelope bytes, signature field omitted
+               || snapshot_signing_preimage(parents, tree, author,
+                                            membership, epoch, flags, timestamp)
 M_membership = ASCII("wyrd membership v1") || DriveId(32 bytes)
-               || canonical transition envelope bytes, signature field omitted
+               || transition_signing_preimage(prev, resolves, changes,
+                                              members_root, owners_root,
+                                              author, epoch)
 ```
 
-Key validation follows BIP-340 exactly: x-only public keys must pass
-`lift_x` (a 32-byte length check is not sufficient), and signatures must be
-exactly 64 bytes and satisfy BIP-340's verification equations. The
-challenge hash is BIP-340's tagged construction.
+`transition_id` = domain-separated BLAKE3 over the signing preimage ‖
+signature (stable, because signatures are deterministic). Key validation
+follows BIP-340 exactly: x-only public keys must pass `lift_x` (a 32-byte
+length check is not sufficient), signatures must be exactly 64 bytes and
+satisfy BIP-340's verification equations, and the challenge hash is
+BIP-340's tagged construction.
 
 `timestamp` is display/tiebreak metadata only: it MUST NOT participate in
 authorization, conflict resolution, membership ordering, or key
@@ -270,19 +287,22 @@ The core rule:
 Two predicates, never collapsed (full definitions and the classification
 state machine in `epochs.md`):
 
-- **Historically valid** — genuine signature, valid canonical membership
+- **Historically valid** — genuine signature, valid *and rooted* membership
   transition, author a member of the committed state. Intrinsic to the
-  snapshot against the log.
-- **Currently eligible** — historically valid, at the peer's known epoch,
-  with ancestry satisfied (parents eligible-lineage). Only eligible heads
-  advance canonical state.
+  snapshot against the log; it does not depend on canonicalization
+  outcomes. `authorized(S)` = historically valid **and** the referenced
+  transition is canonical.
+- **Currently eligible** — authorized, at the peer's known membership
+  state, with ancestry satisfied (live lineage). Only eligible heads
+  advance the live view; membership canonicality is advanced only by
+  transitions.
 
 Consequences:
 
 - **Valid signature ≠ valid current-state transition.** A snapshot signed by
   a removed device, bound to the pre-removal membership state, remains
   historically valid forever — but is superseded once the peer's log
-  advances, and superseded forks can never advance canonical state.
+  advances, and superseded forks can never enter the live view.
 - **Bounded-fork semantics.** Propagation races are expected and bounded:
   while a peer hasn't yet learned a removal (epoch N → N+1), it may
   temporarily accept the removed device's epoch-N snapshots; once the
@@ -291,8 +311,8 @@ Consequences:
   and is not a goal.
 - **Stranding is accepted:** work built on a snapshot that later becomes
   superseded is stranded with it — legitimate or not — and is recovered only
-  by an owner-signed recovery snapshot grafting content onto eligible heads.
-  Never lineage adoption.
+  by a recovery snapshot (recovery flag, current canonical owner) grafting
+  content onto eligible heads. Never lineage adoption.
 
 The precise state machine — transition validation, membership conflicts,
 snapshot classification, recovery — is normative in `epochs.md`.
@@ -310,14 +330,20 @@ snapshot classification, recovery — is normative in `epochs.md`.
 - Membership is signed, encrypted, replicated state: members agree on who is
   a member of which epoch, and membership *contents* never reach a public
   relay (payload vs metadata confidentiality, above).
-- **Capability construction.** The capability wrapping AEAD's associated
-  data is `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
-  transition_id || epoch` — a capability cannot be transplanted or replayed
-  across drives, epochs, or devices; tag verification fails in any other
-  context. **Installation is monotonic:** installing a capability may only
-  add secrets for epochs not yet held; it must never decrease the device's
-  known membership state or remove newer secrets — a replayed older
-  capability is a no-op, not a rollback.
+- **Capability construction.** AAD binding alone is not recipient
+  authentication: the capability is wrapped under a key established by
+  **secp256k1 ECDH** between a fresh owner-ephemeral key and the recipient
+  device's x-only public key (HKDF to the AEAD key — secp256k1 signing
+  keypairs double as ECDH identities), with associated data
+  `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
+  transition_id || epoch`. The AAD binds the context; the ECDH-wrapped AEAD
+  is what actually authenticates the recipient. **Installation is
+  monotonic:** installing a capability may only add secrets for epochs not
+  yet held; it must never decrease the device's known membership state or
+  remove newer secrets — a replayed older capability is a no-op, not a
+  rollback. Knowledge and key material are distinct: learning epoch N+1's
+  transition does not mean holding epoch N+1 secrets until the capability
+  arrives.
 - Admission is explicit and additive; delivery rides the Nostr mailbox, so
   the new device need not be online.
 
@@ -400,8 +426,8 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T6 | NIP-46 optional, scoped, default-deny; daemon never holds the nsec | protects identity keys from the (possibly privileged) daemon process |
 | T7 | Recovery reserved: guardian set (emergency contacts) as membership-log state; Shamir k-of-n shares over the encrypted Nostr mailbox; WoT for vetting only | root-key loss is unrecoverable by crypto alone; social recovery is the deferred Shamir decision given UX; design space held open without changing the epoch model |
 | T8 | DriveRootKey is owner/recovery custody only; never part of an ordinary member capability | a member holding the root could derive every future epoch; revocation would collapse |
-| T9 | Capabilities AAD-bound to `(DriveId, DeviceId, transition_id, epoch)` and installed **monotonically** (only add secrets, never roll back); revocation bounds acquisition, not possession | capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op; the guarantee is explicit about what removal can and cannot undo |
-| T10 | Signatures are BIP-340 with exact message bytes (ASCII domain tag ‖ raw 32-byte DriveId ‖ canonical envelope, signature omitted), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures) | BIP-340 is byte-exact, so the spec must be too; removes all ambiguity around curve, encodings, and challenge hashing before implementation |
+| T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
+| T10 | Signatures are BIP-340 with **deterministic nonces** over a defined signing preimage (ASCII domain tag ‖ raw 32-byte DriveId ‖ self-delimiting preimage: counted vectors, fixed-width fields), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures); ids derive over preimage ‖ signature | BIP-340 is byte-exact, so the spec must be too; deterministic nonces make ids stable; a dedicated preimage avoids envelope-parse ambiguity |
 
 ## Open questions
 

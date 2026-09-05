@@ -82,9 +82,9 @@ Wyrd mounts via **FUSE** to present standard filesystem interfaces:
 
 Pre-alpha. Wyrd is in design. The v0 format spec (`docs/object-model.md`) and
 the trust + epoch contracts (`docs/trust.md`, `docs/epochs.md`) are normative;
-the sync/peer protocol is not yet implemented. The initial implementation
-scope is deliberately small: a content-addressed store, the snapshot DAG, and
-one vault peer. Garbage collection comes later.
+the sync/peer protocol is specified but not yet implemented. The initial
+implementation scope is deliberately small: a content-addressed store, the
+snapshot DAG, and one vault peer. Garbage collection comes later.
 
 ---
 

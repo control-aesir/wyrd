@@ -79,10 +79,15 @@ offset  size  field
 
 Canonical rules (apply to every payload):
 - integers are little-endian, fixed-width
+- vectors are self-delimiting: `u32` little-endian element count, followed
+  by exactly that many canonical elements (counts are not optional)
 - no optional fields in v0; a field is present or the format has a new version
 - tree entries are sorted by path component bytes (bytewise, case-sensitive)
 - serialization is specified byte-for-byte; serde types (if any) must emit
   exactly this layout and round-trip it
+- signatures are computed over a **signing preimage** — the dedicated
+  self-delimiting encoding of the signed fields declared in `trust.md` —
+  never "the envelope minus the signature"
 
 Changing the encoding means a new `version` byte and new derived-key context
 strings. Old objects never change meaning.
@@ -159,12 +164,14 @@ Design decisions:
 - **Manifests are capabilities.** Cross-device dedup is a protocol over them:
   a member that learns from another member's manifest "content C is already
   uploaded as storage S" fetches S instead of uploading its own encryption of
-  C. The vault never learns C. Mappings therefore record their
-  **encryption epoch** as part of the authenticated mapping entry (covered
-  by the manifest's AEAD, like every other field), and a mapping is reusable
-  only by a device holding the capability for that epoch; otherwise the
-  device re-encrypts under its current epoch and publishes a new mapping
-  (rule in `trust.md`).
+  C. The vault never learns C. Mappings record their **encryption epoch**
+  inside the authenticated manifest entry, but they are **untrusted
+  optimization hints**: a mapping is acted on only after the referenced
+  representation passes the two verification checks (AEAD tag over the
+  bound AAD, plaintext hashing to the ContentId) — never on blind trust —
+  and only by a device holding the capability for that mapping's epoch;
+  otherwise the device re-encrypts under its current epoch and publishes a
+  new mapping (rule in `trust.md`).
 - Manifests are versioned envelopes like every other object; their partition
   encoding is the open detail (below).
 
@@ -179,9 +186,10 @@ Snapshot {
     author:     Nostr public key (the DeviceId)
     membership: hash of the MembershipTransition whose state authorizes it
     epoch:      u64 — must equal the referenced transition's epoch
+    flags:      u8 — bit 0 = recovery snapshot (epochs.md); all other bits reserved zero
     timestamp:  u64 (ms, HLC-ordered, display/tiebreak only)
     signature:  BIP-340 signature over
-                "wyrd snapshot v1" || DriveId || canonical bytes (sans signature)
+                "wyrd snapshot v1" || DriveId || signing preimage (trust.md)
 }
 ```
 
@@ -268,4 +276,5 @@ will ride on iroh-blobs' verified streaming rather than duplicating it).
 | 12 | Nostr identity boundary: DeviceId = Nostr pubkey, Schnorr signatures, no Nostr event formats, encrypted control plane, immutable device identity | deletes an entire bespoke identity subsystem; Nostr answers "who", Wyrd answers "what can you decrypt" |
 | 13 | Membership epochs: snapshots carry `epoch` **and commit to a membership transition**; keys derive from fresh random epoch secrets; rotation never re-encrypts history | revocation without rewriting immutable objects; a snapshot commits to the exact authorization state, not a claim; possession of epoch N yields nothing about N+1 |
 | 14 | Membership = append-only owner-signed transition chain, authorized by the **pre-transition** owner set, resulting state derived from `prev` + `changes`; superseded/stranded forks never advance state; adoption forbidden without an owner-signed recovery snapshot | deterministic authorization everywhere; owner-set changes and last-owner removal stay expressible; a removed device's writes fail closed |
-| 15 | Manifest mappings record their encryption epoch; cross-epoch reuse only with a matching capability | re-encryption under a new epoch yields a new StorageId for the same ContentId; a mapping is useful only if the recipient can decrypt the referenced representation |
+| 15 | Manifest mappings record their encryption epoch; cross-epoch reuse only with a matching capability; mappings are **untrusted hints** — acted on only after authenticated decryption | re-encryption under a new epoch yields a new StorageId for the same ContentId; a mapping is useful only if the recipient can decrypt the referenced representation, and a false hint must never corrupt state |
+| 16 | Snapshots carry a `flags` byte (bit 0 = recovery snapshot) | recovery is a distinct, auditable, authenticated operation — not inferable from shape; v0 keeps it a fixed-width field, no optionality |

@@ -46,7 +46,7 @@ the format layer alone.
    signed with the author's Nostr identity key, bound to the DriveId and to
    the membership transition that authorizes them — Nostr cryptography
    (BIP-340), never Nostr event formats. Only live-lineage eligible heads
-   advance canonical state; superseded, stranded, and voided forks are
+   advance the live view; superseded, stranded, and voided forks are
    retained history (`epochs.md`).
 4. **Content IDs never reach vaults.** Vaults store ciphertext by StorageId
    and opaque encrypted manifests; they cannot decrypt contents and cannot

@@ -70,6 +70,27 @@ is created with the drive; `members_root` and `owners_root` both cover
 exactly the owner. Every epoch number has a state, so snapshots can always
 reference one — the snapshot's membership reference is never optional.
 
+Set roots are **derived, never authoritative** (verifiers recompute them
+from the transition chain): `BLAKE3-derive_key` with the pinned contexts
+`"wyrd member set v1"` / `"wyrd owner set v1"` over the set encoded as a
+`u32` LE count followed by the 32-byte x-only pubkeys in ascending bytewise
+order, duplicates removed (object-model.md, decision 18).
+
+Change application (`apply(state, changes)`), pinned semantics:
+
+- `Admit(d)` requires `d ∉ members`. `Remove(d)` requires `d ∈ members`
+  and removes `d` from **members**; removing a device who is an owner is
+  allowed only when they are the **sole owner** — the owner set empties
+  with them (valid and terminal, per the terminal-state rule below). An
+  owner with co-owners can only leave via `SetOwners`.
+- `SetOwners(D)` requires `|D| == 1` in **v0** and replaces the owner set
+  wholesale; the final invariant `owners ⊆ members` is enforced after all
+  changes as the backstop against dangling owners (e.g. `SetOwners` of a
+  non-member).
+- `Rotate()` changes no member or owner; it exists to force a fresh epoch
+  secret.
+- Changes apply sequentially; `changes` is non-empty.
+
 ### Validity and rootedness
 
 A transition is **valid** iff:

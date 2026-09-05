@@ -11,5 +11,7 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 iroh-gossip.workspace = true
 
+secp256k1.workspace = true
+blake3.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

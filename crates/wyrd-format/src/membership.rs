@@ -32,6 +32,30 @@
 use crate::identity::{DeviceId, DriveId, TransitionId};
 use thiserror::Error;
 
+/// Context for deriving member-set roots. A format constant (epochs.md,
+/// Layer 1): changing it changes every `members_root`.
+pub const MEMBER_SET_CONTEXT: &str = "wyrd member set v1";
+
+/// Context for deriving owner-set roots.
+pub const OWNER_SET_CONTEXT: &str = "wyrd owner set v1";
+
+/// Derive a set root over devices: domain-separated BLAKE3 over the set
+/// encoded as `u32` LE count followed by the 32-byte x-only pubkeys in
+/// ascending bytewise order. Order-insensitive by construction. Set roots
+/// are **derived, never authoritative** — verifiers recompute them from
+/// the transition chain (epochs.md rule 2).
+pub fn set_root(context: &'static str, devices: &[DeviceId]) -> [u8; 32] {
+    let mut sorted: Vec<&DeviceId> = devices.iter().collect();
+    sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    sorted.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+    let mut bytes = Vec::with_capacity(4 + 32 * sorted.len());
+    bytes.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    for device in sorted {
+        bytes.extend_from_slice(device.as_bytes());
+    }
+    blake3::derive_key(context, &bytes)
+}
+
 /// Canonical tag byte for each change kind (object-model.md decision
 /// record): Admit, Remove, Rotate, SetOwners.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +453,40 @@ mod tests {
             MembershipTransition::from_canonical_bytes(&bytes),
             Err(MembershipError::UnknownChangeTag(5))
         );
+    }
+
+    #[test]
+    fn set_roots_are_derived_and_order_insensitive() {
+        let a = device(0x01);
+        let b = device(0x02);
+        let c = device(0x03);
+        let members = set_root(MEMBER_SET_CONTEXT, &[a, b, c]);
+        let permuted = set_root(MEMBER_SET_CONTEXT, &[c, a, b]);
+        assert_eq!(members, permuted, "set roots cover sets, not lists");
+        assert_eq!(
+            set_root(MEMBER_SET_CONTEXT, &[a]),
+            set_root(MEMBER_SET_CONTEXT, &[a, a]),
+            "duplicate devices must not change the root"
+        );
+        // Domains are separated: the same set under both contexts differs.
+        assert_ne!(
+            set_root(MEMBER_SET_CONTEXT, &[a, b]),
+            set_root(OWNER_SET_CONTEXT, &[a, b])
+        );
+        // Subsets differ.
+        assert_ne!(
+            set_root(MEMBER_SET_CONTEXT, &[a, b]),
+            set_root(MEMBER_SET_CONTEXT, &[a])
+        );
+    }
+}
+
+#[cfg(test)]
+mod setowners_tests {
+    use super::*;
+
+    fn device(pattern: u8) -> DeviceId {
+        DeviceId::from_bytes([pattern; 32])
     }
 
     #[test]

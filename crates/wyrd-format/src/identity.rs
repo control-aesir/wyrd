@@ -19,8 +19,8 @@ use std::fmt;
 pub const ID_LEN: usize = 32;
 
 /// 32 bytes shared by every Wyrd identifier. Not constructible outside this
-/// module; use the typed newtypes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// module; use the typed newtypes. Ordered bytewise.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RawId([u8; 32]);
 
 /// Domain separation contexts, derived per object kind. Changing a context
@@ -66,7 +66,7 @@ impl ObjectKind {
 macro_rules! define_id {
     ($name:ident, $doc:expr) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(RawId);
 
         impl $name {

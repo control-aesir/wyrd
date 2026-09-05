@@ -13,7 +13,6 @@ edition = "2021"
 [workspace.dependencies]
 # wyrd crates
 wyrd-format = { path = "crates/wyrd-format" }
-wyrd-sync = { path = "crates/wyrd-sync" }
 
 # content hashing
 blake3 = "1.8"
@@ -24,6 +23,10 @@ fastcdc = { version = "5.0.0", default-features = false }
 
 # errors
 thiserror = "2"
+
+# cryptographic primitives (substrate decision T11: audited crates only;
+# wyrd-owned code never touches the arithmetic)
+secp256k1 = { version = "0.30", features = ["global-context"] }
 
 # async runtime
 tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal"] }

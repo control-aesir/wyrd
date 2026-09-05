@@ -1,0 +1,153 @@
+//! Identity types. Two identity worlds, enforced by the type system:
+//!
+//! - `ContentId` — domain-separated BLAKE3 over *plaintext*; the logical
+//!   world (trees, snapshots, local dedup). Drive members only.
+//! - `StorageId` — domain-separated BLAKE3 over *ciphertext*; the physical
+//!   world (vaults, fetch addresses). Safe for untrusted peers.
+//! - `SnapshotId` — a `ContentId` of a snapshot object, its own type so the
+//!   compiler can tell DAG references from file content.
+//!
+//! Never construct identifiers by hashing raw bytes with a bare hash call;
+//! always go through the domain-separated derivations here. See
+//! `docs/object-model.md` for the normative contract.
+
+use std::fmt;
+
+/// 32 bytes shared by every Wyrd identifier. Not constructible outside this
+/// module; use the typed newtypes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RawId([u8; 32]);
+
+/// Domain separation contexts, derived per object kind. Changing a context
+/// string changes every identity derived with it — these are format constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    Chunk,
+    Tree,
+    Snapshot,
+}
+
+impl ObjectKind {
+    /// The `derive_key` context for content identities of this kind.
+    pub fn content_context(self) -> &'static str {
+        match self {
+            ObjectKind::Chunk => "wyrd content v1/chunk",
+            ObjectKind::Tree => "wyrd content v1/tree",
+            ObjectKind::Snapshot => "wyrd content v1/snapshot",
+        }
+    }
+}
+
+macro_rules! define_id {
+    ($name:ident, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(RawId);
+
+        impl $name {
+            /// The raw 32 bytes.
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0 .0
+            }
+
+            /// Reconstruct from raw bytes. Callers must have obtained these
+            /// bytes from a verified source; derivation is preferred.
+            pub fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(RawId(bytes))
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&hex::encode(self.as_bytes()))
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, stringify!($name))?;
+                write!(f, "({})", hex::encode(self.as_bytes()))
+            }
+        }
+    };
+}
+
+define_id!(
+    ContentId,
+    "A plaintext-domain identity: the logical address of a chunk, tree, or
+snapshot. Deterministic — identical content always yields the identical
+Content ID. Drive members only; never exposed to vaults."
+);
+define_id!(
+    StorageId,
+    "A ciphertext-domain identity: the physical address of an encrypted
+object. Deterministic over the ciphertext, which carries a fresh random
+nonce, so equal plaintexts yield unrelated Storage IDs. Safe to expose to
+vaults."
+);
+define_id!(
+    SnapshotId,
+    "The Content ID of a snapshot object — a node in the snapshot DAG,
+distinct in type from ordinary file content."
+);
+define_id!(
+    DriveId,
+    "A random 256-bit identifier naming one logical drive. Never derived
+from content, and never a Nostr identity: every identifier answers a
+different question (DriveId: which drive? Nostr pubkey: which participant?
+ContentId: which content? StorageId: which encrypted representation?).
+Minting a drive (drawing the randomness) is a sync/owner concern; the
+format layer only carries the identifier."
+);
+
+impl ContentId {
+    /// Derive the Content ID for plaintext of the given kind. The identity
+    /// includes the object kind: a chunk and a tree can never collide.
+    pub fn derive(kind: ObjectKind, plaintext: &[u8]) -> Self {
+        Self(RawId(blake3::derive_key(kind.content_context(), plaintext)))
+    }
+}
+
+impl StorageId {
+    /// Derive the Storage ID for a ciphertext blob. The ciphertext must
+    /// carry its own fresh random nonce; equality of Storage IDs implies
+    /// equality of ciphertexts only.
+    pub fn derive(ciphertext: &[u8]) -> Self {
+        Self(RawId(blake3::derive_key("wyrd storage v1", ciphertext)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_id_is_deterministic_per_kind() {
+        let a = ContentId::derive(ObjectKind::Chunk, b"hello");
+        let b = ContentId::derive(ObjectKind::Chunk, b"hello");
+        assert_eq!(a, b);
+        let c = ContentId::derive(ObjectKind::Tree, b"hello");
+        assert_ne!(a, c, "kinds must not collide");
+        let d = ContentId::derive(ObjectKind::Chunk, b"hellp");
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn storage_id_is_ciphertext_domain() {
+        // Same plaintext encrypted twice (nonce variation simulated here by
+        // distinct ciphertext inputs) must yield unrelated Storage IDs.
+        let s1 = StorageId::derive(b"nonce-a||ciphertext");
+        let s2 = StorageId::derive(b"nonce-b||ciphertext");
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn id_types_are_distinct_at_rest() {
+        let c = ContentId::derive(ObjectKind::Chunk, b"x");
+        let s = StorageId::derive(b"x");
+        // Same raw bytes would still be different types; this only checks
+        // derivation contexts differ so cross-domain accidents are caught
+        // by construction.
+        assert_ne!(c.as_bytes(), s.as_bytes());
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "wyrd-format"
+version.workspace = true
+edition.workspace = true
+description = "Wyrd's core object model: content-addressed chunks, Merkle file trees, append-only snapshot log"
+
+[dependencies]
+blake3.workspace = true
+hex.workspace = true
+thiserror.workspace = true

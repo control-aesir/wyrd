@@ -1,0 +1,21 @@
+# devenv
+.devenv*
+devenv.local.nix
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# Rust build artifacts
+target/
+
+# Repo packers (scratch files for review workflows)
+repomix*
+
+# Logs
+*.log
+
+# OS
+.DS_Store

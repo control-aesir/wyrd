@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wyrd-format",
+    "crates/wyrd-sync",
+    "crates/wyrd-fuse",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# wyrd crates
+wyrd-format = { path = "crates/wyrd-format" }
+wyrd-sync = { path = "crates/wyrd-sync" }
+
+# content hashing
+blake3 = "1.8"
+hex = "0.4"
+
+# errors
+thiserror = "2"
+
+# async runtime
+tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal"] }
+
+# iroh stack — validated as a set, change all three together and test
+iroh = "1.0.3"
+iroh-blobs = { version = "0.103.0", default-features = false, features = ["fs-store"] }
+iroh-gossip = "0.101.0"

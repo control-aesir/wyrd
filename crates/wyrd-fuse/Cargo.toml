@@ -1,0 +1,8 @@
+[package]
+name = "wyrd-fuse"
+version.workspace = true
+edition.workspace = true
+description = "Wyrd's FUSE presentation layer: live view and time travel"
+
+[dependencies]
+wyrd-format.workspace = true

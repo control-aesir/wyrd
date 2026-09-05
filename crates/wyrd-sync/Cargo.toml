@@ -1,0 +1,15 @@
+[package]
+name = "wyrd-sync"
+version.workspace = true
+edition.workspace = true
+description = "Wyrd's peer-to-peer replication layer: iroh transport, peer roles, snapshot log exchange"
+
+[dependencies]
+wyrd-format.workspace = true
+
+iroh.workspace = true
+iroh-blobs.workspace = true
+iroh-gossip.workspace = true
+
+tokio.workspace = true
+thiserror.workspace = true

@@ -18,9 +18,9 @@ impl std::fmt::Debug for DriveRootKey {
 
 impl DriveRootKey {
     /// Mint a fresh random root key: once per drive, at drive creation.
-    pub fn generate() -> Result<Self, super::capability::CryptoError> {
+    pub fn generate() -> Result<Self, super::CryptoError> {
         let mut bytes = [0u8; 32];
-        super::capability::random_bytes(&mut bytes)?;
+        super::random_bytes(&mut bytes)?;
         Ok(DriveRootKey(bytes))
     }
 

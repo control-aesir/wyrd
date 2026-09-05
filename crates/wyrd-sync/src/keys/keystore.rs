@@ -16,7 +16,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use thiserror::Error;
 
-use super::capability::{random_bytes, CryptoError};
+use super::{random_bytes, CryptoError};
 
 /// The keystore AEAD domain tag.
 pub(crate) const KEYSTORE_AAD_DOMAIN: &[u8] = b"wyrd keystore root v1";
@@ -64,15 +64,6 @@ pub enum KeystoreError {
     KdfFailed,
 }
 
-impl From<CryptoError> for KeystoreError {
-    fn from(e: CryptoError) -> Self {
-        match e {
-            CryptoError::RngFailed => KeystoreError::RngFailed,
-            _ => KeystoreError::KdfFailed,
-        }
-    }
-}
-
 /// Derive the keystore key from a passphrase with the pinned Argon2id
 /// parameter table. Public so the parameters are one visible, testable
 /// surface.
@@ -94,10 +85,10 @@ fn aead_key(key: &[u8]) -> XChaCha20Poly1305 {
 /// Wrap the root key under a passphrase: random salt and nonce per wrap.
 pub fn wrap_root(root: &[u8; 32], passphrase: &str) -> Result<WrappedRoot, KeystoreError> {
     let mut salt = [0u8; KDF_SALT_LEN];
-    random_bytes(&mut salt)?;
+    random_bytes(&mut salt).map_err(|_| KeystoreError::RngFailed)?;
     let key = kdf_key(passphrase, &salt)?;
     let mut nonce = [0u8; 24];
-    random_bytes(&mut nonce)?;
+    random_bytes(&mut nonce).map_err(|_| KeystoreError::RngFailed)?;
     let ciphertext = aead_key(&key)
         .encrypt(
             chacha20poly1305::XNonce::from_slice(&nonce),
@@ -118,8 +109,9 @@ pub fn wrap_root(root: &[u8; 32], passphrase: &str) -> Result<WrappedRoot, Keyst
 /// passphrase (AEAD tag) — success alone is never trusted beyond the tag.
 pub fn unwrap_root(wrapped: &WrappedRoot, passphrase: &str) -> Result<[u8; 32], KeystoreError> {
     let bytes = &wrapped.bytes;
-    // salt + nonce + at least the plaintext (32) + tag (16).
-    if bytes.len() < KDF_SALT_LEN + 24 + 48 {
+    // The envelope is exactly salt ‖ nonce ‖ plaintext(32) ‖ tag(16);
+    // anything else is not something wrap_root produced.
+    if bytes.len() != KDF_SALT_LEN + 24 + 32 + 16 {
         return Err(KeystoreError::Malformed);
     }
     let salt = &bytes[..KDF_SALT_LEN];
@@ -135,7 +127,8 @@ pub fn unwrap_root(wrapped: &WrappedRoot, passphrase: &str) -> Result<[u8; 32], 
             },
         )
         .map_err(|_| KeystoreError::WrongPassphrase)?;
-    Ok(plaintext.try_into().expect("payload length checked"))
+    let root: [u8; 32] = plaintext.try_into().map_err(|_| KeystoreError::Malformed)?;
+    Ok(root)
 }
 
 #[cfg(test)]
@@ -195,6 +188,37 @@ mod tests {
         assert_eq!(
             unwrap_root(&rewrapped, PASSPHRASE),
             Err(KeystoreError::WrongPassphrase)
+        );
+    }
+
+    #[test]
+    fn a_longer_ciphertext_is_never_a_root() {
+        // A corrupted (or hostile) store must not make unwrap_root panic
+        // or hand back more than 32 bytes, whatever the tag says. Build a
+        // validly tagged 48-byte payload under the real passphrase-derived
+        // key; the exact envelope length check rejects it up front.
+        use chacha20poly1305::aead::Payload;
+        let mut salt = [0u8; KDF_SALT_LEN];
+        random_bytes(&mut salt).unwrap();
+        let key = kdf_key(PASSPHRASE, &salt).unwrap();
+        let nonce = [0u8; 24];
+        let plaintext = [0x99u8; 48];
+        let ciphertext = aead_key(&key)
+            .encrypt(
+                chacha20poly1305::XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext[..],
+                    aad: KEYSTORE_AAD_DOMAIN,
+                },
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&salt);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ciphertext);
+        assert_eq!(
+            unwrap_root(&WrappedRoot::from_bytes(bytes), PASSPHRASE),
+            Err(KeystoreError::Malformed)
         );
     }
 

@@ -31,6 +31,7 @@ use thiserror::Error;
 use wyrd_format::{DeviceId, DriveId, TransitionId};
 
 use super::epoch::EpochSecret;
+use super::{random_bytes, CryptoError};
 
 /// The wrapping's HKDF info context (trust.md, T12).
 pub(crate) const CAPABILITY_KEY_CONTEXT: &[u8] = b"wyrd capability key v1";
@@ -80,7 +81,7 @@ impl Capability {
         let recipient_pk = XOnlyPublicKey::from_slice(self.recipient.as_bytes())
             .map_err(|_| CryptoError::Malformed)?;
         let shared = ecdh_shared(&ephemeral_sk, &recipient_pk)?;
-        let aead_key = hkdf_capability_key(&shared)?;
+        let aead_key = hkdf_capability_key(&shared);
         let mut nonce = [0u8; 24];
         random_bytes(&mut nonce)?;
         let aad = capability_aad(
@@ -140,7 +141,7 @@ impl WrappedCapability {
         let ciphertext = &bytes[160..];
 
         let shared = ecdh_shared(recipient, &ephemeral_pk)?;
-        let aead_key = hkdf_capability_key(&shared)?;
+        let aead_key = hkdf_capability_key(&shared);
         let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
             .decrypt(
                 chacha20poly1305::XNonce::from_slice(nonce),
@@ -171,6 +172,12 @@ impl WrappedCapability {
         }
         if pt_epoch != up_to_epoch {
             return Err(CryptoError::HeaderMismatch);
+        }
+        // The declared epoch is the secret count: a tagged envelope
+        // claiming more epochs than it carries must not install as a
+        // partial range under the bigger binding.
+        if pt_epoch != secret_count as u64 {
+            return Err(CryptoError::Malformed);
         }
         let secrets = plaintext[need..]
             .chunks_exact(32)
@@ -272,32 +279,13 @@ impl HeldCapabilities {
     }
 }
 
-/// Failures of wrap/unwrap plumbing. AEAD open failures are collapsed
-/// here on purpose: callers learn only that the envelope did not open
-/// under the provided key and context — never which byte differed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum CryptoError {
-    #[error("the envelope did not open under this key and context")]
-    OpenFailed,
-    #[error("malformed envelope bytes")]
-    Malformed,
-    #[error("the sealed document disagrees with its envelope header")]
-    HeaderMismatch,
-    #[error("secure randomness unavailable")]
-    RngFailed,
-}
-
-pub(crate) fn hkdf_capability_key(shared: &[u8]) -> Result<[u8; 32], CryptoError> {
+pub(crate) fn hkdf_capability_key(shared: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, shared);
     let mut okm = [0u8; 32];
+    // 32-byte OKM is always valid for HKDF-SHA256.
     hk.expand(CAPABILITY_KEY_CONTEXT, &mut okm)
-        .expect("32-byte OKM is always valid for HKDF-SHA256");
-    Ok(okm)
-}
-
-/// Fill a buffer from the OS CSPRNG.
-pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<(), CryptoError> {
-    getrandom::getrandom(buf).map_err(|_| CryptoError::RngFailed)
+        .expect("valid OKM length");
+    okm
 }
 
 /// ECDH over an x-only peer key: canonicalize to even parity (the shared
@@ -473,6 +461,53 @@ mod tests {
         assert_ne!(a.as_bytes(), b.as_bytes(), "fresh ephemeral key and nonce");
         assert_eq!(a.unwrap(&sk_recipient).unwrap(), cap);
         assert_eq!(b.unwrap(&sk_recipient).unwrap(), cap);
+    }
+
+    #[test]
+    fn forged_epoch_count_mismatch_is_rejected() {
+        // An envelope can only be tagged by someone holding the AEAD key
+        // (reachable here in-module), so build one the honest wrapper
+        // cannot produce: the plaintext claims epoch 5 but carries 3
+        // secrets. Unwrap must reject it — install would otherwise treat
+        // it as the 1..=3 range under a 1..=5 binding.
+        let (sk_recipient, recipient) = key(5);
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let transition = TransitionId::from_bytes([0x11; 32]);
+        let ephemeral_sk = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let ephemeral_pk =
+            XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(SECP256K1, &ephemeral_sk)).0;
+        let peer = XOnlyPublicKey::from_slice(recipient.as_bytes()).unwrap();
+        let aead_key = hkdf_capability_key(&ecdh_shared(&ephemeral_sk, &peer).unwrap());
+        let aad = capability_aad(&drive, &recipient, &transition, 5);
+
+        let mut pt = Vec::new();
+        pt.extend_from_slice(drive.as_bytes());
+        pt.extend_from_slice(recipient.as_bytes());
+        pt.extend_from_slice(transition.as_bytes());
+        pt.extend_from_slice(&5u64.to_le_bytes());
+        pt.extend_from_slice(&3u32.to_le_bytes());
+        for e in 1..=3u8 {
+            pt.extend_from_slice(&[e; 32]);
+        }
+        let nonce = [0u8; 24];
+        let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
+            .encrypt(
+                chacha20poly1305::XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &pt[..],
+                    aad: &aad[..],
+                },
+            )
+            .unwrap();
+        let mut envelope = Vec::new();
+        envelope.extend_from_slice(&ephemeral_pk.serialize());
+        envelope.extend_from_slice(&aad[CAPABILITY_AAD_DOMAIN.len()..]);
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&ciphertext);
+        assert_eq!(
+            WrappedCapability::from_bytes(envelope).unwrap(&sk_recipient),
+            Err(CryptoError::Malformed)
+        );
     }
 
     #[test]

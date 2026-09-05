@@ -15,7 +15,7 @@
 //!                 epoch_secret ‖ ContentId ‖ kind_byte ‖ version_byte)
 //! ```
 
-use super::capability::{random_bytes, CryptoError};
+use super::{random_bytes, CryptoError};
 use wyrd_format::{ContentId, ObjectKind, SnapshotId};
 
 /// One epoch's uniformly random secret. Constructed only by

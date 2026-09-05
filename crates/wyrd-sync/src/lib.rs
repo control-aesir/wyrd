@@ -9,5 +9,6 @@
 //! Not yet implemented. The iroh version set is validated as a set; change
 //! all three together and run the full test suite.
 
+pub mod authorization;
 pub mod keys;
 pub mod membership;

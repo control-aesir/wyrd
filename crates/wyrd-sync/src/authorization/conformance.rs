@@ -1,0 +1,585 @@
+//! Conformance tests: the snapshot contract's test list from
+//! `docs/epochs.md` ("Conformance tests", **Snapshots**), as named tests.
+
+use super::test_util::{sign_snapshot, tree_id, Fixture};
+use super::*;
+use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT};
+use wyrd_format::{Change, DeviceId, SnapshotId, TransitionId};
+
+fn observe(dag: &mut SnapshotDag, s: &Snapshot) -> SnapshotId {
+    dag.observe(s.clone())
+}
+
+fn classify_one(dag: &SnapshotDag, log: &MembershipLog, id: &SnapshotId) -> Classification {
+    dag.classify(log)
+        .remove(id)
+        .expect("observed snapshot is classified")
+}
+
+// --- validity ------------------------------------------------------------
+
+#[test]
+fn valid_genesis_snapshot_is_eligible() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let s = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id = observe(&mut dag, &s);
+    assert_eq!(classify_one(&dag, &f.log, &id), Classification::Eligible);
+}
+
+#[test]
+fn same_epoch_chain_eligible_head_and_history() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let s1 = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id1 = observe(&mut dag, &s1);
+    let s2 = f.owner_snapshot(vec![id1], tree_id(2));
+    let id2 = observe(&mut dag, &s2);
+    let s3 = f.owner_snapshot(vec![id2], tree_id(3));
+    let id3 = observe(&mut dag, &s3);
+    // S1 → S2 → S3, all at K = 1: head eligible, ancestors history.
+    assert_eq!(classify_one(&dag, &f.log, &id3), Classification::Eligible);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id2),
+        Classification::CanonicalHistory
+    );
+    assert_eq!(
+        classify_one(&dag, &f.log, &id1),
+        Classification::CanonicalHistory
+    );
+}
+
+#[test]
+fn parallel_heads_are_both_eligible() {
+    // Two same-epoch snapshots with the same parent coexist as parallel
+    // heads; the live view is conflicted, not one superseding the other.
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let a = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_a = observe(&mut dag, &a);
+    let b = f.owner_snapshot(vec![id_base], tree_id(3));
+    let id_b = observe(&mut dag, &b);
+    assert_eq!(classify_one(&dag, &f.log, &id_a), Classification::Eligible);
+    assert_eq!(classify_one(&dag, &f.log, &id_b), Classification::Eligible);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_base),
+        Classification::CanonicalHistory
+    );
+}
+
+// --- rejection -----------------------------------------------------------
+
+#[test]
+fn tampered_signature_is_rejected() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.signature[0] ^= 0xFF;
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Rejected(Rejection::BadSignature)
+    );
+}
+
+#[test]
+fn wrong_drive_is_rejected() {
+    // The snapshot is signed over a different DriveId: the drive-bound
+    // challenge does not verify here.
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    let other_drive = DriveId::from_bytes([0x77; 32]);
+    sign_snapshot(&mut s, &f.sk, &other_drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Rejected(Rejection::BadSignature)
+    );
+}
+
+#[test]
+fn invalid_author_key_is_rejected() {
+    // lift_x failure: the author bytes are not a curve point.
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.author = DeviceId::from_bytes([0xFF; 32]);
+    // Signature still verifies against the real author; the key check
+    // fails first.
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Rejected(Rejection::InvalidAuthorKey)
+    );
+}
+
+#[test]
+fn author_not_in_committed_membership_is_rejected() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let (sk_stranger, stranger) = f.device(9);
+    let s = f.snapshot(Vec::new(), tree_id(1), stranger, &sk_stranger, 0);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Rejected(Rejection::AuthorNotMember)
+    );
+}
+
+#[test]
+fn epoch_membership_mismatch_is_rejected() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.epoch = 7; // claims a later epoch than its transition's
+    sign_snapshot(&mut s, &f.sk, &f.drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Rejected(Rejection::EpochMismatch)
+    );
+}
+
+// --- pending -------------------------------------------------------------
+
+#[test]
+fn unknown_membership_transition_is_pending() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.membership = TransitionId::from_bytes([0x99; 32]);
+    sign_snapshot(&mut s, &f.sk, &f.drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Pending(Pendency::UnknownTransition)
+    );
+}
+
+#[test]
+fn orphaned_transition_reference_is_pending() {
+    // Build a valid log fork whose branch is orphaned by an invalid
+    // sibling, then bind a snapshot to the orphaned branch.
+    let mut f = Fixture::new(1);
+    let (sk_outsider, outsider) = f.device(9);
+    let mut bad = f.builder.child(vec![Change::Rotate]);
+    bad.author = outsider;
+    crate::membership::test_util::sign(&mut bad, &sk_outsider, &f.drive);
+    // A successor of the bad transition (structurally sound chain below).
+    f.builder.prev = Some(bad.transition_id());
+    f.builder.epoch = bad.epoch;
+    let orphaned = f.builder.child(vec![Change::Rotate]);
+    f.log.observe(bad);
+    f.log.observe(orphaned.clone());
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.membership = orphaned.transition_id();
+    s.epoch = orphaned.epoch;
+    sign_snapshot(&mut s, &f.sk, &f.drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Pending(Pendency::OrphanedTransition)
+    );
+}
+
+#[test]
+fn contested_transition_reference_is_pending() {
+    // Fork the membership log: both branches valid, conflict frozen.
+    let mut f = Fixture::new(1);
+    let (_, second) = f.device(2);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork.changes = vec![Change::Admit(second)];
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    f.log.observe(a);
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    f.log.observe(fork);
+    // Snapshot bound to the contested branch tip (fork at epoch 2).
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.membership = fork_id;
+    s.epoch = fork_epoch;
+    sign_snapshot(&mut s, &f.sk, &f.drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Pending(Pendency::ContestedTransition)
+    );
+}
+
+#[test]
+fn snapshot_with_unknown_parent_is_pending() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let s = f.owner_snapshot(vec![SnapshotId::from_bytes([0xAB; 32])], tree_id(1));
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Pending(Pendency::UnknownParent)
+    );
+}
+
+// --- voided / superseded / stranded --------------------------------------
+
+#[test]
+fn voided_branch_reference_is_voided() {
+    let mut f = Fixture::new(1);
+    let (_, second) = f.device(2);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork.changes = vec![Change::Admit(second)];
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    // Resolution: prev = a (winner), resolves = fork (voided).
+    let mut r = f.builder.child(vec![Change::Rotate]);
+    r.prev = Some(a.transition_id());
+    r.resolves = vec![fork.transition_id()];
+    r.epoch = 3;
+    crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
+    f.log.observe(a);
+    f.log.observe(fork.clone());
+    f.log.observe(r);
+    // Snapshot bound to the voided transition.
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s = f.owner_snapshot(Vec::new(), tree_id(1));
+    s.membership = fork.transition_id();
+    s.epoch = fork.epoch;
+    sign_snapshot(&mut s, &f.sk, &f.drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(classify_one(&dag, &f.log, &id), Classification::Voided);
+}
+
+#[test]
+fn stale_fork_becomes_superseded_when_the_log_advances() {
+    // S1 and S2 are same-epoch heads; log advances; new work parents on
+    // S1 only. S2 is a stale fork: superseded, browsable, never live.
+    let mut f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let s1 = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_s1 = observe(&mut dag, &s1);
+    let s2 = f.owner_snapshot(vec![id_base], tree_id(3));
+    let id_s2 = observe(&mut dag, &s2);
+    // Log advances to epoch 2 (a membership change).
+    let (_sk, member) = f.device(3);
+    f.membership(vec![Change::Admit(member)]);
+    // New work at epoch 2 on the first head.
+    let s3 = f.owner_snapshot(vec![id_s1], tree_id(4));
+    let id_s3 = observe(&mut dag, &s3);
+    assert_eq!(classify_one(&dag, &f.log, &id_s3), Classification::Eligible);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_s1),
+        Classification::CanonicalHistory
+    );
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_s2),
+        Classification::Superseded
+    );
+}
+
+#[test]
+fn building_on_dead_ancestry_strands_the_work() {
+    // Work at the current epoch whose parent is on a dead branch (a
+    // snapshot bound to a voided transition): authorized history, but
+    // never live-lineage. Stranding is inherited and permanent.
+    let mut f = Fixture::new(1);
+    let (_, second) = f.device(2);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork.changes = vec![Change::Admit(second)];
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    let mut r = f.builder.child(vec![Change::Rotate]);
+    r.prev = Some(a.transition_id());
+    r.resolves = vec![fork.transition_id()];
+    r.epoch = 3;
+    crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
+    f.observe_raw(a);
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    f.observe_raw(fork);
+    f.observe_raw(r);
+    let mut dag = SnapshotDag::new(f.drive);
+    // A snapshot bound to the voided transition is itself VOIDED.
+    let mut voided = f.owner_snapshot(Vec::new(), tree_id(1));
+    voided.membership = fork_id;
+    voided.epoch = fork_epoch;
+    sign_snapshot(&mut voided, &f.sk, &f.drive);
+    let id_voided = observe(&mut dag, &voided);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_voided),
+        Classification::Voided
+    );
+    // Current-epoch work parenting onto it: stranded.
+    let stranded = f.owner_snapshot(vec![id_voided], tree_id(2));
+    let id_stranded = observe(&mut dag, &stranded);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_stranded),
+        Classification::Stranded
+    );
+    // Stranding is inherited and permanent.
+    let descendant = f.owner_snapshot(vec![id_stranded], tree_id(3));
+    let id_descendant = observe(&mut dag, &descendant);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_descendant),
+        Classification::Stranded
+    );
+}
+
+// --- partial heads, merges ------------------------------------------------
+
+#[test]
+fn partial_head_parenting_stays_valid_when_the_second_head_arrives() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let h1 = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_h1 = observe(&mut dag, &h1);
+    // Built on one of (what will be) two heads.
+    let child = f.owner_snapshot(vec![id_h1], tree_id(3));
+    let id_child = observe(&mut dag, &child);
+    let h2 = f.owner_snapshot(vec![id_base], tree_id(4));
+    let id_h2 = observe(&mut dag, &h2);
+    // The child stays valid: parenting a subset of the heads it knew is
+    // never punished by a late arrival. It is itself a head at the
+    // current epoch now: eligible (the live view is conflicted).
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_child),
+        Classification::Eligible
+    );
+    // The late head is a head at the current epoch: eligible, exactly
+    // like the child.
+    assert_eq!(classify_one(&dag, &f.log, &id_h2), Classification::Eligible);
+    let mut heads = dag.heads();
+    heads.sort_by_key(|id| format!("{id}"));
+    let mut expected = vec![id_child, id_h2];
+    expected.sort_by_key(|id| format!("{id}"));
+    assert_eq!(heads, expected, "child and late head are the heads");
+    assert!(!heads.contains(&id_h1), "the first head is a parent now");
+}
+
+#[test]
+fn merge_of_eligible_heads_is_eligible() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let h1 = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_h1 = observe(&mut dag, &h1);
+    let h2 = f.owner_snapshot(vec![id_base], tree_id(3));
+    let id_h2 = observe(&mut dag, &h2);
+    let merge = f.owner_snapshot(vec![id_h1, id_h2], tree_id(4));
+    let id_merge = observe(&mut dag, &merge);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_merge),
+        Classification::Eligible
+    );
+}
+
+#[test]
+fn merge_including_a_stranded_head_is_stranded() {
+    // The stranded head descends from a voided branch; merging it into
+    // otherwise-live work adopts dead lineage.
+    let mut f = Fixture::new(1);
+    let (_, second) = f.device(2);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork.changes = vec![Change::Admit(second)];
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    let mut r = f.builder.child(vec![Change::Rotate]);
+    r.prev = Some(a.transition_id());
+    r.resolves = vec![fork.transition_id()];
+    r.epoch = 3;
+    crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
+    f.observe_raw(a);
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    f.observe_raw(fork);
+    f.observe_raw(r);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let mut voided = f.owner_snapshot(vec![id_base], tree_id(2));
+    voided.membership = fork_id;
+    voided.epoch = fork_epoch;
+    sign_snapshot(&mut voided, &f.sk, &f.drive);
+    let id_voided = observe(&mut dag, &voided);
+    let stranded = f.owner_snapshot(vec![id_voided], tree_id(3));
+    let id_stranded = observe(&mut dag, &stranded);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_stranded),
+        Classification::Stranded
+    );
+    let live = f.owner_snapshot(vec![id_base], tree_id(4));
+    let id_live = observe(&mut dag, &live);
+    let merge = f.owner_snapshot(vec![id_live, id_stranded], tree_id(5));
+    let id_merge = observe(&mut dag, &merge);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_merge),
+        Classification::Stranded
+    );
+}
+
+// --- recovery -------------------------------------------------------------
+
+#[test]
+fn recovery_snapshot_by_the_owner_with_eligible_parents_is_eligible() {
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let head = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_head = observe(&mut dag, &head);
+    let recovery = f.owner_snapshot(vec![id_head], tree_id(3));
+    let mut recovery = recovery;
+    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Eligible
+    );
+}
+
+#[test]
+fn recovery_snapshot_by_a_non_owner_is_rejected() {
+    let mut f = Fixture::new(1);
+    let (_sk, member) = f.device(2);
+    f.membership(vec![Change::Admit(member)]);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let head = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_head = observe(&mut dag, &head);
+    let (sk_member, member) = f.device(2);
+    let recovery = f.snapshot(
+        vec![id_head],
+        tree_id(3),
+        member,
+        &sk_member,
+        wyrd_format::snapshot::RECOVERY_FLAG,
+    );
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryNotOwner)
+    );
+}
+
+#[test]
+fn recovery_parenting_a_stranded_head_is_rejected() {
+    let mut f = Fixture::new(1);
+    let (_, second) = f.device(2);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork.changes = vec![Change::Admit(second)];
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    let mut r = f.builder.child(vec![Change::Rotate]);
+    r.prev = Some(a.transition_id());
+    r.resolves = vec![fork.transition_id()];
+    r.epoch = 3;
+    crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
+    f.observe_raw(a);
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    f.observe_raw(fork);
+    f.observe_raw(r);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut voided = f.owner_snapshot(Vec::new(), tree_id(1));
+    voided.membership = fork_id;
+    voided.epoch = fork_epoch;
+    sign_snapshot(&mut voided, &f.sk, &f.drive);
+    let id_voided = observe(&mut dag, &voided);
+    let stranded = f.owner_snapshot(vec![id_voided], tree_id(2));
+    let id_stranded = observe(&mut dag, &stranded);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_stranded),
+        Classification::Stranded
+    );
+    // Recovery tries to adopt the stranded head: forbidden. Recovery
+    // grafts content, never lineage.
+    let recovery = f.owner_snapshot(vec![id_stranded], tree_id(3));
+    let mut recovery = recovery;
+    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryParentInvalid)
+    );
+}
+
+// --- determinism ----------------------------------------------------------
+
+#[test]
+fn classification_is_arrival_order_independent() {
+    let mut f = Fixture::new(1);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let h1 = f.owner_snapshot(vec![base.snapshot_id()], tree_id(2));
+    let stale = f.owner_snapshot(vec![base.snapshot_id()], tree_id(3));
+    let (_sk, member) = f.device(3);
+    f.membership(vec![Change::Admit(member)]);
+    let live = f.owner_snapshot(vec![h1.snapshot_id()], tree_id(4));
+    // Stranded work: on a snapshot bound to a voided transition.
+    let (_, second) = f.device(2);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork.changes = vec![Change::Admit(second)];
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    let mut r = f.builder.child(vec![Change::Rotate]);
+    r.prev = Some(a.transition_id());
+    r.resolves = vec![fork.transition_id()];
+    r.epoch = 4;
+    crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
+    f.observe_raw(a);
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    f.observe_raw(fork);
+    f.observe_raw(r);
+    let mut voided = f.owner_snapshot(vec![base.snapshot_id()], tree_id(5));
+    voided.membership = fork_id;
+    voided.epoch = fork_epoch;
+    sign_snapshot(&mut voided, &f.sk, &f.drive);
+    let all = [base, h1, stale, live, voided];
+
+    let orders: Vec<Vec<usize>> = vec![
+        vec![0, 1, 2, 3, 4],
+        vec![4, 3, 2, 1, 0],
+        vec![2, 0, 4, 1, 3],
+    ];
+    let mut fingerprints = Vec::new();
+    for order in &orders {
+        let mut dag = SnapshotDag::new(f.drive);
+        for &i in order {
+            dag.observe(all[i].clone());
+        }
+        let mut fp: Vec<Classification> = all
+            .iter()
+            .map(|s| {
+                dag.classify(&f.log)
+                    .remove(&s.snapshot_id())
+                    .expect("classified")
+            })
+            .collect();
+        fp.sort_by_key(|c| format!("{c:?}"));
+        fingerprints.push(fp);
+    }
+    for fp in &fingerprints[1..] {
+        assert_eq!(
+            fp, &fingerprints[0],
+            "verdicts must not depend on arrival order"
+        );
+    }
+    let _ = stale;
+}

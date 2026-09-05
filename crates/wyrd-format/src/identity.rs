@@ -13,6 +13,11 @@
 
 use std::fmt;
 
+/// Width of every Wyrd identifier: DriveId, ContentId, StorageId,
+/// SnapshotId alike. A format constant — encodings that embed identifiers
+/// must use this, never a literal.
+pub const ID_LEN: usize = 32;
+
 /// 32 bytes shared by every Wyrd identifier. Not constructible outside this
 /// module; use the typed newtypes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

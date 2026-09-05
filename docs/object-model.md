@@ -148,6 +148,37 @@ filesystem face grows.)
 Directories are content-addressed trees: a dir node hashes to the ContentId
 of its canonical encoding. An empty directory is a valid, representable tree.
 
+**Canonical payload encoding (dir nodes):**
+
+```
+u32 LE                  entry count
+entries, sorted bytewise by component:
+  u8                    kind (0 = file, 1 = dir, 2 = symlink)
+  u32 LE + bytes        component (UTF-8)
+  file:     u64 LE      size
+            u8          executable (0 | 1)
+            u32 LE + ContentIds   chunk ids (32 bytes each)
+  dir:      ContentId   subtree reference (the child dir node)
+  symlink:  u32 LE + bytes        target (UTF-8, unvalidated)
+```
+
+Decoders must reject non-canonical payloads: unsorted or duplicate
+components, unknown kind bytes, trailing bytes, components violating the
+path rules, or exec bytes other than 0/1.
+
+Two scope boundaries a reader must know:
+- **Size-vs-chunk consistency is the reader's job.** A file entry's
+  declared size is not cross-validated against its chunk list at decode
+  time (the format layer has no store access). A corrupted or malicious
+  tree can therefore carry an inconsistent entry; the sync/FUSE layers
+  must verify against stored objects before trusting sizes. The format
+  guarantees only that the *encoding* is canonical.
+- **Flat directories are the intended v0 answer**, not sharded/HAMT
+  trees. A huge flat directory is one object, fully materialized on
+  decode; the encoding's `u32` entry count is its hard ceiling. This is
+  a deliberate v0 simplification and the one frozen scalability ceiling
+  in the format; revisit only with evidence from real workloads.
+
 ## Manifests (the bridge between identity worlds)
 
 Manifests are **core objects, not metadata**. They are what makes the

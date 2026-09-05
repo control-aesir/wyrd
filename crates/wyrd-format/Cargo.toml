@@ -6,5 +6,6 @@ description = "Wyrd's core object model: content-addressed chunks, Merkle file t
 
 [dependencies]
 blake3.workspace = true
+fastcdc.workspace = true
 hex.workspace = true
 thiserror.workspace = true

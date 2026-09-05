@@ -10,11 +10,15 @@
 pub mod chunk;
 pub mod envelope;
 pub mod identity;
+pub mod membership;
+pub mod snapshot;
 pub mod store;
 pub mod tree;
 
 pub use chunk::Chunk;
 pub use envelope::{Envelope, EnvelopeError};
-pub use identity::{ContentId, DriveId, ObjectKind, SnapshotId, StorageId};
+pub use identity::{ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, StorageId, TransitionId};
+pub use membership::{Change, MembershipError, MembershipTransition};
+pub use snapshot::Snapshot;
 pub use store::{MemoryObjectStore, ObjectStore};
 pub use tree::Tree;

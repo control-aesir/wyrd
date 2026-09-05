@@ -174,6 +174,16 @@ Epoch Secret (fresh random 256-bit per membership epoch, minted by the owner)
     └─ (snapshot manifest keys derive from the epoch secret + snapshot id)
 ```
 
+**Pinned derivations** (changing a context string changes every key ever
+derived with it — these are format constants, recorded as decision T12):
+
+```
+ManifestKey = BLAKE3-derive_key("wyrd manifest key v1",
+                                epoch_secret ‖ snapshot_id)
+ObjectKey   = BLAKE3-derive_key("wyrd object key v1",
+                                epoch_secret ‖ ContentId ‖ kind_byte ‖ version_byte)
+```
+
 **Epoch secrets are fresh random secrets** — not `KDF(DriveRootKey, N)` and
 not derivable from each other. A new uniformly random 256-bit secret is
 generated for every transition; implementations MUST NOT intentionally
@@ -401,6 +411,17 @@ snapshot classification, recovery — is normative in `epochs.md`.
   rollback. Knowledge and key material are distinct: learning epoch N+1's
   transition does not mean holding epoch N+1 secrets until the capability
   arrives.
+- **Pinned wrap parameters** (decision T12): the ECDH input is the
+  x-coordinate of the shared point, with the peer x-only key
+  canonicalized to even parity (parity-invariant); HKDF-SHA256 expands to
+  the AEAD key with info `"wyrd capability key v1"`; the AEAD is
+  **XChaCha20-Poly1305** (192-bit nonces: no nonce-management risk at
+  these message counts). The delivered envelope is
+  `ephemeral pk ‖ DriveId ‖ recipient ‖ transition_id ‖ epoch ‖ nonce ‖
+  ciphertext` — the clear header carries the AAD inputs, and the sealed
+  plaintext repeats them so a forged header fails either the tag or the
+  inner comparison. The keystore wrap uses the same AEAD with domain
+  `"wyrd keystore root v1"` and the Argon2id-derived key (open questions 6).
 - Admission is explicit and additive; delivery rides the Nostr mailbox, so
   the new device need not be online.
 
@@ -486,6 +507,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
 | T10 | Signatures are BIP-340 with **deterministic nonces** over a defined signing preimage (ASCII domain tag ‖ raw 32-byte DriveId ‖ self-delimiting preimage: counted vectors, fixed-width fields), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures); ids derive over preimage ‖ signature | BIP-340 is byte-exact, so the spec must be too; deterministic nonces make ids stable; a dedicated preimage avoids envelope-parse ambiguity |
 | T11 | Cryptographic substrate: reuse audited Nostr/secp256k1 ecosystem implementations (BIP-340, ECDH, HKDF, AEAD, CSPRNG); NIP-44 for control-plane transport; NIP-04 rejected; Wyrd owns serialization, authorization semantics, and the key hierarchy | never roll your own crypto; the security budget goes to the state machine and key lifecycle, not the elliptic curve |
+| T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson) |
 
 ## Open questions
 

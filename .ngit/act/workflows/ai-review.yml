@@ -22,7 +22,5 @@ jobs:
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          # Your AI review script here
-          echo "Analyzing PR #${{ github.event.pull_request.number }}"
-          # Example: invoke AI model to review changes
+          echo "Trigger ${NGIT_CI_TRIGGER_EVENT:-(no trigger id)} head=${{ github.event.pull_request.head.ref }} sha=${{ github.sha }}"
           python .ngit/scripts/ai-review.py

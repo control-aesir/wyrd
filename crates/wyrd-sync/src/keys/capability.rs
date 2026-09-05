@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn correct_recipient_unwraps() {
-        let (sk_owner, _) = key(1);
+        let (_sk_owner, _) = key(1);
         let (sk_recipient, recipient) = key(5);
         let cap = capability(recipient, 3);
         let wrapped = cap.wrap().unwrap();
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn wrong_recipient_cannot_open() {
-        let (sk_owner, _) = key(1);
+        let (_sk_owner, _) = key(1);
         let (_, recipient) = key(5);
         let (sk_other, _) = key(6);
         let wrapped = capability(recipient, 2).wrap().unwrap();
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn tampered_aad_inputs_fail_the_tag() {
-        let (sk_owner, _) = key(1);
+        let (_sk_owner, _) = key(1);
         let (sk_recipient, recipient) = key(5);
         let wrapped = capability(recipient, 2).wrap().unwrap();
         // Drive (offset 32), transition (96), and epoch (128) live in the
@@ -400,7 +400,7 @@ mod tests {
         // A capability covering 1..=2 and one covering 1..=3 (an extra
         // "future" secret) carry different AAD epochs: a secret can never
         // travel under the binding of a smaller epoch.
-        let (sk_owner, _) = key(1);
+        let (_sk_owner, _) = key(1);
         let (_, recipient) = key(5);
         let w2 = capability(recipient, 2).wrap().unwrap();
         let w3 = capability(recipient, 3).wrap().unwrap();
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn wrap_is_nondeterministic_and_stable_to_open() {
-        let (sk_owner, _) = key(1);
+        let (_sk_owner, _) = key(1);
         let (sk_recipient, recipient) = key(5);
         let cap = capability(recipient, 4);
         let a = cap.wrap().unwrap();
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn malformed_envelopes_are_rejected() {
-        let (sk_owner, _) = key(1);
+        let (_sk_owner, _) = key(1);
         let (sk_recipient, recipient) = key(5);
         let wrapped = capability(recipient, 2).wrap().unwrap();
         let truncated = WrappedCapability::from_bytes(wrapped.as_bytes()[..40].to_vec());

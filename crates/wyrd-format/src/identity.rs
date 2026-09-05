@@ -36,6 +36,26 @@ impl ObjectKind {
             ObjectKind::Snapshot => "wyrd content v1/snapshot",
         }
     }
+
+    /// The envelope kind byte. Format constant (object-model.md):
+    /// 0x00 chunk, 0x01 tree, 0x02 snapshot.
+    pub const fn byte(self) -> u8 {
+        match self {
+            ObjectKind::Chunk => 0x00,
+            ObjectKind::Tree => 0x01,
+            ObjectKind::Snapshot => 0x02,
+        }
+    }
+
+    /// The kind for an envelope kind byte, or `None` if unknown.
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(ObjectKind::Chunk),
+            0x01 => Some(ObjectKind::Tree),
+            0x02 => Some(ObjectKind::Snapshot),
+            _ => None,
+        }
+    }
 }
 
 macro_rules! define_id {
@@ -149,5 +169,22 @@ mod tests {
         // derivation contexts differ so cross-domain accidents are caught
         // by construction.
         assert_ne!(c.as_bytes(), s.as_bytes());
+    }
+
+    #[test]
+    fn kind_bytes_round_trip() {
+        for kind in [ObjectKind::Chunk, ObjectKind::Tree, ObjectKind::Snapshot] {
+            assert_eq!(ObjectKind::from_byte(kind.byte()), Some(kind));
+        }
+        // Distinct, compact, ascending — the format constant table.
+        assert_eq!(ObjectKind::Chunk.byte(), 0x00);
+        assert_eq!(ObjectKind::Tree.byte(), 0x01);
+        assert_eq!(ObjectKind::Snapshot.byte(), 0x02);
+    }
+
+    #[test]
+    fn unknown_kind_bytes_are_rejected() {
+        assert_eq!(ObjectKind::from_byte(0x03), None);
+        assert_eq!(ObjectKind::from_byte(0xFF), None);
     }
 }

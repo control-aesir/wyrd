@@ -19,6 +19,9 @@ wyrd-sync = { path = "crates/wyrd-sync" }
 blake3 = "1.8"
 hex = "0.4"
 
+# content-defined chunking (wyrd-owned parameters in wyrd-format::chunk)
+fastcdc = { version = "5.0.0", default-features = false }
+
 # errors
 thiserror = "2"
 

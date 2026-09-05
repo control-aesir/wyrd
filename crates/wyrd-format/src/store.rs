@@ -68,6 +68,13 @@ impl MemoryStoreError {
     }
 }
 
+impl MemoryObjectStore {
+    #[cfg(test)]
+    pub(crate) fn stored_count(&self) -> usize {
+        self.objects.len()
+    }
+}
+
 impl ObjectStore for MemoryObjectStore {
     type Error = MemoryStoreError;
 

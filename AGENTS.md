@@ -36,6 +36,9 @@ to. The README carries the vision; `docs/` carries the current design contract.
   follow `docs/trust.md` and `docs/epochs.md` as normative contracts: root
   custody, fresh random epoch secrets, the membership state machine, and the
   Nostr/iroh control-plane split are decided; do not relitigate them.
+- Never implement cryptographic primitives (secp256k1, BIP-340, ECDH, HKDF,
+  AEAD, CSPRNG). Use audited crates from the nostr/secp256k1 ecosystem; see
+  the Cryptographic substrate section of `docs/trust.md` (decision T11).
 - iroh dependency versions change as a set.
 - Format decisions live in the decision record at the bottom of
   `docs/object-model.md`. Remaining open questions there are decisions to be

@@ -24,7 +24,7 @@ arbitrary subsets of that drive locally.
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror only |
-| `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack |
+| `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-fuse` | FUSE mount: live view, time travel, conflict surfacing | `wyrd-format` only |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,

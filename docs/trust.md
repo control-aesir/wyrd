@@ -46,9 +46,9 @@ The boundary, stated as a rule:
     layer): relay-visible routing patterns can still suggest relationships
     between pubkeys. Traffic analysis is not resisted here, exactly as for
     vaults.
-- **NIP-44 is not object encryption.** NIP-44 solves pairwise A→B messages;
-  Wyrd objects use drive-derived per-object AEAD (below). Nostr's encrypted
-  message formats may carry the *control plane*, never object content.
+- **NIP-44 carries the control plane, never objects.** Object encryption is
+  Wyrd's own AEAD hierarchy (below); NIP-44 is the control-plane transport
+  encryption (see Cryptographic substrate).
 - **Device identity is immutable.** If a Nostr key is rotated, that is a new
   device: remove the old membership, admit the new key. Nostr's social
   identity-continuity conventions are not inherited.
@@ -63,6 +63,49 @@ Three distinct uses of Nostr, kept separate:
 | public | identity (pubkeys), optional discovery/relay hints |
 | encrypted control plane | membership changes, invitations, capabilities, rotation, snapshot announcements |
 | direct P2P (iroh) | objects, manifests, bulk data |
+
+## Cryptographic substrate: reuse implementations, own the protocol (decided)
+
+> **Wyrd reuses standardized cryptographic primitives and audited
+> implementations from the Nostr/secp256k1 ecosystem, and defines its own
+> object formats, authorization semantics, and key hierarchy.**
+
+Never implemented by Wyrd — MUST come from a maintained, audited
+cryptographic library (the Rust `nostr` crate ecosystem provides all of
+these): secp256k1 arithmetic, point validation / `lift_x`, BIP-340
+sign/verify, private-key generation, ECDH, HKDF, ChaCha20, HMAC, CSPRNG.
+
+Wyrd owns — the actual security surface, and where the design budget goes:
+membership transitions, epoch semantics, capability semantics, revocation,
+snapshot authorization, canonical serialization, DriveId binding,
+ContentId/StorageId, the object encryption hierarchy, conflict resolution,
+recovery.
+
+Rules:
+
+- Implementations MUST use a conformant BIP-340 implementation from a
+  maintained cryptographic library; Wyrd MUST NOT implement secp256k1
+  arithmetic or BIP-340 itself. The validity rules stated in this document
+  (`lift_x`, 64-byte signatures, tagged-hash challenge) are protocol
+  requirements a conformant library already enforces — verification must
+  not bypass them.
+- Wyrd specifies *what gets signed* (`M = domain ‖ DriveId ‖ signing
+  preimage`, below); the library provides `sign(sk, M)` / `verify(pk, M,
+  sig)`.
+- **Control-plane transport encryption is NIP-44** (ECDH + HKDF-SHA256 +
+  ChaCha20 + HMAC-SHA256, CSPRNG nonces), as exposed by the same crate
+  ecosystem; relays see only Nostr routing metadata. NIP-04 is deprecated
+  and MUST NOT be used. NIP-44's documented pairwise limitations (no
+  forward secrecy / post-compromise security) are acceptable for control
+  messages: the epoch/capability model — not the transport — carries the
+  revocation boundary.
+- Drive objects are never NIP-44: object encryption uses standard
+  AEAD/KDF crate primitives directly with Wyrd's per-object construction.
+- Capability wrapping reuses the same primitive set (secp256k1 ECDH →
+  HKDF-SHA256 → AEAD) with the Wyrd AAD context binding — audited building
+  blocks, Wyrd-defined semantics.
+- NIP-46 remote signing (below) rides `nostr-connect`-style tooling; the
+  daemon still never holds the nsec.
 
 ## Principals
 
@@ -248,8 +291,10 @@ Snapshot {
 An epoch number says *when*; the membership reference says **which
 authorization state**. Both are covered by the snapshot signature.
 
-**Exact signing construction.** BIP-340 is byte-exact, so the message is
-too. The message is defined over a **signing preimage** — a dedicated
+**Exact signing construction.** BIP-340 is byte-exact; implementations use
+a conformant library (Cryptographic substrate, above) and never reimplement
+the scheme. What Wyrd specifies is the exact input. The message is defined
+over a **signing preimage** — a dedicated
 canonical encoding of the signed fields, *not* "the envelope minus the
 signature" (that would leave two parseable schemas and a reconstruction
 hazard). The preimage is fully self-delimiting: every vector is a `u32`
@@ -269,10 +314,9 @@ M_membership = ASCII("wyrd membership v1") || DriveId(32 bytes)
 
 `transition_id` = domain-separated BLAKE3 over the signing preimage ‖
 signature (stable, because signatures are deterministic). Key validation
-follows BIP-340 exactly: x-only public keys must pass `lift_x` (a 32-byte
-length check is not sufficient), signatures must be exactly 64 bytes and
-satisfy BIP-340's verification equations, and the challenge hash is
-BIP-340's tagged construction.
+(`lift_x`, exactly 64-byte signatures, BIP-340's tagged challenge hash and
+verification equations) is a protocol requirement enforced by the conformant
+library; verification must never bypass or weaken it.
 
 `timestamp` is display/tiebreak metadata only: it MUST NOT participate in
 authorization, conflict resolution, membership ordering, or key
@@ -428,6 +472,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T8 | DriveRootKey is owner/recovery custody only; never part of an ordinary member capability | a member holding the root could derive every future epoch; revocation would collapse |
 | T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
 | T10 | Signatures are BIP-340 with **deterministic nonces** over a defined signing preimage (ASCII domain tag ‖ raw 32-byte DriveId ‖ self-delimiting preimage: counted vectors, fixed-width fields), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures); ids derive over preimage ‖ signature | BIP-340 is byte-exact, so the spec must be too; deterministic nonces make ids stable; a dedicated preimage avoids envelope-parse ambiguity |
+| T11 | Cryptographic substrate: reuse audited Nostr/secp256k1 ecosystem implementations (BIP-340, ECDH, HKDF, AEAD, CSPRNG); NIP-44 for control-plane transport; NIP-04 rejected; Wyrd owns serialization, authorization semantics, and the key hierarchy | never roll your own crypto; the security budget goes to the state machine and key lifecycle, not the elliptic curve |
 
 ## Open questions
 

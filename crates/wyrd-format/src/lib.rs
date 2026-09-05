@@ -7,8 +7,10 @@
 //! the store implementations it defines. See `docs/object-model.md` for the
 //! normative v0 format contract.
 
+pub mod envelope;
 pub mod identity;
 pub mod store;
 
+pub use envelope::{Envelope, EnvelopeError};
 pub use identity::{ContentId, DriveId, ObjectKind, SnapshotId, StorageId};
-pub use store::ObjectStore;
+pub use store::{MemoryObjectStore, ObjectStore};

@@ -16,7 +16,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use thiserror::Error;
 
-use super::{random_bytes, CryptoError};
+use super::random_bytes;
 
 /// The keystore AEAD domain tag.
 pub(crate) const KEYSTORE_AAD_DOMAIN: &[u8] = b"wyrd keystore root v1";

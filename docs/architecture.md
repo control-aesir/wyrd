@@ -6,11 +6,12 @@ One page. Read this, then the focused docs:
   encoding, chunking, snapshot DAG, manifests, conflicts, decision record
 - `sync-and-peers.md` — transport, encrypted manifests, peer roles,
   materialization policy, two-phase content
-- `trust.md` — trust model: Nostr identity boundary, root custody, epoch
-  hierarchy, control plane, recovery design (decisions made)
-- `epochs.md` — membership/epoch state machine (draft; the final gate for
-  sync-layer implementation, promoted to normative together with
-  `trust.md`)
+- `trust.md` — **normative** trust model: Nostr identity boundary (BIP-340),
+  root custody, epoch key hierarchy, control plane, capability security
+  properties, recovery design
+- `epochs.md` — **normative** membership/epoch state machine: transition
+  validation, membership conflicts, snapshot → membership binding, snapshot
+  authorization, classification, recovery
 
 ## The system in one sentence
 
@@ -23,7 +24,7 @@ arbitrary subsets of that drive locally.
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror only |
-| `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack |
+| `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-fuse` | FUSE mount: live view, time travel, conflict surfacing | `wyrd-format` only |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
@@ -42,8 +43,11 @@ the format layer alone.
    in v0.
 3. **Snapshots are never rewritten.** The snapshot DAG is append-only; heads
    are the drive's state; "current" is a policy over heads. Snapshots are
-   signed with the author's Nostr identity key, bound to the DriveId and the
-   membership epoch — Nostr cryptography, never Nostr event formats.
+   signed with the author's Nostr identity key, bound to the DriveId and to
+   the membership transition that authorizes them — Nostr cryptography
+   (BIP-340), never Nostr event formats. Only live-lineage eligible heads
+   advance the live view; superseded, stranded, and voided forks are
+   retained history (`epochs.md`).
 4. **Content IDs never reach vaults.** Vaults store ciphertext by StorageId
    and opaque encrypted manifests; they cannot decrypt contents and cannot
    determine plaintext equality from object representation (fresh nonces).
@@ -84,7 +88,8 @@ Hard-won operational rules:
 ## Current status
 
 Pre-alpha: crate skeletons, typed identities + `ObjectStore` (`wyrd-format`),
-normative v0 format spec, trust model with decisions made. Next, in order:
-review `epochs.md` + `trust.md` → promote to normative (the last gate for
-sync work), implement the canonical encoding and snapshot DAG in
-`wyrd-format` (the `object-model.md` decision record is the contract).
+normative v0 format spec, normative trust + epochs contracts. Sync-layer
+implementation is unlocked: crypto and membership work must follow
+`trust.md` and `epochs.md` as normative contracts. Next, in order: implement
+the canonical encoding and snapshot DAG in `wyrd-format` (the
+`object-model.md` decision record is the contract).

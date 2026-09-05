@@ -1,11 +1,10 @@
 # Trust Model and Key Hierarchy
 
-**Status: DRAFT.** The identity, custody, transport, and rotation decisions
-below are made. The last piece before this document is normative is the
-**membership/epoch state machine**, now drafted in `epochs.md` — the precise
-answer to "what makes a snapshot an authorized descendant of another
-snapshot?" Reviewing and promoting those two docs together is the final
-gate for `wyrd-sync` implementation.
+**Status: NORMATIVE.** This document owns identity, custody, the key
+hierarchy, cryptographic constructions, capability security properties, and
+control-plane security. The **authorization state machine** — membership
+transitions, snapshot authorization, classification, recovery — is defined by
+the companion contract `epochs.md`, which this document defers to.
 
 The boundary this document owns: **drive membership → keys → manifests →
 Content IDs → Storage IDs → device authorization.**
@@ -19,7 +18,10 @@ Governing principle:
 
 Wyrd does not define a device identity system. A Wyrd device identity **is**
 a Nostr secp256k1 public key; snapshot authorship and membership
-authorization use Nostr-compatible Schnorr signatures.
+authorization use **BIP-340 Schnorr signatures** (secp256k1, 32-byte x-only
+public keys, 64-byte signatures, standard BIP-340 tagged-hash challenge over
+the Wyrd message bytes — no Nostr event serialization, no SHA-256 event IDs,
+no auxiliary-randomness requirements beyond BIP-340's own).
 
 The boundary, stated as a rule:
 
@@ -28,14 +30,20 @@ The boundary, stated as a rule:
 
 - **Nostr cryptography: yes. Nostr event format: no.** Snapshots remain Wyrd
   canonical objects (`wyrd ‖ version ‖ kind ‖ payload`, BLAKE3 domain
-  separation). We reuse the keypair and Schnorr signature conventions, not
+  separation). We reuse the keypair and BIP-340 signature scheme, not
   Nostr's event serialization or its SHA-256 event IDs.
 - **No social Nostr.** No profile metadata, follows, NIP-05, public relay
   presence, or social graph is required. A participant is a secp256k1
   keypair using Nostr conventions.
-- **Membership state is never public.** Membership, invitations, capability
-  distribution, and rotation travel only in encrypted channels. A public
-  relay must never learn "pubkey A is a member of drive X".
+- **Membership contents are never public.** Membership, invitations,
+  capability distribution, and rotation travel only in encrypted channels.
+  Two confidentiality claims are distinguished deliberately:
+  - **Payload confidentiality** (guaranteed): a public relay never learns
+    "pubkey A is a member of drive X" from message contents.
+  - **Metadata confidentiality** (best-effort, out of scope for the crypto
+    layer): relay-visible routing patterns can still suggest relationships
+    between pubkeys. Traffic analysis is not resisted here, exactly as for
+    vaults.
 - **NIP-44 is not object encryption.** NIP-44 solves pairwise A→B messages;
   Wyrd objects use drive-derived per-object AEAD (below). Nostr's encrypted
   message formats may carry the *control plane*, never object content.
@@ -93,25 +101,44 @@ universe is untouched. Hardware-backed unwrapping (Secure Enclave / TPM /
 OS keychain) is a later storage upgrade that changes nothing about the
 format.
 
+**Root possession is an owner/recovery invariant.** The DriveRootKey is
+never distributed as part of an ordinary member capability; it lives only in
+owner custody (wrapped at rest). A member holding the root could otherwise
+derive every future epoch and revocation would collapse.
+
 **Deferred:** multiple owners, Shamir/threshold recovery. Those are a
 *recovery architecture* (share lifecycle, quorum UX, backup procedures), not
 a prerequisite for the storage architecture.
 
-## Key hierarchy: epochs
+## Epoch keys: fresh secrets, not a root KDF
 
 Membership epochs are the revocation primitive. A **membership change
-creates a new epoch**; keys are derived from the *epoch secret*, not from an
-eternal root directly:
+creates a new epoch**; keys are derived from the *epoch secret*. The root is
+**custody and authority, not the top of a KDF tree** — the hierarchy is:
 
 ```
-Drive Root Key (random, passphrase-wrapped at rest)
-    │
-    ▼  (owner rotates on membership change)
-Epoch Secret (per membership epoch)
+Drive Root Key (random, passphrase-wrapped at rest; owner/recovery custody)
+    │  authorizes and protects membership transitions — never derives
+    ▼  epoch material
+Epoch Secret (fresh random 256-bit per membership epoch, minted by the owner)
     ├─ ManifestKey  = KDF(epoch secret, "manifest", ...)
     └─ ObjectKey    = KDF(epoch secret, "object", ContentId, kind, version)
     └─ (snapshot manifest keys derive from the epoch secret + snapshot id)
 ```
+
+**Epoch secrets are fresh random secrets** — not `KDF(DriveRootKey, N)` and
+not derivable from each other. The owner generates a new one at every
+transition and distributes it inside wrapped capabilities. This is what makes
+the revocation boundary exact:
+
+- **Forward secrecy against revocation:** possession of epoch N secrets does
+  not permit computing epoch N+1 secrets.
+- **Historical access is explicit:** access to past epochs comes only from
+  secrets a capability explicitly contains (capabilities carry epochs
+  `1..=N`; see `epochs.md`).
+- **Revocation bounds acquisition, not possession:** a removed device keeps
+  everything it already held — secrets, ciphertext, manifests, cached
+  plaintext — and can obtain nothing later.
 
 Rules:
 
@@ -126,6 +153,9 @@ Rules:
   epoch; no pairwise keys exist.
 - Per-snapshot manifest keys (`KDF(epoch, "manifest", snapshot_id)`) let
   revocation be as fine-grained as snapshots without a global key change.
+- **A fresh epoch secret is minted for every transition** — never reused,
+  even when two transitions produce identical membership state (a `Rotate`
+  always yields a new secret).
 
 ## Control plane: Nostr is the mailbox, iroh is the data plane (decided)
 
@@ -142,13 +172,20 @@ Rules:
 
 Wyrd defines its **own control message types** — `Invitation`,
 `MembershipChange`, `KeyRotation`, `SnapshotAnnouncement` — as Wyrd payloads
-that encrypted Nostr events merely *transport*:
+that encrypted Nostr events merely *transport*. What each layer exposes is
+stated precisely:
 
 ```
-Nostr event (transport envelope, encrypted)
-    └─ Wyrd control message (Wyrd-defined, Wyrd-canonical)
+Nostr-visible (relay metadata):
+    sender pubkey, recipient routing, event timing/counts
+
+Encrypted (opaque to relays):
+    DriveId, membership transitions, capabilities,
+    epoch secrets, invitation details
 ```
 
+The exact routing mechanism (how a recipient discovers its messages without
+leaking drive correlation) is a control-plane protocol decision, deferred.
 Replacing Nostr as the rendezvous mechanism would not change Wyrd's
 cryptographic model.
 
@@ -175,56 +212,112 @@ implicit in the key. Re-encryption under a new epoch produces a new
 ciphertext, a new Storage ID, and a manifest update — the Content ID never
 changes.
 
-## Snapshot authorization and epochs (decided; state machine in `epochs.md`)
+**Cross-epoch reuse rule:** because the same logical content can exist under
+multiple Storage IDs (one per encryption epoch), manifest mappings record
+their encryption epoch, and a content→storage mapping is **reusable by a
+device only if it holds the capability for that mapping's encryption
+epoch**; otherwise the device re-encrypts under its current epoch and
+publishes a new mapping. Fetching an un-decryptable representation is
+meaningless (and fails the two checks above anyway).
 
-The snapshot gains an epoch field:
+## Snapshot authorization (decided; state machine in `epochs.md`)
+
+The snapshot commits to the **exact membership state that authorizes it**:
 
 ```
 Snapshot {
-    parents:   Vec<SnapshotId>
-    tree:      ContentId of root tree
-    author:    Nostr public key (the DeviceId)
-    epoch:     u64 — the membership epoch the author claims
-    timestamp: u64 (ms, HLC-ordered, display/tiebreak only)
-    signature: Schnorr signature over
-               "wyrd snapshot v1" || DriveId || canonical bytes (sans signature)
+    parents:    Vec<SnapshotId>
+    tree:       ContentId of root tree
+    author:     Nostr public key (the DeviceId)
+    membership: hash of the MembershipTransition whose state authorizes it
+    epoch:      u64 — must equal the referenced transition's epoch
+    timestamp:  u64 (ms, HLC-ordered, display/tiebreak only)
+    signature:  BIP-340 signature over
+                "wyrd snapshot v1" || DriveId || canonical bytes (sans signature)
 }
 ```
 
+An epoch number says *when*; the membership reference says **which
+authorization state**. Both are covered by the snapshot signature.
+
+**Exact signing construction.** BIP-340 is byte-exact, so the message is
+too — all fields fixed-width little-endian, canonical envelope order, with
+`sans signature` meaning the signature field is omitted entirely (no
+placeholder, no length prefix — lengths are implied by the fixed layout):
+
+```
+M_snapshot   = ASCII("wyrd snapshot v1") || DriveId(32 bytes)
+               || canonical snapshot envelope bytes, signature field omitted
+M_membership = ASCII("wyrd membership v1") || DriveId(32 bytes)
+               || canonical transition envelope bytes, signature field omitted
+```
+
+Key validation follows BIP-340 exactly: x-only public keys must pass
+`lift_x` (a 32-byte length check is not sufficient), and signatures must be
+exactly 64 bytes and satisfy BIP-340's verification equations. The
+challenge hash is BIP-340's tagged construction.
+
+`timestamp` is display/tiebreak metadata only: it MUST NOT participate in
+authorization, conflict resolution, membership ordering, or key
+derivation.
+
 The core rule:
 
-> **Membership state is part of the signed snapshot DAG, and authorization
-> is evaluated against the member/epoch state known at the snapshot's
-> parents.**
+> **A snapshot commits to the membership-log state that authorizes it, and
+> historical validity is evaluated against that committed state; current
+> eligibility is evaluated against the peer's local knowledge.**
+
+Two predicates, never collapsed (full definitions and the classification
+state machine in `epochs.md`):
+
+- **Historically valid** — genuine signature, valid canonical membership
+  transition, author a member of the committed state. Intrinsic to the
+  snapshot against the log.
+- **Currently eligible** — historically valid, at the peer's known epoch,
+  with ancestry satisfied (parents eligible-lineage). Only eligible heads
+  advance canonical state.
 
 Consequences:
 
-- A snapshot is *authorized* iff its signature verifies, its author was a
-  member in the epoch it claims, and that epoch is consistent with the
-  membership state reachable from its parents.
 - **Valid signature ≠ valid current-state transition.** A snapshot signed by
-  a removed device, claiming the pre-removal epoch, remains a cryptographically
-  valid *historical fork* — but cannot advance canonical state past the
-  revocation boundary.
+  a removed device, bound to the pre-removal membership state, remains
+  historically valid forever — but is superseded once the peer's log
+  advances, and superseded forks can never advance canonical state.
 - **Bounded-fork semantics.** Propagation races are expected and bounded:
   while a peer hasn't yet learned a removal (epoch N → N+1), it may
   temporarily accept the removed device's epoch-N snapshots; once the
-  membership state advances, those branches are marked obsolete forks.
+  membership state advances, those branches become superseded forks.
   Global instantaneous revocation is impossible in an offline-capable system
   and is not a goal.
+- **Stranding is accepted:** work built on a snapshot that later becomes
+  superseded is stranded with it — legitimate or not — and is recovered only
+  by an owner-signed recovery snapshot grafting content onto eligible heads.
+  Never lineage adoption.
 
-The precise **membership/epoch state machine** — what triggers an epoch
-bump, how membership state is embedded in the DAG, epoch-chain encoding,
-reconciliation of obsolete forks — is specified in `epochs.md`.
+The precise state machine — transition validation, membership conflicts,
+snapshot classification, recovery — is normative in `epochs.md`.
 
 ## Device admission (decided)
 
 - The owner mints a **device capability** — the wrapped epoch secrets plus
   registration of the member's Nostr pubkey — and **signs the membership
-  transition** with the owner's Nostr key. The membership record reads:
+  transition** with the owner's Nostr key. Transition authority always comes
+  from the **pre-transition** owner set (so owner-set changes and removing
+  the last current owner are expressible); validation rules and the
+  deterministic `apply(prev, changes)` construction are normative in
+  `epochs.md`. The membership record reads:
   `pubkey, status = active, admitted_by = <owner pubkey>, epoch`.
 - Membership is signed, encrypted, replicated state: members agree on who is
-  a member of which epoch, and no public relay learns the membership graph.
+  a member of which epoch, and membership *contents* never reach a public
+  relay (payload vs metadata confidentiality, above).
+- **Capability construction.** The capability wrapping AEAD's associated
+  data is `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
+  transition_id || epoch` — a capability cannot be transplanted or replayed
+  across drives, epochs, or devices; tag verification fails in any other
+  context. **Installation is monotonic:** installing a capability may only
+  add secrets for epochs not yet held; it must never decrease the device's
+  known membership state or remove newer secrets — a replayed older
+  capability is a no-op, not a rollback.
 - Admission is explicit and additive; delivery rides the Nostr mailbox, so
   the new device need not be online.
 
@@ -302,21 +395,30 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T1 | Device identity = Nostr pubkey; Schnorr signatures; no Nostr event formats; immutable device identity | deletes a bespoke identity subsystem; Nostr answers "who", Wyrd answers "what can you decrypt" |
 | T2 | Root key: random 256-bit, passphrase-*wrapped* at rest; hardware later; Shamir deferred | password changes must not touch the drive's cryptographic universe; recovery architecture ≠ storage architecture |
 | T3 | Control plane: Nostr (async mailbox) + iroh (live data plane); Wyrd-defined control messages inside encrypted Nostr events | offline devices/vaults need asynchronous rendezvous; bulk never through Nostr; rendezvous must be replaceable |
-| T4 | Epoch-derived keys: membership change → new epoch secret → manifest/object KDFs; never re-encrypt history | revocation without rewriting immutable objects; fine-grained via per-snapshot manifest keys |
-| T5 | Snapshots carry `epoch`; authorization evaluated against membership state at the parents; removed-device snapshots stay valid historical forks but cannot advance state | valid-signature ≠ valid transition; bounded-fork semantics for propagation races |
+| T4 | Epoch-derived keys with **fresh random epoch secrets** (never derived from the root or each other); membership change → new epoch secret → manifest/object KDFs; never re-encrypt history | exact revocation: possession of epoch N yields nothing about N+1; root possession must not imply every epoch; revocation without rewriting immutable objects |
+| T5 | Snapshots commit to the **membership transition** that authorizes them (not merely an epoch number); historical validity vs current eligibility are separate predicates; superseded/stranded forks never advance state; recovery grafts content, never lineage | an epoch number says *when*, a membership-state commitment says *which authorization state*; deterministic authorization everywhere; valid-signature ≠ valid transition; bounded-fork semantics for propagation races |
 | T6 | NIP-46 optional, scoped, default-deny; daemon never holds the nsec | protects identity keys from the (possibly privileged) daemon process |
 | T7 | Recovery reserved: guardian set (emergency contacts) as membership-log state; Shamir k-of-n shares over the encrypted Nostr mailbox; WoT for vetting only | root-key loss is unrecoverable by crypto alone; social recovery is the deferred Shamir decision given UX; design space held open without changing the epoch model |
+| T8 | DriveRootKey is owner/recovery custody only; never part of an ordinary member capability | a member holding the root could derive every future epoch; revocation would collapse |
+| T9 | Capabilities AAD-bound to `(DriveId, DeviceId, transition_id, epoch)` and installed **monotonically** (only add secrets, never roll back); revocation bounds acquisition, not possession | capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op; the guarantee is explicit about what removal can and cannot undo |
+| T10 | Signatures are BIP-340 with exact message bytes (ASCII domain tag ‖ raw 32-byte DriveId ‖ canonical envelope, signature omitted), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures) | BIP-340 is byte-exact, so the spec must be too; removes all ambiguity around curve, encodings, and challenge hashing before implementation |
 
 ## Open questions
 
-1. **Membership/epoch state machine** — drafted in `epochs.md`; its review
-   (with this document) is the final gate for `wyrd-sync`.
+1. ~~**Membership/epoch state machine**~~ — resolved: normative in
+   `epochs.md` (membership-state binding, transition authorization against
+   the pre-transition owner set, conflict resolution by extension).
 2. Manifest partition encoding details (sharding, chunked transfer).
 3. Live-view conflict naming (e.g. by author id / snapshot timestamp).
 4. Gossip message framing for snapshot announcements.
 5. Chunk-size parameters (benchmark before the v1 freeze).
-6. Keystore format: passphrase KDF choice and parameters (e.g. Argon2id),
-   OS secure-storage integration.
+6. ~~Keystore KDF~~ — v0 choice recorded: **Argon2id**, 64 MiB memory,
+   t=3, p=1, 16-byte random salt, 32-byte output, selected for
+   portability — a compatibility choice, not a claim of optimality against
+   contemporary hardware (RFC 9106's 64 MiB recommendation uses p=4).
+   The derived key wraps the root key with a domain-separated AEAD; exact
+   AEAD instantiation and serialization land with the keystore
+   implementation. OS secure-storage integration remains open.
 7. Guardian share lifecycle details (re-split procedure, share expiry,
    guardian-offline handling) — blocked behind the post-v0 recovery
    implementation.

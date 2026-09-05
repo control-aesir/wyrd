@@ -80,7 +80,17 @@ Wyrd mounts via **FUSE** to present standard filesystem interfaces:
 
 ## Status
 
-Pre-alpha. Wyrd is in design; the v0 format spec is normative (`docs/object-model.md`), the peer protocol is not yet stable. The initial implementation scope is deliberately small: a content-addressed store, the snapshot DAG, and one vault peer. Garbage collection comes later.
+Pre-alpha. Wyrd is in design. The v0 format spec (`docs/object-model.md`) and
+the trust + epoch contracts (`docs/trust.md`, `docs/epochs.md`) are normative;
+the sync/peer protocol is not yet implemented. The initial implementation
+scope is deliberately small: a content-addressed store, the snapshot DAG, and
+one vault peer. Garbage collection comes later.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 
@@ -110,9 +120,17 @@ Design docs live in `docs/` (`architecture.md` is the one-page entry point);
 
 ## Quick Start
 
-*(Implementation instructions, build steps, and basic mounting commands go here.)*
+Wyrd is pre-alpha: there is no mountable drive yet. To hack on it:
 
 ```bash
-# Example mounting command (placeholder)
-wyrd mount /path/to/vault /mnt/wyrd
+# enter the dev environment (rust toolchain, git hooks)
+devenv shell
+
+# build and test the workspace
+cargo check
+cargo test
 ```
+
+The crates are skeletons; `crates/wyrd-format` is where implementation
+starts (the `docs/object-model.md` decision record is the contract).
+Mounting arrives with `crates/wyrd-fuse`.

@@ -24,9 +24,15 @@ fastcdc = { version = "5.0.0", default-features = false }
 # errors
 thiserror = "2"
 
-# cryptographic primitives (substrate decision T11: audited crates only;
-# wyrd-owned code never touches the arithmetic)
+# cryptographic primitives (substrate decisions T11/T12: audited crates
+# only; wyrd-owned code never touches the arithmetic)
 secp256k1 = { version = "0.30", features = ["global-context"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
+# CSPRNG (the OsRng rand itself builds on)
+getrandom = "0.2"
 
 # async runtime
 tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal"] }

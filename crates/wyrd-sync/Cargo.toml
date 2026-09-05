@@ -12,6 +12,11 @@ iroh-blobs.workspace = true
 iroh-gossip.workspace = true
 
 secp256k1.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+argon2.workspace = true
+getrandom.workspace = true
 blake3.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

@@ -216,12 +216,26 @@ Rules:
 - **A fresh epoch secret is minted for every transition** — never reused,
   even when two transitions produce identical membership state (a `Rotate`
   always yields a new secret).
+- **Epoch-secret escrow (T13):** each freshly minted epoch secret is
+  also wrapped under a root-derived key (pinned context
+  `"wyrd escrow key v1"`, AAD `DriveId ‖ epoch`) as an **escrow record**.
+  This is escrow, not derivation — no root→epoch KDF exists, and the T4
+  invariants stand. The record travels as ciphertext (StorageId-addressed,
+  vault-visible only as an opaque blob), so recovering the root —
+  guardians reconstructing it post-v0 — restores every historical epoch
+  secret and with them the drive's entire readable history. **Recovery
+  composes.**
 
 ## Control plane: Nostr is the mailbox, iroh is the data plane (decided)
 
 **Both transports, different responsibilities:**
 
-- **Nostr = asynchronous, authenticated control plane.** Invitations,
+- **Nostr = asynchronous, authenticated control plane.** Every control
+  message is **idempotent and replay-safe**: receivers dedupe by content
+  id and the state machines are set-based, so a message arriving 0, 1, or
+  5 times, in any order, yields the same state. Nostr delivers evidence;
+  the membership DAG, snapshot DAG, and capability state are the only
+  authority. Invitations,
   membership changes, rotation announcements, and snapshot announcements.
   This is what makes the offline-vault/offline-device case work: the owner
   can authorize a new phone while it sleeps; the phone discovers its
@@ -339,7 +353,9 @@ challenge_membership = BLAKE3-derive_key("wyrd membership challenge v1", M_membe
 Signatures use **canonical BIP-340 nonces** (no auxiliary randomness), so
 the same (key, message) always yields the same signature and ids stay
 stable. Verification must use the same challenge derivation and full key
-validation.
+validation. Terminology: the challenge is the **32-byte BIP-340 message**
+— the digest Wyrd hands to the signing API; BIP-340's own tagged-hash
+internals then run over it exactly as the standard specifies.
 
 `timestamp` is display/tiebreak metadata only: it MUST NOT participate in
 authorization, conflict resolution, membership ordering, or key
@@ -386,6 +402,15 @@ snapshot classification, recovery — is normative in `epochs.md`.
 
 ## Device admission (decided)
 
+- **Two keys per device (T15).** The Nostr identity key (= `DeviceId`)
+  answers "who am I": BIP-340 signatures over Wyrd objects and the NIP-46
+  signing boundary. A separate per-device **encryption key** answers "how
+  are secrets delivered to me": capability wrapping ECDH targets the
+  registered encryption key, and its secret lives in the device keystore,
+  never in the Nostr signer. The encryption pubkey rides the membership
+  transition that admits the device; rotating it is a membership change.
+  (Until the separation lands in the format, capability wrapping targets
+  the identity key; the change is tracked as its own issue.)
 - The owner mints a **device capability** — the wrapped epoch secrets plus
   registration of the member's Nostr pubkey — and **signs the membership
   transition** with the owner's Nostr key. Transition authority always comes
@@ -467,17 +492,22 @@ held open now):
 ## NIP-46 remote signing (optional, scoped, default-deny)
 
 The daemon may delegate identity operations to a remote signer (hardware,
-phone, bunker) over NIP-46, and must never receive the nsec:
+phone, bunker) over NIP-46, and must never receive the nsec. Standard
+NIP-46 `sign_event` signs **Nostr events**, not arbitrary digests — it
+cannot produce Wyrd's signatures (BIP-340 over the pinned Wyrd message
+digest). Wyrd therefore defines a small extension method:
 
 ```
-Wyrd daemon ── "sign this snapshot" ──▶ scoped signer session ──▶ signature
+Wyrd daemon ── "sign_message(digest)" ──▶ scoped signer session ──▶ BIP-340 signature
 ```
 
-Scoping rules: the Wyrd signer session exposes `get_public_key` and
-`sign_event` restricted to Wyrd event kinds only. No `nip44_decrypt`,
-no arbitrary event signing, unless a concrete feature demands it —
-**default-deny**. This is especially desirable when the daemon runs as a
-privileged system service.
+`sign_message` takes exactly one 32-byte digest (the pinned Wyrd message
+digest for a snapshot or membership transition, above) and returns the
+BIP-340 signature. Scoping rules: the Wyrd signer session exposes
+`get_public_key` and `sign_message` only. No `nip44_decrypt`, no
+`sign_event`, no arbitrary-event signing unless a concrete feature
+demands it — **default-deny**. This is especially desirable when the
+daemon runs as a privileged system service.
 
 ## What each party can know (the security boundary, stated precisely)
 
@@ -507,7 +537,9 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
 | T10 | Signatures are BIP-340 with **deterministic nonces** over a defined signing preimage (ASCII domain tag ‖ raw 32-byte DriveId ‖ self-delimiting preimage: counted vectors, fixed-width fields), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures); ids derive over preimage ‖ signature | BIP-340 is byte-exact, so the spec must be too; deterministic nonces make ids stable; a dedicated preimage avoids envelope-parse ambiguity |
 | T11 | Cryptographic substrate: reuse audited Nostr/secp256k1 ecosystem implementations (BIP-340, ECDH, HKDF, AEAD, CSPRNG); NIP-44 for control-plane transport; NIP-04 rejected; Wyrd owns serialization, authorization semantics, and the key hierarchy | never roll your own crypto; the security budget goes to the state machine and key lifecycle, not the elliptic curve |
-| T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson) |
+| T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |
+| T13 | Epoch secrets are **escrowed under the root**, per epoch, as sealed records (root-derived key, context `wyrd escrow key v1`, AAD `DriveId ‖ epoch`); escrow, never derivation | root recovery must compose with data recovery: guardians reconstruct the root, unwrap the records, restore every historical epoch secret. T4 stands — no root→epoch derivation path exists |
+| T15 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
 
 ## Open questions
 

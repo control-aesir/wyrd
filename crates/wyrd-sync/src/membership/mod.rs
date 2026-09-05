@@ -57,6 +57,9 @@ pub enum InvalidReason {
     /// A `resolves` entry is known but is not a valid transition at
     /// `epoch − 1`.
     InvalidResolvesEntry,
+    /// `resolves` carries the same transition twice; a resolution names
+    /// each voided sibling exactly once.
+    DuplicateResolves,
 }
 
 /// The classification of an observed transition (epochs.md status table

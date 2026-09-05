@@ -149,8 +149,9 @@ and never by snapshot DAG state:
   order never decides.
 - **Resolution is explicit and owner-signed.** The conflict stays frozen
   until a valid transition R at the next epoch whose `prev` names the
-  winning branch's tip and whose `resolves` names the voided sibling(s) is
-  observed. On seeing R: the winning branch (and its ancestors to genesis)
+  winning branch's tip and whose `resolves` names **exactly** the voided
+  siblings — no fewer, no more, no duplicates, no unrelated transitions —
+  is observed. On seeing R: the winning branch (and its ancestors to genesis)
   become canonical from the fork point forward; every named sibling is
   voided permanently. R must be the unique valid child of the winning tip
   claiming the next epoch — a *second, contradictory* resolution (naming

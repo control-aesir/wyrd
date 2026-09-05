@@ -40,36 +40,62 @@ def get_trigger_context() -> Tuple[Optional[str], str, Optional[str]]:
     Resolve the PR trigger.
 
     Returns (trigger_id_hex or None, head_sha, head_ref_short or None).
-    - trigger_id from NGIT_CI_TRIGGER_EVENT (preferred, exact)
+    - trigger_id from NGIT_CI_TRIGGER_EVENT (preferred, exact), plus fallbacks:
+      GITHUB_EVENT_PATH (act payload), env file, git notes
     - head_sha from GITHUB_SHA (always set by coordinator)
     - head_ref from GITHUB_REF -> short branch name
     """
-    trigger_id = os.environ.get("NGIT_CI_TRIGGER_EVENT")
-    # ngit-ci also sets NGIT_CI_TRIGGER_EVENT via job_env; act payload is deeper
-    if trigger_id:
-        trigger_id = trigger_id.strip()
-        if len(trigger_id) < 40:  # sanity: hex
-            trigger_id = None
+    trigger_id = os.environ.get("NGIT_CI_TRIGGER_EVENT", "").strip()
+    if trigger_id and len(trigger_id) < 40:
+        trigger_id = ""
+    if not trigger_id:
+        # try alternative name ngit-ci may inject (secret-style prefix scrubbing)
+        trigger_id = os.environ.get("NGIT_CI_SECRET_NGIT_CI_TRIGGER_EVENT", "").strip() or trigger_id
+    if not trigger_id:
+        # try reading from GitHub event file (act writes it) — coordinator also embeds
+        # NGIT_CI_* in job_env but act may not forward host env into the job container;
+        # workflow-level env forwarding (see ai-review.yml) should fix it, but keep fallback.
+        for path in [os.environ.get("GITHUB_EVENT_PATH", ""), "/github/workflow/event.json"]:
+            if path and Path(path).exists():
+                try:
+                    data = json.loads(Path(path).read_text())
+                    # coordinator's build_event_payload for pull_request does not embed trigger id,
+                    # but keep parsing in case future protocol does
+                    for key in ("ngit_trigger_event", "NGIT_CI_TRIGGER_EVENT", "trigger_event_id"):
+                        if data.get(key):
+                            cand = str(data[key]).strip()
+                            if len(cand) >= 40:
+                                trigger_id = cand
+                                break
+                    if trigger_id:
+                        break
+                except Exception:
+                    pass
+    if trigger_id and len(trigger_id) < 40:
+        trigger_id = None
+    if not trigger_id:
+        trigger_id = None
 
     head_sha = os.environ.get("GITHUB_SHA", "").strip()
+    if not head_sha:
+        # fallback: current HEAD
+        success, out = run_command(["git", "rev-parse", "HEAD"], check=False)
+        if success and out:
+            head_sha = out.strip()
     github_ref = os.environ.get("GITHUB_REF", "").strip()
     head_ref: Optional[str] = None
     if github_ref.startswith("refs/heads/"):
         head_ref = github_ref.removeprefix("refs/heads/")
     elif github_ref.startswith("refs/pull/"):
-        # fallback set by ngit-ci when no branch-name tag (1619 inherited)
         head_ref = None
     elif github_ref:
         head_ref = github_ref
 
-    # Also try to hydrate branch via ngit pr view when trigger_id is known
-    # (covers 1619 events with no branch-name tag; the view still knows head)
     if trigger_id and not head_ref:
         success, out = run_command(["ngit", "pr", "view", trigger_id, "--json"], check=False)
         if success and out:
             try:
                 view = json.loads(out)
-                # ngit pr view shape varies by version; try several keys
                 candidate = (
                     view.get("head_branch")
                     or view.get("source_branch")
@@ -123,64 +149,102 @@ def get_pr_diff(head_sha: str, head_ref: Optional[str]) -> Tuple[str, str]:
     """
     Get the diff for the PR as a merge-base diff (GitHub PR semantics).
 
-    Strategy:
-      1. Ensure origin/master is present (fetch shallow).
-      2. Compute merge-base between HEAD (== GITHUB_SHA checkout) and origin/master.
-      3. git diff merge-base...HEAD (two-dot via explicit merge-base equals three-dot).
+    The ngit-ci runner checks out the PR head detached at GITHUB_SHA with
+    depth=1. `git merge-base origin/master HEAD` therefore fails until we
+    deepen. We try progressively: fetch master, deepen, unshallow, then fall
+    back to HEAD~1 / show for orphan single-commit PRs.
 
     Returns (base_label, diff_text).
     """
-    # Ensure we have a remote
-    run_command(["git", "remote", "get-url", "origin"], check=False)
+    def try_diff(range_spec: str) -> Optional[str]:
+        success, out = run_command(["git", "diff", range_spec], check=False)
+        if success and out.strip():
+            return out
+        # also consider empty diff as valid (no changes) only if command succeeded and range exists
+        if success:
+            # check if range resolves
+            success2, _ = run_command(["git", "rev-parse", "--verify", range_spec.split("...")[0].split("..")[0]], check=False)
+            if success2:
+                return out
+        return None
 
-    # Try to ensure origin/master exists; tolerate already-fetched
-    # In CI checkout is at detached HEAD == head_sha, with origin pointing at clone URL.
+    # Diagnostics for CI debug
+    success, remotes = run_command(["git", "remote", "-v"], check=False)
+    if success:
+        print(f"git remotes: {remotes[:500]}", file=sys.stderr)
+
+    # Ensure origin/master is present — try several fetch strategies
+    # (origin may be nostr://, so some fetches fail; be permissive)
+    base_rev = "origin/master"
+    has_origin_master = False
     for fetch_cmd in [
-        ["git", "fetch", "origin", "master", "--depth", "256"],
-        ["git", "fetch", "origin", "refs/heads/master:refs/remotes/origin/master", "--depth", "256"],
+        ["git", "fetch", "origin", "master:refs/remotes/origin/master", "--depth", "512"],
+        ["git", "fetch", "origin", "refs/heads/master:refs/remotes/origin/master", "--depth", "512"],
+        ["git", "fetch", "origin", "--depth", "512"],
+        ["git", "fetch", "--depth", "512"],
     ]:
         success, _ = run_command(fetch_cmd, check=False)
-        if success:
+        success2, _ = run_command(["git", "rev-parse", "--verify", "origin/master"], check=False)
+        if success2:
+            has_origin_master = True
+            base_rev = "origin/master"
             break
 
-    # Determine base oid via merge-base, fallback to origin/master directly
-    base_rev = "origin/master"
-    success, out = run_command(["git", "rev-parse", "--verify", "origin/master"], check=False)
-    if not success:
-        # try master without origin prefix (local)
-        success2, _ = run_command(["git", "rev-parse", "--verify", "master"], check=False)
-        if success2:
+    if not has_origin_master:
+        success, _ = run_command(["git", "rev-parse", "--verify", "master"], check=False)
+        if success:
             base_rev = "master"
+        else:
+            # last resort: try to discover default branch from origin HEAD
+            success, out = run_command(["git", "remote", "set-head", "origin", "-a"], check=False)
+            success, out = run_command(["git", "rev-parse", "--verify", "origin/HEAD"], check=False)
+            if success:
+                base_rev = "origin/HEAD"
 
-    # Prefer merge-base for accurate PR diff; fallback to direct diff against base
-    merge_base: Optional[str] = None
-    success, out = run_command(["git", "merge-base", base_rev, "HEAD"], check=False)
-    if success and out:
-        merge_base = out.strip()
-    else:
-        # deepening fallback: fetch more history
+    # Try to deepen history so merge-base can be found (256 is ngit-ci's PR_DIFF_HISTORY_DEPTH)
+    # If repo is shallow, unshallow or deepen.
+    is_shallow = Path(".git/shallow").exists()
+    if is_shallow:
+        run_command(["git", "fetch", "--unshallow"], check=False)
         run_command(["git", "fetch", "origin", "--depth", "512"], check=False)
-        success, out = run_command(["git", "merge-base", base_rev, "HEAD"], check=False)
-        if success and out:
+
+    # Also ensure HEAD's history is deep enough
+    run_command(["git", "fetch", "origin", head_sha, "--depth", "512"], check=False)
+
+    merge_base: Optional[str] = None
+    for base in [base_rev, "origin/master", "master", "origin/HEAD"]:
+        success, out = run_command(["git", "merge-base", base, "HEAD"], check=False)
+        if success and out.strip():
             merge_base = out.strip()
+            base_rev = base
+            print(f"merge-base {base}..HEAD = {merge_base[:12]}", file=sys.stderr)
+            break
+        else:
+            print(f"no merge-base for {base}..HEAD: {out[:200] if out else 'empty'}", file=sys.stderr)
 
-    diff_range = f"{merge_base}...HEAD" if merge_base else f"{base_rev}...HEAD"
-    success, diff = run_command(["git", "diff", diff_range], check=False)
-    if success and diff:
-        return (diff_range, diff)
+    if merge_base:
+        diff = try_diff(f"{merge_base}..HEAD")
+        if diff is not None:
+            return (f"{merge_base[:12]}..HEAD", diff)
 
-    # Last fallbacks for shallow/orphan PRs
-    for fallback_range in ["origin/master...HEAD", "master...HEAD", "origin/master", "HEAD~1...HEAD"]:
-        success, diff = run_command(["git", "diff", fallback_range], check=False)
-        if success and diff:
-            return (fallback_range, diff)
+    # Fallbacks: direct three-dot, diff against base, HEAD parent
+    for rng in [f"{base_rev}...HEAD", f"{base_rev}..HEAD", "HEAD~1..HEAD", "HEAD^..HEAD"]:
+        diff = try_diff(rng)
+        if diff is not None and diff.strip():
+            return (rng, diff)
 
-    # Absolute last: show head commit alone
-    success, diff = run_command(["git", "show", "--format=", "HEAD"], check=False)
-    if success and diff:
-        return ("HEAD", diff)
+    # Single-commit PR or orphan: show the HEAD patch itself
+    for cmd in [["git", "show", "--patch", "--format=", "HEAD"], ["git", "show", "HEAD"], ["git", "log", "-p", "-1", "HEAD"]]:
+        success, out = run_command(cmd, check=False)
+        if success and out.strip():
+            return ("HEAD patch", out)
 
-    return (diff_range, "Unable to retrieve PR diff")
+    # Last: name-only fallback
+    success, out = run_command(["git", "diff", "--name-only", "HEAD~1", "HEAD"], check=False)
+    if success and out.strip():
+        return ("name-only", out)
+
+    return (base_rev, "Unable to retrieve PR diff")
 
 
 def call_openrouter_api(prompt: str, api_key: str) -> Optional[str]:

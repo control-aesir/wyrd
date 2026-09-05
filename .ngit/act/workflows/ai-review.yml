@@ -17,10 +17,33 @@ jobs:
           # Set PATH for subsequent steps
           echo "/home/runner/.local/bin" >> $GITHUB_PATH
           
+      - name: Debug env
+        run: |
+          echo "NGIT_CI_TRIGGER_EVENT=${NGIT_CI_TRIGGER_EVENT:-unset}"
+          echo "GITHUB_SHA=${GITHUB_SHA:-unset}"
+          echo "GITHUB_REF=${GITHUB_REF:-unset}"
+          echo "GITHUB_EVENT_NAME=${GITHUB_EVENT_NAME:-unset}"
+          echo "env NGIT: $(env | grep NGIT || echo none)"
+          echo "event path: ${GITHUB_EVENT_PATH:-unset}"
+          if [ -f "${GITHUB_EVENT_PATH:-}" ]; then cat "$GITHUB_EVENT_PATH"; echo; fi
+          echo "git log --oneline -3:"
+          git log --oneline -3 || true
+          echo "git remotes:"
+          git remote -v || true
+          echo "git branches:"
+          git branch -a | head -n 20 || true
+
       - name: AI Code Review
         env:
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NGIT_CI_TRIGGER_EVENT: ${{ env.NGIT_CI_TRIGGER_EVENT }}
+          NGIT_CI_REPOSITORY: ${{ env.NGIT_CI_REPOSITORY }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           echo "Trigger ${NGIT_CI_TRIGGER_EVENT:-(no trigger id)} head=${{ github.event.pull_request.head.ref }} sha=${{ github.sha }}"
+          # ensure ngit in PATH (installed to .local/bin in previous step)
+          export PATH="$HOME/.local/bin:$PATH"
+          ngit --version || true
           python .ngit/scripts/ai-review.py

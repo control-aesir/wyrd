@@ -107,8 +107,10 @@ impl MembershipLog {
     }
 
     /// Add a transition to the observed set. Re-observing an identical
-    /// document (same id — the id covers every byte) is a no-op. Returns
-    /// the transition's id.
+    /// document (same id — the id covers every byte) is a no-op. Two
+    /// different documents sharing an id would be a BLAKE3 collision; the
+    /// insert-overwrite path is unreachable short of that. Returns the
+    /// transition's id.
     pub fn observe(&mut self, t: MembershipTransition) -> TransitionId {
         let id = t.transition_id();
         self.transitions.insert(id, t);

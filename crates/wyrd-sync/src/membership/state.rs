@@ -138,8 +138,9 @@ mod tests {
     #[test]
     fn removing_an_owner_with_co_owners_is_invalid() {
         // The v0 log cannot construct this pre-state (singleton rule), but
-        // the change rule is part of the contract: an owner with
-        // co-owners leaves via SetOwners, never via Remove.
+        // the change rule is part of the contract (epochs.md conformance:
+        // "author removed by the transition"): an owner with co-owners
+        // leaves via SetOwners, never via Remove.
         let s = state(&[1, 2], &[1, 2]);
         assert_eq!(
             apply(&s, &[Change::Remove(d(1))]),

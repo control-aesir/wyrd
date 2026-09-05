@@ -50,7 +50,9 @@ MembershipTransition {
     members_root: hash of the member set AFTER applying changes
     owners_root:  hash of the owner set AFTER applying changes
     author:       Nostr pubkey
-    signature:    BIP-340 over "wyrd membership v1" || DriveId || signing preimage
+    signature:    BIP-340 over the challenge of
+                  "wyrd membership v1" || DriveId || signing preimage
+                  (challenge derivation pinned in trust.md)
 }
 ```
 
@@ -157,6 +159,12 @@ and never by snapshot DAG state:
 - Transitions with a non-empty `resolves` where no conflict exists at
   `prev` are invalid. Voided transitions are retained forever; they cannot
   be deleted or re-signed.
+- **A resolution is only recognized at the epoch immediately above the
+  conflict** (its `resolves` entries sit at the conflict epoch). A
+  contested branch that accumulates valid descendants past the conflict
+  epoch therefore makes the freeze permanent for v0: no conformant
+  resolution can ever name the siblings. Peers surface that as a
+  drive-level error for the owner.
 
 v0 has exactly one owner ⇒ a single writer ⇒ conflicts indicate device
 duplication or a bug and are treated as errors, not tolerated forks.

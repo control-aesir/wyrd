@@ -87,12 +87,112 @@ fn two_valid_geneses_conflict_at_epoch_one() {
     );
 }
 
+#[test]
+fn genesis_conflict_is_resolved_like_any_other() {
+    let (b1, g1) = Builder::genesis(1);
+    let (_b2, g2) = Builder::genesis(2);
+    let owner1 = *b1.owners.iter().next().unwrap();
+    // R: prev names the winning genesis, resolves names the loser.
+    let mut r = MembershipTransition {
+        epoch: 2,
+        prev: Some(g1.transition_id()),
+        resolves: vec![g2.transition_id()],
+        changes: vec![Change::Rotate],
+        members_root: set_root(MEMBER_SET_CONTEXT, &[owner1]),
+        owners_root: set_root(OWNER_SET_CONTEXT, &[owner1]),
+        author: owner1,
+        signature: [0; 64],
+    };
+    sign(&mut r, &b1.sk, &b1.drive);
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&g1, &g2, &r]);
+    assert_eq!(
+        log.status(&g1.transition_id()),
+        Some(TransitionStatus::Canonical)
+    );
+    assert_eq!(
+        log.status(&g2.transition_id()),
+        Some(TransitionStatus::Voided)
+    );
+    assert_eq!(
+        log.status(&r.transition_id()),
+        Some(TransitionStatus::Canonical)
+    );
+    assert_eq!(log.frozen_at(), None);
+    assert_eq!(log.known_state().unwrap().epoch, 2);
+    // The chain continues from R.
+    let after = signed(
+        &b1,
+        3,
+        Some(r.transition_id()),
+        Vec::new(),
+        vec![Change::Rotate],
+        &[owner1],
+        &[owner1],
+    );
+    let mut log2 = MembershipLog::new(drive());
+    observe_all(&mut log2, &[&g1, &g2, &r, &after]);
+    assert_eq!(
+        log2.status(&after.transition_id()),
+        Some(TransitionStatus::Canonical)
+    );
+    assert_eq!(log2.known_state().unwrap().epoch, 3);
+}
+
+#[test]
+fn contradictory_genesis_resolutions_refreeze() {
+    let (b1, g1) = Builder::genesis(1);
+    let (b2, g2) = Builder::genesis(2);
+    let owner1 = *b1.owners.iter().next().unwrap();
+    let owner2 = *b2.owners.iter().next().unwrap();
+    let mut r1 = MembershipTransition {
+        epoch: 2,
+        prev: Some(g1.transition_id()),
+        resolves: vec![g2.transition_id()],
+        changes: vec![Change::Rotate],
+        members_root: set_root(MEMBER_SET_CONTEXT, &[owner1]),
+        owners_root: set_root(OWNER_SET_CONTEXT, &[owner1]),
+        author: owner1,
+        signature: [0; 64],
+    };
+    sign(&mut r1, &b1.sk, &b1.drive);
+    let mut r2 = MembershipTransition {
+        epoch: 2,
+        prev: Some(g2.transition_id()),
+        resolves: vec![g1.transition_id()],
+        changes: vec![Change::Rotate],
+        members_root: set_root(MEMBER_SET_CONTEXT, &[owner2]),
+        owners_root: set_root(OWNER_SET_CONTEXT, &[owner2]),
+        author: owner2,
+        signature: [0; 64],
+    };
+    sign(&mut r2, &b2.sk, &b2.drive);
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&g1, &g2, &r1, &r2]);
+    assert_eq!(log.frozen_at(), Some(2), "frozen at the resolution epoch");
+    assert_eq!(
+        log.status(&r1.transition_id()),
+        Some(TransitionStatus::Contested)
+    );
+    assert_eq!(
+        log.status(&r2.transition_id()),
+        Some(TransitionStatus::Contested)
+    );
+    assert_eq!(
+        log.status(&g1.transition_id()),
+        Some(TransitionStatus::Contested)
+    );
+    assert_eq!(
+        log.status(&g2.transition_id()),
+        Some(TransitionStatus::Contested)
+    );
+}
+
 // --- structural validation ---------------------------------------------
 
 #[test]
 fn genesis_with_prev_is_invalid() {
     let (b, genesis) = Builder::genesis(1);
-    let owner = *b.owners.iter().next().unwrap();
     let mut bad = genesis.clone();
     bad.prev = Some(genesis.transition_id());
     sign(&mut bad, &b.sk, &b.drive);
@@ -102,7 +202,6 @@ fn genesis_with_prev_is_invalid() {
         log.status(&bad.transition_id()),
         Some(TransitionStatus::Invalid(InvalidReason::GenesisWithPrev))
     );
-    let _ = owner;
 }
 
 #[test]
@@ -123,7 +222,6 @@ fn epoch_gap_is_pending_until_filled() {
         Some(TransitionStatus::Canonical)
     );
     assert_eq!(log.known_state().unwrap().epoch, 3);
-    let _ = genesis;
 }
 
 #[test]
@@ -154,7 +252,6 @@ fn wrong_predecessor_epoch_is_invalid() {
 #[test]
 fn author_not_owner_is_invalid() {
     let (mut b, genesis) = Builder::genesis(1);
-    let owner = *b.owners.iter().next().unwrap();
     let (sk_outsider, outsider) = key(9);
     let mut t = b.child(vec![Change::Rotate]);
     t.author = outsider;
@@ -165,7 +262,6 @@ fn author_not_owner_is_invalid() {
         log.status(&t.transition_id()),
         Some(TransitionStatus::Invalid(InvalidReason::AuthorNotOwner))
     );
-    let _ = owner;
 }
 
 #[test]
@@ -193,24 +289,6 @@ fn author_made_owner_by_the_transition_is_invalid() {
     assert_eq!(
         log.status(&t.transition_id()),
         Some(TransitionStatus::Invalid(InvalidReason::AuthorNotOwner))
-    );
-}
-
-#[test]
-fn author_removed_by_the_transition_is_invalid() {
-    // The v0 log cannot construct a multi-owner pre-state (the singleton
-    // SetOwners rule makes it unreachable), so the fixture exercises the
-    // change rule directly: an owner with co-owners can only leave via
-    // SetOwners, never via Remove.
-    use super::state::apply;
-    use wyrd_format::DeviceId;
-    let s = MembershipState {
-        members: [DeviceId::from_bytes([1; 32]), DeviceId::from_bytes([2; 32])].into(),
-        owners: [DeviceId::from_bytes([1; 32]), DeviceId::from_bytes([2; 32])].into(),
-    };
-    assert_eq!(
-        apply(&s, &[Change::Remove(DeviceId::from_bytes([1; 32]))]),
-        Err(ApplyError::RemovingOwner)
     );
 }
 
@@ -632,15 +710,13 @@ fn contradictory_resolutions_refreeze() {
         log.status(&fork.transition_id()),
         Some(TransitionStatus::Contested)
     );
-    let _ = second;
 }
 
 #[test]
 fn resolves_without_conflict_is_invalid() {
     let (mut b, genesis) = Builder::genesis(1);
     let first = b.child(vec![Change::Rotate]);
-    let r = b.child(vec![Change::Rotate]);
-    let mut r = r;
+    let mut r = b.child(vec![Change::Rotate]);
     r.resolves = vec![first.transition_id()];
     sign(&mut r, &b.sk, &b.drive);
     let mut log = MembershipLog::new(drive());

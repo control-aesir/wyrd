@@ -6,7 +6,7 @@
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use std::collections::BTreeSet;
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId, ID_LEN};
+use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId};
 
 /// The BIP-340 challenge context for membership transitions (trust.md).
 pub(crate) const CHALLENGE_CONTEXT: &str = "wyrd membership challenge v1";
@@ -27,10 +27,10 @@ pub(crate) fn sign(t: &mut MembershipTransition, sk: &SecretKey, drive: &DriveId
 /// A deterministic key: secret key and the DeviceId it names. Test scalars
 /// are small constants; never use outside tests.
 pub(crate) fn key(byte: u8) -> (SecretKey, DeviceId) {
-    let sk = SecretKey::from_slice(&[byte; ID_LEN]).expect("valid test scalar");
+    let sk = SecretKey::from_slice(&[byte; 32]).expect("valid test scalar");
     let keypair = Keypair::from_secret_key(SECP256K1, &sk);
     let xonly = XOnlyPublicKey::from_keypair(&keypair).0;
-    let mut bytes = [0u8; ID_LEN];
+    let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&xonly.serialize());
     (sk, DeviceId::from_bytes(bytes))
 }

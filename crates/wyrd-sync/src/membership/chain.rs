@@ -77,14 +77,15 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
             walk(log, &link, &mut result, genesis);
         }
         _ => {
-            // Two or more valid geneses: conflict at epoch 1, frozen with
-            // no canonical chain at all until a resolution arrives.
-            result.frozen_at = Some(1);
-            for g in &geneses {
-                result.status.insert(*g, TransitionStatus::Contested);
-                if let Some(Link::Valid(state)) = link.get(g) {
-                    result.states.insert(*g, state.clone());
+            // Two or more valid geneses: conflict at epoch 1, resolvable
+            // like any other (epochs.md: "conflict at epoch 1 like any
+            // other"). A unique resolution heals the chain; without one
+            // the drive is frozen with no canonical chain at all.
+            match handle_conflict(log, &link, &mut result, &geneses, 1) {
+                ConflictOutcome::Resolved { resolution } => {
+                    walk(log, &link, &mut result, resolution);
                 }
+                ConflictOutcome::Unresolved | ConflictOutcome::Contradictory => {}
             }
         }
     }
@@ -228,80 +229,106 @@ fn walk(
 
         // Conflict: two or more valid children of the canonical tip.
         let conflict_epoch = log.transition(&kids[0]).expect("observed").epoch;
-        let contenders: HashSet<TransitionId> = kids.iter().copied().collect();
+        match handle_conflict(log, link, result, &kids, conflict_epoch) {
+            ConflictOutcome::Resolved { resolution } => {
+                current = resolution;
+            }
+            ConflictOutcome::Unresolved | ConflictOutcome::Contradictory => break,
+        }
+    }
+}
 
-        // A resolution is a valid child of a contender whose resolves name
-        // every other valid contender. More than one candidate means the
-        // resolutions themselves conflict.
-        let mut candidates: Vec<TransitionId> = Vec::new();
-        for contender in &kids {
-            for grand in children_of(log, contender) {
-                if !matches!(link.get(&grand), Some(Link::Valid(_))) {
-                    continue;
-                }
-                let gt = log.transition(&grand).expect("observed");
-                if gt.resolves.is_empty() {
-                    continue;
-                }
-                let named: HashSet<TransitionId> = gt.resolves.iter().copied().collect();
-                let others: HashSet<TransitionId> = contenders
-                    .iter()
-                    .filter(|c| **c != *contender)
-                    .copied()
-                    .collect();
-                if others.is_subset(&named) {
-                    candidates.push(grand);
-                }
+/// What became of a conflict among valid siblings.
+enum ConflictOutcome {
+    /// Frozen at the conflict epoch until a resolution arrives.
+    Unresolved,
+    /// A unique complete resolution selected the winner; the resolution
+    /// transition continues the chain.
+    Resolved { resolution: TransitionId },
+    /// Contradictory resolutions: a conflict at the resolution epoch;
+    /// evaluation re-freezes there.
+    Contradictory,
+}
+
+/// Detect resolutions among the children of `contenders` and record the
+/// outcome. A resolution is a valid child of a contender whose resolves
+/// name every other valid contender (epochs.md: R's prev names the
+/// winning tip, resolves names the voided siblings). More than one
+/// candidate means the resolutions themselves conflict.
+fn handle_conflict(
+    log: &MembershipLog,
+    link: &HashMap<TransitionId, Link>,
+    result: &mut Analysis,
+    contenders: &[TransitionId],
+    conflict_epoch: u64,
+) -> ConflictOutcome {
+    let contender_set: HashSet<TransitionId> = contenders.iter().copied().collect();
+    let mut candidates: Vec<TransitionId> = Vec::new();
+    for contender in contenders {
+        for grand in children_of(log, contender) {
+            if !matches!(link.get(&grand), Some(Link::Valid(_))) {
+                continue;
+            }
+            let gt = log.transition(&grand).expect("observed");
+            if gt.resolves.is_empty() {
+                continue;
+            }
+            let named: HashSet<TransitionId> = gt.resolves.iter().copied().collect();
+            let others: HashSet<TransitionId> = contender_set
+                .iter()
+                .filter(|c| **c != *contender)
+                .copied()
+                .collect();
+            if others.is_subset(&named) {
+                candidates.push(grand);
             }
         }
+    }
 
-        match candidates.len() {
-            0 => {
-                result.frozen_at = Some(conflict_epoch);
-                mark_contested(link, result, &kids);
-                break;
+    match candidates.len() {
+        0 => {
+            result.frozen_at = Some(conflict_epoch);
+            mark_contested(link, result, contenders);
+            ConflictOutcome::Unresolved
+        }
+        1 => {
+            let r = candidates[0];
+            let rt = log.transition(&r).expect("observed");
+            let winner = rt.prev.expect("resolution has a prev");
+            result.status.insert(winner, TransitionStatus::Canonical);
+            if let Some(Link::Valid(state)) = link.get(&winner) {
+                result.states.insert(winner, state.clone());
             }
-            1 => {
-                let r = candidates[0];
-                let rt = log.transition(&r).expect("observed");
-                let winner = rt.prev.expect("resolution has a prev");
-                result.status.insert(winner, TransitionStatus::Canonical);
-                if let Some(Link::Valid(state)) = link.get(&winner) {
-                    result.states.insert(winner, state.clone());
-                }
-                result.canonical.push(winner);
-                result.status.insert(r, TransitionStatus::Canonical);
-                if let Some(Link::Valid(state)) = link.get(&r) {
-                    result.states.insert(r, state.clone());
-                }
-                result.canonical.push(r);
-                // Named siblings are voided permanently; unnamed ones stay
-                // contested (a partial resolution leaves them open).
-                let named: HashSet<TransitionId> = rt.resolves.iter().copied().collect();
-                for c in &kids {
-                    if *c == winner {
-                        continue;
-                    }
-                    let status = if named.contains(c) {
-                        TransitionStatus::Voided
-                    } else {
-                        TransitionStatus::Contested
-                    };
-                    result.status.insert(*c, status);
-                    if let Some(Link::Valid(state)) = link.get(c) {
-                        result.states.insert(*c, state.clone());
-                    }
-                }
-                current = r;
+            result.canonical.push(winner);
+            result.status.insert(r, TransitionStatus::Canonical);
+            if let Some(Link::Valid(state)) = link.get(&r) {
+                result.states.insert(r, state.clone());
             }
-            _ => {
-                // Contradictory resolutions: a conflict at the resolution
-                // epoch; evaluation re-freezes there.
-                result.frozen_at = Some(conflict_epoch + 1);
-                mark_contested(link, result, &kids);
-                mark_contested(link, result, &candidates);
-                break;
+            result.canonical.push(r);
+            // Named siblings are voided permanently; unnamed ones stay
+            // contested (a partial resolution leaves them open).
+            let named: HashSet<TransitionId> = rt.resolves.iter().copied().collect();
+            for c in contenders {
+                if *c == winner {
+                    continue;
+                }
+                let status = if named.contains(c) {
+                    TransitionStatus::Voided
+                } else {
+                    TransitionStatus::Contested
+                };
+                result.status.insert(*c, status);
+                if let Some(Link::Valid(state)) = link.get(c) {
+                    result.states.insert(*c, state.clone());
+                }
             }
+            ConflictOutcome::Resolved { resolution: r }
+        }
+        _ => {
+            result.frozen_at = Some(conflict_epoch + 1);
+            mark_contested(link, result, contenders);
+            mark_contested(link, result, &candidates);
+            ConflictOutcome::Contradictory
         }
     }
 }

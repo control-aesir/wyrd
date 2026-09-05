@@ -1,0 +1,50 @@
+name: rust-ci
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".ngit/act/workflows/rust-ci.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".ngit/act/workflows/rust-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Resolve the channel pinned in rust-toolchain.toml. It is passed as an
+      # explicit `toolchain` input rather than letting the action read the
+      # file: file-driven mode installs every target in the file (the macOS
+      # and Linux cross-compile triples), and a literal "rust-toolchain.toml"
+      # value is rejected by rustup as an invalid toolchain name.
+      - name: Resolve pinned channel
+        id: pin
+        run:
+          echo "channel=$(awk -F'"' '/^channel/{print $2}'
+          rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      # Installs rustup when missing (the ngit/act ubuntu image doesn't ship
+      # it), then the pinned channel with a minimal profile + clippy.
+      # Toolchain and registry are cached between runs.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

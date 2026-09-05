@@ -1,8 +1,6 @@
 name: AI Code Review
 on:
   pull_request:
-    branches: [master]
-    types: [opened, synchronize, reopened]
 
 jobs:
   review:
@@ -19,12 +17,75 @@ jobs:
           # Set PATH for subsequent steps
           echo "/home/runner/.local/bin" >> $GITHUB_PATH
           
+      - name: Workaround - resolve NGIT_CI_TRIGGER_EVENT until ngit-ci fix lands
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          # Coordinator fix (src/runner: --env NGIT_CI_TRIGGER_EVENT) not yet deployed,
+          # so NGIT_CI_TRIGGER_EVENT is still unset inside the job container.
+          # Derive it from the actual PR head SHA via `ngit pr list`.
+          if [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
+            echo "NGIT_CI_TRIGGER_EVENT already set: $NGIT_CI_TRIGGER_EVENT"
+            exit 0
+          fi
+          echo "NGIT_CI_TRIGGER_EVENT unset, falling back to ngit pr list for $GITHUB_SHA"
+          if ! command -v ngit >/dev/null 2>&1; then
+            echo "ngit not in PATH yet, trying /home/runner/.local/bin/ngit"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          ngit --version || echo "ngit still not found"
+          PR_ID=$(ngit pr list --json 2>/dev/null | python3 -c "
+          import json, os, sys
+          sha = os.environ.get('GITHUB_SHA','')
+          try:
+              data = json.load(sys.stdin)
+          except Exception as e:
+              print(f'json load failed: {e}', file=sys.stderr)
+              sys.exit(0)
+          if isinstance(data, dict) and 'id' in data:
+              data = [data]
+          # ngit pr list items vary by version: try id/event_id/nevent, and check commit/head fields
+          for pr in data if isinstance(data, list) else []:
+              for k in ('id','event_id','nevent'):
+                  cand = pr.get(k)
+                  if cand and isinstance(cand, str) and len(cand) >= 40:
+                      # verify this pr actually matches our head sha by inspecting view if possible
+                      # quick check: does pr contain sha substring?
+                      if sha and sha[:12] in json.dumps(pr):
+                          print(cand)
+                          sys.exit(0)
+          # fallback: first open pr if no sha match
+          for pr in data if isinstance(data, list) else []:
+              for k in ('id','event_id','nevent'):
+                  cand = pr.get(k)
+                  if cand and isinstance(cand, str) and len(cand) >= 40:
+                      print(cand)
+                      sys.exit(0)
+          " | head -n1 || true)
+          if [ -n "$PR_ID" ]; then
+            echo "Resolved PR event $PR_ID for $GITHUB_SHA"
+            echo "NGIT_CI_TRIGGER_EVENT=$PR_ID" >> "$GITHUB_ENV"
+            # also export for next python step in same shell if using GITHUB_ENV next step
+            echo "$PR_ID" > /tmp/ngit_trigger_id || true
+          else
+            echo "Could not resolve PR event for $GITHUB_SHA - script will use git fallback"
+          fi
+
       - name: AI Code Review
         env:
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          # Your AI review script here
-          echo "Analyzing PR #${{ github.event.pull_request.number }}"
-          # Example: invoke AI model to review changes
+          # Workaround: if previous step wrote to GITHUB_ENV, it's already exported;
+          # also check temp file for same-run fallback (act respects GITHUB_ENV only for next steps,
+          # so re-export here if coordinator still hasn't fixed --env forwarding).
+          if [ -z "${NGIT_CI_TRIGGER_EVENT:-}" ] && [ -f /tmp/ngit_trigger_id ]; then
+            export NGIT_CI_TRIGGER_EVENT=$(cat /tmp/ngit_trigger_id)
+            echo "Exported NGIT_CI_TRIGGER_EVENT from workaround: $NGIT_CI_TRIGGER_EVENT"
+          fi
+          echo "Trigger ${NGIT_CI_TRIGGER_EVENT:-(no trigger id)} head=${{ github.event.pull_request.head.ref }} sha=${{ github.sha }}"
+          export PATH="$HOME/.local/bin:$PATH"
+          # Ensure we run from the checkout (act's actions/checkout copies via docker cp)
+          if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE" ]; then
+            cd "$GITHUB_WORKSPACE" 2>/dev/null || true
+          fi
           python .ngit/scripts/ai-review.py

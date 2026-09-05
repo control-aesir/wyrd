@@ -6,17 +6,20 @@
 //! `Rotate` always mints a new one). This is what makes the revocation
 //! boundary exact: possession of epoch N yields nothing about epoch N+1.
 //!
-//! Pinned derivations (trust.md, object-model.md decision 18 style):
+//! Pinned derivations (trust.md, decision T12): the namespace is explicit
+//! — every derived key binds the DriveId and the epoch number, so a key
+//! always answers "this belongs to epoch N of drive X", even against
+//! accidental secret reuse.
 //!
 //! ```text
 //! ManifestKey = BLAKE3-derive_key("wyrd manifest key v1",
-//!                 epoch_secret ‖ snapshot_id)
+//!                 DriveId ‖ epoch ‖ epoch_secret ‖ snapshot_id)
 //! ObjectKey   = BLAKE3-derive_key("wyrd object key v1",
-//!                 epoch_secret ‖ ContentId ‖ kind_byte ‖ version_byte)
+//!                 DriveId ‖ epoch ‖ epoch_secret ‖ ContentId ‖ kind_byte ‖ version_byte)
 //! ```
 
 use super::{random_bytes, CryptoError};
-use wyrd_format::{ContentId, ObjectKind, SnapshotId};
+use wyrd_format::{ContentId, DriveId, ObjectKind, SnapshotId};
 
 /// One epoch's uniformly random secret. Constructed only by
 /// [`EpochSecret::generate`] (minting) or [`EpochSecret::from_bytes`]
@@ -52,9 +55,11 @@ impl EpochSecret {
 
     /// The manifest key for one snapshot under this epoch (trust.md:
     /// per-snapshot manifest keys keep revocation as fine-grained as
-    /// snapshots).
-    pub fn manifest_key(&self, snapshot_id: &SnapshotId) -> [u8; 32] {
-        let mut input = Vec::with_capacity(64);
+    /// snapshots). Binds the DriveId and epoch number explicitly.
+    pub fn manifest_key(&self, drive: &DriveId, epoch: u64, snapshot_id: &SnapshotId) -> [u8; 32] {
+        let mut input = Vec::with_capacity(104);
+        input.extend_from_slice(drive.as_bytes());
+        input.extend_from_slice(&epoch.to_le_bytes());
         input.extend_from_slice(&self.0);
         input.extend_from_slice(snapshot_id.as_bytes());
         blake3::derive_key(MANIFEST_KEY_CONTEXT, &input)
@@ -62,9 +67,18 @@ impl EpochSecret {
 
     /// The object key for one object under this epoch. The AAD of the
     /// eventual ciphertext binds (version, kind, ContentId); the key
-    /// binds the same triple plus the epoch secret.
-    pub fn object_key(&self, content_id: &ContentId, kind: ObjectKind, version: u8) -> [u8; 32] {
-        let mut input = Vec::with_capacity(66);
+    /// binds the same triple plus the DriveId, epoch, and epoch secret.
+    pub fn object_key(
+        &self,
+        drive: &DriveId,
+        epoch: u64,
+        content_id: &ContentId,
+        kind: ObjectKind,
+        version: u8,
+    ) -> [u8; 32] {
+        let mut input = Vec::with_capacity(106);
+        input.extend_from_slice(drive.as_bytes());
+        input.extend_from_slice(&epoch.to_le_bytes());
         input.extend_from_slice(&self.0);
         input.extend_from_slice(content_id.as_bytes());
         input.push(kind.byte());
@@ -98,43 +112,83 @@ mod tests {
     #[test]
     fn manifest_keys_are_deterministic_and_separated() {
         let secret = EpochSecret::from_bytes([1; 32]);
+        let drive = DriveId::from_bytes([9; 32]);
         let snapshot = SnapshotId::from_bytes([2; 32]);
         assert_eq!(
-            secret.manifest_key(&snapshot),
-            secret.manifest_key(&snapshot)
+            secret.manifest_key(&drive, 1, &snapshot),
+            secret.manifest_key(&drive, 1, &snapshot)
         );
         let other_snapshot = SnapshotId::from_bytes([3; 32]);
         assert_ne!(
-            secret.manifest_key(&snapshot),
-            secret.manifest_key(&other_snapshot),
+            secret.manifest_key(&drive, 1, &snapshot),
+            secret.manifest_key(&drive, 1, &other_snapshot),
             "per-snapshot keys"
         );
         let other_secret = EpochSecret::from_bytes([4; 32]);
         assert_ne!(
-            secret.manifest_key(&snapshot),
-            other_secret.manifest_key(&snapshot),
+            secret.manifest_key(&drive, 1, &snapshot),
+            other_secret.manifest_key(&drive, 1, &snapshot),
             "per-epoch keys"
+        );
+    }
+
+    #[test]
+    fn derived_keys_are_drive_and_epoch_scoped() {
+        let secret = EpochSecret::from_bytes([1; 32]);
+        let drive_a = DriveId::from_bytes([9; 32]);
+        let drive_b = DriveId::from_bytes([8; 32]);
+        let content = ContentId::from_bytes([2; 32]);
+        let snapshot = SnapshotId::from_bytes([2; 32]);
+        // The same epoch secret must not produce the same key on another
+        // drive or at another epoch: the namespace is explicit, not a
+        // promise about randomness.
+        assert_ne!(
+            secret.object_key(&drive_a, 1, &content, ObjectKind::Chunk, 0),
+            secret.object_key(&drive_b, 1, &content, ObjectKind::Chunk, 0),
+            "drive-bound object keys"
+        );
+        assert_ne!(
+            secret.object_key(&drive_a, 1, &content, ObjectKind::Chunk, 0),
+            secret.object_key(&drive_a, 2, &content, ObjectKind::Chunk, 0),
+            "epoch-bound object keys"
+        );
+        assert_ne!(
+            secret.manifest_key(&drive_a, 1, &snapshot),
+            secret.manifest_key(&drive_b, 1, &snapshot),
+            "drive-bound manifest keys"
+        );
+        assert_ne!(
+            secret.manifest_key(&drive_a, 1, &snapshot),
+            secret.manifest_key(&drive_a, 2, &snapshot),
+            "epoch-bound manifest keys"
         );
     }
 
     #[test]
     fn object_keys_bind_content_kind_and_version() {
         let secret = EpochSecret::from_bytes([1; 32]);
+        let drive = DriveId::from_bytes([9; 32]);
         let content = ContentId::from_bytes([2; 32]);
-        let key = secret.object_key(&content, ObjectKind::Chunk, 0);
-        assert_eq!(key, secret.object_key(&content, ObjectKind::Chunk, 0));
+        let key = secret.object_key(&drive, 1, &content, ObjectKind::Chunk, 0);
+        assert_eq!(
+            key,
+            secret.object_key(&drive, 1, &content, ObjectKind::Chunk, 0)
+        );
         assert_ne!(
             key,
-            secret.object_key(&content, ObjectKind::Tree, 0),
+            secret.object_key(&drive, 1, &content, ObjectKind::Tree, 0),
             "kind"
         );
         assert_ne!(
             key,
-            secret.object_key(&content, ObjectKind::Chunk, 1),
+            secret.object_key(&drive, 1, &content, ObjectKind::Chunk, 1),
             "version"
         );
         let other_content = ContentId::from_bytes([5; 32]);
-        assert_ne!(key, secret.object_key(&other_content, ObjectKind::Chunk, 0));
+        assert_ne!(
+            key,
+            secret.object_key(&drive, 1, &other_content, ObjectKind::Chunk, 0)
+        );
     }
 
     #[test]
@@ -142,11 +196,12 @@ mod tests {
         // The same inputs hashed under both contexts differ: manifest and
         // object keys can never collide.
         let secret = EpochSecret::from_bytes([1; 32]);
+        let drive = DriveId::from_bytes([9; 32]);
         let snapshot = SnapshotId::from_bytes([2; 32]);
         let content = ContentId::from_bytes([2; 32]);
         assert_ne!(
-            secret.manifest_key(&snapshot),
-            secret.object_key(&content, ObjectKind::Chunk, 0)
+            secret.manifest_key(&drive, 1, &snapshot),
+            secret.object_key(&drive, 1, &content, ObjectKind::Chunk, 0)
         );
     }
 }

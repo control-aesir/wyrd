@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
 AI Review Script for Wyrd Project (ngit/Nostr version)
-Uses OpenRouter's free models to review PR changes via ngit commands
+Uses OpenRouter's free models to review PR changes via ngit commands.
+
+Runs inside ngit-ci on a pull_request trigger. The coordinator sets
+(see ngit-ci/src/runner/mod.rs: job_env + build_event_payload):
+  - NGIT_CI_TRIGGER_EVENT  hex event id of the 1618/1619 that triggered the run
+  - GITHUB_SHA             trigger commit
+  - GITHUB_REF             refs/heads/<branch> (PR head) or refs/pull/ngit
+  - NGIT_CI_REPOSITORY     30617 coordinate
+and an act payload with pull_request.head.sha/ref but no number/base.
+
+We resolve the exact PR via NGIT_CI_TRIGGER_EVENT instead of
+`ngit pr list --status open` (which would pick the wrong concurrent PR)
+and diff via merge-base against the target default branch.
 """
 
 import json
@@ -10,118 +22,247 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
 def run_command(cmd: List[str], check: bool = True) -> Tuple[bool, str]:
-    """Run a command and return (success, output)"""
+    """Run a command and return (success, output)."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=check)
         return (True, result.stdout.strip())
     except subprocess.CalledProcessError as e:
-        return (False, e.stderr.strip() if e.stderr else str(e))
+        return (False, (e.stderr.strip() if e.stderr else str(e)))
 
 
-def get_pr_number_from_env() -> Optional[int]:
-    """Get PR number from GitHub Actions environment if available"""
-    pr_num = os.environ.get("GITHUB_EVENT_PULL_REQUEST_NUMBER")
-    if pr_num and pr_num.isdigit():
-        return int(pr_num)
-    return None
-
-
-def find_open_pr() -> Optional[Tuple[int, str, str]]:
-    """Find the most recent open PR using ngit.
-
-    Returns (pr_number, base_branch, head_branch) or None.
+def get_trigger_context() -> Tuple[Optional[str], str, Optional[str]]:
     """
-    success, output = run_command(["ngit", "pr", "list", "--json", "--status", "open"], check=False)
+    Resolve the PR trigger.
+
+    Returns (trigger_id_hex or None, head_sha, head_ref_short or None).
+    - trigger_id from NGIT_CI_TRIGGER_EVENT (preferred, exact), plus fallbacks:
+      GITHUB_EVENT_PATH (act payload), env file, git notes
+    - head_sha from GITHUB_SHA (always set by coordinator)
+    - head_ref from GITHUB_REF -> short branch name
+    """
+    trigger_id = os.environ.get("NGIT_CI_TRIGGER_EVENT", "").strip()
+    if trigger_id and len(trigger_id) < 40:
+        trigger_id = ""
+    if not trigger_id:
+        # try alternative name ngit-ci may inject (secret-style prefix scrubbing)
+        trigger_id = os.environ.get("NGIT_CI_SECRET_NGIT_CI_TRIGGER_EVENT", "").strip() or trigger_id
+    if not trigger_id:
+        # try reading from GitHub event file (act writes it) — coordinator also embeds
+        # NGIT_CI_* in job_env but act may not forward host env into the job container;
+        # workflow-level env forwarding (see ai-review.yml) should fix it, but keep fallback.
+        for path in [os.environ.get("GITHUB_EVENT_PATH", ""), "/github/workflow/event.json"]:
+            if path and Path(path).exists():
+                try:
+                    data = json.loads(Path(path).read_text())
+                    # coordinator's build_event_payload for pull_request does not embed trigger id,
+                    # but keep parsing in case future protocol does
+                    for key in ("ngit_trigger_event", "NGIT_CI_TRIGGER_EVENT", "trigger_event_id"):
+                        if data.get(key):
+                            cand = str(data[key]).strip()
+                            if len(cand) >= 40:
+                                trigger_id = cand
+                                break
+                    if trigger_id:
+                        break
+                except Exception:
+                    pass
+    if trigger_id and len(trigger_id) < 40:
+        trigger_id = None
+    if not trigger_id:
+        trigger_id = None
+
+    head_sha = os.environ.get("GITHUB_SHA", "").strip()
+    if not head_sha:
+        # fallback: current HEAD
+        success, out = run_command(["git", "rev-parse", "HEAD"], check=False)
+        if success and out:
+            head_sha = out.strip()
+    github_ref = os.environ.get("GITHUB_REF", "").strip()
+    head_ref: Optional[str] = None
+    if github_ref.startswith("refs/heads/"):
+        head_ref = github_ref.removeprefix("refs/heads/")
+    elif github_ref.startswith("refs/pull/"):
+        head_ref = None
+    elif github_ref:
+        head_ref = github_ref
+
+    if trigger_id and not head_ref:
+        success, out = run_command(["ngit", "pr", "view", trigger_id, "--json"], check=False)
+        if success and out:
+            try:
+                view = json.loads(out)
+                candidate = (
+                    view.get("head_branch")
+                    or view.get("source_branch")
+                    or view.get("branch")
+                    or (view.get("head") or {}).get("ref")
+                )
+                if candidate:
+                    head_ref = str(candidate).removeprefix("refs/heads/")
+            except json.JSONDecodeError:
+                pass
+
+    return (trigger_id, head_sha, head_ref)
+
+
+def find_fallback_pr_via_list(head_sha: str) -> Optional[str]:
+    """
+    Last-resort: find a PR whose head matches GITHUB_SHA.
+    Only used when NGIT_CI_TRIGGER_EVENT is absent (local manual runs).
+    """
+    success, output = run_command(["ngit", "pr", "list", "--json"], check=False)
     if not success or not output:
         return None
-
     try:
         prs = json.loads(output)
     except json.JSONDecodeError:
         return None
+    if not isinstance(prs, list):
+        prs = [prs]
+    for pr in prs:
+        # ngit pr list entries may expose commit or head sha under various keys
+        for key in ("commit", "head", "head_sha", "sha", "tip"):
+            val = pr.get(key)
+            if isinstance(val, str) and val.startswith(head_sha[:12]):
+                # prefer event id
+                return pr.get("id") or pr.get("event_id") or pr.get("nevent") or str(pr.get("number") or "")
+        # also check nested view if needed
+        pr_id = pr.get("id") or pr.get("event_id")
+        if pr_id and head_sha:
+            success, view_out = run_command(["ngit", "pr", "view", str(pr_id), "--json"], check=False)
+            if success:
+                try:
+                    v = json.loads(view_out)
+                    if head_sha[:12] in json.dumps(v):
+                        return str(pr_id)
+                except json.JSONDecodeError:
+                    pass
+    return None
 
-    if not isinstance(prs, list) or not prs:
+
+def get_pr_diff(head_sha: str, head_ref: Optional[str]) -> Tuple[str, str]:
+    """
+    Get the diff for the PR as a merge-base diff (GitHub PR semantics).
+
+    The ngit-ci runner checks out the PR head detached at GITHUB_SHA with
+    depth=1. `git merge-base origin/master HEAD` therefore fails until we
+    deepen. We try progressively: fetch master, deepen, unshallow, then fall
+    back to HEAD~1 / show for orphan single-commit PRs.
+
+    Returns (base_label, diff_text).
+    """
+    def try_diff(range_spec: str) -> Optional[str]:
+        success, out = run_command(["git", "diff", range_spec], check=False)
+        if success and out.strip():
+            return out
+        # also consider empty diff as valid (no changes) only if command succeeded and range exists
+        if success:
+            # check if range resolves
+            success2, _ = run_command(["git", "rev-parse", "--verify", range_spec.split("...")[0].split("..")[0]], check=False)
+            if success2:
+                return out
         return None
 
-    # Take the first (most recent) open PR
-    pr = prs[0]
-    pr_number = pr.get("number") or pr.get("id")
+    # Diagnostics for CI debug
+    success, remotes = run_command(["git", "remote", "-v"], check=False)
+    if success:
+        print(f"git remotes: {remotes[:500]}", file=sys.stderr)
 
-    if pr_number is None:
-        return None
+    # Ensure origin/master is present — try several fetch strategies
+    # (origin may be nostr://, so some fetches fail; be permissive)
+    base_rev = "origin/master"
+    has_origin_master = False
+    for fetch_cmd in [
+        ["git", "fetch", "origin", "master:refs/remotes/origin/master", "--depth", "512"],
+        ["git", "fetch", "origin", "refs/heads/master:refs/remotes/origin/master", "--depth", "512"],
+        ["git", "fetch", "origin", "--depth", "512"],
+        ["git", "fetch", "--depth", "512"],
+    ]:
+        success, _ = run_command(fetch_cmd, check=False)
+        success2, _ = run_command(["git", "rev-parse", "--verify", "origin/master"], check=False)
+        if success2:
+            has_origin_master = True
+            base_rev = "origin/master"
+            break
 
-    # Try to get base and head branches from the PR view
-    success, view_output = run_command(["ngit", "pr", "view", str(pr_number), "--json"], check=False)
-    if not success:
-        return None
+    if not has_origin_master:
+        success, _ = run_command(["git", "rev-parse", "--verify", "master"], check=False)
+        if success:
+            base_rev = "master"
+        else:
+            # last resort: try to discover default branch from origin HEAD
+            success, out = run_command(["git", "remote", "set-head", "origin", "-a"], check=False)
+            success, out = run_command(["git", "rev-parse", "--verify", "origin/HEAD"], check=False)
+            if success:
+                base_rev = "origin/HEAD"
 
-    try:
-        view = json.loads(view_output)
-    except json.JSONDecodeError:
-        return None
+    # Try to deepen history so merge-base can be found (256 is ngit-ci's PR_DIFF_HISTORY_DEPTH)
+    # If repo is shallow, unshallow or deepen.
+    is_shallow = Path(".git/shallow").exists()
+    if is_shallow:
+        run_command(["git", "fetch", "--unshallow"], check=False)
+        run_command(["git", "fetch", "origin", "--depth", "512"], check=False)
 
-    # Extract base and head branch from PR metadata
-    # ngit PRs with pr/ prefix have specific branch tracking
-    base_branch = view.get("base_branch") or view.get("target") or "master"
-    head_branch = view.get("head_branch") or view.get("source_branch") or ""
+    # Also ensure HEAD's history is deep enough
+    run_command(["git", "fetch", "origin", head_sha, "--depth", "512"], check=False)
 
-    # If we can't extract branches from ngit view, derive from PR number
-    # ngit pr/ branches: the branch name itself contains the info
-    if not head_branch:
-        # Try to get from the PR's events/comments or use git
-        head_branch = f"pr/{pr_number}"
+    merge_base: Optional[str] = None
+    for base in [base_rev, "origin/master", "master", "origin/HEAD"]:
+        success, out = run_command(["git", "merge-base", base, "HEAD"], check=False)
+        if success and out.strip():
+            merge_base = out.strip()
+            base_rev = base
+            print(f"merge-base {base}..HEAD = {merge_base[:12]}", file=sys.stderr)
+            break
+        else:
+            print(f"no merge-base for {base}..HEAD: {out[:200] if out else 'empty'}", file=sys.stderr)
 
-    return (pr_number, str(base_branch), head_branch)
+    if merge_base:
+        diff = try_diff(f"{merge_base}..HEAD")
+        if diff is not None:
+            return (f"{merge_base[:12]}..HEAD", diff)
 
+    # Fallbacks: direct three-dot, diff against base, HEAD parent
+    for rng in [f"{base_rev}...HEAD", f"{base_rev}..HEAD", "HEAD~1..HEAD", "HEAD^..HEAD"]:
+        diff = try_diff(rng)
+        if diff is not None and diff.strip():
+            return (rng, diff)
 
-def get_pr_diff(pr_number: int, base_branch: str, head_branch: str) -> str:
-    """Get the diff for a PR using ngit/git"""
-    # Try ngit first - try to get diff between base and head
-    success, output = run_command(
-        ["git", "diff", f"{base_branch}...{head_branch}"], check=False
-    )
-    if success and output:
-        return output
+    # Single-commit PR or orphan: show the HEAD patch itself
+    for cmd in [["git", "show", "--patch", "--format=", "HEAD"], ["git", "show", "HEAD"], ["git", "log", "-p", "-1", "HEAD"]]:
+        success, out = run_command(cmd, check=False)
+        if success and out.strip():
+            return ("HEAD patch", out)
 
-    # Fallback: git diff against master
-    success, output = run_command(["git", "diff", "origin/master"], check=False)
-    if success and output:
-        return output
+    # Last: name-only fallback
+    success, out = run_command(["git", "diff", "--name-only", "HEAD~1", "HEAD"], check=False)
+    if success and out.strip():
+        return ("name-only", out)
 
-    # Try git diff with pr/ prefix
-    success, output = run_command(
-        ["git", "diff", f"master...pr/{pr_number}"], check=False
-    )
-    if success and output:
-        return output
-
-    return "Unable to retrieve PR diff"
+    return (base_rev, "Unable to retrieve PR diff")
 
 
 def call_openrouter_api(prompt: str, api_key: str) -> Optional[str]:
-    """Call OpenRouter API with a free model"""
+    """Call OpenRouter API with a free model."""
     url = "https://openrouter.ai/api/v1/chat/completions"
-
-    # Using a free model from OpenRouter - gemini-flash-1.5 is commonly available as free
-    model = "google/gemini-flash-1.5"
-
+    model = "openrouter/free"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://gitworkshop.dev/npub1k0y4eceal2zryes3azm6nsgt0r0jsa2v8zcsdf9uqxttn0jlfe9q04c9h8/grasp.t5.st/wyrd",
-        "X-Title": "Wyrd AI Review"
+        "X-Title": "Wyrd AI Review",
     }
-
     data = {
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": """You are an expert code reviewer for the Wyrd project, a decentralized, append-only, content-addressed drive system. 
+                "content": """You are an expert code reviewer for the Wyrd project, a decentralized, append-only, content-addressed drive system.
 Review the provided code changes with focus on:
 1. Correctness and adherence to project invariants
 2. Security considerations (cryptographic safety, data validation)
@@ -130,26 +271,24 @@ Review the provided code changes with focus on:
 5. Alignment with the project's architectural principles
 
 Provide specific, actionable feedback. If changes are good, say so. If there are issues, explain them clearly.
-Focus on the most important issues first. Be concise but thorough."""
+Focus on the most important issues first. Be concise but thorough.""",
             },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 2000
+        "max_tokens": 2000,
     }
-
-    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-
+    req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return result['choices'][0]['message']['content']
+            result = json.loads(response.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode('utf-8') if e.read() else "No error details"
-        print(f"OpenRouter API error {e.code}: {error_body}", file=sys.stderr)
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            body = "No error details"
+        print(f"OpenRouter API error {e.code}: {body}", file=sys.stderr)
         return None
     except Exception as e:
         print(f"Error calling OpenRouter API: {str(e)}", file=sys.stderr)
@@ -157,73 +296,77 @@ Focus on the most important issues first. Be concise but thorough."""
 
 
 def post_pr_comment(pr_id: str, comment: str) -> bool:
-    """Post a comment on the PR using ngit"""
-    success, output = run_command(
-        ["ngit", "pr", "comment", pr_id, "--body", comment], check=False
-    )
+    """Post a comment on the PR using ngit (id = event id hex or nevent)."""
+    # ngit pr comment <ID> --body <BODY>  (see `ngit pr comment --help`)
+    success, output = run_command(["ngit", "pr", "comment", pr_id, "--body", comment], check=False)
+    if not success:
+        print(f"ngit pr comment failed: {output}", file=sys.stderr)
     return success
 
 
 def main():
-    """Main function"""
+    # In act the checkout is in GITHUB_WORKSPACE; steps may run outside it
+    ws = os.environ.get("GITHUB_WORKSPACE")
+    if ws and Path(ws).exists():
+        try:
+            os.chdir(ws)
+            print(f"Working directory: {ws}", file=sys.stderr)
+        except Exception as e:
+            print(f"chdir to GITHUB_WORKSPACE failed: {e}", file=sys.stderr)
     print("Starting AI code review (ngit version)...")
+    print(f"pwd={Path.cwd()} GITHUB_WORKSPACE={ws}", file=sys.stderr)
 
-    # Get OpenRouter API key from environment
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         print("Error: OPENROUTER_API_KEY environment variable not set", file=sys.stderr)
         sys.exit(1)
 
-    # Try to get PR number from GitHub Actions env first
-    pr_number = get_pr_number_from_env()
+    trigger_id, head_sha, head_ref = get_trigger_context()
 
-    # If not in GitHub env, find the open PR using ngit
-    if pr_number is None:
-        result = find_open_pr()
-        if result is None:
-            print("Error: Could not determine PR number. Set OPENROUTER_API_KEY and either:")
-            print("  1. Set GITHUB_EVENT_PULL_REQUEST_NUMBER env var, or")
-            print("  2. Run with ngit open PRs available")
-            sys.exit(1)
-        pr_number, base_branch, head_branch = result
-        print(f"Found open PR #{pr_number} (base={base_branch}, head={head_branch})")
+    # Fallback for local runs without coordinator env
+    if not trigger_id and head_sha:
+        trigger_id = find_fallback_pr_via_list(head_sha)
+
+    if not head_sha:
+        print("Error: GITHUB_SHA not set — are you running inside ngit-ci?", file=sys.stderr)
+        print("Hint: locally set GITHUB_SHA=$(git rev-parse HEAD) and NGIT_CI_TRIGGER_EVENT=<pr-event-id>", file=sys.stderr)
+        sys.exit(1)
+
+    if trigger_id:
+        print(f"Trigger PR event: {trigger_id}  head={head_ref or '(no branch)'}  sha={head_sha[:12]}")
     else:
-        # Get branch info using ngit
-        success, view_output = run_command(["ngit", "pr", "view", str(pr_number), "--json"], check=False)
-        if success:
-            try:
-                view = json.loads(view_output)
-                base_branch = view.get("base_branch", "master")
-                head_branch = view.get("head_branch", f"pr/{pr_number}")
-            except json.JSONDecodeError:
-                base_branch = "master"
-                head_branch = f"pr/{pr_number}"
-        else:
-            base_branch = "master"
-            head_branch = f"pr/{pr_number}"
+        print(f"No NGIT_CI_TRIGGER_EVENT — running in fallback mode  head={head_ref or '(no branch)'}  sha={head_sha[:12]}")
 
-    # Get PR diff
-    diff = get_pr_diff(pr_number, base_branch, head_branch)
+    # Get PR diff via merge-base semantics
+    diff_range, diff = get_pr_diff(head_sha, head_ref)
     if not diff or diff == "Unable to retrieve PR diff":
-        print("Warning: Could not retrieve PR diff. Review may be limited.", file=sys.stderr)
+        print(f"Warning: Could not retrieve PR diff for range {diff_range}. Review may be limited.", file=sys.stderr)
         diff = "[Diff unavailable]"
     else:
-        print(f"Retrieved PR diff ({len(diff)} chars)")
+        print(f"Retrieved PR diff via {diff_range} ({len(diff)} chars)")
 
-    # Load project context
-    try:
-        with open("/home/thomas/workspace/control/wyrd/docs/architecture.md", "r") as f:
-            architecture_content = f.read()
-        context = architecture_content[:500] + "..." if len(architecture_content) > 500 else architecture_content
-    except Exception:
-        context = "Wyrd: Decentralized, append-only, content-addressed drive system"
+    # Load project context relative to checkout (not hardcoded /home/thomas/...)
+    # Workflow cwd is the repo checkout after `actions/checkout`.
+    context = "Wyrd: Decentralized, append-only, content-addressed drive system"
+    for candidate in [
+        Path("docs/architecture.md"),
+        Path(".ngit/docs/architecture.md"),
+        Path("/home/thomas/workspace/control/wyrd/docs/architecture.md"),
+    ]:
+        try:
+            if candidate.exists():
+                text = candidate.read_text()
+                context = (text[:800] + "...") if len(text) > 800 else text
+                break
+        except Exception:
+            pass
 
-    # Construct prompt for AI
+    label = f"{trigger_id[:12] if trigger_id else head_sha[:12]}"
     prompt = f"""
 PROJECT CONTEXT:
 {context}
 
-PR #{pr_number} CHANGES (base: {base_branch}, head: {head_branch}):
+PR {label} CHANGES (base: origin/master, range: {diff_range}, head: {head_ref or head_sha}):
 {diff}
 
 Please review these changes for the Wyrd project. Focus on:
@@ -236,35 +379,36 @@ Please review these changes for the Wyrd project. Focus on:
 Provide specific, actionable feedback in GitHub-flavored markdown format.
 """
 
-    # Call OpenRouter API
     print("Calling OpenRouter API for review...")
     review = call_openrouter_api(prompt, api_key)
-
     if not review:
         print("Error: Failed to get review from OpenRouter", file=sys.stderr)
         sys.exit(1)
 
-    # Output review
     print("\n=== AI REVIEW ===")
     print(review)
     print("=== END REVIEW ===\n")
 
-    # Post comment using ngit if we have a PR ID
-    ngit_pr_id = str(pr_number)
-
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        print("Posting review as PR comment via ngit...")
+    # Post comment if we have a PR identity and an NSEC (coordinator injects NGIT_NSEC via secrets)
+    # Don't gate on GITHUB_ACTIONS — ngit-ci/act may not set it; gate on presence of nsec instead.
+    nsec_available = bool(os.environ.get("NGIT_NSEC") or os.environ.get("NSEC") or os.environ.get("NGIT_CI_SECRET_NGIT_NSEC"))
+    if trigger_id and nsec_available:
+        print(f"Posting review as PR comment via ngit pr comment {trigger_id[:12]}...")
         comment = f"""## AI Code Review
 
 {review}
 
 ---
 *This review was generated by AI using OpenRouter's free models. Please review carefully and use your judgment.*"""
-
-        if post_pr_comment(ngit_pr_id, comment):
+        if post_pr_comment(trigger_id, comment):
             print("Successfully posted review as PR comment via ngit")
         else:
-            print("Warning: Failed to post PR comment via ngit", file=sys.stderr)
+            print("Warning: Failed to post PR comment via ngit (check NGIT_NSEC and relay connectivity)", file=sys.stderr)
+    elif trigger_id:
+        print("Skipping PR comment: NGIT_NSEC/NSEC not set (secret only available on maintainer-authored PRs)", file=sys.stderr)
+        print("To enable comments, provision NGIT_NSEC as a per-repo secret for this coordinate.", file=sys.stderr)
+    else:
+        print("Skipping PR comment: no trigger PR id resolved", file=sys.stderr)
 
     print("AI review completed")
 

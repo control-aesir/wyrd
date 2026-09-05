@@ -48,15 +48,52 @@ pub(crate) const CAPABILITY_AAD_DOMAIN: &[u8] = b"wyrd capability v1";
 /// never part of an ordinary capability (trust.md T8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
-    pub drive: DriveId,
-    pub recipient: DeviceId,
+    pub(crate) drive: DriveId,
+    pub(crate) recipient: DeviceId,
     /// The membership transition the capability is bound to (its tip).
-    pub transition: TransitionId,
+    pub(crate) transition: TransitionId,
     /// Epoch secrets `1..=N`; index `i` is the secret for epoch `i + 1`.
-    pub secrets: Vec<EpochSecret>,
+    pub(crate) secrets: Vec<EpochSecret>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CapabilityError {
+    #[error("capability declares epoch {declared} but carries {carried} secrets")]
+    EpochMismatch { declared: u64, carried: u64 },
+    #[error("a capability must cover at least epoch 1")]
+    Empty,
 }
 
 impl Capability {
+    /// Construct a capability bound to the transition whose epoch is
+    /// `epoch`. The minter holds the membership log, so the binding is
+    /// validated here: the secret count must equal the transition's
+    /// epoch (the capability covers exactly `1..=epoch`).
+    pub fn new(
+        drive: DriveId,
+        recipient: DeviceId,
+        transition: TransitionId,
+        epoch: u64,
+        secrets: Vec<EpochSecret>,
+    ) -> Result<Self, CapabilityError> {
+        if secrets.is_empty() {
+            return Err(CapabilityError::Empty);
+        }
+        let carried = secrets.len() as u64;
+        if carried != epoch {
+            return Err(CapabilityError::EpochMismatch {
+                declared: epoch,
+                carried,
+            });
+        }
+        Ok(Capability {
+            drive,
+            recipient,
+            transition,
+            secrets,
+        })
+    }
+
     /// N is the number of secrets; the AAD epoch field is `N`.
     pub fn up_to_epoch(&self) -> u64 {
         self.secrets.len() as u64
@@ -201,16 +238,24 @@ impl WrappedCapability {
     }
 }
 
-/// The device's held epoch secrets. Add-only by design: installing a
-/// capability may add secrets for epochs not yet held, never overwrite or
-/// remove.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HeldCapabilities {
+/// One device's keyring for one drive. Scoped by construction: a
+/// capability for another drive or another device is rejected at
+/// install, so the same holder can never mix secrets across drives.
+/// Add-only by design: installing a capability may add secrets for
+/// epochs not yet held, never overwrite or remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveKeyring {
+    drive: DriveId,
+    device: DeviceId,
     secrets: BTreeMap<u64, EpochSecret>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum InstallError {
+    #[error("capability is for drive {0}, keyring holds {1}")]
+    WrongDrive(String, String),
+    #[error("capability is for device {0}, keyring holds {1}")]
+    WrongDevice(String, String),
     #[error("two capabilities disagree about the secret for epoch {0}")]
     EpochConflict(u64),
     #[error("crypto operation failed")]
@@ -226,17 +271,42 @@ pub enum InstallReport {
     Added { from: u64, to: u64 },
 }
 
-impl HeldCapabilities {
-    pub fn new() -> Self {
-        Self::default()
+impl DriveKeyring {
+    pub fn new(drive: DriveId, device: DeviceId) -> Self {
+        DriveKeyring {
+            drive,
+            device,
+            secrets: BTreeMap::new(),
+        }
+    }
+
+    pub fn drive(&self) -> &DriveId {
+        &self.drive
+    }
+
+    pub fn device(&self) -> &DeviceId {
+        &self.device
     }
 
     /// Monotonic install (trust.md): add-only, replay of an older
     /// capability is a no-op, and a disagreement about an already-held
     /// epoch's secret is an error (forgery or corruption). Conflicts are
     /// detected before any mutation, so a failed install leaves the held
-    /// set untouched.
+    /// set untouched. Capabilities for another drive or device are
+    /// rejected before anything else.
     pub fn install(&mut self, capability: &Capability) -> Result<InstallReport, InstallError> {
+        if capability.drive != self.drive {
+            return Err(InstallError::WrongDrive(
+                capability.drive.to_string(),
+                self.drive.to_string(),
+            ));
+        }
+        if capability.recipient != self.device {
+            return Err(InstallError::WrongDevice(
+                capability.recipient.to_string(),
+                self.device.to_string(),
+            ));
+        }
         for (i, secret) in capability.secrets.iter().enumerate() {
             let epoch = i as u64 + 1;
             if let Some(held) = self.secrets.get(&epoch) {
@@ -335,14 +405,20 @@ mod tests {
     use crate::membership::test_util::key;
 
     fn capability(recipient: DeviceId, n: u64) -> Capability {
-        Capability {
-            drive: DriveId::from_bytes([0xEE; 32]),
+        Capability::new(
+            DriveId::from_bytes([0xEE; 32]),
             recipient,
-            transition: TransitionId::from_bytes([0x11; 32]),
-            secrets: (1..=n)
+            TransitionId::from_bytes([0x11; 32]),
+            n,
+            (1..=n)
                 .map(|e| EpochSecret::from_bytes([e as u8; 32]))
                 .collect(),
-        }
+        )
+        .unwrap()
+    }
+
+    fn keyring(recipient: DeviceId) -> DriveKeyring {
+        DriveKeyring::new(DriveId::from_bytes([0xEE; 32]), recipient)
     }
 
     #[test]
@@ -402,7 +478,7 @@ mod tests {
     #[test]
     fn replay_of_an_older_capability_is_a_noop() {
         let (_, recipient) = key(5);
-        let mut held = HeldCapabilities::new();
+        let mut held = keyring(recipient);
         let newer = capability(recipient, 5);
         let older = capability(recipient, 3);
         assert_eq!(
@@ -418,7 +494,7 @@ mod tests {
         // A removed device holds epoch 1..=3. Installing an older
         // capability cannot manufacture epoch 4.
         let (_, recipient) = key(5);
-        let mut held = HeldCapabilities::new();
+        let mut held = keyring(recipient);
         held.install(&capability(recipient, 3)).unwrap();
         assert!(held.secret(4).is_none());
         held.install(&capability(recipient, 3)).unwrap();
@@ -428,7 +504,7 @@ mod tests {
     #[test]
     fn epoch_conflict_is_an_error() {
         let (_, recipient) = key(5);
-        let mut held = HeldCapabilities::new();
+        let mut held = keyring(recipient);
         let cap = capability(recipient, 2);
         held.install(&cap).unwrap();
         // A forged capability claiming a different secret for epoch 1.
@@ -508,6 +584,71 @@ mod tests {
             WrappedCapability::from_bytes(envelope).unwrap(&sk_recipient),
             Err(CryptoError::Malformed)
         );
+    }
+
+    #[test]
+    fn capability_for_another_drive_is_rejected() {
+        let (_, recipient) = key(5);
+        let mut keyring = keyring(recipient);
+        let mut other = capability(recipient, 2);
+        other.drive = DriveId::from_bytes([0x77; 32]);
+        assert!(matches!(
+            keyring.install(&other),
+            Err(InstallError::WrongDrive(_, _))
+        ));
+        assert!(keyring.is_empty(), "rejected installs must not mutate");
+    }
+
+    #[test]
+    fn capability_for_another_device_is_rejected() {
+        let (_, recipient) = key(5);
+        let (_sk, other_device) = key(6);
+        let mut keyring = keyring(recipient);
+        let foreign = capability(other_device, 2);
+        assert!(matches!(
+            keyring.install(&foreign),
+            Err(InstallError::WrongDevice(_, _))
+        ));
+        assert!(keyring.is_empty());
+    }
+
+    #[test]
+    fn capability_epoch_must_match_the_secret_count() {
+        let (_, recipient) = key(5);
+        let secrets: Vec<EpochSecret> = (1..=3).map(|e| EpochSecret::from_bytes([e; 32])).collect();
+        assert!(matches!(
+            Capability::new(
+                DriveId::from_bytes([0xEE; 32]),
+                recipient,
+                TransitionId::from_bytes([0x11; 32]),
+                5,
+                secrets.clone(),
+            ),
+            Err(CapabilityError::EpochMismatch {
+                declared: 5,
+                carried: 3
+            })
+        ));
+        assert_eq!(
+            Capability::new(
+                DriveId::from_bytes([0xEE; 32]),
+                recipient,
+                TransitionId::from_bytes([0x11; 32]),
+                0,
+                Vec::new(),
+            ),
+            Err(CapabilityError::Empty)
+        );
+        // The honest binding works, and the epoch is the count.
+        let cap = Capability::new(
+            DriveId::from_bytes([0xEE; 32]),
+            recipient,
+            TransitionId::from_bytes([0x11; 32]),
+            3,
+            secrets,
+        )
+        .unwrap();
+        assert_eq!(cap.up_to_epoch(), 3);
     }
 
     #[test]

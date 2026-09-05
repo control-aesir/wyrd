@@ -149,8 +149,9 @@ and never by snapshot DAG state:
   order never decides.
 - **Resolution is explicit and owner-signed.** The conflict stays frozen
   until a valid transition R at the next epoch whose `prev` names the
-  winning branch's tip and whose `resolves` names the voided sibling(s) is
-  observed. On seeing R: the winning branch (and its ancestors to genesis)
+  winning branch's tip and whose `resolves` names **exactly** the voided
+  siblings — no fewer, no more, no duplicates, no unrelated transitions —
+  is observed. On seeing R: the winning branch (and its ancestors to genesis)
   become canonical from the fork point forward; every named sibling is
   voided permanently. R must be the unique valid child of the winning tip
   claiming the next epoch — a *second, contradictory* resolution (naming
@@ -258,25 +259,36 @@ Predicates, evaluated by a peer over its local DAG and canonical chain
 
 ```
 historically_valid(S)  ⟺  BIP-340 signature verifies (drive-bound, exact
-                           bytes, full key validation)
-                       AND T = transition(S.membership) is known, valid,
-                           and rooted
-                       AND S.epoch == T.epoch
-                       AND S.author ∈ members(T)
+                            bytes, full key validation)
+                        AND T = transition(S.membership) is known, valid,
+                            and rooted
+                        AND S.epoch == T.epoch
+                        AND S.author ∈ members(T)
 
 authorized(S)          ⟺  historically_valid(S)
-                       AND T is canonical
+                        AND T is canonical
 
 in_live_lineage(S)     ⟺  authorized(S)
-                       AND (S has no parents                 // genesis snapshot
-                            OR every parent P:
-                                 in_live_lineage(P)
-                                 AND P.epoch ≤ S.epoch)
+                        AND every parent P:
+                                  in_live_lineage(P)
+                                  AND P.epoch ≤ S.epoch
+                        AND (S.epoch == K
+                             OR some child C of S: in_live_lineage(C))
 
 eligible_head(S)       ⟺  in_live_lineage(S)
-                       AND S.epoch == K
-                       AND S is a DAG head
+                        AND S.epoch == K
+                        AND S is a DAG head
 ```
+
+The third clause is the **bounded-fork degradation, made precise**: a
+snapshot (even the genesis) is live-lineage only while its epoch is
+current or its lineage leads onward to the current epoch. Without it, a
+stale parallel fork would remain live-lineage forever after the log
+advanced, contradicting the classification table (SUPERSEDED) and the
+conformance item "old snapshot becomes superseded when the log advances".
+Parentless-ness alone confers nothing once the epoch moves on; the
+parents clause is vacuous for the genesis snapshot, and the child clause
+is what keeps old ancestry live only while it feeds current work.
 
 where K is the epoch of the peer's known membership state (the canonical
 tip). Historical validity is intrinsic to the snapshot against the *valid,

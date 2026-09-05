@@ -8,8 +8,10 @@
 //!     │  protects custody and recovery material — never derives epoch
 //!     ▼  material, never signs transitions
 //! EpochSecret (fresh random 256-bit per membership epoch, minted by the owner)
-//!     ├─ ManifestKey = BLAKE3-derive_key("wyrd manifest key v1", secret ‖ snapshot_id)
-//!     └─ ObjectKey   = BLAKE3-derive_key("wyrd object key v1", secret ‖ ContentId ‖ kind ‖ version)
+//!     ├─ ManifestKey = BLAKE3-derive_key("wyrd manifest key v1",
+//!     │                  DriveId ‖ epoch ‖ secret ‖ snapshot_id)
+//!     └─ ObjectKey   = BLAKE3-derive_key("wyrd object key v1",
+//!                        DriveId ‖ epoch ‖ secret ‖ ContentId ‖ kind ‖ version)
 //! ```
 //!
 //! AEAD substrate (T12): XChaCha20-Poly1305 everywhere (keystore root
@@ -28,7 +30,7 @@ pub mod keystore;
 pub mod root;
 
 pub use capability::{
-    Capability, HeldCapabilities, InstallError, InstallReport, WrappedCapability,
+    Capability, CapabilityError, DriveKeyring, InstallError, InstallReport, WrappedCapability,
 };
 pub use epoch::EpochSecret;
 pub use keystore::{kdf_key, unwrap_root, wrap_root, KeystoreError, WrappedRoot};

@@ -122,7 +122,7 @@ fn validate_link(
     let Some(prev_t) = log.transition(&prev_id) else {
         return Link::Pending;
     };
-    if prev_t.epoch + 1 != t.epoch {
+    if prev_t.epoch.checked_add(1) != Some(t.epoch) {
         return Link::Invalid(InvalidReason::PrevWrongEpoch);
     }
     let prev_link = match link.get(&prev_id) {
@@ -148,15 +148,20 @@ fn validate_link(
         Err(reason) => return Link::Invalid(reason),
     };
 
-    // Resolution shape: every resolves entry must identify a valid
-    // transition at epoch − 1. Unknown entries leave this pending (the
-    // referenced transition may still arrive); known-but-invalid entries
-    // are bad evidence.
+    // Resolution shape: `resolves` names each voided sibling exactly
+    // once, and every entry must identify a valid transition at
+    // epoch − 1. Unknown entries leave this pending (the referenced
+    // transition may still arrive); known-but-invalid entries are bad
+    // evidence.
+    let distinct: HashSet<&TransitionId> = t.resolves.iter().collect();
+    if distinct.len() != t.resolves.len() {
+        return Link::Invalid(InvalidReason::DuplicateResolves);
+    }
     for entry in &t.resolves {
         let Some(entry_t) = log.transition(entry) else {
             return Link::Pending;
         };
-        if entry_t.epoch + 1 != t.epoch {
+        if entry_t.epoch.checked_add(1) != Some(t.epoch) {
             return Link::Invalid(InvalidReason::InvalidResolvesEntry);
         }
         match link_for(log, entry_t, link) {
@@ -279,7 +284,9 @@ fn handle_conflict(
                 .filter(|c| **c != *contender)
                 .copied()
                 .collect();
-            if others.is_subset(&named) {
+            // Exact matching: a resolution names exactly the voided
+            // siblings — no fewer, no more, no unrelated transitions.
+            if named == others {
                 candidates.push(grand);
             }
         }
@@ -325,7 +332,7 @@ fn handle_conflict(
             ConflictOutcome::Resolved { resolution: r }
         }
         _ => {
-            result.frozen_at = Some(conflict_epoch + 1);
+            result.frozen_at = Some(conflict_epoch.checked_add(1).expect("epoch fits u64"));
             mark_contested(link, result, contenders);
             mark_contested(link, result, &candidates);
             ConflictOutcome::Contradictory

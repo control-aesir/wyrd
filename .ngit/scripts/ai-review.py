@@ -186,7 +186,7 @@ def get_pr_diff(head_sha: str, head_ref: Optional[str]) -> Tuple[str, str]:
 def call_openrouter_api(prompt: str, api_key: str) -> Optional[str]:
     """Call OpenRouter API with a free model."""
     url = "https://openrouter.ai/api/v1/chat/completions"
-    model = "google/gemini-flash-1.5"
+    model = "openrouter/free"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

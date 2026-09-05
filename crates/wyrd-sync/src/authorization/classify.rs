@@ -57,10 +57,7 @@ pub(super) fn classify(
 
     // One transition-status map per run (status() would re-analyse the
     // log per query).
-    let mut statuses = HashMap::new();
-    for id in log.observed_ids() {
-        statuses.insert(id, log.status(&id).expect("observed"));
-    }
+    let statuses = log.statuses();
 
     let ids = dag.ids();
 
@@ -82,11 +79,15 @@ pub(super) fn classify(
         );
     }
 
-    // Phase 2: parent-derived fate, seed the liveness map, then the
-    // recovery parent rule (which needs the seeded liveness), then the
-    // fixed point.
+    // Phase 2: parent-derived fate, seed, and the liveness fixed point.
+    // The recovery parent rule runs against the FINAL liveness (a parent
+    // that only dies during the fixed point must fail the check), so the
+    // fixed point runs first and runs again after any recovery
+    // rejection.
     engine.compute_parent_fate();
     engine.seed_live();
+    engine.live_fixed_point();
+    let mut recovery_rejected = false;
     for id in &ids {
         let s = dag.snapshot(id).expect("observed");
         if s.flags & RECOVERY_FLAG != 0
@@ -96,9 +97,17 @@ pub(super) fn classify(
             engine
                 .pre
                 .insert(*id, Pre::Rejected(Rejection::RecoveryParentInvalid));
+            recovery_rejected = true;
         }
     }
-    engine.live_fixed_point();
+    if recovery_rejected {
+        // The rederive guard (pre != Authorized ⇒ Dead) pulls the
+        // rejected snapshots down; this pass cascades to their
+        // descendants. Nothing else can change: the parents of a
+        // recovery snapshot are at the current epoch, so no other
+        // snapshot's liveness depends on the rejected one.
+        engine.live_fixed_point();
+    }
 
     // Phase 3: heads and the final mapping.
     let heads: HashSet<SnapshotId> = dag.heads().into_iter().collect();
@@ -261,6 +270,14 @@ impl<'a> Engine<'a> {
 
     /// Re-derive one snapshot's liveness from the current round.
     fn rederive(&self, id: &SnapshotId) -> Live {
+        // A snapshot whose pre-verdict is not Authorized is never live —
+        // including recovery snapshots rejected after the seed (their
+        // descendants cascade through the parent rule).
+        match self.pre.get(id) {
+            Some(Pre::Authorized) => {}
+            Some(Pre::Pending(p)) => return Live::Undecided(*p),
+            _ => return Live::Dead,
+        }
         let s = self.dag.snapshot(id).expect("observed");
         for parent in &s.parents {
             match self.live.get(parent) {

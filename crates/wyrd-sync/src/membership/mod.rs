@@ -137,7 +137,9 @@ impl MembershipLog {
         ids
     }
 
-    /// Classify a transition against the observed set.
+    /// Classify a transition against the observed set. Each call runs a
+    /// full analysis; callers needing many verdicts should prefer
+    /// [`MembershipLog::statuses`].
     pub fn status(&self, id: &TransitionId) -> Option<TransitionStatus> {
         if !self.transitions.contains_key(id) {
             return None;
@@ -150,6 +152,13 @@ impl MembershipLog {
                 .copied()
                 .expect("every observed transition is classified"),
         )
+    }
+
+    /// All verdicts from one analysis pass. Prefer this over repeated
+    /// [`MembershipLog::status`] calls — each of those re-analyses the
+    /// whole observed set.
+    pub fn statuses(&self) -> HashMap<TransitionId, TransitionStatus> {
+        chain::analyse(self).status
     }
 
     /// The canonical tip's state, or `None` while the log has no unique

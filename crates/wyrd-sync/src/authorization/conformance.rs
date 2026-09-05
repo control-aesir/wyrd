@@ -519,6 +519,76 @@ fn recovery_parenting_a_stranded_head_is_rejected() {
     );
 }
 
+#[test]
+fn descendants_of_a_rejected_recovery_stay_dead() {
+    // A recovery snapshot parenting a non-head is rejected; its own
+    // descendants must fall with it, never inherit live lineage from
+    // rejected history.
+    let f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let head = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_head = observe(&mut dag, &head);
+    let child = f.owner_snapshot(vec![id_head], tree_id(3));
+    observe(&mut dag, &child);
+    // `head` is no longer a DAG head, so the recovery is rejected.
+    let recovery = f.owner_snapshot(vec![id_head], tree_id(4));
+    let mut recovery = recovery;
+    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryParentInvalid)
+    );
+    // The recovery's own child falls with it.
+    let after = f.owner_snapshot(vec![id_recovery], tree_id(5));
+    let id_after = observe(&mut dag, &after);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_after),
+        Classification::Stranded
+    );
+}
+
+#[test]
+fn recovery_parent_that_dies_in_the_fixed_point_is_rejected() {
+    // The parent chain here is authorized and well-parented at seed
+    // time, but an epoch inversion deeper in the ancestry kills `q`
+    // during the liveness fixed point; the recovery parent `p2` falls
+    // with it. The recovery check must read final liveness, not the
+    // optimistic seed.
+    let mut f = Fixture::new(1);
+    let (_sk, member) = f.device(2);
+    f.membership(vec![Change::Admit(member)]); // K = 2
+    let mut dag = SnapshotDag::new(f.drive);
+    // base at the current epoch.
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    // `q` binds the genesis transition (authorized) but its parent is at
+    // a higher epoch: an inversion that only the fixed point sees.
+    let mut q = f.owner_snapshot(vec![id_base], tree_id(2));
+    q.epoch = 1;
+    q.membership = f.builder.prev.expect("genesis transition");
+    q.timestamp = 1;
+    sign_snapshot(&mut q, &f.sk, &f.drive);
+    let id_q = observe(&mut dag, &q);
+    // p2 at the current epoch descends from the doomed q.
+    let p2 = f.owner_snapshot(vec![id_q], tree_id(3));
+    let id_p2 = observe(&mut dag, &p2);
+    assert_eq!(classify_one(&dag, &f.log, &id_p2), Classification::Stranded);
+    // Recovery onto the doomed parent: rejected, not silently stranded.
+    let recovery = f.owner_snapshot(vec![id_p2], tree_id(4));
+    let mut recovery = recovery;
+    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryParentInvalid)
+    );
+}
+
 // --- determinism ----------------------------------------------------------
 
 #[test]
@@ -564,21 +634,23 @@ fn classification_is_arrival_order_independent() {
         for &i in order {
             dag.observe(all[i].clone());
         }
-        let mut fp: Vec<Classification> = all
+        let verdicts = dag.classify(&f.log);
+        let mut fp: Vec<(SnapshotId, Classification)> = all
             .iter()
             .map(|s| {
-                dag.classify(&f.log)
-                    .remove(&s.snapshot_id())
-                    .expect("classified")
+                (
+                    s.snapshot_id(),
+                    verdicts.get(&s.snapshot_id()).copied().expect("classified"),
+                )
             })
             .collect();
-        fp.sort_by_key(|c| format!("{c:?}"));
+        fp.sort_by_key(|(id, _)| format!("{id}"));
         fingerprints.push(fp);
     }
     for fp in &fingerprints[1..] {
         assert_eq!(
             fp, &fingerprints[0],
-            "verdicts must not depend on arrival order"
+            "per-snapshot verdicts must not depend on arrival order"
         );
     }
     let _ = stale;

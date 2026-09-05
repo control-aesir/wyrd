@@ -30,6 +30,7 @@ Three distinct concerns, never collapsed:
 | **DriveId** | random 256-bit, minted once per drive | namespaces everything: manifests, announcements, signatures | drive members; harmless if leaked |
 | **ContentId** | `BLAKE3-derive_key("wyrd content v1/<kind>", plaintext)` | Merkle trees, snapshots, local dedup | drive members only |
 | **StorageId** | `BLAKE3-derive_key("wyrd storage v1", ciphertext)` | object placement, fetch addresses | everyone, including vaults |
+| **TransitionId** | `BLAKE3-derive_key("wyrd transition id v1", signing preimage ‖ signature)` | membership log, snapshot authorization | drive members only |
 
 Device identity is **not** a Wyrd invention: a device is a Nostr secp256k1
 public key, and snapshots carry BIP-340 Schnorr signatures — but

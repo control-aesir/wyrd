@@ -68,7 +68,9 @@ pub enum SnapshotError {
 
 impl Snapshot {
     /// A snapshot with an all-zero signature (unsigned draft). The sync
-    /// layer signs and fills the signature.
+    /// layer signs and fills the signature. Flags with nonzero reserved
+    /// bits are rejected by decode; this constructor debug-asserts them so
+    /// drafts never carry garbage into signing.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parents: Vec<SnapshotId>,
@@ -79,6 +81,10 @@ impl Snapshot {
         flags: u8,
         timestamp: u64,
     ) -> Self {
+        debug_assert!(
+            flags & RESERVED_FLAG_MASK == 0,
+            "reserved flag bits must be zero"
+        );
         Snapshot {
             parents,
             tree,
@@ -89,11 +95,6 @@ impl Snapshot {
             timestamp,
             signature: [0; 64],
         }
-    }
-
-    /// The flags byte carrying only the recovery bit.
-    pub fn recovery_flags() -> u8 {
-        RECOVERY_FLAG
     }
 
     /// The BIP-340 message: `ASCII("wyrd snapshot v1") ‖ DriveId ‖ signing
@@ -319,10 +320,10 @@ mod tests {
 
     #[test]
     fn recovery_flag_is_the_only_defined_flag() {
-        assert_eq!(Snapshot::recovery_flags(), 0x01);
+        assert_eq!(RECOVERY_FLAG, 0x01);
         assert_eq!(Snapshot::decode(&sample().encode()).unwrap().flags, 0);
         let mut recovery = sample();
-        recovery.flags = Snapshot::recovery_flags();
+        recovery.flags = RECOVERY_FLAG;
         assert_eq!(Snapshot::decode(&recovery.encode()).unwrap(), recovery);
     }
 

@@ -59,8 +59,9 @@ preimage ‖ signature** (signing preimage defined in `trust.md`; signatures
 are deterministic BIP-340 nonces, so the id is stable). The transition's
 **canonical byte encoding is its signing preimage concatenated with its
 signature** — transitions are sealed documents, not content-addressed
-objects, so they carry no envelope framing (object-model.md, decision 17). A **membership
-state** is `(epoch, transition_id, members_root, owners_root)`. A peer's
+objects, so they carry no envelope framing (object-model.md, decision 17).
+
+A **membership state** is `(epoch, transition_id, members_root, owners_root)`. A peer's
 authoritative knowledge is its **known membership state** — the canonical
 tip — not a bare epoch number; known membership epoch ≠ held epoch secrets
 (a device can learn epoch N's transition long before its capability for N

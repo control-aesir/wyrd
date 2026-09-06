@@ -42,6 +42,11 @@ iroh = "1.0.3"
 iroh-blobs = { version = "0.103.0", default-features = false, features = ["fs-store"] }
 iroh-gossip = "0.101.0"
 
+# nostr protocol (control-plane transport only: NIP-44 mailbox encryption;
+# object encryption stays Wyrd-owned per T11). Pinned with the iroh set above:
+# bump together and run the full suite.
+nostr = { version = "0.45", default-features = false, features = ["std", "nip44"] }
+
 # property testing (dev-only: generated-sequence suites for the state
 # machines; never a production dependency)
 proptest = "1"

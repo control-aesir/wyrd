@@ -1,7 +1,8 @@
 # Sync and Peers
 
-How Wyrd moves objects and snapshots between devices. Implemented in
-`wyrd-sync` on top of the iroh stack.
+How Wyrd moves objects and snapshots between devices. `wyrd-sync`
+implements the protocol/core boundaries; the runtime wiring that turns
+them into a full distributed system is still in progress.
 
 The identity model is defined in `object-model.md` (two identities: Content
 ID / Storage ID). This doc describes how peers exchange them.
@@ -12,6 +13,20 @@ ID / Storage ID). This doc describes how peers exchange them.
 - Pairing via tickets (one peer generates, the other imports)
 - The iroh version set (iroh 1.0.3 / iroh-blobs 0.103.0 fs-store /
   iroh-gossip 0.101.0) is validated as a set and changes as a set
+
+## Runtime sync boundary
+
+The remaining runtime work sits between the protocol primitives and the
+filesystem surface:
+
+- persistent local state for membership, snapshots, manifests, materialization,
+  capabilities, and pending work
+- relay pool / signer-client wiring for the control plane
+- bulk object transport and backpressure
+- crash recovery and restart reconciliation
+- read-only then read/write FUSE integration
+
+That is the next phase after the protocol/core contracts already in `wyrd-sync`.
 
 ## Control-plane transport (Nostr mailbox)
 

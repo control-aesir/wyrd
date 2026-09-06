@@ -1,12 +1,3 @@
-<!--
-Use when: a planned, multi-step change (docs, format, or implementation) that
-will become a PR. Fill every {{placeholder}} before publishing:
-
-  ngit issue create \
-    --subject "<type>(<scope>): <summary>" \
-    --label enhancement \
-    --body "$(cat .ngit/templates/feature.md)"
--->
 # Goal
 
 {{One-sentence statement of the desired end state.}}

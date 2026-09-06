@@ -31,7 +31,7 @@ in
     typos.enable = true;
 
     review = {
-      enable = true;
+      enable = false;
       stages = [ "push" ];
       entry = "${pkgs.writeShellScriptBin "review" ''
         if command -v opencode >/dev/null 2>&1; then

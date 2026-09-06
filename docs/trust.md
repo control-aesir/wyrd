@@ -245,9 +245,9 @@ Rules:
   authoritative sync transport, and bulk state never flows through it.
 
 Wyrd defines its **own control message types** — `Invitation`,
-`MembershipChange`, `KeyRotation`, `SnapshotAnnouncement` — as Wyrd payloads
-that encrypted Nostr events merely *transport*. What each layer exposes is
-stated precisely:
+`Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`
+— as Wyrd payloads that encrypted Nostr events merely *transport*. What
+each layer exposes is stated precisely:
 
 ```
 Nostr-visible (relay metadata):
@@ -257,6 +257,40 @@ Encrypted (opaque to relays):
     DriveId, membership transitions, capabilities,
     epoch secrets, invitation details
 ```
+
+### Message set (pinned)
+
+Every message is versioned, idempotent, and replay-safe: receivers dedupe
+by message id (BLAKE3 over the sealed bytes) and the machines are
+set-based. Messages are delivery hints, never authority — the receiver
+acts only after machine-side verification.
+
+| Kind | Tag | Carries |
+|---|---|---|
+| `Invitation` | 0x00 | inviter, invitee, epoch, genesis transition bytes, wrapped capability for epoch — the whole offline bootstrap |
+| `Capability` | 0x01 | device, epoch, wrapped capability bytes |
+| `MembershipTransition` | 0x02 | opaque canonical transition bytes (the membership machine verifies) |
+| `KeyRotation` | 0x03 | the epoch's transition id — new epoch material exists, capability follows |
+| `SnapshotAnnouncement` | 0x04 | snapshot id, author, epoch, membership transition id — enough to fetch and classify |
+
+Sealed envelope (changing any byte changes every seal — a format
+constant): `version (1) ‖ DriveId (32) ‖ kind (1) ‖ epoch u64 LE ‖ nonce
+(24) ‖ XChaCha20-Poly1305 ciphertext`, with the AAD equal to the header
+and the plaintext repeating `drive ‖ kind ‖ epoch` ahead of the payload
+(the capability-envelope shape: forgery fails the tag or the inner
+comparison). The epoch rides the clear header so the receiver picks the
+right key; epoch numbers leak nothing.
+
+Control seal keys are epoch-scoped derivations, not new custody:
+`control_key = BLAKE3-derive_key("wyrd control key v1", DriveId ‖ epoch ‖
+epoch_secret)` (pinned context, same construction as the manifest and
+object keys). Rotation bounds control traffic exactly like data: a device
+removed at epoch N holds no later control keys. Message ids derive with
+`"wyrd control message id v1"` over the sealed bytes.
+
+The NIP-46 `sign_message` contract is `request { context string, 32-byte
+digest } → response { 64-byte BIP-340 signature }`; the session exposes
+`get_public_key` and `sign_message` only.
 
 The exact routing mechanism (how a recipient discovers its messages without
 leaking drive correlation) is a control-plane protocol decision, deferred.
@@ -540,6 +574,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |
 | T13 | Epoch secrets are **escrowed under the root**, per epoch, as sealed records (root-derived key, context `wyrd escrow key v1`, AAD `DriveId ‖ epoch`); escrow, never derivation | root recovery must compose with data recovery: guardians reconstruct the root, unwrap the records, restore every historical epoch secret. T4 stands — no root→epoch derivation path exists |
 | T15 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
+| T16 | Control-plane message set (`Invitation`, `Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, idempotent, replay-safe sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header, plaintext repeats the header); epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); NIP-46 `sign_message` is `request { context, digest } → response { signature }` | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
 
 ## Open questions
 

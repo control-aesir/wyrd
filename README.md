@@ -82,11 +82,16 @@ Wyrd mounts via **FUSE** to present standard filesystem interfaces:
 
 Pre-alpha. The v0 format spec (`docs/object-model.md`) and the trust +
 epoch contracts (`docs/trust.md`, `docs/epochs.md`) are normative, and the
-format and sync layers implement them: content-addressed store, snapshot
-DAG, membership and authorization engines, epoch keys and capabilities,
-sealed objects and manifests, escrow records, the control-plane message
-set, and ingest limits. Transports (mailbox, bulk data), FUSE mounting,
+format and sync **protocol/core** layers implement them: content-addressed
+store, snapshot DAG, membership and authorization engines, epoch keys and
+capabilities, sealed objects and manifests, escrow records, the
+control-plane message set, ingest limits, and the control-plane transport
+boundary. The runtime pieces that turn those protocol primitives into a
+real distributed filesystem are still incomplete: relay pool / signer-
+client wiring, bulk data transport, persistent local state, FUSE mounting,
 and garbage collection come later.
+
+See `ROADMAP.md` for the current phase plan and issue links.
 
 ---
 

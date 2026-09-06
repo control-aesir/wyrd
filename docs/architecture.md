@@ -91,8 +91,13 @@ Pre-alpha. `wyrd-format` implements identities, canonical codecs,
 chunking, trees, snapshots, manifests, and membership transition
 documents; `wyrd-sync` implements the membership state machine, snapshot
 authorization, epoch keys, capabilities, object sealing, escrow records,
-the control-plane message set, and ingest limits — covered by example,
-conformance, and generative suites with commit hooks clean. `wyrd-fuse`
+the control-plane message set, ingest limits, and the control-plane
+transport boundary (NIP-44 mailbox sealing, `Mailbox`/`SignerSession`
+traits) — the protocol/core layers are covered by example, conformance,
+and generative suites with commit hooks clean. The runtime pieces that
+turn those primitives into a full distributed system are still
+incomplete: relay pool / signer-client wiring, bulk data transport,
+persistent local state, FUSE mounting, and garbage collection. `wyrd-fuse`
 is still a skeleton. All crypto and sync work follows `trust.md` and
 `epochs.md` as normative contracts; the open tracking issues name what
-comes next (transport wiring, recovery completion).
+comes next (runtime sync, recovery completion).

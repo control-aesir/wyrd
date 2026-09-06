@@ -330,16 +330,29 @@ context separates this challenge from every other derived value).
 Redelivery is safe downstream without inbox dedupe: capability install is
 monotonic and genesis processing idempotent.
 
+**Mailbox transport (decided; `wyrd-sync/src/transport/`):** the sealed
+envelope above (`SealedControl`/`SealedBootstrap`) travels inside a second,
+outer NIP-44 seal between the two devices' Nostr identity keys — the mailbox
+seal is transport confidentiality, the inner seal is authenticity, exactly
+as this document's cryptographic-substrate rule states. Recipient discovery
+addresses the recipient's `DeviceId` directly, the same as any two-party
+NIP-44 conversation: relays learn "these two pubkeys are exchanging opaque
+ciphertext," the same traffic-analysis exposure already accepted above as
+best-effort (identical posture to vault-visible StorageId fetches). No
+additional unlinkability mechanism is adopted for v0. The concrete relay
+pool (subscription management, backoff, event kinds) is relay-client
+wiring for whatever composes this crate — the `Mailbox` trait is the
+boundary, exercised in tests only against an in-memory fake, never a
+live network.
+
 The NIP-46 `sign_message` contract is `request { domain, drive, digest }
 → response { 64-byte BIP-340 signature }`, where the domain is a closed
 enum (`MembershipTransitionV1`, `SnapshotV1`): the signer authorizes per
 domain, so a compromised client cannot re-label an arbitrary digest. The
-session exposes `get_public_key` and `sign_message` only.
-
-The exact routing mechanism (how a recipient discovers its messages without
-leaking drive correlation) is a control-plane protocol decision, deferred.
-Replacing Nostr as the rendezvous mechanism would not change Wyrd's
-cryptographic model.
+session exposes `get_public_key` and `sign_message` only. The
+`SignerSession` trait (`wyrd-sync/src/transport/signer.rs`) is the same
+kind of boundary as `Mailbox`: real `nostr-connect` session negotiation is
+signer-client wiring, tested only against an in-memory fake key.
 
 ## AEAD binding (decided construction)
 
@@ -620,6 +633,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T13 | Epoch secrets are **escrowed under the root**, per epoch, as sealed records (root-derived key, context `wyrd escrow key v1`, AAD `DriveId ‖ epoch`, envelope `version ‖ DriveId ‖ epoch ‖ nonce ‖ ciphertext`, StorageId over the record bytes); escrow, never derivation; v0 owner publishes each record alongside its transition | root recovery must compose with data recovery: guardians reconstruct the root, unwrap the records, restore every historical epoch secret. T4 stands — no root→epoch derivation path exists |
 | T14 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
 | T15 | Control-plane message set (`Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, duplicate-delivery-idempotent sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); bootstrap invitations under their own ECDH-plus-owner-signature framing; epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; the seal proves possession, never authorship; NIP-46 `sign_message` is `request { domain, drive, digest } → response { signature }` with a closed domain enum | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
+| T16 | Mailbox transport: the control envelope travels inside an outer NIP-44 seal addressed directly to the recipient `DeviceId` (no separate unlinkable-routing mechanism); `Mailbox` and `SignerSession` are trait boundaries a concrete relay pool / `nostr-connect` client implements, exercised in this crate only against in-memory fakes | recipient addressing is the same traffic-analysis exposure already accepted as best-effort; the relay pool and signer session are network/UI wiring outside `wyrd-sync`'s scope (`wyrd-format` must never grow a network dependency; the same discipline applies one layer up) |
 
 ## Open questions
 
@@ -640,3 +654,11 @@ member/vault boundary is a security boundary, not an implementation detail.
 7. Guardian share lifecycle details (re-split procedure, share expiry,
    guardian-offline handling) — blocked behind the post-v0 recovery
    implementation.
+8. ~~Recipient discovery mechanism~~ — resolved for v0: direct `DeviceId`
+   addressing under the mailbox's outer NIP-44 seal (T16). A dedicated
+   unlinkable-routing scheme remains open if a concrete threat model
+   later demands one.
+9. Concrete relay pool implementation (connection management, retry/backoff
+   posture, event kind/tag conventions) and the `nostr-connect` session
+   client — deferred to whatever composes `wyrd-sync` (`Mailbox` /
+   `SignerSession` are the pinned boundary).

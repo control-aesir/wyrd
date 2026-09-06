@@ -1,7 +1,8 @@
 # Sync and Peers
 
-How Wyrd moves objects and snapshots between devices. Implemented in
-`wyrd-sync` on top of the iroh stack.
+How Wyrd moves objects and snapshots between devices. `wyrd-sync`
+implements the protocol/core boundaries; the runtime wiring that turns
+them into a full distributed system is still in progress.
 
 The identity model is defined in `object-model.md` (two identities: Content
 ID / Storage ID). This doc describes how peers exchange them.
@@ -12,6 +13,43 @@ ID / Storage ID). This doc describes how peers exchange them.
 - Pairing via tickets (one peer generates, the other imports)
 - The iroh version set (iroh 1.0.3 / iroh-blobs 0.103.0 fs-store /
   iroh-gossip 0.101.0) is validated as a set and changes as a set
+
+## Runtime sync boundary
+
+The remaining runtime work sits between the protocol primitives and the
+filesystem surface:
+
+- persistent local state for membership, snapshots, manifests, materialization,
+  capabilities, and pending work
+- relay pool / signer-client wiring for the control plane
+- bulk object transport and backpressure
+- crash recovery and restart reconciliation
+- read-only then read/write FUSE integration
+
+That is the next phase after the protocol/core contracts already in `wyrd-sync`.
+
+## Control-plane transport (Nostr mailbox)
+
+The control-plane message set (`wyrd-sync/src/control/`) is transport-agnostic
+bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
+
+- **Mailbox seal**: every `SealedControl`/`SealedBootstrap` envelope travels
+  inside an outer NIP-44 seal between the two devices' Nostr identity keys —
+  two independent seals, the inner one authenticity (`trust.md`), the outer
+  one relay confidentiality. Recipient discovery addresses the recipient's
+  `DeviceId` directly (`trust.md` T16); this is the same traffic-analysis
+  exposure as any two-party encrypted messaging, already accepted as
+  best-effort.
+- **`Mailbox` trait**: the send/receive boundary a relay client implements.
+  Synchronous by design, since no concrete relay pool lives in `wyrd-sync`
+  yet — every test runs against an in-memory fake, never a live network.
+- **`SignerSession` trait**: the NIP-46 `sign_message` boundary
+  (`trust.md` "NIP-46 remote signing"); a `nostr-connect`-style client
+  implements it, tested here only against an in-memory fake key.
+- **Deferred**: the concrete relay pool (subscription management, retry
+  backoff, event kind/tag conventions) and the `nostr-connect` session
+  negotiation are wiring for whatever composes this crate — the traits above
+  are the pinned boundary.
 
 ## What is exchanged
 

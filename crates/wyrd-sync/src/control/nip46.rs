@@ -26,7 +26,7 @@ use super::ControlError;
 
 /// The operations a Wyrd signer session may be asked to sign. Closed:
 /// adding an operation is a contract change, not a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignDomain {
     MembershipTransitionV1,
     SnapshotV1,

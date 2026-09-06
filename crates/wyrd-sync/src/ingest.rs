@@ -11,6 +11,11 @@
 //!    precedes the count check. Pre-decode count peeking would duplicate
 //!    every format's byte offsets inside sync for the same protection.
 //!
+//! Decode cost is therefore bounded by the pre-decode total-byte ceiling,
+//! while semantic cardinality is bounded by [`Limits`]: the byte gate fires
+//! first on the wire, and the count checks only classify data already within
+//! that ceiling.
+//!
 //! Format maxima stay generous (flat dirs are legitimate at scale); these
 //! ceilings live in the [`Limits`] struct with the pinned v0 table in
 //! [`Limits::V0`]. Values sit far above any legitimate v0 use — adjust

@@ -310,7 +310,6 @@ mod tests {
             "remote-only content is not queued"
         );
 
-        let mut state = state;
         state.set_materialization(ContentId::from_bytes([4; 32]), MaterializationState::Cached);
         let plan = state.reconcile();
         assert_eq!(plan.pending_objects.len(), 1);

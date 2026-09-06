@@ -114,34 +114,49 @@ def find_fallback_pr_via_list(head_sha: str) -> Optional[str]:
     """
     Last-resort: find a PR whose head matches GITHUB_SHA.
     Only used when NGIT_CI_TRIGGER_EVENT is absent (local manual runs).
+
+    ngit pr list --json does not expose commit SHAs, so we use the git
+    branch relationship: if HEAD is on a branch, find the PR whose branch
+    matches that branch (strips commit hash suffix from PR branch names).
     """
-    success, output = run_command(["ngit", "pr", "list", "--json"], check=False)
+    # Step 1: Get all git branches that contain the commit
+    success, output = run_command([
+        "git", "branch", "--contains", head_sha,
+        "--format", "%(refname:short)", "--all"
+    ], check=False)
     if not success or not output:
         return None
+    git_branches = [b.strip() for b in output.strip().split('\n') if b.strip()]
+    if not git_branches:
+        return None
+    
+    # Step 2: List all PRs
+    success, pr_list_output = run_command(["ngit", "pr", "list", "--json"], check=False)
+    if not success or not pr_list_output:
+        return None
     try:
-        prs = json.loads(output)
+        prs = json.loads(pr_list_output)
     except json.JSONDecodeError:
         return None
     if not isinstance(prs, list):
         prs = [prs]
+
+    # Step 3: Extract base branch name from PR branch field (e.g., "pr/epoch-escrow(e4259b79)" -> "pr/epoch-escrow")
+    def extract_base_branch(pr_branch: str) -> str:
+        if '(' in pr_branch:
+            return pr_branch.split('(')[0].strip()
+        return pr_branch
+
+    # Step 4: Match PR branches with git branches
     for pr in prs:
-        # ngit pr list entries may expose commit or head sha under various keys
-        for key in ("commit", "head", "head_sha", "sha", "tip"):
-            val = pr.get(key)
-            if isinstance(val, str) and val.startswith(head_sha[:12]):
-                # prefer event id
-                return pr.get("id") or pr.get("event_id") or pr.get("nevent") or str(pr.get("number") or "")
-        # also check nested view if needed
-        pr_id = pr.get("id") or pr.get("event_id")
-        if pr_id and head_sha:
-            success, view_out = run_command(["ngit", "pr", "view", str(pr_id), "--json"], check=False)
-            if success:
-                try:
-                    v = json.loads(view_out)
-                    if head_sha[:12] in json.dumps(v):
-                        return str(pr_id)
-                except json.JSONDecodeError:
-                    pass
+        pr_branch = pr.get("branch", "")
+        base_branch = extract_base_branch(pr_branch)
+        
+        if base_branch in git_branches:
+            pr_id = pr.get("id") or pr.get("event_id")
+            if pr_id:
+                return str(pr_id)
+
     return None
 
 

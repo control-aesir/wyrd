@@ -139,8 +139,22 @@ impl ManifestEntry {
 impl Manifest {
     /// The canonical byte encoding: snapshot ‖ counted entries ‖ counted
     /// children. Callers must provide sorted vectors; encoding does not
-    /// sort — byte-exactness must be a choice, never an accident.
+    /// sort — byte-exactness must be a choice, never an accident. The
+    /// debug assertions catch unsorted callers where the decoder would
+    /// later refuse the bytes; release builds carry zero cost.
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        debug_assert!(
+            self.entries
+                .windows(2)
+                .all(|w| w[0].sort_key() < w[1].sort_key()),
+            "manifest entries must be sorted for canonical encoding"
+        );
+        debug_assert!(
+            self.children
+                .windows(2)
+                .all(|w| w[0].tree.as_bytes() < w[1].tree.as_bytes()),
+            "manifest children must be sorted for canonical encoding"
+        );
         let mut out = Vec::with_capacity(
             32 + 4 + ENTRY_LEN * self.entries.len() + 4 + 64 * self.children.len(),
         );
@@ -306,31 +320,43 @@ mod tests {
 
     #[test]
     fn decode_rejects_unsorted_and_duplicate_entries() {
-        let mut m = manifest();
-        m.entries.swap(0, 1);
+        // Forge the non-canonical bytes by hand: no conforming encoder
+        // emits them (canonical_bytes debug-asserts sortedness), so the
+        // decoder is the backstop. Entries live at 36..200 (two 82-byte
+        // blocks after snapshot(32) + count(4)).
+        let mut swapped = manifest().canonical_bytes();
+        let first = swapped[36..36 + ENTRY_LEN].to_vec();
+        swapped.copy_within(36 + ENTRY_LEN..36 + 2 * ENTRY_LEN, 36);
+        swapped[36 + ENTRY_LEN..36 + 2 * ENTRY_LEN].copy_from_slice(&first);
         assert_eq!(
-            Manifest::from_canonical_bytes(&m.canonical_bytes()),
+            Manifest::from_canonical_bytes(&swapped),
             Err(ManifestError::UnsortedEntries)
         );
-        let mut dup = manifest();
-        dup.entries.push(entry(0x01, 1));
-        // Sorted push order: [01, 02, 01] is unsorted; duplicates of
-        // adjacent entries are ambiguity, never canonical.
+        // Duplicates: bump the count 2 -> 3 and splice a repeat of the
+        // first entry after the second; [01, 02, 01] is unsorted, and an
+        // adjacent repeat would be ambiguity, never canonical.
+        let mut bytes = manifest().canonical_bytes();
+        let e01 = bytes[36..36 + ENTRY_LEN].to_vec();
+        bytes[32..36].copy_from_slice(&3u32.to_le_bytes());
+        let mut dup = bytes[..36 + 2 * ENTRY_LEN].to_vec();
+        dup.extend_from_slice(&e01);
+        dup.extend_from_slice(&bytes[36 + 2 * ENTRY_LEN..]);
         assert_eq!(
-            Manifest::from_canonical_bytes(&dup.canonical_bytes()),
+            Manifest::from_canonical_bytes(&dup),
             Err(ManifestError::UnsortedEntries)
         );
     }
 
     #[test]
     fn decode_rejects_unsorted_children() {
-        let mut m = manifest();
-        m.children.push(ChildManifest {
-            tree: ContentId::from_bytes([0x05; 32]),
-            manifest: StorageId::from_bytes([0x06; 32]),
-        });
+        // Children follow entries: count at 200..204, then 64-byte
+        // records. Append a smaller tree id after the 0x10 child.
+        let mut bytes = manifest().canonical_bytes();
+        bytes[200..204].copy_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x05; 32]);
+        bytes.extend_from_slice(&[0x06; 32]);
         assert_eq!(
-            Manifest::from_canonical_bytes(&m.canonical_bytes()),
+            Manifest::from_canonical_bytes(&bytes),
             Err(ManifestError::UnsortedChildren)
         );
     }

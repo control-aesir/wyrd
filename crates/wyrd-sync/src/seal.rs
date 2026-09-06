@@ -132,7 +132,7 @@ pub fn seal(
                 aad: &aad,
             },
         )
-        .map_err(|_| CryptoError::RngFailed)?;
+        .map_err(|_| CryptoError::SealFailed)?;
     Ok(EncryptedObject {
         version: SEAL_VERSION,
         kind,

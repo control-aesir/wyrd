@@ -53,6 +53,8 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<(), CryptoError> {
 pub enum CryptoError {
     #[error("the envelope did not open under this key and context")]
     OpenFailed,
+    #[error("sealing failed under this key and context")]
+    SealFailed,
     #[error("malformed envelope bytes")]
     Malformed,
     #[error("the sealed document disagrees with its envelope header")]

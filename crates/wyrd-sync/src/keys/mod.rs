@@ -26,6 +26,7 @@ use thiserror::Error;
 
 pub mod capability;
 pub mod epoch;
+pub mod escrow;
 pub mod keystore;
 pub mod root;
 
@@ -33,6 +34,7 @@ pub use capability::{
     Capability, CapabilityError, DriveKeyring, InstallError, InstallReport, WrappedCapability,
 };
 pub use epoch::EpochSecret;
+pub use escrow::{EscrowRecord, ESCROW_RECORD_LEN, ESCROW_VERSION};
 pub use keystore::{
     kdf_key, unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, KeystoreError,
     WrappedSecret,

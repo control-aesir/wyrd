@@ -31,7 +31,24 @@ impl DriveRootKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// The wrapping key for one epoch's escrow record (trust.md T13):
+    /// `BLAKE3-derive_key("wyrd escrow key v1", DriveId ‖ epoch ‖ root)`.
+    /// Escrow, never derivation — this key wraps a freshly minted epoch
+    /// secret; no function maps the root to epoch material without the
+    /// sealed record, and T4 stands.
+    pub fn escrow_key(&self, drive: &wyrd_format::DriveId, epoch: u64) -> [u8; 32] {
+        let mut input = Vec::with_capacity(72);
+        input.extend_from_slice(drive.as_bytes());
+        input.extend_from_slice(&epoch.to_le_bytes());
+        input.extend_from_slice(&self.0);
+        blake3::derive_key(ESCROW_KEY_CONTEXT, &input)
+    }
 }
+
+/// Pinned derivation context (trust.md T13): changing it changes every
+/// escrow record ever wrapped — a format constant.
+pub const ESCROW_KEY_CONTEXT: &str = "wyrd escrow key v1";
 
 #[cfg(test)]
 mod tests {

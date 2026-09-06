@@ -15,6 +15,12 @@
 //! ceilings live in the [`Limits`] struct with the pinned v0 table in
 //! [`Limits::V0`]. Values sit far above any legitimate v0 use — adjust
 //! them with evidence, never silently.
+//!
+//! Cost note: decode cost is bounded by the pre-decode total-byte ceiling,
+//! while semantic cardinality is bounded by [`Limits`]. Count ceilings
+//! take effect within the byte ceiling — entries large enough that their
+//! maximum count cannot arrive inside it are still rejected if observed,
+//! but on the wire the byte gate fires first.
 
 use thiserror::Error;
 use wyrd_format::{
@@ -56,7 +62,11 @@ pub struct Limits {
 impl Limits {
     /// The pinned v0 table: generous (far above legitimate use), bounded
     /// (hostile input fails fast). Changing a value changes what this
-    /// peer accepts — record it like a format constant.
+    /// peer accepts — record it like a format constant. Calibrated so
+    /// every count ceiling is actually encodable inside the byte ceiling:
+    /// fixed 82-byte manifest entries top out near 818K per 64 MiB, hence
+    /// 750K with margin; tree and child counts stay reachable for minimal
+    /// entries.
     pub const V0: Limits = Limits {
         max_object_bytes: 64 << 20,
         max_chunk_bytes: MAX_CHUNK + HEADER_LEN,
@@ -68,7 +78,7 @@ impl Limits {
         max_membership_changes: 64,
         max_resolves: 64,
         max_set_owners: 16,
-        max_manifest_entries: 1_000_000,
+        max_manifest_entries: 750_000,
         max_manifest_children: 1_000_000,
     };
 }
@@ -120,6 +130,10 @@ pub fn check_total_len(limits: &Limits, what: &'static str, len: usize) -> Resul
 /// total-bytes ceilings, before any payload decode. Chunks get their
 /// tighter payload ceiling here; everything else is count-checked after
 /// decode.
+///
+/// NOTE: this runs on a materialized `&[u8]` and cannot prevent that
+/// allocation. Transport read paths must consult [`Limits`] while reading
+/// (before materializing), not after.
 pub fn accept_envelope(limits: &Limits, bytes: &[u8]) -> Result<Envelope, IngestError> {
     check_total_len(limits, "object", bytes.len())?;
     let envelope = Envelope::decode(bytes)?;
@@ -427,6 +441,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // Const-evaluable by design: this is a tripwire for future table
+    // edits, not a runtime check.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn v0_table_is_internally_consistent() {
+        use wyrd_format::ENTRY_LEN;
+        // A manifest entry is fixed 82 bytes: the entry ceiling must fit
+        // inside the byte ceiling, or it could never trigger on the wire.
+        // Snapshot header overhead (id plus two counts) is 40 bytes.
+        assert!(
+            Limits::V0.max_manifest_entries * ENTRY_LEN + 40 < Limits::V0.max_object_bytes,
+            "entry ceiling must be encodable within the byte ceiling"
+        );
     }
 
     #[test]

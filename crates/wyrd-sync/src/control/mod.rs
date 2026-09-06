@@ -192,7 +192,7 @@ pub fn seal(
 /// Open a sealed message: version, tag over the header AAD, then the
 /// inner header agreement and payload decode. Payloads repeating the
 /// epoch must agree with the envelope epoch: disagreement is a header
-/// mismatch, so a sealed `Invitation { epoch: 3 }` at envelope epoch 5
+/// mismatch, so a sealed `Capability { epoch: 3 }` at envelope epoch 5
 /// never opens cleanly for the machines to misread. Returns the message
 /// with the drive and epoch it was verified under.
 pub fn open(

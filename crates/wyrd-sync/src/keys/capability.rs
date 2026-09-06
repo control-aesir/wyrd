@@ -406,18 +406,6 @@ impl DriveKeyring {
         capability
             .validate_against(state)
             .map_err(|_| InstallError::NotAuthorized)?;
-        if capability.drive != self.drive {
-            return Err(InstallError::WrongDrive(
-                capability.drive.to_string(),
-                self.drive.to_string(),
-            ));
-        }
-        if capability.device != self.device {
-            return Err(InstallError::WrongDevice(
-                capability.device.to_string(),
-                self.device.to_string(),
-            ));
-        }
         for (i, secret) in capability.secrets.iter().enumerate() {
             let epoch = i as u64 + 1;
             if let Some(held) = self.secrets.get(&epoch) {

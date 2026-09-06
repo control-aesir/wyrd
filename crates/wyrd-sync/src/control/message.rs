@@ -1,12 +1,14 @@
 //! Control-plane message types: the evidence the Nostr mailbox delivers
 //! (see the control-plane issue; transport wiring is a later issue).
 //!
-//! Five kinds, each versioned by the envelope, idempotent and replay-safe
-//! by construction: receivers dedupe by message id and the machines are
-//! set-based, so 0/1/5 receptions in any order converge. Messages are
-//! delivery hints, never authority: the receiver acts only after
-//! machine-side verification (transition signatures, capability unwrap,
-//! snapshot classification), which lives outside this module.
+//! Four kinds, each versioned by the envelope and duplicate-delivery
+//! idempotent within the retained inbox state: receivers dedupe by
+//! message id and the machines are set-based, so 0/1/5 receptions in any
+//! order converge. Semantic replay safety belongs to the receiving state
+//! machines. Messages are delivery hints, never authority: the receiver
+//! acts only after machine-side verification (transition signatures,
+//! capability unwrap, snapshot classification), which lives outside this
+//! module.
 //!
 //! Canonical payload encodings (fixed-width little-endian, blobs counted
 //! with `u32`):
@@ -90,7 +92,7 @@ pub struct KeyRotation {
 }
 
 /// A snapshot announcement: enough to fetch and classify (the snapshot
-/// and transition bodies travel bulk, not here.
+/// and transition bodies travel bulk, not here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAnnouncement {
     pub snapshot: SnapshotId,

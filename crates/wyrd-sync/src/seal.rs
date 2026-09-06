@@ -2,7 +2,7 @@
 //! decisions 9 and 15; trust.md "AEAD binding").
 //!
 //! The physical world: every object a vault stores is an
-//! [`EncryptedObject`] — `version ‖ kind ‖ nonce ‖ ciphertext` — sealed
+//! [`EncryptedObject`] (`version ‖ kind ‖ nonce ‖ ciphertext`), sealed
 //! with XChaCha20-Poly1305 under a per-epoch key, with the AAD binding
 //! `(version, kind, ContentId)` exactly as trust.md pins it. The
 //! [`StorageId`] is derived over the sealed bytes, so equal plaintexts
@@ -12,7 +12,7 @@
 //! Which key seals what is the caller's choice from the epoch hierarchy
 //! (`keys::epoch`): content objects (chunks, trees) seal under
 //! [`EpochSecret::object_key`], whole manifests under
-//! [`EpochSecret::manifest_key`] (one key per snapshot — all subtree
+//! [`EpochSecret::manifest_key`] (one key per snapshot, sealing all subtree
 //! manifests of a snapshot share it; per-entry epochs still allow
 //! mixed-epoch mappings, which is how dedup survives rotation).
 //!
@@ -45,7 +45,7 @@ pub const SEAL_HEADER_LEN: usize = 26;
 pub const SEAL_TAG_LEN: usize = 16;
 
 /// A sealed, vault-storable object. Opaque by construction: no ContentId,
-/// no paths, no structure — only version, kind, nonce, and ciphertext.
+/// no paths, no structure, only version, kind, nonce, and ciphertext.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedObject {
     pub version: u8,
@@ -222,25 +222,28 @@ pub fn verify(
 
 /// Build the entry for freshly sealed content: the caller seals under
 /// the current epoch and records where and how the representation lives.
-/// The returned entry always verifies under the same key.
+/// The size is derived from the plaintext, never caller-supplied, so a
+/// constructed entry cannot misstate it; content agreement still rests
+/// on [`seal`] failing closed on foreign ids. The returned entry always
+/// verifies under the same key.
 pub fn entry_for(
     kind: ObjectKind,
-    version: u8,
     epoch: u64,
     obj: &EncryptedObject,
     content_id: &ContentId,
-    size: u64,
+    plaintext: &[u8],
 ) -> Result<ManifestEntry, CryptoError> {
-    if version != SEAL_VERSION {
+    if obj.version != SEAL_VERSION || obj.kind != kind {
         return Err(CryptoError::HeaderMismatch);
     }
-    if obj.version != version || obj.kind != kind {
-        return Err(CryptoError::HeaderMismatch);
+    if ContentId::derive(kind, plaintext) != *content_id {
+        return Err(CryptoError::IdentityMismatch);
     }
+    let size = u64::try_from(plaintext.len()).map_err(|_| CryptoError::Malformed)?;
     Ok(ManifestEntry {
         content_id: *content_id,
         kind,
-        version,
+        version: obj.version,
         storage_id: obj.storage_id(),
         encryption_epoch: epoch,
         size,
@@ -433,15 +436,7 @@ mod tests {
         let (id, plaintext) = chunk_fixture();
         let key = secret.object_key(&drive(), 3, &id, ObjectKind::Chunk, SEAL_VERSION);
         let obj = seal(&key, ObjectKind::Chunk, &id, &plaintext).unwrap();
-        let entry = entry_for(
-            ObjectKind::Chunk,
-            SEAL_VERSION,
-            3,
-            &obj,
-            &id,
-            plaintext.len() as u64,
-        )
-        .unwrap();
+        let entry = entry_for(ObjectKind::Chunk, 3, &obj, &id, &plaintext).unwrap();
         assert_eq!(verify(&entry, &key, &obj.encode()).unwrap(), plaintext);
         // Another epoch's key fails the tag: no capability, no content.
         let other_key = secret.object_key(&drive(), 4, &id, ObjectKind::Chunk, SEAL_VERSION);
@@ -469,15 +464,25 @@ mod tests {
         let (id, plaintext) = chunk_fixture();
         let obj = seal(&object_key(), ObjectKind::Chunk, &id, &plaintext).unwrap();
         assert_eq!(
-            entry_for(
-                ObjectKind::Tree,
-                SEAL_VERSION,
-                1,
-                &obj,
-                &id,
-                plaintext.len() as u64
-            ),
+            entry_for(ObjectKind::Tree, 1, &obj, &id, &plaintext),
             Err(CryptoError::HeaderMismatch)
+        );
+    }
+
+    #[test]
+    fn entry_for_derives_size_and_rejects_foreign_content() {
+        // Size comes from the plaintext, never the caller: no parameter
+        // exists to lie with.
+        let (id, plaintext) = chunk_fixture();
+        let obj = seal(&object_key(), ObjectKind::Chunk, &id, &plaintext).unwrap();
+        let entry = entry_for(ObjectKind::Chunk, 1, &obj, &id, &plaintext).unwrap();
+        assert_eq!(entry.size, plaintext.len() as u64);
+        // Content agreement rests on seal's fail-closed check, enforced
+        // here too: naming foreign content fails.
+        let foreign = ContentId::from_bytes([0xFF; 32]);
+        assert_eq!(
+            entry_for(ObjectKind::Chunk, 1, &obj, &foreign, &plaintext),
+            Err(CryptoError::IdentityMismatch)
         );
     }
 }

@@ -48,7 +48,7 @@ pub(crate) const CAPABILITY_AAD_DOMAIN: &[u8] = b"wyrd capability v1";
 /// registered ECDH target the secrets actually travel to. The vector
 /// index is the epoch minus one, so sparse ranges (e.g. `3..=5` without
 /// `1..=2`) are not representable: a fresh member's capability must
-/// cover the whole history. The DriveRootKey has no field here — by
+/// cover the whole history. The DriveRootKey has no field here: by
 /// construction it is never part of an ordinary capability (T8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
@@ -113,7 +113,7 @@ impl Capability {
     }
 
     /// Mint a capability from the authoritative membership state: the
-    /// registered encryption key — never the caller's choice — is in the
+    /// registered encryption key (never the caller's choice) is in the
     /// envelope, and the device must be a member of `state`.
     pub fn mint(
         drive: DriveId,
@@ -154,7 +154,7 @@ impl Capability {
     }
 
     /// Wrap for delivery: a fresh ephemeral ECDH key (the "owner-ephemeral
-    /// key" of trust.md — it exists for this one wrap) over the recipient's
+    /// key" of trust.md, which exists for this one wrap) over the recipient's
     /// x-only public key, HKDF-SHA256 to the AEAD key, XChaCha20-Poly1305
     /// with the pinned AAD. Nonce and ephemeral key are fresh per wrap.
     pub fn wrap(&self) -> Result<WrappedCapability, CryptoError> {
@@ -211,7 +211,7 @@ pub struct WrappedCapability {
 
 impl WrappedCapability {
     /// Open with the device's **encryption** secret (not its Nostr
-    /// identity key — see trust.md T14). Tampering with any AAD input in
+    /// identity key; see trust.md T14). Tampering with any AAD input in
     /// the header (drive, device, encryption key, transition, epoch)
     /// fails the AEAD tag; a header that does not match the plaintext
     /// fails the inner comparison.
@@ -290,7 +290,7 @@ impl WrappedCapability {
         }
 
         // Belt-and-braces binding: the decryption secret must actually
-        // belong to the claimed encryption key — not merely succeed at
+        // belong to the claimed encryption key, not merely succeed at
         // opening (ECDH alone relies on the header being honest).
         // Deriving the same pubkey proves the secret matches.
         let proven_pk = {
@@ -341,6 +341,8 @@ pub enum InstallError {
     WrongDrive(String, String),
     #[error("capability is for device {0}, keyring holds {1}")]
     WrongDevice(String, String),
+    #[error("capability device or key does not match membership state")]
+    NotAuthorized,
     #[error("two capabilities disagree about the secret for epoch {0}")]
     EpochConflict(u64),
     #[error("crypto operation failed")]
@@ -375,11 +377,35 @@ impl DriveKeyring {
 
     /// Monotonic install (trust.md): add-only, replay of an older
     /// capability is a no-op, and a disagreement about an already-held
-    /// epoch's secret is an error (forgery or corruption). Conflicts are
+    /// epoch's secret is an error (forgery or corruption). The capability
+    /// envelope alone proves nothing about authorization: anyone holding
+    /// the epoch secrets can wrap them, so installation additionally
+    /// requires the authoritative membership state: the device must be a
+    /// member and the envelope's encryption key must equal the registered
+    /// key. There is no install path that skips this check. Conflicts are
     /// detected before any mutation, so a failed install leaves the held
     /// set untouched. Capabilities for another drive or device are
     /// rejected before anything else.
-    pub fn install(&mut self, capability: &Capability) -> Result<InstallReport, InstallError> {
+    pub fn install(
+        &mut self,
+        capability: &Capability,
+        state: &crate::membership::MembershipState,
+    ) -> Result<InstallReport, InstallError> {
+        if capability.drive != self.drive {
+            return Err(InstallError::WrongDrive(
+                capability.drive.to_string(),
+                self.drive.to_string(),
+            ));
+        }
+        if capability.device != self.device {
+            return Err(InstallError::WrongDevice(
+                capability.device.to_string(),
+                self.device.to_string(),
+            ));
+        }
+        capability
+            .validate_against(state)
+            .map_err(|_| InstallError::NotAuthorized)?;
         if capability.drive != self.drive {
             return Err(InstallError::WrongDrive(
                 capability.drive.to_string(),
@@ -445,8 +471,10 @@ pub(crate) fn hkdf_capability_key(shared: &[u8]) -> [u8; 32] {
 
 /// ECDH over an x-only peer key: canonicalize to even parity (the shared
 /// point's x-coordinate is parity-independent) and take the x-coordinate
-/// of the shared point as the raw key material.
-fn ecdh_shared(sk: &SecretKey, peer: &XOnlyPublicKey) -> Result<[u8; 32], CryptoError> {
+/// of the shared point as the raw key material. Shared with the
+/// bootstrap envelope, which runs the same construction under its own
+/// HKDF context.
+pub(crate) fn ecdh_shared(sk: &SecretKey, peer: &XOnlyPublicKey) -> Result<[u8; 32], CryptoError> {
     let peer_pk = PublicKey::from_x_only_public_key(*peer, Parity::Even);
     let point = secp256k1::ecdh::shared_secret_point(&peer_pk, sk);
     Ok(point[0..32]
@@ -491,6 +519,9 @@ fn encode_capability(capability: &Capability) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::membership::test_util::key;
+    use crate::membership::MembershipState;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     /// The device's registered encryption pair: the secret unwrap uses
     /// and the x-only pubkey capabilities target. Derived as
@@ -532,6 +563,16 @@ mod tests {
         DriveKeyring::new(DriveId::from_bytes([0xEE; 32]), device)
     }
 
+    /// The authoritative state tests install against: `device` a member
+    /// with `enc_key` registered.
+    fn member_state(device: DeviceId, enc_key: DeviceEncryptionKey) -> MembershipState {
+        MembershipState {
+            members: BTreeSet::from([device]),
+            owners: BTreeSet::from([device]),
+            encryption_keys: BTreeMap::from([(device, enc_key)]),
+        }
+    }
+
     #[test]
     fn correct_recipient_unwraps() {
         let (_, device) = key(5);
@@ -563,7 +604,7 @@ mod tests {
     fn tampering_with_ephemeral_pubkey_fails_the_tag() {
         // 0..32 is the ephemeral public key, the ECDH input (not AAD):
         // flipping a bit either lands off the curve (Malformed) or
-        // derives a different shared secret (OpenFailed) — either way
+        // derives a different shared secret (OpenFailed). Either way
         // the envelope must not open. Which one is a coin flip of the
         // fresh ephemeral key, so both rejections are accepted.
         let (_, device) = key(5);
@@ -675,7 +716,7 @@ mod tests {
         let mut other = capability(device, enc_key, 2);
         other.drive = DriveId::from_bytes([0x77; 32]);
         assert!(matches!(
-            keyring.install(&other),
+            keyring.install(&other, &member_state(device, enc_key)),
             Err(InstallError::WrongDrive(_, _))
         ));
         assert!(keyring.is_empty(), "rejected installs must not mutate");
@@ -689,7 +730,7 @@ mod tests {
         let mut keyring = keyring(device);
         let foreign = capability(other_device, enc_key, 2);
         assert!(matches!(
-            keyring.install(&foreign),
+            keyring.install(&foreign, &member_state(device, enc_key)),
             Err(InstallError::WrongDevice(_, _))
         ));
         assert!(keyring.is_empty());
@@ -742,13 +783,17 @@ mod tests {
         let (_, device) = key(5);
         let (_, enc_key) = enc_pair(0x30);
         let mut held = keyring(device);
+        let state = member_state(device, enc_key);
         let newer = capability(device, enc_key, 5);
         let older = capability(device, enc_key, 3);
         assert_eq!(
-            held.install(&newer).unwrap(),
+            held.install(&newer, &state).unwrap(),
             InstallReport::Added { from: 1, to: 5 }
         );
-        assert_eq!(held.install(&older).unwrap(), InstallReport::NoChange);
+        assert_eq!(
+            held.install(&older, &state).unwrap(),
+            InstallReport::NoChange
+        );
         assert_eq!(held.up_to(), 5, "a replay must never roll back");
     }
 
@@ -757,9 +802,12 @@ mod tests {
         let (_, device) = key(5);
         let (_, enc_key) = enc_pair(0x30);
         let mut held = keyring(device);
-        held.install(&capability(device, enc_key, 3)).unwrap();
+        let state = member_state(device, enc_key);
+        held.install(&capability(device, enc_key, 3), &state)
+            .unwrap();
         assert!(held.secret(4).is_none());
-        held.install(&capability(device, enc_key, 3)).unwrap();
+        held.install(&capability(device, enc_key, 3), &state)
+            .unwrap();
         assert!(held.secret(4).is_none(), "replay adds nothing new");
     }
 
@@ -768,12 +816,55 @@ mod tests {
         let (_, device) = key(5);
         let (_, enc_key) = enc_pair(0x30);
         let mut held = keyring(device);
+        let state = member_state(device, enc_key);
         let cap = capability(device, enc_key, 2);
-        held.install(&cap).unwrap();
+        held.install(&cap, &state).unwrap();
         let mut forged = capability(device, enc_key, 2);
         forged.secrets[0] = EpochSecret::from_bytes([0xFF; 32]);
-        assert_eq!(held.install(&forged), Err(InstallError::EpochConflict(1)));
+        assert_eq!(
+            held.install(&forged, &state),
+            Err(InstallError::EpochConflict(1))
+        );
         assert_eq!(held.secret(1), Some(&EpochSecret::from_bytes([1; 32])));
+    }
+
+    #[test]
+    fn install_rejects_capabilities_outside_membership() {
+        // The envelope proves possession, never authorization: anyone
+        // holding the epoch secrets can wrap them to any key. Both
+        // forgeries below are well-formed capabilities that must fail at
+        // install, leaving the keyring untouched.
+        let (_, device) = key(5);
+        let (_, enc_key) = enc_pair(0x30);
+        let (_, other_key) = enc_pair(0x31);
+        let mut held = keyring(device);
+        // The device is not a member of the presented state.
+        let (_, stranger) = key(6);
+        let lone_state = member_state(stranger, other_key);
+        assert_eq!(
+            held.install(&capability(device, enc_key, 2), &lone_state),
+            Err(InstallError::NotAuthorized)
+        );
+        // The device is a member, but the envelope targets a key that is
+        // not the registered one.
+        let state = member_state(device, enc_key);
+        let stale = Capability::new(
+            DriveId::from_bytes([0xEE; 32]),
+            device,
+            other_key,
+            TransitionId::from_bytes([0x11; 32]),
+            2,
+            vec![
+                EpochSecret::from_bytes([1; 32]),
+                EpochSecret::from_bytes([2; 32]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            held.install(&stale, &state),
+            Err(InstallError::NotAuthorized)
+        );
+        assert!(held.is_empty(), "rejected installs must not mutate");
     }
 
     #[test]
@@ -874,7 +965,7 @@ mod tests {
 
     #[test]
     fn mint_uses_the_state_registered_encryption_key() {
-        // The owner (caller of mint) does not choose the key — `state`
+        // The owner (caller of mint) does not choose the key: `state`
         // is the source of truth. A caller passing any other key gets
         // the registered one, not their choice.
         use crate::membership::MembershipState;
@@ -975,5 +1066,34 @@ mod tests {
             ),
             Err(CapabilityError::NotAMember)
         ));
+    }
+
+    proptest! {
+        /// Wrap/unwrap preserves arbitrary capabilities exactly: random
+        /// devices, delivery keys, epoch ranges, and secrets all survive
+        /// the envelope, and only the matching encryption secret opens it.
+        #[test]
+        fn wrap_unwrap_preserves_arbitrary_capabilities(
+            device in any::<[u8; 32]>(),
+            enc_pattern in any::<u8>(),
+            secrets in prop::collection::vec(any::<[u8; 32]>(), 1..=8usize),
+        ) {
+            let device = DeviceId::from_bytes(device);
+            let (enc_secret, enc_key) = enc_pair(enc_pattern);
+            let epoch = secrets.len() as u64;
+            let secrets: Vec<EpochSecret> =
+                secrets.into_iter().map(EpochSecret::from_bytes).collect();
+            let cap = Capability::new(
+                DriveId::from_bytes([0xEE; 32]),
+                device,
+                enc_key,
+                TransitionId::from_bytes([0x11; 32]),
+                epoch,
+                secrets,
+            )
+            .unwrap();
+            let wrapped = cap.wrap().unwrap();
+            prop_assert_eq!(wrapped.unwrap(&enc_secret).unwrap(), cap);
+        }
     }
 }

@@ -408,9 +408,10 @@ single sanctioned remedy.
 - **Removed then re-admitted (new Nostr key):** a new device with a fresh
   capability; nothing special.
 - **Capability lost / fresh device restore:** re-pair via a new owner
-  invitation (new epoch not required for mere re-delivery of the same
-  epoch's secrets; a rotate is still recommended if the loss was a
-  compromise).
+  bootstrap invitation (genesis plus wrapped capability, sealed to the
+  device encryption key; new epoch not required for mere re-delivery of
+  the same epoch's secrets; a rotate is still recommended if the loss
+  was a compromise).
 - **Offline vault:** epochs are irrelevant to it — it holds ciphertext of
   every epoch and accepts fetches for any StorageId it stores.
 - **Compromise response:** remove + rotate in one transition (new epoch,

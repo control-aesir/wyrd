@@ -2,7 +2,7 @@
 //! (see `docs/object-model.md`, "Manifests (the bridge between identity
 //! worlds)").
 //!
-//! A manifest is a plaintext-world document — this crate stays keyless, so
+//! A manifest is a plaintext-world document: this crate stays keyless, so
 //! sealing under the snapshot manifest key and the sealed envelope live in
 //! `wyrd-sync` (`seal.rs`). One manifest covers one subtree: file entries
 //! for the objects of that subtree plus references to child subtree
@@ -10,7 +10,7 @@
 //! fetching whole-drive metadata.
 //!
 //! Canonical encoding (all fields fixed-width little-endian, vectors
-//! counted with `u32`; entries and children sorted — decoders reject
+//! counted with `u32`; entries and children sorted; decoders reject
 //! unsorted documents so every manifest has one byte-exact form):
 //!
 //! ```text
@@ -27,8 +27,8 @@
 //!     entries:          u32 LE count + entries in ascending
 //!                       (content_id, kind, version) order
 //!     children:         u32 LE count + (child tree ContentId (32) +
-//!                       sealed child manifest StorageId (32)) in ascending
-//!                       tree-id order
+//!                       child manifest ContentId (32) + sealed child
+//!                       manifest StorageId (32)) in ascending tree-id order
 //! ```
 //!
 //! Names live in trees, never in manifests: a child reference carries no
@@ -36,15 +36,26 @@
 //! observing StorageId fetches learns neither names nor structure.
 //! Mappings are untrusted hints (object-model.md decision 15): acting on
 //! one requires the sync-layer two-check verification, never blind trust.
-//! Entries may span epochs — cross-epoch reuse is how dedup survives
-//! rotation — while the manifest itself seals under the current epoch's
+//! Entries may span epochs: cross-epoch reuse is how dedup survives
+//! rotation, while the manifest itself seals under the current epoch's
 //! snapshot manifest key.
+//!
+//! One representation per `(content_id, kind, version)`: a manifest
+//! selects exactly one physical representation for a logical object.
+//! Epoch variants of the same content do not coexist here. Cross-epoch
+//! dedup works across members' manifests (each author's view), never
+//! within one. A device reading a current manifest holds every epoch
+//! `1..=N` by capability construction, so coexisting variants would serve
+//! no reader.
 
 use crate::identity::{ContentId, ObjectKind, SnapshotId, StorageId};
 use thiserror::Error;
 
 /// Canonical length of one encoded entry: 32 + 1 + 1 + 32 + 8 + 8.
 pub const ENTRY_LEN: usize = 82;
+
+/// Canonical length of one encoded child reference: 32 + 32 + 32.
+pub const CHILD_LEN: usize = 96;
 
 /// One content→storage mapping: the logical object, the sealed
 /// representation to fetch, and the epoch whose capability decrypts it.
@@ -58,13 +69,17 @@ pub struct ManifestEntry {
     pub size: u64,
 }
 
-/// A reference to a child subtree's sealed manifest: the child tree's
-/// logical identity plus the opaque location of its sealed manifest.
-/// No names — the vault sees only an unlinkable StorageId fetch.
+/// A reference to a child subtree's sealed manifest: the complete
+/// identity pair. `tree` names the child subtree's tree object, `manifest`
+/// names the child manifest's logical identity (the ContentId its seal
+/// opens under; without it the fetched bytes are unauthenticatable),
+/// and `storage` is the sealed representation to fetch. No names: the
+/// vault sees only an unlinkable StorageId fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildManifest {
     pub tree: ContentId,
-    pub manifest: StorageId,
+    pub manifest: ContentId,
+    pub storage: StorageId,
 }
 
 /// One subtree's manifest: its file entries plus child references.
@@ -91,8 +106,8 @@ pub enum ManifestError {
 
 impl ManifestEntry {
     /// Sort key: content identity, then kind, then version. One logical
-    /// object may map several representations (epochs, versions); the
-    /// order keeps them distinct and canonical.
+    /// object selects exactly one representation per key; the order keeps
+    /// coexisting mappings distinct and canonical.
     fn sort_key(&self) -> (Vec<u8>, u8, u8) {
         (
             self.content_id.as_bytes().to_vec(),
@@ -139,7 +154,7 @@ impl ManifestEntry {
 impl Manifest {
     /// The canonical byte encoding: snapshot ‖ counted entries ‖ counted
     /// children. Callers must provide sorted vectors; encoding does not
-    /// sort — byte-exactness must be a choice, never an accident. The
+    /// sort; byte-exactness must be a choice, never an accident. The
     /// debug assertions catch unsorted callers where the decoder would
     /// later refuse the bytes; release builds carry zero cost.
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -156,7 +171,7 @@ impl Manifest {
             "manifest children must be sorted for canonical encoding"
         );
         let mut out = Vec::with_capacity(
-            32 + 4 + ENTRY_LEN * self.entries.len() + 4 + 64 * self.children.len(),
+            32 + 4 + ENTRY_LEN * self.entries.len() + 4 + CHILD_LEN * self.children.len(),
         );
         out.extend_from_slice(self.snapshot.as_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
@@ -167,6 +182,7 @@ impl Manifest {
         for child in &self.children {
             out.extend_from_slice(child.tree.as_bytes());
             out.extend_from_slice(child.manifest.as_bytes());
+            out.extend_from_slice(child.storage.as_bytes());
         }
         out
     }
@@ -209,14 +225,15 @@ impl Manifest {
             u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("bounds checked")) as usize;
         pos += 4;
         let child_bytes = child_count
-            .checked_mul(64)
+            .checked_mul(CHILD_LEN)
             .ok_or(ManifestError::Truncated)?;
         need(pos, child_bytes)?;
         let mut children = Vec::with_capacity(child_count.min(4096));
-        for chunk in bytes[pos..pos + child_bytes].chunks_exact(64) {
+        for chunk in bytes[pos..pos + child_bytes].chunks_exact(CHILD_LEN) {
             children.push(ChildManifest {
                 tree: ContentId::from_bytes(chunk[0..32].try_into().expect("chunks_exact")),
-                manifest: StorageId::from_bytes(chunk[32..64].try_into().expect("chunks_exact")),
+                manifest: ContentId::from_bytes(chunk[32..64].try_into().expect("chunks_exact")),
+                storage: StorageId::from_bytes(chunk[64..96].try_into().expect("chunks_exact")),
             });
         }
         pos += child_bytes;
@@ -259,7 +276,8 @@ mod tests {
             entries: vec![entry(0x01, 1), entry(0x02, 2)],
             children: vec![ChildManifest {
                 tree: ContentId::from_bytes([0x10; 32]),
-                manifest: StorageId::from_bytes([0x20; 32]),
+                manifest: ContentId::from_bytes([0x20; 32]),
+                storage: StorageId::from_bytes([0x30; 32]),
             }],
         }
     }
@@ -349,12 +367,13 @@ mod tests {
 
     #[test]
     fn decode_rejects_unsorted_children() {
-        // Children follow entries: count at 200..204, then 64-byte
+        // Children follow entries: count at 200..204, then 96-byte
         // records. Append a smaller tree id after the 0x10 child.
         let mut bytes = manifest().canonical_bytes();
         bytes[200..204].copy_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&[0x05; 32]);
         bytes.extend_from_slice(&[0x06; 32]);
+        bytes.extend_from_slice(&[0x07; 32]);
         assert_eq!(
             Manifest::from_canonical_bytes(&bytes),
             Err(ManifestError::UnsortedChildren)
@@ -362,9 +381,23 @@ mod tests {
     }
 
     #[test]
-    fn same_content_may_map_several_epochs_canonically() {
-        // Cross-epoch reuse is how dedup survives rotation: one content,
-        // two representations, canonical order by (kind, version).
+    fn child_reference_carries_both_identities() {
+        // The triple: tree identity, manifest logical identity for the
+        // AAD, and sealed storage address for the fetch.
+        let child = &manifest().children[0];
+        assert_eq!(child.tree, ContentId::from_bytes([0x10; 32]));
+        assert_eq!(child.manifest, ContentId::from_bytes([0x20; 32]));
+        assert_eq!(child.storage, StorageId::from_bytes([0x30; 32]));
+        assert_eq!(CHILD_LEN, 96);
+    }
+
+    #[test]
+    fn same_content_may_map_several_kinds_canonically() {
+        // One representation per (content, kind, version): the same
+        // content under two kinds coexists, ordered by the sort key.
+        // Epoch variants do NOT coexist. A manifest selects; dedup
+        // across epochs works through members' manifests, never within
+        // one.
         let mut e1 = entry(0x01, 1);
         let mut e2 = entry(0x01, 2);
         e2.version = 0x00;

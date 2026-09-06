@@ -14,5 +14,6 @@ pub mod control;
 pub mod ingest;
 pub mod keys;
 pub mod membership;
+pub mod runtime;
 pub mod seal;
 pub mod transport;

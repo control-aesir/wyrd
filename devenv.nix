@@ -1,10 +1,12 @@
-{ config, pkgs, inputs, ... }:
+{ pkgs, inputs, ... }:
 let
   inherit (pkgs.lib) optionals;
-  inherit (pkgs.stdenv.hostPlatform) isDarwin isLinux;
+  inherit (pkgs.stdenv.hostPlatform) isLinux;
   unstable = import inputs.nixpkgs-unstable { system = pkgs.stdenv.system; };
 in
 {
+  dotenv.enable = true;
+
   languages.rust.enable = true;
   languages.rust.toolchainFile = ./rust-toolchain.toml;
 
@@ -27,5 +29,16 @@ in
     nixpkgs-fmt.enable = true;
     commitizen.enable = true;
     typos.enable = true;
+
+    review = {
+      enable = true;
+      stages = [ "push" ];
+      entry = "${pkgs.writeShellScriptBin "review" ''
+        if command -v opencode >/dev/null 2>&1; then
+          nohup opencode run --model openrouter/openrouter/free --agent plan "$(cat .agents/prompts/branch-review.md)" \
+            >/dev/null 2>&1 &
+        fi
+      ''}/bin/review";
+    };
   };
 }

@@ -12,3 +12,4 @@
 pub mod authorization;
 pub mod keys;
 pub mod membership;
+pub mod seal;

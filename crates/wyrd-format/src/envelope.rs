@@ -136,6 +136,7 @@ mod tests {
             (ObjectKind::Chunk, b"chunk bytes".to_vec()),
             (ObjectKind::Tree, vec![0x01, 0x02, 0x03]),
             (ObjectKind::Snapshot, vec![0xFF; 40]),
+            (ObjectKind::Manifest, vec![0x07; 82]),
             (ObjectKind::Chunk, Vec::new()),
         ] {
             let env = Envelope {
@@ -172,8 +173,8 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_kind() {
         assert_eq!(
-            Envelope::decode(b"wyrd\x00\x03rest"),
-            Err(EnvelopeError::UnknownKind(3))
+            Envelope::decode(b"wyrd\x00\x04rest"),
+            Err(EnvelopeError::UnknownKind(4))
         );
     }
 

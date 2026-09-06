@@ -10,6 +10,7 @@
 pub mod chunk;
 pub mod envelope;
 pub mod identity;
+pub mod manifest;
 pub mod membership;
 pub mod snapshot;
 pub mod store;
@@ -21,6 +22,7 @@ pub use identity::{
     ContentId, DeviceEncryptionKey, DeviceId, DriveId, ObjectKind, SnapshotId, StorageId,
     TransitionId,
 };
+pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, ENTRY_LEN};
 pub use membership::{Change, MembershipError, MembershipTransition};
 pub use snapshot::Snapshot;
 pub use store::{MemoryObjectStore, ObjectStore};

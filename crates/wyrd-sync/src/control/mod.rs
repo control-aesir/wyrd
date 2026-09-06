@@ -94,13 +94,18 @@ pub struct SealedControl {
 
 /// A control message id: BLAKE3 over the sealed bytes. Identical
 /// deliveries share the id, so replay is a set-membership check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ControlMessageId([u8; 32]);
 
 impl ControlMessageId {
     /// The raw 32 bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Construct an id from raw bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        ControlMessageId(bytes)
     }
 }
 

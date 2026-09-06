@@ -8,9 +8,11 @@
 //!   ‖ AEAD ciphertext
 //! ```
 //!
-//! The AAD is the header itself; the plaintext repeats
-//! `drive ‖ kind ‖ epoch` ahead of the payload, so a forged header fails
-//! either the tag or the inner comparison (the capability-envelope shape).
+//! The AAD is the header minus the nonce (the nonce rides as the AEAD
+//! nonce argument, which is the correct cryptographic placement); the
+//! plaintext repeats `drive ‖ kind ‖ epoch` ahead of the payload, so a
+//! forged header fails either the tag or the inner comparison (the
+//! capability-envelope shape).
 //! The epoch rides the clear header so the receiver picks the right
 //! per-epoch control key; epoch numbers are small integers, not
 //! membership contents, so nothing confidential travels in the clear.
@@ -176,8 +178,11 @@ pub fn seal(
 }
 
 /// Open a sealed message: version, tag over the header AAD, then the
-/// inner header agreement and payload decode. Returns the message with
-/// the drive and epoch it was verified under.
+/// inner header agreement and payload decode. Payloads repeating the
+/// epoch must agree with the envelope epoch — disagreement is a header
+/// mismatch, so a sealed `Invitation { epoch: 3 }` at envelope epoch 5
+/// never opens cleanly for the machines to misread. Returns the message
+/// with the drive and epoch it was verified under.
 pub fn open(
     control_key: &[u8; 32],
     sealed: &SealedControl,
@@ -204,6 +209,21 @@ pub fn open(
         return Err(CryptoError::HeaderMismatch.into());
     }
     let message = Message::decode_payload(sealed.kind, &plaintext[41..])?;
+    // Payloads repeating the epoch are bound to the envelope's: the
+    // duplication lets the machines read the epoch off the payload
+    // without trusting it.
+    let payload_epoch = match &message {
+        Message::Invitation(m) => Some(m.epoch),
+        Message::Capability(m) => Some(m.epoch),
+        Message::MembershipTransition(_) => None,
+        Message::KeyRotation(_) => None,
+        Message::SnapshotAnnouncement(m) => Some(m.epoch),
+    };
+    if let Some(epoch) = payload_epoch {
+        if epoch != sealed.epoch {
+            return Err(CryptoError::HeaderMismatch.into());
+        }
+    }
     Ok((sealed.drive, sealed.epoch, message))
 }
 
@@ -223,6 +243,14 @@ pub enum IngestReport {
 /// opening only with held epoch keys. Failures leave no state behind:
 /// a rejected ingest changes nothing, so hostile bytes are safe to
 /// attempt.
+///
+/// Two lifecycle notes, both acceptable in v0 and stated here so they
+/// stay deliberate: the seen set grows with every accepted message
+/// (bounded by the append-only log; a retention policy rides with GC,
+/// which does not exist yet), and dedupe runs after open — so a
+/// redelivery for an epoch whose key was removed reports UnknownEpoch
+/// rather than Duplicate. v0 never evicts keys, so the coupling is
+/// documented, not exercised.
 ///
 /// [`DriveKeyring`]: crate::keys::DriveKeyring
 #[derive(Debug, Clone)]
@@ -251,10 +279,15 @@ impl ControlInbox {
     }
 
     /// Ingest sealed bytes: decode, scope to this drive, open with the
-    /// held epoch key, dedupe.Wrong-drive, unknown-epoch, and crypto
-    /// failures are errors that mutate nothing.
+    /// held epoch key, dedupe. Error precedence is framing first
+    /// (version, drive), then epoch key, then crypto; dedupe runs last.
+    /// Wrong-drive, unknown-epoch, and crypto failures are errors that
+    /// mutate nothing.
     pub fn ingest(&mut self, sealed_bytes: &[u8]) -> Result<IngestReport, ControlError> {
         let sealed = SealedControl::decode(sealed_bytes)?;
+        if sealed.version != CONTROL_VERSION {
+            return Err(ControlError::UnknownVersion(sealed.version));
+        }
         if sealed.drive != self.drive {
             return Err(ControlError::WrongDrive);
         }
@@ -384,6 +417,39 @@ mod tests {
         // Nothing stuck: both failures left the seen set empty.
         assert!(!inbox.has_seen(&foreign.message_id()));
         assert!(!inbox.has_seen(&future.message_id()));
+    }
+
+    #[test]
+    fn payload_epoch_must_agree_with_the_envelope_epoch() {
+        // A sealed Invitation { epoch: 3 } at envelope epoch 5 must not
+        // open cleanly: the duplication lets the machines read the epoch
+        // off the payload without ever trusting it.
+        let mismatched = Message::Invitation(message::Invitation {
+            inviter: DeviceId::from_bytes([0x01; 32]),
+            invitee: DeviceId::from_bytes([0x02; 32]),
+            epoch: 3,
+            genesis: vec![0xAA; 64],
+            capability: vec![0xBB; 48],
+        });
+        let sealed = seal(&control_key(5), &drive(), 5, &mismatched).unwrap();
+        assert_eq!(
+            open(&control_key(5), &sealed),
+            Err(ControlError::Crypto(CryptoError::HeaderMismatch))
+        );
+    }
+
+    #[test]
+    fn version_errors_precede_epoch_errors() {
+        // Framing first: an unknown version reports UnknownVersion even
+        // when the epoch key is also missing — never UnknownEpoch.
+        let mut inbox = inbox();
+        let mut sealed = seal(&control_key(9), &drive(), 9, &announcement()).unwrap();
+        sealed.version = 0x01;
+        assert_eq!(
+            inbox.ingest(&sealed.encode()),
+            Err(ControlError::UnknownVersion(0x01))
+        );
+        assert!(!inbox.has_seen(&sealed.message_id()));
     }
 
     #[test]

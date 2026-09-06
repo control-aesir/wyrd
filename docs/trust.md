@@ -276,7 +276,8 @@ acts only after machine-side verification.
 Sealed envelope (changing any byte changes every seal — a format
 constant): `version (1) ‖ DriveId (32) ‖ kind (1) ‖ epoch u64 LE ‖ nonce
 (24) ‖ XChaCha20-Poly1305 ciphertext`, with the AAD equal to the header
-and the plaintext repeating `drive ‖ kind ‖ epoch` ahead of the payload
+minus the nonce (which rides as the AEAD nonce argument) and the
+plaintext repeating `drive ‖ kind ‖ epoch` ahead of the payload
 (the capability-envelope shape: forgery fails the tag or the inner
 comparison). The epoch rides the clear header so the receiver picks the
 right key; epoch numbers leak nothing.
@@ -286,7 +287,10 @@ Control seal keys are epoch-scoped derivations, not new custody:
 epoch_secret)` (pinned context, same construction as the manifest and
 object keys). Rotation bounds control traffic exactly like data: a device
 removed at epoch N holds no later control keys. Message ids derive with
-`"wyrd control message id v1"` over the sealed bytes.
+`"wyrd control message id v1"` over the sealed bytes. Payloads repeating
+the epoch (`Invitation`, `Capability`, `SnapshotAnnouncement`) must agree
+with the envelope epoch — `open()` rejects disagreement as a header
+mismatch, so the machines read the epoch without trusting it.
 
 The NIP-46 `sign_message` contract is `request { context string, 32-byte
 digest } → response { 64-byte BIP-340 signature }`; the session exposes
@@ -574,7 +578,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |
 | T13 | Epoch secrets are **escrowed under the root**, per epoch, as sealed records (root-derived key, context `wyrd escrow key v1`, AAD `DriveId ‖ epoch`); escrow, never derivation | root recovery must compose with data recovery: guardians reconstruct the root, unwrap the records, restore every historical epoch secret. T4 stands — no root→epoch derivation path exists |
 | T15 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
-| T16 | Control-plane message set (`Invitation`, `Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, idempotent, replay-safe sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header, plaintext repeats the header); epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); NIP-46 `sign_message` is `request { context, digest } → response { signature }` | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
+| T16 | Control-plane message set (`Invitation`, `Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, idempotent, replay-safe sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; NIP-46 `sign_message` is `request { context, digest } → response { signature }` | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
 
 ## Open questions
 

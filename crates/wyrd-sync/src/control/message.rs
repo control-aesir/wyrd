@@ -143,7 +143,7 @@ impl Message {
     pub fn encode_payload(&self) -> Vec<u8> {
         match self {
             Message::Invitation(m) => {
-                let mut out = Vec::with_capacity(72 + m.genesis.len() + m.capability.len());
+                let mut out = Vec::with_capacity(80 + m.genesis.len() + m.capability.len());
                 out.extend_from_slice(m.inviter.as_bytes());
                 out.extend_from_slice(m.invitee.as_bytes());
                 out.extend_from_slice(&m.epoch.to_le_bytes());
@@ -152,7 +152,7 @@ impl Message {
                 out
             }
             Message::Capability(m) => {
-                let mut out = Vec::with_capacity(40 + m.wrapped.len());
+                let mut out = Vec::with_capacity(44 + m.wrapped.len());
                 out.extend_from_slice(m.device.as_bytes());
                 out.extend_from_slice(&m.epoch.to_le_bytes());
                 push_blob(&mut out, &m.wrapped);

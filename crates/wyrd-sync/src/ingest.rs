@@ -101,12 +101,12 @@ pub enum IngestError {
     Envelope(#[from] EnvelopeError),
 }
 
-fn check_count(limits_max: usize, what: &'static str, count: usize) -> Result<(), IngestError> {
-    if count > limits_max {
+fn check_count(max_allowed: usize, what: &'static str, count: usize) -> Result<(), IngestError> {
+    if count > max_allowed {
         return Err(IngestError::TooMany {
             what,
             count,
-            max: limits_max,
+            max: max_allowed,
         });
     }
     Ok(())
@@ -183,14 +183,17 @@ pub fn check_tree(limits: &Limits, tree: &Tree) -> Result<(), IngestError> {
     Ok(())
 }
 
-/// Raw chunk payload length against the ceiling (chunks split at or under
-/// the format maximum; anything larger inbound is hostile).
-pub fn check_chunk_len(limits: &Limits, len: usize) -> Result<(), IngestError> {
-    if len > limits.max_chunk_bytes {
+/// Raw chunk payload length against the payload ceiling (chunks split at
+/// or under the format maximum; anything larger inbound is hostile). This
+/// is the payload bound, not the envelope bound: the header rides outside
+/// it, unlike in [`accept_envelope`].
+pub fn check_chunk_len(limits: &Limits, payload_len: usize) -> Result<(), IngestError> {
+    let max = limits.max_chunk_bytes.saturating_sub(HEADER_LEN);
+    if payload_len > max {
         return Err(IngestError::TooLarge {
             what: "chunk",
-            bytes: len,
-            max: limits.max_chunk_bytes,
+            bytes: payload_len,
+            max,
         });
     }
     Ok(())
@@ -456,6 +459,18 @@ mod tests {
             Limits::V0.max_manifest_entries * ENTRY_LEN + 40 < Limits::V0.max_object_bytes,
             "entry ceiling must be encodable within the byte ceiling"
         );
+        // Child references are fixed 64 bytes (tree id plus storage id):
+        // the child ceiling must likewise fit the byte ceiling.
+        assert!(
+            Limits::V0.max_manifest_children * 64 + 40 < Limits::V0.max_object_bytes,
+            "child ceiling must be encodable within the byte ceiling"
+        );
+        // Minimal tree entries are ~19 bytes (one-byte name, empty chunk
+        // list), so the tree ceiling stays reachable for flat dirs too.
+        assert!(
+            Limits::V0.max_tree_entries * 19 + 4 < Limits::V0.max_object_bytes,
+            "tree ceiling must be encodable within the byte ceiling"
+        );
     }
 
     #[test]
@@ -469,10 +484,17 @@ mod tests {
                 max: 1024,
             })
         );
-        assert!(check_chunk_len(&SMALL, 128).is_ok());
-        assert!(matches!(
-            check_chunk_len(&SMALL, 129),
-            Err(IngestError::TooLarge { what: "chunk", .. })
-        ));
+        assert!(check_chunk_len(&SMALL, SMALL.max_chunk_bytes - HEADER_LEN).is_ok());
+        // The payload ceiling excludes the envelope header: one byte
+        // over the payload bound fails even though the total still fits
+        // the (larger) envelope ceiling.
+        assert_eq!(
+            check_chunk_len(&SMALL, SMALL.max_chunk_bytes - HEADER_LEN + 1),
+            Err(IngestError::TooLarge {
+                what: "chunk",
+                bytes: SMALL.max_chunk_bytes - HEADER_LEN + 1,
+                max: SMALL.max_chunk_bytes - HEADER_LEN,
+            })
+        );
     }
 }

@@ -9,8 +9,6 @@
 //! doc): every test in this module runs against an in-memory fake
 //! holding a real secp256k1 key, never a network.
 
-#[cfg(test)]
-use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
 use thiserror::Error;
 use wyrd_format::DeviceId;
 
@@ -40,6 +38,7 @@ pub trait SignerSession {
 pub(crate) mod fake {
     use super::*;
     use crate::control::nip46::SignDomain;
+    use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
     use std::collections::HashSet;
 
     /// An in-process signer holding a real secp256k1 key: a stand-in
@@ -48,14 +47,14 @@ pub(crate) mod fake {
     /// refuses every request, matching the real session's posture.
     pub(crate) struct FakeSignerSession {
         keypair: Keypair,
-        allowed: HashSet<u8>,
+        allowed: HashSet<SignDomain>,
     }
 
     impl FakeSignerSession {
         pub(crate) fn new(secret: &secp256k1::SecretKey, allowed: &[SignDomain]) -> Self {
             FakeSignerSession {
                 keypair: Keypair::from_secret_key(SECP256K1, secret),
-                allowed: allowed.iter().map(|d| d.byte()).collect(),
+                allowed: allowed.iter().copied().collect(),
             }
         }
     }
@@ -70,7 +69,7 @@ pub(crate) mod fake {
             &self,
             request: SignMessageRequest,
         ) -> Result<SignMessageResponse, SignerError> {
-            if !self.allowed.contains(&request.domain.byte()) {
+            if !self.allowed.contains(&request.domain) {
                 return Err(SignerError::Refused);
             }
             let signature = SECP256K1
@@ -86,7 +85,6 @@ mod tests {
     use super::fake::FakeSignerSession;
     use super::*;
     use crate::control::nip46::SignDomain;
-    use secp256k1::SECP256K1;
     use wyrd_format::DriveId;
 
     fn secret() -> secp256k1::SecretKey {
@@ -108,6 +106,7 @@ mod tests {
             .sign_message(request(SignDomain::SnapshotV1))
             .unwrap();
         let sig = secp256k1::schnorr::Signature::from_slice(&response.signature).unwrap();
+        use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
         let kp = Keypair::from_secret_key(SECP256K1, &secret());
         let (pk, _) = XOnlyPublicKey::from_keypair(&kp);
         assert!(SECP256K1

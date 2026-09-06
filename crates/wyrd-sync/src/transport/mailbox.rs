@@ -45,17 +45,27 @@ fn nostr_secret(sk: &SecretKey) -> Result<NostrSecretKey, MailboxError> {
     NostrSecretKey::from_slice(&sk.secret_bytes()).map_err(|_| MailboxError::InvalidKey)
 }
 
+fn device_id_from_secret(secret: &SecretKey) -> DeviceId {
+    let kp = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, secret);
+    let (xonly, _) = secp256k1::XOnlyPublicKey::from_keypair(&kp);
+    DeviceId::from_bytes(xonly.serialize())
+}
+
 /// Seal Wyrd control bytes (`SealedControl::encode()` or
 /// `SealedBootstrap::encode()`) for one recipient under NIP-44, using
-/// the sender's Nostr identity secret key as the ECDH source.
+/// the sender's Nostr identity secret key as the ECDH source. The sender
+/// identity is derived from the same secret so the relay-visible metadata
+/// cannot lie about who sealed the envelope.
 pub fn seal_for_recipient(
     sender_secret: &SecretKey,
-    sender: DeviceId,
     recipient: DeviceId,
     control_bytes: &[u8],
 ) -> Result<MailboxEnvelope, MailboxError> {
     let sk = nostr_secret(sender_secret)?;
+    let sender = device_id_from_secret(sender_secret);
     let pk = NostrPublicKey::from_byte_array(*recipient.as_bytes());
+    // Fresh 32-byte nonces keep NIP-44 v2 conversations from reusing a
+    // payload nonce under the same ECDH-derived conversation key.
     let mut nonce_bytes = [0u8; 32];
     random_bytes(&mut nonce_bytes).map_err(|_| MailboxError::Crypto)?;
     let ciphertext =
@@ -71,14 +81,20 @@ pub fn seal_for_recipient(
 /// Open a mailbox envelope with the recipient's Nostr identity secret
 /// key, returning the Wyrd control bytes underneath — still sealed
 /// under the control envelope; hand them to [`ControlInbox::ingest`] or
-/// [`open_bootstrap`].
+/// [`open_bootstrap`]. The caller supplies the expected recipient so a
+/// misdelivered envelope can fail with an addressing error before the
+/// AEAD path.
 ///
 /// [`ControlInbox::ingest`]: crate::control::ControlInbox::ingest
 /// [`open_bootstrap`]: crate::control::bootstrap::open_bootstrap
 pub fn open_from_sender(
     recipient_secret: &SecretKey,
+    expected_recipient: DeviceId,
     envelope: &MailboxEnvelope,
 ) -> Result<Vec<u8>, MailboxError> {
+    if envelope.recipient != expected_recipient {
+        return Err(MailboxError::Crypto);
+    }
     let sk = nostr_secret(recipient_secret)?;
     let pk = NostrPublicKey::from_byte_array(*envelope.sender.as_bytes());
     nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).map_err(|_| MailboxError::Crypto)
@@ -166,29 +182,28 @@ mod tests {
             }),
         )
         .unwrap();
-        let envelope = seal_for_recipient(&sender_sk, sender, recipient, &sealed.encode()).unwrap();
-        let opened = open_from_sender(&recipient_sk, &envelope).unwrap();
+        let envelope = seal_for_recipient(&sender_sk, recipient, &sealed.encode()).unwrap();
+        let opened = open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
         assert_eq!(opened, sealed.encode());
     }
 
     #[test]
     fn wrong_recipient_secret_cannot_open() {
-        let (sender_sk, sender) = identity(0x01);
+        let (sender_sk, _sender) = identity(0x01);
         let (_, recipient) = identity(0x02);
         let (wrong_sk, _) = identity(0x03);
-        let envelope = seal_for_recipient(&sender_sk, sender, recipient, b"control bytes").unwrap();
+        let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
         assert_eq!(
-            open_from_sender(&wrong_sk, &envelope),
+            open_from_sender(&wrong_sk, recipient, &envelope),
             Err(MailboxError::Crypto)
         );
     }
 
     #[test]
     fn tampered_ciphertext_fails_to_open() {
-        let (sender_sk, sender) = identity(0x01);
+        let (sender_sk, _sender) = identity(0x01);
         let (recipient_sk, recipient) = identity(0x02);
-        let mut envelope =
-            seal_for_recipient(&sender_sk, sender, recipient, b"control bytes").unwrap();
+        let mut envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
         // Flip a byte in the base64 payload body (well past the version
         // quantum), so decode still succeeds but the AEAD tag fails.
         let mut bytes = envelope.ciphertext.into_bytes();
@@ -196,7 +211,7 @@ mod tests {
         bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
         envelope.ciphertext = String::from_utf8(bytes).unwrap();
         assert_eq!(
-            open_from_sender(&recipient_sk, &envelope),
+            open_from_sender(&recipient_sk, recipient, &envelope),
             Err(MailboxError::Crypto)
         );
     }
@@ -218,7 +233,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let envelope = seal_for_recipient(&sender_sk, sender, recipient, &sealed.encode()).unwrap();
+        let envelope = seal_for_recipient(&sender_sk, recipient, &sealed.encode()).unwrap();
 
         let mut sender_mailbox = MemoryMailbox {
             relay: &mut relay,
@@ -233,7 +248,7 @@ mod tests {
         let received = recipient_mailbox.recv().expect("envelope delivered");
         assert!(recipient_mailbox.recv().is_none(), "queue drained once");
 
-        let control_bytes = open_from_sender(&recipient_sk, &received).unwrap();
+        let control_bytes = open_from_sender(&recipient_sk, recipient, &received).unwrap();
         let mut inbox = ControlInbox::new(drive());
         inbox.add_epoch_key(5, control_key(5));
         assert!(matches!(
@@ -245,10 +260,34 @@ mod tests {
     }
 
     #[test]
+    fn recv_returns_none_without_draining_other_recipients() {
+        let (sender_sk, sender) = identity(0x01);
+        let (recipient_sk, recipient) = identity(0x02);
+        let (_, other) = identity(0x03);
+        let mut relay = MemoryRelay::default();
+        let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        relay.queue.push_back(envelope);
+
+        let mut other_mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: other,
+        };
+        assert!(other_mailbox.recv().is_none());
+
+        let mut recipient_mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: recipient,
+        };
+        assert!(recipient_mailbox.recv().is_some());
+        let _ = sender;
+        let _ = recipient_sk;
+    }
+
+    #[test]
     fn bootstrap_invitation_round_trips_through_the_mailbox_seal_too() {
         // Bootstrap travels its own framing (control::bootstrap), but
         // the mailbox seal wrapping it is the same NIP-44 layer.
-        let (owner_sk, owner) = identity(0x0A);
+        let (owner_sk, _owner) = identity(0x0A);
         let (device_sk, device) = identity(0x0B);
         let enc_secret = SecretKey::from_slice(&[0x30; 32]).unwrap();
         let enc_kp = Keypair::from_secret_key(SECP256K1, &enc_secret);
@@ -275,12 +314,23 @@ mod tests {
             cap.as_bytes(),
         )
         .unwrap();
-        let envelope =
-            seal_for_recipient(&owner_sk, owner, device, &sealed_bootstrap.encode()).unwrap();
-        let opened_bytes = open_from_sender(&device_sk, &envelope).unwrap();
+        let envelope = seal_for_recipient(&owner_sk, device, &sealed_bootstrap.encode()).unwrap();
+        let opened_bytes = open_from_sender(&device_sk, device, &envelope).unwrap();
         let parsed = SealedBootstrap::decode(&opened_bytes).unwrap();
         let invitation = open_bootstrap(&enc_secret, &parsed).unwrap();
         assert_eq!(invitation.invitee, device);
         assert_eq!(invitation.capability, cap.as_bytes());
+    }
+
+    #[test]
+    fn misdelivered_envelope_is_rejected_before_decrypt() {
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let (_, other) = identity(0x03);
+        let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        assert_eq!(
+            open_from_sender(&sender_sk, other, &envelope),
+            Err(MailboxError::Crypto)
+        );
     }
 }

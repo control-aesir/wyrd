@@ -146,7 +146,7 @@ transitions are sealed documents, not content-addressed objects."
 define_id!(
     DeviceEncryptionKey,
     "The x-only secp256k1 public key used for capability-ECDH delivery of
-epoch secrets (trust.md T15). Registered in the membership transition
+epoch secrets (trust.md T14). Registered in the membership transition
 that admits the device; owned as a secret only in the device's own
 keystore. Distinct from DeviceId by type: the identity key signs, the
 encryption key receives."

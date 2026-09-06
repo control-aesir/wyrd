@@ -308,7 +308,7 @@ will ride on iroh-blobs' verified streaming rather than duplicating it).
 2. Manifest partition encoding details (sharding, chunked transfer of large
    manifests).
 3. Live-view conflict naming (e.g. by author id / snapshot timestamp).
-4. Gossip message framing for snapshot announcements.
+4. Gossip (iroh-gossip) framing for snapshot announcements (announcement encoding pinned in `wyrd-sync/src/control/`).
 5. Chunk-size parameters (benchmark before the v1 freeze).
 
 ## Decision record

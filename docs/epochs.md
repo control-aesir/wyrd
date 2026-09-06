@@ -80,7 +80,8 @@ order, duplicates removed (object-model.md, decision 18).
 
 Change application (`apply(state, changes)`), pinned semantics:
 
-- `Admit(d)` requires `d ∉ members`. `Remove(d)` requires `d ∈ members`
+- `Admit(d, k)` requires `d ∉ members` and registers `k` as the device's
+  delivery encryption key. `Remove(d)` requires `d ∈ members`
   and removes `d` from **members**; removing a device who is an owner is
   allowed only when they are the **sole owner** — the owner set empties
   with them (valid and terminal, per the terminal-state rule below). An
@@ -108,7 +109,8 @@ A transition is **valid** iff:
 2. `apply(state(prev), changes) == (members_root, owners_root)` — the
    resulting roots are **derived, not independently authoritative**; the
    verifier recomputes them. Change rules:
-   - `Admit(d)` requires `d ∉ members`; `Remove(d)` requires `d ∈ members`.
+   - `Admit(d, k)` requires `d ∉ members` and registers `k` as the
+     device's delivery encryption key; `Remove(d)` requires `d ∈ members`.
    - `SetOwners(D)` requires `|D| == 1` in **v0** (singleton ownership;
      multi-owner is a later extension that relaxes exactly this rule) and
      the device must be a member. Owners are a subset of members.
@@ -217,8 +219,8 @@ A **capability** delivered to a member of epoch N:
    owner-ephemeral key and the recipient device's registered encryption
    key (HKDF to
    the AEAD key — the encryption key is a secp256k1 key like the signing
-   keys, so the same ECDH construction applies; the exact instantiation lands with the
-   control-plane implementation) with associated data
+   keys, so the same ECDH construction applies; the exact instantiation
+   is implemented in `wyrd-sync/src/control/`) with associated data
    `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
    recipient encryption key || transition_id || epoch` — the AAD binds the context; the ECDH-wrapped
   AEAD is what actually authenticates the recipient. A capability cannot be

@@ -87,9 +87,12 @@ Hard-won operational rules:
 
 ## Current status
 
-Pre-alpha: crate skeletons, typed identities + `ObjectStore` (`wyrd-format`),
-normative v0 format spec, normative trust + epochs contracts. Sync-layer
-implementation is unlocked: crypto and membership work must follow
-`trust.md` and `epochs.md` as normative contracts. Next, in order: implement
-the canonical encoding and snapshot DAG in `wyrd-format` (the
-`object-model.md` decision record is the contract).
+Pre-alpha. `wyrd-format` implements identities, canonical codecs,
+chunking, trees, snapshots, manifests, and membership transition
+documents; `wyrd-sync` implements the membership state machine, snapshot
+authorization, epoch keys, capabilities, object sealing, escrow records,
+the control-plane message set, and ingest limits — covered by example,
+conformance, and generative suites with commit hooks clean. `wyrd-fuse`
+is still a skeleton. All crypto and sync work follows `trust.md` and
+`epochs.md` as normative contracts; the open tracking issues name what
+comes next (transport wiring, recovery completion).

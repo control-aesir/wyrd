@@ -80,11 +80,13 @@ Wyrd mounts via **FUSE** to present standard filesystem interfaces:
 
 ## Status
 
-Pre-alpha. Wyrd is in design. The v0 format spec (`docs/object-model.md`) and
-the trust + epoch contracts (`docs/trust.md`, `docs/epochs.md`) are normative;
-the sync/peer protocol is specified but not yet implemented. The initial
-implementation scope is deliberately small: a content-addressed store, the
-snapshot DAG, and one vault peer. Garbage collection comes later.
+Pre-alpha. The v0 format spec (`docs/object-model.md`) and the trust +
+epoch contracts (`docs/trust.md`, `docs/epochs.md`) are normative, and the
+format and sync layers implement them: content-addressed store, snapshot
+DAG, membership and authorization engines, epoch keys and capabilities,
+sealed objects and manifests, escrow records, the control-plane message
+set, and ingest limits. Transports (mailbox, bulk data), FUSE mounting,
+and garbage collection come later.
 
 ---
 
@@ -131,6 +133,6 @@ cargo check
 cargo test
 ```
 
-The crates are skeletons; `crates/wyrd-format` is where implementation
-starts (the `docs/object-model.md` decision record is the contract).
-Mounting arrives with `crates/wyrd-fuse`.
+`crates/wyrd-format` carries the format contract and `crates/wyrd-sync`
+the cryptography and state machines (both under test); mounting arrives
+with `crates/wyrd-fuse`, still a skeleton.

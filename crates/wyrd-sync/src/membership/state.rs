@@ -17,7 +17,7 @@ fn admit_change(pattern: u8) -> Change {
 }
 
 /// The member and owner sets at one point in the transition chain, plus
-/// each member's registered **device encryption key** (trust.md T15: the
+/// each member's registered **device encryption key** (trust.md T14: the
 /// capability-ECDH target, carried by the Admit transition). Owners are
 /// always a subset of members (enforced by [`apply`]); the set roots
 /// cover the identity keys only — encryption keys ride along as device
@@ -53,7 +53,7 @@ pub enum ApplyError {
 /// non-member).
 impl MembershipState {
     /// The registered encryption key of a member, used to mint a new
-    /// capability (trust.md T15): the capability targets the registered
+    /// capability (trust.md T14): the capability targets the registered
     /// key, never the caller's guess.
     pub fn encryption_key_of(&self, device: &DeviceId) -> Option<&DeviceEncryptionKey> {
         self.encryption_keys.get(device)
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn remove_then_admit_same_device_in_one_transition_is_rejected() {
-        // v0 has no encryption-key rotation (trust.md T15): replacing a
+        // v0 has no encryption-key rotation (trust.md T14): replacing a
         // device means a removal transition followed by a later admission.
         // A same-transition remove+admit would silently re-key the device's
         // future capability deliveries.

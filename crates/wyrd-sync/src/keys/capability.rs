@@ -43,7 +43,7 @@ pub(crate) const CAPABILITY_AAD_DOMAIN: &[u8] = b"wyrd capability v1";
 
 /// One device's right to decrypt: the epoch secrets `1..=N`, bound to the
 /// membership transition that authorizes them. The identity and delivery
-/// questions are separate keys (trust.md T15): `device` names the device
+/// questions are separate keys (trust.md T14): `device` names the device
 /// (the Nostr identity key, AAD-bound), `encryption_key` is the
 /// registered ECDH target the secrets actually travel to. The vector
 /// index is the epoch minus one, so sparse ranges (e.g. `3..=5` without
@@ -99,7 +99,7 @@ impl Capability {
                 carried,
             });
         }
-        // lift_x: the claimed key must be a real curve point (T15).
+        // lift_x: the claimed key must be a real curve point (T14).
         if XOnlyPublicKey::from_slice(encryption_key.as_bytes()).is_err() {
             return Err(CapabilityError::InvalidEncryptionKey);
         }
@@ -211,7 +211,7 @@ pub struct WrappedCapability {
 
 impl WrappedCapability {
     /// Open with the device's **encryption** secret (not its Nostr
-    /// identity key — see trust.md T15). Tampering with any AAD input in
+    /// identity key — see trust.md T14). Tampering with any AAD input in
     /// the header (drive, device, encryption key, transition, epoch)
     /// fails the AEAD tag; a header that does not match the plaintext
     /// fails the inner comparison.
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn new_rejects_an_encryption_key_that_is_not_a_curve_point() {
-        // T15: the lift_x check at construction time. 0xFF is never a
+        // T14: the lift_x check at construction time. 0xFF is never a
         // valid x-only secp256k1 point, so an envelope built from it must
         // not even form.
         let (_, device) = key(5);

@@ -19,7 +19,7 @@ to. The README carries the vision; `docs/` carries the current design contract.
 ## Hard rules
 
 - `wyrd-format` must not gain networking, async, or FUSE dependencies.
-  Allowed: blake3, hex, thiserror, serde (when serialization lands).
+  Allowed: blake3, hex, thiserror, fastcdc, serde (when serialization lands).
 - `wyrd-format` is the plaintext world: keys, ciphertext, and manifests live
   in `wyrd-sync`. Content IDs never reach vault-visible metadata.
 - Objects are immutable; never mutate stored content in place; `put` of

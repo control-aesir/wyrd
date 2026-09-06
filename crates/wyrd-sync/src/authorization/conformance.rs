@@ -3,6 +3,7 @@
 
 use super::test_util::{sign_snapshot, tree_id, Fixture};
 use super::*;
+use crate::membership::test_util::admit;
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT};
 use wyrd_format::{Change, DeviceId, SnapshotId, TransitionId};
 
@@ -193,7 +194,7 @@ fn contested_transition_reference_is_pending() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![Change::Admit(second)];
+    fork.changes = vec![admit(second)];
     fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     f.log.observe(a);
@@ -233,7 +234,7 @@ fn voided_branch_reference_is_voided() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![Change::Admit(second)];
+    fork.changes = vec![admit(second)];
     fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     // Resolution: prev = a (winner), resolves = fork (voided).
@@ -269,7 +270,7 @@ fn stale_fork_becomes_superseded_when_the_log_advances() {
     let id_s2 = observe(&mut dag, &s2);
     // Log advances to epoch 2 (a membership change).
     let (_sk, member) = f.device(3);
-    f.membership(vec![Change::Admit(member)]);
+    f.membership(vec![admit(member)]);
     // New work at epoch 2 on the first head.
     let s3 = f.owner_snapshot(vec![id_s1], tree_id(4));
     let id_s3 = observe(&mut dag, &s3);
@@ -293,7 +294,7 @@ fn building_on_dead_ancestry_strands_the_work() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![Change::Admit(second)];
+    fork.changes = vec![admit(second)];
     fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
@@ -392,7 +393,7 @@ fn merge_including_a_stranded_head_is_stranded() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![Change::Admit(second)];
+    fork.changes = vec![admit(second)];
     fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
@@ -454,7 +455,7 @@ fn recovery_snapshot_by_the_owner_with_eligible_parents_is_eligible() {
 fn recovery_snapshot_by_a_non_owner_is_rejected() {
     let mut f = Fixture::new(1);
     let (_sk, member) = f.device(2);
-    f.membership(vec![Change::Admit(member)]);
+    f.membership(vec![admit(member)]);
     let mut dag = SnapshotDag::new(f.drive);
     let base = f.owner_snapshot(Vec::new(), tree_id(1));
     let id_base = observe(&mut dag, &base);
@@ -481,7 +482,7 @@ fn recovery_parenting_a_stranded_head_is_rejected() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![Change::Admit(second)];
+    fork.changes = vec![admit(second)];
     fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
@@ -560,7 +561,7 @@ fn recovery_parent_that_dies_in_the_fixed_point_is_rejected() {
     // optimistic seed.
     let mut f = Fixture::new(1);
     let (_sk, member) = f.device(2);
-    f.membership(vec![Change::Admit(member)]); // K = 2
+    f.membership(vec![admit(member)]); // K = 2
     let mut dag = SnapshotDag::new(f.drive);
     // base at the current epoch.
     let base = f.owner_snapshot(Vec::new(), tree_id(1));
@@ -598,13 +599,13 @@ fn classification_is_arrival_order_independent() {
     let h1 = f.owner_snapshot(vec![base.snapshot_id()], tree_id(2));
     let stale = f.owner_snapshot(vec![base.snapshot_id()], tree_id(3));
     let (_sk, member) = f.device(3);
-    f.membership(vec![Change::Admit(member)]);
+    f.membership(vec![admit(member)]);
     let live = f.owner_snapshot(vec![h1.snapshot_id()], tree_id(4));
     // Stranded work: on a snapshot bound to a voided transition.
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![Change::Admit(second)];
+    fork.changes = vec![admit(second)];
     fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);

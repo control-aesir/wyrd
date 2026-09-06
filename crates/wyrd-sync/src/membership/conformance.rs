@@ -4,10 +4,11 @@
 //! happy-path chains come from [`Builder`], everything else is hand-built
 //! with struct literals and signed explicitly.
 
-use super::test_util::{drive, key, sign, Builder};
+use super::test_util::{admit, drive, key, sign, Builder};
 use super::*;
 use std::collections::BTreeSet;
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::DeviceEncryptionKey;
 use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 
 /// Hand-build a signed transition against the builder's drive and owner
@@ -276,7 +277,7 @@ fn author_made_owner_by_the_transition_is_invalid() {
         2,
         Some(genesis.transition_id()),
         Vec::new(),
-        vec![Change::Admit(member), Change::SetOwners(vec![member])],
+        vec![admit(member), Change::SetOwners(vec![member])],
         &[owner, member],
         &[member],
     );
@@ -374,15 +375,68 @@ fn invalid_setowners_cases() {
 }
 
 #[test]
+fn invalid_encryption_key_is_invalid() {
+    // The Admit payload's encryption key must be a real curve point: a
+    // garbage key would make the device uncapability-able forever.
+    let (b, genesis) = Builder::genesis(1);
+    let owner = *b.owners.iter().next().unwrap();
+    let (_sk2, member) = key(2);
+    let t = signed(
+        &b,
+        2,
+        Some(genesis.transition_id()),
+        Vec::new(),
+        vec![Change::Admit(wyrd_format::membership::Admission {
+            device: member,
+            encryption_key: DeviceEncryptionKey::from_bytes([0xFF; 32]), // not a curve point
+        })],
+        &[owner, member],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&genesis, &t]);
+    assert_eq!(
+        log.status(&t.transition_id()),
+        Some(TransitionStatus::Invalid(InvalidReason::BadChanges))
+    );
+}
+
+#[test]
 fn duplicate_admission_is_invalid() {
     let (mut b, genesis) = Builder::genesis(1);
     let (_sk2, m) = key(2);
-    let admitted = b.child(vec![Change::Admit(m)]); // valid epoch 2
-    let dup = b.child(vec![Change::Admit(m), Change::Admit(m)]);
+    let admitted = b.child(vec![admit(m)]); // valid epoch 2
+    let dup = b.child(vec![admit(m), admit(m)]);
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&genesis, &admitted, &dup]);
     assert_eq!(
         log.status(&dup.transition_id()),
+        Some(TransitionStatus::Invalid(InvalidReason::BadChanges))
+    );
+}
+
+#[test]
+fn remove_then_admit_same_device_is_invalid() {
+    // Encryption-key rotation is not expressible as a same-transition
+    // remove+admit (epochs.md Layer 1): the machine must reject it even
+    // though each change is individually well-formed.
+    let (mut b, genesis) = Builder::genesis(1);
+    let owner = *b.owners.iter().next().unwrap();
+    let (_sk2, m) = key(2);
+    let admitted = b.child(vec![admit(m)]); // valid epoch 2
+    let t = signed(
+        &b,
+        3,
+        Some(admitted.transition_id()),
+        Vec::new(),
+        vec![Change::Remove(m), admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&genesis, &admitted, &t]);
+    assert_eq!(
+        log.status(&t.transition_id()),
         Some(TransitionStatus::Invalid(InvalidReason::BadChanges))
     );
 }
@@ -479,7 +533,7 @@ fn declared_root_mismatch_is_invalid() {
         2,
         Some(genesis.transition_id()),
         Vec::new(),
-        vec![Change::Admit(m)],
+        vec![admit(m)],
         &[], // declared roots lie: the change admits a member
         &[owner],
     );
@@ -543,7 +597,7 @@ fn forked_chain() -> (
         2,
         Some(genesis.transition_id()),
         Vec::new(),
-        vec![Change::Admit(second)],
+        vec![admit(second)],
         &[owner, second],
         &[owner],
     );

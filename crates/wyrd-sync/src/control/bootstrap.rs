@@ -311,6 +311,8 @@ pub fn open_bootstrap(
             // Blob bytes plus the trailing owner signature must be present.
             return Err(CryptoError::Malformed.into());
         }
+        // Decoders must not trust declared lengths for allocation:
+        // cap the pre-allocation, then bounds-check the copy.
         let mut out = Vec::with_capacity(n.min(1 << 20));
         out.extend_from_slice(&plaintext[*pos..*pos + n]);
         *pos += n;

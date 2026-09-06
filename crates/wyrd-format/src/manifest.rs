@@ -54,7 +54,8 @@ use thiserror::Error;
 /// Canonical length of one encoded entry: 32 + 1 + 1 + 32 + 8 + 8.
 pub const ENTRY_LEN: usize = 82;
 
-/// Canonical length of one encoded child reference: 32 + 32 + 32.
+/// Canonical length of one encoded child reference: tree (32) +
+/// child manifest ContentId (32) + sealed child StorageId (32).
 pub const CHILD_LEN: usize = 96;
 
 /// One content→storage mapping: the logical object, the sealed

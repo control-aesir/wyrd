@@ -15,7 +15,7 @@
 //! prev:         u8 flag (0x00 absent, 0x01 present) + TransitionId
 //! resolves:     u32 LE count + TransitionIds (voided sibling branches)
 //! changes:      u32 LE count + tagged changes:
-//!               0x00 Admit(d)      + DeviceId
+//!               0x00 Admit(a)      + DeviceId + encryption key
 //!               0x01 Remove(d)     + DeviceId
 //!               0x02 Rotate()      (no payload)
 //!               0x03 SetOwners(D)  + u32 LE count + DeviceIds
@@ -29,7 +29,7 @@
 //! non-empty well-formed changes, derive-the-roots, author authority) is
 //! the membership state machine's job.
 
-use crate::identity::{DeviceId, DriveId, TransitionId};
+use crate::identity::{DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
 use thiserror::Error;
 
 /// Context for deriving member-set roots. A format constant (epochs.md,
@@ -56,11 +56,22 @@ pub fn set_root(context: &'static str, devices: &[DeviceId]) -> [u8; 32] {
     blake3::derive_key(context, &bytes)
 }
 
+/// What `Admit` registers: the device's Nostr identity key (the
+/// `DeviceId`) and its **device encryption key**: the x-only pubkey
+/// capability wrapping ECDH targets (trust.md T15). Two keys, two
+/// questions: identity signs, encryption receives secrets. The distinct
+/// type (`DeviceEncryptionKey`) prevents swapping them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    pub device: DeviceId,
+    pub encryption_key: DeviceEncryptionKey,
+}
+
 /// Canonical tag byte for each change kind (object-model.md decision
 /// record): Admit, Remove, Rotate, SetOwners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Admit(DeviceId),
+    Admit(Admission),
     Remove(DeviceId),
     Rotate,
     SetOwners(Vec<DeviceId>),
@@ -142,7 +153,11 @@ impl MembershipTransition {
         for change in &self.changes {
             out.push(change.tag());
             match change {
-                Change::Admit(device) | Change::Remove(device) => {
+                Change::Admit(admission) => {
+                    out.extend_from_slice(admission.device.as_bytes());
+                    out.extend_from_slice(admission.encryption_key.as_bytes());
+                }
+                Change::Remove(device) => {
                     out.extend_from_slice(device.as_bytes());
                 }
                 Change::Rotate => {}
@@ -231,15 +246,21 @@ impl MembershipTransition {
             let tag = bytes[pos];
             pos += 1;
             let change = match tag {
-                0x00 | 0x01 => {
+                0x00 => {
+                    need(pos, 64)?;
+                    let device = DeviceId::from_bytes(id32(pos));
+                    let encryption_key = DeviceEncryptionKey::from_bytes(id32(pos + 32));
+                    pos += 64;
+                    Change::Admit(Admission {
+                        device,
+                        encryption_key,
+                    })
+                }
+                0x01 => {
                     need(pos, 32)?;
                     let device = DeviceId::from_bytes(id32(pos));
                     pos += 32;
-                    if tag == 0x00 {
-                        Change::Admit(device)
-                    } else {
-                        Change::Remove(device)
-                    }
+                    Change::Remove(device)
                 }
                 0x02 => Change::Rotate,
                 0x03 => {
@@ -299,6 +320,13 @@ mod tests {
         DeviceId::from_bytes([pattern; 32])
     }
 
+    fn admission(pattern: u8) -> Admission {
+        Admission {
+            device: device(pattern),
+            encryption_key: DeviceEncryptionKey::from_bytes([pattern ^ 0xA5; 32]),
+        }
+    }
+
     fn transition_id(pattern: u8) -> TransitionId {
         TransitionId::from_bytes([pattern; 32])
     }
@@ -318,7 +346,7 @@ mod tests {
 
     #[test]
     fn change_tags_match_the_decision_record() {
-        assert_eq!(Change::Admit(device(1)).tag(), 0x00);
+        assert_eq!(Change::Admit(admission(1)).tag(), 0x00);
         assert_eq!(Change::Remove(device(1)).tag(), 0x01);
         assert_eq!(Change::Rotate.tag(), 0x02);
         assert_eq!(Change::SetOwners(vec![device(1)]).tag(), 0x03);
@@ -404,7 +432,7 @@ mod tests {
         let mut t = sample();
         t.resolves = vec![transition_id(0x50), transition_id(0x51)];
         t.changes = vec![
-            Change::Admit(device(0x60)),
+            Change::Admit(admission(0x60)),
             Change::Remove(device(0x61)),
             Change::SetOwners(vec![device(0x62)]),
         ];
@@ -508,5 +536,73 @@ mod setowners_tests {
         assert_eq!(&pre[10..14], &2u32.to_le_bytes(), "owner vector count");
         assert_eq!(pre[14], 0x01, "first device's first byte");
         assert_eq!(pre[14 + 32], 0x02, "second device's first byte");
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn admission(pattern: u8) -> Admission {
+        Admission {
+            device: DeviceId::from_bytes([pattern; 32]),
+            encryption_key: DeviceEncryptionKey::from_bytes([pattern ^ 0xA5; 32]),
+        }
+    }
+
+    #[test]
+    fn admit_registers_both_keys_in_the_preimage() {
+        let t = MembershipTransition {
+            epoch: 2,
+            prev: Some(TransitionId::from_bytes([0x10; 32])),
+            resolves: Vec::new(),
+            changes: vec![Change::Admit(admission(7))],
+            members_root: [0; 32],
+            owners_root: [0; 32],
+            author: DeviceId::from_bytes([1; 32]),
+            signature: [0; 64],
+        };
+        let pre = t.signing_preimage();
+        // prev flag(1) + prev id(32) + resolves count(4) + changes
+        // count(4) puts the Admit tag at offset 41.
+        assert_eq!(pre[41], 0x00, "Admit tag");
+        assert_eq!(&pre[42..74], &[7; 32], "device key");
+        assert_eq!(&pre[74..106], &[7 ^ 0xA5; 32], "encryption key");
+    }
+
+    #[test]
+    fn admit_round_trips_both_keys() {
+        let t = MembershipTransition {
+            epoch: 2,
+            prev: Some(TransitionId::from_bytes([0x10; 32])),
+            resolves: Vec::new(),
+            changes: vec![Change::Admit(admission(9))],
+            members_root: [0; 32],
+            owners_root: [0; 32],
+            author: DeviceId::from_bytes([1; 32]),
+            signature: [0; 64],
+        };
+        let decoded = MembershipTransition::from_canonical_bytes(&t.canonical_bytes()).unwrap();
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn truncated_admit_payload_is_rejected() {
+        let t = MembershipTransition {
+            epoch: 2,
+            prev: Some(TransitionId::from_bytes([0x10; 32])),
+            resolves: Vec::new(),
+            changes: vec![Change::Admit(admission(3))],
+            members_root: [0; 32],
+            owners_root: [0; 32],
+            author: DeviceId::from_bytes([1; 32]),
+            signature: [0; 64],
+        };
+        let bytes = t.canonical_bytes();
+        // Cut into the Admit payload: decode must report truncation.
+        assert_eq!(
+            MembershipTransition::from_canonical_bytes(&bytes[..bytes.len() - 40]),
+            Err(MembershipError::Truncated)
+        );
     }
 }

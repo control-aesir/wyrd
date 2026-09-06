@@ -40,6 +40,15 @@ pub(crate) fn check_intrinsic(t: &MembershipTransition) -> Result<(), InvalidRea
     if t.changes.is_empty() {
         return Err(InvalidReason::EmptyChanges);
     }
+    for change in &t.changes {
+        if let wyrd_format::Change::Admit(admission) = change {
+            // The encryption key must be a real curve point: a garbage
+            // key would make the device uncapability-able forever.
+            if XOnlyPublicKey::from_slice(admission.encryption_key.as_bytes()).is_err() {
+                return Err(InvalidReason::BadChanges);
+            }
+        }
+    }
     Ok(())
 }
 

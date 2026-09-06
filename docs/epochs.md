@@ -84,7 +84,11 @@ Change application (`apply(state, changes)`), pinned semantics:
   and removes `d` from **members**; removing a device who is an owner is
   allowed only when they are the **sole owner** — the owner set empties
   with them (valid and terminal, per the terminal-state rule below). An
-  owner with co-owners can only leave via `SetOwners`.
+  owner with co-owners can only leave via `SetOwners`. **Removing and
+  re-admitting the same device in the same transition is invalid**
+  (encryption-key rotation is not expressible this way): the previous
+  registration and its delivery key leave membership cleanly; replacing
+  a device means a removal transition followed by a later admission.
 - `SetOwners(D)` requires `|D| == 1` in **v0** and replaces the owner set
   wholesale; the final invariant `owners ⊆ members` is enforced after all
   changes as the backstop against dangling owners (e.g. `SetOwners` of a
@@ -210,12 +214,13 @@ A **capability** delivered to a member of epoch N:
 - contains the wrapped secrets for **epochs 1..=N** (new members read full
   history) and nothing beyond;
 - is wrapped under a key established by **secp256k1 ECDH** between a fresh
-  owner-ephemeral key and the recipient device's x-only public key (HKDF to
-  the AEAD key — the recipient's signing keypair doubles as the ECDH
-  identity, which secp256k1 supports; the exact instantiation lands with the
-  control-plane implementation) with associated data
-  `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
-  transition_id || epoch` — the AAD binds the context; the ECDH-wrapped
+   owner-ephemeral key and the recipient device's registered encryption
+   key (HKDF to
+   the AEAD key — the encryption key is a secp256k1 key like the signing
+   keys, so the same ECDH construction applies; the exact instantiation lands with the
+   control-plane implementation) with associated data
+   `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
+   recipient encryption key || transition_id || epoch` — the AAD binds the context; the ECDH-wrapped
   AEAD is what actually authenticates the recipient. A capability cannot be
   transplanted or replayed across drives, epochs, or devices.
 - is delivered via the Nostr mailbox, so the owner can mint epoch N+1 and
@@ -441,7 +446,7 @@ single sanctioned remedy.
 7. Epoch secrets: fresh uniformly random per transition, never reused
    intentionally, never derived from the root or each other; they flow only
    to members of that epoch; capabilities never include future epochs, are
-   ECDH-wrapped and AAD-bound to (drive, device, transition, epoch), and
+   ECDH-wrapped and AAD-bound to (drive, device, encryption_key, transition, epoch), and
    install monotonically.
 8. Ordinary members never possess the DriveRootKey; the root is custody for
    recovery material, never a transition authority or epoch-material source.

@@ -17,7 +17,10 @@ pub mod tree;
 
 pub use chunk::Chunk;
 pub use envelope::{Envelope, EnvelopeError};
-pub use identity::{ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, StorageId, TransitionId};
+pub use identity::{
+    ContentId, DeviceEncryptionKey, DeviceId, DriveId, ObjectKind, SnapshotId, StorageId,
+    TransitionId,
+};
 pub use membership::{Change, MembershipError, MembershipTransition};
 pub use snapshot::Snapshot;
 pub use store::{MemoryObjectStore, ObjectStore};

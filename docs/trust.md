@@ -112,7 +112,7 @@ Rules:
 | Principal | Identity | Purpose / Holds |
 |---|---|---|
 | drive | `DriveId` — random 256-bit, immutable | logical encrypted namespace; distinct from every other identifier |
-| device | Nostr public key (`DeviceId`) | a Wyrd participant; holds a wrapped drive capability + its Nostr signing key |
+| device | Nostr public key (`DeviceId`) | a Wyrd participant; holds a wrapped drive capability + its Nostr signing key; secrets travel to the separate device encryption key (T15) |
 | owner | one or more Nostr public keys | membership administration (v0: exactly one owner; owner *sets* and threshold policies are a later extension this model already accommodates) |
 | vault | transport identity only | stores ciphertext; holds no keys, no Wyrd authorization |
 
@@ -404,13 +404,13 @@ snapshot classification, recovery — is normative in `epochs.md`.
 
 - **Two keys per device (T15).** The Nostr identity key (= `DeviceId`)
   answers "who am I": BIP-340 signatures over Wyrd objects and the NIP-46
-  signing boundary. A separate per-device **encryption key** answers "how
-  are secrets delivered to me": capability wrapping ECDH targets the
-  registered encryption key, and its secret lives in the device keystore,
+  signing boundary. A separate per-device **encryption key** answers
+  "how are secrets delivered to me": capability wrapping ECDH targets the
+  registered encryption key (carried by every `Admit`), and its secret
+  lives in the device keystore (domain-separated from the root wrap),
   never in the Nostr signer. The encryption pubkey rides the membership
   transition that admits the device; rotating it is a membership change.
-  (Until the separation lands in the format, capability wrapping targets
-  the identity key; the change is tracked as its own issue.)
+
 - The owner mints a **device capability** — the wrapped epoch secrets plus
   registration of the member's Nostr pubkey — and **signs the membership
   transition** with the owner's Nostr key. Transition authority always comes
@@ -424,11 +424,11 @@ snapshot classification, recovery — is normative in `epochs.md`.
   relay (payload vs metadata confidentiality, above).
 - **Capability construction.** AAD binding alone is not recipient
   authentication: the capability is wrapped under a key established by
-  **secp256k1 ECDH** between a fresh owner-ephemeral key and the recipient
-  device's x-only public key (HKDF to the AEAD key — secp256k1 signing
-  keypairs double as ECDH identities), with associated data
-  `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
-  transition_id || epoch`. The AAD binds the context; the ECDH-wrapped AEAD
+   **secp256k1 ECDH** between a fresh owner-ephemeral key and the recipient
+   device's registered encryption key (HKDF to the AEAD key — both are
+   secp256k1 keys, so the same ECDH construction applies), with associated data
+   `domain("wyrd capability v1") || DriveId || recipient DeviceId ||
+   recipient encryption key || transition_id || epoch`. The AAD binds the context; the ECDH-wrapped AEAD
   is what actually authenticates the recipient. **Installation is
   monotonic:** installing a capability may only add secrets for epochs not
   yet held; it must never decrease the device's known membership state or
@@ -534,7 +534,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T6 | NIP-46 optional, scoped, default-deny; daemon never holds the nsec | protects identity keys from the (possibly privileged) daemon process |
 | T7 | Recovery reserved: guardian set (emergency contacts) as membership-log state; Shamir k-of-n shares over the encrypted Nostr mailbox; WoT for vetting only | root-key loss is unrecoverable by crypto alone; social recovery is the deferred Shamir decision given UX; design space held open without changing the epoch model |
 | T8 | DriveRootKey is owner/recovery custody only; never part of an ordinary member capability | a member holding the root could derive every future epoch; revocation would collapse |
-| T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
+| T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, encryption_key, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
 | T10 | Signatures are BIP-340 with **deterministic nonces** over a defined signing preimage (ASCII domain tag ‖ raw 32-byte DriveId ‖ self-delimiting preimage: counted vectors, fixed-width fields), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures); ids derive over preimage ‖ signature | BIP-340 is byte-exact, so the spec must be too; deterministic nonces make ids stable; a dedicated preimage avoids envelope-parse ambiguity |
 | T11 | Cryptographic substrate: reuse audited Nostr/secp256k1 ecosystem implementations (BIP-340, ECDH, HKDF, AEAD, CSPRNG); NIP-44 for control-plane transport; NIP-04 rejected; Wyrd owns serialization, authorization semantics, and the key hierarchy | never roll your own crypto; the security budget goes to the state machine and key lifecycle, not the elliptic curve |
 | T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |

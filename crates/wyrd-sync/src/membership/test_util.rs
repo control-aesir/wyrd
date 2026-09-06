@@ -5,11 +5,41 @@
 
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use std::collections::BTreeSet;
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId};
+use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::{
+    Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, TransitionId,
+};
 
 /// The BIP-340 challenge context for membership transitions (trust.md).
 pub(crate) const CHALLENGE_CONTEXT: &str = "wyrd membership challenge v1";
+
+/// A deterministic device encryption key for fixtures: the x-only pubkey
+/// of a test scalar derived as `BLAKE3("wyrd test encryption key
+/// v1" || device || counter)`, retried until it is a valid secp256k1
+/// scalar. Deliberately decoupled from the device fixture's byte pattern:
+/// changing `key()` must never silently invalidate (or collide) this key.
+/// Test-only.
+pub(crate) fn admit(device: DeviceId) -> Change {
+    let mut counter = 0u8;
+    let sk = loop {
+        let mut input = Vec::with_capacity(32 + device.as_bytes().len() + 1);
+        input.extend_from_slice(b"wyrd test encryption key v1");
+        input.extend_from_slice(device.as_bytes());
+        input.push(counter);
+        let hash = blake3::hash(&input);
+        if let Ok(sk) = SecretKey::from_slice(hash.as_bytes()) {
+            break sk;
+        }
+        counter = counter.checked_add(1).expect("test scalar space exhausted");
+    };
+    let keypair = Keypair::from_secret_key(SECP256K1, &sk);
+    Change::Admit(Admission {
+        device,
+        encryption_key: DeviceEncryptionKey::from_bytes(
+            XOnlyPublicKey::from_keypair(&keypair).0.serialize(),
+        ),
+    })
+}
 
 /// The 32-byte BIP-340 challenge for a transition's signing message.
 pub(crate) fn challenge(t: &MembershipTransition, drive: &DriveId) -> [u8; 32] {
@@ -62,7 +92,7 @@ impl Builder {
             epoch: 1,
             prev: None,
             resolves: Vec::new(),
-            changes: vec![Change::Admit(owner), Change::SetOwners(vec![owner])],
+            changes: vec![admit(owner), Change::SetOwners(vec![owner])],
             members_root: set_root(MEMBER_SET_CONTEXT, &[owner]),
             owners_root: set_root(OWNER_SET_CONTEXT, &[owner]),
             author: owner,
@@ -118,8 +148,8 @@ impl Builder {
     fn apply_mirror(&mut self, changes: &[Change]) {
         for change in changes {
             match change {
-                Change::Admit(d) => {
-                    self.members.insert(*d);
+                Change::Admit(admission) => {
+                    self.members.insert(admission.device);
                 }
                 Change::Remove(d) => {
                     self.members.remove(d);

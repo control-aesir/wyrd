@@ -33,7 +33,10 @@ pub use capability::{
     Capability, CapabilityError, DriveKeyring, InstallError, InstallReport, WrappedCapability,
 };
 pub use epoch::EpochSecret;
-pub use keystore::{kdf_key, unwrap_root, wrap_root, KeystoreError, WrappedRoot};
+pub use keystore::{
+    kdf_key, unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, KeystoreError,
+    WrappedSecret,
+};
 pub use root::DriveRootKey;
 
 /// Fill a buffer from the OS CSPRNG.

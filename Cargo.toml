@@ -41,3 +41,7 @@ tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "n
 iroh = "1.0.3"
 iroh-blobs = { version = "0.103.0", default-features = false, features = ["fs-store"] }
 iroh-gossip = "0.101.0"
+
+# property testing (dev-only: generated-sequence suites for the state
+# machines; never a production dependency)
+proptest = "1"

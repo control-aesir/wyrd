@@ -112,7 +112,7 @@ Rules:
 | Principal | Identity | Purpose / Holds |
 |---|---|---|
 | drive | `DriveId` — random 256-bit, immutable | logical encrypted namespace; distinct from every other identifier |
-| device | Nostr public key (`DeviceId`) | a Wyrd participant; holds a wrapped drive capability + its Nostr signing key; secrets travel to the separate device encryption key (T15) |
+| device | Nostr public key (`DeviceId`) | a Wyrd participant; holds a wrapped drive capability + its Nostr signing key; secrets travel to the separate device encryption key (T14) |
 | owner | one or more Nostr public keys | membership administration (v0: exactly one owner; owner *sets* and threshold policies are a later extension this model already accommodates) |
 | vault | transport identity only | stores ciphertext; holds no keys, no Wyrd authorization |
 
@@ -445,7 +445,7 @@ snapshot classification, recovery — is normative in `epochs.md`.
 
 ## Device admission (decided)
 
-- **Two keys per device (T15).** The Nostr identity key (= `DeviceId`)
+- **Two keys per device (T14).** The Nostr identity key (= `DeviceId`)
   answers "who am I": BIP-340 signatures over Wyrd objects and the NIP-46
   signing boundary. A separate per-device **encryption key** answers
   "how are secrets delivered to me": capability wrapping ECDH targets the
@@ -461,7 +461,7 @@ snapshot classification, recovery — is normative in `epochs.md`.
   the last current owner are expressible); validation rules and the
   deterministic `apply(prev, changes)` construction are normative in
   `epochs.md`. The membership record reads:
-  `pubkey, status = active, admitted_by = <owner pubkey>, epoch`.
+  `pubkey, encryption_key, status = active, admitted_by = <owner pubkey>, epoch`.
 - Membership is signed, encrypted, replicated state: members agree on who is
   a member of which epoch, and membership *contents* never reach a public
   relay (payload vs metadata confidentiality, above).
@@ -485,11 +485,11 @@ snapshot classification, recovery — is normative in `epochs.md`.
   the AEAD key with info `"wyrd capability key v1"`; the AEAD is
   **XChaCha20-Poly1305** (192-bit nonces: no nonce-management risk at
   these message counts). The delivered envelope is
-  `ephemeral pk ‖ DriveId ‖ recipient ‖ transition_id ‖ epoch ‖ nonce ‖
+  `ephemeral pk ‖ DriveId ‖ recipient ‖ encryption key ‖ transition_id ‖ epoch ‖ nonce ‖
   ciphertext` — the clear header carries the AAD inputs, and the sealed
   plaintext repeats them so a forged header fails either the tag or the
   inner comparison. The keystore wrap uses the same AEAD with domain
-  `"wyrd keystore root v1"` and the Argon2id-derived key (open questions 6).
+  `"wyrd keystore root v1"` and the Argon2id-derived key (open question 6, resolved).
 - Admission is explicit and additive; delivery rides the Nostr mailbox, so
   the new device need not be online.
 
@@ -541,12 +541,12 @@ cannot produce Wyrd's signatures (BIP-340 over the pinned Wyrd message
 digest). Wyrd therefore defines a small extension method:
 
 ```
-Wyrd daemon ── "sign_message(digest)" ──▶ scoped signer session ──▶ BIP-340 signature
+Wyrd daemon ── "sign_message(context, digest)" ──▶ scoped signer session ──▶ BIP-340 signature
 ```
 
-`sign_message` takes exactly one 32-byte digest (the pinned Wyrd message
-digest for a snapshot or membership transition, above) and returns the
-BIP-340 signature. Scoping rules: the Wyrd signer session exposes
+`sign_message` takes a context string plus one 32-byte digest (the pinned
+Wyrd message digest for a snapshot or membership transition, above) and
+returns the BIP-340 signature. Scoping rules: the Wyrd signer session exposes
 `get_public_key` and `sign_message` only. No `nip44_decrypt`, no
 `sign_event`, no arbitrary-event signing unless a concrete feature
 demands it — **default-deny**. This is especially desirable when the
@@ -582,8 +582,8 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T11 | Cryptographic substrate: reuse audited Nostr/secp256k1 ecosystem implementations (BIP-340, ECDH, HKDF, AEAD, CSPRNG); NIP-44 for control-plane transport; NIP-04 rejected; Wyrd owns serialization, authorization semantics, and the key hierarchy | never roll your own crypto; the security budget goes to the state machine and key lifecycle, not the elliptic curve |
 | T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |
 | T13 | Epoch secrets are **escrowed under the root**, per epoch, as sealed records (root-derived key, context `wyrd escrow key v1`, AAD `DriveId ‖ epoch`, envelope `version ‖ DriveId ‖ epoch ‖ nonce ‖ ciphertext`, StorageId over the record bytes); escrow, never derivation; v0 owner publishes each record alongside its transition | root recovery must compose with data recovery: guardians reconstruct the root, unwrap the records, restore every historical epoch secret. T4 stands — no root→epoch derivation path exists |
-| T15 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
-| T16 | Control-plane message set (`Invitation`, `Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, idempotent, replay-safe sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; NIP-46 `sign_message` is `request { context, digest } → response { signature }` | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
+| T14 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
+| T15 | Control-plane message set (`Invitation`, `Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, idempotent, replay-safe sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; NIP-46 `sign_message` is `request { context, digest } → response { signature }` | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
 
 ## Open questions
 
@@ -592,7 +592,7 @@ member/vault boundary is a security boundary, not an implementation detail.
    the pre-transition owner set, conflict resolution by extension).
 2. Manifest partition encoding details (sharding, chunked transfer).
 3. Live-view conflict naming (e.g. by author id / snapshot timestamp).
-4. Gossip message framing for snapshot announcements.
+4. Gossip (iroh-gossip) framing for snapshot announcements (announcement encoding pinned in `wyrd-sync/src/control/`).
 5. Chunk-size parameters (benchmark before the v1 freeze).
 6. ~~Keystore KDF~~ — v0 choice recorded: **Argon2id**, 64 MiB memory,
    t=3, p=1, 16-byte random salt, 32-byte output, selected for

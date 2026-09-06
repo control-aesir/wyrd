@@ -58,7 +58,7 @@ pub fn set_root(context: &'static str, devices: &[DeviceId]) -> [u8; 32] {
 
 /// What `Admit` registers: the device's Nostr identity key (the
 /// `DeviceId`) and its **device encryption key**: the x-only pubkey
-/// capability wrapping ECDH targets (trust.md T15). Two keys, two
+/// capability wrapping ECDH targets (trust.md T14). Two keys, two
 /// questions: identity signs, encryption receives secrets. The distinct
 /// type (`DeviceEncryptionKey`) prevents swapping them.
 #[derive(Debug, Clone, PartialEq, Eq)]

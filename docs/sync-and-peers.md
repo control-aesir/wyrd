@@ -86,13 +86,14 @@ drive contains.
 - Snapshots are signed by their author device's identity key; peers reject
   unverifiable snapshots.
 - The full key hierarchy, admission, removal, and rotation semantics are
-  drafted in `trust.md` — **that document gates sync-layer implementation**.
+  normative in `trust.md` — **that document gates sync-layer implementation**.
 
 ## Peer admission
 
-Only peers that minted the drive can mint new snapshots; guests receive
-capability handles, never the ability to create drives. Membership is
-signed, replicated state that members agree on.
+Any member can author snapshots — authorization comes from membership
+state, not drive creation. New devices join through admission and receive
+capabilities; there are no guest privileges. Membership is signed,
+replicated state that members agree on.
 
 ## Conflicts
 

@@ -176,7 +176,10 @@ Two scope boundaries a reader must know:
   guarantees only that the *encoding* is canonical.
 - **Flat directories are the intended v0 answer**, not sharded/HAMT
   trees. A huge flat directory is one object, fully materialized on
-  decode; the encoding's `u32` entry count is its hard ceiling. This is
+  decode; the encoding's `u32` entry count is its hard ceiling at the
+  format layer, while the sync layer applies tighter structured ceilings
+  pre-transport (`Limits::V0` in `crates/wyrd-sync/src/ingest.rs`,
+  decision 23). This is
   a deliberate v0 simplification and the one frozen scalability ceiling
   in the format; revisit only with evidence from real workloads.
 
@@ -305,7 +308,7 @@ will ride on iroh-blobs' verified streaming rather than duplicating it).
 2. Manifest partition encoding details (sharding, chunked transfer of large
    manifests).
 3. Live-view conflict naming (e.g. by author id / snapshot timestamp).
-4. Gossip message framing for snapshot announcements.
+4. Gossip (iroh-gossip) framing for snapshot announcements (announcement encoding pinned in `wyrd-sync/src/control/`).
 5. Chunk-size parameters (benchmark before the v1 freeze).
 
 ## Decision record
@@ -334,3 +337,4 @@ will ride on iroh-blobs' verified streaming rather than duplicating it).
 | 20 | Manifest entry layout: fixed 82 bytes `content_id (32) ‖ kind (1) ‖ version (1) ‖ storage_id (32) ‖ encryption_epoch u64 LE ‖ plaintext size u64 LE`; entries sorted by `(content_id, kind, version)`, decoders reject unsorted vectors | one logical object may map several representations (epochs, versions) without ambiguity; size rides along because vaults already see ciphertext size — it buys allocation without a round trip and costs no privacy |
 | 21 | Subtree linkage by `(child tree ContentId, sealed child manifest StorageId)` — no names in manifests; all subtree manifests of a snapshot seal under that snapshot's manifest key | names stay in trees; the parent manifest is sealed, so vaults see only unlinkable StorageId fetches; revocation granularity stays snapshots (trust.md) while per-entry epochs let dedup survive rotation |
 | 22 | `EncryptedObject` envelope `version (1) ‖ kind (1) ‖ nonce (24) ‖ ciphertext`; `StorageId` is derived over the sealed bytes; `ObjectKind::Manifest = 0x03` gives sealed manifests a kind byte (plaintext keeps a member-only ContentId; the sealed form is StorageId-addressed, no `ManifestId`) | equal plaintexts sealed twice stay unlinkable (fresh nonces); the kind byte keeps the AAD binding uniform across content and manifests without a new identity type |
+| 23 | Sync-layer ingest limits (`Limits::V0`): 64 MiB object ceiling pre-decode, structural count ceilings post-decode (64 parents/changes/resolves, 1M tree entries and manifest children, 750K manifest mappings calibrated to fit the byte ceiling, 1024-byte names, 65K chunks per file, 256 KiB chunks, 16 owners); format maxima stay generous | attacker-controlled bytes meet bounded allocation everywhere: the total-bytes gate fires before decode, counts validate after decode over pre-allocation-bounded decoders |

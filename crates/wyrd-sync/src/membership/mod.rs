@@ -21,6 +21,9 @@ pub(crate) mod test_util;
 #[cfg(test)]
 mod conformance;
 
+#[cfg(test)]
+mod properties;
+
 use std::collections::{BTreeSet, HashMap};
 use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 

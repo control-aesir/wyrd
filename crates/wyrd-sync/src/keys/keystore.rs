@@ -26,7 +26,7 @@ use super::random_bytes;
 pub(crate) const KEYSTORE_AAD_DOMAIN: &[u8] = b"wyrd keystore root v1";
 
 /// AAD domain tag for wrapped **device encryption secrets** (trust.md
-/// T15): same envelope, different custody domain.
+/// T14): same envelope, different custody domain.
 pub(crate) const KEYSTORE_DEVICE_AAD_DOMAIN: &[u8] = b"wyrd keystore device v1";
 
 // The v0 Argon2id parameter table (trust.md, recorded KDF decision):

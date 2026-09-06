@@ -16,7 +16,7 @@ use wyrd_format::{ChildManifest, ContentId, DriveId, Manifest, ObjectKind, Snaps
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
 /// Local residency policy for one content object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializationState {
     RemoteOnly,
     Cached,
@@ -39,6 +39,7 @@ pub struct ManifestRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingObjectFetch {
     pub content_id: ContentId,
+    /// The sealed representation address from the manifest entry.
     pub storage_id: StorageId,
     pub kind: ObjectKind,
     pub version: u8,
@@ -72,6 +73,11 @@ pub enum RuntimeError {
     ConflictingAnnouncement { snapshot: SnapshotId },
     #[error("conflicting manifest record for {manifest}")]
     ConflictingManifest { manifest: ContentId },
+    #[error("manifest id {manifest} does not match derived content id {derived}")]
+    ManifestIdentityMismatch {
+        manifest: ContentId,
+        derived: ContentId,
+    },
 }
 
 impl RuntimeState {
@@ -119,9 +125,18 @@ impl RuntimeState {
 
     /// Record a manifest and the sealed address it arrived under.
     /// Replaying the same manifest is a no-op; a conflicting record for the
-    /// same snapshot is rejected.
+    /// same logical manifest is rejected. Callers are expected to validate
+    /// the manifest before handing it here; this method enforces the
+    /// content-addressable boundary as a backstop.
     pub fn record_manifest(&mut self, record: ManifestRecord) -> Result<bool, RuntimeError> {
         let manifest_id = record.manifest_id;
+        let derived = ContentId::derive(ObjectKind::Manifest, &record.manifest.canonical_bytes());
+        if manifest_id != derived {
+            return Err(RuntimeError::ManifestIdentityMismatch {
+                manifest: manifest_id,
+                derived,
+            });
+        }
         match self.manifests.get_mut(&manifest_id) {
             None => {
                 self.manifests.insert(manifest_id, record);
@@ -177,7 +192,7 @@ impl RuntimeState {
 
         for record in self.manifests.values() {
             for child in &record.manifest.children {
-                if self.manifests.get(&child.manifest).is_none() {
+                if !self.manifests.contains_key(&child.manifest) {
                     pending_manifests
                         .entry(child.manifest)
                         .or_insert_with(|| child.clone());
@@ -268,17 +283,23 @@ mod tests {
         }
     }
 
+    fn manifest_id_for(record: &ManifestRecord) -> ContentId {
+        ContentId::derive(ObjectKind::Manifest, &record.manifest.canonical_bytes())
+    }
+
+    fn root_manifest(snapshot: u8, manifest_id: u8, object: u8, child: u8) -> ManifestRecord {
+        let mut record = manifest_record(snapshot, manifest_id, object, child, true);
+        record.manifest_id = manifest_id_for(&record);
+        record
+    }
+
     #[test]
     fn announcements_and_manifests_are_idempotent() {
         let mut state = RuntimeState::new(drive());
         assert!(state.record_announcement(announcement(1, 2, 3)).unwrap());
         assert!(!state.record_announcement(announcement(1, 2, 3)).unwrap());
-        assert!(state
-            .record_manifest(manifest_record(1, 9, 4, 5, true))
-            .unwrap());
-        assert!(!state
-            .record_manifest(manifest_record(1, 9, 4, 5, true))
-            .unwrap());
+        assert!(state.record_manifest(root_manifest(1, 9, 4, 5)).unwrap());
+        assert!(!state.record_manifest(root_manifest(1, 9, 4, 5)).unwrap());
 
         let plan = state.reconcile();
         assert!(plan.pending_snapshots.is_empty());
@@ -309,6 +330,7 @@ mod tests {
         let mut child = manifest_record(1, 8, 4, 5, false);
         child.is_root = false;
         child.manifest.entries.clear();
+        child.manifest_id = manifest_id_for(&child);
         assert!(state.record_manifest(child).unwrap());
 
         let plan = state.reconcile();
@@ -317,7 +339,7 @@ mod tests {
             .contains(&SnapshotId::from_bytes([1; 32])));
         assert_eq!(plan.pending_manifests.len(), 1);
 
-        let mut root = manifest_record(1, 9, 4, 5, true);
+        let mut root = root_manifest(1, 9, 4, 5);
         root.storage_ids.insert(StorageId::from_bytes([0xB0; 32]));
         assert!(state.record_manifest(root).unwrap());
         assert!(state.reconcile().pending_snapshots.is_empty());
@@ -326,13 +348,13 @@ mod tests {
     #[test]
     fn alternate_manifest_storage_ids_merge_by_plaintext_identity() {
         let mut state = RuntimeState::new(drive());
-        let mut a = manifest_record(1, 9, 4, 5, true);
+        let mut a = root_manifest(1, 9, 4, 5);
         assert!(state.record_manifest(a.clone()).unwrap());
         a.storage_ids = BTreeSet::from([StorageId::from_bytes([0xB0; 32])]);
         assert!(!state.record_manifest(a).unwrap());
         let stored = state
             .manifests
-            .get(&ContentId::from_bytes([9; 32]))
+            .get(&manifest_id_for(&root_manifest(1, 9, 4, 5)))
             .unwrap();
         assert_eq!(stored.storage_ids.len(), 2);
     }
@@ -346,14 +368,13 @@ mod tests {
             Err(RuntimeError::ConflictingAnnouncement { .. })
         ));
 
-        state
-            .record_manifest(manifest_record(1, 9, 4, 5, true))
-            .unwrap();
-        let mut conflicting = manifest_record(1, 9, 7, 5, true);
+        state.record_manifest(root_manifest(1, 9, 4, 5)).unwrap();
+        let mut conflicting = root_manifest(1, 9, 4, 5);
         conflicting.manifest.entries[0].size = 999;
+        conflicting.manifest_id = ContentId::from_bytes([0xFE; 32]);
         assert!(matches!(
             state.record_manifest(conflicting),
-            Err(RuntimeError::ConflictingManifest { .. })
+            Err(RuntimeError::ManifestIdentityMismatch { .. })
         ));
     }
 
@@ -368,9 +389,7 @@ mod tests {
     #[test]
     fn remote_only_materialization_stays_out_of_the_plan() {
         let mut state = RuntimeState::new(drive());
-        state
-            .record_manifest(manifest_record(1, 9, 4, 5, true))
-            .unwrap();
+        state.record_manifest(root_manifest(1, 9, 4, 5)).unwrap();
         state.set_materialization(
             ContentId::from_bytes([4; 32]),
             MaterializationState::RemoteOnly,
@@ -381,13 +400,36 @@ mod tests {
     #[test]
     fn object_plan_carries_the_encryption_epoch() {
         let mut state = RuntimeState::new(drive());
-        let record = manifest_record(1, 9, 4, 5, true);
+        let record = root_manifest(1, 9, 4, 5);
         state.record_manifest(record).unwrap();
         state.set_materialization(ContentId::from_bytes([4; 32]), MaterializationState::Pinned);
         let plan = state.reconcile();
         assert_eq!(
             plan.pending_objects[&ContentId::from_bytes([4; 32])].encryption_epoch,
             1
+        );
+    }
+
+    #[test]
+    fn reconcile_without_announcements_is_empty() {
+        let state = RuntimeState::new(drive());
+        let plan = state.reconcile();
+        assert!(plan.pending_snapshots.is_empty());
+        assert!(plan.pending_manifests.is_empty());
+        assert!(plan.pending_objects.is_empty());
+    }
+
+    #[test]
+    fn set_materialization_returns_previous_value() {
+        let mut state = RuntimeState::new(drive());
+        let id = ContentId::from_bytes([0x44; 32]);
+        assert_eq!(
+            state.set_materialization(id, MaterializationState::Cached),
+            None
+        );
+        assert_eq!(
+            state.set_materialization(id, MaterializationState::Pinned),
+            Some(MaterializationState::Cached)
         );
     }
 }

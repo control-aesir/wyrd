@@ -228,7 +228,8 @@ Rules:
   restores every historical epoch secret and with them the drive's entire
   readable history. **Recovery composes.** v0 lifecycle: the owner wraps
   at mint time and publishes each record alongside its transition; vault
-  replication of records rides later transport work.
+  replication of records rides later transport work. Mint-time wiring
+  lands with the owner flow.
 
 ## Control plane: Nostr is the mailbox, iroh is the data plane (decided)
 

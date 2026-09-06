@@ -6,10 +6,10 @@
 //! wraps each freshly minted epoch secret under the epoch's root-derived
 //! escrow key as a per-epoch record: guardians reconstructing the root
 //! post-v0 unwrap the records and restore every historical epoch secret.
-//! This is escrow, not derivation — no root→epoch KDF exists anywhere
+//! This is escrow, not derivation: no root→epoch KDF exists anywhere
 //! (T4 stands); without the sealed records the root yields nothing.
 //!
-//! Record envelope (pinned — changing any byte changes every record):
+//! Record envelope (pinned: changing any byte changes every record):
 //!
 //! ```text
 //! version (1) ‖ DriveId (32) ‖ epoch u64 LE ‖ nonce (24)
@@ -19,7 +19,10 @@
 //! The AAD is `version ‖ DriveId ‖ epoch`; the StorageId is derived over
 //! the record bytes, so vaults hold opaque blobs. v0 lifecycle: the owner
 //! wraps at mint time and publishes each record alongside its transition;
-//! vault replication rides later transport work.
+//! vault replication rides later transport work. Mint-time integration
+//! (calling wrap from the owner flow) lands with the transition/owner
+//! work: this change provides the record type, derivation, and
+//! verification.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
@@ -35,7 +38,7 @@ pub const ESCROW_VERSION: u8 = 0x00;
 /// Fixed record length: 1 + 32 + 8 + 24 + 48.
 pub const ESCROW_RECORD_LEN: usize = 113;
 
-/// One epoch's escrowed secret: the sealed record. Opaque to vaults —
+/// One epoch's escrowed secret: the sealed record. Opaque to vaults:
 /// no plaintext secret, no structure beyond the pinned header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EscrowRecord {
@@ -60,7 +63,9 @@ impl EscrowRecord {
     }
 
     /// Parse record bytes. Fixed length, nothing else: truncation and
-    /// trailing bytes are both malformed.
+    /// trailing bytes are both malformed. The version byte is parsed,
+    /// not enforced, here; unwrap() enforces it before crypto (the
+    /// parse/act split is deliberate).
     pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
         if bytes.len() != ESCROW_RECORD_LEN {
             return Err(CryptoError::Malformed);
@@ -124,7 +129,7 @@ pub fn wrap(
 
 /// Unwrap an escrow record: version, tag over the record's AAD, then the
 /// secret. A record wrapped under any other root, drive, or epoch fails
-/// the tag — recovery needs the right root *and* the right record.
+/// the tag. Recovery needs the right root *and* the right record.
 pub fn unwrap(escrow_key: &[u8; 32], record: &EscrowRecord) -> Result<EpochSecret, CryptoError> {
     if record.version != ESCROW_VERSION {
         return Err(CryptoError::Malformed);
@@ -189,7 +194,7 @@ mod tests {
     fn wrong_root_drive_or_epoch_fails_the_tag() {
         let secret = EpochSecret::from_bytes([0xAA; 32]);
         let record = wrap(&root().escrow_key(&drive(), 3), &drive(), 3, &secret).unwrap();
-        // Wrong root: the reconstructed-guadian path with a bad share set.
+        // Wrong root: the reconstructed-guardian path with a bad share set.
         assert_eq!(
             unwrap(
                 &DriveRootKey::from_bytes([0x53; 32]).escrow_key(&drive(), 3),

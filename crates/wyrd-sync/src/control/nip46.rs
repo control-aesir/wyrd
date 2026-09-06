@@ -2,65 +2,97 @@
 //! remote signing").
 //!
 //! Standard NIP-46 `sign_event` signs Nostr events, not arbitrary
-//! digests — it cannot produce Wyrd's signatures (BIP-340 over the pinned
-//! Wyrd message digest). The daemon therefore requests exactly one
-//! 32-byte digest plus the context string naming what it is (e.g. the
-//! ASCII domain of the signing message); the scoped signer session
-//! returns the 64-byte BIP-340 signature. `get_public_key` and
-//! `sign_message` are the session's only methods — default-deny
-//! (trust.md). Transport rides `nostr-connect`-style tooling, which is a
+//! digests, so it cannot produce Wyrd's signatures (BIP-340 over the
+//! pinned Wyrd message digest). The daemon instead requests a signature
+//! over exactly one 32-byte digest within an explicit operation domain;
+//! the scoped signer session returns the 64-byte BIP-340 signature. The
+//! domain is a closed enum, never free text: a compromised client cannot
+//! talk the signer into blessing an arbitrary digest under a permissive
+//! label, because the signer authorizes per domain. `get_public_key` and
+//! `sign_message` are the session's only methods (default-deny,
+//! trust.md). Transport rides `nostr-connect`-style tooling, which is a
 //! later issue; this module pins the request/response bytes.
 //!
-//! Canonical encoding (counted with `u32`, little-endian):
+//! Canonical encoding (fixed-width):
 //!
 //! ```text
-//! Request:   context u32+UTF-8 bytes ‖ digest (32)
+//! Request:   domain (1) ‖ drive (32) ‖ digest (32)
 //! Response:  signature (64)
 //! ```
 
+use wyrd_format::DriveId;
+
 use super::ControlError;
 
-/// A `sign_message` request: the context naming the digest plus the
-/// 32-byte pinned Wyrd message digest itself.
+/// The operations a Wyrd signer session may be asked to sign. Closed:
+/// adding an operation is a contract change, not a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignDomain {
+    MembershipTransitionV1,
+    SnapshotV1,
+}
+
+impl SignDomain {
+    /// The canonical domain byte.
+    pub fn byte(self) -> u8 {
+        match self {
+            SignDomain::MembershipTransitionV1 => 0x00,
+            SignDomain::SnapshotV1 => 0x01,
+        }
+    }
+
+    /// The domain for a byte, or `None` if unknown.
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(SignDomain::MembershipTransitionV1),
+            0x01 => Some(SignDomain::SnapshotV1),
+            _ => None,
+        }
+    }
+}
+
+/// A `sign_message` request: the operation domain, the drive it belongs
+/// to, and the 32-byte pinned Wyrd message digest itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignMessageRequest {
-    pub context: String,
+    pub domain: SignDomain,
+    pub drive: DriveId,
     pub digest: [u8; 32],
 }
 
 /// A `sign_message` response: the BIP-340 signature over the digest.
+/// Callers verify it against the expected signer key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignMessageResponse {
     pub signature: [u8; 64],
 }
 
 impl SignMessageRequest {
-    /// The canonical request bytes.
+    /// The canonical request bytes: fixed 65 bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.context.len() + 32);
-        out.extend_from_slice(&(self.context.len() as u32).to_le_bytes());
-        out.extend_from_slice(self.context.as_bytes());
+        let mut out = Vec::with_capacity(65);
+        out.push(self.domain.byte());
+        out.extend_from_slice(self.drive.as_bytes());
         out.extend_from_slice(&self.digest);
         out
     }
 
-    /// Decode a request. Rejects truncation, trailing bytes, and
-    /// non-UTF-8 contexts.
+    /// Decode a request. Fixed length with a closed domain byte: rejects
+    /// truncation, trailing bytes, and unknown domains.
     pub fn decode(bytes: &[u8]) -> Result<Self, ControlError> {
-        if bytes.len() < 4 {
+        if bytes.len() < 65 {
             return Err(ControlError::Truncated);
         }
-        let n = u32::from_le_bytes(bytes[0..4].try_into().expect("bounds checked")) as usize;
-        if bytes.len() < 4 + n + 32 {
-            return Err(ControlError::Truncated);
-        }
-        let context =
-            String::from_utf8(bytes[4..4 + n].to_vec()).map_err(|_| ControlError::BadContext)?;
-        let digest = bytes[4 + n..4 + n + 32].try_into().expect("bounds checked");
-        if bytes.len() != 4 + n + 32 {
+        if bytes.len() != 65 {
             return Err(ControlError::TrailingBytes);
         }
-        Ok(SignMessageRequest { context, digest })
+        let domain =
+            SignDomain::from_byte(bytes[0]).ok_or(ControlError::UnknownSignDomain(bytes[0]))?;
+        Ok(SignMessageRequest {
+            domain,
+            drive: DriveId::from_bytes(bytes[1..33].try_into().expect("bounds checked")),
+            digest: bytes[33..65].try_into().expect("bounds checked"),
+        })
     }
 }
 
@@ -90,15 +122,46 @@ mod tests {
 
     fn request() -> SignMessageRequest {
         SignMessageRequest {
-            context: "wyrd membership v1".to_string(),
+            domain: SignDomain::MembershipTransitionV1,
+            drive: DriveId::from_bytes([0xEE; 32]),
             digest: [0x42; 32],
         }
     }
 
     #[test]
-    fn request_round_trips_context_and_digest() {
+    fn domains_are_closed_and_distinct() {
+        assert_eq!(SignDomain::MembershipTransitionV1.byte(), 0x00);
+        assert_eq!(SignDomain::SnapshotV1.byte(), 0x01);
+        assert_eq!(SignDomain::from_byte(0x01), Some(SignDomain::SnapshotV1));
+        assert_eq!(SignDomain::from_byte(0x02), None);
+    }
+
+    #[test]
+    fn request_is_fixed_65_bytes() {
         let bytes = request().encode();
+        assert_eq!(bytes.len(), 65);
         assert_eq!(SignMessageRequest::decode(&bytes).unwrap(), request());
+    }
+
+    #[test]
+    fn request_rejects_truncated_trailing_and_unknown_domain() {
+        let bytes = request().encode();
+        assert_eq!(
+            SignMessageRequest::decode(&bytes[..10]),
+            Err(ControlError::Truncated)
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            SignMessageRequest::decode(&trailing),
+            Err(ControlError::TrailingBytes)
+        );
+        let mut unknown = bytes.clone();
+        unknown[0] = 0x09;
+        assert_eq!(
+            SignMessageRequest::decode(&unknown),
+            Err(ControlError::UnknownSignDomain(0x09))
+        );
     }
 
     #[test]
@@ -118,35 +181,6 @@ mod tests {
         assert_eq!(
             SignMessageResponse::decode(&[0x55; 65]),
             Err(ControlError::TrailingBytes)
-        );
-    }
-
-    #[test]
-    fn request_rejects_truncated_trailing_and_non_utf8() {
-        let bytes = request().encode();
-        assert_eq!(
-            SignMessageRequest::decode(&bytes[..5]),
-            Err(ControlError::Truncated)
-        );
-        let mut trailing = bytes.clone();
-        trailing.push(0x00);
-        assert_eq!(
-            SignMessageRequest::decode(&trailing),
-            Err(ControlError::TrailingBytes)
-        );
-        // Declared context longer than the buffer.
-        let mut lying = bytes.clone();
-        lying[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(
-            SignMessageRequest::decode(&lying),
-            Err(ControlError::Truncated)
-        );
-        // Non-UTF-8 context bytes.
-        let mut bad = request().encode();
-        bad[4] = 0xFF;
-        assert_eq!(
-            SignMessageRequest::decode(&bad),
-            Err(ControlError::BadContext)
         );
     }
 }

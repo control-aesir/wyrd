@@ -19,3 +19,6 @@ repomix*
 
 # OS
 .DS_Store
+
+# Env
+.env

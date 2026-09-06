@@ -1,45 +1,43 @@
 //! Control-plane message types: the evidence the Nostr mailbox delivers
 //! (see the control-plane issue; transport wiring is a later issue).
 //!
-//! Five kinds, each versioned by the envelope, idempotent and replay-safe
-//! by construction: receivers dedupe by message id and the machines are
-//! set-based, so 0/1/5 receptions in any order converge. Messages are
-//! delivery hints, never authority — the receiver acts only after
-//! machine-side verification (transition signatures, capability unwrap,
-//! snapshot classification), which lives outside this module.
+//! Four kinds, each versioned by the envelope and duplicate-delivery
+//! idempotent within the retained inbox state: receivers dedupe by
+//! message id and the machines are set-based, so 0/1/5 receptions in any
+//! order converge. Semantic replay safety belongs to the receiving state
+//! machines. Messages are delivery hints, never authority: the receiver
+//! acts only after machine-side verification (transition signatures,
+//! capability unwrap, snapshot classification), which lives outside this
+//! module.
 //!
 //! Canonical payload encodings (fixed-width little-endian, blobs counted
 //! with `u32`):
 //!
 //! ```text
-//! Invitation:            inviter DeviceId (32) ‖ invitee DeviceId (32)
-//!                        ‖ epoch u64 LE ‖ genesis u32+bytes (canonical
-//!                        genesis transition) ‖ capability u32+bytes
-//!                        (WrappedCapability for epoch)
 //! Capability:            device DeviceId (32) ‖ epoch u64 LE
 //!                        ‖ wrapped u32+bytes (WrappedCapability)
 //! MembershipTransition:  transition u32+bytes (canonical bytes; the
 //!                        membership machine verifies them)
 //! KeyRotation:           transition TransitionId (32; the epoch's
-//!                        transition — new epoch material exists)
+//!                        transition: new epoch material exists)
 //! SnapshotAnnouncement:  snapshot SnapshotId (32) ‖ author DeviceId (32)
 //!                        ‖ epoch u64 LE ‖ membership TransitionId (32)
 //! ```
 //!
 //! The envelope carries the drive and epoch; payloads carry the rest.
-//! The genesis-plus-capability invitation is the whole bootstrap: with
-//! it, an offline device can verify the chain root and unwrap its first
-//! epoch secrets. Everything after admission arrives as typed kinds.
+//! Bootstrapping a device with no epoch key is a different framing
+//! (`bootstrap.rs`): nothing here opens without a held epoch key.
 
 use wyrd_format::{DeviceId, SnapshotId, TransitionId};
 
 use super::ControlError;
 
-/// The control-plane message kinds. Canonical tag bytes: Invitation,
-/// Capability, MembershipTransition, KeyRotation, SnapshotAnnouncement.
+/// The control-plane message kinds. Canonical tag bytes: Capability,
+/// MembershipTransition, KeyRotation, SnapshotAnnouncement. (Bootstrapping
+/// travels outside this envelope in `bootstrap.rs`, so no tag is reserved
+/// for invitations.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlKind {
-    Invitation,
     Capability,
     MembershipTransition,
     KeyRotation,
@@ -50,37 +48,23 @@ impl ControlKind {
     /// The canonical tag byte of this kind.
     pub fn byte(self) -> u8 {
         match self {
-            ControlKind::Invitation => 0x00,
-            ControlKind::Capability => 0x01,
-            ControlKind::MembershipTransition => 0x02,
-            ControlKind::KeyRotation => 0x03,
-            ControlKind::SnapshotAnnouncement => 0x04,
+            ControlKind::Capability => 0x00,
+            ControlKind::MembershipTransition => 0x01,
+            ControlKind::KeyRotation => 0x02,
+            ControlKind::SnapshotAnnouncement => 0x03,
         }
     }
 
     /// The kind for a tag byte, or `None` if unknown.
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            0x00 => Some(ControlKind::Invitation),
-            0x01 => Some(ControlKind::Capability),
-            0x02 => Some(ControlKind::MembershipTransition),
-            0x03 => Some(ControlKind::KeyRotation),
-            0x04 => Some(ControlKind::SnapshotAnnouncement),
+            0x00 => Some(ControlKind::Capability),
+            0x01 => Some(ControlKind::MembershipTransition),
+            0x02 => Some(ControlKind::KeyRotation),
+            0x03 => Some(ControlKind::SnapshotAnnouncement),
             _ => None,
         }
     }
-}
-
-/// An invitation: the whole bootstrap for an offline device — the chain
-/// root to verify against plus the wrapped capability for `epoch`.
-/// Everything after admission arrives as typed message kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Invitation {
-    pub inviter: DeviceId,
-    pub invitee: DeviceId,
-    pub epoch: u64,
-    pub genesis: Vec<u8>,
-    pub capability: Vec<u8>,
 }
 
 /// A capability delivery: the wrapped epoch secrets for one device.
@@ -100,15 +84,15 @@ pub struct TransitionPayload {
     pub transition: Vec<u8>,
 }
 
-/// A rotation notice: new epoch material exists under this transition —
+/// A rotation notice: new epoch material exists under this transition:
 /// the capability follows as its own message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRotation {
     pub transition: TransitionId,
 }
 
-/// A snapshot announcement: enough to fetch and classify — the snapshot
-/// and transition bodies travel bulk, not here.
+/// A snapshot announcement: enough to fetch and classify (the snapshot
+/// and transition bodies travel bulk, not here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAnnouncement {
     pub snapshot: SnapshotId,
@@ -120,7 +104,6 @@ pub struct SnapshotAnnouncement {
 /// One control-plane message: the kind plus its payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    Invitation(Invitation),
     Capability(CapabilityPayload),
     MembershipTransition(TransitionPayload),
     KeyRotation(KeyRotation),
@@ -131,7 +114,6 @@ impl Message {
     /// The kind tag of this message.
     pub fn kind(&self) -> ControlKind {
         match self {
-            Message::Invitation(_) => ControlKind::Invitation,
             Message::Capability(_) => ControlKind::Capability,
             Message::MembershipTransition(_) => ControlKind::MembershipTransition,
             Message::KeyRotation(_) => ControlKind::KeyRotation,
@@ -142,15 +124,6 @@ impl Message {
     /// The canonical payload encoding (the envelope frames the rest).
     pub fn encode_payload(&self) -> Vec<u8> {
         match self {
-            Message::Invitation(m) => {
-                let mut out = Vec::with_capacity(80 + m.genesis.len() + m.capability.len());
-                out.extend_from_slice(m.inviter.as_bytes());
-                out.extend_from_slice(m.invitee.as_bytes());
-                out.extend_from_slice(&m.epoch.to_le_bytes());
-                push_blob(&mut out, &m.genesis);
-                push_blob(&mut out, &m.capability);
-                out
-            }
             Message::Capability(m) => {
                 let mut out = Vec::with_capacity(44 + m.wrapped.len());
                 out.extend_from_slice(m.device.as_bytes());
@@ -208,22 +181,6 @@ impl Message {
             Ok(out)
         };
         let message = match kind {
-            ControlKind::Invitation => {
-                need(pos, 72)?;
-                let inviter = DeviceId::from_bytes(id32(pos));
-                let invitee = DeviceId::from_bytes(id32(pos + 32));
-                let epoch = u64le(pos + 64);
-                pos += 72;
-                let genesis = blob(&mut pos)?;
-                let capability = blob(&mut pos)?;
-                Message::Invitation(Invitation {
-                    inviter,
-                    invitee,
-                    epoch,
-                    genesis,
-                    capability,
-                })
-            }
             ControlKind::Capability => {
                 need(pos, 40)?;
                 let device = DeviceId::from_bytes(id32(pos));
@@ -276,16 +233,6 @@ fn push_blob(out: &mut Vec<u8>, blob: &[u8]) {
 mod tests {
     use super::*;
 
-    fn invitation() -> Message {
-        Message::Invitation(Invitation {
-            inviter: DeviceId::from_bytes([0x01; 32]),
-            invitee: DeviceId::from_bytes([0x02; 32]),
-            epoch: 3,
-            genesis: vec![0xAA; 64],
-            capability: vec![0xBB; 48],
-        })
-    }
-
     fn capability() -> Message {
         Message::Capability(CapabilityPayload {
             device: DeviceId::from_bytes([0x02; 32]),
@@ -317,28 +264,21 @@ mod tests {
 
     #[test]
     fn kind_tags_match_the_table() {
-        assert_eq!(invitation().kind(), ControlKind::Invitation);
-        assert_eq!(invitation().kind().byte(), 0x00);
-        assert_eq!(capability().kind().byte(), 0x01);
-        assert_eq!(transition().kind().byte(), 0x02);
-        assert_eq!(rotation().kind().byte(), 0x03);
-        assert_eq!(announcement().kind().byte(), 0x04);
+        assert_eq!(capability().kind(), ControlKind::Capability);
+        assert_eq!(capability().kind().byte(), 0x00);
+        assert_eq!(transition().kind().byte(), 0x01);
+        assert_eq!(rotation().kind().byte(), 0x02);
+        assert_eq!(announcement().kind().byte(), 0x03);
         assert_eq!(
-            ControlKind::from_byte(0x04),
+            ControlKind::from_byte(0x03),
             Some(ControlKind::SnapshotAnnouncement)
         );
-        assert_eq!(ControlKind::from_byte(0x05), None);
+        assert_eq!(ControlKind::from_byte(0x04), None);
     }
 
     #[test]
     fn every_kind_round_trips() {
-        for m in [
-            invitation(),
-            capability(),
-            transition(),
-            rotation(),
-            announcement(),
-        ] {
+        for m in [capability(), transition(), rotation(), announcement()] {
             let kind = m.kind();
             assert_eq!(
                 Message::decode_payload(kind, &m.encode_payload()).unwrap(),
@@ -360,24 +300,24 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_and_trailing() {
-        let bytes = invitation().encode_payload();
+        // Capability payload: device(32) + epoch(8) + wrapped u32+bytes.
+        let bytes = capability().encode_payload();
         assert_eq!(
-            Message::decode_payload(ControlKind::Invitation, &bytes[..10]),
+            Message::decode_payload(ControlKind::Capability, &bytes[..10]),
             Err(ControlError::Truncated)
         );
-        // Declared blob longer than the buffer: the capability length
-        // prefix lives at 140..144 (after 72 header + 4 + 64 genesis
-        // bytes); claiming u32::MAX must fail, not allocate.
+        // Declared blob longer than the buffer: the wrapped length prefix
+        // lives at 40..44; claiming u32::MAX must fail, not allocate.
         let mut lying = bytes.clone();
-        lying[140..144].copy_from_slice(&u32::MAX.to_le_bytes());
+        lying[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
-            Message::decode_payload(ControlKind::Invitation, &lying),
+            Message::decode_payload(ControlKind::Capability, &lying),
             Err(ControlError::Truncated)
         );
         let mut trailing = bytes;
         trailing.push(0x00);
         assert_eq!(
-            Message::decode_payload(ControlKind::Invitation, &trailing),
+            Message::decode_payload(ControlKind::Capability, &trailing),
             Err(ControlError::TrailingBytes)
         );
     }

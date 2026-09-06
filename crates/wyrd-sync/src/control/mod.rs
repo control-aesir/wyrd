@@ -19,12 +19,20 @@
 //! NIP-44 wraps this envelope later at the transport layer (our seal is
 //! authenticity, NIP-44 is relay confidentiality).
 //!
-//! Delivery is idempotent by construction: [`ControlInbox`] dedupes on
-//! the message id (BLAKE3 over the sealed bytes — any redelivery is the
-//! same bytes), scoped per drive, opening only with a held epoch key.
+//! Delivery is duplicate-delivery idempotent within the retained inbox
+//! state: [`ControlInbox`] dedupes on the message id (BLAKE3 over the
+//! sealed bytes, so any redelivery is the same bytes), scoped per drive,
+//! opening only with a held epoch key. Semantic replay safety belongs to
+//! the receiving state machines, which verify every payload independently.
 //! Knowledge and key material stay distinct: a message for an unknown
 //! epoch is an error, never a guess.
+//!
+//! The seal proves epoch-key possession (confidentiality from
+//! non-holders), not authorship: any holder of the epoch secret can forge
+//! any kind. Authorship comes from inner signatures (membership
+//! transitions) and machine classification, never from the envelope.
 
+pub mod bootstrap;
 pub mod message;
 pub mod nip46;
 
@@ -36,11 +44,13 @@ use crate::keys::{random_bytes, CryptoError};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 
-pub use message::{
-    CapabilityPayload, ControlKind, Invitation, KeyRotation, Message, SnapshotAnnouncement,
-    TransitionPayload,
+pub use bootstrap::{
+    BootstrapInvitation, SealedBootstrap, BOOTSTRAP_HEADER_LEN, BOOTSTRAP_VERSION,
 };
-pub use nip46::{SignMessageRequest, SignMessageResponse};
+pub use message::{
+    CapabilityPayload, ControlKind, KeyRotation, Message, SnapshotAnnouncement, TransitionPayload,
+};
+pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
 
 /// The only control-envelope version.
 pub const CONTROL_VERSION: u8 = 0x00;
@@ -59,10 +69,12 @@ pub enum ControlError {
     UnknownKind(u8),
     #[error("unknown control envelope version {0:#04x}")]
     UnknownVersion(u8),
-    #[error("control context is not valid UTF-8")]
-    BadContext,
+    #[error("unknown signer domain byte {0:#04x}")]
+    UnknownSignDomain(u8),
     #[error("message is for another drive")]
     WrongDrive,
+    #[error("owner signature does not verify")]
+    BadSignature,
     #[error("no control key held for epoch {0}")]
     UnknownEpoch(u64),
     #[error("control crypto failed")]
@@ -179,8 +191,8 @@ pub fn seal(
 
 /// Open a sealed message: version, tag over the header AAD, then the
 /// inner header agreement and payload decode. Payloads repeating the
-/// epoch must agree with the envelope epoch — disagreement is a header
-/// mismatch, so a sealed `Invitation { epoch: 3 }` at envelope epoch 5
+/// epoch must agree with the envelope epoch: disagreement is a header
+/// mismatch, so a sealed `Capability { epoch: 3 }` at envelope epoch 5
 /// never opens cleanly for the machines to misread. Returns the message
 /// with the drive and epoch it was verified under.
 pub fn open(
@@ -213,7 +225,6 @@ pub fn open(
     // duplication lets the machines read the epoch off the payload
     // without trusting it.
     let payload_epoch = match &message {
-        Message::Invitation(m) => Some(m.epoch),
         Message::Capability(m) => Some(m.epoch),
         Message::MembershipTransition(_) => None,
         Message::KeyRotation(_) => None,
@@ -247,7 +258,7 @@ pub enum IngestReport {
 /// Two lifecycle notes, both acceptable in v0 and stated here so they
 /// stay deliberate: the seen set grows with every accepted message
 /// (bounded by the append-only log; a retention policy rides with GC,
-/// which does not exist yet), and dedupe runs after open — so a
+/// which does not exist yet), and dedupe runs after open, so a
 /// redelivery for an epoch whose key was removed reports UnknownEpoch
 /// rather than Duplicate. v0 never evicts keys, so the coupling is
 /// documented, not exercised.
@@ -421,15 +432,13 @@ mod tests {
 
     #[test]
     fn payload_epoch_must_agree_with_the_envelope_epoch() {
-        // A sealed Invitation { epoch: 3 } at envelope epoch 5 must not
+        // A sealed Capability { epoch: 3 } at envelope epoch 5 must not
         // open cleanly: the duplication lets the machines read the epoch
         // off the payload without ever trusting it.
-        let mismatched = Message::Invitation(message::Invitation {
-            inviter: DeviceId::from_bytes([0x01; 32]),
-            invitee: DeviceId::from_bytes([0x02; 32]),
+        let mismatched = Message::Capability(message::CapabilityPayload {
+            device: DeviceId::from_bytes([0x02; 32]),
             epoch: 3,
-            genesis: vec![0xAA; 64],
-            capability: vec![0xBB; 48],
+            wrapped: vec![0xCC; 48],
         });
         let sealed = seal(&control_key(5), &drive(), 5, &mismatched).unwrap();
         assert_eq!(
@@ -441,7 +450,7 @@ mod tests {
     #[test]
     fn version_errors_precede_epoch_errors() {
         // Framing first: an unknown version reports UnknownVersion even
-        // when the epoch key is also missing — never UnknownEpoch.
+        // when the epoch key is also missing, never UnknownEpoch.
         let mut inbox = inbox();
         let mut sealed = seal(&control_key(9), &drive(), 9, &announcement()).unwrap();
         sealed.version = 0x01;
@@ -462,7 +471,7 @@ mod tests {
             forged[offset] ^= 0x01;
             let decoded = SealedControl::decode(&forged);
             // A kind flip may decode as another known kind or fail as
-            // unknown — either way the message must never open.
+            // unknown: either way the message must never open.
             match decoded {
                 Err(_) => {}
                 Ok(sealed) => assert!(open(&key, &sealed).is_err(), "offset {offset}"),

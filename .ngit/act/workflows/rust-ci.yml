@@ -25,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       # Resolve the channel pinned in rust-toolchain.toml. It is passed as an
       # explicit `toolchain` input rather than letting the action read the
@@ -55,43 +55,154 @@ jobs:
       - name: Tests
         run: cargo test --color never --workspace 2>&1 | tee /tmp/test.log
 
-      - name: Run OpenCode
-        if: github.event_name == 'pull_request'
-        uses: anomalyco/opencode/github@latest
+      - if: github.event_name == 'pull_request'
+        name: Run OpenCode review
         env:
-          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GITHUB_TOKEN: NOT_NEEDED
-        with:
-          use_github_token: true
-          model: openrouter/openrouter/free
-          prompt: |
-            # Full branch code review compared to master, posts to PR
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
+        run: |
+          set -euo pipefail
 
-            Current branch:!`git branch --show-current`
-            PR info:!`ngit pr list --json --offline`
-            Recent commits (master..HEAD):!`git log master..HEAD --oneline`
-            Diff stats:!`git diff master..HEAD --stat`
+          sudo apt-get update
+          sudo apt-get install -y curl wget gnupg
 
-            ### Code quality checks:
-            Check:!`cat /tmp/check.log`
-            Clippy:!`cat /tmp/clippy.log`
-            Tests:!`cat /tmp/test.log`
+          # Install ngit and OpenCode
+          curl -Ls https://ngit.dev/install.sh | bash
+          curl -fsSL https://opencode.ai/install | bash
 
-            ## **Your task:** 
-            1. Analyze the above information and produce a comprehensive code review covering:
-               - Overall assessment
-               - Potential bugs/edge cases
-               - Code quality (style, readability, maintainability)
-               - Test coverage observations
-               - Clippy warnings/suggestions
-               - Performance considerations
-               - Specific improvements with file:line references
+          # Make installed binaries available
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
 
-            2. **After writing the review**, post it as a PR comment:
-               - Extract the PR `id` (nevent1...) from the PR info JSON where `branch` contains the current branch name
-               - Run: `ngit --nsec $NGIT_NSEC pr comment <PR_ID> --body "$(cat <<'EOF'\n<your-review-text>\nEOF\n)" --json`
-               
-               Use the bash tool to execute this. The review should be well-formatted markdown.
+          # Fetch the actual PR base branch.
+          git fetch origin "$BASE_BRANCH" --depth=1
 
-            Be constructive and specific. Reference actual files and line numbers. Do not impersonate the user and make clear where the review comes from.
+          # Keep the ngit secret out of OpenCode's environment.
+          NGIT_NSEC_FILE="$RUNNER_TEMP/ngit-nsec"
+          printf '%s' "$NGIT_NSEC" > "$NGIT_NSEC_FILE"
+          chmod 600 "$NGIT_NSEC_FILE"
+          unset NGIT_NSEC
+
+          # Gather PR metadata for the reviewer.
+          PR_INFO="$(ngit pr list --json)"
+          PR_ID="$(
+            printf '%s\n' "$PR_INFO" |
+              jq -r --arg branch "$PR_BRANCH" '
+                .[] |
+                select(.branch == $branch) |
+                .id
+              ' |
+              head -n1
+          )"
+
+          if [ -z "$PR_ID" ] || [ "$PR_ID" = "null" ]; then
+            echo "Could not determine ngit PR ID for branch: $PR_BRANCH"
+            echo "$PR_INFO"
+            exit 1
+          fi
+
+          echo "Reviewing PR: $PR_ID"
+          echo "Branch: $PR_BRANCH"
+          echo "Base: $BASE_BRANCH"
+
+          # Ask OpenCode to perform the review.
+          opencode run \
+            --model openrouter/openrouter/free \
+            "$(cat <<EOF
+          # Full branch code review
+
+          You are reviewing a pull request.
+
+          PR branch: ${PR_BRANCH}
+          Base branch: ${BASE_BRANCH}
+          PR ID: ${PR_ID}
+
+          ## Recent commits
+
+          !git log origin/${BASE_BRANCH}..HEAD --oneline
+
+          ## Diff statistics
+
+          !git diff origin/${BASE_BRANCH}...HEAD --stat
+
+          ## Full diff
+
+          !git diff origin/${BASE_BRANCH}...HEAD
+
+          ## Code quality checks
+
+          ### Check
+
+          !cat /tmp/check.log
+
+          ### Clippy
+
+          !cat /tmp/clippy.log
+
+          ### Tests
+
+          !cat /tmp/test.log
+
+          ## Your task
+
+          Perform a comprehensive code review of the current branch compared
+          with the base branch.
+
+          Do not limit the review to the supplied diff summary. Inspect the
+          repository and relevant surrounding code as necessary to understand
+          the changes and their invariants.
+
+          Cover:
+
+          1. Overall assessment
+          2. Potential bugs and edge cases
+          3. Correctness and architectural concerns
+          4. Code quality, readability, and maintainability
+          5. Test coverage and missing tests
+          6. Clippy warnings and suggestions
+          7. Performance considerations
+          8. API, serialization, compatibility, and security concerns where
+             applicable
+          9. Specific improvements with file:line references
+
+          Prioritize actionable findings over generic praise.
+
+          Clearly distinguish:
+          - actual bugs
+          - likely problems
+          - risks / design concerns
+          - optional improvements
+
+          Do not invent issues that are not supported by the code.
+
+          The final output must be well-formatted Markdown suitable for posting
+          directly as a pull-request review comment.
+
+          Do not post the review yourself.
+
+          Write the final review to:
+
+              /tmp/pr-review.md
+          EOF
+          )"
+
+          # Make sure OpenCode actually produced the review.
+          if [ ! -s /tmp/pr-review.md ]; then
+            echo "OpenCode did not produce /tmp/pr-review.md"
+            exit 1
+          fi
+
+          echo "Review generated:"
+          sed -n '1,120p' /tmp/pr-review.md
+
+          # Publish the review through ngit.
+          ngit \
+            --nsec-file "$NGIT_NSEC_FILE" \
+            pr comment "$PR_ID" \
+            --body "$(cat /tmp/pr-review.md)" \
+            --json
+
+          # Remove the secret as soon as it is no longer needed.
+          rm -f "$NGIT_NSEC_FILE"

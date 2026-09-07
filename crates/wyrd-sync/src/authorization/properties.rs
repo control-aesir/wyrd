@@ -98,13 +98,16 @@ fn build_dag(drive: wyrd_format::DriveId, order: &[Snapshot]) -> SnapshotDag {
 }
 
 /// Reduce a classification map to a deterministic (sorted) fingerprint
-/// for cross-run comparison.
+/// for cross-run comparison. Sort key is the raw 32-byte id bytes
+/// (`SnapshotId::as_bytes`), which is what the snapshot's own identity
+/// is — the fingerprint order tracks the id order, not whatever
+/// `Display` happens to format.
 fn fingerprint(
     verdicts: &std::collections::HashMap<SnapshotId, super::Classification>,
 ) -> Vec<(SnapshotId, super::Classification)> {
     let mut fp: Vec<(SnapshotId, super::Classification)> =
         verdicts.iter().map(|(k, v)| (*k, *v)).collect();
-    fp.sort_by_key(|(id, _)| format!("{id}"));
+    fp.sort_by_key(|(id, _)| *id.as_bytes());
     fp
 }
 

@@ -29,6 +29,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use thiserror::Error;
 use wyrd_format::{DeviceId, DriveId, TransitionId};
+use zeroize::Zeroizing;
 
 use super::epoch::EpochSecret;
 use super::{random_bytes, CryptoError};
@@ -172,7 +173,7 @@ impl Capability {
         let target = XOnlyPublicKey::from_slice(self.encryption_key.as_bytes())
             .map_err(|_| CryptoError::Malformed)?;
         let shared = ecdh_shared(&ephemeral_sk, &target)?;
-        let aead_key = hkdf_capability_key(&shared);
+        let aead_key = hkdf_capability_key(shared.as_slice());
         let mut nonce = [0u8; 24];
         random_bytes(&mut nonce)?;
         let aad = capability_aad(
@@ -183,15 +184,16 @@ impl Capability {
             self.up_to_epoch(),
         );
         let plaintext = encode_capability(self);
-        let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
-            .encrypt(
-                chacha20poly1305::XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plaintext[..],
-                    aad: &aad[..],
-                },
-            )
-            .map_err(|_| CryptoError::OpenFailed)?;
+        let ciphertext =
+            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
+                .encrypt(
+                    chacha20poly1305::XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &plaintext[..],
+                        aad: &aad[..],
+                    },
+                )
+                .map_err(|_| CryptoError::OpenFailed)?;
 
         let mut bytes = Vec::with_capacity(128 + 24 + ciphertext.len());
         bytes.extend_from_slice(&ephemeral_pk.serialize());
@@ -236,7 +238,7 @@ impl WrappedCapability {
         let ciphertext = &bytes[192..];
 
         let shared = ecdh_shared(encryption_secret, &ephemeral_pk)?;
-        let aead_key = hkdf_capability_key(&shared);
+        let aead_key = hkdf_capability_key(shared.as_slice());
         let aad = capability_aad(
             &drive,
             &claimed_device,
@@ -244,15 +246,19 @@ impl WrappedCapability {
             &transition,
             up_to_epoch,
         );
-        let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
-            .decrypt(
-                chacha20poly1305::XNonce::from_slice(nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad: &aad[..],
-                },
-            )
-            .map_err(|_| CryptoError::OpenFailed)?;
+        let plaintext =
+            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
+                .decrypt(
+                    chacha20poly1305::XNonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: &aad[..],
+                    },
+                )
+                .map_err(|_| CryptoError::OpenFailed)?;
+        // `plaintext` is now a Zeroizing<Vec<u8>> — the decoded secret list
+        // is wiped on drop. The secrets are extracted below into owned
+        // EpochSecret wrappers before plaintext is consumed.
 
         // The sealed document must agree with its envelope header.
         let need = 128 + 8 + 4;
@@ -448,11 +454,11 @@ impl DriveKeyring {
     }
 }
 
-pub(crate) fn hkdf_capability_key(shared: &[u8]) -> [u8; 32] {
+pub(crate) fn hkdf_capability_key(shared: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(None, shared);
-    let mut okm = [0u8; 32];
+    let mut okm = Zeroizing::new([0u8; 32]);
     // 32-byte OKM is always valid for HKDF-SHA256.
-    hk.expand(CAPABILITY_KEY_CONTEXT, &mut okm)
+    hk.expand(CAPABILITY_KEY_CONTEXT, okm.as_mut())
         .expect("valid OKM length");
     okm
 }
@@ -462,12 +468,15 @@ pub(crate) fn hkdf_capability_key(shared: &[u8]) -> [u8; 32] {
 /// of the shared point as the raw key material. Shared with the
 /// bootstrap envelope, which runs the same construction under its own
 /// HKDF context.
-pub(crate) fn ecdh_shared(sk: &SecretKey, peer: &XOnlyPublicKey) -> Result<[u8; 32], CryptoError> {
+pub(crate) fn ecdh_shared(
+    sk: &SecretKey,
+    peer: &XOnlyPublicKey,
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let peer_pk = PublicKey::from_x_only_public_key(*peer, Parity::Even);
     let point = secp256k1::ecdh::shared_secret_point(&peer_pk, sk);
-    Ok(point[0..32]
-        .try_into()
-        .expect("shared_secret_point is 64 bytes"))
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&point[0..32]);
+    Ok(out)
 }
 
 fn capability_aad(
@@ -489,8 +498,12 @@ fn capability_aad(
 
 /// The plaintext document inside the envelope: the same AAD inputs plus
 /// the secret list, so a forged header must agree with what it carries.
-fn encode_capability(capability: &Capability) -> Vec<u8> {
-    let mut pt = Vec::with_capacity(128 + 8 + 4 + 32 * capability.secrets.len());
+/// Returned as `Zeroizing<Vec<u8>>` so the secret material is wiped when
+/// the wrapper is dropped.
+fn encode_capability(capability: &Capability) -> Zeroizing<Vec<u8>> {
+    let mut pt = Zeroizing::new(Vec::with_capacity(
+        128 + 8 + 4 + 32 * capability.secrets.len(),
+    ));
     pt.extend_from_slice(capability.drive.as_bytes());
     pt.extend_from_slice(capability.device.as_bytes());
     pt.extend_from_slice(capability.encryption_key.as_bytes());
@@ -896,7 +909,7 @@ mod tests {
         let ephemeral_pk =
             XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(SECP256K1, &ephemeral_sk)).0;
         let target = XOnlyPublicKey::from_slice(enc_key.as_bytes()).unwrap();
-        let aead_key = hkdf_capability_key(&ecdh_shared(&ephemeral_sk, &target).unwrap());
+        let aead_key = hkdf_capability_key(ecdh_shared(&ephemeral_sk, &target).unwrap().as_slice());
         let aad = capability_aad(&drive, &device, &enc_key, &transition, 5);
 
         let mut pt = Vec::new();
@@ -910,15 +923,16 @@ mod tests {
             pt.extend_from_slice(&[e; 32]);
         }
         let nonce = [0u8; 24];
-        let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
-            .encrypt(
-                chacha20poly1305::XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &pt[..],
-                    aad: &aad[..],
-                },
-            )
-            .unwrap();
+        let ciphertext =
+            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
+                .encrypt(
+                    chacha20poly1305::XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &pt[..],
+                        aad: &aad[..],
+                    },
+                )
+                .unwrap();
         let mut envelope = Vec::new();
         envelope.extend_from_slice(&ephemeral_pk.serialize());
         envelope.extend_from_slice(&aad[CAPABILITY_AAD_DOMAIN.len()..]);

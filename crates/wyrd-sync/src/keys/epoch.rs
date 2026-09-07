@@ -20,11 +20,16 @@
 
 use super::{random_bytes, CryptoError};
 use wyrd_format::{ContentId, DriveId, ObjectKind, SnapshotId};
+use zeroize::ZeroizeOnDrop;
 
 /// One epoch's uniformly random secret. Constructed only by
 /// [`EpochSecret::generate`] (minting) or [`EpochSecret::from_bytes`]
 /// (installing a delivered capability).
-#[derive(Clone, PartialEq, Eq)]
+///
+/// `ZeroizeOnDrop` scrubs the underlying bytes when the wrapper is dropped
+/// (and on panic unwind) so a revoked epoch's secret does not linger in
+/// process memory.
+#[derive(Clone, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct EpochSecret([u8; 32]);
 
 impl std::fmt::Debug for EpochSecret {
@@ -257,5 +262,15 @@ mod tests {
             secret.manifest_key(&drive, 1, &snapshot),
             secret.object_key(&drive, 1, &content, ObjectKind::Chunk, 0)
         );
+    }
+
+    #[test]
+    fn epoch_secret_implements_zeroize_on_drop() {
+        // Type-level lock: `Drop` will scrub the underlying bytes when
+        // the wrapper goes out of scope. Behavioral zeroization is not
+        // directly observable in safe Rust, so this is a compile-time
+        // guarantee, not a runtime check.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<EpochSecret>();
     }
 }

@@ -19,6 +19,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use super::random_bytes;
 
@@ -59,13 +60,22 @@ pub enum KeystoreError {
 /// Derive the keystore key from a passphrase with the pinned Argon2id
 /// parameter table. Public so the parameters are one visible, testable
 /// surface.
-pub fn kdf_key(passphrase: &str, salt: &[u8]) -> Result<[u8; KDF_OUT_LEN], KeystoreError> {
+///
+/// The return is a `Zeroizing<[u8; 32]>` so the derived key is wiped when
+/// the wrapper is dropped (and on panic unwind). Callers that need to
+/// hand the key to AEAD should keep it in a `Zeroizing`; callers that
+/// must return a raw array (e.g. `unwrap_root`) extract it, taking care
+/// to wipe the wrapper as soon as the extract is done.
+pub fn kdf_key(
+    passphrase: &str,
+    salt: &[u8],
+) -> Result<Zeroizing<[u8; KDF_OUT_LEN]>, KeystoreError> {
     use argon2::{Algorithm, Argon2, Params, Version};
     let params = Params::new(KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST, Some(KDF_OUT_LEN))
         .map_err(|_| KeystoreError::KdfFailed)?;
-    let mut out = [0u8; KDF_OUT_LEN];
+    let mut out = Zeroizing::new([0u8; KDF_OUT_LEN]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+        .hash_password_into(passphrase.as_bytes(), salt, out.as_mut())
         .map_err(|_| KeystoreError::KdfFailed)?;
     Ok(out)
 }
@@ -132,7 +142,7 @@ fn seal(
     let key = kdf_key(passphrase, &salt)?;
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce).map_err(|_| KeystoreError::RngFailed)?;
-    let ciphertext = aead_key(&key)
+    let ciphertext = aead_key(key.as_slice())
         .encrypt(
             chacha20poly1305::XNonce::from_slice(&nonce),
             Payload {
@@ -141,6 +151,7 @@ fn seal(
             },
         )
         .map_err(|_| KeystoreError::KdfFailed)?;
+    // `key` is zeroed at the end of this scope.
     let mut bytes = Vec::with_capacity(KDF_SALT_LEN + 24 + ciphertext.len());
     bytes.extend_from_slice(&salt);
     bytes.extend_from_slice(&nonce);
@@ -163,7 +174,7 @@ fn open(
     let nonce = &bytes[KDF_SALT_LEN..KDF_SALT_LEN + 24];
     let ciphertext = &bytes[KDF_SALT_LEN + 24..];
     let key = kdf_key(passphrase, salt)?;
-    let plaintext = aead_key(&key)
+    let plaintext = aead_key(key.as_slice())
         .decrypt(
             chacha20poly1305::XNonce::from_slice(nonce),
             Payload {
@@ -172,6 +183,8 @@ fn open(
             },
         )
         .map_err(|_| KeystoreError::WrongPassphrase)?;
+    // `key` is zeroed at the end of this scope; the plaintext array is
+    // returned to the caller, who owns its lifetime.
     plaintext
         .as_slice()
         .try_into()
@@ -281,7 +294,7 @@ mod tests {
         let key = kdf_key(PASSPHRASE, &salt).unwrap();
         let nonce = [0u8; 24];
         let plaintext = [0x99u8; 48];
-        let ciphertext = aead_key(&key)
+        let ciphertext = aead_key(key.as_slice())
             .encrypt(
                 chacha20poly1305::XNonce::from_slice(&nonce),
                 Payload {

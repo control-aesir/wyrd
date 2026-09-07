@@ -38,6 +38,7 @@ use hkdf::Hkdf;
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use sha2::Sha256;
 use wyrd_format::{DeviceEncryptionKey, DeviceId, DriveId};
+use zeroize::Zeroizing;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -129,10 +130,10 @@ impl SealedBootstrap {
     }
 }
 
-pub(crate) fn hkdf_bootstrap_key(shared: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, shared);
-    let mut okm = [0u8; 32];
-    hk.expand(BOOTSTRAP_KEY_CONTEXT, &mut okm)
+pub(crate) fn hkdf_bootstrap_key(shared: &Zeroizing<[u8; 32]>) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, shared.as_slice());
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(BOOTSTRAP_KEY_CONTEXT, okm.as_mut())
         .expect("valid OKM length");
     okm
 }
@@ -228,7 +229,7 @@ pub fn seal_bootstrap(
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
     let aad = bootstrap_aad(drive, &invitee, encryption_key, &inviter);
-    let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
+    let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
@@ -272,7 +273,7 @@ pub fn open_bootstrap(
         &sealed.encryption_key,
         &sealed.inviter,
     );
-    let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
+    let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
         .decrypt(
             XNonce::from_slice(&sealed.nonce),
             Payload {
@@ -488,15 +489,16 @@ mod tests {
         plaintext.extend_from_slice(&sig);
         let nonce = [0x77u8; 24];
         let aad = bootstrap_aad(&drive(), &device, &enc_key, &owner);
-        let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&aead_key))
-            .encrypt(
-                chacha20poly1305::XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plaintext,
-                    aad: &aad,
-                },
-            )
-            .unwrap();
+        let ciphertext =
+            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
+                .encrypt(
+                    chacha20poly1305::XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &plaintext,
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
         let forged = SealedBootstrap {
             version: BOOTSTRAP_VERSION,
             drive: drive(),

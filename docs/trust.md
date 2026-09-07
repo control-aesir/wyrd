@@ -179,9 +179,9 @@ derived with it — these are format constants, recorded as decision T12):
 
 ```
 ManifestKey = BLAKE3-derive_key("wyrd manifest key v1",
-                                epoch_secret ‖ snapshot_id)
+                                DriveId ‖ epoch ‖ epoch_secret ‖ snapshot_id)
 ObjectKey   = BLAKE3-derive_key("wyrd object key v1",
-                                epoch_secret ‖ ContentId ‖ kind_byte ‖ version_byte)
+                                DriveId ‖ epoch ‖ epoch_secret ‖ ContentId ‖ kind_byte ‖ version_byte)
 ```
 
 **Epoch secrets are fresh random secrets** — not `KDF(DriveRootKey, N)` and

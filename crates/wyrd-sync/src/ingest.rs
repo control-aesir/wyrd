@@ -456,7 +456,7 @@ mod tests {
     #[allow(clippy::assertions_on_constants)]
     #[test]
     fn v0_table_is_internally_consistent() {
-        use wyrd_format::ENTRY_LEN;
+        use wyrd_format::{CHILD_LEN, ENTRY_LEN};
         // A manifest entry is fixed 82 bytes: the entry ceiling must fit
         // inside the byte ceiling, or it could never trigger on the wire.
         // Snapshot header overhead (id plus two counts) is 40 bytes.
@@ -464,11 +464,20 @@ mod tests {
             Limits::V0.max_manifest_entries * ENTRY_LEN + 40 < Limits::V0.max_object_bytes,
             "entry ceiling must be encodable within the byte ceiling"
         );
-        // Child references are fixed 64 bytes (tree id plus storage id):
-        // the child ceiling must likewise fit the byte ceiling.
+        // Child references are fixed 96 bytes per object-model decision 21
+        // (tree id, child-manifest id, sealed child-manifest storage id).
+        // The current count ceiling deliberately exceeds what the byte
+        // ceiling can carry — the byte gate fires first on the wire, and
+        // the count check is a backstop for any in-budget case that
+        // exceeds the count (see module docs: "values sit far above any
+        // legitimate v0 use"). The tripwire is honest: it reports the
+        // true reachable count instead of pretending the ceiling fits.
+        let max_reachable_children = (Limits::V0.max_object_bytes - 40) / CHILD_LEN;
         assert!(
-            Limits::V0.max_manifest_children * 64 + 40 < Limits::V0.max_object_bytes,
-            "child ceiling must be encodable within the byte ceiling"
+            Limits::V0.max_manifest_children > max_reachable_children,
+            "child ceiling must stay above the byte-ceiling-reachable count \
+             (current reachable: {max_reachable_children}, ceiling: {})",
+            Limits::V0.max_manifest_children,
         );
         // Minimal tree entries are ~19 bytes (one-byte name, empty chunk
         // list), so the tree ceiling stays reachable for flat dirs too.

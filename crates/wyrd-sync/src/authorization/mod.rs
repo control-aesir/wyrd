@@ -29,6 +29,9 @@ pub(crate) mod test_util;
 #[cfg(test)]
 mod conformance;
 
+#[cfg(test)]
+mod properties;
+
 use std::collections::{HashMap, HashSet};
 use wyrd_format::{DriveId, Snapshot, SnapshotId};
 

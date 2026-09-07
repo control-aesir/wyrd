@@ -22,5 +22,10 @@ blake3.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 
+# Zeroize secret material on drop (root key, epoch secrets, capability and
+# keystore plaintexts). `derive` gives us `ZeroizeOnDrop` for the newtype
+# wrappers; `Zeroizing<T>` covers the buffer-shaped temporaries.
+zeroize = { version = "1.9", features = ["derive"] }
+
 [dev-dependencies]
 proptest.workspace = true

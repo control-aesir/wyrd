@@ -7,8 +7,13 @@
 //! passphrase (see [`crate::keys::keystore`]); changing the passphrase
 //! re-wraps it without touching the drive's cryptographic universe.
 
+use zeroize::ZeroizeOnDrop;
+
 /// The random 256-bit drive root key. Owner/recovery custody only.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// `ZeroizeOnDrop` scrubs the underlying bytes when the wrapper is dropped
+/// (and on panic unwind) so the secret does not linger in process memory.
+#[derive(Clone, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct DriveRootKey([u8; 32]);
 impl std::fmt::Debug for DriveRootKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +70,17 @@ mod tests {
     fn root_does_not_leak_through_debug() {
         let root = DriveRootKey::from_bytes([0xAB; 32]);
         assert_eq!(format!("{root:?}"), "DriveRootKey(REDACTED)");
+    }
+
+    #[test]
+    fn root_implements_zeroize_on_drop() {
+        // The type-level guarantee is what we're testing: the trait
+        // derive means `Drop` will scrub the underlying bytes when the
+        // wrapper goes out of scope. Behavioral zeroization is not
+        // directly observable in safe Rust, so this is a compile-time
+        // lock on the contract, not a runtime check.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<DriveRootKey>();
     }
 
     // The root's most important property is structural: no derivation

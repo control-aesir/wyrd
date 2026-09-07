@@ -21,8 +21,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -63,7 +61,9 @@ jobs:
         env:
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: NOT_NEEDED
         with:
+          use_github_token: true
           model: openrouter/openrouter/free
           prompt: |
             # Full branch code review compared to master, posts to PR

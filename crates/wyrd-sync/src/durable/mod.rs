@@ -92,6 +92,7 @@ mod store;
 mod tests;
 
 pub use replay::{LoadedFacts, Rebuilt};
+#[allow(unused_imports)]
 pub(crate) use store::CrashStage;
 pub use store::DurableStore;
 

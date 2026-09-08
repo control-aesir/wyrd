@@ -1,6 +1,6 @@
 //! The private on-disk capability plaintext encoding.
 
-use super::Capability;
+use super::model::Capability;
 use crate::keys::epoch::EpochSecret;
 use wyrd_format::{DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
 use zeroize::Zeroizing;

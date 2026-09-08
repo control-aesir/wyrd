@@ -8,8 +8,8 @@ use wyrd_format::{ContentId, DriveId, Manifest, MembershipTransition, ObjectKind
 use super::{DurableError, Fact};
 use crate::control::message::{ControlKind, Message};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
-use crate::keys::capability::Capability;
-use crate::keys::capability_encoding as encoding;
+use crate::keys::capability::{encoding, Capability};
+
 use crate::keys::{aead, random_bytes};
 use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
 

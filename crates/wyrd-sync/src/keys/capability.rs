@@ -1040,11 +1040,16 @@ mod tests {
         /// Wrap/unwrap preserves arbitrary capabilities exactly: random
         /// devices, delivery keys, epoch ranges, and secrets all survive
         /// the envelope, and only the matching encryption secret opens it.
+        /// The tamper variant flips one byte in the ephemeral-key header
+        /// or the tag tail: the forgery must fail the open, never
+        /// half-open.
         #[test]
         fn wrap_unwrap_preserves_arbitrary_capabilities(
             device in any::<[u8; 32]>(),
             enc_pattern in any::<u8>(),
             secrets in prop::collection::vec(any::<[u8; 32]>(), 1..=8usize),
+            tamper_header in any::<bool>(),
+            mask in 1u8..=255,
         ) {
             let device = DeviceId::from_bytes(device);
             let (enc_secret, enc_key) = enc_pair(enc_pattern);
@@ -1062,6 +1067,14 @@ mod tests {
             .unwrap();
             let wrapped = cap.wrap().unwrap();
             prop_assert_eq!(wrapped.unwrap(&enc_secret).unwrap(), cap);
+            let mut tampered = wrapped.as_bytes().to_vec();
+            let at = if tamper_header {
+                0
+            } else {
+                tampered.len() - 1
+            };
+            tampered[at] ^= mask;
+            prop_assert!(WrappedCapability::from_bytes(tampered).unwrap(&enc_secret).is_err());
         }
     }
 }

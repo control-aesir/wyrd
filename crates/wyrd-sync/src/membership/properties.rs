@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 
+use super::state::{apply, MembershipState};
 use super::test_util::{admit, drive, key, sign, Builder};
 use super::{MembershipLog, TransitionStatus};
 
@@ -153,6 +154,45 @@ proptest! {
         let tips: Vec<Option<u64>> =
             logs.iter().map(|l| l.known_state().map(|k| k.epoch)).collect();
         prop_assert!(tips.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    /// Canonical apply equals the sequential fold: the link-walking
+    /// derivation must agree with folding `state::apply` over the
+    /// canonical transitions in epoch order, at every step — and the
+    /// verdicts and known tip must match between canonical-order and
+    /// shuffled-order observation. This pins derived states against the
+    /// naive semantics, so refactors of the chain walk (e.g. iterative
+    /// validation) cannot silently change what a transition means.
+    #[test]
+    fn canonical_apply_matches_sequential_fold(
+        ops in prop::collection::vec(op_strategy(), 0..12usize),
+        seed in any::<u64>(),
+    ) {
+        let chain = build_chain(&ops);
+        let mut canonical_log = MembershipLog::new(drive());
+        observe_all(&mut canonical_log, &chain);
+        let mut shuffled_log = MembershipLog::new(drive());
+        observe_all(&mut shuffled_log, &shuffled(&chain, seed));
+        prop_assert_eq!(shuffled_log.statuses(), canonical_log.statuses());
+        prop_assert_eq!(shuffled_log.known_state(), canonical_log.known_state());
+        let mut canonical: Vec<&MembershipTransition> = chain
+            .iter()
+            .filter(|t| {
+                shuffled_log.status(&t.transition_id()) == Some(TransitionStatus::Canonical)
+            })
+            .collect();
+        canonical.sort_by_key(|t| t.epoch);
+        prop_assert!(!canonical.is_empty(), "valid chain has a tip");
+        let mut folded = MembershipState::default();
+        for t in &canonical {
+            // Generated chains are valid end to end by construction
+            // (ill-formed ops degrade to `Rotate`), so the fold cannot fail.
+            folded = apply(&folded, &t.changes).expect("generated chain folds");
+            prop_assert_eq!(
+                shuffled_log.state_of(&t.transition_id()),
+                Some(folded.clone())
+            );
+        }
     }
 
     /// Canonical epochs are exactly 1..=K: no gaps, no duplicates, no

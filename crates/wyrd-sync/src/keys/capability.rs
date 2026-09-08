@@ -471,6 +471,14 @@ fn capability_aad(
     aad
 }
 
+/// The plaintext document for durable storage: the same encoding the
+/// wrap envelope seals, so load-time parsing shares the envelope's field
+/// discipline. Returned as `Zeroizing<Vec<u8>>` so the secret material is
+/// wiped when the wrapper is dropped. Only ever persisted sealed.
+pub(crate) fn plaintext_bytes(capability: &Capability) -> Zeroizing<Vec<u8>> {
+    encode_capability(capability)
+}
+
 /// The plaintext document inside the envelope: the same AAD inputs plus
 /// the secret list, so a forged header must agree with what it carries.
 /// Returned as `Zeroizing<Vec<u8>>` so the secret material is wiped when

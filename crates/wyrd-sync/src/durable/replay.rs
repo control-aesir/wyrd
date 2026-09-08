@@ -29,6 +29,7 @@ pub struct LoadedFacts {
     pub announcements: Vec<SnapshotAnnouncement>,
     pub manifests: Vec<ManifestRecord>,
     pub local_objects: Vec<ContentId>,
+    pub removed_objects: Vec<ContentId>,
     pub materialization: Vec<(ContentId, MaterializationState)>,
     pub seen: Vec<ControlMessageId>,
 }
@@ -41,6 +42,7 @@ impl LoadedFacts {
             DecodedFact::Announcement(a) => self.announcements.push(a),
             DecodedFact::Manifest(m) => self.manifests.push(m),
             DecodedFact::LocalObject(id) => self.local_objects.push(id),
+            DecodedFact::ObjectRemoved(id) => self.removed_objects.push(id),
             DecodedFact::Materialization(id, s) => self.materialization.push((id, s)),
             DecodedFact::ControlMessage(id) => self.seen.push(id),
         }
@@ -79,6 +81,9 @@ pub(super) fn rebuild_facts(
     }
     for id in facts.local_objects {
         runtime.mark_local_object(id);
+    }
+    for id in facts.removed_objects {
+        runtime.remove_local_object(id);
     }
     for (id, state) in facts.materialization {
         runtime.set_materialization(id, state);

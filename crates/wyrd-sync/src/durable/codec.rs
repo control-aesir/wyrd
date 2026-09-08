@@ -23,10 +23,11 @@ const TAG_MANIFEST: u8 = 0x04;
 const TAG_LOCAL_OBJECT: u8 = 0x05;
 const TAG_MATERIALIZATION: u8 = 0x06;
 const TAG_CONTROL_MESSAGE: u8 = 0x07;
+const TAG_OBJECT_REMOVED: u8 = 0x08;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 7] = [
+const KNOWN_TAGS: [u8; 8] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -34,6 +35,7 @@ const KNOWN_TAGS: [u8; 7] = [
     TAG_LOCAL_OBJECT,
     TAG_MATERIALIZATION,
     TAG_CONTROL_MESSAGE,
+    TAG_OBJECT_REMOVED,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -159,6 +161,7 @@ pub(super) fn encode_fact(
             Ok((TAG_MANIFEST, bytes))
         }
         Fact::LocalObject(id) => Ok((TAG_LOCAL_OBJECT, id.as_bytes().to_vec())),
+        Fact::ObjectRemoved(id) => Ok((TAG_OBJECT_REMOVED, id.as_bytes().to_vec())),
         Fact::Materialization(id, state) => {
             let byte = match state {
                 MaterializationState::RemoteOnly => 0,
@@ -287,6 +290,10 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let id = ContentId::from_bytes(record.try_into().ok()?);
             Some(DecodedFact::LocalObject(id))
         }
+        TAG_OBJECT_REMOVED => {
+            let id = ContentId::from_bytes(record.try_into().ok()?);
+            Some(DecodedFact::ObjectRemoved(id))
+        }
         TAG_MATERIALIZATION => {
             if record.len() != 33 {
                 return None;
@@ -354,6 +361,7 @@ pub(super) enum DecodedFact {
     Announcement(SnapshotAnnouncement),
     Manifest(ManifestRecord),
     LocalObject(ContentId),
+    ObjectRemoved(ContentId),
     Materialization(ContentId, MaterializationState),
     ControlMessage(ControlMessageId),
 }

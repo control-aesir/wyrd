@@ -25,6 +25,7 @@
 use thiserror::Error;
 
 pub mod capability;
+pub(crate) mod capability_encoding;
 pub mod epoch;
 pub mod escrow;
 pub mod keystore;

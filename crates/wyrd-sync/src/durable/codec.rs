@@ -3,16 +3,13 @@
 //! format and CURRENT protocol are byte-for-byte stable; unknown record
 //! tags are skipped for forward compatibility.
 
-use wyrd_format::{
-    ContentId, DeviceEncryptionKey, DeviceId, DriveId, Manifest, MembershipTransition, ObjectKind,
-    StorageId, TransitionId,
-};
+use wyrd_format::{ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, StorageId};
 
 use super::{DurableError, Fact};
 use crate::control::message::{ControlKind, Message};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
-use crate::keys::capability::{plaintext_bytes, Capability};
-use crate::keys::epoch::EpochSecret;
+use crate::keys::capability::Capability;
+use crate::keys::capability_encoding as encoding;
 use crate::keys::{aead, random_bytes};
 use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
 
@@ -126,7 +123,7 @@ pub(super) fn encode_fact(
         Fact::Transition(t) => Ok((TAG_TRANSITION, t.canonical_bytes())),
         Fact::Capability(authorized) => {
             let cap = authorized.capability();
-            let pt = plaintext_bytes(cap);
+            let pt = encoding::plaintext_bytes(cap);
             let mut nonce = [0u8; 24];
             random_bytes(&mut nonce)?;
             let aad = capability_aad(drive);
@@ -271,7 +268,7 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             }
             let nonce: &[u8; 24] = record[..24].try_into().ok()?;
             let pt = aead::open(store_key, nonce, &record[24..], &capability_aad(drive)).ok()?;
-            let cap = parse_capability_plaintext(&pt)?;
+            let cap = encoding::parse_plaintext(&pt)?;
             if cap.drive != *drive {
                 return None;
             }
@@ -312,39 +309,6 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
-}
-
-// --- capability plaintext ----------------------------------------------------
-
-// NOTE: `parse_capability_plaintext` moves to `keys::capability::encoding`
-// as a narrow capability-owned decode API in the capability-split stage;
-// it lives here verbatim until then so this stage stays behavior-inert.
-
-/// Parse sealed-capability plaintext back into a capability: exact
-/// length, epoch equals the secret count, and `Capability::new`
-/// re-checks the shape (curve point, non-empty, epoch binding).
-fn parse_capability_plaintext(pt: &[u8]) -> Option<Capability> {
-    if pt.len() < 140 || !(pt.len() - 140).is_multiple_of(32) {
-        return None;
-    }
-    let epoch = u64::from_le_bytes(pt[128..136].try_into().ok()?);
-    let count = u32::from_le_bytes(pt[136..140].try_into().ok()?) as u64;
-    if epoch != count || pt.len() != 140 + count as usize * 32 {
-        return None;
-    }
-    let secrets = pt[140..]
-        .chunks_exact(32)
-        .map(|c| EpochSecret::from_bytes(c.try_into().expect("chunks_exact(32)")))
-        .collect();
-    Capability::new(
-        DriveId::from_bytes(pt[0..32].try_into().ok()?),
-        DeviceId::from_bytes(pt[32..64].try_into().ok()?),
-        DeviceEncryptionKey::from_bytes(pt[64..96].try_into().ok()?),
-        TransitionId::from_bytes(pt[96..128].try_into().ok()?),
-        epoch,
-        secrets,
-    )
-    .ok()
 }
 
 fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {

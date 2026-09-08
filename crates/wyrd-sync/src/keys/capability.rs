@@ -29,6 +29,7 @@ use thiserror::Error;
 use wyrd_format::{DeviceId, DriveId, TransitionId};
 use zeroize::Zeroizing;
 
+use super::capability_encoding as encoding;
 use super::epoch::EpochSecret;
 use super::{random_bytes, CryptoError};
 use wyrd_format::DeviceEncryptionKey;
@@ -174,7 +175,7 @@ impl Capability {
             &self.transition,
             self.up_to_epoch(),
         );
-        let plaintext = encode_capability(self);
+        let plaintext = encoding::plaintext_bytes(self);
         let ciphertext = super::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad)?;
 
         let mut bytes = Vec::with_capacity(128 + 24 + ciphertext.len());
@@ -475,30 +476,6 @@ fn capability_aad(
 /// wrap envelope seals, so load-time parsing shares the envelope's field
 /// discipline. Returned as `Zeroizing<Vec<u8>>` so the secret material is
 /// wiped when the wrapper is dropped. Only ever persisted sealed.
-pub(crate) fn plaintext_bytes(capability: &Capability) -> Zeroizing<Vec<u8>> {
-    encode_capability(capability)
-}
-
-/// The plaintext document inside the envelope: the same AAD inputs plus
-/// the secret list, so a forged header must agree with what it carries.
-/// Returned as `Zeroizing<Vec<u8>>` so the secret material is wiped when
-/// the wrapper is dropped.
-fn encode_capability(capability: &Capability) -> Zeroizing<Vec<u8>> {
-    let mut pt = Zeroizing::new(Vec::with_capacity(
-        128 + 8 + 4 + 32 * capability.secrets.len(),
-    ));
-    pt.extend_from_slice(capability.drive.as_bytes());
-    pt.extend_from_slice(capability.device.as_bytes());
-    pt.extend_from_slice(capability.encryption_key.as_bytes());
-    pt.extend_from_slice(capability.transition.as_bytes());
-    pt.extend_from_slice(&capability.up_to_epoch().to_le_bytes());
-    pt.extend_from_slice(&(capability.secrets.len() as u32).to_le_bytes());
-    for secret in &capability.secrets {
-        pt.extend_from_slice(secret.as_bytes());
-    }
-    pt
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

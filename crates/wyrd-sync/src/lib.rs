@@ -11,6 +11,8 @@
 
 pub mod authorization;
 pub mod control;
+#[cfg(test)]
+mod fuzz;
 pub mod ingest;
 pub mod keys;
 pub mod membership;

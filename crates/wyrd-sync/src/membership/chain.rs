@@ -53,8 +53,9 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
 
     for (_epoch, id) in &by_epoch {
         let t = log.transition(id).expect("observed");
-        let outcome = validate_link(log, t, &mut link);
-        link.insert(*id, outcome);
+        // `link_for` memoizes, so the ascending pass classifies each link
+        // once while staying correct for any order.
+        link_for(log, t, &mut link);
     }
 
     let mut result = Analysis::default();
@@ -125,13 +126,14 @@ fn validate_link(
     if prev_t.epoch.checked_add(1) != Some(t.epoch) {
         return Link::Invalid(InvalidReason::PrevWrongEpoch);
     }
+    // Ancestry. The predecessor is already classified: `analyse` feeds
+    // transitions in ascending epoch order and `link_for` classifies the
+    // closure leaves-first, so this is a lookup, never a descent. An
+    // unclassified-but-observed predecessor stays Pending (defensive;
+    // unreachable through either driver).
     let prev_link = match link.get(&prev_id) {
         Some(prev) => prev.clone(),
-        None => {
-            let outcome = validate_link(log, prev_t, link);
-            link.insert(prev_id, outcome.clone());
-            outcome
-        }
+        None => return Link::Pending,
     };
     let prev_state = match prev_link {
         Link::Valid(state) => state,
@@ -164,16 +166,23 @@ fn validate_link(
         if entry_t.epoch.checked_add(1) != Some(t.epoch) {
             return Link::Invalid(InvalidReason::InvalidResolvesEntry);
         }
-        match link_for(log, entry_t, link) {
-            Link::Valid(_) => {}
-            Link::Pending => return Link::Pending,
-            _ => return Link::Invalid(InvalidReason::InvalidResolvesEntry),
+        // Already classified, as with the predecessor above: a lookup,
+        // never a descent. Unknown-but-observed stays Pending.
+        match link.get(entry) {
+            Some(Link::Valid(_)) => {}
+            Some(Link::Pending) | None => return Link::Pending,
+            Some(_) => return Link::Invalid(InvalidReason::InvalidResolvesEntry),
         }
     }
     Link::Valid(state)
 }
 
-/// Memoized link classification for an observed transition.
+/// Memoized link classification for an observed transition. Gathers the
+/// (predecessor, `resolves`) closure with an explicit stack and validates
+/// leaves first in ascending epoch order, so arbitrarily deep ancestry
+/// never touches the call stack. Closure edges strictly descend in epoch
+/// (enforced at validation), which makes ascending-epoch order a valid
+/// topological order for the whole closure.
 fn link_for(
     log: &MembershipLog,
     t: &MembershipTransition,
@@ -183,9 +192,40 @@ fn link_for(
     if let Some(l) = link.get(&id) {
         return l.clone();
     }
-    let outcome = validate_link(log, t, link);
-    link.insert(id, outcome.clone());
-    outcome
+    let mut closure = vec![id];
+    let mut stack = vec![id];
+    let mut seen = HashSet::from([id]);
+    while let Some(cur) = stack.pop() {
+        let Some(cur_t) = log.transition(&cur) else {
+            continue;
+        };
+        if let Some(prev) = cur_t.prev {
+            if seen.insert(prev) {
+                closure.push(prev);
+                stack.push(prev);
+            }
+        }
+        for entry in &cur_t.resolves {
+            if seen.insert(*entry) {
+                closure.push(*entry);
+                stack.push(*entry);
+            }
+        }
+    }
+    closure.sort_by_key(|dep| log.transition(dep).map_or(0, |dep_t| dep_t.epoch));
+    for dep in closure {
+        if link.contains_key(&dep) {
+            continue;
+        }
+        let Some(dep_t) = log.transition(&dep) else {
+            // Unobserved dependency: there is no link to classify. The
+            // dependent validates Pending against it, as before.
+            continue;
+        };
+        let outcome = validate_link(log, dep_t, link);
+        link.insert(dep, outcome);
+    }
+    link.get(&id).cloned().unwrap_or(Link::Pending)
 }
 
 /// Children of a transition: observed transitions whose prev names it.
@@ -403,5 +443,34 @@ fn classify_remaining(
                 result.states.insert(id, state.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::{drive, Builder};
+    use super::*;
+    use wyrd_format::Change;
+
+    /// Depth stress on the classifier itself: classifying a deep tip
+    /// against a cold memo map descends the whole ancestry. The recursive
+    /// `link_for` overflows the stack here; the iterative version walks
+    /// the closure leaves-first on the heap.
+    #[test]
+    fn deep_tip_classifies_without_recursion() {
+        const DEPTH: usize = 10_000;
+        let (mut b, genesis) = Builder::genesis(10);
+        let mut chain = vec![genesis];
+        for _ in 1..DEPTH {
+            chain.push(b.child(vec![Change::Rotate]));
+        }
+        let mut log = MembershipLog::new(drive());
+        for t in &chain {
+            log.observe(t.clone());
+        }
+        let tip = chain.last().expect("nonempty chain");
+        let mut link = HashMap::new();
+        assert!(matches!(link_for(&log, tip, &mut link), Link::Valid(_)));
+        assert_eq!(link.len(), DEPTH, "every link classified exactly once");
     }
 }

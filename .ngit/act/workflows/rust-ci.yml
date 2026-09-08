@@ -55,7 +55,9 @@ jobs:
       - name: Tests
         run: cargo test --color never --workspace 2>&1 | tee /tmp/test.log
 
-      - if: github.event_name == 'pull_request'
+      # Disabled since it's not working for now
+      # - if: github.event_name == 'pull_request'
+      - if: false
         name: Run OpenCode review
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

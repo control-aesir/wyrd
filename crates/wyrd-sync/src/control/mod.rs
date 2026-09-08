@@ -41,8 +41,6 @@ use thiserror::Error;
 use wyrd_format::DriveId;
 
 use crate::keys::{random_bytes, CryptoError};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::XChaCha20Poly1305;
 
 pub use bootstrap::{
     BootstrapInvitation, SealedBootstrap, BOOTSTRAP_HEADER_LEN, BOOTSTRAP_VERSION,
@@ -175,15 +173,7 @@ pub fn seal(
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
     let aad = control_aad(CONTROL_VERSION, drive, kind, epoch);
-    let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(control_key))
-        .encrypt(
-            chacha20poly1305::XNonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::SealFailed)?;
+    let ciphertext = crate::keys::aead::seal(control_key, &nonce, &plaintext, &aad)?;
     Ok(SealedControl {
         version: CONTROL_VERSION,
         drive: *drive,
@@ -208,15 +198,7 @@ pub fn open(
         return Err(ControlError::UnknownVersion(sealed.version));
     }
     let aad = control_aad(sealed.version, &sealed.drive, sealed.kind, sealed.epoch);
-    let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(control_key))
-        .decrypt(
-            chacha20poly1305::XNonce::from_slice(&sealed.nonce),
-            Payload {
-                msg: &sealed.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::OpenFailed)?;
+    let plaintext = crate::keys::aead::open(control_key, &sealed.nonce, &sealed.ciphertext, &aad)?;
     if plaintext.len() < 41 {
         return Err(CryptoError::Malformed.into());
     }

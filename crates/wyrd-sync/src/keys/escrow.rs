@@ -24,8 +24,6 @@
 //! work: this change provides the record type, derivation, and
 //! verification.
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::XChaCha20Poly1305;
 use wyrd_format::DriveId;
 use wyrd_format::StorageId;
 
@@ -107,15 +105,7 @@ pub fn wrap(
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
     let aad = escrow_aad(ESCROW_VERSION, drive, epoch);
-    let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(escrow_key))
-        .encrypt(
-            chacha20poly1305::XNonce::from_slice(&nonce),
-            Payload {
-                msg: secret.as_bytes(),
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::SealFailed)?;
+    let ciphertext = super::aead::seal(escrow_key, &nonce, secret.as_bytes(), &aad)?;
     Ok(EscrowRecord {
         version: ESCROW_VERSION,
         drive: *drive,
@@ -135,15 +125,7 @@ pub fn unwrap(escrow_key: &[u8; 32], record: &EscrowRecord) -> Result<EpochSecre
         return Err(CryptoError::Malformed);
     }
     let aad = escrow_aad(record.version, &record.drive, record.epoch);
-    let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(escrow_key))
-        .decrypt(
-            chacha20poly1305::XNonce::from_slice(&record.nonce),
-            Payload {
-                msg: &record.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::OpenFailed)?;
+    let plaintext = super::aead::open(escrow_key, &record.nonce, &record.ciphertext, &aad)?;
     Ok(EpochSecret::from_bytes(
         plaintext
             .try_into()

@@ -541,3 +541,15 @@ proptest! {
         let _ = WrappedCapability::from_bytes(random).unwrap(&enc_secret);
     }
 }
+
+/// Full-length keystore forgeries: an 88-byte envelope passes the length
+/// gate, runs the KDF, and must still fail the tag. Kept as single
+/// deterministic cases (not a property) so the suite pays for exactly
+/// two Argon2id executions here instead of one per generated case.
+#[test]
+fn keystore_full_length_forgery_fails_the_tag() {
+    let mut forged = keystore_seed();
+    forged[80] ^= 1;
+    assert!(unwrap_root(&WrappedSecret::from_bytes(forged), "pw").is_err());
+    assert!(unwrap_root(&WrappedSecret::from_bytes(keystore_seed()), "pw").is_err());
+}

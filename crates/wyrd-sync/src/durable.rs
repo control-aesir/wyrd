@@ -7,7 +7,7 @@
 //! drive/
 //!   DRIVE              32-byte drive id, written once at creation
 //!   store-key.wrap     store key sealed under the passphrase
-//!   CURRENT            8-byte LE last durable commit sequence
+//!   CURRENT            sequence (8-byte LE) plus commit hash (32 bytes)
 //!   commits/
 //!     0000000000000001.commit
 //!     ...
@@ -24,18 +24,46 @@
 //!
 //! The critical invariant: **a commit is visible iff its sequence is
 //! `<=` the durable CURRENT.** Recovery replays commits `1..=CURRENT`
-//! and ignores orphaned `.tmp` files, unparsable commit files, and
-//! unknown record tags; a missing commit file at or below CURRENT is
-//! store damage and fails the load. Directory `fsync`s are part of the
-//! contract: renames are filesystem metadata and must reach stable
-//! storage too.
+//! and verifies each against the hash chain before replaying it.
 //!
-//! Facts, not state: commits carry canonical records (transitions,
-//! sealed capabilities, announcements, manifests, residency facts).
-//! Loading replays them into a [`MembershipLog`], a [`DriveKeyring`],
-//! and a [`RuntimeState`]; the caller runs `reconcile()` for the fetch
-//! plan. Derived indexes are rebuilt, never persisted, so two
-//! representations of the same DAG can never disagree.
+//! Failure semantics, stated exactly:
+//!
+//! ```text
+//! orphaned .tmp files ............ ignore (never crossed the boundary)
+//! commits above CURRENT .......... ignore (leave for GC)
+//! commit <= CURRENT, valid ....... replay
+//! commit <= CURRENT, missing ..... ERROR (store damage)
+//! commit <= CURRENT, undecodable . ERROR (store damage, never a skip)
+//! ```
+//!
+//! A torn write can only ever produce an orphaned temp: renames are
+//! atomic and CURRENT advances only after the commit file and its
+//! directory entry are durable. So corruption inside the committed
+//! prefix is damage or tampering, and the load fails rather than
+//! reconstructing a hybrid state around it.
+//!
+//! Integrity: each commit carries the BLAKE3 hash of the domain tag,
+//! the drive id, its sequence, the previous commit's hash, and the
+//! canonical records; CURRENT binds the tip hash. Recovery verifies the
+//! whole chain, so the durable log is content-addressed end to end:
+//!
+//! ```text
+//! CURRENT(seq, hash)
+//!    ↓
+//! commit N ──hash──> ... ──hash──> commit 1 ──hash──> zeros
+//! ```
+//!
+//! Facts, not state — precisely, immutable mutations: commits carry
+//! canonical records (transitions, sealed capabilities, announcements,
+//! manifests) plus residency mutations (materialization entries are
+//! last-wins, local-object marks are ever-local until a future removal
+//! mutation exists). Loading replays them into a [`MembershipLog`], a
+//! [`DriveKeyring`], and a [`RuntimeState`]; the caller runs
+//! `reconcile()` for the fetch plan. Replay runs in dependency phases
+//! (transitions first, then the rest), so the per-type buckets of
+//! [`LoadedFacts`] reflect the replay structure; order is preserved
+//! within each bucket. Derived indexes are rebuilt, never persisted, so
+//! two representations of the same DAG can never disagree.
 //!
 //! Capabilities cross the durability boundary only as
 //! [`AuthorizedCapability`]: validated against membership state at
@@ -76,6 +104,18 @@ const TAG_LOCAL_OBJECT: u8 = 0x05;
 const TAG_MATERIALIZATION: u8 = 0x06;
 const TAG_CONTROL_MESSAGE: u8 = 0x07;
 
+/// Resource limits: a corrupt local file must not cause unbounded
+/// allocation. Commits hold small canonical facts; anything beyond
+/// these bounds is damage, not data.
+const MAX_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECORDS_PER_COMMIT: usize = 65_536;
+const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Domain tag for the commit-chain hash: integrity and ordering of the
+/// durable log itself, not confidentiality.
+const COMMIT_HASH_DOMAIN: &[u8] = b"wyrd durable commit v1";
+// The chain genesis: commit 1 links from all-zero bytes.
+
 /// AAD domain for the store key envelope (keystore-shaped, own domain so
 /// a wrapped store key can never open as a root or device secret).
 const STORE_KEY_AAD: &[u8] = b"wyrd store key v1";
@@ -92,8 +132,10 @@ const CAPABILITY_STORE_AAD: &[u8] = b"wyrd capability store v1";
 pub enum DurableError {
     #[error("durable I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("CURRENT is present but not an 8-byte sequence")]
+    #[error("CURRENT is present but not a sequence plus commit hash")]
     CorruptCurrent,
+    #[error("commit {0} is present but undecodable")]
+    CorruptCommit(u64),
     #[error("store holds another drive")]
     DriveMismatch,
     #[error("store key failed: {0}")]
@@ -114,6 +156,8 @@ pub enum DurableError {
     Install(#[from] InstallError),
     #[error("commit {0} is missing at or below CURRENT")]
     MissingCommit(u64),
+    #[error("commit sequence exhausted")]
+    SequenceExhausted,
     #[error("capability for {0:?} no longer validates on rebuild")]
     CapabilityChanged(DeviceId),
     #[error("capability references a transition with no derived state")]
@@ -222,6 +266,9 @@ pub struct DurableStore {
     dir: PathBuf,
     drive: DriveId,
     current: u64,
+    /// The hash of the commit at `current` (zeros on a fresh store):
+    /// the previous-hash link for the next commit.
+    last_hash: [u8; 32],
     store_key: StoreKey,
 }
 
@@ -253,6 +300,7 @@ impl DurableStore {
 
     /// Open (or create) the store: verify the drive id, unwrap or mint
     /// the store key, read CURRENT. Missing CURRENT means a fresh store.
+    /// The CURRENT marker is trusted on open and verified on load.
     pub fn open(dir: PathBuf, drive: DriveId, passphrase: &str) -> Result<Self, DurableError> {
         let commits = dir.join("commits");
         fs::create_dir_all(&commits)?;
@@ -270,11 +318,12 @@ impl DurableStore {
             Err(e) => return Err(DurableError::Io(e)),
         }
         let store_key = Self::load_or_mint_store_key(&dir, passphrase)?;
-        let current = Self::read_current(&dir)?;
+        let (current, last_hash) = Self::read_current(&dir)?;
         Ok(DurableStore {
             dir,
             drive,
             current,
+            last_hash,
             store_key,
         })
     }
@@ -332,16 +381,20 @@ impl DurableStore {
         }
     }
 
-    fn read_current(dir: &Path) -> Result<u64, DurableError> {
+    /// Read the CURRENT marker: sequence plus tip hash. Missing means a
+    /// fresh store; anything else malformed fails — CURRENT is only ever
+    /// written atomically, so a partial marker is damage, not a crash
+    /// artifact.
+    fn read_current(dir: &Path) -> Result<(u64, [u8; 32]), DurableError> {
         match fs::read(dir.join("CURRENT")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, [0; 32])),
             Ok(bytes) => {
-                if bytes.len() != 8 {
+                if bytes.len() != 40 {
                     return Err(DurableError::CorruptCurrent);
                 }
-                Ok(u64::from_le_bytes(
-                    bytes.try_into().expect("length checked"),
-                ))
+                let seq = u64::from_le_bytes(bytes[..8].try_into().expect("length checked"));
+                let hash = bytes[8..40].try_into().expect("length checked");
+                Ok((seq, hash))
             }
             Err(e) => Err(DurableError::Io(e)),
         }
@@ -424,6 +477,12 @@ impl DurableStore {
         self.commit_until(facts, CrashStage::Complete)
     }
 
+    /// The tip hash for crafting chained commit files in tests.
+    #[cfg(test)]
+    pub(crate) fn tip_hash_for_test(&self) -> [u8; 32] {
+        self.last_hash
+    }
+
     /// The commit protocol, stopping after the named stage to simulate
     /// power loss (tests only pass non-`Complete` stages). Production
     /// always runs to `Complete`.
@@ -437,13 +496,20 @@ impl DurableStore {
         }
         // Refresh against disk: a crashed predecessor may have advanced
         // CURRENT further than this handle saw.
-        self.current = Self::read_current(&self.dir)?.max(self.current);
+        let (disk_current, disk_hash) = Self::read_current(&self.dir)?;
+        if disk_current > self.current {
+            self.current = disk_current;
+            self.last_hash = disk_hash;
+        }
         let mut records = Vec::with_capacity(facts.len());
         for fact in facts {
             records.push(self.encode_fact(fact)?);
         }
-        let seq = self.current + 1;
-        let bytes = encode_commit(seq, &records);
+        let seq = self
+            .current
+            .checked_add(1)
+            .ok_or(DurableError::SequenceExhausted)?;
+        let (bytes, hash) = encode_commit(&self.drive, seq, &self.last_hash, &records);
         let name = commit_name(seq);
         let commits = self.commits_dir();
 
@@ -467,9 +533,11 @@ impl DurableStore {
         if stop == CrashStage::AfterFsyncCommitDir {
             return Ok(self.current);
         }
-        let current_bytes = seq.to_le_bytes();
         let current_tmp = self.dir.join("CURRENT.tmp");
         {
+            let mut current_bytes = Vec::with_capacity(40);
+            current_bytes.extend_from_slice(&seq.to_le_bytes());
+            current_bytes.extend_from_slice(&hash);
             let mut f = File::create(&current_tmp)?;
             f.write_all(&current_bytes)?;
         }
@@ -482,6 +550,7 @@ impl DurableStore {
         }
         fs::rename(&current_tmp, self.dir.join("CURRENT"))?;
         self.current = seq;
+        self.last_hash = hash;
         if stop == CrashStage::AfterRenameCurrent {
             return Ok(seq);
         }
@@ -489,35 +558,58 @@ impl DurableStore {
         Ok(seq)
     }
 
-    /// Replay commits `1..=CURRENT` into facts, in commit order. Orphaned
-    /// `.tmp` files, unparsable commit files, and unknown record tags
-    /// are ignored; a missing commit at or below CURRENT fails the load.
+    /// Replay commits `1..=CURRENT` into facts, verifying the hash chain
+    /// as it goes. Orphaned `.tmp` files and commits above CURRENT are
+    /// ignored; anything else wrong — a missing commit, an undecodable
+    /// commit, a broken hash link, a tip hash that disagrees with CURRENT
+    /// — fails the load. A commit at or below CURRENT is authoritative;
+    /// the loader never reconstructs around it.
     pub fn load(&self) -> Result<LoadedFacts, DurableError> {
-        let current = Self::read_current(&self.dir)?;
+        let (current, tip_hash) = Self::read_current(&self.dir)?;
         let mut facts = LoadedFacts::default();
+        let mut prev_hash = [0u8; 32];
         for seq in 1..=current {
             let path = self.commits_dir().join(commit_name(seq));
-            let bytes = match fs::read(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(DurableError::MissingCommit(seq));
-                }
-                Err(e) => return Err(DurableError::Io(e)),
-                Ok(bytes) => bytes,
-            };
-            let Some(records) = self.decode_commit_file(&bytes, seq) else {
-                continue;
-            };
+            // Bound the read before allocating: the file must exist at
+            // this size for the commit to be real.
+            let size = fs::metadata(&path)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        DurableError::MissingCommit(seq)
+                    } else {
+                        DurableError::Io(e)
+                    }
+                })?
+                .len();
+            if size > MAX_COMMIT_BYTES {
+                return Err(DurableError::CorruptCommit(seq));
+            }
+            let bytes = fs::read(&path).map_err(DurableError::Io)?;
+            let (records, hash) = self.decode_commit_file(&bytes, seq, &prev_hash)?;
+            prev_hash = hash;
             for record in records {
                 facts.push(record);
             }
         }
+        if prev_hash != tip_hash {
+            return Err(DurableError::CorruptCurrent);
+        }
         Ok(facts)
     }
 
-    /// Decode one commit file: `None` means ignore the file (torn write,
-    /// future version, or corrupt entry — never a partial state, since
-    /// visibility is gated on CURRENT, not on file presence).
-    fn decode_commit_file(&self, bytes: &[u8], seq: u64) -> Option<Vec<DecodedFact>> {
+    /// Decode and verify one commit file. Every structural failure —
+    /// wrong version, sequence or previous-hash mismatch, over-limit
+    /// counts or lengths, malformed known records, trailing bytes, a
+    /// hash mismatch — fails the file: inside the committed prefix
+    /// there is no such thing as an ignorable commit. Unknown record
+    /// tags are the only skips, for forward compatibility.
+    fn decode_commit_file(
+        &self,
+        bytes: &[u8],
+        seq: u64,
+        prev_hash: &[u8; 32],
+    ) -> Result<(Vec<DecodedFact>, [u8; 32]), DurableError> {
+        let corrupt = || DurableError::CorruptCommit(seq);
         let mut pos = 0usize;
         let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
             let end = pos.checked_add(n)?;
@@ -528,29 +620,58 @@ impl DurableStore {
             *pos = end;
             Some(slice)
         };
-        if take(&mut pos, 1)? != [COMMIT_VERSION] {
-            return None;
+        if take(&mut pos, 1).ok_or_else(&corrupt)? != [COMMIT_VERSION] {
+            return Err(corrupt());
         }
-        if u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) != seq {
-            return None;
+        if u64::from_le_bytes(
+            take(&mut pos, 8)
+                .ok_or_else(&corrupt)?
+                .try_into()
+                .expect("take"),
+        ) != seq
+        {
+            return Err(corrupt());
         }
-        let count = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
+        if take(&mut pos, 32).ok_or_else(&corrupt)? != prev_hash {
+            return Err(corrupt());
+        }
+        let count = u32::from_le_bytes(
+            take(&mut pos, 4)
+                .ok_or_else(&corrupt)?
+                .try_into()
+                .expect("take"),
+        ) as usize;
+        if count > MAX_RECORDS_PER_COMMIT {
+            return Err(corrupt());
+        }
         let mut out = Vec::with_capacity(count.min(1024));
         for _ in 0..count {
-            let tag = take(&mut pos, 1)?[0];
-            let len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
-            let record = take(&mut pos, len)?.to_vec();
-            // Unknown tags are skipped for forward compatibility; a
-            // malformed known record poisons the file, not the store.
+            let tag = take(&mut pos, 1).ok_or_else(&corrupt)?[0];
+            let len = u32::from_le_bytes(
+                take(&mut pos, 4)
+                    .ok_or_else(&corrupt)?
+                    .try_into()
+                    .expect("take"),
+            ) as usize;
+            if len > MAX_RECORD_BYTES {
+                return Err(corrupt());
+            }
+            let record = take(&mut pos, len).ok_or_else(&corrupt)?.to_vec();
             if !KNOWN_TAGS.contains(&tag) {
                 continue;
             }
-            out.push(self.decode_record(tag, &record)?);
+            out.push(self.decode_record(tag, &record).ok_or_else(&corrupt)?);
         }
-        if pos != bytes.len() {
-            return None;
+        // The trailer hash sits exactly at the end: no trailing bytes.
+        if pos.checked_add(32) != Some(bytes.len()) {
+            return Err(corrupt());
         }
-        Some(out)
+        let expected = commit_hash(&self.drive, seq, prev_hash, &bytes[HEADER_LEN..pos]);
+        let trailer: &[u8; 32] = bytes[pos..].try_into().expect("trailer bounds");
+        if trailer != &expected {
+            return Err(corrupt());
+        }
+        Ok((out, expected))
     }
 
     /// Decode one known record: `None` poisons the file (the caller
@@ -678,17 +799,47 @@ const KNOWN_TAGS: [u8; 7] = [
     TAG_CONTROL_MESSAGE,
 ];
 
-fn encode_commit(seq: u64, records: &[(u8, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Commit header length: version (1) + sequence (8) + previous hash (32).
+/// The records section hashed into the trailer starts right after it.
+const HEADER_LEN: usize = 41;
+
+/// The chain hash of one commit: domain tag, drive id, sequence,
+/// previous hash, and the exact serialized records section. Binds
+/// integrity and ordering; confidentiality is not the point (secrets
+/// carry their own AEAD inside capability records).
+fn commit_hash(drive: &DriveId, seq: u64, prev: &[u8; 32], records: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(COMMIT_HASH_DOMAIN);
+    hasher.update(drive.as_bytes());
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(prev);
+    hasher.update(records);
+    *hasher.finalize().as_bytes()
+}
+
+/// Serialize one commit and hash it: header (version, sequence,
+/// previous hash) + records + trailer hash.
+fn encode_commit(
+    drive: &DriveId,
+    seq: u64,
+    prev: &[u8; 32],
+    records: &[(u8, Vec<u8>)],
+) -> (Vec<u8>, [u8; 32]) {
+    let mut records_bytes = Vec::new();
+    records_bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for (tag, record) in records {
+        records_bytes.push(*tag);
+        records_bytes.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        records_bytes.extend_from_slice(record);
+    }
+    let hash = commit_hash(drive, seq, prev, &records_bytes);
+    let mut out = Vec::with_capacity(HEADER_LEN + records_bytes.len() + 32);
     out.push(COMMIT_VERSION);
     out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
-    for (tag, record) in records {
-        out.push(*tag);
-        out.extend_from_slice(&(record.len() as u32).to_le_bytes());
-        out.extend_from_slice(record);
-    }
-    out
+    out.extend_from_slice(prev);
+    out.extend_from_slice(&records_bytes);
+    out.extend_from_slice(&hash);
+    (out, hash)
 }
 
 // --- capability plaintext ----------------------------------------------------
@@ -784,9 +935,10 @@ impl LoadedFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::membership::test_util::{drive, key, Builder};
+    use crate::membership::test_util::{admit, drive, key, sign, Builder};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use wyrd_format::{ManifestEntry, SnapshotId};
+    use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+    use wyrd_format::{Change, ManifestEntry, SnapshotId};
 
     const PASSPHRASE: &str = "durable test passphrase";
 
@@ -942,36 +1094,21 @@ mod tests {
         }
     }
 
-    /// Torn writes, orphaned temps, unknown tags, and trailing garbage
-    /// are ignored; a missing commit at or below CURRENT fails loudly.
+    /// Outside the committed prefix, debris is harmless: orphaned temps
+    /// and commits above CURRENT are ignored, and only commit 1 replays.
     #[test]
-    fn torn_and_orphan_files_ignored() {
+    fn orphan_files_are_ignored() {
         let (a, _) = fact_stream();
-        let dir = TestDir::new("torn");
+        let dir = TestDir::new("orphans");
         let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
         store.commit(&a).unwrap();
         let commits = dir.path.join("commits");
 
-        // Valid but empty commits 2..=6, so CURRENT may advance past them.
-        for seq in 2..=6u64 {
-            let bytes = encode_commit(seq, &[]);
-            fs::write(commits.join(commit_name(seq)), &bytes).unwrap();
-        }
-        // Bad version, truncation, trailing garbage, future tag. Names
-        // go through commit_name: sequences are hex, not decimal.
-        fs::write(commits.join(commit_name(7)), b"junk").unwrap();
-        let valid = encode_commit(8, &[(TAG_TRANSITION, b"short".to_vec())]);
-        fs::write(commits.join(commit_name(8)), &valid[..10]).unwrap();
-        let mut trailed = encode_commit(9, &[]);
-        trailed.extend_from_slice(b"trailing");
-        fs::write(commits.join(commit_name(9)), &trailed).unwrap();
-        let future = encode_commit(10, &[(0x7F, b"future".to_vec())]);
-        fs::write(commits.join(commit_name(10)), &future).unwrap();
-        // Orphaned temps from a crashed predecessor.
-        fs::write(commits.join("0000000000000004.commit.tmp"), b"partial").unwrap();
+        // Orphaned temps from a crashed predecessor, plus a commit file
+        // above CURRENT (left for GC, never replayed — contents unread).
+        fs::write(commits.join("0000000000000002.commit.tmp"), b"partial").unwrap();
         fs::write(dir.path.join("CURRENT.tmp"), b"partial").unwrap();
-        // Advance CURRENT past the debris: only commit 1 is real.
-        atomic_write(&dir.path, "CURRENT", &10u64.to_le_bytes()).unwrap();
+        fs::write(commits.join(commit_name(2)), b"future commit").unwrap();
 
         drop(store);
         let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
@@ -979,13 +1116,95 @@ mod tests {
         assert_eq!(
             reloaded.transitions.len(),
             1,
-            "only the real commit replays"
+            "only the committed prefix replays"
         );
+    }
 
-        // A missing commit at or below CURRENT is damage, not a crash
-        // artifact: fail loudly.
-        fs::remove_file(commits.join("0000000000000001.commit")).unwrap();
-        assert!(matches!(store.load(), Err(DurableError::MissingCommit(1))));
+    /// Inside the committed prefix, corruption fails the load: a damaged
+    /// committed file is store damage, not an ignorable crash artifact.
+    /// Pristine bytes are restored between cases.
+    #[test]
+    fn committed_corruption_fails() {
+        let (genesis, child) = chain();
+        let announcement = announcement(&child);
+        let dir = TestDir::new("corrupt");
+        let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+        store.commit(&[Fact::Transition(genesis)]).unwrap();
+        store.commit(&[Fact::Transition(child)]).unwrap();
+        let h2 = store.tip_hash_for_test();
+        store.commit(&[Fact::Announcement(announcement)]).unwrap();
+        let commits = dir.path.join("commits");
+        drop(store);
+
+        let pristine: Vec<Vec<u8>> = [1u64, 2, 3]
+            .iter()
+            .map(|seq| fs::read(commits.join(commit_name(*seq))).unwrap())
+            .collect();
+        let restore = || {
+            for (seq, bytes) in [1u64, 2, 3].iter().zip(&pristine) {
+                fs::write(commits.join(commit_name(*seq)), bytes).unwrap();
+            }
+        };
+        let load = || {
+            DurableStore::open(dir.path.clone(), drive(), PASSPHRASE)
+                .unwrap()
+                .load()
+        };
+
+        // A valid commit carrying only an unknown tag replays (the tag is
+        // skipped); everything else below fails. Replacing the file
+        // changes its hash, so CURRENT is re-anchored to the new tip —
+        // exactly what a real commit would have written.
+        let orig_current = fs::read(dir.path.join("CURRENT")).unwrap();
+        let (tagged, hash3) = encode_commit(&drive(), 3, &h2, &[(0x7F, b"future".to_vec())]);
+        fs::write(commits.join(commit_name(3)), &tagged).unwrap();
+        let mut current = 3u64.to_le_bytes().to_vec();
+        current.extend_from_slice(&hash3);
+        atomic_write(&dir.path, "CURRENT", &current).unwrap();
+        let reloaded = load().unwrap();
+        assert_eq!(
+            reloaded.transitions.len(),
+            2,
+            "unknown tags are skipped, valid facts replay"
+        );
+        restore();
+        atomic_write(&dir.path, "CURRENT", &orig_current).unwrap();
+
+        // Corrupt the middle commit: hybrid states must never load.
+        let mut bad = pristine[1].clone();
+        bad[50] ^= 1;
+        fs::write(commits.join(commit_name(2)), &bad).unwrap();
+        assert!(matches!(load(), Err(DurableError::CorruptCommit(2))));
+        restore();
+
+        // Corrupt the tip commit's trailer hash.
+        let mut bad = pristine[2].clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        fs::write(commits.join(commit_name(3)), &bad).unwrap();
+        assert!(matches!(load(), Err(DurableError::CorruptCommit(3))));
+        restore();
+
+        // Corrupt the header (version byte).
+        let mut bad = pristine[1].clone();
+        bad[0] = 0xFF;
+        fs::write(commits.join(commit_name(2)), &bad).unwrap();
+        assert!(matches!(load(), Err(DurableError::CorruptCommit(2))));
+        restore();
+
+        // Truncate a known record.
+        let cut = pristine[1].len() - 40;
+        fs::write(commits.join(commit_name(2)), &pristine[1][..cut]).unwrap();
+        assert!(matches!(load(), Err(DurableError::CorruptCommit(2))));
+        restore();
+
+        // Delete the tip commit.
+        fs::remove_file(commits.join(commit_name(3))).unwrap();
+        assert!(matches!(load(), Err(DurableError::MissingCommit(3))));
+        restore();
+
+        // After all damage is repaired, the store loads cleanly.
+        assert_eq!(load().unwrap().transitions.len(), 2);
     }
 
     /// Facts rebuild the live machines bit-identically: same log
@@ -1029,6 +1248,125 @@ mod tests {
             rebuilt.runtime.reconcile().pending_objects.len(),
             0,
             "the persisted object is local, so nothing is queued"
+        );
+    }
+
+    /// Hand-build a signed transition against the builder's drive and
+    /// owner key, mirroring the membership suites: for siblings the
+    /// builder cannot produce.
+    #[allow(clippy::too_many_arguments)]
+    fn signed(
+        b: &Builder,
+        epoch: u64,
+        prev: Option<TransitionId>,
+        resolves: Vec<TransitionId>,
+        changes: Vec<Change>,
+        members: &[DeviceId],
+        owners: &[DeviceId],
+        author_sk: &secp256k1::SecretKey,
+        author: DeviceId,
+    ) -> MembershipTransition {
+        let mut t = MembershipTransition {
+            epoch,
+            prev,
+            resolves,
+            changes,
+            members_root: set_root(MEMBER_SET_CONTEXT, members),
+            owners_root: set_root(OWNER_SET_CONTEXT, owners),
+            author,
+            signature: [0; 64],
+        };
+        sign(&mut t, author_sk, &b.drive);
+        t
+    }
+
+    /// Persistence against a nontrivial history: a fork with an explicit
+    /// resolution rebuilds to the same verdicts, tip, and derived states
+    /// as the live log — the replay is not just a linear-chain trick.
+    #[test]
+    fn fork_history_rebuilds_verdicts() {
+        let (b, genesis) = Builder::genesis(10);
+        let genesis_id = genesis.transition_id();
+        let own = owner();
+        let (sk_owner, _) = key(10);
+        let members = [own];
+        // Two valid siblings at epoch 2: Rotate vs admitting device(5).
+        let fork_rotate = signed(
+            &b,
+            2,
+            Some(genesis_id),
+            Vec::new(),
+            vec![Change::Rotate],
+            &members,
+            &members,
+            &sk_owner,
+            own,
+        );
+        let forked = [own, DeviceId::from_bytes([5; 32])];
+        let fork_admit = signed(
+            &b,
+            2,
+            Some(genesis_id),
+            Vec::new(),
+            vec![admit(forked[1])],
+            &forked,
+            &members,
+            &sk_owner,
+            own,
+        );
+        // The Rotate sibling wins; the resolution names the loser.
+        let resolution = signed(
+            &b,
+            3,
+            Some(fork_rotate.transition_id()),
+            vec![fork_admit.transition_id()],
+            vec![Change::Rotate],
+            &members,
+            &members,
+            &sk_owner,
+            own,
+        );
+
+        let dir = TestDir::new("fork");
+        let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+        store.commit(&[Fact::Transition(genesis.clone())]).unwrap();
+        store
+            .commit(&[
+                Fact::Transition(fork_rotate.clone()),
+                Fact::Transition(fork_admit.clone()),
+                Fact::Transition(resolution.clone()),
+            ])
+            .unwrap();
+        drop(store);
+        let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+        let rebuilt = store.rebuild(owner()).unwrap();
+
+        let mut log = MembershipLog::new(drive());
+        for t in [&genesis, &fork_rotate, &fork_admit, &resolution] {
+            log.observe((*t).clone());
+        }
+        use crate::membership::TransitionStatus;
+        assert_eq!(rebuilt.log.statuses(), log.statuses());
+        assert_eq!(
+            rebuilt.log.status(&fork_rotate.transition_id()),
+            Some(TransitionStatus::Canonical)
+        );
+        assert_eq!(
+            rebuilt.log.status(&fork_admit.transition_id()),
+            Some(TransitionStatus::Voided)
+        );
+        assert_eq!(
+            rebuilt.log.status(&resolution.transition_id()),
+            Some(TransitionStatus::Canonical)
+        );
+        assert_eq!(
+            rebuilt.log.known_state().map(|k| k.epoch),
+            Some(3),
+            "rebuilt tip follows the resolution"
+        );
+        assert_eq!(
+            rebuilt.log.state_of(&resolution.transition_id()),
+            log.state_of(&resolution.transition_id())
         );
     }
 

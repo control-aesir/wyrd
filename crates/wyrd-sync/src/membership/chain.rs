@@ -98,7 +98,7 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
 fn validate_link(
     log: &MembershipLog,
     t: &MembershipTransition,
-    link: &mut HashMap<TransitionId, Link>,
+    link: &HashMap<TransitionId, Link>,
 ) -> Link {
     if let Err(reason) = check_intrinsic(t) {
         return Link::Invalid(reason);
@@ -119,18 +119,18 @@ fn validate_link(
         };
     };
 
-    // Ancestry.
+    // Ancestry: the predecessor must be observed at epoch − 1 and
+    // already classified. `analyse` feeds transitions in ascending epoch
+    // order and `link_for` classifies the closure leaves-first, so the
+    // lookup below never descends; an unclassified-but-observed
+    // predecessor stays Pending (defensive, unreachable through either
+    // driver).
     let Some(prev_t) = log.transition(&prev_id) else {
         return Link::Pending;
     };
     if prev_t.epoch.checked_add(1) != Some(t.epoch) {
         return Link::Invalid(InvalidReason::PrevWrongEpoch);
     }
-    // Ancestry. The predecessor is already classified: `analyse` feeds
-    // transitions in ascending epoch order and `link_for` classifies the
-    // closure leaves-first, so this is a lookup, never a descent. An
-    // unclassified-but-observed predecessor stays Pending (defensive;
-    // unreachable through either driver).
     let prev_link = match link.get(&prev_id) {
         Some(prev) => prev.clone(),
         None => return Link::Pending,
@@ -196,6 +196,13 @@ fn link_for(
     let mut stack = vec![id];
     let mut seen = HashSet::from([id]);
     while let Some(cur) = stack.pop() {
+        // Already classified: its observed ancestry was classified with
+        // it (both drivers order leaves first), so there is nothing
+        // below worth gathering. This keeps the ascending `analyse` pass
+        // near-linear instead of re-walking the ancestry per transition.
+        if link.contains_key(&cur) {
+            continue;
+        }
         let Some(cur_t) = log.transition(&cur) else {
             continue;
         };
@@ -212,6 +219,9 @@ fn link_for(
             }
         }
     }
+    // Ascending epoch order is a valid topological order here; sort ties
+    // are independent of each other (a dependency always sits exactly one
+    // epoch below its dependent), so insertion order among ties is safe.
     closure.sort_by_key(|dep| log.transition(dep).map_or(0, |dep_t| dep_t.epoch));
     for dep in closure {
         if link.contains_key(&dep) {

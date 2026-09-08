@@ -185,6 +185,8 @@ pub enum Fact {
     Manifest(ManifestRecord),
     /// A locally present object.
     LocalObject(ContentId),
+    /// An object evicted from local storage.
+    ObjectRemoved(ContentId),
     /// A residency policy entry.
     Materialization(ContentId, MaterializationState),
     /// A seen control-message id (dedupe set).

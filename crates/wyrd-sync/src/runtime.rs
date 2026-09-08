@@ -159,6 +159,12 @@ impl RuntimeState {
         self.local_objects.insert(content_id)
     }
 
+    /// Forget that an object is present locally after it has been evicted.
+    /// Returns `true` when the object was previously marked local.
+    pub fn remove_local_object(&mut self, content_id: ContentId) -> bool {
+        self.local_objects.remove(&content_id)
+    }
+
     /// Set the desired residency policy for one content object.
     pub fn set_materialization(
         &mut self,

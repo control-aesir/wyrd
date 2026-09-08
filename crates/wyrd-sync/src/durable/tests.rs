@@ -114,8 +114,9 @@ fn fact_stream() -> (Vec<Fact>, Vec<Fact>) {
         Fact::Announcement(announcement(&child)),
         Fact::Manifest(manifest_record()),
         Fact::Capability(authorized_capability(&genesis, &log)),
-        Fact::LocalObject(ContentId::from_bytes([9; 32])),
-        Fact::Materialization(ContentId::from_bytes([9; 32]), MaterializationState::Cached),
+        Fact::LocalObject(ContentId::from_bytes([4; 32])),
+        Fact::ObjectRemoved(ContentId::from_bytes([4; 32])),
+        Fact::Materialization(ContentId::from_bytes([4; 32]), MaterializationState::Cached),
         Fact::ControlMessage(ControlMessageId::from_bytes([0xAB; 32])),
     ];
     (a, b)
@@ -315,15 +316,84 @@ fn facts_rebuild_live_state() {
     let mut runtime = RuntimeState::new(drive());
     runtime.record_announcement(announcement(&child)).unwrap();
     runtime.record_manifest(manifest_record()).unwrap();
-    runtime.mark_local_object(ContentId::from_bytes([9; 32]));
-    runtime.set_materialization(ContentId::from_bytes([9; 32]), MaterializationState::Cached);
+    runtime.remove_local_object(ContentId::from_bytes([4; 32]));
+    runtime.set_materialization(ContentId::from_bytes([4; 32]), MaterializationState::Cached);
     runtime.remember_control_message(&ControlMessageId::from_bytes([0xAB; 32]));
     assert_eq!(rebuilt.runtime, runtime);
     assert_eq!(
         rebuilt.runtime.reconcile().pending_objects.len(),
-        0,
-        "the persisted object is local, so nothing is queued"
+        1,
+        "the persisted eviction returns the object to the fetch plan"
     );
+}
+
+#[test]
+fn evict_then_reload_returns_object_to_fetch_plan() {
+    let dir = TestDir::new("eviction");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let object = ContentId::from_bytes([4; 32]);
+    store
+        .commit(&[
+            Fact::Announcement(announcement(&chain().1)),
+            Fact::Manifest(manifest_record()),
+            Fact::Materialization(object, MaterializationState::Cached),
+            Fact::LocalObject(object),
+            Fact::ObjectRemoved(object),
+        ])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert_eq!(rebuilt.runtime.reconcile().pending_objects.len(), 1);
+    assert!(rebuilt
+        .runtime
+        .reconcile()
+        .pending_objects
+        .contains_key(&object));
+}
+
+#[test]
+fn reload_preserves_object_presence_order() {
+    let dir = TestDir::new("presence-order");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let object = ContentId::from_bytes([4; 32]);
+    store
+        .commit(&[
+            Fact::Announcement(announcement(&chain().1)),
+            Fact::Manifest(manifest_record()),
+            Fact::Materialization(object, MaterializationState::Cached),
+            Fact::LocalObject(object),
+            Fact::ObjectRemoved(object),
+            Fact::LocalObject(object),
+        ])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert!(rebuilt.runtime.reconcile().pending_objects.is_empty());
+}
+
+#[test]
+fn reload_preserves_materialization_order() {
+    let dir = TestDir::new("materialization-order");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let object = ContentId::from_bytes([4; 32]);
+    store
+        .commit(&[
+            Fact::Announcement(announcement(&chain().1)),
+            Fact::Manifest(manifest_record()),
+            Fact::Materialization(object, MaterializationState::Cached),
+            Fact::ObjectRemoved(object),
+            Fact::Materialization(object, MaterializationState::RemoteOnly),
+        ])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert!(rebuilt.runtime.reconcile().pending_objects.is_empty());
 }
 
 /// Hand-build a signed transition against the builder's drive and

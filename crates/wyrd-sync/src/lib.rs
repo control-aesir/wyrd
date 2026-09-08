@@ -11,6 +11,7 @@
 
 pub mod authorization;
 pub mod control;
+pub mod durable;
 #[cfg(test)]
 mod fuzz;
 pub mod ingest;

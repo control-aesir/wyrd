@@ -353,6 +353,49 @@ fn evict_then_reload_returns_object_to_fetch_plan() {
         .contains_key(&object));
 }
 
+#[test]
+fn reload_preserves_object_presence_order() {
+    let dir = TestDir::new("presence-order");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let object = ContentId::from_bytes([4; 32]);
+    store
+        .commit(&[
+            Fact::Announcement(announcement(&chain().1)),
+            Fact::Manifest(manifest_record()),
+            Fact::Materialization(object, MaterializationState::Cached),
+            Fact::LocalObject(object),
+            Fact::ObjectRemoved(object),
+            Fact::LocalObject(object),
+        ])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert!(rebuilt.runtime.reconcile().pending_objects.is_empty());
+}
+
+#[test]
+fn reload_preserves_materialization_order() {
+    let dir = TestDir::new("materialization-order");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let object = ContentId::from_bytes([4; 32]);
+    store
+        .commit(&[
+            Fact::Announcement(announcement(&chain().1)),
+            Fact::Manifest(manifest_record()),
+            Fact::Materialization(object, MaterializationState::Cached),
+            Fact::ObjectRemoved(object),
+            Fact::Materialization(object, MaterializationState::RemoteOnly),
+        ])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert!(rebuilt.runtime.reconcile().pending_objects.is_empty());
+}
+
 /// Hand-build a signed transition against the builder's drive and
 /// owner key, mirroring the membership suites: for siblings the
 /// builder cannot produce.

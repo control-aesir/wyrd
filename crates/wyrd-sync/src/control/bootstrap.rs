@@ -198,14 +198,9 @@ pub fn seal_bootstrap(
     let inviter = inviter_id(owner_sk);
     let target = XOnlyPublicKey::from_slice(encryption_key.as_bytes())
         .map_err(|_| CryptoError::Malformed)?;
-    let (ephemeral_sk, ephemeral_pk) = loop {
-        let mut sk_bytes = [0u8; 32];
-        random_bytes(&mut sk_bytes)?;
-        if let Ok(sk) = SecretKey::from_slice(&sk_bytes) {
-            let kp = Keypair::from_secret_key(SECP256K1, &sk);
-            break (sk, XOnlyPublicKey::from_keypair(&kp).0);
-        }
-    };
+    // Fresh ephemeral keypair; the seed sibling is scrubbed on drop (see
+    // `keys::ephemeral` for the FFI limitation).
+    let (ephemeral_sk, _seed, ephemeral_pk) = crate::keys::ephemeral::generate_ephemeral()?;
     let shared = ecdh_shared(&ephemeral_sk, &target)?;
     let aead_key = hkdf_bootstrap_key(&shared);
     let unsigned = unsigned_bytes(

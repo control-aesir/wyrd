@@ -31,6 +31,7 @@ pub mod keystore;
 pub mod root;
 
 pub(crate) mod aead;
+pub(crate) mod ephemeral;
 
 pub use capability::{
     Capability, CapabilityError, DriveKeyring, InstallError, InstallReport, WrappedCapability,

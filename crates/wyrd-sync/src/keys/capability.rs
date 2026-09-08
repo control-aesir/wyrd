@@ -157,17 +157,10 @@ impl Capability {
     /// x-only public key, HKDF-SHA256 to the AEAD key, XChaCha20-Poly1305
     /// with the pinned AAD. Nonce and ephemeral key are fresh per wrap.
     pub fn wrap(&self) -> Result<WrappedCapability, CryptoError> {
-        // Fresh ephemeral keypair. SecretKey::from_slice rejects
-        // only the zero scalar, so the retry loop exits immediately in
-        // practice.
-        let (ephemeral_sk, ephemeral_pk) = loop {
-            let mut sk_bytes = [0u8; 32];
-            random_bytes(&mut sk_bytes)?;
-            if let Ok(sk) = SecretKey::from_slice(&sk_bytes) {
-                let kp = Keypair::from_secret_key(SECP256K1, &sk);
-                break (sk, XOnlyPublicKey::from_keypair(&kp).0);
-            }
-        };
+        // Fresh ephemeral keypair. The seed sibling is scrubbed on drop;
+        // the FFI scalar inside `ephemeral_sk` is upstream's (secp256k1
+        // 0.30 has no `Zeroize` impl) and out of our reach.
+        let (ephemeral_sk, _seed, ephemeral_pk) = super::ephemeral::generate_ephemeral()?;
         let target = XOnlyPublicKey::from_slice(self.encryption_key.as_bytes())
             .map_err(|_| CryptoError::Malformed)?;
         let shared = ecdh_shared(&ephemeral_sk, &target)?;

@@ -21,8 +21,6 @@
 //! Knowledge and key material are distinct: learning epoch N+1's
 //! transition confers nothing until the capability for it arrives.
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::XChaCha20Poly1305;
 use hkdf::Hkdf;
 use secp256k1::{Keypair, Parity, PublicKey, SecretKey, XOnlyPublicKey, SECP256K1};
 use sha2::Sha256;
@@ -184,16 +182,7 @@ impl Capability {
             self.up_to_epoch(),
         );
         let plaintext = encode_capability(self);
-        let ciphertext =
-            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
-                .encrypt(
-                    chacha20poly1305::XNonce::from_slice(&nonce),
-                    Payload {
-                        msg: &plaintext[..],
-                        aad: &aad[..],
-                    },
-                )
-                .map_err(|_| CryptoError::OpenFailed)?;
+        let ciphertext = super::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad)?;
 
         let mut bytes = Vec::with_capacity(128 + 24 + ciphertext.len());
         bytes.extend_from_slice(&ephemeral_pk.serialize());
@@ -234,7 +223,9 @@ impl WrappedCapability {
         let transition =
             TransitionId::from_bytes(bytes[128..160].try_into().expect("header bounds"));
         let up_to_epoch = u64::from_le_bytes(bytes[160..168].try_into().expect("header bounds"));
-        let nonce = &bytes[168..192];
+        let nonce: &[u8; 24] = bytes[168..192]
+            .try_into()
+            .map_err(|_| CryptoError::Malformed)?;
         let ciphertext = &bytes[192..];
 
         let shared = ecdh_shared(encryption_secret, &ephemeral_pk)?;
@@ -246,16 +237,7 @@ impl WrappedCapability {
             &transition,
             up_to_epoch,
         );
-        let plaintext =
-            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
-                .decrypt(
-                    chacha20poly1305::XNonce::from_slice(nonce),
-                    Payload {
-                        msg: ciphertext,
-                        aad: &aad[..],
-                    },
-                )
-                .map_err(|_| CryptoError::OpenFailed)?;
+        let plaintext = super::aead::open(aead_key.as_slice(), nonce, ciphertext, &aad)?;
         // `plaintext` is now a Zeroizing<Vec<u8>> — the decoded secret list
         // is wiped on drop. The secrets are extracted below into owned
         // EpochSecret wrappers before plaintext is consumed.
@@ -923,16 +905,7 @@ mod tests {
             pt.extend_from_slice(&[e; 32]);
         }
         let nonce = [0u8; 24];
-        let ciphertext =
-            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
-                .encrypt(
-                    chacha20poly1305::XNonce::from_slice(&nonce),
-                    Payload {
-                        msg: &pt[..],
-                        aad: &aad[..],
-                    },
-                )
-                .unwrap();
+        let ciphertext = crate::keys::aead::seal(aead_key.as_slice(), &nonce, &pt, &aad).unwrap();
         let mut envelope = Vec::new();
         envelope.extend_from_slice(&ephemeral_pk.serialize());
         envelope.extend_from_slice(&aad[CAPABILITY_AAD_DOMAIN.len()..]);

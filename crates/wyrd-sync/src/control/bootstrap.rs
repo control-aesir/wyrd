@@ -40,9 +40,6 @@ use sha2::Sha256;
 use wyrd_format::{DeviceEncryptionKey, DeviceId, DriveId};
 use zeroize::Zeroizing;
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-
 use super::ControlError;
 use crate::keys::capability::ecdh_shared;
 use crate::keys::{random_bytes, CryptoError};
@@ -229,15 +226,7 @@ pub fn seal_bootstrap(
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
     let aad = bootstrap_aad(drive, &invitee, encryption_key, &inviter);
-    let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::SealFailed)?;
+    let ciphertext = crate::keys::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad)?;
     Ok(SealedBootstrap {
         version: BOOTSTRAP_VERSION,
         drive: *drive,
@@ -273,15 +262,8 @@ pub fn open_bootstrap(
         &sealed.encryption_key,
         &sealed.inviter,
     );
-    let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
-        .decrypt(
-            XNonce::from_slice(&sealed.nonce),
-            Payload {
-                msg: &sealed.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::OpenFailed)?;
+    let plaintext =
+        crate::keys::aead::open(aead_key.as_slice(), &sealed.nonce, &sealed.ciphertext, &aad)?;
     if plaintext.len() < 128 + 8 + 64 {
         return Err(CryptoError::Malformed.into());
     }
@@ -470,8 +452,6 @@ mod tests {
         // Valid tag, wrong signer: hand-build an envelope naming the
         // owner as inviter but signed by the attacker. The tag verifies;
         // authorship must still fail.
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::XChaCha20Poly1305;
         let (device, enc_key, genesis, capability) = invitation_parts();
         let owner = inviter_id(&owner_sk());
         let attacker_sk = SecretKey::from_slice(&[0x0B; 32]).unwrap();
@@ -490,15 +470,7 @@ mod tests {
         let nonce = [0x77u8; 24];
         let aad = bootstrap_aad(&drive(), &device, &enc_key, &owner);
         let ciphertext =
-            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(aead_key.as_slice()))
-                .encrypt(
-                    chacha20poly1305::XNonce::from_slice(&nonce),
-                    Payload {
-                        msg: &plaintext,
-                        aad: &aad,
-                    },
-                )
-                .unwrap();
+            crate::keys::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad).unwrap();
         let forged = SealedBootstrap {
             version: BOOTSTRAP_VERSION,
             drive: drive(),

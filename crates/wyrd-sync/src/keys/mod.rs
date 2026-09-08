@@ -30,6 +30,8 @@ pub mod escrow;
 pub mod keystore;
 pub mod root;
 
+pub(crate) mod aead;
+
 pub use capability::{
     Capability, CapabilityError, DriveKeyring, InstallError, InstallReport, WrappedCapability,
 };

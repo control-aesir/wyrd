@@ -26,8 +26,6 @@
 //! [`EpochSecret::object_key`]: crate::keys::EpochSecret::object_key
 //! [`EpochSecret::manifest_key`]: crate::keys::EpochSecret::manifest_key
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::XChaCha20Poly1305;
 use thiserror::Error;
 use wyrd_format::{ContentId, Manifest, ManifestEntry, ManifestError, ObjectKind, StorageId};
 
@@ -124,15 +122,7 @@ pub fn seal(
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
     let aad = seal_aad(SEAL_VERSION, kind, content_id);
-    let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key))
-        .encrypt(
-            chacha20poly1305::XNonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::SealFailed)?;
+    let ciphertext = crate::keys::aead::seal(key, &nonce, plaintext, &aad)?;
     Ok(EncryptedObject {
         version: SEAL_VERSION,
         kind,
@@ -154,15 +144,7 @@ pub fn open(
         return Err(CryptoError::Malformed);
     }
     let aad = seal_aad(obj.version, obj.kind, expected);
-    let plaintext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key))
-        .decrypt(
-            chacha20poly1305::XNonce::from_slice(&obj.nonce),
-            Payload {
-                msg: &obj.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::OpenFailed)?;
+    let plaintext = crate::keys::aead::open(key, &obj.nonce, &obj.ciphertext, &aad)?;
     if ContentId::derive(obj.kind, &plaintext) != *expected {
         return Err(CryptoError::IdentityMismatch);
     }
@@ -320,15 +302,7 @@ mod tests {
         let mut nonce = [0u8; 24];
         random_bytes(&mut nonce).unwrap();
         let aad = seal_aad(SEAL_VERSION, ObjectKind::Chunk, &q);
-        let ciphertext = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key))
-            .encrypt(
-                chacha20poly1305::XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plaintext,
-                    aad: &aad,
-                },
-            )
-            .unwrap();
+        let ciphertext = crate::keys::aead::seal(&key, &nonce, &plaintext, &aad).unwrap();
         let obj = EncryptedObject {
             version: SEAL_VERSION,
             kind: ObjectKind::Chunk,

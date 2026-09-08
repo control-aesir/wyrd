@@ -16,8 +16,6 @@
 //! Changing a passphrase re-wraps; the underlying secret (and everything
 //! derived at rest against it) is untouched.
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::XChaCha20Poly1305;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -80,10 +78,6 @@ pub fn kdf_key(
     Ok(out)
 }
 
-fn aead_key(key: &[u8]) -> XChaCha20Poly1305 {
-    XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key))
-}
-
 /// A shared envelope for secrets at rest: `salt ‖ nonce ‖ ciphertext+tag`.
 /// `wrap_root` and `wrap_device_secret` produce it under their own AAD
 /// domains — same wire shape cutting across custody categories, so the
@@ -142,14 +136,9 @@ fn seal(
     let key = kdf_key(passphrase, &salt)?;
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce).map_err(|_| KeystoreError::RngFailed)?;
-    let ciphertext = aead_key(key.as_slice())
-        .encrypt(
-            chacha20poly1305::XNonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext.as_slice(),
-                aad,
-            },
-        )
+    let ciphertext = super::aead::seal(key.as_slice(), &nonce, plaintext.as_slice(), aad)
+        // `KdfFailed` here is wrong terminology for a seal failure, but it
+        // is the pre-existing error surface and stays scope-limited.
         .map_err(|_| KeystoreError::KdfFailed)?;
     // `key` is zeroed at the end of this scope.
     let mut bytes = Vec::with_capacity(KDF_SALT_LEN + 24 + ciphertext.len());
@@ -171,17 +160,12 @@ fn open(
         return Err(KeystoreError::Malformed);
     }
     let salt = &bytes[..KDF_SALT_LEN];
-    let nonce = &bytes[KDF_SALT_LEN..KDF_SALT_LEN + 24];
+    let nonce: &[u8; 24] = bytes[KDF_SALT_LEN..KDF_SALT_LEN + 24]
+        .try_into()
+        .map_err(|_| KeystoreError::Malformed)?;
     let ciphertext = &bytes[KDF_SALT_LEN + 24..];
     let key = kdf_key(passphrase, salt)?;
-    let plaintext = aead_key(key.as_slice())
-        .decrypt(
-            chacha20poly1305::XNonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
+    let plaintext = super::aead::open(key.as_slice(), nonce, ciphertext, aad)
         .map_err(|_| KeystoreError::WrongPassphrase)?;
     // `key` is zeroed at the end of this scope; the plaintext array is
     // returned to the caller, who owns its lifetime.
@@ -294,15 +278,9 @@ mod tests {
         let key = kdf_key(PASSPHRASE, &salt).unwrap();
         let nonce = [0u8; 24];
         let plaintext = [0x99u8; 48];
-        let ciphertext = aead_key(key.as_slice())
-            .encrypt(
-                chacha20poly1305::XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plaintext[..],
-                    aad: KEYSTORE_AAD_DOMAIN,
-                },
-            )
-            .unwrap();
+        let ciphertext =
+            crate::keys::aead::seal(key.as_slice(), &nonce, &plaintext, KEYSTORE_AAD_DOMAIN)
+                .unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&salt);
         bytes.extend_from_slice(&nonce);

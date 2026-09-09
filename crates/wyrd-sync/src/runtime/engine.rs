@@ -1512,10 +1512,21 @@ mod tests {
         epoch: u64,
         secrets: Vec<EpochSecret>,
     ) -> Message {
+        capability_message_for(&engine_encryption_sk(), device, transition, epoch, secrets)
+    }
+
+    /// A capability for any device/key pair (two-device scenarios).
+    fn capability_message_for(
+        encryption_sk: &SecretKey,
+        device: DeviceId,
+        transition: TransitionId,
+        epoch: u64,
+        secrets: Vec<EpochSecret>,
+    ) -> Message {
         let cap = Capability::new(
             member_drive(),
             device,
-            encryption_key(&engine_encryption_sk()),
+            encryption_key(encryption_sk),
             transition,
             epoch,
             secrets,
@@ -1938,5 +1949,365 @@ mod tests {
         assert_eq!(report.unfulfilled, 1);
         let facts = fixture.engine.store.load().expect("loads");
         assert!(facts.manifests.is_empty());
+    }
+
+    // --- two-device convergence ---------------------------------------
+    //
+    // Two engines with separate stores and object holdings share one
+    // relay and one bulk peer. The test routes every control message
+    // explicitly (engines emit nothing in these slices); convergence
+    // means both engines reach the same durable facts and the same
+    // local objects, surviving restarts at any boundary.
+
+    /// One scenario epoch secret (capability-delivered knowledge).
+    fn secret(byte: u8) -> EpochSecret {
+        EpochSecret::from_bytes([byte; 32])
+    }
+
+    struct Device {
+        dir: TestDir,
+        engine: Engine,
+        identity_sk: SecretKey,
+        encryption_sk: SecretKey,
+        device: DeviceId,
+        objects: MemoryObjectStore,
+    }
+
+    struct Pair {
+        relay: MemoryRelay,
+        bulk: MemoryBulkSource,
+        a: Device,
+        b: Device,
+    }
+
+    /// Open one device holding the scenario control keys: the keys
+    /// are capability-delivered knowledge, so both members hold every
+    /// epoch they are a member of.
+    fn open_device(
+        name: &str,
+        identity_byte: u8,
+        encryption_byte: u8,
+        controls: &[(u64, [u8; 32])],
+    ) -> Device {
+        let dir = TestDir::new(name);
+        let (identity_sk, device) = identity(identity_byte);
+        let encryption_sk = SecretKey::from_slice(&[encryption_byte; 32]).unwrap();
+        let mut engine = Engine::open(
+            dir.path.clone(),
+            member_drive(),
+            device,
+            "test-pass",
+            identity_sk,
+            encryption_sk,
+        )
+        .unwrap();
+        for (epoch, key) in controls {
+            engine.add_epoch_key(*epoch, *key);
+        }
+        Device {
+            dir,
+            engine,
+            identity_sk,
+            encryption_sk,
+            device,
+            objects: MemoryObjectStore::default(),
+        }
+    }
+
+    /// Seal a control message for a device under a scenario epoch key.
+    fn send_to(
+        pair: &mut Pair,
+        from_sk: &SecretKey,
+        to: DeviceId,
+        epoch: u64,
+        key: &[u8; 32],
+        message: &Message,
+    ) {
+        let sealed = seal(key, &member_drive(), epoch, message).unwrap();
+        pair.relay
+            .queue
+            .push_back(seal_for_recipient(from_sk, to, &sealed.encode()).unwrap());
+    }
+
+    fn drain_side(relay: &mut MemoryRelay, device: &mut Device) -> DrainReport {
+        let mut mailbox = MemoryMailbox {
+            relay,
+            owner: device.device,
+        };
+        device.engine.drain(&mut mailbox).unwrap()
+    }
+
+    fn execute_side(bulk: &mut MemoryBulkSource, device: &mut Device) -> ExecuteReport {
+        device
+            .engine
+            .execute_plan(bulk, &mut device.objects)
+            .unwrap()
+    }
+
+    /// Simulated restart: reopen the same store directory with the
+    /// same keys. Held epoch keys are device knowledge, re-applied.
+    fn restart(device: &mut Device, controls: &[(u64, [u8; 32])]) {
+        let mut engine = Engine::open(
+            device.dir.path.clone(),
+            member_drive(),
+            device.device,
+            "test-pass",
+            device.identity_sk,
+            device.encryption_sk,
+        )
+        .unwrap();
+        for (epoch, key) in controls {
+            engine.add_epoch_key(*epoch, *key);
+        }
+        device.engine = engine;
+    }
+
+    /// Both engines hold the same announcements, manifests, and local
+    /// objects, and both plans are empty.
+    fn assert_agreement(pair: &mut Pair) {
+        let a = pair.a.engine.store.load().expect("loads a");
+        let b = pair.b.engine.store.load().expect("loads b");
+        assert_eq!(a.announcements, b.announcements);
+        assert_eq!(a.manifests, b.manifests);
+        assert_eq!(a.local_objects, b.local_objects);
+        assert!(!a.announcements.is_empty(), "shared history recorded");
+        let report = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(report.unfulfilled, 0, "a converged");
+        let report = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(report.unfulfilled, 0, "b converged");
+    }
+
+    /// The shared scenario: owner admits A (epoch 2) then B (epoch
+    /// 3); each authors one snapshot and publishes it to the shared
+    /// bulk peer. Returns the pair plus the two chunk content ids.
+    /// Every control message is routed to both devices up front; each
+    /// test then decides drain/execute/restart interleaving.
+    type ScenarioControls = Vec<(u64, [u8; 32])>;
+    type ScenarioContents = (ContentId, ContentId);
+
+    fn scenario() -> (Pair, ScenarioControls, ScenarioContents) {
+        let drive = member_drive();
+        let controls: Vec<(u64, [u8; 32])> = [1, 2, 3]
+            .iter()
+            .map(|e| (*e, secret(0x07 + *e as u8).control_key(&drive, *e)))
+            .collect();
+        let key = |e: u64| controls.iter().find(|(x, _)| *x == e).unwrap().1;
+        let mut pair = Pair {
+            relay: MemoryRelay::default(),
+            bulk: MemoryBulkSource::default(),
+            a: open_device("conv-a", 0x02, 0xE0, &controls),
+            b: open_device("conv-b", 0x03, 0xE1, &controls),
+        };
+
+        let (owner_sk, _) = owner();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admit_a = builder.child(vec![Change::Admit(Admission {
+            device: pair.a.device,
+            encryption_key: encryption_key(&pair.a.encryption_sk),
+        })]);
+        let admit_b = builder.child(vec![Change::Admit(Admission {
+            device: pair.b.device,
+            encryption_key: encryption_key(&pair.b.encryption_sk),
+        })]);
+
+        let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
+        let snapshot_b = SnapshotId::from_bytes([0x12; 32]);
+        let content_a = publish_into(
+            &mut pair.bulk,
+            &secret(0x09),
+            2,
+            &secret(0x09),
+            2,
+            snapshot_a,
+            b"a bytes",
+        );
+        let content_b = publish_into(
+            &mut pair.bulk,
+            &secret(0x0A),
+            3,
+            &secret(0x0A),
+            3,
+            snapshot_b,
+            b"b bytes",
+        );
+
+        let a_sk = pair.a.identity_sk;
+        let b_sk = pair.b.identity_sk;
+        let a_dev = pair.a.device;
+        let b_dev = pair.b.device;
+        // The full chain to both devices.
+        for target in [a_dev, b_dev] {
+            for t in [&genesis, &admit_a, &admit_b] {
+                send_to(
+                    &mut pair,
+                    &owner_sk,
+                    target,
+                    1,
+                    &key(1),
+                    &transition_message(t),
+                );
+            }
+        }
+        // Each device's capability, then both announcements to both.
+        // A also receives the epoch-3 capability bound to B's
+        // admission (rotation delivery): A stays a member, so it
+        // authorizes, and only then can A open epoch-3 snapshots.
+        let cap_a2 = capability_message_for(
+            &pair.a.encryption_sk,
+            a_dev,
+            admit_a.transition_id(),
+            2,
+            vec![secret(0x08), secret(0x09)],
+        );
+        let cap_a3 = capability_message_for(
+            &pair.a.encryption_sk,
+            a_dev,
+            admit_b.transition_id(),
+            3,
+            vec![secret(0x08), secret(0x09), secret(0x0A)],
+        );
+        let cap_b = capability_message_for(
+            &pair.b.encryption_sk,
+            b_dev,
+            admit_b.transition_id(),
+            3,
+            vec![secret(0x08), secret(0x09), secret(0x0A)],
+        );
+        send_to(&mut pair, &owner_sk, a_dev, 2, &key(2), &cap_a2);
+        send_to(&mut pair, &owner_sk, a_dev, 3, &key(3), &cap_a3);
+        send_to(&mut pair, &owner_sk, b_dev, 3, &key(3), &cap_b);
+        let ann_a = announcement_msg(snapshot_a, a_dev, 2, admit_a.transition_id());
+        let ann_b = announcement_msg(snapshot_b, b_dev, 3, admit_b.transition_id());
+        for target in [a_dev, b_dev] {
+            send_to(&mut pair, &a_sk, target, 2, &key(2), &ann_a);
+            send_to(&mut pair, &b_sk, target, 3, &key(3), &ann_b);
+        }
+        (pair, controls, (content_a, content_b))
+    }
+
+    #[test]
+    fn two_devices_converge_on_shared_history() {
+        let (mut pair, _, (content_a, content_b)) = scenario();
+        for content in [content_a, content_b] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+
+        let a_drain = drain_side(&mut pair.relay, &mut pair.a);
+        assert_eq!(
+            a_drain.accepted, 7,
+            "chain, two capabilities, announcements"
+        );
+        let b_drain = drain_side(&mut pair.relay, &mut pair.b);
+        assert_eq!(b_drain.accepted, 6);
+
+        let a_plan = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(a_plan.manifests, 4, "two roots plus two children");
+        assert_eq!(a_plan.objects, 2);
+        assert_eq!(a_plan.unfulfilled, 0);
+        let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(b_plan, a_plan, "same evidence, same outcome");
+
+        assert_agreement(&mut pair);
+        assert_eq!(
+            pair.a.objects.get(&content_a).unwrap().as_deref(),
+            Some(b"a bytes".as_slice())
+        );
+        assert_eq!(
+            pair.a.objects.get(&content_b).unwrap().as_deref(),
+            Some(b"b bytes".as_slice())
+        );
+        assert_eq!(
+            pair.b.objects.get(&content_a).unwrap().as_deref(),
+            Some(b"a bytes".as_slice())
+        );
+        assert_eq!(
+            pair.b.objects.get(&content_b).unwrap().as_deref(),
+            Some(b"b bytes".as_slice())
+        );
+    }
+
+    #[test]
+    fn restart_between_intake_and_planning_loses_nothing() {
+        let (mut pair, controls, (content_a, content_b)) = scenario();
+        for content in [content_a, content_b] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+
+        // A drains the control plane, then restarts before ever
+        // running the plan: the committed facts must carry it through.
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        restart(&mut pair.a, &controls);
+        let facts = pair.a.engine.store.load().expect("loads after restart");
+        assert_eq!(facts.announcements.len(), 2, "intake survived the restart");
+
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+        let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(b_plan.objects, 2);
+        let a_plan = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(a_plan, b_plan, "restarted A reaches the same plan outcome");
+
+        assert_agreement(&mut pair);
+    }
+
+    #[test]
+    fn repeated_restarts_are_idempotent() {
+        let (mut pair, controls, (content_a, content_b)) = scenario();
+        for content in [content_a, content_b] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+        assert_eq!(execute_side(&mut pair.bulk, &mut pair.a).objects, 2);
+        assert_eq!(execute_side(&mut pair.bulk, &mut pair.b).objects, 2);
+        assert_agreement(&mut pair);
+
+        // Three reopen/drain/execute cycles with no new traffic: no
+        // state may change, nothing may report progress.
+        let current = pair.a.engine.current();
+        for _ in 0..3 {
+            restart(&mut pair.a, &controls);
+            let drain = drain_side(&mut pair.relay, &mut pair.a);
+            assert_eq!(
+                drain,
+                DrainReport {
+                    accepted: 0,
+                    duplicates: 0,
+                    deferred: 0,
+                    skipped: 0,
+                }
+            );
+            let plan = execute_side(&mut pair.bulk, &mut pair.a);
+            assert_eq!(
+                plan,
+                ExecuteReport {
+                    manifests: 0,
+                    objects: 0,
+                    unfulfilled: 0,
+                }
+            );
+            assert_eq!(pair.a.engine.current(), current, "no new commits");
+        }
+        assert_agreement(&mut pair);
     }
 }

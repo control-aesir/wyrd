@@ -60,16 +60,7 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
 
     let mut result = Analysis::default();
 
-    // Children index: one linear scan over the observed set replaces the
-    // per-step full scan the walk used to do. Iteration is in ascending
-    // id order (exactly what the old `children_of` scan produced), so
-    // each child list stays sorted and classification order is unchanged.
-    let mut children: HashMap<TransitionId, Vec<TransitionId>> = HashMap::with_capacity(log.len());
-    for id in log.observed_ids() {
-        if let Some(prev) = log.transition(&id).expect("observed").prev {
-            children.entry(prev).or_default().push(id);
-        }
-    }
+    let children = build_children_index(log);
 
     // Genesis selection: canonical(1) is the unique valid genesis.
     let geneses: Vec<TransitionId> = by_epoch
@@ -247,6 +238,23 @@ fn link_for(
         link.insert(dep, outcome);
     }
     link.get(&id).cloned().unwrap_or(Link::Pending)
+}
+
+/// Child lookup for one analysis pass: every observed transition with
+/// a `prev`, grouped by parent. One linear scan replaces the per-step
+/// full-log scans the walk used to do. Iteration follows the
+/// `MembershipLog::observed_ids` contract (ascending id order), so each
+/// child list stays sorted and classification order is unchanged.
+pub(crate) fn build_children_index(
+    log: &MembershipLog,
+) -> HashMap<TransitionId, Vec<TransitionId>> {
+    let mut children: HashMap<TransitionId, Vec<TransitionId>> = HashMap::with_capacity(log.len());
+    for id in log.observed_ids() {
+        if let Some(prev) = log.transition(&id).expect("observed").prev {
+            children.entry(prev).or_default().push(id);
+        }
+    }
+    children
 }
 
 /// Children of a transition from the per-analyse index: observed

@@ -133,10 +133,18 @@ impl MembershipLog {
         self.transitions.get(id)
     }
 
-    /// All observed ids, in deterministic (ascending) order.
+    /// All observed ids, in deterministic (ascending) order. The
+    /// ascending order is a contract, not an implementation detail:
+    /// the per-analyse children index (`chain`) builds sorted child
+    /// lists from this sequence, so classification order depends on
+    /// it. Keep this sorted if the storage changes.
     pub fn observed_ids(&self) -> Vec<TransitionId> {
         let mut ids: Vec<TransitionId> = self.transitions.keys().copied().collect();
         ids.sort();
+        debug_assert!(
+            ids.windows(2).all(|w| w[0] <= w[1]),
+            "observed_ids must stay ascending"
+        );
         ids
     }
 

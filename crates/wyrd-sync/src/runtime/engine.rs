@@ -17,7 +17,7 @@
 //! unknown epoch key ............. skipped, retried on redelivery
 //! forged or undecryptable ....... seen-id committed (poison suppression)
 //! capability, state unknown ..... held in-memory, retried as transitions land
-//! capability, state rejects ..... held in-memory (membership evolves)
+//! capability, unauthorized ..... seen-id committed (derived state is immutable)
 //! capability, undecryptable ..... seen-id committed (deterministic)
 //! announcement, membership unseen  held in-memory, retried as transitions land
 //! announcement, noncanonical .... held in-memory, retried as membership resolves
@@ -358,9 +358,11 @@ impl Engine {
 
     /// Unwrap and authorize one capability delivery. Undecryptable
     /// bytes suppress immediately (deterministic failure, never
-    /// retriable); unknown transitions and failed authorizations
-    /// defer — membership evolves, so today's rejection may be
-    /// tomorrow's install.
+    /// retriable). An unknown transition defers — its state may still
+    /// arrive. But authorization against a known transition's derived
+    /// state is final: the state is a pure function of immutable
+    /// transition bytes, so a device absent from it stays absent and a
+    /// stale key stays stale. Those suppress too.
     fn capability_action(&self, id: &ControlMessageId, message: &Message) -> Action {
         let Message::Capability(payload) = message else {
             return Action::Defer;
@@ -380,7 +382,7 @@ impl Engine {
                 Fact::Capability(authorized),
                 Fact::ControlMessage(*id),
             ]),
-            Err(_) => Action::Defer,
+            Err(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
         }
     }
 }
@@ -1148,5 +1150,78 @@ mod tests {
         assert_eq!(report.deferred, 0);
         let facts = fixture.engine.store.load().expect("loads");
         assert!(facts.announcements.is_empty());
+    }
+
+    #[test]
+    fn unauthorized_capability_suppresses_without_pending() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let secret = EpochSecret::from_bytes([0x07; 32]);
+
+        // Genesis observed: the engine device is not a member of its
+        // state, so a capability naming it is terminally unauthorized.
+        let (_, genesis) = Builder::genesis(10);
+        let mail = vec![deliver(&fixture, 1, &transition_message(&genesis))];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 1);
+        let stranger = Capability::new(
+            member_drive(),
+            device,
+            encryption_key(&encryption_sk),
+            genesis.transition_id(),
+            1,
+            vec![secret.clone()],
+        )
+        .expect("well-formed");
+        let wrapped = stranger.wrap().expect("wraps").as_bytes().to_vec();
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 1,
+            wrapped,
+        });
+        let mail = vec![deliver(&fixture, 1, &delivery)];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty());
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).duplicates, 1);
+
+        // Stale key: the device is admitted under one encryption key
+        // while the capability delivers to another. Unwrap succeeds
+        // (it targets the engine's key) but authorization is final.
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![crate::membership::test_util::admit(device)]);
+        let mut scratch = MembershipLog::new(member_drive());
+        scratch.observe(genesis.clone());
+        scratch.observe(admission.clone());
+        let stale = Capability::new(
+            member_drive(),
+            device,
+            encryption_key(&encryption_sk),
+            admission.transition_id(),
+            2,
+            vec![secret.clone(), secret],
+        )
+        .expect("well-formed");
+        let wrapped = stale.wrap().expect("wraps").as_bytes().to_vec();
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped,
+        });
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&admission)),
+            deliver(&fixture, 2, &delivery),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty());
     }
 }

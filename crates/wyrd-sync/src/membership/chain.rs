@@ -60,6 +60,17 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
 
     let mut result = Analysis::default();
 
+    // Children index: one linear scan over the observed set replaces the
+    // per-step full scan the walk used to do. Iteration is in ascending
+    // id order (exactly what the old `children_of` scan produced), so
+    // each child list stays sorted and classification order is unchanged.
+    let mut children: HashMap<TransitionId, Vec<TransitionId>> = HashMap::with_capacity(log.len());
+    for id in log.observed_ids() {
+        if let Some(prev) = log.transition(&id).expect("observed").prev {
+            children.entry(prev).or_default().push(id);
+        }
+    }
+
     // Genesis selection: canonical(1) is the unique valid genesis.
     let geneses: Vec<TransitionId> = by_epoch
         .iter()
@@ -75,16 +86,16 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
                 result.states.insert(genesis, state.clone());
             }
             result.canonical.push(genesis);
-            walk(log, &link, &mut result, genesis);
+            walk(log, &link, &children, &mut result, genesis);
         }
         _ => {
             // Two or more valid geneses: conflict at epoch 1, resolvable
             // like any other (epochs.md: "conflict at epoch 1 like any
             // other"). A unique resolution heals the chain; without one
             // the drive is frozen with no canonical chain at all.
-            match handle_conflict(log, &link, &mut result, &geneses, 1) {
+            match handle_conflict(log, &link, &children, &mut result, &geneses, 1) {
                 ConflictOutcome::Resolved { resolution } => {
-                    walk(log, &link, &mut result, resolution);
+                    walk(log, &link, &children, &mut result, resolution);
                 }
                 ConflictOutcome::Unresolved | ConflictOutcome::Contradictory => {}
             }
@@ -238,12 +249,13 @@ fn link_for(
     link.get(&id).cloned().unwrap_or(Link::Pending)
 }
 
-/// Children of a transition: observed transitions whose prev names it.
-fn children_of(log: &MembershipLog, id: &TransitionId) -> Vec<TransitionId> {
-    log.observed_ids()
-        .into_iter()
-        .filter(|other| log.transition(other).expect("observed").prev == Some(*id))
-        .collect()
+/// Children of a transition from the per-analyse index: observed
+/// transitions whose prev names it, in ascending id order.
+fn children_of<'a>(
+    children: &'a HashMap<TransitionId, Vec<TransitionId>>,
+    id: &TransitionId,
+) -> &'a [TransitionId] {
+    children.get(id).map(Vec::as_slice).unwrap_or(&[])
 }
 
 /// Advance the canonical chain from `current`, resolving conflicts only
@@ -251,12 +263,14 @@ fn children_of(log: &MembershipLog, id: &TransitionId) -> Vec<TransitionId> {
 fn walk(
     log: &MembershipLog,
     link: &HashMap<TransitionId, Link>,
+    children: &HashMap<TransitionId, Vec<TransitionId>>,
     result: &mut Analysis,
     mut current: TransitionId,
 ) {
     loop {
-        let kids: Vec<TransitionId> = children_of(log, &current)
-            .into_iter()
+        let kids: Vec<TransitionId> = children_of(children, &current)
+            .iter()
+            .copied()
             .filter(|c| matches!(link.get(c), Some(Link::Valid(_))))
             .collect();
         if kids.is_empty() {
@@ -284,7 +298,7 @@ fn walk(
 
         // Conflict: two or more valid children of the canonical tip.
         let conflict_epoch = log.transition(&kids[0]).expect("observed").epoch;
-        match handle_conflict(log, link, result, &kids, conflict_epoch) {
+        match handle_conflict(log, link, children, result, &kids, conflict_epoch) {
             ConflictOutcome::Resolved { resolution } => {
                 current = resolution;
             }
@@ -313,6 +327,7 @@ enum ConflictOutcome {
 fn handle_conflict(
     log: &MembershipLog,
     link: &HashMap<TransitionId, Link>,
+    children: &HashMap<TransitionId, Vec<TransitionId>>,
     result: &mut Analysis,
     contenders: &[TransitionId],
     conflict_epoch: u64,
@@ -320,11 +335,11 @@ fn handle_conflict(
     let contender_set: HashSet<TransitionId> = contenders.iter().copied().collect();
     let mut candidates: Vec<TransitionId> = Vec::new();
     for contender in contenders {
-        for grand in children_of(log, contender) {
-            if !matches!(link.get(&grand), Some(Link::Valid(_))) {
+        for grand in children_of(children, contender) {
+            if !matches!(link.get(grand), Some(Link::Valid(_))) {
                 continue;
             }
-            let gt = log.transition(&grand).expect("observed");
+            let gt = log.transition(grand).expect("observed");
             if gt.resolves.is_empty() {
                 continue;
             }
@@ -337,7 +352,7 @@ fn handle_conflict(
             // Exact matching: a resolution names exactly the voided
             // siblings — no fewer, no more, no unrelated transitions.
             if named == others {
-                candidates.push(grand);
+                candidates.push(*grand);
             }
         }
     }

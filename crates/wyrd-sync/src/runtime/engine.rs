@@ -18,7 +18,10 @@
 //! forged or undecryptable ....... seen-id committed (poison suppression)
 //! capability, state unknown ..... held in-memory, retried as transitions land
 //! capability, state rejects ..... held in-memory (membership evolves)
+//! capability, undecryptable ..... seen-id committed (deterministic)
 //! announcement, membership unseen  held in-memory, retried as transitions land
+//! announcement, noncanonical .... held in-memory, retried as membership resolves
+//! announcement, invalid ......... seen-id committed (verdicts are final)
 //! announcement, epoch mismatched . seen-id committed (epochs are immutable)
 //! held-message overflow ......... seen-id committed (pending is bounded)
 //! ```
@@ -44,7 +47,7 @@ use crate::control::{ControlInbox, ControlMessageId, IngestReport, Message, Seal
 use crate::durable::{AuthorizedCapability, DurableError, DurableStore, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::WrappedCapability;
-use crate::membership::MembershipLog;
+use crate::membership::{MembershipLog, TransitionStatus};
 use crate::transport::mailbox::{open_from_sender, Mailbox, MailboxEnvelope};
 
 /// Engine failures: only durable-commit trouble is fatal. Per-envelope
@@ -319,40 +322,66 @@ impl Engine {
                         // epochs are immutable — so suppress, never park.
                         Action::Commit(vec![Fact::ControlMessage(*id)])
                     }
-                    Some(_) => Action::Commit(vec![
-                        Fact::Announcement(announcement.clone()),
-                        Fact::ControlMessage(*id),
-                    ]),
+                    Some(_) => {
+                        // Observed is not valid: only a canonical
+                        // membership state authorizes a snapshot.
+                        // Non-final verdicts park until membership
+                        // resolves (epochs.md treats such references
+                        // as pending); final rejections suppress.
+                        match self
+                            .log
+                            .status(&announcement.membership)
+                            .expect("membership observed")
+                        {
+                            TransitionStatus::Canonical => Action::Commit(vec![
+                                Fact::Announcement(announcement.clone()),
+                                Fact::ControlMessage(*id),
+                            ]),
+                            TransitionStatus::Invalid(_) => {
+                                Action::Commit(vec![Fact::ControlMessage(*id)])
+                            }
+                            TransitionStatus::Contested
+                            | TransitionStatus::Voided
+                            | TransitionStatus::Orphaned
+                            | TransitionStatus::Pending => Action::Defer,
+                        }
+                    }
                 }
             }
             // Rotation notices carry no fact of their own: the
             // capability follows as its own message. The seen-id keeps
             // the notice from redelivering.
             Message::KeyRotation(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
-            Message::Capability(_) => match self.capability_action(id, message) {
-                Ok(facts) => Action::Commit(facts),
-                Err(()) => Action::Defer,
-            },
+            Message::Capability(_) => self.capability_action(id, message),
         }
     }
 
-    /// Unwrap and authorize one capability delivery. Anything
-    /// state-dependent (unknown transition, failed authorization)
-    /// defers — membership evolves, so today's rejection may be
-    /// tomorrow's install. Only undecryptable bytes suppress.
-    fn capability_action(&self, id: &ControlMessageId, message: &Message) -> Result<Vec<Fact>, ()> {
+    /// Unwrap and authorize one capability delivery. Undecryptable
+    /// bytes suppress immediately (deterministic failure, never
+    /// retriable); unknown transitions and failed authorizations
+    /// defer — membership evolves, so today's rejection may be
+    /// tomorrow's install.
+    fn capability_action(&self, id: &ControlMessageId, message: &Message) -> Action {
         let Message::Capability(payload) = message else {
-            return Err(());
+            return Action::Defer;
         };
-        let capability = WrappedCapability::from_bytes(payload.wrapped.clone())
+        let capability = match WrappedCapability::from_bytes(payload.wrapped.clone())
             .unwrap(&self.encryption_secret)
-            .map_err(|_| ())?;
-        let state = self.log.state_of(&capability.transition).ok_or(())?;
-        let authorized = AuthorizedCapability::authorize(capability, &state).map_err(|_| ())?;
-        Ok(vec![
-            Fact::Capability(authorized),
-            Fact::ControlMessage(*id),
-        ])
+        {
+            Ok(capability) => capability,
+            Err(_) => return Action::Commit(vec![Fact::ControlMessage(*id)]),
+        };
+        let state = match self.log.state_of(&capability.transition) {
+            Some(state) => state,
+            None => return Action::Defer,
+        };
+        match AuthorizedCapability::authorize(capability, &state) {
+            Ok(authorized) => Action::Commit(vec![
+                Fact::Capability(authorized),
+                Fact::ControlMessage(*id),
+            ]),
+            Err(_) => Action::Defer,
+        }
     }
 }
 
@@ -367,12 +396,12 @@ mod tests {
     use crate::control::{seal, CapabilityPayload, SnapshotAnnouncement, TransitionPayload};
     use crate::keys::capability::Capability;
     use crate::keys::EpochSecret;
-    use crate::membership::test_util::{drive as member_drive, Builder};
+    use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
     use crate::transport::mailbox::{seal_for_recipient, MailboxError};
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use wyrd_format::membership::Admission;
+    use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
     use wyrd_format::{Change, DeviceEncryptionKey, SnapshotId, TransitionId};
 
     /// An isolated store directory, removed on drop (mirrors the
@@ -537,6 +566,38 @@ mod tests {
             engine.add_epoch_key(epoch, control_key(epoch));
         }
         engine
+    }
+
+    /// Hand-sign one transition against the fixture drive (mirrors
+    /// the conformance helper): for siblings the builder cannot
+    /// produce.
+    #[allow(clippy::too_many_arguments)]
+    fn signed(
+        epoch: u64,
+        prev: Option<TransitionId>,
+        resolves: Vec<TransitionId>,
+        changes: Vec<Change>,
+        members: &[DeviceId],
+        owners: &[DeviceId],
+        author_sk: &SecretKey,
+        author: DeviceId,
+    ) -> MembershipTransition {
+        let mut t = MembershipTransition {
+            epoch,
+            prev,
+            resolves,
+            changes,
+            members_root: set_root(MEMBER_SET_CONTEXT, members),
+            owners_root: set_root(OWNER_SET_CONTEXT, owners),
+            author,
+            signature: [0; 64],
+        };
+        sign(&mut t, author_sk, &member_drive());
+        t
+    }
+
+    fn owner() -> (SecretKey, DeviceId) {
+        key(10)
     }
 
     #[test]
@@ -867,5 +928,225 @@ mod tests {
         let report = drain(&mut fixture);
         assert_eq!(report.accepted, 1);
         assert_eq!(fixture.engine.current(), 1);
+    }
+
+    #[test]
+    fn malformed_capability_suppresses_without_pending() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        // Sealed under a held epoch key, but the wrapped bytes are
+        // neither a valid envelope nor openable: deterministic
+        // failure, never a hold.
+        for (name, wrapped) in [("garbage", vec![0xCC; 48]), ("truncated", vec![0xDD; 7])] {
+            let delivery = Message::Capability(CapabilityPayload {
+                device,
+                epoch: 2,
+                wrapped,
+            });
+            let mail = vec![deliver(&fixture, 2, &delivery)];
+            queue(&mut fixture, mail.clone());
+            let report = drain(&mut fixture);
+            assert_eq!(report.accepted, 1, "{name} suppresses");
+            assert_eq!(fixture.engine.pending_count(), 0, "{name} never pends");
+            queue(&mut fixture, mail);
+            let report = drain(&mut fixture);
+            assert_eq!(report.duplicates, 1, "{name} redelivery is a duplicate");
+        }
+    }
+
+    #[test]
+    fn tampered_capability_wrap_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+
+        // A well-formed wrap for the engine device, then tampered: the
+        // AEAD open fails deterministically.
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+        let mut scratch = MembershipLog::new(member_drive());
+        scratch.observe(genesis.clone());
+        scratch.observe(admission.clone());
+        let state = scratch
+            .state_of(&admission.transition_id())
+            .expect("admission is valid");
+        let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
+        let capability = Capability::mint(
+            member_drive(),
+            device,
+            &state,
+            admission.transition_id(),
+            2,
+            secrets,
+        )
+        .expect("device is a member");
+        let mut wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
+        wrapped[20] ^= 0xFF;
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped,
+        });
+        let mail = vec![deliver(&fixture, 2, &delivery)];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    #[test]
+    fn announcement_bound_to_orphaned_transition_defers() {
+        let mut fixture = fixture();
+        fixture.engine.add_epoch_key(3, control_key(3));
+        let (owner_sk, owner_id) = owner();
+        let (outsider_sk, outsider_id) = key(20);
+        let (_, genesis) = Builder::genesis(10);
+        let genesis_id = genesis.transition_id();
+
+        // Invalid parent (outsider-signed) with a legitimate
+        // owner-signed child: the child is orphaned, never canonical.
+        let mut bad = signed(
+            2,
+            Some(genesis_id),
+            Vec::new(),
+            vec![Change::Rotate],
+            &[owner_id],
+            &[owner_id],
+            &owner_sk,
+            owner_id,
+        );
+        bad.author = outsider_id;
+        sign(&mut bad, &outsider_sk, &member_drive());
+        let child = signed(
+            3,
+            Some(bad.transition_id()),
+            Vec::new(),
+            vec![Change::Rotate],
+            &[owner_id],
+            &[owner_id],
+            &owner_sk,
+            owner_id,
+        );
+        let bound = announcement_for(3, child.transition_id());
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&bad)),
+            deliver(&fixture, 1, &transition_message(&child)),
+            deliver(&fixture, 3, &bound),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 3);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(fixture.engine.pending_count(), 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.announcements.is_empty());
+    }
+
+    #[test]
+    fn announcement_bound_to_contested_transition_resolves() {
+        let mut fixture = fixture();
+        let (owner_sk, owner_id) = owner();
+        let (_, genesis) = Builder::genesis(10);
+        let genesis_id = genesis.transition_id();
+        let members = [owner_id];
+
+        // Unresolved fork: both siblings are contested.
+        let sibling_a = signed(
+            2,
+            Some(genesis_id),
+            Vec::new(),
+            vec![Change::Rotate],
+            &members,
+            &members,
+            &owner_sk,
+            owner_id,
+        );
+        let mut with_new = vec![owner_id, key(11).1];
+        with_new.sort();
+        let sibling_b = signed(
+            2,
+            Some(genesis_id),
+            Vec::new(),
+            vec![crate::membership::test_util::admit(key(11).1)],
+            &with_new,
+            &members,
+            &owner_sk,
+            owner_id,
+        );
+        let bound = announcement_for(2, sibling_a.transition_id());
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&sibling_a)),
+            deliver(&fixture, 1, &transition_message(&sibling_b)),
+            deliver(&fixture, 2, &bound),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 3);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(fixture.engine.pending_count(), 1);
+
+        // The resolution names the winner: it canonicalizes, and the
+        // held announcement validates in the same pass.
+        let resolution = signed(
+            3,
+            Some(sibling_a.transition_id()),
+            vec![sibling_b.transition_id()],
+            vec![Change::Rotate],
+            &members,
+            &members,
+            &owner_sk,
+            owner_id,
+        );
+        // Resolution envelope rides any held epoch; its payload has no
+        // epoch binding, so epoch 1 suffices.
+        let mail = vec![deliver(&fixture, 1, &transition_message(&resolution))];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1);
+    }
+
+    #[test]
+    fn announcement_bound_to_invalid_transition_suppresses() {
+        let mut fixture = fixture();
+        fixture.engine.add_epoch_key(5, control_key(5));
+        let (owner_sk, owner_id) = owner();
+        let (_, genesis) = Builder::genesis(10);
+        let genesis_id = genesis.transition_id();
+
+        // Epoch 5 naming an epoch-1 prev: structurally invalid, with a
+        // matching announcement epoch so only the status gate fires.
+        let bad = signed(
+            5,
+            Some(genesis_id),
+            Vec::new(),
+            vec![Change::Rotate],
+            &[owner_id],
+            &[owner_id],
+            &owner_sk,
+            owner_id,
+        );
+        let bound = announcement_for(5, bad.transition_id());
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&bad)),
+            deliver(&fixture, 5, &bound),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 3);
+        assert_eq!(report.deferred, 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.announcements.is_empty());
     }
 }

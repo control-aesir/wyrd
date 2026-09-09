@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 
+use super::chain::build_children_index;
 use super::state::{apply, MembershipState};
 use super::test_util::{admit, drive, key, sign, Builder};
 use super::{MembershipLog, TransitionStatus};
@@ -123,6 +124,27 @@ fn observe_all(log: &mut MembershipLog, transitions: &[MembershipTransition]) {
     for t in transitions {
         log.observe(t.clone());
     }
+}
+
+/// Member set at the tip of a generated chain, replayed the way the
+/// fork tests do it (generated chains only emit Admit/Remove/Rotate,
+/// and ownership stays on the genesis device).
+fn tip_members(chain: &[MembershipTransition]) -> BTreeSet<DeviceId> {
+    let mut members = BTreeSet::from([device(0)]);
+    for t in chain.iter().skip(1) {
+        for c in &t.changes {
+            match c {
+                Change::Admit(a) => {
+                    members.insert(a.device);
+                }
+                Change::Remove(d) => {
+                    members.remove(d);
+                }
+                _ => {}
+            }
+        }
+    }
+    members
 }
 
 proptest! {
@@ -405,5 +427,107 @@ proptest! {
             Some(TransitionStatus::Canonical)
         );
         prop_assert_eq!(log.status(&child.transition_id()), Some(TransitionStatus::Orphaned));
+    }
+
+    /// The per-analyse children index matches a naive reference scan:
+    /// identical child sets in identical ascending order for every
+    /// observed parent, over generated chains extended with forks,
+    /// resolutions, and contradictory resolutions. This pins the
+    /// index refactor's equivalence guarantee directly; the
+    /// conformance suites pin the resulting classifications.
+    #[test]
+    fn children_index_matches_reference_scan(
+        ops in prop::collection::vec(op_strategy(), 0..8usize),
+        fork in any::<bool>(),
+        resolve in any::<bool>(),
+        contradict in any::<bool>(),
+        winner_is_first in any::<bool>(),
+    ) {
+        let chain = build_chain(&ops);
+        let mut all = chain.clone();
+        if fork {
+            let members = tip_members(&chain);
+            let owner = device(0);
+            let (sk_owner, _) = key(10);
+            // Drive-only probe: all fixtures share `drive()`.
+            let (probe, _) = Builder::genesis(10);
+            let tip = chain.last().expect("chain has genesis");
+            let tip_id = tip.transition_id();
+            let tip_epoch = tip.epoch;
+            let fresh = (0..POOL)
+                .find(|i| *i != 0 && !members.contains(&device(*i)))
+                .expect("pool has room");
+            let member_vec: Vec<DeviceId> = members.iter().copied().collect();
+            let sibling_rotate = signed(
+                &probe, tip_epoch + 1, Some(tip_id), Vec::new(), vec![Change::Rotate],
+                &member_vec, &[owner], &sk_owner, owner,
+            );
+            let mut with_new = members.clone();
+            with_new.insert(device(fresh));
+            let sibling_admit = signed(
+                &probe, tip_epoch + 1, Some(tip_id), Vec::new(), vec![admit(device(fresh))],
+                &with_new.iter().copied().collect::<Vec<_>>(), &[owner], &sk_owner, owner,
+            );
+            let (winner, loser) = if winner_is_first {
+                (&sibling_rotate, &sibling_admit)
+            } else {
+                (&sibling_admit, &sibling_rotate)
+            };
+            all.push(sibling_rotate.clone());
+            all.push(sibling_admit.clone());
+            if resolve && !contradict {
+                let mut resolution = signed(
+                    &probe, tip_epoch + 2, Some(winner.transition_id()), vec![loser.transition_id()],
+                    vec![Change::Rotate],
+                    &member_vec, &[owner], &sk_owner, owner,
+                );
+                // An admitting winner keeps its new member, as in the
+                // example-based fork test.
+                if !winner_is_first {
+                    resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>());
+                    sign(&mut resolution, &sk_owner, &probe.drive);
+                }
+                all.push(resolution);
+            } else if resolve {
+                // Contradictory resolutions: each sibling names the other.
+                let r1 = signed(
+                    &probe, tip_epoch + 2, Some(sibling_rotate.transition_id()), vec![sibling_admit.transition_id()],
+                    vec![Change::Rotate], &member_vec, &[owner], &sk_owner, owner,
+                );
+                let r2 = signed(
+                    &probe, tip_epoch + 2, Some(sibling_admit.transition_id()), vec![sibling_rotate.transition_id()],
+                    vec![Change::Rotate],
+                    &with_new.iter().copied().collect::<Vec<_>>(), &[owner], &sk_owner, owner,
+                );
+                all.extend([r1, r2]);
+            }
+        }
+        let mut log = MembershipLog::new(drive());
+        observe_all(&mut log, &all);
+        let index = build_children_index(&log);
+        let observed = log.observed_ids();
+        // Reference scan: children in observed (ascending) order.
+        for id in &observed {
+            let expected: Vec<TransitionId> = observed
+                .iter()
+                .copied()
+                .filter(|other| log.transition(other).expect("observed").prev == Some(*id))
+                .collect();
+            prop_assert_eq!(index.get(id).cloned().unwrap_or_default(), expected);
+        }
+        // The index covers exactly the parents with children, with
+        // sorted lists over observed ids only.
+        let parents: BTreeSet<TransitionId> = observed
+            .iter()
+            .filter_map(|id| log.transition(id).expect("observed").prev)
+            .collect();
+        prop_assert_eq!(index.len(), parents.len());
+        for (parent, kids) in &index {
+            prop_assert!(observed.contains(parent));
+            prop_assert!(kids.windows(2).all(|w| w[0] <= w[1]), "child list sorted");
+            for kid in kids {
+                prop_assert!(observed.contains(kid));
+            }
+        }
     }
 }

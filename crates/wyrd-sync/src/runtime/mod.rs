@@ -16,6 +16,9 @@ use wyrd_format::{ChildManifest, ContentId, DriveId, Manifest, ObjectKind, Snaps
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
 pub mod engine;
+mod fetch;
+mod intake;
+mod plan;
 
 pub use engine::{DrainReport, Engine, EngineError, ExecuteReport};
 

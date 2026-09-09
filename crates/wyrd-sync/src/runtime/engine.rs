@@ -773,9 +773,23 @@ mod tests {
     }
 
     fn announcement_for(epoch: u64, membership: TransitionId) -> Message {
+        announcement_msg(
+            SnapshotId::from_bytes([0x11; 32]),
+            DeviceId::from_bytes([0x22; 32]),
+            epoch,
+            membership,
+        )
+    }
+
+    fn announcement_msg(
+        snapshot: SnapshotId,
+        author: DeviceId,
+        epoch: u64,
+        membership: TransitionId,
+    ) -> Message {
         Message::SnapshotAnnouncement(SnapshotAnnouncement {
-            snapshot: SnapshotId::from_bytes([0x11; 32]),
-            author: DeviceId::from_bytes([0x22; 32]),
+            snapshot,
+            author,
             epoch,
             membership,
         })
@@ -1550,7 +1564,31 @@ mod tests {
         object_epoch: u64,
         plaintext: &[u8],
     ) -> Published {
-        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let mut bulk = MemoryBulkSource::default();
+        let content = publish_into(
+            &mut bulk,
+            manifest_secret,
+            manifest_epoch,
+            object_secret,
+            object_epoch,
+            SnapshotId::from_bytes([0x11; 32]),
+            plaintext,
+        );
+        Published { bulk, content }
+    }
+
+    /// Publish one snapshot's manifest tree into a shared bulk peer
+    /// (two devices publish side by side). Returns the chunk's
+    /// content id.
+    fn publish_into(
+        bulk: &mut MemoryBulkSource,
+        manifest_secret: &EpochSecret,
+        manifest_epoch: u64,
+        object_secret: &EpochSecret,
+        object_epoch: u64,
+        snapshot: SnapshotId,
+        plaintext: &[u8],
+    ) -> ContentId {
         let drive = member_drive();
         let content = ContentId::derive(ObjectKind::Chunk, plaintext);
         let object_key = object_secret.object_key(
@@ -1590,7 +1628,6 @@ mod tests {
         };
         let (root_id, sealed_root) = seal_manifest(&manifest_key, &root).unwrap();
 
-        let mut bulk = MemoryBulkSource::default();
         bulk.publish_root(
             snapshot,
             SealedManifest {
@@ -1600,7 +1637,7 @@ mod tests {
         );
         bulk.publish_sealed(sealed_child.storage_id(), sealed_child.encode());
         bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
-        Published { bulk, content }
+        content
     }
 
     /// A store that refuses the local-write path: any import the

@@ -57,10 +57,19 @@ pub struct PendingObjectFetch {
 pub struct RuntimeReconcile {
     pub pending_snapshots: BTreeSet<SnapshotId>,
     pub pending_manifests: BTreeMap<ContentId, ChildManifest>,
-    pub pending_objects: BTreeMap<ContentId, PendingObjectFetch>,
+    /// Fetch candidates by plaintext content: every usable storage
+    /// representation is retained, in first-seen order. The same
+    /// content legitimately maps to several `StorageId`s across
+    /// encryption epochs (trust.md), and the fetch layer must choose
+    /// among them using its epoch capabilities — first-wins would
+    /// silently lose a decryptable representation.
+    pub pending_objects: BTreeMap<ContentId, Vec<PendingObjectFetch>>,
 }
 
-/// Durably retained runtime sync state.
+/// Durably retained runtime sync state: the live view rebuilds from
+/// committed durable facts (transitions, announcements, manifests,
+/// residency mutations) via the fact/replay path, so this struct
+/// itself is never serialized — only the facts are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeState {
     drive: DriveId,
@@ -186,7 +195,7 @@ impl RuntimeState {
     pub fn reconcile(&self) -> RuntimeReconcile {
         let mut pending_snapshots = BTreeSet::new();
         let mut pending_manifests = BTreeMap::new();
-        let mut pending_objects = BTreeMap::new();
+        let mut pending_objects: BTreeMap<ContentId, Vec<PendingObjectFetch>> = BTreeMap::new();
 
         for snapshot in self.announcements.keys() {
             // Root manifests are the snapshot anchors; child manifests share
@@ -223,7 +232,8 @@ impl RuntimeState {
                 }
                 pending_objects
                     .entry(entry.content_id)
-                    .or_insert_with(|| PendingObjectFetch {
+                    .or_default()
+                    .push(PendingObjectFetch {
                         content_id: entry.content_id,
                         storage_id: entry.storage_id,
                         kind: entry.kind,
@@ -324,7 +334,7 @@ mod tests {
         let plan = state.reconcile();
         assert_eq!(plan.pending_objects.len(), 1);
         assert_eq!(
-            plan.pending_objects[&ContentId::from_bytes([4; 32])].kind,
+            plan.pending_objects[&ContentId::from_bytes([4; 32])][0].kind,
             ObjectKind::Chunk
         );
         state.mark_local_object(ContentId::from_bytes([4; 32]));
@@ -414,8 +424,42 @@ mod tests {
         state.set_materialization(ContentId::from_bytes([4; 32]), MaterializationState::Pinned);
         let plan = state.reconcile();
         assert_eq!(
-            plan.pending_objects[&ContentId::from_bytes([4; 32])].encryption_epoch,
+            plan.pending_objects[&ContentId::from_bytes([4; 32])][0].encryption_epoch,
             1
+        );
+    }
+
+    #[test]
+    fn alternate_epoch_representations_all_survive_reconciliation() {
+        // The same plaintext content sealed under two encryption epochs
+        // (two manifests, two storage ids): the fetch layer chooses by
+        // epoch capability, so both candidates must reach the plan.
+        let mut state = RuntimeState::new(drive());
+        let content = ContentId::from_bytes([4; 32]);
+        let mut old_epoch = root_manifest(1, 9, 4, 5);
+        old_epoch.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
+        old_epoch.manifest.entries[0].encryption_epoch = 1;
+        old_epoch.manifest_id = manifest_id_for(&old_epoch);
+        let mut new_epoch = root_manifest(1, 9, 4, 5);
+        new_epoch.manifest.entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
+        new_epoch.manifest.entries[0].encryption_epoch = 2;
+        new_epoch.manifest_id = manifest_id_for(&new_epoch);
+        assert!(state.record_manifest(old_epoch).unwrap());
+        assert!(state.record_manifest(new_epoch).unwrap());
+        state.set_materialization(content, MaterializationState::Pinned);
+        let plan = state.reconcile();
+        let candidates = &plan.pending_objects[&content];
+        assert_eq!(candidates.len(), 2, "both representations reach the plan");
+        let mut epochs: Vec<u64> = candidates.iter().map(|c| c.encryption_epoch).collect();
+        epochs.sort_unstable();
+        assert_eq!(epochs, vec![1, 2], "no epoch representation is lost");
+        let storages: BTreeSet<StorageId> = candidates.iter().map(|c| c.storage_id).collect();
+        assert_eq!(
+            storages,
+            BTreeSet::from([
+                StorageId::from_bytes([0xA0; 32]),
+                StorageId::from_bytes([0xB0; 32]),
+            ])
         );
     }
 

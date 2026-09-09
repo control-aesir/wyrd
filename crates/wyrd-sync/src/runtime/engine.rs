@@ -18,9 +18,12 @@
 //! forged or undecryptable ....... seen-id committed (poison suppression)
 //! capability, state unknown ..... held in-memory, retried as transitions land
 //! capability, state rejects ..... held in-memory (membership evolves)
+//! announcement, membership unseen  held in-memory, retried as transitions land
+//! announcement, epoch mismatched . seen-id committed (epochs are immutable)
+//! held-message overflow ......... seen-id committed (pending is bounded)
 //! ```
 //!
-//! A capability held in memory is lost on crash, but it was never
+//! A message held in memory is lost on crash, but it was never
 //! committed — so the durable seen set lacks it and relay redelivery
 //! processes it fresh after rehydration. The relay retaining unacked
 //! deliveries is the assumption this depends on.
@@ -30,7 +33,7 @@
 //! [`MembershipLog`]: crate::membership::MembershipLog
 //! [`DurableStore`]: crate::durable::DurableStore
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use secp256k1::SecretKey;
@@ -61,11 +64,17 @@ pub struct DrainReport {
     pub accepted: usize,
     /// Redeliveries of already-committed messages.
     pub duplicates: usize,
-    /// Capabilities held for a future transition.
+    /// Messages held for a future transition.
     pub deferred: usize,
     /// Envelopes that could not be processed (left for redelivery).
     pub skipped: usize,
 }
+
+/// Cap on held messages: without one, distinct never-authorizable
+/// deliveries accumulate without bound, each owning its full sealed
+/// payload. Over-limit deferrals suppress instead (a seen-id commit):
+/// the sender can redeliver once legitimate holds drain.
+pub const MAX_PENDING_MESSAGES: usize = 1024;
 
 /// The intake driver for one device on one drive.
 pub struct Engine {
@@ -75,6 +84,10 @@ pub struct Engine {
     encryption_secret: SecretKey,
     store: DurableStore,
     inbox: ControlInbox,
+    /// Held epoch control keys, retained outside the inbox so a
+    /// resync (which rebuilds the inbox from durable facts) never
+    /// drops key material the device still holds.
+    epoch_keys: BTreeMap<u64, [u8; 32]>,
     log: MembershipLog,
     pending: HashMap<ControlMessageId, Message>,
 }
@@ -108,29 +121,26 @@ impl Engine {
         encryption_secret: SecretKey,
     ) -> Result<Self, EngineError> {
         let store = DurableStore::open(dir, drive, passphrase)?;
-        let facts = store.load()?;
-        let mut inbox = ControlInbox::new(drive);
-        for id in &facts.seen {
-            inbox.remember(id);
-        }
-        let mut log = MembershipLog::new(drive);
-        for t in &facts.transitions {
-            log.observe(t.clone());
-        }
-        Ok(Engine {
+        let mut engine = Engine {
             drive,
             device,
             identity_secret,
             encryption_secret,
             store,
-            inbox,
-            log,
+            inbox: ControlInbox::new(drive),
+            epoch_keys: BTreeMap::new(),
+            log: MembershipLog::new(drive),
             pending: HashMap::new(),
-        })
+        };
+        engine.resync()?;
+        Ok(engine)
     }
 
-    /// Hold an epoch's control key for inbox ingest.
+    /// Hold an epoch's control key for inbox ingest. Keys live with
+    /// the engine (not just the inbox) so restarts and resyncs keep
+    /// them.
     pub fn add_epoch_key(&mut self, epoch: u64, key: [u8; 32]) {
+        self.epoch_keys.insert(epoch, key);
         self.inbox.add_epoch_key(epoch, key);
     }
 
@@ -147,6 +157,25 @@ impl Engine {
     /// Capabilities held for a future transition.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Rebuild the inbox dedupe set and membership log from committed
+    /// facts, discarding uncommitted in-memory views. Held epoch keys
+    /// are re-applied: they are device knowledge, not durable facts.
+    fn resync(&mut self) -> Result<(), EngineError> {
+        let facts = self.store.load()?;
+        self.inbox = ControlInbox::new(self.drive);
+        for (epoch, key) in &self.epoch_keys {
+            self.inbox.add_epoch_key(*epoch, *key);
+        }
+        for id in &facts.seen {
+            self.inbox.remember(id);
+        }
+        self.log = MembershipLog::new(self.drive);
+        for t in &facts.transitions {
+            self.log.observe(t.clone());
+        }
+        Ok(())
     }
 
     /// The last durable commit sequence.
@@ -209,6 +238,11 @@ impl Engine {
     ) -> Result<Outcome, EngineError> {
         let mut facts = match self.message_action(id, message) {
             Action::Commit(facts) => facts,
+            Action::Defer if self.pending.len() >= MAX_PENDING_MESSAGES => {
+                // Bounded holds: suppress with a seen-id commit rather
+                // than accumulate without limit.
+                vec![Fact::ControlMessage(*id)]
+            }
             Action::Defer => {
                 self.pending.insert(*id, message.clone());
                 return Ok(Outcome::Deferred);
@@ -220,12 +254,12 @@ impl Engine {
             facts.clear();
         }
         if matches!(message, Message::MembershipTransition(_)) {
-            // A fresh transition may authorize held capabilities: fold
-            // the newly unlocked facts into the same commit.
+            // A fresh transition may unlock held messages: fold the
+            // newly unlocked facts into the same commit.
             for (pending_id, pending_message) in std::mem::take(&mut self.pending) {
-                match self.capability_action(&pending_id, &pending_message) {
-                    Ok(more) => facts.extend(more),
-                    Err(()) => {
+                match self.message_action(&pending_id, &pending_message) {
+                    Action::Commit(more) => facts.extend(more),
+                    Action::Defer => {
                         self.pending.insert(pending_id, pending_message);
                     }
                 }
@@ -235,15 +269,25 @@ impl Engine {
             // A redelivery that unlocked nothing: still a duplicate.
             return Ok(Outcome::Duplicate);
         }
-        self.store.commit(&facts)?;
+        if let Err(e) = self.store.commit(&facts) {
+            // The in-memory log may have observed a transition that is
+            // not durable: rebuild both views from the store so the
+            // engine never decides against uncommitted state.
+            let _ = self.resync();
+            return Err(e.into());
+        }
         Ok(Outcome::Accepted)
     }
 
     /// The facts one message carries. State-dependent failures (a
-    /// capability whose transition is unobserved or not authorizing)
-    /// defer; bytes-dependent failures (undecodable, over limits,
-    /// unopenable) commit a seen-id suppression so the poison is never
-    /// reprocessed.
+    /// capability whose transition is unobserved or not authorizing; an
+    /// announcement naming an unobserved membership transition) defer;
+    /// bytes-dependent or deterministically inconsistent payloads
+    /// (undecodable, over limits, unopenable, epoch-mismatched)
+    /// commit a seen-id suppression so the poison is never reprocessed.
+    /// Full snapshot authorization waits for the bulk snapshot bytes in
+    /// a later slice; the cheap membership/epoch binding is enforced
+    /// here.
     fn message_action(&mut self, id: &ControlMessageId, message: &Message) -> Action {
         match message {
             Message::MembershipTransition(payload) => {
@@ -265,10 +309,22 @@ impl Engine {
                     Fact::ControlMessage(*id),
                 ])
             }
-            Message::SnapshotAnnouncement(announcement) => Action::Commit(vec![
-                Fact::Announcement(announcement.clone()),
-                Fact::ControlMessage(*id),
-            ]),
+            Message::SnapshotAnnouncement(announcement) => {
+                match self.log.transition(&announcement.membership) {
+                    // Membership not yet observed: hold for the
+                    // transition, retried as transitions land.
+                    None => Action::Defer,
+                    Some(t) if t.epoch != announcement.epoch => {
+                        // Deterministic inconsistency — transition
+                        // epochs are immutable — so suppress, never park.
+                        Action::Commit(vec![Fact::ControlMessage(*id)])
+                    }
+                    Some(_) => Action::Commit(vec![
+                        Fact::Announcement(announcement.clone()),
+                        Fact::ControlMessage(*id),
+                    ]),
+                }
+            }
             // Rotation notices carry no fact of their own: the
             // capability follows as its own message. The seen-id keeps
             // the notice from redelivering.
@@ -440,12 +496,12 @@ mod tests {
         fixture.engine.drain(&mut mailbox).unwrap()
     }
 
-    fn announcement(epoch: u64) -> Message {
+    fn announcement_for(epoch: u64, membership: TransitionId) -> Message {
         Message::SnapshotAnnouncement(SnapshotAnnouncement {
             snapshot: SnapshotId::from_bytes([0x11; 32]),
             author: DeviceId::from_bytes([0x22; 32]),
             epoch,
-            membership: TransitionId::from_bytes([0x33; 32]),
+            membership,
         })
     }
 
@@ -488,10 +544,11 @@ mod tests {
         let mut fixture = fixture();
         let (mut builder, genesis) = Builder::genesis(10);
         let child = builder.child(vec![Change::Rotate]);
+        let bound = announcement_for(2, child.transition_id());
         let mail = vec![
             deliver(&fixture, 1, &transition_message(&genesis)),
             deliver(&fixture, 1, &transition_message(&child)),
-            deliver(&fixture, 1, &announcement(1)),
+            deliver(&fixture, 2, &bound),
         ];
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
@@ -539,26 +596,41 @@ mod tests {
     #[test]
     fn unknown_epoch_skips_without_commit_then_lands() {
         let mut fixture = fixture();
-        let mail = vec![deliver(&fixture, 9, &announcement(9))];
+        // A nine-deep chain: the announcement binds epoch 9 to the
+        // epoch-9 tip, whose key the engine does not hold yet.
+        let (mut builder, genesis) = Builder::genesis(10);
+        let mut chain = vec![genesis];
+        for _ in 1..9 {
+            chain.push(builder.child(vec![Change::Rotate]));
+        }
+        let tip = chain.last().expect("nonempty chain").clone();
+        let bound = announcement_for(9, tip.transition_id());
+        let mail = vec![deliver(&fixture, 9, &bound)];
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.accepted, 0);
         assert_eq!(fixture.engine.current(), 0);
 
-        // The epoch key arrives; redelivery processes fresh.
+        // The epoch key arrives with the chain behind it: the
+        // transitions commit, then the announcement validates.
         fixture.engine.add_epoch_key(9, control_key(9));
-        let mail = vec![deliver(&fixture, 9, &announcement(9))];
+        let mut mail: Vec<MailboxEnvelope> = chain
+            .iter()
+            .map(|t| deliver(&fixture, 1, &transition_message(t)))
+            .collect();
+        mail.push(deliver(&fixture, 9, &bound));
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
-        assert_eq!(report.accepted, 1);
-        assert_eq!(fixture.engine.current(), 1);
+        assert_eq!(report.accepted, 10);
+        assert_eq!(fixture.engine.current(), 10);
     }
 
     #[test]
     fn forged_envelope_skips_without_commit() {
         let mut fixture = fixture();
-        let mut envelope = deliver(&fixture, 1, &announcement(1));
+        let genesis_id = Builder::genesis(10).1.transition_id();
+        let mut envelope = deliver(&fixture, 1, &announcement_for(1, genesis_id));
         // Truncation breaks the base64 framing deterministically, so
         // the transport seal can never open.
         envelope.ciphertext.pop();
@@ -652,5 +724,148 @@ mod tests {
         assert_eq!(fixture.engine.current(), 2);
         let facts = fixture.engine.store.load().expect("loads");
         assert_eq!(facts.capabilities.len(), 1);
+    }
+
+    #[test]
+    fn announcement_defers_until_membership_lands() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let bound = announcement_for(2, child.transition_id());
+
+        // Announcement first: its membership is unobserved, so it holds.
+        let mail = vec![deliver(&fixture, 2, &bound)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(fixture.engine.pending_count(), 1);
+        assert_eq!(fixture.engine.current(), 0);
+
+        // The transitions land: both commit, and the held announcement
+        // validates against the new state in the same pass.
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        assert_eq!(fixture.engine.current(), 2);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1);
+    }
+
+    #[test]
+    fn announcement_epoch_mismatch_suppresses() {
+        let mut fixture = fixture();
+        let (_, genesis) = Builder::genesis(10);
+        let genesis_id = genesis.transition_id();
+        let mail = vec![deliver(&fixture, 1, &transition_message(&genesis))];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 1);
+
+        // Epoch 2 claimed against an epoch-1 transition: transition
+        // epochs are immutable, so this suppresses rather than parks.
+        let bad = announcement_for(2, genesis_id);
+        let mail = vec![deliver(&fixture, 2, &bad)];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.announcements.is_empty());
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    #[test]
+    fn pending_holds_are_bounded() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+
+        // A well-formed capability for a transition the engine never
+        // observes: every redelivery defers under a distinct message
+        // id (fresh seal nonces).
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+        let mut scratch = MembershipLog::new(member_drive());
+        scratch.observe(genesis.clone());
+        scratch.observe(admission.clone());
+        let state = scratch
+            .state_of(&admission.transition_id())
+            .expect("admission is valid");
+        let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
+        let capability = Capability::mint(
+            member_drive(),
+            device,
+            &state,
+            admission.transition_id(),
+            2,
+            secrets,
+        )
+        .expect("device is a member");
+        let wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped,
+        });
+        let mut mail = Vec::with_capacity(MAX_PENDING_MESSAGES + 1);
+        for _ in 0..=MAX_PENDING_MESSAGES {
+            mail.push(deliver(&fixture, 2, &delivery));
+        }
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.deferred, MAX_PENDING_MESSAGES);
+        // The overflow suppresses with a seen-id commit instead of
+        // accumulating without bound.
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.pending_count(), MAX_PENDING_MESSAGES);
+    }
+
+    #[test]
+    fn commit_failure_resyncs_uncommitted_views() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = fixture();
+        let (_, genesis) = Builder::genesis(10);
+        let mail = vec![deliver(&fixture, 1, &transition_message(&genesis))];
+
+        // Read-only store: the commit fails after inbox ingest marked
+        // the message seen and the log observed it.
+        std::fs::set_permissions(&fixture.dir.path, std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        std::fs::set_permissions(
+            fixture.dir.path.join("commits"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        queue(&mut fixture, mail.clone());
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        assert!(fixture.engine.drain(&mut mailbox).is_err());
+
+        // Permissions restored: the engine resynced on failure, so the
+        // same envelope processes fresh instead of reading stale
+        // in-memory dedupe as a duplicate.
+        std::fs::set_permissions(
+            fixture.dir.path.join("commits"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture.dir.path, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.current(), 1);
     }
 }

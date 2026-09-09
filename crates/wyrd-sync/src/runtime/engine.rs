@@ -41,28 +41,22 @@
 //! [`MembershipLog`]: crate::membership::MembershipLog
 //! [`DurableStore`]: crate::durable::DurableStore
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use secp256k1::SecretKey;
 use thiserror::Error;
-use wyrd_format::{
-    ChildManifest, ContentId, DeviceId, DriveId, ManifestEntry, MembershipTransition, ObjectStore,
-    SnapshotId,
-};
+use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore};
 
-use super::{ManifestRecord, MaterializationState, PendingObjectFetch, RuntimeError, RuntimeState};
+use super::{MaterializationState, RuntimeError};
 
-use crate::bulk::{BulkSource, SealedManifest};
-use crate::control::{ControlInbox, ControlMessageId, IngestReport, Message, SealedControl};
+use crate::bulk::BulkSource;
+use crate::control::{ControlInbox, ControlMessageId, Message};
 #[cfg(test)]
 use crate::durable::CrashStage;
-use crate::durable::{AuthorizedCapability, DurableError, DurableStore, Fact};
-use crate::ingest::{check_manifest, check_total_len, check_transition, Limits};
-use crate::keys::capability::{DriveKeyring, WrappedCapability};
-use crate::membership::{MembershipLog, TransitionStatus};
-use crate::seal::{open_manifest, verify, EncryptedObject};
-use crate::transport::mailbox::{open_from_sender, Mailbox, MailboxEnvelope};
+use crate::durable::{DurableError, DurableStore, Fact};
+use crate::membership::MembershipLog;
+use crate::transport::mailbox::Mailbox;
 
 /// Engine failures: durable-commit trouble and runtime-record
 /// trouble are fatal. Per-envelope mailbox, decode, and ingest
@@ -119,37 +113,22 @@ pub const MAX_PENDING_MESSAGES: usize = 1024;
 pub struct Engine {
     pub(super) drive: DriveId,
     pub(super) device: DeviceId,
-    identity_secret: SecretKey,
-    encryption_secret: SecretKey,
+    pub(super) identity_secret: SecretKey,
+    pub(super) encryption_secret: SecretKey,
     pub(super) store: DurableStore,
-    inbox: ControlInbox,
+    pub(super) inbox: ControlInbox,
     /// Held epoch control keys, retained outside the inbox so a
     /// resync (which rebuilds the inbox from durable facts) never
     /// drops key material the device still holds.
     epoch_keys: BTreeMap<u64, [u8; 32]>,
-    log: MembershipLog,
-    pending: HashMap<ControlMessageId, Message>,
+    pub(super) log: MembershipLog,
+    pub(super) pending: HashMap<ControlMessageId, Message>,
     /// Test-only crash injection: the next durable commit stops after
     /// the named stage, simulating power loss (see
     /// `DurableStore::commit_until`). Production always runs to
     /// `Complete`; the hook is one-shot.
     #[cfg(test)]
     crash_stage: Option<CrashStage>,
-}
-
-/// What one message turned into: facts to commit, or a hold for
-/// later. Skips happen one layer up (mailbox open, inbox ingest) and
-/// never reach message processing.
-enum Action {
-    Commit(Vec<Fact>),
-    Defer,
-}
-
-enum Outcome {
-    Accepted,
-    Duplicate,
-    Deferred,
-    Skipped,
 }
 
 impl Engine {
@@ -251,201 +230,7 @@ impl Engine {
     /// Drain every envelope currently in the mailbox, committing facts
     /// per accepted message. Stops at the first empty `recv`.
     pub fn drain(&mut self, mailbox: &mut impl Mailbox) -> Result<DrainReport, EngineError> {
-        let mut report = DrainReport::default();
-        while let Some(envelope) = mailbox.recv() {
-            match self.accept_envelope(&envelope)? {
-                Outcome::Accepted => report.accepted += 1,
-                Outcome::Duplicate => report.duplicates += 1,
-                Outcome::Deferred => report.deferred += 1,
-                Outcome::Skipped => report.skipped += 1,
-            }
-        }
-        Ok(report)
-    }
-
-    fn accept_envelope(&mut self, envelope: &MailboxEnvelope) -> Result<Outcome, EngineError> {
-        let bytes = match open_from_sender(&self.identity_secret, self.device, envelope) {
-            // Misdelivered or forged at the transport seal: not ours to
-            // process. The relay redelivers to whoever it was for.
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(Outcome::Skipped),
-        };
-        match self.inbox.ingest(&bytes) {
-            // Unknown epoch, wrong drive, truncated framing, or a failed
-            // tag: ingest mutates nothing. Unknown-epoch mail is retried
-            // on redelivery once the key arrives; the rest is hostile
-            // bytes the relay will redeliver and we will skip again.
-            Err(_) => Ok(Outcome::Skipped),
-            Ok(IngestReport::Duplicate) => {
-                // A redelivery may unlock a held capability: the inbox
-                // drops the bytes, but the engine kept the message.
-                match sealed_id(&bytes) {
-                    Some(id) => match self.pending.remove(&id) {
-                        Some(message) => self.commit_action(&id, &message, false),
-                        None => Ok(Outcome::Duplicate),
-                    },
-                    None => Ok(Outcome::Duplicate),
-                }
-            }
-            Ok(IngestReport::Accepted { id, message }) => self.commit_action(&id, &message, true),
-        }
-    }
-
-    /// Process one ingested message: commit its facts, batching newly
-    /// unlocked capabilities when a transition lands. `is_new` tells
-    /// whether the message itself still needs its facts committed
-    /// (redelivered pending retries only unlock others).
-    fn commit_action(
-        &mut self,
-        id: &ControlMessageId,
-        message: &Message,
-        is_new: bool,
-    ) -> Result<Outcome, EngineError> {
-        let mut facts = match self.message_action(id, message) {
-            Action::Commit(facts) => facts,
-            Action::Defer if self.pending.len() >= MAX_PENDING_MESSAGES => {
-                // Bounded holds: suppress with a seen-id commit rather
-                // than accumulate without limit.
-                vec![Fact::ControlMessage(*id)]
-            }
-            Action::Defer => {
-                self.pending.insert(*id, message.clone());
-                return Ok(Outcome::Deferred);
-            }
-        };
-        if !is_new {
-            // A redelivered trigger unlocks others but commits nothing
-            // itself: its facts are already durable.
-            facts.clear();
-        }
-        if matches!(message, Message::MembershipTransition(_)) {
-            // A fresh transition may unlock held messages: fold the
-            // newly unlocked facts into the same commit.
-            for (pending_id, pending_message) in std::mem::take(&mut self.pending) {
-                match self.message_action(&pending_id, &pending_message) {
-                    Action::Commit(more) => facts.extend(more),
-                    Action::Defer => {
-                        self.pending.insert(pending_id, pending_message);
-                    }
-                }
-            }
-        }
-        if facts.is_empty() {
-            // A redelivery that unlocked nothing: still a duplicate.
-            return Ok(Outcome::Duplicate);
-        }
-        if let Err(e) = self.commit_facts(&facts) {
-            // The in-memory log may have observed a transition that is
-            // not durable: rebuild both views from the store so the
-            // engine never decides against uncommitted state.
-            let _ = self.resync();
-            return Err(e.into());
-        }
-        Ok(Outcome::Accepted)
-    }
-
-    /// The facts one message carries. State-dependent failures (a
-    /// capability whose transition is unobserved or not authorizing; an
-    /// announcement naming an unobserved membership transition) defer;
-    /// bytes-dependent or deterministically inconsistent payloads
-    /// (undecodable, over limits, unopenable, epoch-mismatched)
-    /// commit a seen-id suppression so the poison is never reprocessed.
-    /// Full snapshot authorization waits for the bulk snapshot bytes in
-    /// a later slice; the cheap membership/epoch binding is enforced
-    /// here.
-    fn message_action(&mut self, id: &ControlMessageId, message: &Message) -> Action {
-        match message {
-            Message::MembershipTransition(payload) => {
-                let seen = || vec![Fact::ControlMessage(*id)];
-                if check_total_len(&Limits::V0, "transition", payload.transition.len()).is_err() {
-                    return Action::Commit(seen());
-                }
-                let transition =
-                    match MembershipTransition::from_canonical_bytes(&payload.transition) {
-                        Ok(t) => t,
-                        Err(_) => return Action::Commit(seen()),
-                    };
-                if check_transition(&Limits::V0, &transition).is_err() {
-                    return Action::Commit(seen());
-                }
-                self.log.observe(transition.clone());
-                Action::Commit(vec![
-                    Fact::Transition(transition),
-                    Fact::ControlMessage(*id),
-                ])
-            }
-            Message::SnapshotAnnouncement(announcement) => {
-                match self.log.transition(&announcement.membership) {
-                    // Membership not yet observed: hold for the
-                    // transition, retried as transitions land.
-                    None => Action::Defer,
-                    Some(t) if t.epoch != announcement.epoch => {
-                        // Deterministic inconsistency — transition
-                        // epochs are immutable — so suppress, never park.
-                        Action::Commit(vec![Fact::ControlMessage(*id)])
-                    }
-                    Some(_) => {
-                        // Observed is not valid: only a canonical
-                        // membership state authorizes a snapshot.
-                        // Non-final verdicts park until membership
-                        // resolves (epochs.md treats such references
-                        // as pending); final rejections suppress.
-                        match self
-                            .log
-                            .status(&announcement.membership)
-                            .expect("membership observed")
-                        {
-                            TransitionStatus::Canonical => Action::Commit(vec![
-                                Fact::Announcement(announcement.clone()),
-                                Fact::ControlMessage(*id),
-                            ]),
-                            TransitionStatus::Invalid(_) => {
-                                Action::Commit(vec![Fact::ControlMessage(*id)])
-                            }
-                            TransitionStatus::Contested
-                            | TransitionStatus::Voided
-                            | TransitionStatus::Orphaned
-                            | TransitionStatus::Pending => Action::Defer,
-                        }
-                    }
-                }
-            }
-            // Rotation notices carry no fact of their own: the
-            // capability follows as its own message. The seen-id keeps
-            // the notice from redelivering.
-            Message::KeyRotation(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
-            Message::Capability(_) => self.capability_action(id, message),
-        }
-    }
-
-    /// Unwrap and authorize one capability delivery. Undecryptable
-    /// bytes suppress immediately (deterministic failure, never
-    /// retriable). An unknown transition defers — its state may still
-    /// arrive. But authorization against a known transition's derived
-    /// state is final: the state is a pure function of immutable
-    /// transition bytes, so a device absent from it stays absent and a
-    /// stale key stays stale. Those suppress too.
-    fn capability_action(&self, id: &ControlMessageId, message: &Message) -> Action {
-        let Message::Capability(payload) = message else {
-            return Action::Defer;
-        };
-        let capability = match WrappedCapability::from_bytes(payload.wrapped.clone())
-            .unwrap(&self.encryption_secret)
-        {
-            Ok(capability) => capability,
-            Err(_) => return Action::Commit(vec![Fact::ControlMessage(*id)]),
-        };
-        let state = match self.log.state_of(&capability.transition) {
-            Some(state) => state,
-            None => return Action::Defer,
-        };
-        match AuthorizedCapability::authorize(capability, &state) {
-            Ok(authorized) => Action::Commit(vec![
-                Fact::Capability(authorized),
-                Fact::ControlMessage(*id),
-            ]),
-            Err(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
-        }
+        super::intake::drain(self, mailbox)
     }
 
     /// Set the residency policy for one content object, durably. The
@@ -493,153 +278,6 @@ impl Engine {
     ) -> Result<ExecuteReport, EngineError> {
         super::plan::execute(self, bulk, objects)
     }
-
-    /// Fetch and validate one pending root manifest. The manifest key
-    /// derives from the announcement's epoch secret; the bulk peer's
-    /// claimed ContentId verifies as the seal AAD on open, so a lying
-    /// peer fails the tag instead of planting a record.
-    pub(super) fn fetch_root(
-        drive: &DriveId,
-        bulk: &mut impl BulkSource,
-        keyring: &DriveKeyring,
-        runtime: &RuntimeState,
-        snapshot: &SnapshotId,
-        transport_errors: &mut usize,
-    ) -> Option<ManifestRecord> {
-        let announcement = runtime.announcement(snapshot)?;
-        let secret = keyring.secret(announcement.epoch)?;
-        let key = secret.manifest_key(drive, announcement.epoch, snapshot);
-        let served: SealedManifest = match bulk.fetch_root_manifest(snapshot) {
-            Ok(served) => served?,
-            Err(_) => {
-                *transport_errors += 1;
-                return None;
-            }
-        };
-        Self::open_record(&served.sealed, &key, &served.content_id, *snapshot, true)
-    }
-
-    /// Fetch and validate one pending child manifest. Children seal
-    /// under their snapshot's manifest key; the owning snapshot comes
-    /// from the recorded parent, the expected identity from the
-    /// authenticated parent link.
-    pub(super) fn fetch_child(
-        drive: &DriveId,
-        bulk: &mut impl BulkSource,
-        keyring: &DriveKeyring,
-        runtime: &RuntimeState,
-        id: &ContentId,
-        link: &ChildManifest,
-        transport_errors: &mut usize,
-    ) -> Option<ManifestRecord> {
-        let snapshot = runtime.manifest_parent_snapshot(id)?;
-        let announcement = runtime.announcement(&snapshot)?;
-        let secret = keyring.secret(announcement.epoch)?;
-        let key = secret.manifest_key(drive, announcement.epoch, &snapshot);
-        let sealed = match bulk.fetch_sealed(&link.storage) {
-            Ok(sealed) => sealed?,
-            Err(_) => {
-                *transport_errors += 1;
-                return None;
-            }
-        };
-        Self::open_record(&sealed, &key, &link.manifest, snapshot, false)
-    }
-
-    /// Gate, open, and limit-check sealed manifest bytes into a record.
-    /// Anything the bytes do wrong — oversize, undecodable, failed tag,
-    /// unparsable, over structural limits — is `None`: corrupt bulk
-    /// data is never a durable fact.
-    fn open_record(
-        sealed: &[u8],
-        key: &[u8; 32],
-        expected: &ContentId,
-        snapshot: SnapshotId,
-        is_root: bool,
-    ) -> Option<ManifestRecord> {
-        if check_total_len(&Limits::V0, "sealed manifest", sealed.len()).is_err() {
-            return None;
-        }
-        let obj = EncryptedObject::decode(sealed).ok()?;
-        let manifest = open_manifest(key, expected, &obj).ok()?;
-        if check_manifest(&Limits::V0, &manifest).is_err() {
-            return None;
-        }
-        if manifest.snapshot != snapshot {
-            return None;
-        }
-        Some(ManifestRecord {
-            is_root,
-            manifest_id: *expected,
-            storage_ids: BTreeSet::from([obj.storage_id()]),
-            manifest,
-        })
-    }
-
-    /// Fetch one object by trying each representation the plan
-    /// retains, in order, and importing the first whose epoch key is
-    /// held and whose bytes verify. Representations under unheld
-    /// epochs are skipped, not failed: the device re-encrypts under
-    /// its own epoch rather than reaching for keys it lacks.
-    pub(super) fn fetch_object(
-        drive: &DriveId,
-        bulk: &mut impl BulkSource,
-        keyring: &DriveKeyring,
-        objects: &mut impl ObjectStore,
-        content: &ContentId,
-        candidates: &[PendingObjectFetch],
-        transport_errors: &mut usize,
-    ) -> bool {
-        for candidate in candidates {
-            let Some(secret) = keyring.secret(candidate.encryption_epoch) else {
-                continue;
-            };
-            let key = secret.object_key(
-                drive,
-                candidate.encryption_epoch,
-                content,
-                candidate.kind,
-                candidate.version,
-            );
-            let entry = ManifestEntry {
-                content_id: *content,
-                kind: candidate.kind,
-                version: candidate.version,
-                storage_id: candidate.storage_id,
-                encryption_epoch: candidate.encryption_epoch,
-                size: candidate.size,
-            };
-            let sealed = match bulk.fetch_sealed(&candidate.storage_id) {
-                Ok(sealed) => match sealed {
-                    Some(sealed) => sealed,
-                    None => continue,
-                },
-                Err(_) => {
-                    *transport_errors += 1;
-                    continue;
-                }
-            };
-            if check_total_len(&Limits::V0, "sealed object", sealed.len()).is_err() {
-                continue;
-            }
-            let Ok(plaintext) = verify(&entry, &key, &sealed) else {
-                continue;
-            };
-            if objects
-                .insert_verified(candidate.kind, content, &plaintext)
-                .is_err()
-            {
-                continue;
-            }
-            return true;
-        }
-        false
-    }
-}
-
-/// The dedupe id of sealed bytes, when they decode.
-fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
-    SealedControl::decode(bytes).ok().map(|s| s.message_id())
 }
 
 #[cfg(test)]
@@ -652,15 +290,15 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
     use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
-    use crate::transport::mailbox::{seal_for_recipient, MailboxError};
+    use crate::transport::mailbox::{seal_for_recipient, MailboxEnvelope, MailboxError};
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        Change, ChildManifest, DeviceEncryptionKey, Manifest, MemoryObjectStore, ObjectKind,
-        ObjectStore, SnapshotId, StorageId, TransitionId,
+        Change, ChildManifest, DeviceEncryptionKey, Manifest, MembershipTransition,
+        MemoryObjectStore, ObjectKind, ObjectStore, SnapshotId, StorageId, TransitionId,
     };
 
     /// An isolated store directory, removed on drop (mirrors the

@@ -25,7 +25,7 @@ pub(super) fn execute(
         let mut facts = Vec::new();
 
         for snapshot in &plan.pending_snapshots {
-            if let Some(record) = Engine::fetch_root(
+            if let Some(record) = super::fetch::root(
                 &engine.drive,
                 bulk,
                 &keyring,
@@ -39,7 +39,7 @@ pub(super) fn execute(
             }
         }
         for (id, link) in &plan.pending_manifests {
-            if let Some(record) = Engine::fetch_child(
+            if let Some(record) = super::fetch::child(
                 &engine.drive,
                 bulk,
                 &keyring,
@@ -54,7 +54,7 @@ pub(super) fn execute(
             }
         }
         for (content, candidates) in &plan.pending_objects {
-            if Engine::fetch_object(
+            if super::fetch::object(
                 &engine.drive,
                 bulk,
                 &keyring,

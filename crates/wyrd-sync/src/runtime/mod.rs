@@ -15,6 +15,10 @@ use wyrd_format::{ChildManifest, ContentId, DriveId, Manifest, ObjectKind, Snaps
 
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
+pub mod engine;
+
+pub use engine::{DrainReport, Engine, EngineError};
+
 /// Local residency policy for one content object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializationState {

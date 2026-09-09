@@ -1,0 +1,656 @@
+//! The sync engine intake loop (engine-intake issue): drains the
+//! mailbox, ingests control messages, and commits durable facts.
+//!
+//! Sync-only, like the rest of `wyrd-sync`: the [`Mailbox`] trait is the
+//! transport boundary (in-memory fake in tests, relay pool later), and
+//! bulk object transport arrives in a later slice. The engine owns the
+//! [`ControlInbox`] dedupe set, an observed [`MembershipLog`] for
+//! capability authorization, and the [`DurableStore`] handle; every
+//! accepted message commits facts before the next envelope is read, so a
+//! crash can only lose envelopes the relay still holds for redelivery.
+//!
+//! Redelivery policy, stated exactly:
+//!
+//! ```text
+//! duplicate delivery ............ no-op (already committed)
+//! undecodable / wrong drive ..... skipped, never committed
+//! unknown epoch key ............. skipped, retried on redelivery
+//! forged or undecryptable ....... seen-id committed (poison suppression)
+//! capability, state unknown ..... held in-memory, retried as transitions land
+//! capability, state rejects ..... held in-memory (membership evolves)
+//! ```
+//!
+//! A capability held in memory is lost on crash, but it was never
+//! committed — so the durable seen set lacks it and relay redelivery
+//! processes it fresh after rehydration. The relay retaining unacked
+//! deliveries is the assumption this depends on.
+//!
+//! [`Mailbox`]: crate::transport::mailbox::Mailbox
+//! [`ControlInbox`]: crate::control::ControlInbox
+//! [`MembershipLog`]: crate::membership::MembershipLog
+//! [`DurableStore`]: crate::durable::DurableStore
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use secp256k1::SecretKey;
+use thiserror::Error;
+use wyrd_format::{DeviceId, DriveId, MembershipTransition};
+
+use crate::control::{ControlInbox, ControlMessageId, IngestReport, Message, SealedControl};
+use crate::durable::{AuthorizedCapability, DurableError, DurableStore, Fact};
+use crate::ingest::{check_total_len, check_transition, Limits};
+use crate::keys::capability::WrappedCapability;
+use crate::membership::MembershipLog;
+use crate::transport::mailbox::{open_from_sender, Mailbox, MailboxEnvelope};
+
+/// Engine failures: only durable-commit trouble is fatal. Per-envelope
+/// mailbox, decode, and ingest failures are counted in the
+/// [`DrainReport`], never raised, so one hostile envelope cannot wedge
+/// the drain.
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("durable commit failed: {0}")]
+    Durable(#[from] DurableError),
+}
+
+/// What one [`Engine::drain`] pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainReport {
+    /// Messages whose facts committed (including poison suppressions).
+    pub accepted: usize,
+    /// Redeliveries of already-committed messages.
+    pub duplicates: usize,
+    /// Capabilities held for a future transition.
+    pub deferred: usize,
+    /// Envelopes that could not be processed (left for redelivery).
+    pub skipped: usize,
+}
+
+/// The intake driver for one device on one drive.
+pub struct Engine {
+    drive: DriveId,
+    device: DeviceId,
+    identity_secret: SecretKey,
+    encryption_secret: SecretKey,
+    store: DurableStore,
+    inbox: ControlInbox,
+    log: MembershipLog,
+    pending: HashMap<ControlMessageId, Message>,
+}
+
+/// What one message turned into: facts to commit, or a hold for
+/// later. Skips happen one layer up (mailbox open, inbox ingest) and
+/// never reach message processing.
+enum Action {
+    Commit(Vec<Fact>),
+    Defer,
+}
+
+enum Outcome {
+    Accepted,
+    Duplicate,
+    Deferred,
+    Skipped,
+}
+
+impl Engine {
+    /// Open (or create) the engine state: the durable store plus the
+    /// inbox dedupe set and membership log rehydrated from committed
+    /// facts. `identity_secret` opens NIP-44 envelopes addressed to
+    /// `device`; `encryption_secret` unwraps capabilities for it.
+    pub fn open(
+        dir: PathBuf,
+        drive: DriveId,
+        device: DeviceId,
+        passphrase: &str,
+        identity_secret: SecretKey,
+        encryption_secret: SecretKey,
+    ) -> Result<Self, EngineError> {
+        let store = DurableStore::open(dir, drive, passphrase)?;
+        let facts = store.load()?;
+        let mut inbox = ControlInbox::new(drive);
+        for id in &facts.seen {
+            inbox.remember(id);
+        }
+        let mut log = MembershipLog::new(drive);
+        for t in &facts.transitions {
+            log.observe(t.clone());
+        }
+        Ok(Engine {
+            drive,
+            device,
+            identity_secret,
+            encryption_secret,
+            store,
+            inbox,
+            log,
+            pending: HashMap::new(),
+        })
+    }
+
+    /// Hold an epoch's control key for inbox ingest.
+    pub fn add_epoch_key(&mut self, epoch: u64, key: [u8; 32]) {
+        self.inbox.add_epoch_key(epoch, key);
+    }
+
+    /// The drive this engine serves.
+    pub fn drive(&self) -> DriveId {
+        self.drive
+    }
+
+    /// The local device id.
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// Capabilities held for a future transition.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The last durable commit sequence.
+    pub fn current(&self) -> u64 {
+        self.store.current()
+    }
+
+    /// Drain every envelope currently in the mailbox, committing facts
+    /// per accepted message. Stops at the first empty `recv`.
+    pub fn drain(&mut self, mailbox: &mut impl Mailbox) -> Result<DrainReport, EngineError> {
+        let mut report = DrainReport::default();
+        while let Some(envelope) = mailbox.recv() {
+            match self.accept_envelope(&envelope)? {
+                Outcome::Accepted => report.accepted += 1,
+                Outcome::Duplicate => report.duplicates += 1,
+                Outcome::Deferred => report.deferred += 1,
+                Outcome::Skipped => report.skipped += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    fn accept_envelope(&mut self, envelope: &MailboxEnvelope) -> Result<Outcome, EngineError> {
+        let bytes = match open_from_sender(&self.identity_secret, self.device, envelope) {
+            // Misdelivered or forged at the transport seal: not ours to
+            // process. The relay redelivers to whoever it was for.
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(Outcome::Skipped),
+        };
+        match self.inbox.ingest(&bytes) {
+            // Unknown epoch, wrong drive, truncated framing, or a failed
+            // tag: ingest mutates nothing. Unknown-epoch mail is retried
+            // on redelivery once the key arrives; the rest is hostile
+            // bytes the relay will redeliver and we will skip again.
+            Err(_) => Ok(Outcome::Skipped),
+            Ok(IngestReport::Duplicate) => {
+                // A redelivery may unlock a held capability: the inbox
+                // drops the bytes, but the engine kept the message.
+                match sealed_id(&bytes) {
+                    Some(id) => match self.pending.remove(&id) {
+                        Some(message) => self.commit_action(&id, &message, false),
+                        None => Ok(Outcome::Duplicate),
+                    },
+                    None => Ok(Outcome::Duplicate),
+                }
+            }
+            Ok(IngestReport::Accepted { id, message }) => self.commit_action(&id, &message, true),
+        }
+    }
+
+    /// Process one ingested message: commit its facts, batching newly
+    /// unlocked capabilities when a transition lands. `is_new` tells
+    /// whether the message itself still needs its facts committed
+    /// (redelivered pending retries only unlock others).
+    fn commit_action(
+        &mut self,
+        id: &ControlMessageId,
+        message: &Message,
+        is_new: bool,
+    ) -> Result<Outcome, EngineError> {
+        let mut facts = match self.message_action(id, message) {
+            Action::Commit(facts) => facts,
+            Action::Defer => {
+                self.pending.insert(*id, message.clone());
+                return Ok(Outcome::Deferred);
+            }
+        };
+        if !is_new {
+            // A redelivered trigger unlocks others but commits nothing
+            // itself: its facts are already durable.
+            facts.clear();
+        }
+        if matches!(message, Message::MembershipTransition(_)) {
+            // A fresh transition may authorize held capabilities: fold
+            // the newly unlocked facts into the same commit.
+            for (pending_id, pending_message) in std::mem::take(&mut self.pending) {
+                match self.capability_action(&pending_id, &pending_message) {
+                    Ok(more) => facts.extend(more),
+                    Err(()) => {
+                        self.pending.insert(pending_id, pending_message);
+                    }
+                }
+            }
+        }
+        if facts.is_empty() {
+            // A redelivery that unlocked nothing: still a duplicate.
+            return Ok(Outcome::Duplicate);
+        }
+        self.store.commit(&facts)?;
+        Ok(Outcome::Accepted)
+    }
+
+    /// The facts one message carries. State-dependent failures (a
+    /// capability whose transition is unobserved or not authorizing)
+    /// defer; bytes-dependent failures (undecodable, over limits,
+    /// unopenable) commit a seen-id suppression so the poison is never
+    /// reprocessed.
+    fn message_action(&mut self, id: &ControlMessageId, message: &Message) -> Action {
+        match message {
+            Message::MembershipTransition(payload) => {
+                let seen = || vec![Fact::ControlMessage(*id)];
+                if check_total_len(&Limits::V0, "transition", payload.transition.len()).is_err() {
+                    return Action::Commit(seen());
+                }
+                let transition =
+                    match MembershipTransition::from_canonical_bytes(&payload.transition) {
+                        Ok(t) => t,
+                        Err(_) => return Action::Commit(seen()),
+                    };
+                if check_transition(&Limits::V0, &transition).is_err() {
+                    return Action::Commit(seen());
+                }
+                self.log.observe(transition.clone());
+                Action::Commit(vec![
+                    Fact::Transition(transition),
+                    Fact::ControlMessage(*id),
+                ])
+            }
+            Message::SnapshotAnnouncement(announcement) => Action::Commit(vec![
+                Fact::Announcement(announcement.clone()),
+                Fact::ControlMessage(*id),
+            ]),
+            // Rotation notices carry no fact of their own: the
+            // capability follows as its own message. The seen-id keeps
+            // the notice from redelivering.
+            Message::KeyRotation(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
+            Message::Capability(_) => match self.capability_action(id, message) {
+                Ok(facts) => Action::Commit(facts),
+                Err(()) => Action::Defer,
+            },
+        }
+    }
+
+    /// Unwrap and authorize one capability delivery. Anything
+    /// state-dependent (unknown transition, failed authorization)
+    /// defers — membership evolves, so today's rejection may be
+    /// tomorrow's install. Only undecryptable bytes suppress.
+    fn capability_action(&self, id: &ControlMessageId, message: &Message) -> Result<Vec<Fact>, ()> {
+        let Message::Capability(payload) = message else {
+            return Err(());
+        };
+        let capability = WrappedCapability::from_bytes(payload.wrapped.clone())
+            .unwrap(&self.encryption_secret)
+            .map_err(|_| ())?;
+        let state = self.log.state_of(&capability.transition).ok_or(())?;
+        let authorized = AuthorizedCapability::authorize(capability, &state).map_err(|_| ())?;
+        Ok(vec![
+            Fact::Capability(authorized),
+            Fact::ControlMessage(*id),
+        ])
+    }
+}
+
+/// The dedupe id of sealed bytes, when they decode.
+fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
+    SealedControl::decode(bytes).ok().map(|s| s.message_id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{seal, CapabilityPayload, SnapshotAnnouncement, TransitionPayload};
+    use crate::keys::capability::Capability;
+    use crate::keys::EpochSecret;
+    use crate::membership::test_util::{drive as member_drive, Builder};
+    use crate::transport::mailbox::{seal_for_recipient, MailboxError};
+    use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wyrd_format::membership::Admission;
+    use wyrd_format::{Change, DeviceEncryptionKey, SnapshotId, TransitionId};
+
+    /// An isolated store directory, removed on drop (mirrors the
+    /// durable-store test helper: process id plus counter, since tests
+    /// run multithreaded).
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("wyrd-engine-{name}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            TestDir { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// An in-memory relay: every sent envelope lands in a shared queue;
+    /// `recv` filters by the owning device. No network, no async.
+    #[derive(Default)]
+    struct MemoryRelay {
+        queue: VecDeque<MailboxEnvelope>,
+    }
+
+    struct MemoryMailbox<'a> {
+        relay: &'a mut MemoryRelay,
+        owner: DeviceId,
+    }
+
+    impl Mailbox for MemoryMailbox<'_> {
+        fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            self.relay.queue.push_back(envelope);
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Option<MailboxEnvelope> {
+            let pos = self
+                .relay
+                .queue
+                .iter()
+                .position(|e| e.recipient == self.owner)?;
+            self.relay.queue.remove(pos)
+        }
+    }
+
+    struct Fixture {
+        dir: TestDir,
+        engine: Engine,
+        relay: MemoryRelay,
+        sender_sk: SecretKey,
+        recipient: DeviceId,
+    }
+
+    /// Nostr identity: secret key plus the x-only device id it names.
+    fn identity(pattern: u8) -> (SecretKey, DeviceId) {
+        let sk = SecretKey::from_slice(&[pattern; 32]).unwrap();
+        let kp = Keypair::from_secret_key(SECP256K1, &sk);
+        let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
+        (sk, DeviceId::from_bytes(xonly.serialize()))
+    }
+
+    fn control_key(epoch: u64) -> [u8; 32] {
+        EpochSecret::from_bytes([0x07; 32]).control_key(&member_drive(), epoch)
+    }
+
+    /// One engine plus its relay, holding epoch keys 1 and 2 (epoch
+    /// 9 arrives in the unknown-epoch test). The engine device doubles
+    /// as a Nostr identity (mailbox) and a membership admittee.
+    fn fixture() -> Fixture {
+        let dir = TestDir::new("intake");
+        let (identity_sk, device) = identity(0x02);
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let (sender_sk, _) = identity(0x01);
+        let mut engine = Engine::open(
+            dir.path.clone(),
+            member_drive(),
+            device,
+            "test-pass",
+            identity_sk,
+            encryption_sk,
+        )
+        .unwrap();
+        for epoch in [1, 2] {
+            engine.add_epoch_key(epoch, control_key(epoch));
+        }
+        Fixture {
+            dir,
+            engine,
+            relay: MemoryRelay::default(),
+            sender_sk,
+            recipient: device,
+        }
+    }
+
+    /// Seal a control message and address it to the fixture device.
+    fn deliver(fixture: &Fixture, epoch: u64, message: &Message) -> MailboxEnvelope {
+        let sealed = seal(&control_key(epoch), &member_drive(), epoch, message).unwrap();
+        seal_for_recipient(&fixture.sender_sk, fixture.recipient, &sealed.encode()).unwrap()
+    }
+
+    fn queue(fixture: &mut Fixture, envelopes: Vec<MailboxEnvelope>) {
+        fixture.relay.queue.extend(envelopes);
+    }
+
+    fn drain(fixture: &mut Fixture) -> DrainReport {
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        fixture.engine.drain(&mut mailbox).unwrap()
+    }
+
+    fn announcement(epoch: u64) -> Message {
+        Message::SnapshotAnnouncement(SnapshotAnnouncement {
+            snapshot: SnapshotId::from_bytes([0x11; 32]),
+            author: DeviceId::from_bytes([0x22; 32]),
+            epoch,
+            membership: TransitionId::from_bytes([0x33; 32]),
+        })
+    }
+
+    fn transition_message(t: &MembershipTransition) -> Message {
+        Message::MembershipTransition(TransitionPayload {
+            transition: t.canonical_bytes(),
+        })
+    }
+
+    /// The engine's device encryption key, derived from its secret the
+    /// way fixtures do (registered on-chain by the capability test).
+    fn encryption_key(secret: &SecretKey) -> DeviceEncryptionKey {
+        let kp = Keypair::from_secret_key(SECP256K1, secret);
+        let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
+        DeviceEncryptionKey::from_bytes(xonly.serialize())
+    }
+
+    /// Reopen the fixture's store in a fresh engine (simulated
+    /// restart): dedupe and membership rehydrate from committed facts.
+    fn reopen(fixture: &Fixture) -> Engine {
+        let (identity_sk, device) = identity(0x02);
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let mut engine = Engine::open(
+            fixture.dir.path.clone(),
+            member_drive(),
+            device,
+            "test-pass",
+            identity_sk,
+            encryption_sk,
+        )
+        .unwrap();
+        for epoch in [1, 2, 9] {
+            engine.add_epoch_key(epoch, control_key(epoch));
+        }
+        engine
+    }
+
+    #[test]
+    fn intake_commits_transitions_and_announcements() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+            deliver(&fixture, 1, &announcement(1)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(
+            report,
+            DrainReport {
+                accepted: 3,
+                duplicates: 0,
+                deferred: 0,
+                skipped: 0,
+            }
+        );
+        assert_eq!(fixture.engine.current(), 3);
+    }
+
+    #[test]
+    fn redelivery_after_restart_stays_duplicate() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        // The same sealed bytes are queued twice: a fresh seal would
+        // mint a fresh nonce and therefore a new message id.
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail.clone());
+        assert_eq!(drain(&mut fixture).accepted, 2);
+
+        // Simulated restart, then redelivery of the same envelopes:
+        // rehydrated dedupe makes every replay a duplicate.
+        let mut engine = reopen(&fixture);
+        queue(&mut fixture, mail);
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        let report = engine.drain(&mut mailbox).unwrap();
+        assert_eq!(report.duplicates, 2);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(engine.current(), 2);
+    }
+
+    #[test]
+    fn unknown_epoch_skips_without_commit_then_lands() {
+        let mut fixture = fixture();
+        let mail = vec![deliver(&fixture, 9, &announcement(9))];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(fixture.engine.current(), 0);
+
+        // The epoch key arrives; redelivery processes fresh.
+        fixture.engine.add_epoch_key(9, control_key(9));
+        let mail = vec![deliver(&fixture, 9, &announcement(9))];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.current(), 1);
+    }
+
+    #[test]
+    fn forged_envelope_skips_without_commit() {
+        let mut fixture = fixture();
+        let mut envelope = deliver(&fixture, 1, &announcement(1));
+        // Truncation breaks the base64 framing deterministically, so
+        // the transport seal can never open.
+        envelope.ciphertext.pop();
+        queue(&mut fixture, vec![envelope]);
+        let report = drain(&mut fixture);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(fixture.engine.current(), 0);
+    }
+
+    #[test]
+    fn garbage_transition_suppresses_redelivery() {
+        let mut fixture = fixture();
+        let (_, genesis) = Builder::genesis(10);
+        let mut poisoned = genesis.canonical_bytes();
+        poisoned[10] ^= 0xFF;
+        // The same sealed bytes are queued twice: a fresh seal would
+        // mint a fresh nonce and therefore a new message id.
+        let mail = vec![deliver(
+            &fixture,
+            1,
+            &Message::MembershipTransition(TransitionPayload {
+                transition: poisoned,
+            }),
+        )];
+        queue(&mut fixture, mail.clone());
+        // Undecodable bytes commit a seen-id suppression...
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.current(), 1);
+        // ...so redelivery is a duplicate, never reprocessed.
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(fixture.engine.current(), 1);
+    }
+
+    #[test]
+    fn capability_defers_until_its_transition_lands() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+
+        // Admit the engine device on-chain with its encryption key.
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+        let mut scratch = MembershipLog::new(member_drive());
+        scratch.observe(genesis.clone());
+        scratch.observe(admission.clone());
+        let state = scratch
+            .state_of(&admission.transition_id())
+            .expect("admission is valid");
+        let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
+        let capability = Capability::mint(
+            member_drive(),
+            device,
+            &state,
+            admission.transition_id(),
+            2,
+            secrets,
+        )
+        .expect("device is a member");
+        let wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped,
+        });
+
+        // Capability first: its transition is unobserved, so it holds.
+        let mail = vec![deliver(&fixture, 2, &delivery)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(fixture.engine.pending_count(), 1);
+        assert_eq!(fixture.engine.current(), 0);
+
+        // The transitions land: both commit, and the held capability
+        // authorizes against the new state in the same pass.
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&admission)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        assert_eq!(fixture.engine.current(), 2);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.capabilities.len(), 1);
+    }
+}

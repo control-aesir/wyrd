@@ -117,11 +117,11 @@ pub const MAX_PENDING_MESSAGES: usize = 1024;
 
 /// The intake driver for one device on one drive.
 pub struct Engine {
-    drive: DriveId,
-    device: DeviceId,
+    pub(super) drive: DriveId,
+    pub(super) device: DeviceId,
     identity_secret: SecretKey,
     encryption_secret: SecretKey,
-    store: DurableStore,
+    pub(super) store: DurableStore,
     inbox: ControlInbox,
     /// Held epoch control keys, retained outside the inbox so a
     /// resync (which rebuilds the inbox from durable facts) never
@@ -193,7 +193,7 @@ impl Engine {
     /// Commit one fact batch, honoring the test crash hook. A torn
     /// commit returns `Ok` with nothing durable — exactly like power
     /// loss — so callers proceed and recovery happens on reopen.
-    fn commit_facts(&mut self, facts: &[Fact]) -> Result<u64, DurableError> {
+    pub(super) fn commit_facts(&mut self, facts: &[Fact]) -> Result<u64, DurableError> {
         #[cfg(test)]
         if let Some(stage) = self.crash_stage.take() {
             return self.store.commit_until(facts, stage);
@@ -227,7 +227,7 @@ impl Engine {
     /// Rebuild the inbox dedupe set and membership log from committed
     /// facts, discarding uncommitted in-memory views. Held epoch keys
     /// are re-applied: they are device knowledge, not durable facts.
-    fn resync(&mut self) -> Result<(), EngineError> {
+    pub(super) fn resync(&mut self) -> Result<(), EngineError> {
         let facts = self.store.load()?;
         self.inbox = ControlInbox::new(self.drive);
         for (epoch, key) in &self.epoch_keys {
@@ -491,77 +491,14 @@ impl Engine {
         bulk: &mut impl BulkSource,
         objects: &mut impl ObjectStore,
     ) -> Result<ExecuteReport, EngineError> {
-        let mut report = ExecuteReport::default();
-        loop {
-            let rebuilt = self.store.rebuild(self.device)?;
-            let mut runtime = rebuilt.runtime;
-            let keyring = rebuilt.keyring;
-            let plan = runtime.reconcile();
-            let mut facts = Vec::new();
-
-            for snapshot in &plan.pending_snapshots {
-                if let Some(record) = Self::fetch_root(
-                    &self.drive,
-                    bulk,
-                    &keyring,
-                    &runtime,
-                    snapshot,
-                    &mut report.transport_errors,
-                ) {
-                    runtime.record_manifest(record.clone())?;
-                    facts.push(Fact::Manifest(record));
-                    report.manifests += 1;
-                }
-            }
-            for (id, link) in &plan.pending_manifests {
-                if let Some(record) = Self::fetch_child(
-                    &self.drive,
-                    bulk,
-                    &keyring,
-                    &runtime,
-                    id,
-                    link,
-                    &mut report.transport_errors,
-                ) {
-                    runtime.record_manifest(record.clone())?;
-                    facts.push(Fact::Manifest(record));
-                    report.manifests += 1;
-                }
-            }
-            for (content, candidates) in &plan.pending_objects {
-                if Self::fetch_object(
-                    &self.drive,
-                    bulk,
-                    &keyring,
-                    objects,
-                    content,
-                    candidates,
-                    &mut report.transport_errors,
-                ) {
-                    runtime.mark_local_object(*content);
-                    facts.push(Fact::LocalObject(*content));
-                    report.objects += 1;
-                }
-            }
-
-            if facts.is_empty() {
-                report.unfulfilled = plan.pending_snapshots.len()
-                    + plan.pending_manifests.len()
-                    + plan.pending_objects.len();
-                return Ok(report);
-            }
-            if let Err(e) = self.commit_facts(&facts) {
-                let _ = self.resync();
-                return Err(e.into());
-            }
-        }
+        super::plan::execute(self, bulk, objects)
     }
 
     /// Fetch and validate one pending root manifest. The manifest key
     /// derives from the announcement's epoch secret; the bulk peer's
     /// claimed ContentId verifies as the seal AAD on open, so a lying
     /// peer fails the tag instead of planting a record.
-    fn fetch_root(
+    pub(super) fn fetch_root(
         drive: &DriveId,
         bulk: &mut impl BulkSource,
         keyring: &DriveKeyring,
@@ -586,7 +523,7 @@ impl Engine {
     /// under their snapshot's manifest key; the owning snapshot comes
     /// from the recorded parent, the expected identity from the
     /// authenticated parent link.
-    fn fetch_child(
+    pub(super) fn fetch_child(
         drive: &DriveId,
         bulk: &mut impl BulkSource,
         keyring: &DriveKeyring,
@@ -644,7 +581,7 @@ impl Engine {
     /// held and whose bytes verify. Representations under unheld
     /// epochs are skipped, not failed: the device re-encrypts under
     /// its own epoch rather than reaching for keys it lacks.
-    fn fetch_object(
+    pub(super) fn fetch_object(
         drive: &DriveId,
         bulk: &mut impl BulkSource,
         keyring: &DriveKeyring,

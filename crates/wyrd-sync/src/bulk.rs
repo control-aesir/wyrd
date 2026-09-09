@@ -3,7 +3,7 @@
 //! The control plane (mailbox) carries small gossip; everything bulky —
 //! sealed manifests and sealed objects — moves through [`BulkSource`],
 //! synchronously by design like the rest of `wyrd-sync`: the in-memory
-//! fake serves tests, the iroh-blobs backend arrives in a later slice.
+//! fake serves tests, and [`IrohBulkSource`] provides the network backend.
 //!
 //! Addressing mirrors what each party may know. Sealed objects are
 //! vault-visible, so they fetch by [`StorageId`]. The root manifest of
@@ -15,8 +15,12 @@
 //! enforces it as AAD before the record is trusted.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use iroh::{Endpoint, EndpointAddr};
+use iroh_blobs::{get::request::get_blob, Hash};
 use thiserror::Error;
+use tokio::runtime::Runtime;
 use wyrd_format::{ContentId, SnapshotId, StorageId};
 
 /// A sealed root manifest as a member peer serves it: the claimed
@@ -50,6 +54,122 @@ pub trait BulkSource {
 
     /// Sealed bytes (manifest or object) at a vault-visible address, if held.
     fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError>;
+}
+
+/// A remotely addressable iroh blob.
+///
+/// Iroh's BLAKE3 hash is deliberately kept separate from Wyrd's
+/// [`StorageId`]. The latter is the protocol identity and the former is the
+/// transport verification root; an explicit mapping is required between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohBlobRef {
+    pub provider: EndpointAddr,
+    pub hash: [u8; 32],
+}
+
+impl IrohBlobRef {
+    fn hash(&self) -> Hash {
+        Hash::from_bytes(self.hash)
+    }
+}
+
+/// A synchronous [`BulkSource`] backed by iroh-blobs' verified streaming API.
+///
+/// The address maps are populated by the control/runtime layer. Root manifests
+/// use a snapshot address because their vault-visible StorageId is not known
+/// from a snapshot announcement; ordinary manifests and objects use StorageId.
+/// A successful transfer is returned only after iroh-blobs has verified the Bao
+/// stream. Wyrd's AEAD and identity checks still happen in the sync engine.
+pub struct IrohBulkSource {
+    endpoint: Endpoint,
+    runtime: Arc<Runtime>,
+    roots: BTreeMap<SnapshotId, (ContentId, IrohBlobRef)>,
+    sealed: BTreeMap<StorageId, IrohBlobRef>,
+}
+
+impl std::fmt::Debug for IrohBulkSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohBulkSource")
+            .field("endpoint", &self.endpoint.id())
+            .field("roots", &self.roots.len())
+            .field("sealed", &self.sealed.len())
+            .finish()
+    }
+}
+
+impl IrohBulkSource {
+    /// Create a source using a runtime owned by the caller.
+    ///
+    /// The runtime must outlive all calls to this source. Calls are blocking at
+    /// the [`BulkSource`] boundary, matching the existing engine API.
+    pub fn with_runtime(endpoint: Endpoint, runtime: Arc<Runtime>) -> Self {
+        Self {
+            endpoint,
+            runtime,
+            roots: BTreeMap::new(),
+            sealed: BTreeMap::new(),
+        }
+    }
+
+    /// Create a source with a dedicated current-thread runtime.
+    pub fn new(endpoint: Endpoint) -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self::with_runtime(endpoint, Arc::new(runtime)))
+    }
+
+    /// Publish the transport address for a snapshot's root manifest.
+    pub fn publish_root(&mut self, snapshot: SnapshotId, content_id: ContentId, blob: IrohBlobRef) {
+        self.roots.insert(snapshot, (content_id, blob));
+    }
+
+    /// Publish the transport address for a sealed manifest or object.
+    pub fn publish_sealed(&mut self, storage: StorageId, blob: IrohBlobRef) {
+        self.sealed.insert(storage, blob);
+    }
+
+    /// Close the owned endpoint after all in-flight transfers have finished.
+    pub fn shutdown(&self) {
+        self.runtime.block_on(self.endpoint.close());
+    }
+
+    fn fetch(&self, blob: &IrohBlobRef) -> Result<Vec<u8>, BulkError> {
+        let endpoint = self.endpoint.clone();
+        let provider = blob.provider.clone();
+        let hash = blob.hash();
+        self.runtime
+            .block_on(async move {
+                let connection = endpoint.connect(provider, iroh_blobs::ALPN).await?;
+                let bytes = get_blob(connection, hash).bytes().await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes.to_vec())
+            })
+            .map_err(|error| BulkError::Transport(error.to_string()))
+    }
+}
+
+impl BulkSource for IrohBulkSource {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        let Some((content_id, blob)) = self.roots.get(snapshot) else {
+            return Ok(None);
+        };
+        self.fetch(blob).map(|sealed| {
+            Some(SealedManifest {
+                content_id: *content_id,
+                sealed,
+            })
+        })
+    }
+
+    fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError> {
+        let Some(blob) = self.sealed.get(storage) else {
+            return Ok(None);
+        };
+        self.fetch(blob).map(Some)
+    }
 }
 
 /// An in-memory bulk peer for tests: preloaded sealed bytes keyed by
@@ -119,5 +239,129 @@ mod tests {
             Some(manifest)
         );
         assert_eq!(bulk.fetch_sealed(&storage).unwrap(), Some(vec![0xBB; 40]));
+    }
+
+    #[test]
+    fn iroh_source_fetches_bao_verified_bytes() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(b"verified over iroh").await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+
+        let provider = direct_addr(&server);
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+        let storage = StorageId::from_bytes([0x55; 32]);
+        source.publish_sealed(
+            storage,
+            IrohBlobRef {
+                provider,
+                hash: *hash.as_bytes(),
+            },
+        );
+
+        assert_eq!(
+            source.fetch_sealed(&storage).unwrap(),
+            Some(b"verified over iroh".to_vec())
+        );
+
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
+        source.shutdown();
+    }
+
+    #[test]
+    fn iroh_source_fetches_root_manifest_by_snapshot() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(b"root manifest bytes").await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+
+        let snapshot = SnapshotId::from_bytes([0x66; 32]);
+        let content_id = ContentId::from_bytes([0x77; 32]);
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+        source.publish_root(
+            snapshot,
+            content_id,
+            IrohBlobRef {
+                provider: direct_addr(&server),
+                hash: *hash.as_bytes(),
+            },
+        );
+
+        assert_eq!(
+            source.fetch_root_manifest(&snapshot).unwrap(),
+            Some(SealedManifest {
+                content_id,
+                sealed: b"root manifest bytes".to_vec(),
+            })
+        );
+        assert_eq!(
+            source
+                .fetch_root_manifest(&SnapshotId::from_bytes([0x88; 32]))
+                .unwrap(),
+            None
+        );
+
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
+        source.shutdown();
+    }
+
+    fn direct_addr(endpoint: &iroh::Endpoint) -> EndpointAddr {
+        let mut address = EndpointAddr::new(endpoint.id());
+        for ip in endpoint.addr().ip_addrs() {
+            address = address.with_ip_addr(*ip);
+        }
+        address
     }
 }

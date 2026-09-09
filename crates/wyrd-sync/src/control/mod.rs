@@ -306,6 +306,13 @@ impl ControlInbox {
     pub fn has_seen(&self, id: &ControlMessageId) -> bool {
         self.seen.contains(id)
     }
+
+    /// Record an already-committed message id: restart rehydration from
+    /// durable facts. Ids committed durably are processed by definition,
+    /// so they must never be re-ingested.
+    pub fn remember(&mut self, id: &ControlMessageId) -> bool {
+        self.seen.insert(*id)
+    }
 }
 
 #[cfg(test)]

@@ -634,7 +634,7 @@ fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bulk::{MemoryBulkSource, SealedManifest};
+    use crate::bulk::{BulkSource, MemoryBulkSource, SealedManifest};
     use crate::control::{seal, CapabilityPayload, SnapshotAnnouncement, TransitionPayload};
     use crate::keys::capability::Capability;
     use crate::keys::EpochSecret;
@@ -642,13 +642,13 @@ mod tests {
     use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
     use crate::transport::mailbox::{seal_for_recipient, MailboxError};
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
         Change, ChildManifest, DeviceEncryptionKey, Manifest, MemoryObjectStore, ObjectKind,
-        ObjectStore, SnapshotId, TransitionId,
+        ObjectStore, SnapshotId, StorageId, TransitionId,
     };
 
     /// An isolated store directory, removed on drop (mirrors the
@@ -1565,6 +1565,14 @@ mod tests {
         content: ContentId,
     }
 
+    /// One published snapshot: the chunk's content id plus the
+    /// storage address of its sealed object, so tests can withhold
+    /// individual representations from the bulk peer.
+    struct PublishedSnapshot {
+        content: ContentId,
+        object_storage: StorageId,
+    }
+
     /// Seal one chunk under an entry epoch secret and publish it plus
     /// a root manifest (with one empty child) to a bulk peer. Returns
     /// the peer and the chunk's content id.
@@ -1576,7 +1584,7 @@ mod tests {
         plaintext: &[u8],
     ) -> Published {
         let mut bulk = MemoryBulkSource::default();
-        let content = publish_into(
+        let published = publish_into(
             &mut bulk,
             manifest_secret,
             manifest_epoch,
@@ -1585,7 +1593,10 @@ mod tests {
             SnapshotId::from_bytes([0x11; 32]),
             plaintext,
         );
-        Published { bulk, content }
+        Published {
+            bulk,
+            content: published.content,
+        }
     }
 
     /// Publish one snapshot's manifest tree into a shared bulk peer
@@ -1599,7 +1610,7 @@ mod tests {
         object_epoch: u64,
         snapshot: SnapshotId,
         plaintext: &[u8],
-    ) -> ContentId {
+    ) -> PublishedSnapshot {
         let drive = member_drive();
         let content = ContentId::derive(ObjectKind::Chunk, plaintext);
         let object_key = object_secret.object_key(
@@ -1647,8 +1658,12 @@ mod tests {
             },
         );
         bulk.publish_sealed(sealed_child.storage_id(), sealed_child.encode());
-        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
-        content
+        let object_storage = sealed_object.storage_id();
+        bulk.publish_sealed(object_storage, sealed_object.encode());
+        PublishedSnapshot {
+            content,
+            object_storage,
+        }
     }
 
     /// A store that refuses the local-write path: any import the
@@ -1957,7 +1972,10 @@ mod tests {
     // relay and one bulk peer. The test routes every control message
     // explicitly (engines emit nothing in these slices); convergence
     // means both engines reach the same durable facts and the same
-    // local objects, surviving restarts at any boundary.
+    // local objects, surviving restarts at drain and plan boundaries:
+    // intake-then-restart, partial-plan resume, and repeated
+    // idempotent restarts. Commit-failure injection inside a plan
+    // batch needs a durable test hook and is tracked separately.
 
     /// One scenario epoch secret (capability-delivered knowledge).
     fn secret(byte: u8) -> EpochSecret {
@@ -2063,13 +2081,23 @@ mod tests {
     }
 
     /// Both engines hold the same announcements, manifests, and local
-    /// objects, and both plans are empty.
+    /// objects, and both plans are empty. Commit order may differ
+    /// (partial plans commit across restarts), so the comparison is
+    /// order-insensitive.
     fn assert_agreement(pair: &mut Pair) {
         let a = pair.a.engine.store.load().expect("loads a");
         let b = pair.b.engine.store.load().expect("loads b");
         assert_eq!(a.announcements, b.announcements);
-        assert_eq!(a.manifests, b.manifests);
-        assert_eq!(a.local_objects, b.local_objects);
+        let mut a_manifests: Vec<_> = a.manifests.iter().map(|m| m.manifest_id).collect();
+        let mut b_manifests: Vec<_> = b.manifests.iter().map(|m| m.manifest_id).collect();
+        a_manifests.sort();
+        b_manifests.sort();
+        assert_eq!(a_manifests, b_manifests);
+        let mut a_objects = a.local_objects.clone();
+        let mut b_objects = b.local_objects.clone();
+        a_objects.sort();
+        b_objects.sort();
+        assert_eq!(a_objects, b_objects);
         assert!(!a.announcements.is_empty(), "shared history recorded");
         let report = execute_side(&mut pair.bulk, &mut pair.a);
         assert_eq!(report.unfulfilled, 0, "a converged");
@@ -2079,11 +2107,11 @@ mod tests {
 
     /// The shared scenario: owner admits A (epoch 2) then B (epoch
     /// 3); each authors one snapshot and publishes it to the shared
-    /// bulk peer. Returns the pair plus the two chunk content ids.
+    /// bulk peer. Returns the pair plus the two published snapshots.
     /// Every control message is routed to both devices up front; each
     /// test then decides drain/execute/restart interleaving.
     type ScenarioControls = Vec<(u64, [u8; 32])>;
-    type ScenarioContents = (ContentId, ContentId);
+    type ScenarioContents = (PublishedSnapshot, PublishedSnapshot);
 
     fn scenario() -> (Pair, ScenarioControls, ScenarioContents) {
         let drive = member_drive();
@@ -2112,7 +2140,7 @@ mod tests {
 
         let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
         let snapshot_b = SnapshotId::from_bytes([0x12; 32]);
-        let content_a = publish_into(
+        let snap_a = publish_into(
             &mut pair.bulk,
             &secret(0x09),
             2,
@@ -2121,7 +2149,7 @@ mod tests {
             snapshot_a,
             b"a bytes",
         );
-        let content_b = publish_into(
+        let snap_b = publish_into(
             &mut pair.bulk,
             &secret(0x0A),
             3,
@@ -2149,9 +2177,9 @@ mod tests {
             }
         }
         // Each device's capability, then both announcements to both.
-        // A also receives the epoch-3 capability bound to B's
-        // admission (rotation delivery): A stays a member, so it
-        // authorizes, and only then can A open epoch-3 snapshots.
+        // A also receives the epoch-3 capability bound to the
+        // subsequent admission: A stays a member, so it authorizes,
+        // and only then can A open epoch-3 snapshots.
         let cap_a2 = capability_message_for(
             &pair.a.encryption_sk,
             a_dev,
@@ -2182,13 +2210,13 @@ mod tests {
             send_to(&mut pair, &a_sk, target, 2, &key(2), &ann_a);
             send_to(&mut pair, &b_sk, target, 3, &key(3), &ann_b);
         }
-        (pair, controls, (content_a, content_b))
+        (pair, controls, (snap_a, snap_b))
     }
 
     #[test]
     fn two_devices_converge_on_shared_history() {
-        let (mut pair, _, (content_a, content_b)) = scenario();
-        for content in [content_a, content_b] {
+        let (mut pair, _, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
             pair.a
                 .engine
                 .set_materialization(content, MaterializationState::Pinned)
@@ -2216,27 +2244,27 @@ mod tests {
 
         assert_agreement(&mut pair);
         assert_eq!(
-            pair.a.objects.get(&content_a).unwrap().as_deref(),
+            pair.a.objects.get(&snap_a.content).unwrap().as_deref(),
             Some(b"a bytes".as_slice())
         );
         assert_eq!(
-            pair.a.objects.get(&content_b).unwrap().as_deref(),
+            pair.a.objects.get(&snap_b.content).unwrap().as_deref(),
             Some(b"b bytes".as_slice())
         );
         assert_eq!(
-            pair.b.objects.get(&content_a).unwrap().as_deref(),
+            pair.b.objects.get(&snap_a.content).unwrap().as_deref(),
             Some(b"a bytes".as_slice())
         );
         assert_eq!(
-            pair.b.objects.get(&content_b).unwrap().as_deref(),
+            pair.b.objects.get(&snap_b.content).unwrap().as_deref(),
             Some(b"b bytes".as_slice())
         );
     }
 
     #[test]
     fn restart_between_intake_and_planning_loses_nothing() {
-        let (mut pair, controls, (content_a, content_b)) = scenario();
-        for content in [content_a, content_b] {
+        let (mut pair, controls, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
             pair.a
                 .engine
                 .set_materialization(content, MaterializationState::Pinned)
@@ -2265,8 +2293,8 @@ mod tests {
 
     #[test]
     fn repeated_restarts_are_idempotent() {
-        let (mut pair, controls, (content_a, content_b)) = scenario();
-        for content in [content_a, content_b] {
+        let (mut pair, controls, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
             pair.a
                 .engine
                 .set_materialization(content, MaterializationState::Pinned)
@@ -2308,6 +2336,79 @@ mod tests {
             );
             assert_eq!(pair.a.engine.current(), current, "no new commits");
         }
+        assert_agreement(&mut pair);
+    }
+
+    /// A bulk peer that withholds listed sealed objects (absence,
+    /// not error): the plan commits what it can and leaves the rest
+    /// unfulfilled.
+    struct WithoutObjects {
+        inner: MemoryBulkSource,
+        hidden: BTreeSet<StorageId>,
+    }
+
+    impl BulkSource for WithoutObjects {
+        fn fetch_root_manifest(
+            &mut self,
+            snapshot: &SnapshotId,
+        ) -> Result<Option<SealedManifest>, crate::bulk::BulkError> {
+            self.inner.fetch_root_manifest(snapshot)
+        }
+
+        fn fetch_sealed(
+            &mut self,
+            storage: &StorageId,
+        ) -> Result<Option<Vec<u8>>, crate::bulk::BulkError> {
+            if self.hidden.contains(storage) {
+                return Ok(None);
+            }
+            self.inner.fetch_sealed(storage)
+        }
+    }
+
+    #[test]
+    fn restart_after_partial_plan_resumes_to_convergence() {
+        let (mut pair, controls, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+
+        // B's object bytes are absent: A's plan commits all four
+        // manifests and A's object, leaving B's object unfulfilled.
+        // The committed prefix is durable; the rest is retry-later.
+        let mut partial = WithoutObjects {
+            inner: pair.bulk.clone(),
+            hidden: BTreeSet::from([snap_b.object_storage]),
+        };
+        let a_plan = pair
+            .a
+            .engine
+            .execute_plan(&mut partial, &mut pair.a.objects)
+            .unwrap();
+        assert_eq!(a_plan.manifests, 4);
+        assert_eq!(a_plan.objects, 1);
+        assert_eq!(a_plan.unfulfilled, 1);
+
+        // Restart on the partially committed plan, then serve the
+        // missing bytes: no manifest recommits, the object imports,
+        // and the plan empties.
+        restart(&mut pair.a, &controls);
+        let resume = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(resume.manifests, 0, "manifests stayed committed");
+        assert_eq!(resume.objects, 1);
+        assert_eq!(resume.unfulfilled, 0);
+
+        let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(b_plan.objects, 2);
         assert_agreement(&mut pair);
     }
 }

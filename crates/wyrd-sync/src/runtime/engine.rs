@@ -634,7 +634,7 @@ fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bulk::{MemoryBulkSource, SealedManifest};
+    use crate::bulk::{BulkSource, MemoryBulkSource, SealedManifest};
     use crate::control::{seal, CapabilityPayload, SnapshotAnnouncement, TransitionPayload};
     use crate::keys::capability::Capability;
     use crate::keys::EpochSecret;
@@ -642,13 +642,13 @@ mod tests {
     use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
     use crate::transport::mailbox::{seal_for_recipient, MailboxError};
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
         Change, ChildManifest, DeviceEncryptionKey, Manifest, MemoryObjectStore, ObjectKind,
-        ObjectStore, SnapshotId, TransitionId,
+        ObjectStore, SnapshotId, StorageId, TransitionId,
     };
 
     /// An isolated store directory, removed on drop (mirrors the
@@ -773,9 +773,23 @@ mod tests {
     }
 
     fn announcement_for(epoch: u64, membership: TransitionId) -> Message {
+        announcement_msg(
+            SnapshotId::from_bytes([0x11; 32]),
+            DeviceId::from_bytes([0x22; 32]),
+            epoch,
+            membership,
+        )
+    }
+
+    fn announcement_msg(
+        snapshot: SnapshotId,
+        author: DeviceId,
+        epoch: u64,
+        membership: TransitionId,
+    ) -> Message {
         Message::SnapshotAnnouncement(SnapshotAnnouncement {
-            snapshot: SnapshotId::from_bytes([0x11; 32]),
-            author: DeviceId::from_bytes([0x22; 32]),
+            snapshot,
+            author,
             epoch,
             membership,
         })
@@ -1498,10 +1512,21 @@ mod tests {
         epoch: u64,
         secrets: Vec<EpochSecret>,
     ) -> Message {
+        capability_message_for(&engine_encryption_sk(), device, transition, epoch, secrets)
+    }
+
+    /// A capability for any device/key pair (two-device scenarios).
+    fn capability_message_for(
+        encryption_sk: &SecretKey,
+        device: DeviceId,
+        transition: TransitionId,
+        epoch: u64,
+        secrets: Vec<EpochSecret>,
+    ) -> Message {
         let cap = Capability::new(
             member_drive(),
             device,
-            encryption_key(&engine_encryption_sk()),
+            encryption_key(encryption_sk),
             transition,
             epoch,
             secrets,
@@ -1540,6 +1565,14 @@ mod tests {
         content: ContentId,
     }
 
+    /// One published snapshot: the chunk's content id plus the
+    /// storage address of its sealed object, so tests can withhold
+    /// individual representations from the bulk peer.
+    struct PublishedSnapshot {
+        content: ContentId,
+        object_storage: StorageId,
+    }
+
     /// Seal one chunk under an entry epoch secret and publish it plus
     /// a root manifest (with one empty child) to a bulk peer. Returns
     /// the peer and the chunk's content id.
@@ -1550,7 +1583,34 @@ mod tests {
         object_epoch: u64,
         plaintext: &[u8],
     ) -> Published {
-        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let mut bulk = MemoryBulkSource::default();
+        let published = publish_into(
+            &mut bulk,
+            manifest_secret,
+            manifest_epoch,
+            object_secret,
+            object_epoch,
+            SnapshotId::from_bytes([0x11; 32]),
+            plaintext,
+        );
+        Published {
+            bulk,
+            content: published.content,
+        }
+    }
+
+    /// Publish one snapshot's manifest tree into a shared bulk peer
+    /// (two devices publish side by side). Returns the chunk's
+    /// content id.
+    fn publish_into(
+        bulk: &mut MemoryBulkSource,
+        manifest_secret: &EpochSecret,
+        manifest_epoch: u64,
+        object_secret: &EpochSecret,
+        object_epoch: u64,
+        snapshot: SnapshotId,
+        plaintext: &[u8],
+    ) -> PublishedSnapshot {
         let drive = member_drive();
         let content = ContentId::derive(ObjectKind::Chunk, plaintext);
         let object_key = object_secret.object_key(
@@ -1590,7 +1650,6 @@ mod tests {
         };
         let (root_id, sealed_root) = seal_manifest(&manifest_key, &root).unwrap();
 
-        let mut bulk = MemoryBulkSource::default();
         bulk.publish_root(
             snapshot,
             SealedManifest {
@@ -1599,8 +1658,12 @@ mod tests {
             },
         );
         bulk.publish_sealed(sealed_child.storage_id(), sealed_child.encode());
-        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
-        Published { bulk, content }
+        let object_storage = sealed_object.storage_id();
+        bulk.publish_sealed(object_storage, sealed_object.encode());
+        PublishedSnapshot {
+            content,
+            object_storage,
+        }
     }
 
     /// A store that refuses the local-write path: any import the
@@ -1901,5 +1964,451 @@ mod tests {
         assert_eq!(report.unfulfilled, 1);
         let facts = fixture.engine.store.load().expect("loads");
         assert!(facts.manifests.is_empty());
+    }
+
+    // --- two-device convergence ---------------------------------------
+    //
+    // Two engines with separate stores and object holdings share one
+    // relay and one bulk peer. The test routes every control message
+    // explicitly (engines emit nothing in these slices); convergence
+    // means both engines reach the same durable facts and the same
+    // local objects, surviving restarts at drain and plan boundaries:
+    // intake-then-restart, partial-plan resume, and repeated
+    // idempotent restarts. Commit-failure injection inside a plan
+    // batch needs a durable test hook and is tracked separately.
+
+    /// One scenario epoch secret (capability-delivered knowledge).
+    fn secret(byte: u8) -> EpochSecret {
+        EpochSecret::from_bytes([byte; 32])
+    }
+
+    struct Device {
+        dir: TestDir,
+        engine: Engine,
+        identity_sk: SecretKey,
+        encryption_sk: SecretKey,
+        device: DeviceId,
+        objects: MemoryObjectStore,
+    }
+
+    struct Pair {
+        relay: MemoryRelay,
+        bulk: MemoryBulkSource,
+        a: Device,
+        b: Device,
+    }
+
+    /// Open one device holding the scenario control keys: the keys
+    /// are capability-delivered knowledge, so both members hold every
+    /// epoch they are a member of.
+    fn open_device(
+        name: &str,
+        identity_byte: u8,
+        encryption_byte: u8,
+        controls: &[(u64, [u8; 32])],
+    ) -> Device {
+        let dir = TestDir::new(name);
+        let (identity_sk, device) = identity(identity_byte);
+        let encryption_sk = SecretKey::from_slice(&[encryption_byte; 32]).unwrap();
+        let mut engine = Engine::open(
+            dir.path.clone(),
+            member_drive(),
+            device,
+            "test-pass",
+            identity_sk,
+            encryption_sk,
+        )
+        .unwrap();
+        for (epoch, key) in controls {
+            engine.add_epoch_key(*epoch, *key);
+        }
+        Device {
+            dir,
+            engine,
+            identity_sk,
+            encryption_sk,
+            device,
+            objects: MemoryObjectStore::default(),
+        }
+    }
+
+    /// Seal a control message for a device under a scenario epoch key.
+    fn send_to(
+        pair: &mut Pair,
+        from_sk: &SecretKey,
+        to: DeviceId,
+        epoch: u64,
+        key: &[u8; 32],
+        message: &Message,
+    ) {
+        let sealed = seal(key, &member_drive(), epoch, message).unwrap();
+        pair.relay
+            .queue
+            .push_back(seal_for_recipient(from_sk, to, &sealed.encode()).unwrap());
+    }
+
+    fn drain_side(relay: &mut MemoryRelay, device: &mut Device) -> DrainReport {
+        let mut mailbox = MemoryMailbox {
+            relay,
+            owner: device.device,
+        };
+        device.engine.drain(&mut mailbox).unwrap()
+    }
+
+    fn execute_side(bulk: &mut MemoryBulkSource, device: &mut Device) -> ExecuteReport {
+        device
+            .engine
+            .execute_plan(bulk, &mut device.objects)
+            .unwrap()
+    }
+
+    /// Simulated restart: reopen the same store directory with the
+    /// same keys. Held epoch keys are device knowledge, re-applied.
+    fn restart(device: &mut Device, controls: &[(u64, [u8; 32])]) {
+        let mut engine = Engine::open(
+            device.dir.path.clone(),
+            member_drive(),
+            device.device,
+            "test-pass",
+            device.identity_sk,
+            device.encryption_sk,
+        )
+        .unwrap();
+        for (epoch, key) in controls {
+            engine.add_epoch_key(*epoch, *key);
+        }
+        device.engine = engine;
+    }
+
+    /// Both engines hold the same announcements, manifests, and local
+    /// objects, and both plans are empty. Commit order may differ
+    /// (partial plans commit across restarts), so the comparison is
+    /// order-insensitive.
+    fn assert_agreement(pair: &mut Pair) {
+        let a = pair.a.engine.store.load().expect("loads a");
+        let b = pair.b.engine.store.load().expect("loads b");
+        assert_eq!(a.announcements, b.announcements);
+        let mut a_manifests: Vec<_> = a.manifests.iter().map(|m| m.manifest_id).collect();
+        let mut b_manifests: Vec<_> = b.manifests.iter().map(|m| m.manifest_id).collect();
+        a_manifests.sort();
+        b_manifests.sort();
+        assert_eq!(a_manifests, b_manifests);
+        let mut a_objects = a.local_objects.clone();
+        let mut b_objects = b.local_objects.clone();
+        a_objects.sort();
+        b_objects.sort();
+        assert_eq!(a_objects, b_objects);
+        assert!(!a.announcements.is_empty(), "shared history recorded");
+        let report = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(report.unfulfilled, 0, "a converged");
+        let report = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(report.unfulfilled, 0, "b converged");
+    }
+
+    /// The shared scenario: owner admits A (epoch 2) then B (epoch
+    /// 3); each authors one snapshot and publishes it to the shared
+    /// bulk peer. Returns the pair plus the two published snapshots.
+    /// Every control message is routed to both devices up front; each
+    /// test then decides drain/execute/restart interleaving.
+    type ScenarioControls = Vec<(u64, [u8; 32])>;
+    type ScenarioContents = (PublishedSnapshot, PublishedSnapshot);
+
+    fn scenario() -> (Pair, ScenarioControls, ScenarioContents) {
+        let drive = member_drive();
+        let controls: Vec<(u64, [u8; 32])> = [1, 2, 3]
+            .iter()
+            .map(|e| (*e, secret(0x07 + *e as u8).control_key(&drive, *e)))
+            .collect();
+        let key = |e: u64| controls.iter().find(|(x, _)| *x == e).unwrap().1;
+        let mut pair = Pair {
+            relay: MemoryRelay::default(),
+            bulk: MemoryBulkSource::default(),
+            a: open_device("conv-a", 0x02, 0xE0, &controls),
+            b: open_device("conv-b", 0x03, 0xE1, &controls),
+        };
+
+        let (owner_sk, _) = owner();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admit_a = builder.child(vec![Change::Admit(Admission {
+            device: pair.a.device,
+            encryption_key: encryption_key(&pair.a.encryption_sk),
+        })]);
+        let admit_b = builder.child(vec![Change::Admit(Admission {
+            device: pair.b.device,
+            encryption_key: encryption_key(&pair.b.encryption_sk),
+        })]);
+
+        let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
+        let snapshot_b = SnapshotId::from_bytes([0x12; 32]);
+        let snap_a = publish_into(
+            &mut pair.bulk,
+            &secret(0x09),
+            2,
+            &secret(0x09),
+            2,
+            snapshot_a,
+            b"a bytes",
+        );
+        let snap_b = publish_into(
+            &mut pair.bulk,
+            &secret(0x0A),
+            3,
+            &secret(0x0A),
+            3,
+            snapshot_b,
+            b"b bytes",
+        );
+
+        let a_sk = pair.a.identity_sk;
+        let b_sk = pair.b.identity_sk;
+        let a_dev = pair.a.device;
+        let b_dev = pair.b.device;
+        // The full chain to both devices.
+        for target in [a_dev, b_dev] {
+            for t in [&genesis, &admit_a, &admit_b] {
+                send_to(
+                    &mut pair,
+                    &owner_sk,
+                    target,
+                    1,
+                    &key(1),
+                    &transition_message(t),
+                );
+            }
+        }
+        // Each device's capability, then both announcements to both.
+        // A also receives the epoch-3 capability bound to the
+        // subsequent admission: A stays a member, so it authorizes,
+        // and only then can A open epoch-3 snapshots.
+        let cap_a2 = capability_message_for(
+            &pair.a.encryption_sk,
+            a_dev,
+            admit_a.transition_id(),
+            2,
+            vec![secret(0x08), secret(0x09)],
+        );
+        let cap_a3 = capability_message_for(
+            &pair.a.encryption_sk,
+            a_dev,
+            admit_b.transition_id(),
+            3,
+            vec![secret(0x08), secret(0x09), secret(0x0A)],
+        );
+        let cap_b = capability_message_for(
+            &pair.b.encryption_sk,
+            b_dev,
+            admit_b.transition_id(),
+            3,
+            vec![secret(0x08), secret(0x09), secret(0x0A)],
+        );
+        send_to(&mut pair, &owner_sk, a_dev, 2, &key(2), &cap_a2);
+        send_to(&mut pair, &owner_sk, a_dev, 3, &key(3), &cap_a3);
+        send_to(&mut pair, &owner_sk, b_dev, 3, &key(3), &cap_b);
+        let ann_a = announcement_msg(snapshot_a, a_dev, 2, admit_a.transition_id());
+        let ann_b = announcement_msg(snapshot_b, b_dev, 3, admit_b.transition_id());
+        for target in [a_dev, b_dev] {
+            send_to(&mut pair, &a_sk, target, 2, &key(2), &ann_a);
+            send_to(&mut pair, &b_sk, target, 3, &key(3), &ann_b);
+        }
+        (pair, controls, (snap_a, snap_b))
+    }
+
+    #[test]
+    fn two_devices_converge_on_shared_history() {
+        let (mut pair, _, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+
+        let a_drain = drain_side(&mut pair.relay, &mut pair.a);
+        assert_eq!(
+            a_drain.accepted, 7,
+            "chain, two capabilities, announcements"
+        );
+        let b_drain = drain_side(&mut pair.relay, &mut pair.b);
+        assert_eq!(b_drain.accepted, 6);
+
+        let a_plan = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(a_plan.manifests, 4, "two roots plus two children");
+        assert_eq!(a_plan.objects, 2);
+        assert_eq!(a_plan.unfulfilled, 0);
+        let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(b_plan, a_plan, "same evidence, same outcome");
+
+        assert_agreement(&mut pair);
+        assert_eq!(
+            pair.a.objects.get(&snap_a.content).unwrap().as_deref(),
+            Some(b"a bytes".as_slice())
+        );
+        assert_eq!(
+            pair.a.objects.get(&snap_b.content).unwrap().as_deref(),
+            Some(b"b bytes".as_slice())
+        );
+        assert_eq!(
+            pair.b.objects.get(&snap_a.content).unwrap().as_deref(),
+            Some(b"a bytes".as_slice())
+        );
+        assert_eq!(
+            pair.b.objects.get(&snap_b.content).unwrap().as_deref(),
+            Some(b"b bytes".as_slice())
+        );
+    }
+
+    #[test]
+    fn restart_between_intake_and_planning_loses_nothing() {
+        let (mut pair, controls, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+
+        // A drains the control plane, then restarts before ever
+        // running the plan: the committed facts must carry it through.
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        restart(&mut pair.a, &controls);
+        let facts = pair.a.engine.store.load().expect("loads after restart");
+        assert_eq!(facts.announcements.len(), 2, "intake survived the restart");
+
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+        let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(b_plan.objects, 2);
+        let a_plan = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(a_plan, b_plan, "restarted A reaches the same plan outcome");
+
+        assert_agreement(&mut pair);
+    }
+
+    #[test]
+    fn repeated_restarts_are_idempotent() {
+        let (mut pair, controls, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+        assert_eq!(execute_side(&mut pair.bulk, &mut pair.a).objects, 2);
+        assert_eq!(execute_side(&mut pair.bulk, &mut pair.b).objects, 2);
+        assert_agreement(&mut pair);
+
+        // Three reopen/drain/execute cycles with no new traffic: no
+        // state may change, nothing may report progress.
+        let current = pair.a.engine.current();
+        for _ in 0..3 {
+            restart(&mut pair.a, &controls);
+            let drain = drain_side(&mut pair.relay, &mut pair.a);
+            assert_eq!(
+                drain,
+                DrainReport {
+                    accepted: 0,
+                    duplicates: 0,
+                    deferred: 0,
+                    skipped: 0,
+                }
+            );
+            let plan = execute_side(&mut pair.bulk, &mut pair.a);
+            assert_eq!(
+                plan,
+                ExecuteReport {
+                    manifests: 0,
+                    objects: 0,
+                    unfulfilled: 0,
+                }
+            );
+            assert_eq!(pair.a.engine.current(), current, "no new commits");
+        }
+        assert_agreement(&mut pair);
+    }
+
+    /// A bulk peer that withholds listed sealed objects (absence,
+    /// not error): the plan commits what it can and leaves the rest
+    /// unfulfilled.
+    struct WithoutObjects {
+        inner: MemoryBulkSource,
+        hidden: BTreeSet<StorageId>,
+    }
+
+    impl BulkSource for WithoutObjects {
+        fn fetch_root_manifest(
+            &mut self,
+            snapshot: &SnapshotId,
+        ) -> Result<Option<SealedManifest>, crate::bulk::BulkError> {
+            self.inner.fetch_root_manifest(snapshot)
+        }
+
+        fn fetch_sealed(
+            &mut self,
+            storage: &StorageId,
+        ) -> Result<Option<Vec<u8>>, crate::bulk::BulkError> {
+            if self.hidden.contains(storage) {
+                return Ok(None);
+            }
+            self.inner.fetch_sealed(storage)
+        }
+    }
+
+    #[test]
+    fn restart_after_partial_plan_resumes_to_convergence() {
+        let (mut pair, controls, (snap_a, snap_b)) = scenario();
+        for content in [snap_a.content, snap_b.content] {
+            pair.a
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+            pair.b
+                .engine
+                .set_materialization(content, MaterializationState::Pinned)
+                .unwrap();
+        }
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+
+        // B's object bytes are absent: A's plan commits all four
+        // manifests and A's object, leaving B's object unfulfilled.
+        // The committed prefix is durable; the rest is retry-later.
+        let mut partial = WithoutObjects {
+            inner: pair.bulk.clone(),
+            hidden: BTreeSet::from([snap_b.object_storage]),
+        };
+        let a_plan = pair
+            .a
+            .engine
+            .execute_plan(&mut partial, &mut pair.a.objects)
+            .unwrap();
+        assert_eq!(a_plan.manifests, 4);
+        assert_eq!(a_plan.objects, 1);
+        assert_eq!(a_plan.unfulfilled, 1);
+
+        // Restart on the partially committed plan, then serve the
+        // missing bytes: no manifest recommits, the object imports,
+        // and the plan empties.
+        restart(&mut pair.a, &controls);
+        let resume = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(resume.manifests, 0, "manifests stayed committed");
+        assert_eq!(resume.objects, 1);
+        assert_eq!(resume.unfulfilled, 0);
+
+        let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
+        assert_eq!(b_plan.objects, 2);
+        assert_agreement(&mut pair);
     }
 }

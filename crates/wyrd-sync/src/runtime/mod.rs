@@ -252,17 +252,23 @@ impl RuntimeState {
                 if matches!(desired, MaterializationState::RemoteOnly) {
                     continue;
                 }
-                pending_objects
-                    .entry(entry.content_id)
-                    .or_default()
-                    .push(PendingObjectFetch {
-                        content_id: entry.content_id,
-                        storage_id: entry.storage_id,
-                        kind: entry.kind,
-                        version: entry.version,
-                        encryption_epoch: entry.encryption_epoch,
-                        size: entry.size,
-                    });
+                // The same entry in several manifests yields one
+                // candidate per distinct representation: identical
+                // (storage, kind, version, epoch) tuples fetch once,
+                // while cross-epoch alternatives all survive for the
+                // fetch layer to choose among.
+                let candidate = PendingObjectFetch {
+                    content_id: entry.content_id,
+                    storage_id: entry.storage_id,
+                    kind: entry.kind,
+                    version: entry.version,
+                    encryption_epoch: entry.encryption_epoch,
+                    size: entry.size,
+                };
+                let candidates = pending_objects.entry(entry.content_id).or_default();
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
             }
         }
 
@@ -482,6 +488,38 @@ mod tests {
                 StorageId::from_bytes([0xA0; 32]),
                 StorageId::from_bytes([0xB0; 32]),
             ])
+        );
+    }
+
+    #[test]
+    fn identical_entries_across_manifests_fetch_once() {
+        // The same representation recorded under two manifests is
+        // one candidate; the alternate-epoch representation still
+        // survives alongside it.
+        let mut state = RuntimeState::new(drive());
+        let content = ContentId::from_bytes([4; 32]);
+        let mut first = root_manifest(1, 9, 4, 5);
+        first.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
+        first.manifest.entries[0].encryption_epoch = 1;
+        first.manifest_id = manifest_id_for(&first);
+        let mut second = root_manifest(2, 9, 4, 5);
+        second.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
+        second.manifest.entries[0].encryption_epoch = 1;
+        second.manifest_id = manifest_id_for(&second);
+        let mut third = root_manifest(3, 9, 4, 5);
+        third.manifest.entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
+        third.manifest.entries[0].encryption_epoch = 2;
+        third.manifest_id = manifest_id_for(&third);
+        assert!(state.record_manifest(first).unwrap());
+        assert!(state.record_manifest(second).unwrap());
+        assert!(state.record_manifest(third).unwrap());
+        state.set_materialization(content, MaterializationState::Pinned);
+        let plan = state.reconcile();
+        let candidates = &plan.pending_objects[&content];
+        assert_eq!(
+            candidates.len(),
+            2,
+            "duplicate collapses, epoch alternative stays"
         );
     }
 

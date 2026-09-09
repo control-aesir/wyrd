@@ -54,7 +54,7 @@ pub trait BulkSource {
 
 /// An in-memory bulk peer for tests: preloaded sealed bytes keyed by
 /// their fetch addresses. No network, no async.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MemoryBulkSource {
     roots: BTreeMap<SnapshotId, SealedManifest>,
     sealed: BTreeMap<StorageId, Vec<u8>>,

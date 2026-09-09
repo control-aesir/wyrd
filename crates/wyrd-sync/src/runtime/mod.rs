@@ -79,6 +79,9 @@ pub struct RuntimeState {
     seen_control_messages: BTreeSet<ControlMessageId>,
     announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
     manifests: BTreeMap<ContentId, ManifestRecord>,
+    /// Derived indexes rebuilt by replay; never persisted as facts.
+    root_manifests_by_snapshot: BTreeMap<SnapshotId, BTreeSet<ContentId>>,
+    child_parent_by_manifest: BTreeMap<ContentId, SnapshotId>,
     local_objects: BTreeSet<ContentId>,
     materialization: BTreeMap<ContentId, MaterializationState>,
 }
@@ -89,6 +92,8 @@ pub enum RuntimeError {
     ConflictingAnnouncement { snapshot: SnapshotId },
     #[error("conflicting manifest record for {manifest}")]
     ConflictingManifest { manifest: ContentId },
+    #[error("child manifest {manifest} has multiple owning snapshots")]
+    ConflictingChildParent { manifest: ContentId },
     #[error("manifest id {manifest} does not match derived content id {derived}")]
     ManifestIdentityMismatch {
         manifest: ContentId,
@@ -104,6 +109,8 @@ impl RuntimeState {
             seen_control_messages: BTreeSet::new(),
             announcements: BTreeMap::new(),
             manifests: BTreeMap::new(),
+            root_manifests_by_snapshot: BTreeMap::new(),
+            child_parent_by_manifest: BTreeMap::new(),
             local_objects: BTreeSet::new(),
             materialization: BTreeMap::new(),
         }
@@ -153,21 +160,39 @@ impl RuntimeState {
                 derived,
             });
         }
-        match self.manifests.get_mut(&manifest_id) {
-            None => {
-                self.manifests.insert(manifest_id, record);
-                Ok(true)
-            }
-            Some(existing)
-                if existing.manifest == record.manifest && existing.is_root == record.is_root =>
-            {
+        if let Some(existing) = self.manifests.get_mut(&manifest_id) {
+            return if existing.manifest == record.manifest && existing.is_root == record.is_root {
                 existing.storage_ids.extend(record.storage_ids);
                 Ok(false)
-            }
-            Some(_) => Err(RuntimeError::ConflictingManifest {
-                manifest: manifest_id,
-            }),
+            } else {
+                Err(RuntimeError::ConflictingManifest {
+                    manifest: manifest_id,
+                })
+            };
         }
+
+        for child in &record.manifest.children {
+            if let Some(existing) = self.child_parent_by_manifest.get(&child.manifest) {
+                if existing != &record.manifest.snapshot {
+                    return Err(RuntimeError::ConflictingChildParent {
+                        manifest: child.manifest,
+                    });
+                }
+            }
+        }
+
+        self.manifests.insert(manifest_id, record.clone());
+        if record.is_root {
+            self.root_manifests_by_snapshot
+                .entry(record.manifest.snapshot)
+                .or_default()
+                .insert(manifest_id);
+        }
+        for child in &record.manifest.children {
+            self.child_parent_by_manifest
+                .insert(child.manifest, record.manifest.snapshot);
+        }
+        Ok(true)
     }
 
     /// The announcement for one snapshot, if recorded.
@@ -182,14 +207,7 @@ impl RuntimeState {
     /// embed their snapshot, so cross-snapshot id collisions do not
     /// occur for honest members.
     pub fn manifest_parent_snapshot(&self, child: &ContentId) -> Option<SnapshotId> {
-        self.manifests.values().find_map(|record| {
-            record
-                .manifest
-                .children
-                .iter()
-                .any(|link| link.manifest == *child)
-                .then_some(record.manifest.snapshot)
-        })
+        self.child_parent_by_manifest.get(child).copied()
     }
 
     /// Remember that an object is already present locally.
@@ -225,11 +243,7 @@ impl RuntimeState {
         for snapshot in self.announcements.keys() {
             // Root manifests are the snapshot anchors; child manifests share
             // the snapshot id but do not resolve the announcement on their own.
-            if !self
-                .manifests
-                .values()
-                .any(|record| record.is_root && record.manifest.snapshot == *snapshot)
-            {
+            if !self.root_manifests_by_snapshot.contains_key(snapshot) {
                 pending_snapshots.insert(*snapshot);
             }
         }
@@ -396,6 +410,36 @@ mod tests {
     }
 
     #[test]
+    fn derived_indexes_reject_child_claimed_by_another_snapshot() {
+        let mut state = RuntimeState::new(drive());
+        assert!(state.record_manifest(root_manifest(1, 9, 4, 5)).unwrap());
+
+        let conflicting = root_manifest(2, 10, 8, 5);
+        assert!(matches!(
+            state.record_manifest(conflicting),
+            Err(RuntimeError::ConflictingChildParent { .. })
+        ));
+        assert_eq!(
+            state.manifest_parent_snapshot(&ContentId::from_bytes([6; 32])),
+            Some(SnapshotId::from_bytes([1; 32]))
+        );
+    }
+
+    #[test]
+    fn derived_root_index_is_rebuilt_by_state_mutations() {
+        let mut state = RuntimeState::new(drive());
+        state.record_announcement(announcement(1, 2, 3)).unwrap();
+        let root = root_manifest(1, 9, 4, 5);
+        let root_id = root.manifest_id;
+        state.record_manifest(root).unwrap();
+
+        assert!(state.reconcile().pending_snapshots.is_empty());
+        assert!(
+            state.root_manifests_by_snapshot[&SnapshotId::from_bytes([1; 32])].contains(&root_id)
+        );
+    }
+
+    #[test]
     fn alternate_manifest_storage_ids_merge_by_plaintext_identity() {
         let mut state = RuntimeState::new(drive());
         let mut a = root_manifest(1, 9, 4, 5);
@@ -502,14 +546,17 @@ mod tests {
         let mut state = RuntimeState::new(drive());
         let content = ContentId::from_bytes([4; 32]);
         let mut first = root_manifest(1, 9, 4, 5);
+        first.manifest.children.clear();
         first.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
         first.manifest.entries[0].encryption_epoch = 1;
         first.manifest_id = manifest_id_for(&first);
         let mut second = root_manifest(2, 9, 4, 5);
+        second.manifest.children.clear();
         second.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
         second.manifest.entries[0].encryption_epoch = 1;
         second.manifest_id = manifest_id_for(&second);
         let mut third = root_manifest(3, 9, 4, 5);
+        third.manifest.children.clear();
         third.manifest.entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
         third.manifest.entries[0].encryption_epoch = 2;
         third.manifest_id = manifest_id_for(&third);

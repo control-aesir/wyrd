@@ -17,7 +17,7 @@ use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
 pub mod engine;
 
-pub use engine::{DrainReport, Engine, EngineError};
+pub use engine::{DrainReport, Engine, EngineError, ExecuteReport};
 
 /// Local residency policy for one content object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +165,28 @@ impl RuntimeState {
                 manifest: manifest_id,
             }),
         }
+    }
+
+    /// The announcement for one snapshot, if recorded.
+    pub fn announcement(&self, snapshot: &SnapshotId) -> Option<&SnapshotAnnouncement> {
+        self.announcements.get(snapshot)
+    }
+
+    /// The snapshot whose recorded manifest tree references a child
+    /// manifest id. Child manifests seal under their snapshot's
+    /// manifest key, so the fetch layer needs the owning snapshot to
+    /// derive it. First match in record order wins; manifest bytes
+    /// embed their snapshot, so cross-snapshot id collisions do not
+    /// occur for honest members.
+    pub fn manifest_parent_snapshot(&self, child: &ContentId) -> Option<SnapshotId> {
+        self.manifests.values().find_map(|record| {
+            record
+                .manifest
+                .children
+                .iter()
+                .any(|link| link.manifest == *child)
+                .then_some(record.manifest.snapshot)
+        })
     }
 
     /// Remember that an object is already present locally.

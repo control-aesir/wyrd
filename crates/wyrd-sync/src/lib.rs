@@ -10,6 +10,7 @@
 //! all three together and run the full test suite.
 
 pub mod authorization;
+pub mod bulk;
 pub mod control;
 pub mod durable;
 #[cfg(test)]

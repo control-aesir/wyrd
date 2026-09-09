@@ -3,11 +3,15 @@
 //!
 //! Sync-only, like the rest of `wyrd-sync`: the [`Mailbox`] trait is the
 //! transport boundary (in-memory fake in tests, relay pool later), and
-//! bulk object transport arrives in a later slice. The engine owns the
-//! [`ControlInbox`] dedupe set, an observed [`MembershipLog`] for
-//! capability authorization, and the [`DurableStore`] handle; every
-//! accepted message commits facts before the next envelope is read, so a
-//! crash can only lose envelopes the relay still holds for redelivery.
+//! [`BulkSource`] is the bulk boundary (in-memory fake in tests,
+//! iroh-blobs later). The engine owns the [`ControlInbox`] dedupe set,
+//! an observed [`MembershipLog`] for capability authorization, and the
+//! [`DurableStore`] handle; every accepted message commits facts before
+//! the next envelope is read, so a crash can only lose envelopes the
+//! relay still holds for redelivery. [`Engine::execute_plan`] (the
+//! engine-planning slice) runs the reconciled fetch plan against the
+//! bulk source afterwards, importing objects strictly through
+//! `insert_verified`.
 //!
 //! Redelivery policy, stated exactly:
 //!
@@ -32,32 +36,44 @@
 //! deliveries is the assumption this depends on.
 //!
 //! [`Mailbox`]: crate::transport::mailbox::Mailbox
+//! [`BulkSource`]: crate::bulk::BulkSource
 //! [`ControlInbox`]: crate::control::ControlInbox
 //! [`MembershipLog`]: crate::membership::MembershipLog
 //! [`DurableStore`]: crate::durable::DurableStore
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use secp256k1::SecretKey;
 use thiserror::Error;
-use wyrd_format::{DeviceId, DriveId, MembershipTransition};
+use wyrd_format::{
+    ChildManifest, ContentId, DeviceId, DriveId, ManifestEntry, MembershipTransition, ObjectStore,
+    SnapshotId,
+};
 
+use super::{ManifestRecord, MaterializationState, PendingObjectFetch, RuntimeError, RuntimeState};
+
+use crate::bulk::{BulkSource, SealedManifest};
 use crate::control::{ControlInbox, ControlMessageId, IngestReport, Message, SealedControl};
 use crate::durable::{AuthorizedCapability, DurableError, DurableStore, Fact};
-use crate::ingest::{check_total_len, check_transition, Limits};
-use crate::keys::capability::WrappedCapability;
+use crate::ingest::{check_manifest, check_total_len, check_transition, Limits};
+use crate::keys::capability::{DriveKeyring, WrappedCapability};
 use crate::membership::{MembershipLog, TransitionStatus};
+use crate::seal::{open_manifest, verify, EncryptedObject};
 use crate::transport::mailbox::{open_from_sender, Mailbox, MailboxEnvelope};
 
-/// Engine failures: only durable-commit trouble is fatal. Per-envelope
-/// mailbox, decode, and ingest failures are counted in the
-/// [`DrainReport`], never raised, so one hostile envelope cannot wedge
-/// the drain.
+/// Engine failures: durable-commit trouble and runtime-record
+/// trouble are fatal. Per-envelope mailbox, decode, and ingest
+/// failures are counted in the [`DrainReport`], never raised, so one
+/// hostile envelope cannot wedge the drain. Bulk fetch failures are
+/// never raised either: a missing or corrupt bulk object just leaves
+/// its plan item unfulfilled for the next pass.
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("durable commit failed: {0}")]
     Durable(#[from] DurableError),
+    #[error("runtime record failed: {0}")]
+    Runtime(#[from] RuntimeError),
 }
 
 /// What one [`Engine::drain`] pass did.
@@ -71,6 +87,19 @@ pub struct DrainReport {
     pub deferred: usize,
     /// Envelopes that could not be processed (left for redelivery).
     pub skipped: usize,
+}
+
+/// What one [`Engine::execute_plan`] pass committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecuteReport {
+    /// Manifest records (root and child) committed this run.
+    pub manifests: usize,
+    /// Objects verified and marked local this run.
+    pub objects: usize,
+    /// Plan items still unfulfilled: bulk bytes absent, epoch
+    /// capabilities unheld, or fetched bytes that failed verification.
+    /// Nothing commits for these; the next run retries them.
+    pub unfulfilled: usize,
 }
 
 /// Cap on held messages: without one, distinct never-authorizable
@@ -385,6 +414,216 @@ impl Engine {
             Err(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
         }
     }
+
+    /// Set the residency policy for one content object, durably. The
+    /// next [`Engine::execute_plan`] run fetches everything not
+    /// `RemoteOnly` that is not yet local.
+    pub fn set_materialization(
+        &mut self,
+        content: ContentId,
+        state: MaterializationState,
+    ) -> Result<(), EngineError> {
+        self.store
+            .commit(&[Fact::Materialization(content, state)])?;
+        Ok(())
+    }
+
+    /// Run the fetch plan to convergence against a bulk source,
+    /// importing every object strictly through `insert_verified`.
+    ///
+    /// Each pass rebuilds the keyring and runtime view from durable
+    /// facts, reconciles the plan, and commits one batch of manifest
+    /// and local-object facts. Passes repeat while they commit: child
+    /// manifests discovered in one pass unlock their own children and
+    /// objects in the next. A pass that commits nothing ends the run;
+    /// its remaining items are reported as unfulfilled, never raised.
+    ///
+    /// Per-item failure policy, stated exactly:
+    ///
+    /// ```text
+    /// bulk bytes absent ........... unfulfilled, retried next run
+    /// bulk transport error ........ unfulfilled, retried next run
+    /// epoch capability unheld ..... unfulfilled, retried next run
+    /// over ingest limits .......... unfulfilled, never committed
+    /// undecodable / wrong kind .... unfulfilled, never committed
+    /// failed AEAD / identity ...... unfulfilled, never committed
+    /// store import failure ........ unfulfilled, never marked local
+    /// ```
+    ///
+    /// A failed import never marks the object local and never commits:
+    /// verification is the store's job (`insert_verified`), and only
+    /// bytes that pass it earn a `LocalObject` fact.
+    pub fn execute_plan(
+        &mut self,
+        bulk: &mut impl BulkSource,
+        objects: &mut impl ObjectStore,
+    ) -> Result<ExecuteReport, EngineError> {
+        let mut report = ExecuteReport::default();
+        loop {
+            let rebuilt = self.store.rebuild(self.device)?;
+            let mut runtime = rebuilt.runtime;
+            let keyring = rebuilt.keyring;
+            let plan = runtime.reconcile();
+            let mut facts = Vec::new();
+
+            for snapshot in &plan.pending_snapshots {
+                if let Some(record) =
+                    Self::fetch_root(&self.drive, bulk, &keyring, &runtime, snapshot)
+                {
+                    runtime.record_manifest(record.clone())?;
+                    facts.push(Fact::Manifest(record));
+                    report.manifests += 1;
+                }
+            }
+            for (id, link) in &plan.pending_manifests {
+                if let Some(record) =
+                    Self::fetch_child(&self.drive, bulk, &keyring, &runtime, id, link)
+                {
+                    runtime.record_manifest(record.clone())?;
+                    facts.push(Fact::Manifest(record));
+                    report.manifests += 1;
+                }
+            }
+            for (content, candidates) in &plan.pending_objects {
+                if Self::fetch_object(&self.drive, bulk, &keyring, objects, content, candidates) {
+                    runtime.mark_local_object(*content);
+                    facts.push(Fact::LocalObject(*content));
+                    report.objects += 1;
+                }
+            }
+
+            if facts.is_empty() {
+                report.unfulfilled = plan.pending_snapshots.len()
+                    + plan.pending_manifests.len()
+                    + plan.pending_objects.len();
+                return Ok(report);
+            }
+            if let Err(e) = self.store.commit(&facts) {
+                let _ = self.resync();
+                return Err(e.into());
+            }
+        }
+    }
+
+    /// Fetch and validate one pending root manifest. The manifest key
+    /// derives from the announcement's epoch secret; the bulk peer's
+    /// claimed ContentId verifies as the seal AAD on open, so a lying
+    /// peer fails the tag instead of planting a record.
+    fn fetch_root(
+        drive: &DriveId,
+        bulk: &mut impl BulkSource,
+        keyring: &DriveKeyring,
+        runtime: &RuntimeState,
+        snapshot: &SnapshotId,
+    ) -> Option<ManifestRecord> {
+        let announcement = runtime.announcement(snapshot)?;
+        let secret = keyring.secret(announcement.epoch)?;
+        let key = secret.manifest_key(drive, announcement.epoch, snapshot);
+        let served: SealedManifest = bulk.fetch_root_manifest(snapshot).ok()??;
+        Self::open_record(&served.sealed, &key, &served.content_id, *snapshot, true)
+    }
+
+    /// Fetch and validate one pending child manifest. Children seal
+    /// under their snapshot's manifest key; the owning snapshot comes
+    /// from the recorded parent, the expected identity from the
+    /// authenticated parent link.
+    fn fetch_child(
+        drive: &DriveId,
+        bulk: &mut impl BulkSource,
+        keyring: &DriveKeyring,
+        runtime: &RuntimeState,
+        id: &ContentId,
+        link: &ChildManifest,
+    ) -> Option<ManifestRecord> {
+        let snapshot = runtime.manifest_parent_snapshot(id)?;
+        let announcement = runtime.announcement(&snapshot)?;
+        let secret = keyring.secret(announcement.epoch)?;
+        let key = secret.manifest_key(drive, announcement.epoch, &snapshot);
+        let sealed = bulk.fetch_sealed(&link.storage).ok()??;
+        Self::open_record(&sealed, &key, &link.manifest, snapshot, false)
+    }
+
+    /// Gate, open, and limit-check sealed manifest bytes into a record.
+    /// Anything the bytes do wrong — oversize, undecodable, failed tag,
+    /// unparsable, over structural limits — is `None`: corrupt bulk
+    /// data is never a durable fact.
+    fn open_record(
+        sealed: &[u8],
+        key: &[u8; 32],
+        expected: &ContentId,
+        snapshot: SnapshotId,
+        is_root: bool,
+    ) -> Option<ManifestRecord> {
+        if check_total_len(&Limits::V0, "sealed manifest", sealed.len()).is_err() {
+            return None;
+        }
+        let obj = EncryptedObject::decode(sealed).ok()?;
+        let manifest = open_manifest(key, expected, &obj).ok()?;
+        if check_manifest(&Limits::V0, &manifest).is_err() {
+            return None;
+        }
+        if manifest.snapshot != snapshot {
+            return None;
+        }
+        Some(ManifestRecord {
+            is_root,
+            manifest_id: *expected,
+            storage_ids: BTreeSet::from([obj.storage_id()]),
+            manifest,
+        })
+    }
+
+    /// Fetch one object by trying each representation the plan
+    /// retains, in order, and importing the first whose epoch key is
+    /// held and whose bytes verify. Representations under unheld
+    /// epochs are skipped, not failed: the device re-encrypts under
+    /// its own epoch rather than reaching for keys it lacks.
+    fn fetch_object(
+        drive: &DriveId,
+        bulk: &mut impl BulkSource,
+        keyring: &DriveKeyring,
+        objects: &mut impl ObjectStore,
+        content: &ContentId,
+        candidates: &[PendingObjectFetch],
+    ) -> bool {
+        for candidate in candidates {
+            let Some(secret) = keyring.secret(candidate.encryption_epoch) else {
+                continue;
+            };
+            let key = secret.object_key(
+                drive,
+                candidate.encryption_epoch,
+                content,
+                candidate.kind,
+                candidate.version,
+            );
+            let entry = ManifestEntry {
+                content_id: *content,
+                kind: candidate.kind,
+                version: candidate.version,
+                storage_id: candidate.storage_id,
+                encryption_epoch: candidate.encryption_epoch,
+                size: candidate.size,
+            };
+            let Ok(Some(sealed)) = bulk.fetch_sealed(&candidate.storage_id) else {
+                continue;
+            };
+            if check_total_len(&Limits::V0, "sealed object", sealed.len()).is_err() {
+                continue;
+            }
+            let Ok(plaintext) = verify(&entry, &key, &sealed) else {
+                continue;
+            };
+            if objects
+                .insert_verified(candidate.kind, content, &plaintext)
+                .is_err()
+            {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
 }
 
 /// The dedupe id of sealed bytes, when they decode.
@@ -395,16 +634,22 @@ fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bulk::{MemoryBulkSource, SealedManifest};
     use crate::control::{seal, CapabilityPayload, SnapshotAnnouncement, TransitionPayload};
     use crate::keys::capability::Capability;
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
+    use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
     use crate::transport::mailbox::{seal_for_recipient, MailboxError};
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-    use wyrd_format::{Change, DeviceEncryptionKey, SnapshotId, TransitionId};
+    use wyrd_format::store::MemoryStoreError;
+    use wyrd_format::{
+        Change, ChildManifest, DeviceEncryptionKey, Manifest, MemoryObjectStore, ObjectKind,
+        ObjectStore, SnapshotId, TransitionId,
+    };
 
     /// An isolated store directory, removed on drop (mirrors the
     /// durable-store test helper: process id plus counter, since tests
@@ -1223,5 +1468,438 @@ mod tests {
         assert_eq!(fixture.engine.pending_count(), 0);
         let facts = fixture.engine.store.load().expect("loads");
         assert!(facts.capabilities.is_empty());
+    }
+
+    // --- plan execution -------------------------------------------------
+    //
+    // The publisher side seals manifests and objects under keys derived
+    // from the epoch secret the capability delivers; the engine side
+    // ingests the control plane, pins the content, and executes the
+    // plan against the in-memory bulk peer.
+
+    /// The engine device's encryption secret (mirrors `fixture`).
+    fn engine_encryption_sk() -> SecretKey {
+        SecretKey::from_slice(&[0xE0; 32]).unwrap()
+    }
+
+    /// Admit the engine device with its real encryption key, epoch 2.
+    fn admit_engine(builder: &mut Builder, device: DeviceId) -> MembershipTransition {
+        builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&engine_encryption_sk()),
+        })])
+    }
+
+    /// A capability delivering `secrets` (exactly `epoch` of them) to
+    /// the engine device, sealed the way the intake tests do.
+    fn capability_message(
+        device: DeviceId,
+        transition: TransitionId,
+        epoch: u64,
+        secrets: Vec<EpochSecret>,
+    ) -> Message {
+        let cap = Capability::new(
+            member_drive(),
+            device,
+            encryption_key(&engine_encryption_sk()),
+            transition,
+            epoch,
+            secrets,
+        )
+        .expect("well-formed");
+        Message::Capability(CapabilityPayload {
+            device,
+            epoch,
+            wrapped: cap.wrap().expect("wraps").as_bytes().to_vec(),
+        })
+    }
+
+    /// Ingest the control plane for one snapshot announcement: the
+    /// genesis, the admission transition, the capability carrying
+    /// `secrets`, and the announcement itself.
+    fn intake_snapshot(
+        fixture: &mut Fixture,
+        genesis: &MembershipTransition,
+        admission: &MembershipTransition,
+        secrets: Vec<EpochSecret>,
+    ) {
+        let bound = announcement_for(2, admission.transition_id());
+        let cap = capability_message(fixture.recipient, admission.transition_id(), 2, secrets);
+        let mail = vec![
+            deliver(fixture, 1, &transition_message(genesis)),
+            deliver(fixture, 1, &transition_message(admission)),
+            deliver(fixture, 2, &cap),
+            deliver(fixture, 2, &bound),
+        ];
+        queue(fixture, mail);
+        assert_eq!(drain(fixture).accepted, 4);
+    }
+
+    struct Published {
+        bulk: MemoryBulkSource,
+        content: ContentId,
+    }
+
+    /// Seal one chunk under an entry epoch secret and publish it plus
+    /// a root manifest (with one empty child) to a bulk peer. Returns
+    /// the peer and the chunk's content id.
+    fn publish(
+        manifest_secret: &EpochSecret,
+        manifest_epoch: u64,
+        object_secret: &EpochSecret,
+        object_epoch: u64,
+        plaintext: &[u8],
+    ) -> Published {
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let drive = member_drive();
+        let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+        let object_key = object_secret.object_key(
+            &drive,
+            object_epoch,
+            &content,
+            ObjectKind::Chunk,
+            SEAL_VERSION,
+        );
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let entry = entry_for(
+            ObjectKind::Chunk,
+            object_epoch,
+            &sealed_object,
+            &content,
+            plaintext,
+        )
+        .unwrap();
+
+        let child_manifest = Manifest {
+            snapshot,
+            entries: vec![],
+            children: vec![],
+        };
+        let manifest_key = manifest_secret.manifest_key(&drive, manifest_epoch, &snapshot);
+        let (child_id, sealed_child) = seal_manifest(&manifest_key, &child_manifest).unwrap();
+        let link = ChildManifest {
+            tree: ContentId::from_bytes([0xC1; 32]),
+            manifest: child_id,
+            storage: sealed_child.storage_id(),
+        };
+        let root = Manifest {
+            snapshot,
+            entries: vec![entry],
+            children: vec![link],
+        };
+        let (root_id, sealed_root) = seal_manifest(&manifest_key, &root).unwrap();
+
+        let mut bulk = MemoryBulkSource::default();
+        bulk.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: root_id,
+                sealed: sealed_root.encode(),
+            },
+        );
+        bulk.publish_sealed(sealed_child.storage_id(), sealed_child.encode());
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+        Published { bulk, content }
+    }
+
+    /// A store that refuses the local-write path: any import the
+    /// engine performs must go through `insert_verified`, or the test
+    /// panics. (The review scope note, enforced as a test.)
+    struct NoBareInsert(MemoryObjectStore);
+
+    impl ObjectStore for NoBareInsert {
+        type Error = MemoryStoreError;
+
+        fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, Self::Error> {
+            panic!("bulk imports must use insert_verified, never bare insert");
+        }
+
+        fn insert_verified(
+            &mut self,
+            kind: ObjectKind,
+            expected: &ContentId,
+            data: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.0.insert_verified(kind, expected, data)
+        }
+
+        fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.0.get(id)
+        }
+
+        fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
+            self.0.has(id)
+        }
+    }
+
+    #[test]
+    fn plan_executes_to_convergence() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"hello wyrd");
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2, "root plus its child");
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+        assert_eq!(
+            objects.get(&published.content).unwrap().as_deref(),
+            Some(b"hello wyrd".as_slice())
+        );
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.manifests.len(), 2);
+        assert_eq!(facts.local_objects, vec![published.content]);
+
+        // A second run is a no-op: everything recorded, nothing pending.
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(
+            report,
+            ExecuteReport {
+                manifests: 0,
+                objects: 0,
+                unfulfilled: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_imports_only_through_insert_verified() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"pinned import");
+        let mut objects = NoBareInsert(MemoryObjectStore::default());
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Cached)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+        assert!(objects.has(&published.content).unwrap());
+    }
+
+    #[test]
+    fn plan_waits_for_absent_bytes_then_converges() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"late bytes");
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+
+        // Nothing published yet: the snapshot stays pending, nothing commits.
+        let mut empty = MemoryBulkSource::default();
+        let report = fixture
+            .engine
+            .execute_plan(&mut empty, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.manifests.is_empty());
+        assert!(facts.local_objects.is_empty());
+
+        // The peer arrives: the same plan converges without re-intake.
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+    }
+
+    #[test]
+    fn plan_rejects_corrupt_bulk_without_poison() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let mut objects = MemoryObjectStore::default();
+
+        // Truncated bytes, a well-formed seal under the wrong key, and
+        // a wrong-identity claim: none may become a durable fact.
+        let mut hostile = MemoryBulkSource::default();
+        hostile.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: ContentId::from_bytes([0xEE; 32]),
+                sealed: vec![0xAA; 10],
+            },
+        );
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0);
+        assert_eq!(report.unfulfilled, 1);
+
+        let foreign = EncryptedObject {
+            version: SEAL_VERSION,
+            kind: ObjectKind::Manifest,
+            nonce: [0x11; 24],
+            ciphertext: vec![0x22; 64],
+        };
+        let foreign_id = ContentId::from_bytes([0xEF; 32]);
+        hostile.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: foreign_id,
+                sealed: foreign.encode(),
+            },
+        );
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0);
+        assert_eq!(report.unfulfilled, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.manifests.is_empty());
+
+        // The honest peer replaces the hostile bytes: the plan
+        // converges, proving skips never poisoned the snapshot.
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"honest bytes");
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+    }
+
+    #[test]
+    fn plan_skips_objects_without_epoch_capability() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // The manifest opens under the held epoch, but its entry names
+        // an epoch the device holds no capability for: the manifest
+        // records, the object waits, and nothing reaches the store.
+        let foreign_secret = EpochSecret::from_bytes([0x0A; 32]);
+        let published = publish(&epoch_secret, 2, &foreign_secret, 9, b"future epoch");
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1);
+        assert!(!objects.has(&published.content).unwrap());
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.local_objects.is_empty());
+    }
+
+    #[test]
+    fn plan_enforces_limits_on_bulk_bytes() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![
+                EpochSecret::from_bytes([0x08; 32]),
+                EpochSecret::from_bytes([0x09; 32]),
+            ],
+        );
+
+        // Past the 64 MiB pre-decode ceiling: gated before decode,
+        // never committed, still pending for the next run.
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let mut oversize = MemoryBulkSource::default();
+        oversize.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: ContentId::from_bytes([0xED; 32]),
+                sealed: vec![0xAA; 64 * 1024 * 1024 + 1],
+            },
+        );
+        let mut objects = MemoryObjectStore::default();
+        let report = fixture
+            .engine
+            .execute_plan(&mut oversize, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0);
+        assert_eq!(report.unfulfilled, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.manifests.is_empty());
     }
 }

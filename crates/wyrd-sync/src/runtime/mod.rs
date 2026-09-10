@@ -426,6 +426,27 @@ mod tests {
     }
 
     #[test]
+    fn derived_indexes_reject_child_claimed_by_non_root_manifests() {
+        let mut first = manifest_record(1, 9, 4, 5, false);
+        first.manifest_id = manifest_id_for(&first);
+        let mut state = RuntimeState::new(drive());
+        assert!(state.record_manifest(first).unwrap());
+
+        let mut conflicting = manifest_record(2, 10, 8, 5, false);
+        conflicting.manifest_id = manifest_id_for(&conflicting);
+        assert!(matches!(
+            state.record_manifest(conflicting),
+            Err(RuntimeError::ConflictingChildParent { .. })
+        ));
+        // The rejected insert leaves the index untouched.
+        assert_eq!(
+            state.manifest_parent_snapshot(&ContentId::from_bytes([6; 32])),
+            Some(SnapshotId::from_bytes([1; 32]))
+        );
+        assert_eq!(state.manifests.len(), 1);
+    }
+
+    #[test]
     fn derived_root_index_is_rebuilt_by_state_mutations() {
         let mut state = RuntimeState::new(drive());
         state.record_announcement(announcement(1, 2, 3)).unwrap();

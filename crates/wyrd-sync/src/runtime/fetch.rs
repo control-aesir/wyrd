@@ -217,6 +217,11 @@ impl<T> FetchOutcome<T> {
     /// they ever surface. A refused local import maps to corrupt: the
     /// bytes verified, so retrying the network cannot help — the data
     /// path itself needs repair.
+    ///
+    /// No production caller yet: the daemon composing sync with the
+    /// FUSE view settles attempts through here once in-flight fetch
+    /// tracking lands. Unit tests pin the contract until then.
+    #[allow(dead_code)]
     pub(super) fn settled(&self) -> FetchStatus {
         match self {
             FetchOutcome::Fulfilled(_) => FetchStatus::Available,

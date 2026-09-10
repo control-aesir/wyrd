@@ -19,6 +19,8 @@ pub mod engine;
 mod fetch;
 mod intake;
 mod plan;
+#[cfg(test)]
+pub(crate) mod test_util;
 
 pub use engine::{DrainReport, Engine, EngineError, ExecuteReport};
 

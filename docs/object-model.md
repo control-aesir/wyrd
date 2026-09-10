@@ -144,6 +144,8 @@ filesystem face grows.)
 - `/`-separated, case-sensitive, UTF-8, no Unicode normalization is applied
   or enforced
 - components must be non-empty; `.` and `..` are not valid components
+- components must not contain `/` or null bytes (names reach FUSE and host
+  filesystems, where NUL truncates or panics)
 - duplicate names within a tree are impossible (canonical sorted encoding)
 
 Directories are content-addressed trees: a dir node hashes to the ContentId

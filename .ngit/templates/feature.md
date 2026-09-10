@@ -39,7 +39,7 @@ re-deriving the design.}}
 
 1. {{Doc-level check: cross-references valid, status lines updated, decision
    records extended, no dangling "DRAFT" claims.}}
-2. Code-level: `devenv shell -- cargo check && devenv shell -- cargo test`
+2. Code-level: `devenv shell -- cargo check && devenv shell -- cargo nextest run`
    green (docs-only changes still run it — hooks run clippy/rustfmt/typos on
    every commit).
 3. {{Any new test that pins an invariant the change introduces.}}

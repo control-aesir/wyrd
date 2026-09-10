@@ -47,9 +47,10 @@ to. The README carries the vision; `docs/` carries the current design contract.
 ## Commands
 
 ```
-cargo check        # workspace build/validation
-cargo test         # once there are tests
-devenv shell       # enter the dev environment (rust, git-hooks)
+cargo check                 # workspace build/validation
+cargo nextest run           # workspace tests (unit + integration)
+cargo test --workspace --doc  # doctests; nextest skips these
+devenv shell                # enter the dev environment (rust, git-hooks)
 ```
 
 ## Conventions

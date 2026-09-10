@@ -135,7 +135,7 @@ devenv shell
 
 # build and test the workspace
 cargo check
-cargo test
+cargo nextest run
 ```
 
 `crates/wyrd-format` carries the format contract and `crates/wyrd-sync`

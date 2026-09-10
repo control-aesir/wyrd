@@ -148,95 +148,6 @@ fn tip_members(chain: &[MembershipTransition]) -> BTreeSet<DeviceId> {
 }
 
 proptest! {
-    /// Arrival order never decides verdicts: three distinct orders over
-    /// the same observed set agree on every status and the known tip.
-    #[test]
-    fn arrival_order_does_not_change_verdicts(
-        ops in prop::collection::vec(op_strategy(), 0..12usize),
-        seed in any::<u64>(),
-    ) {
-        let chain = build_chain(&ops);
-        let orders = [
-            chain.clone(),
-            chain.iter().rev().cloned().collect(),
-            shuffled(&chain, seed),
-        ];
-        let mut logs = Vec::new();
-        for order in &orders {
-            let mut log = MembershipLog::new(drive());
-            observe_all(&mut log, order);
-            logs.push(log);
-        }
-        for t in &chain {
-            let id = t.transition_id();
-            for log in &logs[1..] {
-                prop_assert_eq!(log.status(&id), logs[0].status(&id));
-            }
-        }
-        let tips: Vec<Option<u64>> =
-            logs.iter().map(|l| l.known_state().map(|k| k.epoch)).collect();
-        prop_assert!(tips.windows(2).all(|w| w[0] == w[1]));
-    }
-
-    /// Canonical apply equals the sequential fold: the link-walking
-    /// derivation must agree with folding `state::apply` over the
-    /// canonical transitions in epoch order, at every step — and the
-    /// verdicts and known tip must match between canonical-order and
-    /// shuffled-order observation. This pins derived states against the
-    /// naive semantics, so refactors of the chain walk (e.g. iterative
-    /// validation) cannot silently change what a transition means.
-    #[test]
-    fn canonical_apply_matches_sequential_fold(
-        ops in prop::collection::vec(op_strategy(), 0..12usize),
-        seed in any::<u64>(),
-    ) {
-        let chain = build_chain(&ops);
-        let mut canonical_log = MembershipLog::new(drive());
-        observe_all(&mut canonical_log, &chain);
-        let mut shuffled_log = MembershipLog::new(drive());
-        observe_all(&mut shuffled_log, &shuffled(&chain, seed));
-        prop_assert_eq!(shuffled_log.statuses(), canonical_log.statuses());
-        prop_assert_eq!(shuffled_log.known_state(), canonical_log.known_state());
-        let mut canonical: Vec<&MembershipTransition> = chain
-            .iter()
-            .filter(|t| {
-                shuffled_log.status(&t.transition_id()) == Some(TransitionStatus::Canonical)
-            })
-            .collect();
-        canonical.sort_by_key(|t| t.epoch);
-        prop_assert!(!canonical.is_empty(), "valid chain has a tip");
-        let mut folded = MembershipState::default();
-        for t in &canonical {
-            // Generated chains are valid end to end by construction
-            // (ill-formed ops degrade to `Rotate`), so the fold cannot fail.
-            folded = apply(&folded, &t.changes).expect("generated chain folds");
-            prop_assert_eq!(
-                shuffled_log.state_of(&t.transition_id()),
-                Some(folded.clone())
-            );
-        }
-    }
-
-    /// Canonical epochs are exactly 1..=K: no gaps, no duplicates, no
-    /// extras on a conflict-free chain.
-    #[test]
-    fn canonical_epochs_are_consecutive(
-        ops in prop::collection::vec(op_strategy(), 0..12usize),
-    ) {
-        let chain = build_chain(&ops);
-        let mut log = MembershipLog::new(drive());
-        observe_all(&mut log, &chain);
-        prop_assert!(log.known_state().is_some(), "valid chain has a tip");
-        let tip = log.known_state().expect("asserted").epoch;
-        let mut epochs: Vec<u64> = chain
-            .iter()
-            .filter(|t| log.status(&t.transition_id()) == Some(TransitionStatus::Canonical))
-            .map(|t| log.transition(&t.transition_id()).expect("observed").epoch)
-            .collect();
-        epochs.sort_unstable();
-        prop_assert_eq!(epochs, (1..=tip).collect::<Vec<_>>());
-    }
-
     /// Corruption never canonicalizes: flip a byte anywhere in a random
     /// transition of a valid chain — signature, roots, counts, prev —
     /// and the forged document must never become canonical, whatever
@@ -529,5 +440,158 @@ proptest! {
                 prop_assert!(observed.contains(kid));
             }
         }
+    }
+}
+
+// The slowest properties below run sharded: four tests of SHARD_CASES
+// novel cases each instead of one test of 256. The per-run budget is
+// unchanged, but nextest executes the shards in parallel, so wall
+// time roughly quarters on a multicore machine. Persisted regression
+// seeds replay in every shard on top. Bodies are written once; the
+// macro stamps out the four shard tests, so shrinking and failure
+// reporting behave exactly like hand-written tests.
+const SHARD_CASES: u32 = 64;
+macro_rules! sharded_property {
+    (
+        body $body:block
+        shards { $($name:ident ( $($arg:ident in $strategy:expr),* ))* }
+    ) => {
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(SHARD_CASES))]
+            $(
+                #[test]
+                fn $name($($arg in $strategy),*) $body
+            )*
+        }
+    };
+}
+
+sharded_property! {
+    // Arrival order never decides verdicts: three distinct orders over
+    // the same observed set agree on every status and the known tip.
+    body {
+        let chain = build_chain(&ops);
+        let orders = [
+            chain.clone(),
+            chain.iter().rev().cloned().collect(),
+            shuffled(&chain, seed),
+        ];
+        let mut logs = Vec::new();
+        for order in &orders {
+            let mut log = MembershipLog::new(drive());
+            observe_all(&mut log, order);
+            logs.push(log);
+        }
+        for t in &chain {
+            let id = t.transition_id();
+            for log in &logs[1..] {
+                prop_assert_eq!(log.status(&id), logs[0].status(&id));
+            }
+        }
+        let tips: Vec<Option<u64>> =
+            logs.iter().map(|l| l.known_state().map(|k| k.epoch)).collect();
+        prop_assert!(tips.windows(2).all(|w| w[0] == w[1]));
+    }
+    shards {
+        arrival_order_does_not_change_verdicts(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+        arrival_order_does_not_change_verdicts_shard_1(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+        arrival_order_does_not_change_verdicts_shard_2(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+        arrival_order_does_not_change_verdicts_shard_3(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+    }
+}
+
+sharded_property! {
+    // Canonical apply equals the sequential fold: the link-walking
+    // derivation must agree with folding `state::apply` over the
+    // canonical transitions in epoch order, at every step.
+    body {
+        let chain = build_chain(&ops);
+        let mut canonical_log = MembershipLog::new(drive());
+        observe_all(&mut canonical_log, &chain);
+        let mut shuffled_log = MembershipLog::new(drive());
+        observe_all(&mut shuffled_log, &shuffled(&chain, seed));
+        prop_assert_eq!(shuffled_log.statuses(), canonical_log.statuses());
+        prop_assert_eq!(shuffled_log.known_state(), canonical_log.known_state());
+        let mut canonical: Vec<&MembershipTransition> = chain
+            .iter()
+            .filter(|t| {
+                shuffled_log.status(&t.transition_id()) == Some(TransitionStatus::Canonical)
+            })
+            .collect();
+        canonical.sort_by_key(|t| t.epoch);
+        prop_assert!(!canonical.is_empty(), "valid chain has a tip");
+        let mut folded = MembershipState::default();
+        for t in &canonical {
+            // Generated chains are valid end to end by construction
+            // (ill-formed ops degrade to `Rotate`), so the fold cannot fail.
+            folded = apply(&folded, &t.changes).expect("generated chain folds");
+            prop_assert_eq!(
+                shuffled_log.state_of(&t.transition_id()),
+                Some(folded.clone())
+            );
+        }
+    }
+    shards {
+        canonical_apply_matches_sequential_fold(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+        canonical_apply_matches_sequential_fold_shard_1(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+        canonical_apply_matches_sequential_fold_shard_2(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+        canonical_apply_matches_sequential_fold_shard_3(
+            ops in prop::collection::vec(op_strategy(), 0..12usize),
+            seed in any::<u64>()
+        )
+    }
+}
+
+sharded_property! {
+    // Canonical epochs are exactly 1..=K: no gaps, no duplicates, no
+    // extras on a conflict-free chain.
+    body {
+        let chain = build_chain(&ops);
+        let mut log = MembershipLog::new(drive());
+        observe_all(&mut log, &chain);
+        prop_assert!(log.known_state().is_some(), "valid chain has a tip");
+        let tip = log.known_state().expect("asserted").epoch;
+        let mut epochs: Vec<u64> = chain
+            .iter()
+            .filter(|t| log.status(&t.transition_id()) == Some(TransitionStatus::Canonical))
+            .map(|t| log.transition(&t.transition_id()).expect("observed").epoch)
+            .collect();
+        epochs.sort_unstable();
+        prop_assert_eq!(epochs, (1..=tip).collect::<Vec<_>>());
+    }
+    shards {
+        canonical_epochs_are_consecutive(
+            ops in prop::collection::vec(op_strategy(), 0..12usize)
+        )
+        canonical_epochs_are_consecutive_shard_1(
+            ops in prop::collection::vec(op_strategy(), 0..12usize)
+        )
+        canonical_epochs_are_consecutive_shard_2(
+            ops in prop::collection::vec(op_strategy(), 0..12usize)
+        )
+        canonical_epochs_are_consecutive_shard_3(
+            ops in prop::collection::vec(op_strategy(), 0..12usize)
+        )
     }
 }

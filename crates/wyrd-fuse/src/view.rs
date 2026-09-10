@@ -252,7 +252,16 @@ where
     /// in order and the total must equal the declared size — a lying
     /// size fails verification at consumption time instead of serving
     /// short or padded data.
+    ///
+    /// Prototype cost: the whole file assembles before slicing, so a
+    /// small ranged read on a large file loads everything. The
+    /// production path fetches only the overlapping chunk range (and
+    /// caches or separates full-file verification). Zero-length reads
+    /// short-circuit: no bytes served, nothing to verify.
     pub fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         let mut bytes = Vec::new();
         for chunk in &file.chunks {
             bytes.extend_from_slice(&self.load_chunk(chunk)?);
@@ -339,19 +348,22 @@ where
 }
 
 /// Merge per-head resolutions: unanimous absence is not-found,
-/// unanimous agreement serves, anything else is a conflict. Versions
-/// list only the heads where the path resolves.
+/// unanimous presence with agreement serves, anything else is a
+/// conflict. Presence versus deletion disagrees — deletion is a state
+/// change, so a path surviving in only some heads never serves
+/// quietly. Versions list only the heads where the path resolves.
 fn merge(resolutions: Vec<(wyrd_format::SnapshotId, Option<Node>)>) -> Result<Node, ViewError> {
     let mut present = Vec::with_capacity(resolutions.len());
-    for (snapshot, node) in resolutions {
+    for (snapshot, node) in &resolutions {
         if let Some(node) = node {
-            present.push((snapshot, node));
+            present.push((*snapshot, node.clone()));
         }
     }
-    let Some(((_, first), _)) = present.split_first() else {
+    if present.is_empty() {
         return Err(ViewError::NotFound);
-    };
-    if present.iter().all(|(_, node)| node == first) {
+    }
+    let first = &present[0].1;
+    if present.len() == resolutions.len() && present.iter().all(|(_, node)| node == first) {
         return Ok(first.clone());
     }
     Ok(Node::Conflict {
@@ -739,6 +751,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_reads_serve_nothing() {
+        let drive = small_drive();
+        let view = view(drive);
+        let file = view.open(&view.lookup("hello.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&file, 0, 0).unwrap(), b"");
+
+        // Even where bytes are absent: no bytes served, nothing to verify.
+        let mut store = MemoryObjectStore::default();
+        let missing = ContentId::derive(ObjectKind::Chunk, b"withheld");
+        let root = tree_of(
+            &mut store,
+            vec![Entry::file("gone.txt", 8, false, vec![missing]).unwrap()],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::with(vec![(missing, FetchStatus::Unavailable)]),
+            vec![snapshot(root)],
+        );
+        let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&gone, 0, 0).unwrap(), b"");
+        assert_eq!(view.read(&gone, 0, 8), Err(ViewError::Unavailable));
+    }
+
+    #[test]
     fn lying_size_is_corrupt() {
         let mut store = MemoryObjectStore::default();
         let data = chunk(&mut store, b"short");
@@ -750,6 +786,64 @@ mod tests {
 
         let file = view.open(&view.lookup("lies.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 1024), Err(ViewError::Corrupt));
+    }
+
+    #[test]
+    fn deletion_is_a_conflict_not_agreement() {
+        let mut store = MemoryObjectStore::default();
+        let kept = chunk(&mut store, b"kept");
+        let root_a = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 4, false, vec![kept]).unwrap()],
+        );
+        let root_b = tree_of(&mut store, vec![]);
+        let snap_a = snapshot(root_a);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snap_a.clone(), snapshot(root_b)],
+        );
+
+        // Present in one head, deleted in the other: a path conflict,
+        // never the surviving version served quietly.
+        let node = view.lookup("f.txt").unwrap();
+        let Node::Conflict { versions } = &node else {
+            panic!("presence versus deletion must conflict, got {node:?}");
+        };
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].snapshot, snap_a.snapshot_id());
+        assert_eq!(view.open(&node), Err(ViewError::Conflict));
+    }
+
+    #[test]
+    fn deleted_child_inside_a_conflicted_dir() {
+        let mut store = MemoryObjectStore::default();
+        let x = chunk(&mut store, b"1");
+        let sub_a = tree_of(
+            &mut store,
+            vec![Entry::file("x.txt", 1, false, vec![x]).unwrap()],
+        );
+        let sub_b = tree_of(&mut store, vec![]);
+        let root_a = tree_of(&mut store, vec![Entry::dir("d", sub_a).unwrap()]);
+        let root_b = tree_of(&mut store, vec![Entry::dir("d", sub_b).unwrap()]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        let dir = view.lookup("d").unwrap();
+        assert!(matches!(dir, Node::Conflict { .. }));
+        let entries = view.readdir(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x.txt");
+        let Node::Conflict { versions } = &entries[0].node else {
+            panic!(
+                "child deleted on one side must conflict, got {:?}",
+                entries[0].node
+            );
+        };
+        assert_eq!(versions.len(), 1);
     }
 
     #[test]

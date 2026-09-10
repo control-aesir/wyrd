@@ -50,13 +50,26 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Check
-        run: cargo check --color never 2>&1 | tee /tmp/check.log
+        run: |
+          set -o pipefail
+          cargo check --color never 2>&1 | tee /tmp/check.log
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
 
       - name: Tests
-        run: cargo nextest run --color never --workspace 2>&1 | tee /tmp/test.log
+        run: |
+          set -o pipefail
+          cargo nextest run --color never --workspace 2>&1 | tee /tmp/test.log
+
+      # Nextest skips doctests; this gate keeps them validated as API
+      # examples appear. Cheap while empty, load-bearing later.
+      - name: Doctests
+        run: |
+          set -o pipefail
+          cargo test --color never --workspace --doc 2>&1 | tee /tmp/doctests.log
 
       # Disabled since it's not working for now
       # - if: github.event_name == 'pull_request'

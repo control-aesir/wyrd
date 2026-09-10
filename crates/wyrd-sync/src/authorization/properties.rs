@@ -260,18 +260,16 @@ proptest! {
     }
 }
 
-// Sharded like the membership properties: four tests of 64 cases
-// instead of one of 256, same total novel cases, parallel wall time.
-
-// Sharded like the membership properties: four tests of 64 cases
-// instead of one of 256, same total novel cases, parallel wall time.
+// Sharded like the membership properties: four SHARD_CASES-case tests
+// instead of one 256-case test, same budget, parallel wall time.
+const SHARD_CASES: u32 = 64;
 macro_rules! sharded_property {
     (
         body $body:block
         shards { $($name:ident ( $($arg:ident in $strategy:expr),* ))* }
     ) => {
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(64))]
+            #![proptest_config(ProptestConfig::with_cases(SHARD_CASES))]
             $(
                 #[test]
                 fn $name($($arg in $strategy),*) $body

@@ -443,26 +443,21 @@ proptest! {
     }
 }
 
-// The slowest properties below run sharded: four tests of 64 cases
-// each instead of one test of 256. Total novel cases per run are
-// unchanged, but nextest executes the shards in parallel, so wall
-// time roughly quarters on a multicore machine. Persisted regression
-// seeds replay in every shard on top.
-
-// The slowest properties below run sharded: four tests of 64 cases
-// each instead of one test of 256. Total novel cases per run are
+// The slowest properties below run sharded: four tests of SHARD_CASES
+// novel cases each instead of one test of 256. The per-run budget is
 // unchanged, but nextest executes the shards in parallel, so wall
 // time roughly quarters on a multicore machine. Persisted regression
 // seeds replay in every shard on top. Bodies are written once; the
 // macro stamps out the four shard tests, so shrinking and failure
 // reporting behave exactly like hand-written tests.
+const SHARD_CASES: u32 = 64;
 macro_rules! sharded_property {
     (
         body $body:block
         shards { $($name:ident ( $($arg:ident in $strategy:expr),* ))* }
     ) => {
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(64))]
+            #![proptest_config(ProptestConfig::with_cases(SHARD_CASES))]
             $(
                 #[test]
                 fn $name($($arg in $strategy),*) $body

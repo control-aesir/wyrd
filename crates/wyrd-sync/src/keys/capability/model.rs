@@ -130,6 +130,13 @@ impl Capability {
         Self::new(drive, device, encryption_key, transition, epoch, secrets)
     }
 
+    /// The epoch this capability covers: exactly `1..=epoch`, where the
+    /// epoch equals the carried secret count (`EpochMismatch` pins that
+    /// agreement at construction).
+    pub(crate) fn covered_epoch(&self) -> u64 {
+        self.secrets.len() as u64
+    }
+
     /// Check the capability against the authoritative membership state:
     /// the device must be a member and the envelope's encryption key must
     /// equal the registered key (`membership.encryption_keys[device]`).

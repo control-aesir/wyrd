@@ -158,6 +158,14 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
         Ok(capability) => capability,
         Err(_) => return Action::Commit(vec![Fact::ControlMessage(*id)]),
     };
+    // Redundant-field agreement, mirrored from the control envelope
+    // (T15): the sealed payload's device and epoch are authenticated
+    // delivery metadata and must match the capability they deliver. A
+    // disagreement is tampering or a broken sender — it never heals by
+    // deferring, so suppress without a durable capability fact.
+    if payload.device != capability.device || payload.epoch != capability.covered_epoch() {
+        return Action::Commit(vec![Fact::ControlMessage(*id)]);
+    }
     let state = match engine.log.state_of(&capability.transition) {
         Some(state) => state,
         None => return Action::Defer,
@@ -632,6 +640,105 @@ mod tests {
         let report = drain(&mut fixture);
         assert_eq!(report.accepted, 1);
         assert_eq!(fixture.engine.pending_count(), 0);
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    /// The suppression tests need a capability that unwraps cleanly
+    /// against the engine device, so the mismatch — not the seal — is
+    /// what the intake must catch.
+    fn valid_capability_delivery(
+        device: DeviceId,
+        genesis: &MembershipTransition,
+        admission: &MembershipTransition,
+    ) -> Message {
+        let mut scratch = MembershipLog::new(member_drive());
+        scratch.observe(genesis.clone());
+        scratch.observe(admission.clone());
+        let state = scratch
+            .state_of(&admission.transition_id())
+            .expect("transition is valid");
+        let capability = Capability::mint(
+            member_drive(),
+            device,
+            &state,
+            admission.transition_id(),
+            2,
+            vec![EpochSecret::from_bytes([0x07; 32]); 2],
+        )
+        .expect("device is a member");
+        Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped: capability.wrap().expect("wraps").as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn mismatched_capability_device_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+
+        // The wrap opens for this device; the outer payload claims a
+        // different device. The redundant field is authenticated by the
+        // control seal, so the disagreement is tampering or a broken
+        // sender: suppress without a durable capability fact.
+        let Message::Capability(mut payload) =
+            valid_capability_delivery(device, &genesis, &admission)
+        else {
+            panic!("capability delivery");
+        };
+        payload.device = DeviceId::from_bytes([0x99; 32]);
+        let mail = vec![deliver(&fixture, 2, &Message::Capability(payload))];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1, "mismatch suppresses, never defers");
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty(), "no capability installs");
+        // Redelivery stays a duplicate: the suppression committed.
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    #[test]
+    fn mismatched_capability_epoch_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+
+        // The same wrap delivered under a lying outer epoch. The
+        // envelope open already binds payload epoch to envelope epoch,
+        // so the lie is sealed at its own claimed epoch (3): the
+        // envelope opens cleanly and only the capability-agreement
+        // check catches the disagreement with the wrap's coverage.
+        let Message::Capability(mut payload) =
+            valid_capability_delivery(device, &genesis, &admission)
+        else {
+            panic!("capability delivery");
+        };
+        payload.epoch = 3;
+        fixture.engine.add_epoch_key(3, control_key(3));
+        let mail = vec![deliver(&fixture, 3, &Message::Capability(payload))];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1, "mismatch suppresses, never defers");
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty(), "no capability installs");
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
         assert_eq!(report.duplicates, 1);

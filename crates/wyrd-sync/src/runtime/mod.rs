@@ -3,16 +3,18 @@
 //!
 //! This is the first runtime slice, not the full engine. It records the
 //! local facts the roadmap already names: which control messages were seen,
-//! which snapshot announcements arrived, which manifests have been
-//! recorded, which objects are already local, and which objects should be
-//! fetched next. The state is intentionally plain data so a higher layer can
-//! persist it without pulling transport or async concerns into `wyrd-sync`.
+//! which snapshot announcements arrived, which snapshot bodies are
+//! recorded, which manifests have been recorded, which objects are already
+//! local, and which objects should be fetched next. The state is
+//! intentionally plain data so a higher layer can persist it without
+//! pulling transport or async concerns into `wyrd-sync`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wyrd_format::{
-    ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, SnapshotId, StorageId,
+    ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, Snapshot, SnapshotId,
+    StorageId,
 };
 
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
@@ -63,6 +65,8 @@ pub struct PendingObjectFetch {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeReconcile {
     pub pending_snapshots: BTreeSet<SnapshotId>,
+    /// Announcements whose snapshot body is not yet recorded.
+    pub pending_snapshot_bodies: BTreeSet<SnapshotId>,
     pub pending_manifests: BTreeMap<ContentId, ChildManifest>,
     /// Fetch candidates by plaintext content: every usable storage
     /// representation is retained, in first-seen order. The same
@@ -82,6 +86,9 @@ pub struct RuntimeState {
     drive: DriveId,
     seen_control_messages: BTreeSet<ControlMessageId>,
     announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
+    /// Signature-verified snapshot bodies, keyed by snapshot id (the id
+    /// covers the bytes, so a recorded body is the announcement's body).
+    snapshot_bodies: BTreeMap<SnapshotId, Snapshot>,
     manifests: BTreeMap<ContentId, ManifestRecord>,
     /// Derived indexes rebuilt by replay; never persisted as facts.
     root_manifests_by_snapshot: BTreeMap<SnapshotId, BTreeSet<ContentId>>,
@@ -112,6 +119,7 @@ impl RuntimeState {
             drive,
             seen_control_messages: BTreeSet::new(),
             announcements: BTreeMap::new(),
+            snapshot_bodies: BTreeMap::new(),
             manifests: BTreeMap::new(),
             root_manifests_by_snapshot: BTreeMap::new(),
             child_parent_by_manifest: BTreeMap::new(),
@@ -228,6 +236,20 @@ impl RuntimeState {
         self.announcements.get(snapshot)
     }
 
+    /// Record a signature-verified snapshot body. Replaying a body is a
+    /// no-op: the snapshot id covers the bytes, so a second body for the
+    /// same id is the same body. Returns `true` when newly recorded.
+    pub fn record_snapshot_body(&mut self, snapshot: Snapshot) -> bool {
+        self.snapshot_bodies
+            .insert(snapshot.snapshot_id(), snapshot)
+            .is_none()
+    }
+
+    /// The recorded body for one snapshot, if any.
+    pub fn snapshot_body(&self, snapshot: &SnapshotId) -> Option<&Snapshot> {
+        self.snapshot_bodies.get(snapshot)
+    }
+
     /// The snapshot whose recorded manifest tree references a child
     /// manifest id. Child manifests seal under their snapshot's
     /// manifest key, so the fetch layer needs the owning snapshot to
@@ -260,11 +282,12 @@ impl RuntimeState {
 
     /// Build the current fetch plan from durable state. This is the
     /// reconciliation step a restart would run after reloading persisted
-    /// state: announcements without a recorded root manifest stay pending,
-    /// missing child manifests stay pending, and materialized objects that
-    /// are not yet local remain queued.
+    /// state: announcements without a recorded root manifest or snapshot
+    /// body stay pending, missing child manifests stay pending, and
+    /// materialized objects that are not yet local remain queued.
     pub fn reconcile(&self) -> RuntimeReconcile {
         let mut pending_snapshots = BTreeSet::new();
+        let mut pending_snapshot_bodies = BTreeSet::new();
         let mut pending_manifests = BTreeMap::new();
         let mut pending_objects: BTreeMap<ContentId, Vec<PendingObjectFetch>> = BTreeMap::new();
 
@@ -273,6 +296,11 @@ impl RuntimeState {
             // the snapshot id but do not resolve the announcement on their own.
             if !self.root_manifests_by_snapshot.contains_key(snapshot) {
                 pending_snapshots.insert(*snapshot);
+            }
+            // Bodies are the classification input for the live-head
+            // projection; an accepted announcement always wants one.
+            if !self.snapshot_bodies.contains_key(snapshot) {
+                pending_snapshot_bodies.insert(*snapshot);
             }
         }
 
@@ -319,6 +347,7 @@ impl RuntimeState {
 
         RuntimeReconcile {
             pending_snapshots,
+            pending_snapshot_bodies,
             pending_manifests,
             pending_objects,
         }
@@ -627,8 +656,47 @@ mod tests {
         let state = RuntimeState::new(drive());
         let plan = state.reconcile();
         assert!(plan.pending_snapshots.is_empty());
+        assert!(plan.pending_snapshot_bodies.is_empty());
         assert!(plan.pending_manifests.is_empty());
         assert!(plan.pending_objects.is_empty());
+    }
+
+    #[test]
+    fn announced_snapshots_want_bodies_until_one_is_recorded() {
+        let mut state = RuntimeState::new(drive());
+        // The announcement names the author's body: the snapshot id
+        // covers the bytes, so the id here derives from the body.
+        let body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x51; 32]),
+            wyrd_format::DeviceId::from_bytes([2; 32]),
+            wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            3,
+            0,
+            42,
+        );
+        let id = body.snapshot_id();
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot: id,
+                author: wyrd_format::DeviceId::from_bytes([2; 32]),
+                epoch: 3,
+                membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            })
+            .unwrap();
+
+        let plan = state.reconcile();
+        assert!(plan.pending_snapshot_bodies.contains(&id));
+        assert!(plan.pending_snapshots.contains(&id), "manifest side too");
+
+        assert!(state.record_snapshot_body(body.clone()));
+        assert!(!state.record_snapshot_body(body), "replay is a no-op");
+        assert_eq!(
+            state.reconcile().pending_snapshot_bodies,
+            BTreeSet::new(),
+            "the body is no longer wanted"
+        );
+        assert!(state.snapshot_body(&id).is_some());
     }
 
     #[test]

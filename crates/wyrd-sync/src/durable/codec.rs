@@ -3,7 +3,9 @@
 //! format and CURRENT protocol are byte-for-byte stable; unknown record
 //! tags are skipped for forward compatibility.
 
-use wyrd_format::{ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, StorageId};
+use wyrd_format::{
+    ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot, StorageId,
+};
 
 use super::{DurableError, Fact};
 use crate::control::message::{ControlKind, Message};
@@ -24,10 +26,11 @@ const TAG_LOCAL_OBJECT: u8 = 0x05;
 const TAG_MATERIALIZATION: u8 = 0x06;
 const TAG_CONTROL_MESSAGE: u8 = 0x07;
 const TAG_OBJECT_REMOVED: u8 = 0x08;
+const TAG_SNAPSHOT_BODY: u8 = 0x09;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 8] = [
+const KNOWN_TAGS: [u8; 9] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -36,6 +39,7 @@ const KNOWN_TAGS: [u8; 8] = [
     TAG_MATERIALIZATION,
     TAG_CONTROL_MESSAGE,
     TAG_OBJECT_REMOVED,
+    TAG_SNAPSHOT_BODY,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -139,6 +143,7 @@ pub(super) fn encode_fact(
             let bytes = Message::SnapshotAnnouncement(a.clone()).encode_payload();
             Ok((TAG_ANNOUNCEMENT, bytes))
         }
+        Fact::SnapshotBody(authorized) => Ok((TAG_SNAPSHOT_BODY, authorized.snapshot().encode())),
         Fact::Manifest(record) => {
             let derived =
                 ContentId::derive(ObjectKind::Manifest, &record.manifest.canonical_bytes());
@@ -285,6 +290,7 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             };
             Some(DecodedFact::Announcement(a))
         }
+        TAG_SNAPSHOT_BODY => Some(DecodedFact::SnapshotBody(Snapshot::decode(record).ok()?)),
         TAG_MANIFEST => Some(DecodedFact::Manifest(parse_manifest_record(record)?)),
         TAG_LOCAL_OBJECT => {
             let id = ContentId::from_bytes(record.try_into().ok()?);
@@ -359,6 +365,7 @@ pub(super) enum DecodedFact {
     Transition(MembershipTransition),
     Capability(Capability),
     Announcement(SnapshotAnnouncement),
+    SnapshotBody(Snapshot),
     Manifest(ManifestRecord),
     LocalObject(ContentId),
     ObjectRemoved(ContentId),

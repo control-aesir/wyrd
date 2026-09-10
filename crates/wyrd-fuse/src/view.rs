@@ -251,14 +251,13 @@ where
     /// Read `len` bytes at `offset`, like a FUSE read. Chunks are
     /// content-defined with unknown sizes, so the walk is sequential from
     /// the first chunk and is bounded by the offset plus the served range —
-    /// a small mid-file read on a large file loads only the overlapping
-    /// chunk(s), never the whole file. The declared size is enforced where
-    /// observable: bytes never serve past it, a walk that exhausts the
-    /// chunk list short of the request (or of the declared size) is a lying
-    /// size and fails, and a read reaching the last chunk checks the total.
-    /// A longer-than-declared tail is only observable on reads that cross
-    /// the declared end. Zero-length reads short-circuit: no bytes served,
-    /// nothing to verify.
+    /// a small mid-file read on a large file loads only the chunks up to
+    /// its range, never the whole file. Integrity follows the same bound:
+    /// interior reads validate only their window, while reads touching the
+    /// declared end (including at and past EOF) walk the entire chunk list
+    /// and enforce the declared total — extra trailing references, absent
+    /// trailing chunks, and short declarations all fail there. Zero-length
+    /// reads short-circuit: no bytes served, nothing to verify.
     pub fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError> {
         if len == 0 {
             return Ok(Vec::new());
@@ -267,10 +266,11 @@ where
         let end = offset
             .saturating_add(u64::try_from(len).map_err(|_| ViewError::Corrupt)?)
             .min(file.size);
-        if offset >= end {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::with_capacity((end - offset) as usize);
+        // A read reaching the declared end inherits the full-file
+        // validation duty (its walk is whole-file anyway); interior
+        // reads stop once their window is served.
+        let must_validate = end == file.size;
+        let mut out = Vec::with_capacity(end.saturating_sub(offset) as usize);
         let mut consumed: u64 = 0;
         let mut exhausted = true;
         for chunk in &file.chunks {
@@ -285,18 +285,19 @@ where
                 out.extend_from_slice(&bytes[start..stop]);
             }
             consumed = chunk_end;
-            if consumed >= end {
+            if consumed >= end && !must_validate {
                 exhausted = false;
                 break;
             }
         }
-        // Chunks exhausted before serving the requested window (or
-        // before reaching the declared size) mean the content is short
-        // of its declaration: corrupt, never served short or padded.
+        // The whole-list walk must reconcile with the declared size: a
+        // lying size, a trailing reference past it, or a zero-size
+        // declaration with chunks is corrupt. Chunks exhausted before
+        // serving the requested window are short content: also corrupt.
         if exhausted && consumed != file.size {
             return Err(ViewError::Corrupt);
         }
-        if out.len() != (end - offset) as usize {
+        if out.len() != end.saturating_sub(offset) as usize {
             return Err(ViewError::Corrupt);
         }
         Ok(out)
@@ -922,6 +923,67 @@ mod tests {
             32,
             "whole-file reads are whole-file work"
         );
+    }
+
+    #[test]
+    fn eof_reads_still_validate_the_whole_file() {
+        // Declared 600 bytes, one 5-byte chunk: a non-zero read at and
+        // beyond EOF must still report the lying size, not empty
+        // success — reads touching the declared end walk the whole list
+        // anyway, so they keep full validation.
+        let mut store = MemoryObjectStore::default();
+        let data = chunk(&mut store, b"short");
+        let root = tree_of(
+            &mut store,
+            vec![Entry::file("lies.txt", 600, false, vec![data]).unwrap()],
+        );
+        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let file = view.open(&view.lookup("lies.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&file, 600, 8), Err(ViewError::Corrupt));
+        assert_eq!(view.read(&file, 700, 8), Err(ViewError::Corrupt));
+
+        // A zero-size declaration with chunk references is corrupt on
+        // any non-zero read, even at EOF.
+        let mut store = MemoryObjectStore::default();
+        let data = chunk(&mut store, b"stray");
+        let root = tree_of(
+            &mut store,
+            vec![Entry::file("zero.txt", 0, false, vec![data]).unwrap()],
+        );
+        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let file = view.open(&view.lookup("zero.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&file, 0, 4), Err(ViewError::Corrupt));
+    }
+
+    #[test]
+    fn trailing_chunks_after_the_declared_end_are_corrupt() {
+        // The declared size is 5 bytes; the first chunk carries exactly
+        // them and a second (valid) chunk trails. A read ending exactly
+        // at the declared size must reject the trailing reference.
+        let mut store = MemoryObjectStore::default();
+        let first = chunk(&mut store, b"exact");
+        let extra = chunk(&mut store, b"trailing");
+        let root = tree_of(
+            &mut store,
+            vec![Entry::file("tail.txt", 5, false, vec![first, extra]).unwrap()],
+        );
+        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let file = view.open(&view.lookup("tail.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&file, 0, 5), Err(ViewError::Corrupt));
+
+        // The same shape with an absent trailing chunk fails on
+        // availability, not corruption (the fake materialization
+        // reports remote-only for unreferenced content ids).
+        let mut store = MemoryObjectStore::default();
+        let first = chunk(&mut store, b"exact");
+        let absent = ContentId::derive(ObjectKind::Chunk, b"withheld");
+        let root = tree_of(
+            &mut store,
+            vec![Entry::file("tail.txt", 5, false, vec![first, absent]).unwrap()],
+        );
+        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let file = view.open(&view.lookup("tail.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&file, 0, 5), Err(ViewError::NotMaterialized));
     }
 
     #[test]

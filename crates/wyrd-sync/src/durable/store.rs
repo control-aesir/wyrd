@@ -97,17 +97,27 @@ impl DurableStore {
     pub fn open(dir: PathBuf, drive: DriveId, passphrase: &str) -> Result<Self, DurableError> {
         let commits = dir.join("commits");
         fs::create_dir_all(&commits)?;
-        // Exclusive ownership before anything else touches the
-        // directory: a kernel-held flock on LOCK dies with this
-        // process, so a crash leaves no stale lock to clean up. The
-        // handle is held for the store's lifetime and released on drop.
+        // Exclusive ownership before any store state is read or written
+        // (the directory itself is created idempotently above). The lock
+        // is a kernel-held flock on LOCK: it dies with this process, so
+        // a crash leaves no stale lock to clean up. The handle is held
+        // for the store's lifetime and released on drop. The lock guards
+        // cooperating callers — every open runs through here; the
+        // commit chain still detects damage from non-cooperating
+        // writers, it never serialized them.
         let lock = File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(dir.join("LOCK"))?;
-        lock.try_lock().map_err(|_| DurableError::StoreLocked)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            // Definite contention: another holder owns the directory.
+            Err(std::fs::TryLockError::WouldBlock) => return Err(DurableError::StoreLocked),
+            // Anything else is an operational failure, not contention.
+            Err(std::fs::TryLockError::Error(error)) => return Err(DurableError::Io(error)),
+        }
         // Drive identity, written once: a store directory never changes drives.
         let drive_path = dir.join("DRIVE");
         match fs::read(&drive_path) {

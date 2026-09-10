@@ -8,6 +8,7 @@
 //!   DRIVE              32-byte drive id, written once at creation
 //!   store-key.wrap     store key sealed under the passphrase
 //!   CURRENT            sequence (8-byte LE) plus commit hash (32 bytes)
+//!   LOCK               advisory exclusive lock (kernel-held, empty file)
 //!   commits/
 //!     0000000000000001.commit
 //!     ...

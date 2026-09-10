@@ -43,6 +43,18 @@ pub const KDF_SALT_LEN: usize = 16;
 /// Derived key length in bytes.
 pub const KDF_OUT_LEN: usize = 32;
 
+// The test KDF profile: minimum memory, one pass. Tests exercise KDF
+// plumbing (salts, lengths, zeroization, tags), never memory-hardness
+// itself — that assurance comes from the argon2 crate plus the pinning
+// test below. These constants are test-only and must never reach
+// production paths; `kdf_key` selects them only under `cfg(test)`.
+#[cfg(test)]
+const TEST_KDF_M_COST_KIB: u32 = 8;
+#[cfg(test)]
+const TEST_KDF_T_COST: u32 = 1;
+#[cfg(test)]
+const TEST_KDF_P_COST: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum KeystoreError {
     #[error("the passphrase did not open the wrapped secret")]
@@ -59,6 +71,10 @@ pub enum KeystoreError {
 /// parameter table. Public so the parameters are one visible, testable
 /// surface.
 ///
+/// Tests run the fast `TEST_KDF_*` profile instead (same plumbing,
+/// negligible cost); the pinning test below guards the production
+/// table and the prod smoke test proves it end to end.
+///
 /// The return is a `Zeroizing<[u8; 32]>` so the derived key is wiped when
 /// the wrapper is dropped (and on panic unwind). Callers that need to
 /// hand the key to AEAD should keep it in a `Zeroizing`; callers that
@@ -68,8 +84,26 @@ pub fn kdf_key(
     passphrase: &str,
     salt: &[u8],
 ) -> Result<Zeroizing<[u8; KDF_OUT_LEN]>, KeystoreError> {
+    #[cfg(test)]
+    let (m_cost, t_cost, p_cost) = (TEST_KDF_M_COST_KIB, TEST_KDF_T_COST, TEST_KDF_P_COST);
+    #[cfg(not(test))]
+    let (m_cost, t_cost, p_cost) = (KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST);
+    kdf_key_with_params(passphrase, salt, m_cost, t_cost, p_cost)
+}
+
+/// Derive with an explicit parameter table. Production always passes
+/// the pinned `KDF_*` constants through [`kdf_key`]; tests pass the
+/// fast profile or, for the prod smoke test, the pinned table itself.
+/// One code path, so the fast profile tests the real plumbing.
+fn kdf_key_with_params(
+    passphrase: &str,
+    salt: &[u8],
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<Zeroizing<[u8; KDF_OUT_LEN]>, KeystoreError> {
     use argon2::{Algorithm, Argon2, Params, Version};
-    let params = Params::new(KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST, Some(KDF_OUT_LEN))
+    let params = Params::new(m_cost_kib, t_cost, p_cost, Some(KDF_OUT_LEN))
         .map_err(|_| KeystoreError::KdfFailed)?;
     let mut out = Zeroizing::new([0u8; KDF_OUT_LEN]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
@@ -191,6 +225,49 @@ mod tests {
         assert_eq!(KDF_P_COST, 1);
         assert_eq!(KDF_SALT_LEN, 16);
         assert_eq!(KDF_OUT_LEN, 32);
+    }
+
+    #[test]
+    fn prod_kdf_params_round_trip() {
+        // The test that pays full price: proves the pinned table
+        // instantiates and produces working AEAD keys end to end (~3
+        // KDFs). Everything else runs the fast profile; this plus the
+        // pinning test above are the guardrails that keep it honest.
+        let mut salt = [0u8; KDF_SALT_LEN];
+        random_bytes(&mut salt).unwrap();
+        let key =
+            kdf_key_with_params(PASSPHRASE, &salt, KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST).unwrap();
+        let again =
+            kdf_key_with_params(PASSPHRASE, &salt, KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST).unwrap();
+        assert_eq!(key.as_slice(), again.as_slice(), "KDF is deterministic");
+        let nonce = [0u8; 24];
+        let ciphertext = crate::keys::aead::seal(
+            key.as_slice(),
+            &nonce,
+            b"prod params work",
+            KEYSTORE_AAD_DOMAIN,
+        )
+        .unwrap();
+        let plaintext =
+            crate::keys::aead::open(key.as_slice(), &nonce, &ciphertext, KEYSTORE_AAD_DOMAIN)
+                .unwrap();
+        assert_eq!(plaintext, b"prod params work");
+        // A wrong passphrase derives a key that fails the tag.
+        let wrong = kdf_key_with_params(
+            "wrong passphrase",
+            &salt,
+            KDF_M_COST_KIB,
+            KDF_T_COST,
+            KDF_P_COST,
+        )
+        .unwrap();
+        assert!(crate::keys::aead::open(
+            wrong.as_slice(),
+            &nonce,
+            &ciphertext,
+            KEYSTORE_AAD_DOMAIN
+        )
+        .is_err());
     }
 
     #[test]

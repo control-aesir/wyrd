@@ -210,7 +210,6 @@ fn committed_corruption_fails() {
     let h2 = store.tip_hash_for_test();
     store.commit(&[Fact::Announcement(announcement)]).unwrap();
     let commits = dir.path.join("commits");
-    drop(store);
 
     let pristine: Vec<Vec<u8>> = [1u64, 2, 3]
         .iter()
@@ -221,11 +220,10 @@ fn committed_corruption_fails() {
             fs::write(commits.join(commit_name(*seq)), bytes).unwrap();
         }
     };
-    let load = || {
-        DurableStore::open(dir.path.clone(), drive(), PASSPHRASE)
-            .unwrap()
-            .load()
-    };
+    // One handle for every case: load() replays from disk on each call,
+    // so re-opening (and re-deriving the store key) per case would only
+    // burn KDF time without testing anything new.
+    let load = || store.load();
 
     // A valid commit carrying only an unknown tag replays (the tag is
     // skipped); everything else below fails. Replacing the file

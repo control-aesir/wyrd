@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use wyrd_format::{
     ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectStore, SnapshotId,
+    StorageId,
 };
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
@@ -130,6 +131,18 @@ fn open_record(
     })
 }
 
+/// One object fetch's outcome with per-representation attribution: the
+/// aggregate (most actionable) verdict for reporting, the storage ids
+/// whose bytes arrived and failed validation (the only ones that earn
+/// backoff strikes), and the representation that served valid bytes (the
+/// only one whose backoff state clears). Absent, key-less, transport-
+/// failed, and locally-refused representations never strike.
+pub(super) struct ObjectAttempt {
+    pub aggregate: FetchOutcome<()>,
+    pub invalid: Vec<StorageId>,
+    pub fulfilled: Option<StorageId>,
+}
+
 /// Fetch one object by trying each usable representation in plan order.
 /// A later candidate still fulfills after an earlier one fails, so one
 /// corrupt or unavailable representation never blocks a healthy one.
@@ -143,11 +156,12 @@ pub(super) fn object(
     objects: &mut impl ObjectStore,
     content: &ContentId,
     candidates: &[PendingObjectFetch],
-) -> FetchOutcome<()> {
-    let mut outcome = FetchOutcome::Missing;
+) -> ObjectAttempt {
+    let mut aggregate = FetchOutcome::Missing;
+    let mut invalid = Vec::new();
     for candidate in candidates {
         let Some(secret) = keyring.secret(candidate.encryption_epoch) else {
-            outcome = worse(outcome, FetchOutcome::UnavailableKey);
+            aggregate = worse(aggregate, FetchOutcome::UnavailableKey);
             continue;
         };
         let key = secret.object_key(
@@ -168,31 +182,41 @@ pub(super) fn object(
         let sealed = match bulk.fetch_sealed(&candidate.storage_id, Limits::V0.max_object_bytes) {
             Ok(Some(sealed)) => sealed,
             Ok(None) => {
-                outcome = worse(outcome, FetchOutcome::Missing);
+                aggregate = worse(aggregate, FetchOutcome::Missing);
                 continue;
             }
             Err(BulkError::Oversize { .. }) => {
-                outcome = worse(outcome, FetchOutcome::Invalid);
+                aggregate = worse(aggregate, FetchOutcome::Invalid);
+                invalid.push(candidate.storage_id);
                 continue;
             }
             Err(_) => {
-                outcome = worse(outcome, FetchOutcome::Transport);
+                aggregate = worse(aggregate, FetchOutcome::Transport);
                 continue;
             }
         };
         let Ok(plaintext) = verify(&entry, &key, &sealed) else {
-            outcome = worse(outcome, FetchOutcome::Invalid);
+            aggregate = worse(aggregate, FetchOutcome::Invalid);
+            invalid.push(candidate.storage_id);
             continue;
         };
         if objects
             .insert_verified(candidate.kind, content, &plaintext)
             .is_ok()
         {
-            return FetchOutcome::Fulfilled(());
+            return ObjectAttempt {
+                aggregate: FetchOutcome::Fulfilled(()),
+                invalid,
+                fulfilled: Some(candidate.storage_id),
+            };
         }
-        outcome = worse(outcome, FetchOutcome::Local);
+        aggregate = worse(aggregate, FetchOutcome::Local);
     }
-    outcome
+    ObjectAttempt {
+        aggregate,
+        invalid,
+        fulfilled: None,
+    }
 }
 
 /// The more actionable of two fetch failures, by the documented

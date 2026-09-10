@@ -46,7 +46,7 @@ use std::path::PathBuf;
 
 use secp256k1::SecretKey;
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, StorageId};
+use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId};
 
 use super::{MaterializationState, RuntimeError};
 
@@ -130,6 +130,16 @@ pub const MAX_PENDING_MESSAGES: usize = 1024;
 pub const FETCH_MAX_STRIKES: u32 = 3;
 pub const FETCH_COOLDOWN_PASSES: u64 = 8;
 
+/// The backoff identity for one fetchable unit: child-manifest and
+/// object fetches strike by vault-visible representation address; root
+/// manifests have no such address before fetching (the announcement
+/// carries only the snapshot id), so they strike by snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum FetchKey {
+    Storage(StorageId),
+    Root(SnapshotId),
+}
+
 /// The intake driver for one device on one drive.
 pub struct Engine {
     pub(super) drive: DriveId,
@@ -150,8 +160,8 @@ pub struct Engine {
     /// retry the same failure), and the run number a representation
     /// becomes eligible again. Transient: reset on restart, never durable.
     pub(super) fetch_run: u64,
-    pub(super) fetch_strikes: BTreeMap<StorageId, (u32, u64)>,
-    pub(super) fetch_cool_until: BTreeMap<StorageId, u64>,
+    pub(super) fetch_strikes: BTreeMap<FetchKey, (u32, u64)>,
+    pub(super) fetch_cool_until: BTreeMap<FetchKey, u64>,
     /// Test-only crash injection: the next durable commit stops after
     /// the named stage, simulating power loss (see
     /// `DurableStore::commit_until`). Production always runs to
@@ -327,12 +337,12 @@ impl Engine {
     /// attempted — the item stays pending and reports unfulfilled.
     /// Expiry also clears the strike count: cooldown restarts striking
     /// from zero rather than resuming a stale count.
-    pub(super) fn fetch_eligible(&mut self, storage: &StorageId) -> bool {
-        match self.fetch_cool_until.get(storage) {
+    pub(super) fn fetch_eligible(&mut self, key: &FetchKey) -> bool {
+        match self.fetch_cool_until.get(key) {
             None => true,
             Some(until) if self.fetch_run > *until => {
-                self.fetch_cool_until.remove(storage);
-                self.fetch_strikes.remove(storage);
+                self.fetch_cool_until.remove(key);
+                self.fetch_strikes.remove(key);
                 true
             }
             Some(_) => false,
@@ -343,8 +353,8 @@ impl Engine {
     /// (a call's convergence passes retry the same failure); reaching
     /// the strike threshold puts the representation in cooldown starting
     /// after this run. A later fulfillment clears everything.
-    pub(super) fn note_fetch_invalid(&mut self, storage: &StorageId) {
-        let (strikes, last_run) = self.fetch_strikes.entry(*storage).or_insert((0, 0));
+    pub(super) fn note_fetch_invalid(&mut self, key: &FetchKey) {
+        let (strikes, last_run) = self.fetch_strikes.entry(*key).or_insert((0, 0));
         if *last_run == self.fetch_run {
             return;
         }
@@ -352,15 +362,15 @@ impl Engine {
         *strikes = strikes.saturating_add(1);
         if *strikes >= FETCH_MAX_STRIKES {
             self.fetch_cool_until
-                .insert(*storage, self.fetch_run + FETCH_COOLDOWN_PASSES);
+                .insert(*key, self.fetch_run + FETCH_COOLDOWN_PASSES);
         }
     }
 
     /// Record a fulfilled fetch: strikes and cooldowns dissolve — the
     /// representation served valid bytes.
-    pub(super) fn note_fetch_fulfilled(&mut self, storage: &StorageId) {
-        self.fetch_strikes.remove(storage);
-        self.fetch_cool_until.remove(storage);
+    pub(super) fn note_fetch_fulfilled(&mut self, key: &FetchKey) {
+        self.fetch_strikes.remove(key);
+        self.fetch_cool_until.remove(key);
     }
 }
 
@@ -1348,6 +1358,73 @@ mod tests {
             content: published.content,
             object_storage: published.object_storage,
         }
+    }
+
+    /// One logical object under two representations across two snapshots
+    /// (one manifest per snapshot), announced and intake-ready: the corrupt
+    /// representation serves at `bad_storage`, and the caller decides what
+    /// the healthy representation serves. Returns the content id, the
+    /// sealed object (whose storage id is the healthy address), and the
+    /// announced bulk peer.
+    fn two_representation_setup(
+        fixture: &mut Fixture,
+    ) -> (ContentId, EncryptedObject, MemoryBulkSource, StorageId) {
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+        let drive = member_drive();
+        let plaintext = b"two-rep content";
+        let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+        let object_key =
+            epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let good = entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, plaintext).unwrap();
+        let bad_storage = StorageId::from_bytes([0xBD; 32]);
+        let bad = ManifestEntry {
+            content_id: content,
+            kind: ObjectKind::Chunk,
+            version: SEAL_VERSION,
+            storage_id: bad_storage,
+            encryption_epoch: 2,
+            size: plaintext.len() as u64,
+        };
+        let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
+        let snapshot_b = SnapshotId::from_bytes([0x13; 32]);
+        let mut bulk = MemoryBulkSource::default();
+        for (snapshot, entry) in [(snapshot_a, bad), (snapshot_b, good)] {
+            let manifest = Manifest {
+                snapshot,
+                entries: vec![entry],
+                children: vec![],
+            };
+            let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
+            let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+            bulk.publish_root(
+                snapshot,
+                SealedManifest {
+                    content_id: id,
+                    sealed: sealed.encode(),
+                },
+            );
+        }
+        let bound = announcement_msg(
+            snapshot_b,
+            DeviceId::from_bytes([0x22; 32]),
+            2,
+            admission.transition_id(),
+        );
+        let envelope = deliver(fixture, 2, &bound);
+        queue(fixture, vec![envelope]);
+        assert_eq!(drain(fixture).accepted, 1);
+        (content, sealed_object, bulk, bad_storage)
     }
 
     /// Publish one snapshot's manifest tree into a shared bulk peer
@@ -2622,6 +2699,150 @@ mod tests {
             .unwrap();
         assert_eq!(report.invalid, 0, "cooled only after fresh strikes");
         assert_eq!(report.unfulfilled, 1);
+    }
+
+    #[test]
+    fn absent_representations_do_not_strike() {
+        let mut fixture = fixture();
+        let (content, _sealed_object, mut bulk, bad_storage) =
+            two_representation_setup(&mut fixture);
+        // The healthy representation's bytes are absent (never published):
+        // the aggregate verdict is invalid (corrupt outranks absence),
+        // but only the corrupt representation may strike.
+        bulk.publish_sealed(bad_storage, vec![0xFF; 64]);
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(content, MaterializationState::Pinned)
+            .unwrap();
+
+        // Three runs strike the corrupt representation only.
+        for _ in 0..FETCH_MAX_STRIKES {
+            let report = fixture
+                .engine
+                .execute_plan(&mut bulk.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 1, "aggregate invalid; corrupt strikes");
+        }
+        // The corrupt representation is cooled; the absent one must
+        // still be attempted: absence never strikes.
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 0, "corrupt representation cooled");
+        assert_eq!(report.missing, 1, "absent representation still attempted");
+    }
+
+    #[test]
+    fn fulfillment_keeps_other_representations_strikes() {
+        let mut fixture = fixture();
+        let (content, sealed_object, mut bulk, bad_storage) =
+            two_representation_setup(&mut fixture);
+        // Run one: corrupt candidate rejects, healthy candidate fulfills.
+        bulk.publish_sealed(bad_storage, vec![0xFF; 64]);
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(report.objects, 1);
+
+        // Evict so the object re-enters the plan, then hide the healthy
+        // representation's bytes: only the corrupt one remains servable.
+        fixture
+            .engine
+            .commit_facts(&[crate::durable::Fact::ObjectRemoved(content)])
+            .unwrap();
+        let mut corrupt_only = MemoryBulkSource::default();
+        corrupt_only.publish_sealed(bad_storage, vec![0xFF; 64]);
+
+        // Two corrupt runs add strikes two and three to the corrupt
+        // representation (retained through the earlier fulfillment — a
+        // cleared strike would need three runs from here).
+        for _ in 0..2 {
+            let report = fixture
+                .engine
+                .execute_plan(&mut corrupt_only.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 1);
+        }
+        // Third corrupt run cools it; the healthy representation's
+        // absence is then the only attempt.
+        let report = fixture
+            .engine
+            .execute_plan(&mut corrupt_only.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 1, "last strike");
+        let report = fixture
+            .engine
+            .execute_plan(&mut corrupt_only.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 0, "corrupt representation cooled");
+        assert_eq!(report.missing, 1, "absent healthy representation attempted");
+    }
+
+    #[test]
+    fn invalid_roots_back_off() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // A manifest sealed under this snapshot's key embedding another
+        // snapshot id: structurally valid, wrong binding — invalid.
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
+        let rogue = Manifest {
+            snapshot: SnapshotId::from_bytes([0x22; 32]),
+            entries: vec![],
+            children: vec![],
+        };
+        let (rogue_id, sealed_rogue) = seal_manifest(&manifest_key, &rogue).unwrap();
+        let mut hostile = MemoryBulkSource::default();
+        hostile.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: rogue_id,
+                sealed: sealed_rogue.encode(),
+            },
+        );
+        let mut objects = MemoryObjectStore::default();
+
+        // The root fetch strikes per run like child and object fetches.
+        for _ in 0..FETCH_MAX_STRIKES {
+            let report = fixture
+                .engine
+                .execute_plan(&mut hostile.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 1, "attempted while striking");
+        }
+        for _ in 0..FETCH_COOLDOWN_PASSES {
+            let report = fixture
+                .engine
+                .execute_plan(&mut hostile.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 0, "backing off");
+            assert_eq!(report.unfulfilled, 1);
+        }
+        // Cooldown expired: retried and rejected again.
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 1, "retried after the cooldown");
     }
 
     #[test]

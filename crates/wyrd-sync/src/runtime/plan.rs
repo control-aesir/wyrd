@@ -7,7 +7,7 @@
 
 use wyrd_format::ObjectStore;
 
-use super::engine::{Engine, EngineError, ExecuteReport};
+use super::engine::{Engine, EngineError, ExecuteReport, FetchKey};
 use super::fetch::FetchOutcome;
 use super::PendingObjectFetch;
 use crate::bulk::BulkSource;
@@ -26,16 +26,26 @@ pub(super) fn execute(
         let keyring = rebuilt.keyring;
         let plan = runtime.reconcile();
         let mut facts = Vec::new();
-
         for snapshot in &plan.pending_snapshots {
+            // Backoff: a repeatedly invalid root stops being attempted
+            // while cooled (the snapshot stays pending). Roots strike by
+            // snapshot: no storage address exists before the fetch.
+            let root_key = FetchKey::Root(*snapshot);
+            if !engine.fetch_eligible(&root_key) {
+                continue;
+            }
             match super::fetch::root(&engine.drive, bulk, &keyring, &runtime, snapshot) {
                 FetchOutcome::Fulfilled(record) => {
                     runtime.record_manifest(record.clone())?;
                     facts.push(crate::durable::Fact::Manifest(record));
                     report.manifests += 1;
+                    engine.note_fetch_fulfilled(&root_key);
+                }
+                FetchOutcome::Invalid => {
+                    report.invalid += 1;
+                    engine.note_fetch_invalid(&root_key);
                 }
                 FetchOutcome::Missing => report.missing += 1,
-                FetchOutcome::Invalid => report.invalid += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,
                 FetchOutcome::Local => report.local_failures += 1,
@@ -44,7 +54,8 @@ pub(super) fn execute(
         for (id, link) in &plan.pending_manifests {
             // Backoff: a repeatedly invalid child representation is
             // skipped while cooled — no attempt, item stays pending.
-            if !engine.fetch_eligible(&link.storage) {
+            let child_key = FetchKey::Storage(link.storage);
+            if !engine.fetch_eligible(&child_key) {
                 continue;
             }
             match super::fetch::child(&engine.drive, bulk, &keyring, &runtime, id, link) {
@@ -52,11 +63,11 @@ pub(super) fn execute(
                     runtime.record_manifest(record.clone())?;
                     facts.push(crate::durable::Fact::Manifest(record));
                     report.manifests += 1;
-                    engine.note_fetch_fulfilled(&link.storage);
+                    engine.note_fetch_fulfilled(&child_key);
                 }
                 FetchOutcome::Invalid => {
                     report.invalid += 1;
-                    engine.note_fetch_invalid(&link.storage);
+                    engine.note_fetch_invalid(&child_key);
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
@@ -70,28 +81,33 @@ pub(super) fn execute(
             // at all — the item just stays pending.
             let eligible: Vec<PendingObjectFetch> = candidates
                 .iter()
-                .filter(|candidate| engine.fetch_eligible(&candidate.storage_id))
+                .filter(|candidate| engine.fetch_eligible(&FetchKey::Storage(candidate.storage_id)))
                 .cloned()
                 .collect();
             if eligible.is_empty() {
                 continue;
             }
-            match super::fetch::object(&engine.drive, bulk, &keyring, objects, content, &eligible) {
+            let attempt =
+                super::fetch::object(&engine.drive, bulk, &keyring, objects, content, &eligible);
+            match attempt.aggregate {
                 FetchOutcome::Fulfilled(()) => {
                     runtime.mark_local_object(*content);
                     facts.push(crate::durable::Fact::LocalObject(*content));
                     report.objects += 1;
-                    for candidate in &eligible {
-                        engine.note_fetch_fulfilled(&candidate.storage_id);
+                    // Only the representation that served valid bytes
+                    // clears its backoff state; other candidates keep
+                    // their accumulated strikes.
+                    if let Some(storage) = attempt.fulfilled {
+                        engine.note_fetch_fulfilled(&FetchKey::Storage(storage));
                     }
                 }
                 FetchOutcome::Invalid => {
                     report.invalid += 1;
-                    // Every eligible candidate was tried and the worst
-                    // outcome was invalid; strike each representation
-                    // that participated in the failure.
-                    for candidate in &eligible {
-                        engine.note_fetch_invalid(&candidate.storage_id);
+                    // Only representations whose bytes arrived and failed
+                    // validation strike; absent, key-less, transport-
+                    // failed, and locally-refused candidates never do.
+                    for storage in &attempt.invalid {
+                        engine.note_fetch_invalid(&FetchKey::Storage(*storage));
                     }
                 }
                 FetchOutcome::Missing => report.missing += 1,

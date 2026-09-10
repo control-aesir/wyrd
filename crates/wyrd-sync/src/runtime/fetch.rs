@@ -564,6 +564,150 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_candidates_strike_even_when_a_fallback_fulfills() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // Two manifests for the same content: the corrupt representation
+        // in one, the healthy fallback in the other. Candidate order
+        // follows manifest-id order (BLAKE3 over deterministic manifest
+        // bytes), so a probe loop pins the corrupt manifest to sort
+        // first — the fallback path is exercised deterministically.
+        let drive = member_drive();
+        let plaintext = b"strike-through-fallback";
+        let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+        let object_key =
+            epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let good = entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, plaintext).unwrap();
+        let bad_storage = StorageId::from_bytes([0xBD; 32]);
+        let bad = ManifestEntry {
+            content_id: content,
+            kind: ObjectKind::Chunk,
+            version: SEAL_VERSION,
+            storage_id: bad_storage,
+            encryption_epoch: 2,
+            size: plaintext.len() as u64,
+        };
+        let good_snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let good_key = epoch_secret.manifest_key(&drive, 2, &good_snapshot);
+        let (good_id, good_sealed) = seal_manifest(
+            &good_key,
+            &Manifest {
+                snapshot: good_snapshot,
+                entries: vec![good],
+                children: vec![],
+            },
+        )
+        .unwrap();
+        let mut bad_snapshot: Option<(SnapshotId, EncryptedObject, ContentId)> = None;
+        for probe in 0x20u8..=0xFF {
+            let candidate = SnapshotId::from_bytes([probe; 32]);
+            let manifest = Manifest {
+                snapshot: candidate,
+                entries: vec![bad.clone()],
+                children: vec![],
+            };
+            let key = epoch_secret.manifest_key(&drive, 2, &candidate);
+            let (id, sealed_manifest) = seal_manifest(&key, &manifest).unwrap();
+            if id < good_id {
+                bad_snapshot = Some((candidate, sealed_manifest, id));
+                break;
+            }
+        }
+        let Some((bad_snapshot, bad_sealed, bad_id)) = bad_snapshot else {
+            panic!("no probe produced a corrupt manifest sorting first");
+        };
+
+        let mut bulk = MemoryBulkSource::default();
+        bulk.publish_root(
+            bad_snapshot,
+            SealedManifest {
+                content_id: bad_id,
+                sealed: bad_sealed.encode(),
+            },
+        );
+        bulk.publish_root(
+            good_snapshot,
+            SealedManifest {
+                content_id: good_id,
+                sealed: good_sealed.encode(),
+            },
+        );
+        // Both roots must be announced to become pending.
+        let bound = announcement_msg(
+            bad_snapshot,
+            DeviceId::from_bytes([0x22; 32]),
+            2,
+            admission.transition_id(),
+        );
+        let envelope = deliver(&fixture, 2, &bound);
+        queue(&mut fixture, vec![envelope]);
+        assert_eq!(drain(&mut fixture).accepted, 1);
+        bulk.publish_sealed(bad_storage, vec![0xFF; 64]);
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(content, MaterializationState::Pinned)
+            .unwrap();
+
+        // Preload one strike: healthy bytes absent, corrupt bytes reject.
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.invalid, 1);
+
+        // Fallback run: the corrupt candidate rejects (its strike must be
+        // recorded even though the aggregate verdict is fulfilled) and
+        // the healthy candidate fulfills. The report counts the
+        // aggregate — fulfilled — so invalid stays zero here; the
+        // strike surfaces in the cooldown timing below.
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(report.objects, 1, "fallback fulfills");
+        assert_eq!(report.invalid, 0, "aggregate is fulfilled, not invalid");
+
+        // Evict, hide the healthy bytes: only the corrupt representation
+        // remains servable. With the fallback strike recorded, one more
+        // corrupt run reaches the threshold; without it, the corrupt rep
+        // stays attempted one run longer than this sequence allows.
+        fixture
+            .engine
+            .commit_facts(&[crate::durable::Fact::ObjectRemoved(content)])
+            .unwrap();
+        let mut corrupt_only = MemoryBulkSource::default();
+        corrupt_only.publish_sealed(bad_storage, vec![0xFF; 64]);
+        let report = fixture
+            .engine
+            .execute_plan(&mut corrupt_only.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 1, "third strike cools the corrupt rep");
+        // Cooldown active: the absent healthy representation is the only
+        // attempt.
+        let report = fixture
+            .engine
+            .execute_plan(&mut corrupt_only, &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 0, "corrupt rep cooled despite the fallback");
+        assert_eq!(report.missing, 1, "absent healthy rep still attempted");
+    }
+
+    #[test]
     fn fulfillment_keeps_other_representations_strikes() {
         let mut fixture = fixture();
         let (content, sealed_object, mut bulk, bad_storage) =
@@ -591,9 +735,10 @@ mod tests {
         let mut corrupt_only = MemoryBulkSource::default();
         corrupt_only.publish_sealed(bad_storage, vec![0xFF; 64]);
 
-        // Two corrupt runs add strikes two and three to the corrupt
-        // representation (retained through the earlier fulfillment — a
-        // cleared strike would need three runs from here).
+        // Two corrupt runs accumulate strikes one and two; the third run
+        // below reaches the threshold. Strike retention through a
+        // fulfilled fallback is pinned separately by
+        // corrupt_candidates_strike_even_when_a_fallback_fulfills.
         for _ in 0..2 {
             let report = fixture
                 .engine

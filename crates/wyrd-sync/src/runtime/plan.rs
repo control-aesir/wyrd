@@ -89,6 +89,14 @@ pub(super) fn execute(
             }
             let attempt =
                 super::fetch::object(&engine.drive, bulk, &keyring, objects, content, &eligible);
+            // Strike representations whose bytes arrived and failed
+            // validation regardless of the aggregate verdict: a corrupt
+            // candidate keeps earning strikes even when a later
+            // candidate fulfilled. Absent, key-less, transport-failed,
+            // and locally-refused candidates never strike.
+            for storage in &attempt.invalid {
+                engine.note_fetch_invalid(&FetchKey::Storage(*storage));
+            }
             match attempt.aggregate {
                 FetchOutcome::Fulfilled(()) => {
                     runtime.mark_local_object(*content);
@@ -103,12 +111,6 @@ pub(super) fn execute(
                 }
                 FetchOutcome::Invalid => {
                     report.invalid += 1;
-                    // Only representations whose bytes arrived and failed
-                    // validation strike; absent, key-less, transport-
-                    // failed, and locally-refused candidates never do.
-                    for storage in &attempt.invalid {
-                        engine.note_fetch_invalid(&FetchKey::Storage(*storage));
-                    }
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,

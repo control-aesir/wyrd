@@ -164,6 +164,21 @@ impl SnapshotDag {
         heads
     }
 
+    /// The live-head projection: observed snapshots classified
+    /// [`Classification::Eligible`] — live-lineage DAG heads at the
+    /// current epoch. Only this set may advance a live view (epochs.md);
+    /// everything else is retained history. Sorted ascending.
+    pub fn eligible_heads(&self, log: &MembershipLog) -> Vec<SnapshotId> {
+        let mut heads: Vec<SnapshotId> = self
+            .classify(log)
+            .into_iter()
+            .filter(|(_, classification)| *classification == Classification::Eligible)
+            .map(|(id, _)| id)
+            .collect();
+        heads.sort();
+        heads
+    }
+
     /// Classify the whole DAG against the log. One analysis per call;
     /// hold the returned map.
     pub fn classify(&self, log: &MembershipLog) -> HashMap<SnapshotId, Classification> {

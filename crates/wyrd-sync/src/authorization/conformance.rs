@@ -70,6 +70,36 @@ fn parallel_heads_are_both_eligible() {
     );
 }
 
+#[test]
+fn eligible_heads_returns_only_the_live_head_set() {
+    // The projection the live view consumes: a chain serves only the
+    // child, parallel heads coexist, and a stale fork drops out when the
+    // log advances past its epoch.
+    let mut f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let s1 = f.owner_snapshot(vec![id_base], tree_id(2));
+    let id_s1 = observe(&mut dag, &s1);
+    assert_eq!(dag.eligible_heads(&f.log), vec![id_s1], "child only");
+
+    let s2 = f.owner_snapshot(vec![id_base], tree_id(3));
+    let id_s2 = observe(&mut dag, &s2);
+    let mut both = vec![id_s1, id_s2];
+    both.sort();
+    assert_eq!(dag.eligible_heads(&f.log), both, "parallel heads coexist");
+
+    let (_sk, member) = f.device(3);
+    f.membership(vec![admit(member)]);
+    let s3 = f.owner_snapshot(vec![id_s1], tree_id(4));
+    let id_s3 = observe(&mut dag, &s3);
+    assert_eq!(
+        dag.eligible_heads(&f.log),
+        vec![id_s3],
+        "the stale fork is history, never live"
+    );
+}
+
 // --- rejection -----------------------------------------------------------
 
 #[test]
@@ -254,6 +284,8 @@ fn voided_branch_reference_is_voided() {
     sign_snapshot(&mut s, &f.sk, &f.drive);
     let id = observe(&mut dag, &s);
     assert_eq!(classify_one(&dag, &f.log, &id), Classification::Voided);
+    // Voided work never advances a live view, even as a DAG head.
+    assert!(dag.eligible_heads(&f.log).is_empty());
 }
 
 #[test]
@@ -283,6 +315,8 @@ fn stale_fork_becomes_superseded_when_the_log_advances() {
         classify_one(&dag, &f.log, &id_s2),
         Classification::Superseded
     );
+    // The projection agrees: only the continued branch is live.
+    assert_eq!(dag.eligible_heads(&f.log), vec![id_s3]);
 }
 
 #[test]

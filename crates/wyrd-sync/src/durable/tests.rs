@@ -455,6 +455,35 @@ fn reload_preserves_materialization_order() {
     assert!(rebuilt.runtime.reconcile().pending_objects.is_empty());
 }
 
+/// Replay is order-agnostic, so the announcement/body pairing invariant
+/// must hold when the body fact commits before its announcement: a body
+/// followed by a disagreeing announcement fails the rebuild instead of
+/// reconstructing an inconsistent pair.
+#[test]
+fn rebuild_rejects_a_body_that_precedes_a_disagreeing_announcement() {
+    let dir = TestDir::new("body-before-announcement");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let body = authorized_snapshot_body();
+    let lying = SnapshotAnnouncement {
+        snapshot: body.snapshot().snapshot_id(),
+        author: DeviceId::from_bytes([0x22; 32]),
+        epoch: 2,
+        membership: chain().1.transition_id(),
+    };
+    store
+        .commit(&[Fact::SnapshotBody(body), Fact::Announcement(lying)])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(matches!(
+        store.rebuild(owner()),
+        Err(DurableError::Runtime(
+            crate::runtime::RuntimeError::AnnouncementBodyMismatch { .. }
+        ))
+    ));
+}
+
 /// Hand-build a signed transition against the builder's drive and
 /// owner key, mirroring the membership suites: for siblings the
 /// builder cannot produce.

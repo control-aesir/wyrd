@@ -167,20 +167,30 @@ impl RuntimeState {
 
     /// Record a snapshot announcement. Replaying the same announcement is a
     /// no-op; a different announcement for the same snapshot is rejected.
+    /// A body recorded for the snapshot must agree with the announcement's
+    /// `author`, `epoch`, and `membership` (`record_snapshot_body`
+    /// enforces the pairing symmetrically), so replay can never represent
+    /// an inconsistent pair in either fact order.
     pub fn record_announcement(
         &mut self,
         announcement: SnapshotAnnouncement,
     ) -> Result<bool, RuntimeError> {
-        match self.announcements.get(&announcement.snapshot) {
+        let id = announcement.snapshot;
+        if let Some(body) = self.snapshot_bodies.get(&id) {
+            let agrees = announcement.author == body.author
+                && announcement.epoch == body.epoch
+                && announcement.membership == body.membership;
+            if !agrees {
+                return Err(RuntimeError::AnnouncementBodyMismatch { snapshot: id });
+            }
+        }
+        match self.announcements.get(&id) {
             None => {
-                self.announcements
-                    .insert(announcement.snapshot, announcement);
+                self.announcements.insert(id, announcement);
                 Ok(true)
             }
             Some(existing) if existing == &announcement => Ok(false),
-            Some(_) => Err(RuntimeError::ConflictingAnnouncement {
-                snapshot: announcement.snapshot,
-            }),
+            Some(_) => Err(RuntimeError::ConflictingAnnouncement { snapshot: id }),
         }
     }
 
@@ -241,11 +251,11 @@ impl RuntimeState {
     /// Record a signature-verified snapshot body. The body must agree
     /// with the accepted announcement's `author`, `epoch`, and
     /// `membership` — the fetch plan compares before committing, and
-    /// this method enforces the invariant as a backstop, so replay can
-    /// never represent an inconsistent pair. Replaying a body is a
-    /// no-op: the snapshot id covers the bytes, so a second body for
-    /// the same id is the same body. Returns `true` when newly
-    /// recorded.
+    /// both mutators enforce the invariant as a backstop (`record_announcement`
+    /// symmetrically), so replay can never represent an inconsistent
+    /// pair. Replaying a body is a no-op: the snapshot id covers the
+    /// bytes, so a second body for the same id is the same body.
+    /// Returns `true` when newly recorded.
     pub fn record_snapshot_body(&mut self, snapshot: Snapshot) -> Result<bool, RuntimeError> {
         let id = snapshot.snapshot_id();
         if let Some(announcement) = self.announcements.get(&id) {
@@ -780,6 +790,55 @@ mod tests {
             })
             .unwrap();
         assert!(state.record_snapshot_body(body).unwrap());
+    }
+
+    #[test]
+    fn announcements_are_rejected_when_they_disagree_with_recorded_bodies() {
+        // Replay is order-agnostic, so the pairing invariant must hold in
+        // both mutator orders: a body recorded before its announcement
+        // makes the announcement the second half of the pair, and a
+        // disagreeing one must be refused.
+        let author = wyrd_format::DeviceId::from_bytes([2; 32]);
+        let other_author = wyrd_format::DeviceId::from_bytes([9; 32]);
+        let membership = wyrd_format::TransitionId::from_bytes([0x33; 32]);
+        let body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x51; 32]),
+            author,
+            membership,
+            3,
+            0,
+            42,
+        );
+        let id = body.snapshot_id();
+
+        let mut state = RuntimeState::new(drive());
+        assert!(state.record_snapshot_body(body.clone()).unwrap());
+        assert!(
+            matches!(
+                state.record_announcement(SnapshotAnnouncement {
+                    snapshot: id,
+                    author: other_author,
+                    epoch: 3,
+                    membership,
+                }),
+                Err(RuntimeError::AnnouncementBodyMismatch { .. })
+            ),
+            "a disagreeing announcement must never join a recorded body"
+        );
+        assert!(state.snapshot_body(&id).is_some(), "the body stays");
+        assert!(state.announcement(&id).is_none(), "nothing is recorded");
+
+        // The agreeing announcement joins the recorded body.
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 3,
+                membership,
+            })
+            .unwrap();
+        assert!(state.announcement(&id).is_some());
     }
 
     #[test]

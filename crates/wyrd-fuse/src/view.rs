@@ -619,10 +619,7 @@ mod tests {
             child = tree_of(&mut store, vec![Entry::dir("d", child).unwrap()]);
         }
         let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(child)]);
-        let path = std::iter::repeat("d")
-            .take(DEPTH)
-            .collect::<Vec<_>>()
-            .join("/");
+        let path = vec!["d"; DEPTH].join("/");
         assert!(matches!(view.lookup(&path), Ok(Node::Dir { .. })));
     }
 

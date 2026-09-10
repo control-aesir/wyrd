@@ -8,16 +8,28 @@
 //! kind: opaque bytes alone are not enough to re-derive (and therefore
 //! scrub) an address.
 //!
-//! Crash discipline: writes go to a `.tmp` sibling (temp + `fsync` +
-//! rename + directory `fsync`), so a crash leaves either the previous
-//! state or the fully committed object — never partial bytes under the
-//! live name. `open` sweeps stale `.tmp` files left by crashed writers.
-//! Re-inserting identical content is a no-op (the live name already
-//! exists); content addressing makes that check exact.
+//! Crash discipline: writes go to a per-attempt unique `.tmp` sibling
+//! (temp + `fsync` + rename + directory `fsync`), so a crash leaves either
+//! the previous state or the fully committed object — never partial bytes
+//! under the live name. `open` sweeps stale `.tmp` files left by crashed
+//! writers.
+//! Re-inserting identical content is a no-op when the live bytes still
+//! derive to the requested id, and heals them when they don't.
+//!
+//! Trust and durability assumptions: the store directory is trusted —
+//! symlinks or foreign entries inside it are not defended against, and
+//! `open` may remove any `.tmp` file, including one a concurrent writer
+//! in another process is still writing (the writer retries and converges,
+//! since identical content means identical bytes). Directory `fsync` and
+//! rename-atomicity assume Unix-like filesystem semantics; other
+//! platforms get best-effort durability, not the crash guarantee.
+//! `has` is the trait's cheap existence check only — readability and
+//! validity are proven by `get`, never by `has`.
 
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::identity::{ContentId, ObjectKind};
@@ -69,6 +81,13 @@ const ALL_KINDS: [ObjectKind; 4] = [
     ObjectKind::Manifest,
 ];
 
+/// Writer-unique temp-file sequence: temp names carry pid + counter so
+/// concurrent writers (threads or processes) never share a temp path.
+/// Same live path always means identical bytes (content addressing), so
+/// two writers racing to rename different temps is benign — either
+/// rename wins with the same content.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
 impl FsObjectStore {
     /// Open (or create) the store at `dir`, sweeping stale `.tmp` files
     /// from crashed writers.
@@ -119,17 +138,38 @@ impl FsObjectStore {
     }
 
     /// Durably create one file: temp + `fsync` + rename + directory
-    /// `fsync`. Stale temps are overwritten, never read.
+    /// `fsync`. Stale temps are overwritten, never read. The temp name is
+    /// unique per attempt; if a concurrent `open()` sweep deletes the temp
+    /// between write and rename, the rename fails with `NotFound`: when
+    /// another writer already won the race the write becomes a no-op,
+    /// otherwise it retries with a fresh temp.
     fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
-        fs::create_dir_all(path.parent().expect("object paths have parents"))
-            .map_err(FsStoreError::io)?;
-        let tmp = path.with_extension("tmp");
-        let mut f = File::create(&tmp).map_err(FsStoreError::io)?;
-        f.write_all(bytes).map_err(FsStoreError::io)?;
-        f.sync_all().map_err(FsStoreError::io)?;
+        for _ in 0..3 {
+            match Self::atomic_write_once(path, bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if path.is_file() {
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(FsStoreError::io(error)),
+            }
+        }
+        // Final attempt surfaces its error: the target is still absent
+        // and no writer won the race.
+        Self::atomic_write_once(path, bytes).map_err(FsStoreError::io)
+    }
+
+    fn atomic_write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        fs::create_dir_all(path.parent().expect("object paths have parents"))?;
+        let nonce = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
+        let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce));
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path).map_err(FsStoreError::io)?;
-        fsync_dir(path.parent().expect("object paths have parents")).map_err(FsStoreError::io)?;
+        fs::rename(&tmp, path)?;
+        fsync_dir(path.parent().expect("object paths have parents"))?;
         Ok(())
     }
 }
@@ -140,7 +180,15 @@ impl ObjectStore for FsObjectStore {
     fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
         let id = ContentId::derive(kind, data);
         let path = self.path_for(kind, &id);
-        if !path.is_file() {
+        // A present file is a no-op only when it still derives to the
+        // requested id: bitrot under the live name heals here instead of
+        // succeeding while `get` keeps failing closed.
+        let valid = path
+            .is_file()
+            .then(|| fs::read(&path))
+            .and_then(Result::ok)
+            .is_some_and(|bytes| ContentId::derive(kind, &bytes) == id);
+        if !valid {
             Self::atomic_write(&path, data)?;
         }
         Ok(id)
@@ -246,7 +294,7 @@ mod tests {
             store.get(&chunk_id.1).unwrap().as_deref(),
             Some(b"persist me too".as_slice())
         );
-        assert_eq!(store.get(&chunk_id.0).unwrap().is_some(), true);
+        assert!(store.get(&chunk_id.0).unwrap().is_some());
         remove_scratch(&dir);
     }
 
@@ -274,6 +322,74 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert!(!store.has(&expected).unwrap());
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn reinsert_heals_corruption() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = store.insert(ObjectKind::Chunk, b"pristine").unwrap();
+        fs::write(store.path_for(ObjectKind::Chunk, &id), b"tampered").unwrap();
+        assert!(store.get(&id).is_err());
+        // Re-inserting the original bytes restores the scrub invariant
+        // instead of succeeding over corrupt bytes.
+        assert_eq!(store.insert(ObjectKind::Chunk, b"pristine").unwrap(), id);
+        assert_eq!(
+            store.get(&id).unwrap().as_deref(),
+            Some(b"pristine".as_slice())
+        );
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn concurrent_inserts_converge() {
+        use std::thread;
+        let dir = scratch_dir();
+        // Several store instances share one directory while `open()`
+        // sweeps temps mid-write: every insert still succeeds and the
+        // object reads back valid.
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                thread::spawn(move || {
+                    let mut store = FsObjectStore::open(dir).unwrap();
+                    for _ in 0..25 {
+                        store.insert(ObjectKind::Chunk, b"shared bytes").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..10 {
+            let _ = FsObjectStore::open(dir.clone()).unwrap();
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = ContentId::derive(ObjectKind::Chunk, b"shared bytes");
+        assert_eq!(
+            store.get(&id).unwrap().as_deref(),
+            Some(b"shared bytes".as_slice())
+        );
+        assert!(temp_files(&dir).is_empty());
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn on_disk_layout_is_kind_fanout_hex() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = store.insert(ObjectKind::Tree, b"layout probe").unwrap();
+        let hex = id.to_string();
+        assert_eq!(
+            store.path_for(ObjectKind::Tree, &id),
+            dir.join("objects")
+                .join(format!("{:02x}", ObjectKind::Tree.byte()))
+                .join(&hex[..2])
+                .join(&hex[2..])
+        );
+        assert!(store.path_for(ObjectKind::Tree, &id).is_file());
         remove_scratch(&dir);
     }
 

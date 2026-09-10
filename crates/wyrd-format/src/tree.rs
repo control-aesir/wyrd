@@ -26,8 +26,9 @@ use crate::store::ObjectStore;
 use std::cmp::Ordering;
 use thiserror::Error;
 
-/// A single path component: non-empty UTF-8, never `.` or `..`, and never
-/// containing the `/` separator.
+/// A single path component: non-empty UTF-8, never `.` or `..`, never
+/// containing the `/` separator, and never containing null bytes (names
+/// reach FUSE and host filesystems, where NUL truncates or panics).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Component(String);
 
@@ -41,6 +42,8 @@ pub enum ComponentError {
     DotDot,
     #[error("path components must not contain the '/' separator")]
     Separator,
+    #[error("path components must not contain null bytes")]
+    NullByte,
 }
 
 impl Component {
@@ -54,6 +57,8 @@ impl Component {
             Err(ComponentError::DotDot)
         } else if name.contains('/') {
             Err(ComponentError::Separator)
+        } else if name.contains('\0') {
+            Err(ComponentError::NullByte)
         } else {
             Ok(Component(name))
         }
@@ -360,6 +365,7 @@ mod tests {
         assert_eq!(Component::new("."), Err(ComponentError::Dot));
         assert_eq!(Component::new(".."), Err(ComponentError::DotDot));
         assert_eq!(Component::new("a/b"), Err(ComponentError::Separator));
+        assert_eq!(Component::new("a\0b"), Err(ComponentError::NullByte));
     }
 
     #[test]

@@ -25,5 +25,5 @@ pub use identity::{
 pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_LEN, ENTRY_LEN};
 pub use membership::{Change, MembershipError, MembershipTransition};
 pub use snapshot::Snapshot;
-pub use store::{MemoryObjectStore, ObjectStore};
+pub use store::{FetchStatus, MemoryObjectStore, ObjectStore};
 pub use tree::Tree;

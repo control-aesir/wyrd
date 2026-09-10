@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use wyrd_format::{ChildManifest, ContentId, DriveId, ManifestEntry, ObjectStore, SnapshotId};
+use wyrd_format::{
+    ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectStore, SnapshotId,
+};
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
 use crate::bulk::BulkSource;
@@ -205,5 +207,62 @@ fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> 
         second
     } else {
         first
+    }
+}
+
+impl<T> FetchOutcome<T> {
+    /// Settle one finished attempt into fetch status for FUSE
+    /// consumption. Benign failures (absence, missing key, transport)
+    /// stay retryable; verification failures need scrub/repair before
+    /// they ever surface. A refused local import maps to corrupt: the
+    /// bytes verified, so retrying the network cannot help — the data
+    /// path itself needs repair.
+    pub(super) fn settled(&self) -> FetchStatus {
+        match self {
+            FetchOutcome::Fulfilled(_) => FetchStatus::Available,
+            FetchOutcome::Missing | FetchOutcome::UnavailableKey | FetchOutcome::Transport => {
+                FetchStatus::Unavailable
+            }
+            FetchOutcome::Invalid | FetchOutcome::Local => FetchStatus::Corrupt,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempts_settle_into_fetch_status() {
+        assert_eq!(
+            FetchOutcome::Fulfilled(()).settled(),
+            FetchStatus::Available
+        );
+        for outcome in [
+            FetchOutcome::<()>::Missing,
+            FetchOutcome::UnavailableKey,
+            FetchOutcome::Transport,
+        ] {
+            assert_eq!(outcome.settled(), FetchStatus::Unavailable);
+        }
+        for outcome in [FetchOutcome::<()>::Invalid, FetchOutcome::Local] {
+            assert_eq!(outcome.settled(), FetchStatus::Corrupt);
+        }
+    }
+
+    #[test]
+    fn worse_failure_wins_by_actionability() {
+        assert_eq!(
+            worse(FetchOutcome::Missing, FetchOutcome::Transport),
+            FetchOutcome::Transport
+        );
+        assert_eq!(
+            worse(FetchOutcome::Invalid, FetchOutcome::UnavailableKey),
+            FetchOutcome::Invalid
+        );
+        assert_eq!(
+            worse(FetchOutcome::Transport, FetchOutcome::Local),
+            FetchOutcome::Transport
+        );
     }
 }

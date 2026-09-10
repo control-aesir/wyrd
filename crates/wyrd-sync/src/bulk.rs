@@ -19,9 +19,12 @@
 //! a snapshot has no vault-visible pointer (the announcement carries
 //! only the snapshot id), so roots fetch by [`SnapshotId`] from a member
 //! peer holding that snapshot's metadata — this is the eager manifest
-//! exchange of sync-and-peers.md, not a vault read. The returned
-//! [`ContentId`] is an untrusted hint: `seal::open_manifest` still
-//! enforces it as AAD before the record is trusted.
+//! exchange of sync-and-peers.md, not a vault read. Snapshot bodies
+//! fetch the same way: they are plaintext CAS objects whose content id
+//! equals the snapshot id (`ObjectKind::Snapshot`). The returned
+//! [`ContentId`] of a root fetch is an untrusted hint:
+//! `seal::open_manifest` still enforces it as AAD before the record is
+//! trusted.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -68,6 +71,14 @@ pub trait BulkSource {
         max: usize,
     ) -> Result<Option<SealedManifest>, BulkError>;
 
+    /// The snapshot body a member peer holds: the plaintext CAS object
+    /// whose content id equals the snapshot id, if any.
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError>;
+
     /// Sealed bytes (manifest or object) at a vault-visible address, if held.
     fn fetch_sealed(
         &mut self,
@@ -104,6 +115,7 @@ pub struct IrohBulkSource {
     endpoint: Endpoint,
     runtime: Arc<Runtime>,
     roots: BTreeMap<SnapshotId, (ContentId, IrohBlobRef)>,
+    snapshots: BTreeMap<SnapshotId, IrohBlobRef>,
     sealed: BTreeMap<StorageId, IrohBlobRef>,
 }
 
@@ -112,6 +124,7 @@ impl std::fmt::Debug for IrohBulkSource {
         f.debug_struct("IrohBulkSource")
             .field("endpoint", &self.endpoint.id())
             .field("roots", &self.roots.len())
+            .field("snapshots", &self.snapshots.len())
             .field("sealed", &self.sealed.len())
             .finish()
     }
@@ -127,6 +140,7 @@ impl IrohBulkSource {
             endpoint,
             runtime,
             roots: BTreeMap::new(),
+            snapshots: BTreeMap::new(),
             sealed: BTreeMap::new(),
         }
     }
@@ -142,6 +156,11 @@ impl IrohBulkSource {
     /// Publish the transport address for a snapshot's root manifest.
     pub fn publish_root(&mut self, snapshot: SnapshotId, content_id: ContentId, blob: IrohBlobRef) {
         self.roots.insert(snapshot, (content_id, blob));
+    }
+
+    /// Publish the transport address for a snapshot body.
+    pub fn publish_snapshot(&mut self, snapshot: SnapshotId, blob: IrohBlobRef) {
+        self.snapshots.insert(snapshot, blob);
     }
 
     /// Publish the transport address for a sealed manifest or object.
@@ -196,6 +215,17 @@ impl BulkSource for IrohBulkSource {
         })
     }
 
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        let Some(blob) = self.snapshots.get(snapshot) else {
+            return Ok(None);
+        };
+        self.fetch(blob, max).map(Some)
+    }
+
     fn fetch_sealed(
         &mut self,
         storage: &StorageId,
@@ -213,6 +243,7 @@ impl BulkSource for IrohBulkSource {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MemoryBulkSource {
     roots: BTreeMap<SnapshotId, SealedManifest>,
+    snapshots: BTreeMap<SnapshotId, Vec<u8>>,
     sealed: BTreeMap<StorageId, Vec<u8>>,
 }
 
@@ -220,6 +251,11 @@ impl MemoryBulkSource {
     /// Serve a sealed root manifest for a snapshot.
     pub fn publish_root(&mut self, snapshot: SnapshotId, manifest: SealedManifest) {
         self.roots.insert(snapshot, manifest);
+    }
+
+    /// Serve a snapshot body at its snapshot address.
+    pub fn publish_snapshot(&mut self, snapshot: SnapshotId, body: Vec<u8>) {
+        self.snapshots.insert(snapshot, body);
     }
 
     /// Serve sealed bytes at a storage address.
@@ -244,6 +280,23 @@ impl BulkSource for MemoryBulkSource {
             });
         }
         Ok(Some(manifest))
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        let Some(body) = self.snapshots.get(snapshot).cloned() else {
+            return Ok(None);
+        };
+        if body.len() > max {
+            return Err(BulkError::Oversize {
+                bytes: body.len(),
+                max,
+            });
+        }
+        Ok(Some(body))
     }
 
     fn fetch_sealed(

@@ -46,7 +46,7 @@ use std::path::PathBuf;
 
 use secp256k1::SecretKey;
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId};
+use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, Snapshot, SnapshotId, StorageId};
 
 use super::{MaterializationState, RuntimeError};
 
@@ -90,6 +90,8 @@ pub struct DrainReport {
 pub struct ExecuteReport {
     /// Manifest records (root and child) committed this run.
     pub manifests: usize,
+    /// Snapshot bodies fetched, verified, and committed this run.
+    pub snapshot_bodies: usize,
     /// Objects verified and marked local this run.
     pub objects: usize,
     /// Plan items still unfulfilled: bulk bytes absent, epoch
@@ -132,12 +134,14 @@ pub const FETCH_COOLDOWN_PASSES: u64 = 8;
 
 /// The backoff identity for one fetchable unit: child-manifest and
 /// object fetches strike by vault-visible representation address; root
-/// manifests have no such address before fetching (the announcement
-/// carries only the snapshot id), so they strike by snapshot.
+/// manifests and snapshot bodies have no such address before fetching
+/// (the announcement carries only the snapshot id), so they strike by
+/// snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum FetchKey {
     Storage(StorageId),
     Root(SnapshotId),
+    Body(SnapshotId),
 }
 
 /// The intake driver for one device on one drive.
@@ -284,6 +288,22 @@ impl Engine {
         Ok(self.store.rebuild(self.device)?.runtime)
     }
 
+    /// The classified live-head projection: the verified snapshot bodies
+    /// the authorization engine currently marks `Eligible` — live-lineage
+    /// DAG heads at the current epoch (`docs/epochs.md`). Built from
+    /// durable snapshot-body facts and the membership log, so it survives
+    /// restarts; backends install exactly this set as the view's heads.
+    /// Everything else in the DAG is retained history and never advances
+    /// the live view.
+    pub fn live_heads(&self) -> Result<Vec<Snapshot>, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        Ok(dag.eligible_head_bodies(&rebuilt.log))
+    }
+
     /// Drain every envelope currently in the mailbox, committing facts
     /// per accepted message. Stops at the first empty `recv`.
     pub fn drain(&mut self, mailbox: &mut impl Mailbox) -> Result<DrainReport, EngineError> {
@@ -395,8 +415,9 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    use crate::authorization::test_util::sign_snapshot;
     use wyrd_format::membership::Admission;
-    use wyrd_format::{Change, MemoryObjectStore};
+    use wyrd_format::{Change, ContentId, MemoryObjectStore, Snapshot};
 
     use crate::bulk::MemoryBulkSource;
     use crate::control::seal;
@@ -582,8 +603,40 @@ mod tests {
             encryption_key: encryption_key(&pair.b.encryption_sk),
         })]);
 
-        let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
-        let snapshot_b = SnapshotId::from_bytes([0x12; 32]);
+        let a_sk = pair.a.identity_sk;
+        let b_sk = pair.b.identity_sk;
+        let a_dev = pair.a.device;
+        let b_dev = pair.b.device;
+        // Each device authors one snapshot: the body is signed by the
+        // author and published beside the manifests, and the manifest
+        // set embeds the body's snapshot id (the plan validates the
+        // binding between announcement, body, and manifests).
+        let mut body_a = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0xC1; 32]),
+            a_dev,
+            admit_a.transition_id(),
+            2,
+            0,
+            1002,
+        );
+        sign_snapshot(&mut body_a, &a_sk, &drive);
+        pair.bulk
+            .publish_snapshot(body_a.snapshot_id(), body_a.encode());
+        let snapshot_a = body_a.snapshot_id();
+        let mut body_b = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0xC2; 32]),
+            b_dev,
+            admit_b.transition_id(),
+            3,
+            0,
+            1003,
+        );
+        sign_snapshot(&mut body_b, &b_sk, &drive);
+        pair.bulk
+            .publish_snapshot(body_b.snapshot_id(), body_b.encode());
+        let snapshot_b = body_b.snapshot_id();
         let snap_a = publish_into(
             &mut pair.bulk,
             &secret(0x09),
@@ -603,10 +656,6 @@ mod tests {
             b"b bytes",
         );
 
-        let a_sk = pair.a.identity_sk;
-        let b_sk = pair.b.identity_sk;
-        let a_dev = pair.a.device;
-        let b_dev = pair.b.device;
         // The full chain to both devices.
         for target in [a_dev, b_dev] {
             for t in [&genesis, &admit_a, &admit_b] {
@@ -774,6 +823,7 @@ mod tests {
                 plan,
                 ExecuteReport {
                     manifests: 0,
+                    snapshot_bodies: 0,
                     objects: 0,
                     unfulfilled: 0,
                     transport_errors: 0,

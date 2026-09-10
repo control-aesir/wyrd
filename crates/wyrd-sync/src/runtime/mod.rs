@@ -3,16 +3,18 @@
 //!
 //! This is the first runtime slice, not the full engine. It records the
 //! local facts the roadmap already names: which control messages were seen,
-//! which snapshot announcements arrived, which manifests have been
-//! recorded, which objects are already local, and which objects should be
-//! fetched next. The state is intentionally plain data so a higher layer can
-//! persist it without pulling transport or async concerns into `wyrd-sync`.
+//! which snapshot announcements arrived, which snapshot bodies are
+//! recorded, which manifests have been recorded, which objects are already
+//! local, and which objects should be fetched next. The state is
+//! intentionally plain data so a higher layer can persist it without
+//! pulling transport or async concerns into `wyrd-sync`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wyrd_format::{
-    ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, SnapshotId, StorageId,
+    ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, Snapshot, SnapshotId,
+    StorageId,
 };
 
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
@@ -63,6 +65,8 @@ pub struct PendingObjectFetch {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeReconcile {
     pub pending_snapshots: BTreeSet<SnapshotId>,
+    /// Announcements whose snapshot body is not yet recorded.
+    pub pending_snapshot_bodies: BTreeSet<SnapshotId>,
     pub pending_manifests: BTreeMap<ContentId, ChildManifest>,
     /// Fetch candidates by plaintext content: every usable storage
     /// representation is retained, in first-seen order. The same
@@ -82,6 +86,9 @@ pub struct RuntimeState {
     drive: DriveId,
     seen_control_messages: BTreeSet<ControlMessageId>,
     announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
+    /// Signature-verified snapshot bodies, keyed by snapshot id (the id
+    /// covers the bytes, so a recorded body is the announcement's body).
+    snapshot_bodies: BTreeMap<SnapshotId, Snapshot>,
     manifests: BTreeMap<ContentId, ManifestRecord>,
     /// Derived indexes rebuilt by replay; never persisted as facts.
     root_manifests_by_snapshot: BTreeMap<SnapshotId, BTreeSet<ContentId>>,
@@ -94,6 +101,8 @@ pub struct RuntimeState {
 pub enum RuntimeError {
     #[error("conflicting snapshot announcement for {snapshot}")]
     ConflictingAnnouncement { snapshot: SnapshotId },
+    #[error("snapshot body {snapshot} disagrees with its accepted announcement")]
+    AnnouncementBodyMismatch { snapshot: SnapshotId },
     #[error("conflicting manifest record for {manifest}")]
     ConflictingManifest { manifest: ContentId },
     #[error("child manifest {manifest} has multiple owning snapshots")]
@@ -112,6 +121,7 @@ impl RuntimeState {
             drive,
             seen_control_messages: BTreeSet::new(),
             announcements: BTreeMap::new(),
+            snapshot_bodies: BTreeMap::new(),
             manifests: BTreeMap::new(),
             root_manifests_by_snapshot: BTreeMap::new(),
             child_parent_by_manifest: BTreeMap::new(),
@@ -157,20 +167,30 @@ impl RuntimeState {
 
     /// Record a snapshot announcement. Replaying the same announcement is a
     /// no-op; a different announcement for the same snapshot is rejected.
+    /// A body recorded for the snapshot must agree with the announcement's
+    /// `author`, `epoch`, and `membership` (`record_snapshot_body`
+    /// enforces the pairing symmetrically), so replay can never represent
+    /// an inconsistent pair in either fact order.
     pub fn record_announcement(
         &mut self,
         announcement: SnapshotAnnouncement,
     ) -> Result<bool, RuntimeError> {
-        match self.announcements.get(&announcement.snapshot) {
+        let id = announcement.snapshot;
+        if let Some(body) = self.snapshot_bodies.get(&id) {
+            let agrees = announcement.author == body.author
+                && announcement.epoch == body.epoch
+                && announcement.membership == body.membership;
+            if !agrees {
+                return Err(RuntimeError::AnnouncementBodyMismatch { snapshot: id });
+            }
+        }
+        match self.announcements.get(&id) {
             None => {
-                self.announcements
-                    .insert(announcement.snapshot, announcement);
+                self.announcements.insert(id, announcement);
                 Ok(true)
             }
             Some(existing) if existing == &announcement => Ok(false),
-            Some(_) => Err(RuntimeError::ConflictingAnnouncement {
-                snapshot: announcement.snapshot,
-            }),
+            Some(_) => Err(RuntimeError::ConflictingAnnouncement { snapshot: id }),
         }
     }
 
@@ -228,6 +248,32 @@ impl RuntimeState {
         self.announcements.get(snapshot)
     }
 
+    /// Record a signature-verified snapshot body. The body must agree
+    /// with the accepted announcement's `author`, `epoch`, and
+    /// `membership` — the fetch plan compares before committing, and
+    /// both mutators enforce the invariant as a backstop (`record_announcement`
+    /// symmetrically), so replay can never represent an inconsistent
+    /// pair. Replaying a body is a no-op: the snapshot id covers the
+    /// bytes, so a second body for the same id is the same body.
+    /// Returns `true` when newly recorded.
+    pub fn record_snapshot_body(&mut self, snapshot: Snapshot) -> Result<bool, RuntimeError> {
+        let id = snapshot.snapshot_id();
+        if let Some(announcement) = self.announcements.get(&id) {
+            let agrees = announcement.author == snapshot.author
+                && announcement.epoch == snapshot.epoch
+                && announcement.membership == snapshot.membership;
+            if !agrees {
+                return Err(RuntimeError::AnnouncementBodyMismatch { snapshot: id });
+            }
+        }
+        Ok(self.snapshot_bodies.insert(id, snapshot).is_none())
+    }
+
+    /// The recorded body for one snapshot, if any.
+    pub fn snapshot_body(&self, snapshot: &SnapshotId) -> Option<&Snapshot> {
+        self.snapshot_bodies.get(snapshot)
+    }
+
     /// The snapshot whose recorded manifest tree references a child
     /// manifest id. Child manifests seal under their snapshot's
     /// manifest key, so the fetch layer needs the owning snapshot to
@@ -260,11 +306,12 @@ impl RuntimeState {
 
     /// Build the current fetch plan from durable state. This is the
     /// reconciliation step a restart would run after reloading persisted
-    /// state: announcements without a recorded root manifest stay pending,
-    /// missing child manifests stay pending, and materialized objects that
-    /// are not yet local remain queued.
+    /// state: announcements without a recorded root manifest or snapshot
+    /// body stay pending, missing child manifests stay pending, and
+    /// materialized objects that are not yet local remain queued.
     pub fn reconcile(&self) -> RuntimeReconcile {
         let mut pending_snapshots = BTreeSet::new();
+        let mut pending_snapshot_bodies = BTreeSet::new();
         let mut pending_manifests = BTreeMap::new();
         let mut pending_objects: BTreeMap<ContentId, Vec<PendingObjectFetch>> = BTreeMap::new();
 
@@ -273,6 +320,11 @@ impl RuntimeState {
             // the snapshot id but do not resolve the announcement on their own.
             if !self.root_manifests_by_snapshot.contains_key(snapshot) {
                 pending_snapshots.insert(*snapshot);
+            }
+            // Bodies are the classification input for the live-head
+            // projection; an accepted announcement always wants one.
+            if !self.snapshot_bodies.contains_key(snapshot) {
+                pending_snapshot_bodies.insert(*snapshot);
             }
         }
 
@@ -319,6 +371,7 @@ impl RuntimeState {
 
         RuntimeReconcile {
             pending_snapshots,
+            pending_snapshot_bodies,
             pending_manifests,
             pending_objects,
         }
@@ -627,8 +680,165 @@ mod tests {
         let state = RuntimeState::new(drive());
         let plan = state.reconcile();
         assert!(plan.pending_snapshots.is_empty());
+        assert!(plan.pending_snapshot_bodies.is_empty());
         assert!(plan.pending_manifests.is_empty());
         assert!(plan.pending_objects.is_empty());
+    }
+
+    #[test]
+    fn announced_snapshots_want_bodies_until_one_is_recorded() {
+        let mut state = RuntimeState::new(drive());
+        // The announcement names the author's body: the snapshot id
+        // covers the bytes, so the id here derives from the body.
+        let body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x51; 32]),
+            wyrd_format::DeviceId::from_bytes([2; 32]),
+            wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            3,
+            0,
+            42,
+        );
+        let id = body.snapshot_id();
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot: id,
+                author: wyrd_format::DeviceId::from_bytes([2; 32]),
+                epoch: 3,
+                membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            })
+            .unwrap();
+
+        let plan = state.reconcile();
+        assert!(plan.pending_snapshot_bodies.contains(&id));
+        assert!(plan.pending_snapshots.contains(&id), "manifest side too");
+
+        assert!(state.record_snapshot_body(body.clone()).unwrap());
+        assert!(
+            !state.record_snapshot_body(body).unwrap(),
+            "replay is a no-op"
+        );
+        assert_eq!(
+            state.reconcile().pending_snapshot_bodies,
+            BTreeSet::new(),
+            "the body is no longer wanted"
+        );
+        assert!(state.snapshot_body(&id).is_some());
+    }
+
+    #[test]
+    fn recorded_bodies_must_match_their_announcement() {
+        // The id covers the bytes, so an announcement always names a
+        // real body — but a lying announcement can name it under wrong
+        // metadata. The runtime state refuses to hold such a pair, per
+        // field: author, epoch, and membership.
+        let author = wyrd_format::DeviceId::from_bytes([2; 32]);
+        let other_author = wyrd_format::DeviceId::from_bytes([9; 32]);
+        let membership = wyrd_format::TransitionId::from_bytes([0x33; 32]);
+        let other_membership = wyrd_format::TransitionId::from_bytes([0x44; 32]);
+        let body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x51; 32]),
+            author,
+            membership,
+            3,
+            0,
+            42,
+        );
+        let id = body.snapshot_id();
+
+        for announcement in [
+            SnapshotAnnouncement {
+                snapshot: id,
+                author: other_author,
+                epoch: 3,
+                membership,
+            },
+            SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 4,
+                membership,
+            },
+            SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 3,
+                membership: other_membership,
+            },
+        ] {
+            let mut state = RuntimeState::new(drive());
+            state.record_announcement(announcement).unwrap();
+            assert!(
+                matches!(
+                    state.record_snapshot_body(body.clone()),
+                    Err(RuntimeError::AnnouncementBodyMismatch { .. })
+                ),
+                "a disagreeing pair must never be recorded"
+            );
+            assert!(state.snapshot_body(&id).is_none());
+        }
+
+        // With agreeing metadata the same body records fine.
+        let mut state = RuntimeState::new(drive());
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 3,
+                membership,
+            })
+            .unwrap();
+        assert!(state.record_snapshot_body(body).unwrap());
+    }
+
+    #[test]
+    fn announcements_are_rejected_when_they_disagree_with_recorded_bodies() {
+        // Replay is order-agnostic, so the pairing invariant must hold in
+        // both mutator orders: a body recorded before its announcement
+        // makes the announcement the second half of the pair, and a
+        // disagreeing one must be refused.
+        let author = wyrd_format::DeviceId::from_bytes([2; 32]);
+        let other_author = wyrd_format::DeviceId::from_bytes([9; 32]);
+        let membership = wyrd_format::TransitionId::from_bytes([0x33; 32]);
+        let body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x51; 32]),
+            author,
+            membership,
+            3,
+            0,
+            42,
+        );
+        let id = body.snapshot_id();
+
+        let mut state = RuntimeState::new(drive());
+        assert!(state.record_snapshot_body(body.clone()).unwrap());
+        assert!(
+            matches!(
+                state.record_announcement(SnapshotAnnouncement {
+                    snapshot: id,
+                    author: other_author,
+                    epoch: 3,
+                    membership,
+                }),
+                Err(RuntimeError::AnnouncementBodyMismatch { .. })
+            ),
+            "a disagreeing announcement must never join a recorded body"
+        );
+        assert!(state.snapshot_body(&id).is_some(), "the body stays");
+        assert!(state.announcement(&id).is_none(), "nothing is recorded");
+
+        // The agreeing announcement joins the recorded body.
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 3,
+                membership,
+            })
+            .unwrap();
+        assert!(state.announcement(&id).is_some());
     }
 
     #[test]

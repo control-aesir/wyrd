@@ -1,6 +1,7 @@
 use super::codec::encode_commit;
 use super::store::{atomic_write, commit_name, DurableStore};
-use super::{AuthorizedCapability, CrashStage, DurableError, Fact};
+use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
+use crate::authorization::test_util::sign_snapshot;
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::epoch::EpochSecret;
@@ -12,7 +13,7 @@ use std::{fs, path::PathBuf};
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{
     Change, ContentId, DeviceId, DriveId, Manifest, ManifestEntry, MembershipTransition,
-    ObjectKind, SnapshotId, StorageId, TransitionId,
+    ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
 const PASSPHRASE: &str = "durable test passphrase";
@@ -129,6 +130,23 @@ fn manifest_record() -> ManifestRecord {
     }
 }
 
+/// A signature-verified body for the announcement's snapshot id: the
+/// author is the chain owner, so the commit-time gate accepts it.
+fn authorized_snapshot_body() -> AuthorizedSnapshot {
+    let (_, child) = chain();
+    let mut body = Snapshot::new(
+        Vec::new(),
+        ContentId::from_bytes([0x51; 32]),
+        owner(),
+        child.transition_id(),
+        2,
+        0,
+        42,
+    );
+    sign_snapshot(&mut body, &key(10).0, &drive());
+    AuthorizedSnapshot::authorize(body, &drive()).unwrap()
+}
+
 /// The two-commit fact stream: A holds genesis, B holds everything
 /// else. Returns (A facts, B facts).
 fn fact_stream() -> (Vec<Fact>, Vec<Fact>) {
@@ -139,6 +157,7 @@ fn fact_stream() -> (Vec<Fact>, Vec<Fact>) {
     let b = vec![
         Fact::Transition(child.clone()),
         Fact::Announcement(announcement(&child)),
+        Fact::SnapshotBody(authorized_snapshot_body()),
         Fact::Manifest(manifest_record()),
         Fact::Capability(authorized_capability(&genesis, &log)),
         Fact::LocalObject(ContentId::from_bytes([4; 32])),
@@ -340,6 +359,10 @@ fn facts_rebuild_live_state() {
 
     let mut runtime = RuntimeState::new(drive());
     runtime.record_announcement(announcement(&child)).unwrap();
+    let body = authorized_snapshot_body();
+    runtime
+        .record_snapshot_body(body.snapshot().clone())
+        .unwrap();
     runtime.record_manifest(manifest_record()).unwrap();
     runtime.remove_local_object(ContentId::from_bytes([4; 32]));
     runtime.set_materialization(ContentId::from_bytes([4; 32]), MaterializationState::Cached);
@@ -349,6 +372,17 @@ fn facts_rebuild_live_state() {
         rebuilt.runtime.reconcile().pending_objects.len(),
         1,
         "the persisted eviction returns the object to the fetch plan"
+    );
+    // The replayed body is present and does not create phantom wants;
+    // the announcement's own body (never committed in this stream) is
+    // still the only one the fetch plan asks for.
+    assert!(rebuilt
+        .runtime
+        .snapshot_body(&body.snapshot().snapshot_id())
+        .is_some());
+    assert_eq!(
+        rebuilt.runtime.reconcile().pending_snapshot_bodies,
+        std::collections::BTreeSet::from([SnapshotId::from_bytes([1; 32])]),
     );
 }
 
@@ -419,6 +453,35 @@ fn reload_preserves_materialization_order() {
     let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     let rebuilt = store.rebuild(owner()).unwrap();
     assert!(rebuilt.runtime.reconcile().pending_objects.is_empty());
+}
+
+/// Replay is order-agnostic, so the announcement/body pairing invariant
+/// must hold when the body fact commits before its announcement: a body
+/// followed by a disagreeing announcement fails the rebuild instead of
+/// reconstructing an inconsistent pair.
+#[test]
+fn rebuild_rejects_a_body_that_precedes_a_disagreeing_announcement() {
+    let dir = TestDir::new("body-before-announcement");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let body = authorized_snapshot_body();
+    let lying = SnapshotAnnouncement {
+        snapshot: body.snapshot().snapshot_id(),
+        author: DeviceId::from_bytes([0x22; 32]),
+        epoch: 2,
+        membership: chain().1.transition_id(),
+    };
+    store
+        .commit(&[Fact::SnapshotBody(body), Fact::Announcement(lying)])
+        .unwrap();
+    drop(store);
+
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(matches!(
+        store.rebuild(owner()),
+        Err(DurableError::Runtime(
+            crate::runtime::RuntimeError::AnnouncementBodyMismatch { .. }
+        ))
+    ));
 }
 
 /// Hand-build a signed transition against the builder's drive and

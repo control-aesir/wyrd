@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use wyrd_format::{
-    ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectStore, SnapshotId,
-    StorageId,
+    ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectKind, ObjectStore,
+    Snapshot, SnapshotId, StorageId,
 };
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
@@ -73,6 +73,39 @@ pub(super) fn root(
     match open_record(&served.sealed, &key, &served.content_id, *snapshot, true) {
         Some(record) => FetchOutcome::Fulfilled(record),
         None => FetchOutcome::Invalid,
+    }
+}
+
+/// Fetch and validate a snapshot body: the plaintext CAS object whose
+/// content id is the snapshot id. The content check binds the bytes to
+/// the announcement (the id covers the bytes, so only the author's body
+/// can hash to it); the announcement's *metadata* must also agree with
+/// the body's own binding, which the plan stage compares before
+/// committing, and the signature gate happens at the commit boundary,
+/// because durable facts only carry verified bodies.
+pub(super) fn snapshot_body(
+    bulk: &mut impl BulkSource,
+    snapshot: &SnapshotId,
+) -> FetchOutcome<Snapshot> {
+    let served = match bulk.fetch_snapshot(snapshot, Limits::V0.max_object_bytes) {
+        Ok(served) => served,
+        // Oversize representations are invalid remote data, not
+        // transport trouble: the boundary classified them already.
+        Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+        Err(_) => return FetchOutcome::Transport,
+    };
+    let Some(bytes) = served else {
+        return FetchOutcome::Missing;
+    };
+    let derived = ContentId::derive(ObjectKind::Snapshot, &bytes);
+    if SnapshotId::from_bytes(*derived.as_bytes()) != *snapshot {
+        return FetchOutcome::Invalid;
+    }
+    match Snapshot::decode(&bytes) {
+        Ok(snapshot) => FetchOutcome::Fulfilled(snapshot),
+        // Unreachable for id-matching bytes (the id derives from the
+        // encoding), but never serve undecodable bytes.
+        Err(_) => FetchOutcome::Invalid,
     }
 }
 
@@ -312,8 +345,8 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::engine::{FETCH_COOLDOWN_PASSES, FETCH_MAX_STRIKES};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, deliver, drain, fixture, intake_snapshot, publish, queue,
-        Fixture,
+        admit_engine, announcement_msg, deliver, drain, fixture, intake_snapshot, publish_into,
+        queue, Fixture,
     };
     use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
     use wyrd_format::{DeviceId, Manifest, MemoryObjectStore, ObjectKind};
@@ -332,8 +365,11 @@ mod tests {
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
-        intake_snapshot(
+        let mut bulk = MemoryBulkSource::default();
+        let body_a = intake_snapshot(
             fixture,
+            &mut bulk,
+            &builder,
             &genesis,
             &admission,
             vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
@@ -355,9 +391,23 @@ mod tests {
             encryption_epoch: 2,
             size: plaintext.len() as u64,
         };
-        let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
-        let snapshot_b = SnapshotId::from_bytes([0x13; 32]);
-        let mut bulk = MemoryBulkSource::default();
+        let snapshot_a = body_a.snapshot_id();
+        // A second authored snapshot carrying the healthy representation:
+        // its body is signed by the owner (a member of the admitted
+        // state) and its announcement rides the same intake.
+        let owner = *builder.owners.iter().next().expect("tracked owner");
+        let mut body_b = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0xC2; 32]),
+            owner,
+            admission.transition_id(),
+            2,
+            0,
+            1003,
+        );
+        crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
+        bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
+        let snapshot_b = body_b.snapshot_id();
         for (snapshot, entry) in [(snapshot_a, bad), (snapshot_b, good)] {
             let manifest = Manifest {
                 snapshot,
@@ -374,12 +424,7 @@ mod tests {
                 },
             );
         }
-        let bound = announcement_msg(
-            snapshot_b,
-            DeviceId::from_bytes([0x22; 32]),
-            2,
-            admission.transition_id(),
-        );
+        let bound = announcement_msg(snapshot_b, owner, 2, admission.transition_id());
         let envelope = deliver(fixture, 2, &bound);
         queue(fixture, vec![envelope]);
         assert_eq!(drain(fixture).accepted, 1);
@@ -393,15 +438,26 @@ mod tests {
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
-        intake_snapshot(
+        let mut bulk = MemoryBulkSource::default();
+        let body = intake_snapshot(
             &mut fixture,
+            &mut bulk,
+            &builder,
             &genesis,
             &admission,
             vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
         );
 
-        let mut published = publish(&epoch_secret, 2, &epoch_secret, 2, b"backoff probe");
-        let healthy = published.bulk.clone();
+        let published = publish_into(
+            &mut bulk,
+            &epoch_secret,
+            2,
+            &epoch_secret,
+            2,
+            body.snapshot_id(),
+            b"backoff probe",
+        );
+        let healthy = bulk.clone();
         let mut objects = MemoryObjectStore::default();
         fixture
             .engine
@@ -409,15 +465,13 @@ mod tests {
             .unwrap();
         // Corrupt bytes under the served address: every fetch attempt
         // verifies and rejects.
-        published
-            .bulk
-            .publish_sealed(published.object_storage, vec![0xFF; 64]);
+        bulk.publish_sealed(published.object_storage, vec![0xFF; 64]);
 
         // The first call converges manifests (two passes), so the object is
         // attempted twice while striking once — attempts count per pass.
         let report = fixture
             .engine
-            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .execute_plan(&mut bulk.clone(), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 2, "attempted while striking");
 
@@ -425,7 +479,7 @@ mod tests {
         for _ in 0..FETCH_MAX_STRIKES - 1 {
             let report = fixture
                 .engine
-                .execute_plan(&mut published.bulk.clone(), &mut objects)
+                .execute_plan(&mut bulk.clone(), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 1, "attempted while striking");
         }
@@ -434,7 +488,7 @@ mod tests {
         for _ in 0..FETCH_COOLDOWN_PASSES {
             let report = fixture
                 .engine
-                .execute_plan(&mut published.bulk.clone(), &mut objects)
+                .execute_plan(&mut bulk.clone(), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 0, "backing off");
             assert_eq!(report.unfulfilled, 1);
@@ -443,12 +497,12 @@ mod tests {
         // and the strike count restarts from one rather than resuming.
         let report = fixture
             .engine
-            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .execute_plan(&mut bulk.clone(), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 1, "retried after the cooldown");
         let next = fixture
             .engine
-            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .execute_plan(&mut bulk.clone(), &mut objects)
             .unwrap();
         assert_eq!(next.invalid, 1, "strike count restarted, not resumed");
 
@@ -470,15 +524,26 @@ mod tests {
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
-        intake_snapshot(
+        let mut bulk = MemoryBulkSource::default();
+        let body = intake_snapshot(
             &mut fixture,
+            &mut bulk,
+            &builder,
             &genesis,
             &admission,
             vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
         );
 
-        let mut published = publish(&epoch_secret, 2, &epoch_secret, 2, b"strike probe");
-        let healthy = published.bulk.clone();
+        let published = publish_into(
+            &mut bulk,
+            &epoch_secret,
+            2,
+            &epoch_secret,
+            2,
+            body.snapshot_id(),
+            b"strike probe",
+        );
+        let healthy = bulk.clone();
         let mut objects = MemoryObjectStore::default();
         fixture
             .engine
@@ -487,12 +552,10 @@ mod tests {
 
         // One invalid run: the call converges manifests in pass one, so the
         // object attempt repeats in pass two while striking once.
-        published
-            .bulk
-            .publish_sealed(published.object_storage, vec![0xFF; 64]);
+        bulk.publish_sealed(published.object_storage, vec![0xFF; 64]);
         let report = fixture
             .engine
-            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .execute_plan(&mut bulk.clone(), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 2);
         assert_eq!(report.manifests, 2);
@@ -516,7 +579,7 @@ mod tests {
         for _ in 0..3 {
             let report = fixture
                 .engine
-                .execute_plan(&mut published.bulk.clone(), &mut objects)
+                .execute_plan(&mut bulk.clone(), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 1, "attempted while striking");
         }
@@ -524,7 +587,7 @@ mod tests {
         // fulfillment finally reached the threshold.
         let report = fixture
             .engine
-            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .execute_plan(&mut bulk.clone(), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 0, "cooled only after fresh strikes");
         assert_eq!(report.unfulfilled, 1);
@@ -570,8 +633,11 @@ mod tests {
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
-        intake_snapshot(
+        let mut bulk = MemoryBulkSource::default();
+        let body = intake_snapshot(
             &mut fixture,
+            &mut bulk,
+            &builder,
             &genesis,
             &admission,
             vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
@@ -599,7 +665,7 @@ mod tests {
             encryption_epoch: 2,
             size: plaintext.len() as u64,
         };
-        let good_snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let good_snapshot = body.snapshot_id();
         let good_key = epoch_secret.manifest_key(&drive, 2, &good_snapshot);
         let (good_id, good_sealed) = seal_manifest(
             &good_key,
@@ -629,7 +695,8 @@ mod tests {
             panic!("no probe produced a corrupt manifest sorting first");
         };
 
-        let mut bulk = MemoryBulkSource::default();
+        // The intake bulk already serves the good snapshot's body; the
+        // two roots (good and corrupt) are published beside it.
         bulk.publish_root(
             bad_snapshot,
             SealedManifest {
@@ -704,7 +771,10 @@ mod tests {
             .execute_plan(&mut corrupt_only, &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 0, "corrupt rep cooled despite the fallback");
-        assert_eq!(report.missing, 1, "absent healthy rep still attempted");
+        assert_eq!(
+            report.missing, 2,
+            "the absent healthy rep and the announced-but-unpublished body"
+        );
     }
 
     #[test]
@@ -714,8 +784,11 @@ mod tests {
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
-        intake_snapshot(
+        let mut bulk = MemoryBulkSource::default();
+        let body = intake_snapshot(
             &mut fixture,
+            &mut bulk,
+            &builder,
             &genesis,
             &admission,
             vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
@@ -723,7 +796,7 @@ mod tests {
 
         // A manifest sealed under this snapshot's key embedding another
         // snapshot id: structurally valid, wrong binding — invalid.
-        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let snapshot = body.snapshot_id();
         let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
         let rogue = Manifest {
             snapshot: SnapshotId::from_bytes([0x22; 32]),
@@ -755,7 +828,10 @@ mod tests {
                 .execute_plan(&mut hostile.clone(), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 0, "backing off");
-            assert_eq!(report.unfulfilled, 1);
+            assert_eq!(
+                report.unfulfilled, 2,
+                "the cooled root and the absent body stay pending"
+            );
         }
         // Cooldown expired: retried and rejected again.
         let report = fixture

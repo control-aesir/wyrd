@@ -58,21 +58,26 @@
 //!
 //! Facts, not state — precisely, immutable mutations: commits carry
 //! canonical records (transitions, sealed capabilities, announcements,
-//! manifests) plus residency mutations (materialization entries are
-//! last-wins, local-object marks are ever-local until a future removal
-//! mutation exists). Loading replays them into a [`MembershipLog`], a
-//! [`DriveKeyring`], and a [`RuntimeState`]; the caller runs
-//! `reconcile()` for the fetch plan. Replay runs in dependency phases
-//! (transitions first, then the rest), so the per-type buckets of
-//! [`LoadedFacts`] reflect the replay structure; order is preserved
-//! within each bucket. Derived indexes are rebuilt, never persisted, so
-//! two representations of the same DAG can never disagree.
+//! snapshot bodies, manifests) plus residency mutations (materialization
+//! entries are last-wins, local-object marks are ever-local until a
+//! future removal mutation exists). Loading replays them into a
+//! [`MembershipLog`], a [`DriveKeyring`], and a [`RuntimeState`]; the
+//! caller runs `reconcile()` for the fetch plan. Replay runs in
+//! dependency phases (transitions first, then the rest), so the
+//! per-type buckets of [`LoadedFacts`] reflect the replay structure;
+//! order is preserved within each bucket. Derived indexes are rebuilt,
+//! never persisted, so two representations of the same DAG can never
+//! disagree.
 //!
 //! Capabilities cross the durability boundary only as
 //! [`AuthorizedCapability`]: validated against membership state at
 //! commit time, sealed under the store key at rest, re-validated on
 //! rebuild. The persistence layer can never launder an unauthorized
-//! capability into the keyring.
+//! capability into the keyring. Snapshot bodies cross only as
+//! [`AuthorizedSnapshot`]: signature-verified at commit time (the
+//! content id already binds the bytes to the announcement), replayed
+//! verbatim (validity is bytes-bound, unlike capabilities, so no
+//! re-check is needed).
 //!
 //! Children: [`store`] owns lifecycle and the crash-safe commit
 //! protocol; [`codec`] owns the commit envelope and fact records;
@@ -100,8 +105,12 @@ pub(crate) use store::CrashStage;
 pub use store::DurableStore;
 
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, ManifestError, MembershipError, MembershipTransition};
+use wyrd_format::{
+    ContentId, DeviceId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
+};
 
+use crate::authorization::predicates::verify_snapshot;
+use crate::authorization::Rejection;
 use crate::control::{ControlError, ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::keystore::KeystoreError;
@@ -176,6 +185,30 @@ impl AuthorizedCapability {
     }
 }
 
+/// A snapshot body that passed signature verification and may be durably
+/// recorded. Constructible only through [`AuthorizedSnapshot::authorize`],
+/// so the commit path cannot persist a body that was never checked. Full
+/// classification (eligibility, lineage) re-runs at projection against
+/// the whole DAG; the signature is the commit-time integrity gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedSnapshot {
+    snapshot: Snapshot,
+}
+
+impl AuthorizedSnapshot {
+    /// Verify the body's BIP-340 signature (drive-bound, exact bytes)
+    /// and wrap it for durability.
+    pub fn authorize(snapshot: Snapshot, drive: &DriveId) -> Result<Self, Rejection> {
+        verify_snapshot(drive, &snapshot)?;
+        Ok(AuthorizedSnapshot { snapshot })
+    }
+
+    /// The verified snapshot body.
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+}
+
 /// One durable mutation. All variants carry canonical records; the commit
 /// envelope frames them with type tags and lengths.
 #[derive(Debug, Clone)]
@@ -186,6 +219,9 @@ pub enum Fact {
     Capability(AuthorizedCapability),
     /// A snapshot announcement.
     Announcement(SnapshotAnnouncement),
+    /// A signature-verified snapshot body (the CAS object whose content
+    /// id is the snapshot id).
+    SnapshotBody(AuthorizedSnapshot),
     /// A manifest record (identity-checked at commit).
     Manifest(ManifestRecord),
     /// A locally present object.

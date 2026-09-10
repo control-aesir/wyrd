@@ -10,7 +10,7 @@
 //! [`DriveKeyring`]: crate::keys::capability::DriveKeyring
 //! [`RuntimeState`]: crate::runtime::RuntimeState
 
-use wyrd_format::{ContentId, DeviceId, DriveId, MembershipTransition};
+use wyrd_format::{ContentId, DeviceId, DriveId, MembershipTransition, Snapshot};
 
 use super::codec::DecodedFact;
 use super::DurableError;
@@ -26,6 +26,7 @@ use crate::runtime::{ManifestRecord, MaterializationState, RuntimeState};
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeFact {
     Announcement(SnapshotAnnouncement),
+    SnapshotBody(Snapshot),
     Manifest(ManifestRecord),
     LocalObject(ContentId),
     ObjectRemoved(ContentId),
@@ -40,6 +41,7 @@ pub struct LoadedFacts {
     pub transitions: Vec<MembershipTransition>,
     pub capabilities: Vec<Capability>,
     pub announcements: Vec<SnapshotAnnouncement>,
+    pub snapshot_bodies: Vec<Snapshot>,
     pub manifests: Vec<ManifestRecord>,
     pub local_objects: Vec<ContentId>,
     pub removed_objects: Vec<ContentId>,
@@ -56,6 +58,10 @@ impl LoadedFacts {
             DecodedFact::Announcement(a) => {
                 self.announcements.push(a.clone());
                 self.runtime_facts.push(RuntimeFact::Announcement(a));
+            }
+            DecodedFact::SnapshotBody(s) => {
+                self.snapshot_bodies.push(s.clone());
+                self.runtime_facts.push(RuntimeFact::SnapshotBody(s));
             }
             DecodedFact::Manifest(m) => {
                 self.manifests.push(m.clone());
@@ -123,6 +129,9 @@ pub(super) fn rebuild_facts(
         match fact {
             RuntimeFact::Announcement(a) => {
                 runtime.record_announcement(a)?;
+            }
+            RuntimeFact::SnapshotBody(s) => {
+                runtime.record_snapshot_body(s)?;
             }
             RuntimeFact::Manifest(m) => {
                 runtime.record_manifest(m)?;

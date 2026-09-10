@@ -125,11 +125,6 @@ impl RuntimeState {
         self.drive
     }
 
-    /// Snapshot announcements currently accepted by durable runtime state.
-    pub fn announced_snapshots(&self) -> impl Iterator<Item = SnapshotId> + '_ {
-        self.announcements.keys().copied()
-    }
-
     /// Whether the verified plaintext object is present in the local store.
     pub fn is_local(&self, id: &ContentId) -> bool {
         self.local_objects.contains(id)

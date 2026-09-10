@@ -12,3 +12,4 @@ fuser = "0.18"
 
 [dev-dependencies]
 secp256k1.workspace = true
+blake3.workspace = true

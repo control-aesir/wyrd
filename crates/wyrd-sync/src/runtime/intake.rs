@@ -263,7 +263,7 @@ mod tests {
 
         // Simulated restart, then redelivery of the same envelopes:
         // rehydrated dedupe makes every replay a duplicate.
-        let mut engine = reopen(&fixture);
+        let mut engine = reopen(&mut fixture);
         queue(&mut fixture, mail);
         let recipient = fixture.recipient;
         let mut mailbox = MemoryMailbox {

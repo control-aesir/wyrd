@@ -8,12 +8,15 @@
 //!   DRIVE              32-byte drive id, written once at creation
 //!   store-key.wrap     store key sealed under the passphrase
 //!   CURRENT            sequence (8-byte LE) plus commit hash (32 bytes)
+//!   LOCK               advisory exclusive lock (kernel-held, empty file)
 //!   commits/
 //!     0000000000000001.commit
 //!     ...
 //! ```
 //!
-//! Commit protocol (single writer — no locking in v1):
+//! Commit protocol (single writer — enforced: an exclusive advisory
+//! `LOCK` on the store directory rejects concurrent opens and releases
+//! on drop):
 //!
 //! 1. Serialize the commit (canonical records) to a temp file.
 //! 2. `fsync` the temp file.
@@ -114,6 +117,8 @@ use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
 pub enum DurableError {
     #[error("durable I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("another process holds this store directory")]
+    StoreLocked,
     #[error("CURRENT is present but not a sequence plus commit hash")]
     CorruptCurrent,
     #[error("commit {0} is present but undecodable")]

@@ -968,7 +968,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.objects, 1);
 
-        fixture.engine = reopen(&fixture);
+        fixture.engine = reopen(&mut fixture);
         let report = fixture
             .engine
             .execute_plan(&mut published.bulk.clone(), &mut objects)

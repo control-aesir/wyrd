@@ -190,7 +190,10 @@ pub(crate) fn encryption_key(secret: &SecretKey) -> DeviceEncryptionKey {
 
 /// Reopen the fixture's store in a fresh engine (simulated
 /// restart): dedupe and membership rehydrate from committed facts.
-pub(crate) fn reopen(fixture: &Fixture) -> Engine {
+/// The parked engine releases its lock first (abrupt death, not an
+/// orderly second process); it is never touched again.
+pub(crate) fn reopen(fixture: &mut Fixture) -> Engine {
+    fixture.engine.release_store_lock();
     let (identity_sk, device) = identity(0x02);
     let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
     let mut engine = Engine::open(

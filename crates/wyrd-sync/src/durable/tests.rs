@@ -41,6 +41,33 @@ impl Drop for TestDir {
     }
 }
 
+#[test]
+fn concurrent_open_is_rejected() {
+    let dir = TestDir::new("concurrent-open");
+    let _holder = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    // A second store on the same directory is refused while the first
+    // holds the lock: two single-writer stores must never share a state
+    // directory.
+    let second = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE);
+    assert!(
+        matches!(second, Err(DurableError::StoreLocked)),
+        "expected StoreLocked, got {:?}",
+        second.map(|_| ()).err()
+    );
+}
+
+#[test]
+fn lock_releases_on_drop() {
+    let dir = TestDir::new("lock-release");
+    {
+        let _holder = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    }
+    // Dropping the holder released the advisory lock: the directory is
+    // openable again.
+    let reopened = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert_eq!(reopened.current(), 0);
+}
+
 fn owner() -> DeviceId {
     key(10).1
 }

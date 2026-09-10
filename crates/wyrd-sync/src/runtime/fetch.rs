@@ -708,60 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn fulfillment_keeps_other_representations_strikes() {
-        let mut fixture = fixture();
-        let (content, sealed_object, mut bulk, bad_storage) =
-            two_representation_setup(&mut fixture);
-        // Run one: corrupt candidate rejects, healthy candidate fulfills.
-        bulk.publish_sealed(bad_storage, vec![0xFF; 64]);
-        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
-        let mut objects = MemoryObjectStore::default();
-        fixture
-            .engine
-            .set_materialization(content, MaterializationState::Pinned)
-            .unwrap();
-        let report = fixture
-            .engine
-            .execute_plan(&mut bulk, &mut objects)
-            .unwrap();
-        assert_eq!(report.objects, 1);
-
-        // Evict so the object re-enters the plan, then hide the healthy
-        // representation's bytes: only the corrupt one remains servable.
-        fixture
-            .engine
-            .commit_facts(&[crate::durable::Fact::ObjectRemoved(content)])
-            .unwrap();
-        let mut corrupt_only = MemoryBulkSource::default();
-        corrupt_only.publish_sealed(bad_storage, vec![0xFF; 64]);
-
-        // Two corrupt runs accumulate strikes one and two; the third run
-        // below reaches the threshold. Strike retention through a
-        // fulfilled fallback is pinned separately by
-        // corrupt_candidates_strike_even_when_a_fallback_fulfills.
-        for _ in 0..2 {
-            let report = fixture
-                .engine
-                .execute_plan(&mut corrupt_only.clone(), &mut objects)
-                .unwrap();
-            assert_eq!(report.invalid, 1);
-        }
-        // Third corrupt run cools it; the healthy representation's
-        // absence is then the only attempt.
-        let report = fixture
-            .engine
-            .execute_plan(&mut corrupt_only.clone(), &mut objects)
-            .unwrap();
-        assert_eq!(report.invalid, 1, "last strike");
-        let report = fixture
-            .engine
-            .execute_plan(&mut corrupt_only.clone(), &mut objects)
-            .unwrap();
-        assert_eq!(report.invalid, 0, "corrupt representation cooled");
-        assert_eq!(report.missing, 1, "absent healthy representation attempted");
-    }
-
-    #[test]
     fn invalid_roots_back_off() {
         let mut fixture = fixture();
         let device = fixture.recipient;

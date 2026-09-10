@@ -830,6 +830,21 @@ mod tests {
             std::fs::Permissions::from_mode(0o555),
         )
         .unwrap();
+        // Root bypasses permissions, so probe writability now that the
+        // store is supposed to be read-only and skip when the commit
+        // failure cannot occur.
+        let probe = fixture.dir.path.join(".writetest");
+        if std::fs::File::create(&probe).is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::set_permissions(
+                fixture.dir.path.join("commits"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fixture.dir.path, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            return;
+        }
         queue(&mut fixture, mail.clone());
         let recipient = fixture.recipient;
         let mut mailbox = MemoryMailbox {
@@ -2584,20 +2599,24 @@ mod tests {
             deliver(&fixture, 2, &cap),
             deliver(&fixture, 2, &bound),
         ];
-        queue(&mut fixture, mail);
+        queue(&mut fixture, mail.clone());
 
-        // Make the store unwritable (root can still write: probe and
-        // skip before asserting a failure that never comes).
+        // Make the store unwritable. Root bypasses permissions, so
+        // probe writability after the chmod and skip when the commit
+        // failure cannot occur; otherwise assert the failure, restore,
+        // and verify redelivery retries cleanly.
         let dir = fixture.dir.path.clone();
         let commits = dir.join("commits");
-        let probe = dir.join(".writetest");
-        let skip_if_root = std::fs::File::create(&probe).is_ok();
-        std::fs::remove_file(&probe).unwrap();
-        if skip_if_root {
-            return;
-        }
         for path in [&dir, &commits] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let probe = dir.join(".writetest");
+        if std::fs::File::create(&probe).is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            for path in [&dir, &commits] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            return;
         }
 
         // The first commit fails: the engine resyncs its views and
@@ -2614,11 +2633,17 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // Retry after the outage: every envelope commits fresh and
-        // the intake converges as if the failure never happened.
+        // Retry after the outage: the failed drain consumed genesis
+        // from the relay, so redeliver the whole batch fresh. Leftover
+        // admission commits at once; the orphaned capability and
+        // announcement defer until genesis lands, then ride genesis's
+        // commit; the redelivered copies deduplicate. Every effect lands
+        // durably exactly once.
+        queue(&mut fixture, mail);
         let report = drain(&mut fixture);
-        assert_eq!(report.accepted, 4);
-        assert_eq!(report.deferred, 0);
+        assert_eq!(report.accepted, 2);
+        assert_eq!(report.deferred, 2);
+        assert_eq!(report.duplicates, 3);
         let facts = fixture.engine.store.load().expect("loads");
         assert_eq!(facts.transitions.len(), 2);
         assert_eq!(facts.announcements.len(), 1);

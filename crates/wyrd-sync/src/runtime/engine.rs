@@ -46,7 +46,7 @@ use std::path::PathBuf;
 
 use secp256k1::SecretKey;
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore};
+use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, StorageId};
 
 use super::{MaterializationState, RuntimeError};
 
@@ -120,6 +120,16 @@ pub struct ExecuteReport {
 /// the sender can redeliver once legitimate holds drain.
 pub const MAX_PENDING_MESSAGES: usize = 1024;
 
+/// Backoff policy for repeatedly invalid representations: a fetch that
+/// verifies-and-rejects this many times (across `execute_plan` runs)
+/// stops being attempted for [`FETCH_COOLDOWN_PASSES`] runs. Only
+/// `Invalid` strikes — absence and transport trouble stay benign, and a
+/// fulfilled fetch clears the strike count. In-memory transient state:
+/// restarts resume striking from zero, which is safe (attempts are
+/// fail-closed) and cheaper to reason about than persisting grudges.
+pub const FETCH_MAX_STRIKES: u32 = 3;
+pub const FETCH_COOLDOWN_PASSES: u64 = 8;
+
 /// The intake driver for one device on one drive.
 pub struct Engine {
     pub(super) drive: DriveId,
@@ -134,6 +144,14 @@ pub struct Engine {
     epoch_keys: BTreeMap<u64, [u8; 32]>,
     pub(super) log: MembershipLog,
     pub(super) pending: HashMap<ControlMessageId, Message>,
+    /// In-memory fetch-backoff state: how many `execute_plan` runs have
+    /// happened, per-representation strike counts with the run they were
+    /// last struck (one strike per run — a call's convergence passes
+    /// retry the same failure), and the run number a representation
+    /// becomes eligible again. Transient: reset on restart, never durable.
+    pub(super) fetch_run: u64,
+    pub(super) fetch_strikes: BTreeMap<StorageId, (u32, u64)>,
+    pub(super) fetch_cool_until: BTreeMap<StorageId, u64>,
     /// Test-only crash injection: the next durable commit stops after
     /// the named stage, simulating power loss (see
     /// `DurableStore::commit_until`). Production always runs to
@@ -166,6 +184,9 @@ impl Engine {
             epoch_keys: BTreeMap::new(),
             log: MembershipLog::new(drive),
             pending: HashMap::new(),
+            fetch_run: 0,
+            fetch_strikes: BTreeMap::new(),
+            fetch_cool_until: BTreeMap::new(),
             #[cfg(test)]
             crash_stage: None,
         };
@@ -275,11 +296,20 @@ impl Engine {
     /// bulk bytes absent ........... unfulfilled plus missing, retried next run
     /// bulk transport error ........ unfulfilled plus transport_errors, retried next run
     /// epoch capability unheld ..... unfulfilled plus unavailable_keys, retried next run
+    /// over fetch ceiling .......... unfulfilled plus invalid, never committed
     /// over ingest limits .......... unfulfilled plus invalid, never committed
     /// undecodable / wrong kind .... unfulfilled plus invalid, never committed
     /// failed AEAD / identity ...... unfulfilled plus invalid, never committed
     /// store import failure ........ unfulfilled plus local_failures, never marked local
     /// ```
+    ///
+    /// Repeatedly invalid representations back off: one strike per run
+    /// (`FETCH_MAX_STRIKES` strikes) puts the representation in cooldown
+    /// for [`FETCH_COOLDOWN_PASSES`] runs — attempts stop, the item stays
+    /// pending, and cooldown expiry restarts striking from zero. A
+    /// fulfilled fetch clears the strike count. Strikes are in-memory
+    /// state; a restart resumes attempting (fail-closed), never
+    /// persisting grudges.
     ///
     /// A failed import never marks the object local and never commits:
     /// verification is the store's job (`insert_verified`), and only
@@ -290,6 +320,47 @@ impl Engine {
         objects: &mut impl ObjectStore,
     ) -> Result<ExecuteReport, EngineError> {
         super::plan::execute(self, bulk, objects)
+    }
+
+    /// Whether a representation is fetch-eligible this run: its cooldown
+    /// (if any) has expired. Cooled representations are skipped, not
+    /// attempted — the item stays pending and reports unfulfilled.
+    /// Expiry also clears the strike count: cooldown restarts striking
+    /// from zero rather than resuming a stale count.
+    pub(super) fn fetch_eligible(&mut self, storage: &StorageId) -> bool {
+        match self.fetch_cool_until.get(storage) {
+            None => true,
+            Some(until) if self.fetch_run > *until => {
+                self.fetch_cool_until.remove(storage);
+                self.fetch_strikes.remove(storage);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Record a verified-and-rejected fetch attempt. One strike per run
+    /// (a call's convergence passes retry the same failure); reaching
+    /// the strike threshold puts the representation in cooldown starting
+    /// after this run. A later fulfillment clears everything.
+    pub(super) fn note_fetch_invalid(&mut self, storage: &StorageId) {
+        let (strikes, last_run) = self.fetch_strikes.entry(*storage).or_insert((0, 0));
+        if *last_run == self.fetch_run {
+            return;
+        }
+        *last_run = self.fetch_run;
+        *strikes = strikes.saturating_add(1);
+        if *strikes >= FETCH_MAX_STRIKES {
+            self.fetch_cool_until
+                .insert(*storage, self.fetch_run + FETCH_COOLDOWN_PASSES);
+        }
+    }
+
+    /// Record a fulfilled fetch: strikes and cooldowns dissolve — the
+    /// representation served valid bytes.
+    pub(super) fn note_fetch_fulfilled(&mut self, storage: &StorageId) {
+        self.fetch_strikes.remove(storage);
+        self.fetch_cool_until.remove(storage);
     }
 }
 
@@ -2041,15 +2112,20 @@ mod tests {
         fn fetch_root_manifest(
             &mut self,
             snapshot: &SnapshotId,
+            max: usize,
         ) -> Result<Option<SealedManifest>, BulkError> {
-            self.inner.fetch_root_manifest(snapshot)
+            self.inner.fetch_root_manifest(snapshot, max)
         }
 
-        fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError> {
+        fn fetch_sealed(
+            &mut self,
+            storage: &StorageId,
+            max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
             if self.hidden.contains(storage) {
                 return Ok(None);
             }
-            self.inner.fetch_sealed(storage)
+            self.inner.fetch_sealed(storage, max)
         }
     }
 
@@ -2065,15 +2141,20 @@ mod tests {
         fn fetch_root_manifest(
             &mut self,
             snapshot: &SnapshotId,
+            max: usize,
         ) -> Result<Option<SealedManifest>, BulkError> {
-            self.inner.fetch_root_manifest(snapshot)
+            self.inner.fetch_root_manifest(snapshot, max)
         }
 
-        fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError> {
+        fn fetch_sealed(
+            &mut self,
+            storage: &StorageId,
+            max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
             if self.failing.contains(storage) {
                 return Err(BulkError::Transport("injected failure".to_string()));
             }
-            self.inner.fetch_sealed(storage)
+            self.inner.fetch_sealed(storage, max)
         }
     }
 
@@ -2400,6 +2481,150 @@ mod tests {
     }
 
     #[test]
+    fn repeatedly_invalid_representations_back_off() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let mut published = publish(&epoch_secret, 2, &epoch_secret, 2, b"backoff probe");
+        let healthy = published.bulk.clone();
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+        // Corrupt bytes under the served address: every fetch attempt
+        // verifies and rejects.
+        published
+            .bulk
+            .publish_sealed(published.object_storage, vec![0xFF; 64]);
+
+        // The first call converges manifests (two passes), so the object is
+        // attempted twice while striking once — attempts count per pass.
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 2, "attempted while striking");
+
+        // Calls two and three: single-pass strikes, reaching the threshold.
+        for _ in 0..FETCH_MAX_STRIKES - 1 {
+            let report = fixture
+                .engine
+                .execute_plan(&mut published.bulk.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 1, "attempted while striking");
+        }
+        // The strike threshold put the representation in cooldown: the
+        // item stays pending (unfulfilled) but no fetch is attempted.
+        for _ in 0..FETCH_COOLDOWN_PASSES {
+            let report = fixture
+                .engine
+                .execute_plan(&mut published.bulk.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 0, "backing off");
+            assert_eq!(report.unfulfilled, 1);
+        }
+        // Cooldown expired: the representation is retried, fails again,
+        // and the strike count restarts from one rather than resuming.
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 1, "retried after the cooldown");
+        let next = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(next.invalid, 1, "strike count restarted, not resumed");
+
+        // Healing the bytes at the same address converges: the fetch
+        // is attempted and fulfills.
+        let report = fixture
+            .engine
+            .execute_plan(&mut healthy.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+        assert_eq!(report.invalid, 0);
+    }
+
+    #[test]
+    fn fulfillment_clears_fetch_strikes() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let mut published = publish(&epoch_secret, 2, &epoch_secret, 2, b"strike probe");
+        let healthy = published.bulk.clone();
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+
+        // One invalid run: the call converges manifests in pass one, so the
+        // object attempt repeats in pass two while striking once.
+        published
+            .bulk
+            .publish_sealed(published.object_storage, vec![0xFF; 64]);
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 2);
+        assert_eq!(report.manifests, 2);
+
+        // Fulfillment resets strike state: healing the bytes and
+        // converging clears the accumulated strike.
+        let report = fixture
+            .engine
+            .execute_plan(&mut healthy.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.objects, 1, "valid bytes fulfill and clear strikes");
+
+        // Evict the local object (the durable eviction fact): the
+        // object re-enters the plan, and further corrupt runs strike
+        // from zero. A carried strike would have cooled after the
+        // second of the three attempts below.
+        fixture
+            .engine
+            .commit_facts(&[crate::durable::Fact::ObjectRemoved(published.content)])
+            .unwrap();
+        for _ in 0..3 {
+            let report = fixture
+                .engine
+                .execute_plan(&mut published.bulk.clone(), &mut objects)
+                .unwrap();
+            assert_eq!(report.invalid, 1, "attempted while striking");
+        }
+        // The next run is skipped: the strikes accumulated after the
+        // fulfillment finally reached the threshold.
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.invalid, 0, "cooled only after fresh strikes");
+        assert_eq!(report.unfulfilled, 1);
+    }
+
+    #[test]
     fn plan_rejects_root_manifest_for_another_snapshot() {
         let mut fixture = fixture();
         let device = fixture.recipient;
@@ -2659,13 +2884,18 @@ mod tests {
         fn fetch_root_manifest(
             &mut self,
             snapshot: &SnapshotId,
+            max: usize,
         ) -> Result<Option<SealedManifest>, BulkError> {
-            self.inner.fetch_root_manifest(snapshot)
+            self.inner.fetch_root_manifest(snapshot, max)
         }
 
-        fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError> {
+        fn fetch_sealed(
+            &mut self,
+            storage: &StorageId,
+            max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
             *self.fetches.entry(*storage).or_default() += 1;
-            self.inner.fetch_sealed(storage)
+            self.inner.fetch_sealed(storage, max)
         }
     }
 

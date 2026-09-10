@@ -5,6 +5,15 @@
 //! synchronously by design like the rest of `wyrd-sync`: the in-memory
 //! fake serves tests, and [`IrohBulkSource`] provides the network backend.
 //!
+//! Fetches are size-aware: the caller passes the pre-decode byte ceiling
+//! with every request, and the source classifies an oversize
+//! representation as [`BulkError::Oversize`] instead of handing over
+//! undecodable bytes. The memory source and the engine tests enforce the
+//! ceiling exactly; the iroh source enforces it after transfer (its
+//! streaming API verifies the whole Bao tree before bytes are usable —
+//! aborting mid-transfer once the header announces an oversize blob is
+//! transport-internals work that rides with the iroh version set).
+//!
 //! Addressing mirrors what each party may know. Sealed objects are
 //! vault-visible, so they fetch by [`StorageId`]. The root manifest of
 //! a snapshot has no vault-visible pointer (the announcement carries
@@ -34,26 +43,37 @@ pub struct SealedManifest {
 }
 
 /// Bulk fetch failures. Absence is `Ok(None)` — the peer simply does
-/// not hold the bytes — while transport trouble surfaces here. The
-/// engine treats both as "try again later": nothing commits, nothing
-/// is lost.
+/// not hold the bytes — while transport trouble and oversize
+/// representations surface here. The engine treats absence and
+/// transport trouble as "try again later": nothing commits, nothing
+/// is lost. Oversize is classified at this boundary so the plan layer
+/// counts it as invalid remote data, not transport trouble.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BulkError {
     #[error("bulk transport failed: {0}")]
     Transport(String),
+    #[error("sealed representation of {bytes} bytes exceeds the {max}-byte fetch ceiling")]
+    Oversize { bytes: usize, max: usize },
 }
 
 /// The synchronous bulk boundary: sealed manifests and sealed objects
-/// by their fetch addresses.
+/// by their fetch addresses. Every fetch is size-aware: `max` is the
+/// caller's pre-decode byte ceiling, and a representation over it must
+/// fail with [`BulkError::Oversize`] rather than return bytes.
 pub trait BulkSource {
     /// The sealed root manifest a member peer holds for a snapshot, if any.
     fn fetch_root_manifest(
         &mut self,
         snapshot: &SnapshotId,
+        max: usize,
     ) -> Result<Option<SealedManifest>, BulkError>;
 
     /// Sealed bytes (manifest or object) at a vault-visible address, if held.
-    fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError>;
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError>;
 }
 
 /// A remotely addressable iroh blob.
@@ -134,17 +154,28 @@ impl IrohBulkSource {
         self.runtime.block_on(self.endpoint.close());
     }
 
-    fn fetch(&self, blob: &IrohBlobRef) -> Result<Vec<u8>, BulkError> {
+    fn fetch(&self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
-        self.runtime
+        let bytes = self
+            .runtime
             .block_on(async move {
                 let connection = endpoint.connect(provider, iroh_blobs::ALPN).await?;
                 let bytes = get_blob(connection, hash).bytes().await?;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes.to_vec())
             })
-            .map_err(|error| BulkError::Transport(error.to_string()))
+            .map_err(|error| BulkError::Transport(error.to_string()))?;
+        // The iroh path enforces the ceiling after transfer; the module
+        // doc records why (Bao-verified streaming before bytes are
+        // usable) and the streaming abort rides the iroh version set.
+        if bytes.len() > max {
+            return Err(BulkError::Oversize {
+                bytes: bytes.len(),
+                max,
+            });
+        }
+        Ok(bytes)
     }
 }
 
@@ -152,11 +183,12 @@ impl BulkSource for IrohBulkSource {
     fn fetch_root_manifest(
         &mut self,
         snapshot: &SnapshotId,
+        max: usize,
     ) -> Result<Option<SealedManifest>, BulkError> {
         let Some((content_id, blob)) = self.roots.get(snapshot) else {
             return Ok(None);
         };
-        self.fetch(blob).map(|sealed| {
+        self.fetch(blob, max).map(|sealed| {
             Some(SealedManifest {
                 content_id: *content_id,
                 sealed,
@@ -164,11 +196,15 @@ impl BulkSource for IrohBulkSource {
         })
     }
 
-    fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError> {
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
         let Some(blob) = self.sealed.get(storage) else {
             return Ok(None);
         };
-        self.fetch(blob).map(Some)
+        self.fetch(blob, max).map(Some)
     }
 }
 
@@ -196,12 +232,35 @@ impl BulkSource for MemoryBulkSource {
     fn fetch_root_manifest(
         &mut self,
         snapshot: &SnapshotId,
+        max: usize,
     ) -> Result<Option<SealedManifest>, BulkError> {
-        Ok(self.roots.get(snapshot).cloned())
+        let Some(manifest) = self.roots.get(snapshot).cloned() else {
+            return Ok(None);
+        };
+        if manifest.sealed.len() > max {
+            return Err(BulkError::Oversize {
+                bytes: manifest.sealed.len(),
+                max,
+            });
+        }
+        Ok(Some(manifest))
     }
 
-    fn fetch_sealed(&mut self, storage: &StorageId) -> Result<Option<Vec<u8>>, BulkError> {
-        Ok(self.sealed.get(storage).cloned())
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        let Some(sealed) = self.sealed.get(storage).cloned() else {
+            return Ok(None);
+        };
+        if sealed.len() > max {
+            return Err(BulkError::Oversize {
+                bytes: sealed.len(),
+                max,
+            });
+        }
+        Ok(Some(sealed))
     }
 }
 
@@ -214,11 +273,32 @@ mod tests {
     }
 
     #[test]
+    fn oversize_sealed_bytes_classify_structured() {
+        let mut bulk = MemoryBulkSource::default();
+        let storage = StorageId::from_bytes([0x44; 32]);
+        bulk.publish_sealed(storage, vec![0xBB; 65]);
+        // Size-aware fetch: the ceiling rides the request, and an
+        // oversize representation is classified at the boundary instead
+        // of surfacing later as undecodable bytes.
+        assert_eq!(
+            bulk.fetch_sealed(&storage, 64),
+            Err(BulkError::Oversize { bytes: 65, max: 64 })
+        );
+        assert_eq!(
+            bulk.fetch_sealed(&storage, 65).unwrap(),
+            Some(vec![0xBB; 65])
+        );
+    }
+
+    #[test]
     fn missing_bytes_are_absence_not_error() {
         let mut bulk = MemoryBulkSource::default();
-        assert_eq!(bulk.fetch_root_manifest(&snapshot()).unwrap(), None);
         assert_eq!(
-            bulk.fetch_sealed(&StorageId::from_bytes([0x22; 32]))
+            bulk.fetch_root_manifest(&snapshot(), usize::MAX).unwrap(),
+            None
+        );
+        assert_eq!(
+            bulk.fetch_sealed(&StorageId::from_bytes([0x22; 32]), usize::MAX)
                 .unwrap(),
             None
         );
@@ -235,10 +315,13 @@ mod tests {
         bulk.publish_root(snapshot(), manifest.clone());
         bulk.publish_sealed(storage, vec![0xBB; 40]);
         assert_eq!(
-            bulk.fetch_root_manifest(&snapshot()).unwrap(),
+            bulk.fetch_root_manifest(&snapshot(), usize::MAX).unwrap(),
             Some(manifest)
         );
-        assert_eq!(bulk.fetch_sealed(&storage).unwrap(), Some(vec![0xBB; 40]));
+        assert_eq!(
+            bulk.fetch_sealed(&storage, usize::MAX).unwrap(),
+            Some(vec![0xBB; 40])
+        );
     }
 
     #[test]
@@ -283,7 +366,7 @@ mod tests {
         );
 
         assert_eq!(
-            source.fetch_sealed(&storage).unwrap(),
+            source.fetch_sealed(&storage, usize::MAX).unwrap(),
             Some(b"verified over iroh".to_vec())
         );
 
@@ -337,7 +420,7 @@ mod tests {
         );
 
         assert_eq!(
-            source.fetch_root_manifest(&snapshot).unwrap(),
+            source.fetch_root_manifest(&snapshot, usize::MAX).unwrap(),
             Some(SealedManifest {
                 content_id,
                 sealed: b"root manifest bytes".to_vec(),
@@ -345,7 +428,7 @@ mod tests {
         );
         assert_eq!(
             source
-                .fetch_root_manifest(&SnapshotId::from_bytes([0x88; 32]))
+                .fetch_root_manifest(&SnapshotId::from_bytes([0x88; 32]), usize::MAX)
                 .unwrap(),
             None
         );

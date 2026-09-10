@@ -7,8 +7,8 @@ use wyrd_format::{
 };
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
-use crate::bulk::BulkSource;
-use crate::ingest::{check_manifest, check_total_len, Limits};
+use crate::bulk::{BulkError, BulkSource};
+use crate::ingest::{check_manifest, Limits};
 use crate::keys::capability::DriveKeyring;
 use crate::seal::{open_manifest, verify, EncryptedObject};
 
@@ -59,8 +59,11 @@ pub(super) fn root(
         return FetchOutcome::UnavailableKey;
     };
     let key = secret.manifest_key(drive, announcement.epoch, snapshot);
-    let served = match bulk.fetch_root_manifest(snapshot) {
+    let served = match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
         Ok(served) => served,
+        // Oversize representations are invalid remote data, not
+        // transport trouble: the boundary classified them already.
+        Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
         Err(_) => return FetchOutcome::Transport,
     };
     let Some(served) = served else {
@@ -91,8 +94,9 @@ pub(super) fn child(
         return FetchOutcome::UnavailableKey;
     };
     let key = secret.manifest_key(drive, announcement.epoch, &snapshot);
-    let sealed = match bulk.fetch_sealed(&link.storage) {
+    let sealed = match bulk.fetch_sealed(&link.storage, Limits::V0.max_object_bytes) {
         Ok(sealed) => sealed,
+        Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
         Err(_) => return FetchOutcome::Transport,
     };
     let Some(sealed) = sealed else {
@@ -111,9 +115,8 @@ fn open_record(
     snapshot: SnapshotId,
     is_root: bool,
 ) -> Option<ManifestRecord> {
-    if check_total_len(&Limits::V0, "sealed manifest", sealed.len()).is_err() {
-        return None;
-    }
+    // Total-length gating happened at the bulk boundary (size-aware
+    // fetch); decode-level ceilings still apply here.
     let obj = EncryptedObject::decode(sealed).ok()?;
     let manifest = open_manifest(key, expected, &obj).ok()?;
     if check_manifest(&Limits::V0, &manifest).is_err() || manifest.snapshot != snapshot {
@@ -162,10 +165,14 @@ pub(super) fn object(
             encryption_epoch: candidate.encryption_epoch,
             size: candidate.size,
         };
-        let sealed = match bulk.fetch_sealed(&candidate.storage_id) {
+        let sealed = match bulk.fetch_sealed(&candidate.storage_id, Limits::V0.max_object_bytes) {
             Ok(Some(sealed)) => sealed,
             Ok(None) => {
                 outcome = worse(outcome, FetchOutcome::Missing);
+                continue;
+            }
+            Err(BulkError::Oversize { .. }) => {
+                outcome = worse(outcome, FetchOutcome::Invalid);
                 continue;
             }
             Err(_) => {
@@ -173,10 +180,6 @@ pub(super) fn object(
                 continue;
             }
         };
-        if check_total_len(&Limits::V0, "sealed object", sealed.len()).is_err() {
-            outcome = worse(outcome, FetchOutcome::Invalid);
-            continue;
-        }
         let Ok(plaintext) = verify(&entry, &key, &sealed) else {
             outcome = worse(outcome, FetchOutcome::Invalid);
             continue;

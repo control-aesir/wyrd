@@ -179,6 +179,16 @@ impl SnapshotDag {
         heads
     }
 
+    /// The live-head projection as bodies: the id set of
+    /// [`SnapshotDag::eligible_heads`], resolved against the observed
+    /// DAG (sorted ascending, like the ids).
+    pub fn eligible_head_bodies(&self, log: &MembershipLog) -> Vec<Snapshot> {
+        self.eligible_heads(log)
+            .into_iter()
+            .map(|id| self.snapshot(&id).expect("eligible id is observed").clone())
+            .collect()
+    }
+
     /// Classify the whole DAG against the log. One analysis per call;
     /// hold the returned map.
     pub fn classify(&self, log: &MembershipLog) -> HashMap<SnapshotId, Classification> {

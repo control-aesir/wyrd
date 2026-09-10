@@ -17,7 +17,7 @@ use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use wyrd_format::membership::Admission;
 use wyrd_format::{
     Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, Manifest,
-    MembershipTransition, ObjectKind, SnapshotId, StorageId, TransitionId,
+    MembershipTransition, ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
 use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -261,31 +261,54 @@ pub(crate) fn capability_message_for(
     })
 }
 
-/// Ingest the control plane for one snapshot announcement: the
-/// genesis, the admission transition, the capability carrying
-/// `secrets`, and the announcement itself.
+/// Build, sign, and publish a snapshot body to the bulk peer, then
+/// ingest the control plane that makes it pending: the genesis, the
+/// admission transition, the capability carrying `secrets`, and the
+/// announcement bound to the body. Returns the body; its snapshot id is
+/// the address every manifest of the scenario must embed (the plan
+/// validates the binding), so callers thread it into `publish_into`.
 pub(crate) fn intake_snapshot(
     fixture: &mut Fixture,
+    bulk: &mut MemoryBulkSource,
+    builder: &Builder,
     genesis: &MembershipTransition,
     admission: &MembershipTransition,
     secrets: Vec<EpochSecret>,
-) {
-    let bound = announcement_for(2, admission.transition_id());
-    let cap = capability_message(fixture.recipient, admission.transition_id(), 2, secrets);
+) -> Snapshot {
+    let owner = *builder.owners.iter().next().expect("tracked owner");
+    let mut body = Snapshot::new(
+        Vec::new(),
+        ContentId::from_bytes([0xC1; 32]),
+        owner,
+        admission.transition_id(),
+        admission.epoch,
+        0,
+        1000 + admission.epoch,
+    );
+    crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
+    bulk.publish_snapshot(body.snapshot_id(), body.encode());
+
+    let cap = capability_message(
+        fixture.recipient,
+        admission.transition_id(),
+        admission.epoch,
+        secrets,
+    );
+    let bound = announcement_msg(
+        body.snapshot_id(),
+        owner,
+        admission.epoch,
+        admission.transition_id(),
+    );
     let mail = vec![
         deliver(fixture, 1, &transition_message(genesis)),
         deliver(fixture, 1, &transition_message(admission)),
-        deliver(fixture, 2, &cap),
-        deliver(fixture, 2, &bound),
+        deliver(fixture, admission.epoch, &cap),
+        deliver(fixture, admission.epoch, &bound),
     ];
     queue(fixture, mail);
     assert_eq!(drain(fixture).accepted, 4);
-}
-
-pub(crate) struct Published {
-    pub(crate) bulk: MemoryBulkSource,
-    pub(crate) content: ContentId,
-    pub(crate) object_storage: StorageId,
+    body
 }
 
 /// One published snapshot: the chunk's content id plus the
@@ -294,33 +317,6 @@ pub(crate) struct Published {
 pub(crate) struct PublishedSnapshot {
     pub(crate) content: ContentId,
     pub(crate) object_storage: StorageId,
-}
-
-/// Seal one chunk under an entry epoch secret and publish it plus
-/// a root manifest (with one empty child) to a bulk peer. Returns
-/// the peer and the chunk's content id.
-pub(crate) fn publish(
-    manifest_secret: &EpochSecret,
-    manifest_epoch: u64,
-    object_secret: &EpochSecret,
-    object_epoch: u64,
-    plaintext: &[u8],
-) -> Published {
-    let mut bulk = MemoryBulkSource::default();
-    let published = publish_into(
-        &mut bulk,
-        manifest_secret,
-        manifest_epoch,
-        object_secret,
-        object_epoch,
-        SnapshotId::from_bytes([0x11; 32]),
-        plaintext,
-    );
-    Published {
-        bulk,
-        content: published.content,
-        object_storage: published.object_storage,
-    }
 }
 /// Publish one snapshot's manifest tree into a shared bulk peer
 /// (two devices publish side by side). Returns the chunk's
@@ -403,6 +399,14 @@ impl BulkSource for WithoutObjects {
         max: usize,
     ) -> Result<Option<SealedManifest>, BulkError> {
         self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
     }
 
     fn fetch_sealed(

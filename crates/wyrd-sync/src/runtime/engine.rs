@@ -222,6 +222,15 @@ impl Engine {
         self.store.commit(facts)
     }
 
+    /// Test-only: release the store's advisory lock without dropping the
+    /// engine, modeling abrupt process death. Used by the restart helper:
+    /// the fresh engine opens the directory while the parked old engine
+    /// is still in scope but never touched again.
+    #[cfg(test)]
+    pub(crate) fn release_store_lock(&self) {
+        self.store.release_store_lock();
+    }
+
     /// Hold an epoch's control key for inbox ingest. Keys live with
     /// the engine (not just the inbox) so restarts and resyncs keep
     /// them.
@@ -489,8 +498,11 @@ mod tests {
     }
 
     /// Simulated restart: reopen the same store directory with the
-    /// same keys. Held epoch keys are device knowledge, re-applied.
+    /// same keys. The parked engine releases its lock first (abrupt
+    /// death, not an orderly second process). Held epoch keys are
+    /// device knowledge, re-applied.
     fn restart(device: &mut Device, controls: &[(u64, [u8; 32])]) {
+        device.engine.release_store_lock();
         let mut engine = Engine::open(
             device.dir.path.clone(),
             member_drive(),

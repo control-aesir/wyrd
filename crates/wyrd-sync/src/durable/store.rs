@@ -47,8 +47,11 @@ pub(crate) enum CrashStage {
 #[derive(ZeroizeOnDrop)]
 struct StoreKey(Zeroizing<[u8; 32]>);
 
-/// The durable commit log for one drive. Single writer. No `Debug`: the
-/// store key must never be printable.
+/// The durable commit log for one drive. Single writer, enforced: an
+/// exclusive advisory lock (`LOCK`, kernel-held for the store's
+/// lifetime) rejects a second open of the same directory, so the
+/// single-writer invariant no longer rests on discipline alone. No
+/// `Debug`: the store key must never be printable.
 pub struct DurableStore {
     dir: PathBuf,
     drive: DriveId,
@@ -57,6 +60,9 @@ pub struct DurableStore {
     /// the previous-hash link for the next commit.
     last_hash: [u8; 32],
     store_key: StoreKey,
+    /// The locked lock-file handle; holding it keeps the advisory lock.
+    /// Closed and released on drop — no stale locks survive a crash.
+    _lock: File,
 }
 
 pub(super) fn commit_name(seq: u64) -> String {
@@ -91,6 +97,17 @@ impl DurableStore {
     pub fn open(dir: PathBuf, drive: DriveId, passphrase: &str) -> Result<Self, DurableError> {
         let commits = dir.join("commits");
         fs::create_dir_all(&commits)?;
+        // Exclusive ownership before anything else touches the
+        // directory: a kernel-held flock on LOCK dies with this
+        // process, so a crash leaves no stale lock to clean up. The
+        // handle is held for the store's lifetime and released on drop.
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("LOCK"))?;
+        lock.try_lock().map_err(|_| DurableError::StoreLocked)?;
         // Drive identity, written once: a store directory never changes drives.
         let drive_path = dir.join("DRIVE");
         match fs::read(&drive_path) {
@@ -112,12 +129,22 @@ impl DurableStore {
             current,
             last_hash,
             store_key,
+            _lock: lock,
         })
     }
 
     /// The last durable commit sequence.
     pub fn current(&self) -> u64 {
         self.current
+    }
+
+    /// Test-only: release the advisory lock without dropping the store,
+    /// modeling an abrupt process death (a restart test's fresh engine
+    /// opens the directory while the parked old engine is still in
+    /// scope, holding an unlocked store it never touches again).
+    #[cfg(test)]
+    pub(crate) fn release_store_lock(&self) {
+        let _ = self._lock.unlock();
     }
 
     fn load_or_mint_store_key(dir: &Path, passphrase: &str) -> Result<StoreKey, DurableError> {

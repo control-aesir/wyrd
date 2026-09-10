@@ -13,7 +13,9 @@
 //!     ...
 //! ```
 //!
-//! Commit protocol (single writer — no locking in v1):
+//! Commit protocol (single writer — enforced: an exclusive advisory
+//! `LOCK` on the store directory rejects concurrent opens and releases
+//! on drop):
 //!
 //! 1. Serialize the commit (canonical records) to a temp file.
 //! 2. `fsync` the temp file.
@@ -114,6 +116,8 @@ use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
 pub enum DurableError {
     #[error("durable I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("another process holds this store directory")]
+    StoreLocked,
     #[error("CURRENT is present but not a sequence plus commit hash")]
     CorruptCurrent,
     #[error("commit {0} is present but undecodable")]

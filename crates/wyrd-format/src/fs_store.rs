@@ -130,7 +130,15 @@ impl FsObjectStore {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "tmp") {
-                    fs::remove_file(&path).map_err(FsStoreError::io)?;
+                    // A concurrent writer may rename the temp into place
+                    // between the listing and the removal: NotFound means
+                    // the file already reached its live name, which is the
+                    // outcome sweeping wants anyway.
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(FsStoreError::io(error)),
+                    }
                 }
             }
         }
@@ -142,11 +150,19 @@ impl FsObjectStore {
     /// unique per attempt; if a concurrent `open()` sweep deletes the temp
     /// between write and rename, the rename fails with `NotFound`: when
     /// another writer already won the race the write becomes a no-op,
-    /// otherwise it retries with a fresh temp.
+    /// otherwise it rewrites to a fresh temp. Only the rename stage
+    /// retries — write-stage errors return at once, so a broken
+    /// filesystem surfaces instead of looping. The loop terminates
+    /// because only `open()` removes temps and `open()` calls are finite.
     fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
-        for _ in 0..3 {
-            match Self::atomic_write_once(path, bytes) {
-                Ok(()) => return Ok(()),
+        loop {
+            let tmp = Self::write_tmp(path, bytes).map_err(FsStoreError::io)?;
+            match fs::rename(&tmp, path) {
+                Ok(()) => {
+                    fsync_dir(path.parent().expect("object paths have parents"))
+                        .map_err(FsStoreError::io)?;
+                    return Ok(());
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if path.is_file() {
                         return Ok(());
@@ -155,12 +171,11 @@ impl FsObjectStore {
                 Err(error) => return Err(FsStoreError::io(error)),
             }
         }
-        // Final attempt surfaces its error: the target is still absent
-        // and no writer won the race.
-        Self::atomic_write_once(path, bytes).map_err(FsStoreError::io)
     }
 
-    fn atomic_write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    /// Write the temp file for one attempt: created, fully written, and
+    /// fsynced, but not yet renamed into place.
+    fn write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
         fs::create_dir_all(path.parent().expect("object paths have parents"))?;
         let nonce = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
         let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce));
@@ -168,9 +183,7 @@ impl FsObjectStore {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)?;
-        fsync_dir(path.parent().expect("object paths have parents"))?;
-        Ok(())
+        Ok(tmp)
     }
 }
 

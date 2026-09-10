@@ -118,6 +118,17 @@ where
         self.view.set_heads(heads);
         Ok(())
     }
+
+    /// Install the engine's classified live heads: the durable snapshot
+    /// bodies the authorization engine marks `Eligible`, replayed and
+    /// classified inside `wyrd-sync` (see [`Engine::live_heads`]). This
+    /// is the engine-backed projection; [`Daemon::refresh_heads`] stays
+    /// for non-engine sources.
+    pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
+        let heads = self.engine.live_heads()?;
+        self.view.set_heads(heads);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -190,10 +201,19 @@ mod tests {
         );
 
         // Scratch engine: the daemon slice does not drive it yet, but
-        // the composition holds the real dependency shape.
+        // the composition holds the real dependency shape. The engine
+        // holds no durable snapshot bodies, so the live-head projection
+        // is empty and the view serves nothing.
         let (engine, dir) = scratch_engine();
 
         let mut daemon = Daemon::new(engine, store);
+        daemon.refresh_live_heads().unwrap();
+        assert_eq!(
+            daemon.view().lookup("sub/a.txt"),
+            Err(ViewError::NotFound),
+            "an empty engine projects no heads"
+        );
+
         daemon.set_heads(vec![head]);
 
         let node = daemon.view().lookup("sub/a.txt").unwrap();

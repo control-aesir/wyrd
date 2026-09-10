@@ -9,6 +9,7 @@
 
 pub mod chunk;
 pub mod envelope;
+pub mod fs_store;
 pub mod identity;
 pub mod manifest;
 pub mod membership;
@@ -18,6 +19,7 @@ pub mod tree;
 
 pub use chunk::Chunk;
 pub use envelope::{Envelope, EnvelopeError};
+pub use fs_store::{FsObjectStore, FsStoreError};
 pub use identity::{
     ContentId, DeviceEncryptionKey, DeviceId, DriveId, ObjectKind, SnapshotId, StorageId,
     TransitionId,

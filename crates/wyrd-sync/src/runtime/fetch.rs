@@ -11,6 +11,15 @@ use crate::keys::capability::DriveKeyring;
 use crate::seal::{open_manifest, verify, EncryptedObject};
 
 /// Fetch and validate a pending root manifest.
+///
+/// The enforced binding is same-snapshot, not any-root-for-snapshot: the
+/// bytes must open under this snapshot's manifest key with the served
+/// content id as AAD, hash to that id, and embed this snapshot's id.
+/// A manifest for another snapshot is rejected even when its seal is
+/// well-formed. What fetch does *not* check is that the manifest's
+/// entries describe the snapshot's tree — that correspondence is
+/// author-attested and verified at consumption (lookup cross-checks
+/// the tree walk against manifest entries).
 pub(super) fn root(
     drive: &DriveId,
     bulk: &mut impl BulkSource,

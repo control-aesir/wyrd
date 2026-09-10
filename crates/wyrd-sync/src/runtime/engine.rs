@@ -2093,6 +2093,60 @@ mod tests {
     }
 
     #[test]
+    fn plan_rejects_root_manifest_for_another_snapshot() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // A manifest sealed under this snapshot's key but embedding a
+        // different snapshot id: it opens cleanly, yet claims the wrong
+        // snapshot. fetch_root must reject it — same-snapshot is the
+        // enforced binding, not any-root-for-snapshot.
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
+        let rogue = Manifest {
+            snapshot: SnapshotId::from_bytes([0x22; 32]),
+            entries: vec![],
+            children: vec![],
+        };
+        let (rogue_id, sealed_rogue) = seal_manifest(&manifest_key, &rogue).unwrap();
+        let mut hostile = MemoryBulkSource::default();
+        hostile.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: rogue_id,
+                sealed: sealed_rogue.encode(),
+            },
+        );
+
+        let mut objects = MemoryObjectStore::default();
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0, "wrong-snapshot root commits nothing");
+        assert_eq!(report.unfulfilled, 1, "the snapshot stays pending");
+        assert_eq!(report.transport_errors, 0);
+
+        // Rejection is stable: a second run still finds the snapshot
+        // pending and commits nothing.
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0);
+        assert_eq!(report.unfulfilled, 1);
+    }
+
+    #[test]
     fn plan_ignores_resealed_equivalents_of_recorded_manifests() {
         let mut fixture = fixture();
         let device = fixture.recipient;

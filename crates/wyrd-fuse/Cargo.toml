@@ -6,3 +6,4 @@ description = "Wyrd's FUSE presentation layer: live view and time travel"
 
 [dependencies]
 wyrd-format.workspace = true
+thiserror.workspace = true

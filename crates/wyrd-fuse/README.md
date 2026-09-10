@@ -20,6 +20,9 @@ operations into format-layer calls and renders format-layer state as files.
 
 ## Status
 
-Not implemented. Mounting requires macFUSE on macOS and FUSE 3 on Linux; both
-constraints shape how much can run in tests, so the crate will lean on the
-format layer being pure and mount-free.
+Read-only drive view implemented mount-free (`src/view.rs`: lookup,
+readdir, open, read, stat over the format layer, remote-only content
+mapped through `FetchStatus`, conflicts surfaced per the policy in
+`docs/sync-and-peers.md`). Kernel mounting still pending: it requires
+macFUSE on macOS and FUSE 3 on Linux, and a daemon composing this view
+with `wyrd-sync`.

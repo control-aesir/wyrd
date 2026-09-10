@@ -26,4 +26,4 @@ pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_
 pub use membership::{Change, MembershipError, MembershipTransition};
 pub use snapshot::Snapshot;
 pub use store::{FetchStatus, MemoryObjectStore, ObjectStore};
-pub use tree::Tree;
+pub use tree::{Component, Entry, EntryContent, Tree};

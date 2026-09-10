@@ -101,6 +101,8 @@ pub struct RuntimeState {
 pub enum RuntimeError {
     #[error("conflicting snapshot announcement for {snapshot}")]
     ConflictingAnnouncement { snapshot: SnapshotId },
+    #[error("snapshot body {snapshot} disagrees with its accepted announcement")]
+    AnnouncementBodyMismatch { snapshot: SnapshotId },
     #[error("conflicting manifest record for {manifest}")]
     ConflictingManifest { manifest: ContentId },
     #[error("child manifest {manifest} has multiple owning snapshots")]
@@ -236,13 +238,25 @@ impl RuntimeState {
         self.announcements.get(snapshot)
     }
 
-    /// Record a signature-verified snapshot body. Replaying a body is a
-    /// no-op: the snapshot id covers the bytes, so a second body for the
-    /// same id is the same body. Returns `true` when newly recorded.
-    pub fn record_snapshot_body(&mut self, snapshot: Snapshot) -> bool {
-        self.snapshot_bodies
-            .insert(snapshot.snapshot_id(), snapshot)
-            .is_none()
+    /// Record a signature-verified snapshot body. The body must agree
+    /// with the accepted announcement's `author`, `epoch`, and
+    /// `membership` — the fetch plan compares before committing, and
+    /// this method enforces the invariant as a backstop, so replay can
+    /// never represent an inconsistent pair. Replaying a body is a
+    /// no-op: the snapshot id covers the bytes, so a second body for
+    /// the same id is the same body. Returns `true` when newly
+    /// recorded.
+    pub fn record_snapshot_body(&mut self, snapshot: Snapshot) -> Result<bool, RuntimeError> {
+        let id = snapshot.snapshot_id();
+        if let Some(announcement) = self.announcements.get(&id) {
+            let agrees = announcement.author == snapshot.author
+                && announcement.epoch == snapshot.epoch
+                && announcement.membership == snapshot.membership;
+            if !agrees {
+                return Err(RuntimeError::AnnouncementBodyMismatch { snapshot: id });
+            }
+        }
+        Ok(self.snapshot_bodies.insert(id, snapshot).is_none())
     }
 
     /// The recorded body for one snapshot, if any.
@@ -689,14 +703,83 @@ mod tests {
         assert!(plan.pending_snapshot_bodies.contains(&id));
         assert!(plan.pending_snapshots.contains(&id), "manifest side too");
 
-        assert!(state.record_snapshot_body(body.clone()));
-        assert!(!state.record_snapshot_body(body), "replay is a no-op");
+        assert!(state.record_snapshot_body(body.clone()).unwrap());
+        assert!(
+            !state.record_snapshot_body(body).unwrap(),
+            "replay is a no-op"
+        );
         assert_eq!(
             state.reconcile().pending_snapshot_bodies,
             BTreeSet::new(),
             "the body is no longer wanted"
         );
         assert!(state.snapshot_body(&id).is_some());
+    }
+
+    #[test]
+    fn recorded_bodies_must_match_their_announcement() {
+        // The id covers the bytes, so an announcement always names a
+        // real body — but a lying announcement can name it under wrong
+        // metadata. The runtime state refuses to hold such a pair, per
+        // field: author, epoch, and membership.
+        let author = wyrd_format::DeviceId::from_bytes([2; 32]);
+        let other_author = wyrd_format::DeviceId::from_bytes([9; 32]);
+        let membership = wyrd_format::TransitionId::from_bytes([0x33; 32]);
+        let other_membership = wyrd_format::TransitionId::from_bytes([0x44; 32]);
+        let body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x51; 32]),
+            author,
+            membership,
+            3,
+            0,
+            42,
+        );
+        let id = body.snapshot_id();
+
+        for announcement in [
+            SnapshotAnnouncement {
+                snapshot: id,
+                author: other_author,
+                epoch: 3,
+                membership,
+            },
+            SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 4,
+                membership,
+            },
+            SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 3,
+                membership: other_membership,
+            },
+        ] {
+            let mut state = RuntimeState::new(drive());
+            state.record_announcement(announcement).unwrap();
+            assert!(
+                matches!(
+                    state.record_snapshot_body(body.clone()),
+                    Err(RuntimeError::AnnouncementBodyMismatch { .. })
+                ),
+                "a disagreeing pair must never be recorded"
+            );
+            assert!(state.snapshot_body(&id).is_none());
+        }
+
+        // With agreeing metadata the same body records fine.
+        let mut state = RuntimeState::new(drive());
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot: id,
+                author,
+                epoch: 3,
+                membership,
+            })
+            .unwrap();
+        assert!(state.record_snapshot_body(body).unwrap());
     }
 
     #[test]

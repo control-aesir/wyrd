@@ -131,7 +131,7 @@ pub(super) fn rebuild_facts(
                 runtime.record_announcement(a)?;
             }
             RuntimeFact::SnapshotBody(s) => {
-                runtime.record_snapshot_body(s);
+                runtime.record_snapshot_body(s)?;
             }
             RuntimeFact::Manifest(m) => {
                 runtime.record_manifest(m)?;

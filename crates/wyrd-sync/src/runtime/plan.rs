@@ -36,11 +36,30 @@ pub(super) fn execute(
             }
             match super::fetch::snapshot_body(bulk, snapshot) {
                 FetchOutcome::Fulfilled(body) => {
+                    // The cross-record binding: the body must be the one
+                    // the accepted announcement describes. The snapshot
+                    // id covers the bytes, but a lying announcement can
+                    // still name a real body under wrong metadata — and
+                    // that metadata drives manifest-key selection while
+                    // the body's own binding drives authorization. Only
+                    // an agreeing pair commits; a disagreement is the
+                    // sender's invalid data, not a transport failure.
+                    let announced = runtime
+                        .announcement(snapshot)
+                        .expect("pending bodies derive from announcements");
+                    let agrees = announced.author == body.author
+                        && announced.epoch == body.epoch
+                        && announced.membership == body.membership;
+                    if !agrees {
+                        report.invalid += 1;
+                        engine.note_fetch_invalid(&body_key);
+                        continue;
+                    }
                     // The commit-time gate: only signature-verified
                     // bodies become durable facts.
                     match crate::durable::AuthorizedSnapshot::authorize(body, &engine.drive) {
                         Ok(authorized) => {
-                            runtime.record_snapshot_body(authorized.snapshot().clone());
+                            runtime.record_snapshot_body(authorized.snapshot().clone())?;
                             facts.push(crate::durable::Fact::SnapshotBody(authorized));
                             report.snapshot_bodies += 1;
                             engine.note_fetch_fulfilled(&body_key);
@@ -176,8 +195,8 @@ mod tests {
 
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        ContentId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, Snapshot, SnapshotId,
-        StorageId,
+        ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, Snapshot,
+        SnapshotId, StorageId,
     };
 
     use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -186,7 +205,7 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
         admit_engine, announcement_msg, deliver, drain, fixture, intake_snapshot, publish_into,
-        queue, reopen, WithoutObjects,
+        queue, reopen, transition_message, WithoutObjects,
     };
     use crate::runtime::MaterializationState;
     use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
@@ -1143,6 +1162,110 @@ mod tests {
             .map(|m| (m.manifest_id, m.storage_ids.clone()))
             .collect();
         assert_eq!(before, after, "records keep original storage ids");
+    }
+
+    #[test]
+    fn plan_rejects_bodies_that_disagree_with_their_announcement() {
+        // A lying announcement: a real, validly signed body announced
+        // under wrong metadata. The body is fetched, then rejected as
+        // invalid — never recorded, never eligible — because the
+        // announcement's metadata drives manifest-key selection while
+        // the body's own binding drives authorization, and the pair
+        // must agree.
+        let assert_rejected = |fixture: &mut crate::runtime::test_util::Fixture,
+                               bulk: &mut MemoryBulkSource| {
+            let mut objects = MemoryObjectStore::default();
+            let report = fixture.engine.execute_plan(bulk, &mut objects).unwrap();
+            assert_eq!(report.invalid, 1);
+            assert_eq!(
+                report.snapshot_bodies, 0,
+                "a disagreeing body never commits"
+            );
+            let facts = fixture.engine.store.load().expect("loads");
+            assert!(facts.snapshot_bodies.is_empty());
+            assert!(fixture.engine.live_heads().unwrap().is_empty());
+        };
+
+        // Author mismatch: the announcement names another device.
+        {
+            let mut fixture = fixture();
+            let device = fixture.recipient;
+            let (mut builder, genesis) = Builder::genesis(10);
+            let admission = admit_engine(&mut builder, device);
+            let owner = *builder.owners.iter().next().expect("tracked owner");
+            let mut body = wyrd_format::Snapshot::new(
+                Vec::new(),
+                ContentId::from_bytes([0xC3; 32]),
+                owner,
+                admission.transition_id(),
+                admission.epoch,
+                0,
+                1005,
+            );
+            crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
+            let mut bulk = MemoryBulkSource::default();
+            bulk.publish_snapshot(body.snapshot_id(), body.encode());
+            let mail = vec![
+                deliver(&fixture, 1, &transition_message(&genesis)),
+                deliver(&fixture, 1, &transition_message(&admission)),
+            ];
+            queue(&mut fixture, mail);
+            assert_eq!(drain(&mut fixture).accepted, 2);
+            let lying = announcement_msg(
+                body.snapshot_id(),
+                DeviceId::from_bytes([0x22; 32]),
+                admission.epoch,
+                admission.transition_id(),
+            );
+            let envelope = deliver(&fixture, 2, &lying);
+            queue(&mut fixture, vec![envelope]);
+            assert_eq!(drain(&mut fixture).accepted, 1);
+            assert_rejected(&mut fixture, &mut bulk);
+        }
+
+        // Epoch and membership mismatch: the body binds to the genesis
+        // transition (epoch 1) while the announcement claims epoch 2
+        // and the admission transition — self-consistent for intake, so
+        // only the cross-record comparison can catch it.
+        {
+            let mut fixture = fixture();
+            let device = fixture.recipient;
+            let (mut builder, genesis) = Builder::genesis(10);
+            let admission = admit_engine(&mut builder, device);
+            let owner = *builder.owners.iter().next().expect("tracked owner");
+            let mut stale = wyrd_format::Snapshot::new(
+                Vec::new(),
+                ContentId::from_bytes([0xC4; 32]),
+                owner,
+                genesis.transition_id(),
+                genesis.epoch,
+                0,
+                1006,
+            );
+            crate::authorization::test_util::sign_snapshot(
+                &mut stale,
+                &builder.sk,
+                &member_drive(),
+            );
+            let mut bulk = MemoryBulkSource::default();
+            bulk.publish_snapshot(stale.snapshot_id(), stale.encode());
+            let mail = vec![
+                deliver(&fixture, 1, &transition_message(&genesis)),
+                deliver(&fixture, 1, &transition_message(&admission)),
+            ];
+            queue(&mut fixture, mail);
+            assert_eq!(drain(&mut fixture).accepted, 2);
+            let lying = announcement_msg(
+                stale.snapshot_id(),
+                owner,
+                admission.epoch,
+                admission.transition_id(),
+            );
+            let envelope = deliver(&fixture, 2, &lying);
+            queue(&mut fixture, vec![envelope]);
+            assert_eq!(drain(&mut fixture).accepted, 1);
+            assert_rejected(&mut fixture, &mut bulk);
+        }
     }
 
     #[test]

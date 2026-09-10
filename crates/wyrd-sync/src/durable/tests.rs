@@ -360,7 +360,9 @@ fn facts_rebuild_live_state() {
     let mut runtime = RuntimeState::new(drive());
     runtime.record_announcement(announcement(&child)).unwrap();
     let body = authorized_snapshot_body();
-    runtime.record_snapshot_body(body.snapshot().clone());
+    runtime
+        .record_snapshot_body(body.snapshot().clone())
+        .unwrap();
     runtime.record_manifest(manifest_record()).unwrap();
     runtime.remove_local_object(ContentId::from_bytes([4; 32]));
     runtime.set_materialization(ContentId::from_bytes([4; 32]), MaterializationState::Cached);

@@ -79,7 +79,9 @@ pub(super) fn root(
 /// Fetch and validate a snapshot body: the plaintext CAS object whose
 /// content id is the snapshot id. The content check binds the bytes to
 /// the announcement (the id covers the bytes, so only the author's body
-/// can hash to it); the signature gate happens at the commit boundary,
+/// can hash to it); the announcement's *metadata* must also agree with
+/// the body's own binding, which the plan stage compares before
+/// committing, and the signature gate happens at the commit boundary,
 /// because durable facts only carry verified bodies.
 pub(super) fn snapshot_body(
     bulk: &mut impl BulkSource,

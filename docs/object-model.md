@@ -303,6 +303,11 @@ a stored object always hashes back to its address (the scrub invariant).
 Ciphertext stores addressed by `StorageId` are a sync-layer concern (they
 will ride on iroh-blobs' verified streaming rather than duplicating it).
 
+Two implementations: `MemoryObjectStore` (test and bench scaffolding) and
+`FsObjectStore` (`crates/wyrd-format/src/fs_store.rs`), the crash-safe
+directory store — `<dir>/objects/<kind>/<fanout>/<hex>`, temp+fsync+rename
+writes, stale-temp sweep on open, verify-on-read scrub.
+
 ## Remaining open questions
 
 1. ~~**Membership/epoch state machine**~~ — resolved: normative in

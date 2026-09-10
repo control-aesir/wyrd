@@ -25,12 +25,15 @@ arbitrary subsets of that drive locally.
 |---|---|---|
 | `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror only |
 | `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
-| `wyrd-fuse` | FUSE mount: live view, time travel, conflict surfacing | `wyrd-format` only |
+| `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format` only |
+| `wyrd-daemon` | Composition: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-sync`, `wyrd-fuse`, `fuser` |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
-async, or FUSE dependency. `wyrd-fuse` must never know that iroh exists — an
-application/daemon composes sync and fuse; the filesystem should work against
-the format layer alone.
+async, or FUSE dependency. `wyrd-fuse` must never know that iroh exists — the
+daemon composes sync and fuse. `wyrd-daemon` is that composer: its core is
+presentation-agnostic (mobile platforms cannot use FUSE, so the platform
+surface is a pluggable backend over the same view); the FUSE adapter is the
+first backend, not a property of the core.
 
 ## Invariants (hold everywhere, always)
 

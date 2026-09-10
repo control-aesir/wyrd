@@ -9,7 +9,8 @@ to. The README carries the vision; `docs/` carries the current design contract.
 
 - `crates/wyrd-format` — CAS, typed identities, chunking, Merkle snapshot DAG. The format contract.
 - `crates/wyrd-sync` — iroh transport, encrypted manifests, roles × materialization, two-phase content.
-- `crates/wyrd-fuse` — FUSE mount (unimplemented; macFUSE/FUSE3 constraints).
+- `crates/wyrd-fuse` — Mount-free drive view (the filesystem-shaped read surface; never mounts).
+- `crates/wyrd-daemon` — Composition crate: engine + view + presentation backends (FUSE adapter today; mobile file surfaces later). The composer per T16.
 - `docs/` — agent-digestible architecture docs. `object-model.md` is the normative
   v0 format spec; `trust.md` and `epochs.md` are the normative trust and
   authorization contracts. Keep them current when behavior changes; stale

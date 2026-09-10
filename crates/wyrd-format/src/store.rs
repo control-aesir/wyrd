@@ -44,6 +44,33 @@ pub trait ObjectStore {
     fn has(&self, id: &ContentId) -> Result<bool, Self::Error>;
 }
 
+/// Transient fetch status for one content object: the sync-internal
+/// fetch state machine FUSE consumes through the abstract
+/// materialization interface (`docs/sync-and-peers.md`).
+///
+/// This answers "can this be read right now". It is not the residency
+/// policy (`wyrd-sync`'s `RemoteOnly`/`Cached`/`Pinned` answers "what
+/// does this device want to hold"). Transitions into and out of
+/// `Fetching` are owned by the sync layer; the filesystem maps the
+/// settled states to POSIX errors only at its boundary (`EIO` when no
+/// peer is reachable and the object is not cached; corrupt objects
+/// trigger scrub/repair before ever surfacing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    /// Known via manifest; content not local; no fetch in flight.
+    RemoteOnly,
+    /// A fetch is in flight; readers block with visible progress.
+    Fetching,
+    /// Verified bytes are local and readable.
+    Available,
+    /// No peer holds it, no key is held, or no peer is reachable;
+    /// retryable once conditions change.
+    Unavailable,
+    /// Remote bytes failed verification, or the local store refused
+    /// verified bytes; scrub/repair before ever surfacing as data.
+    Corrupt,
+}
+
 /// An in-memory [`ObjectStore`]: test and bench scaffolding. Network-backed
 /// stores are a sync-layer concern.
 #[derive(Debug, Default, Clone)]

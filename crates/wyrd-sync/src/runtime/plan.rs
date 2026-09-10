@@ -8,6 +8,7 @@
 use wyrd_format::ObjectStore;
 
 use super::engine::{Engine, EngineError, ExecuteReport};
+use super::fetch::FetchOutcome;
 use crate::bulk::BulkSource;
 
 /// Execute the current fetch plan to convergence.
@@ -25,47 +26,46 @@ pub(super) fn execute(
         let mut facts = Vec::new();
 
         for snapshot in &plan.pending_snapshots {
-            if let Some(record) = super::fetch::root(
-                &engine.drive,
-                bulk,
-                &keyring,
-                &runtime,
-                snapshot,
-                &mut report.transport_errors,
-            ) {
-                runtime.record_manifest(record.clone())?;
-                facts.push(crate::durable::Fact::Manifest(record));
-                report.manifests += 1;
+            match super::fetch::root(&engine.drive, bulk, &keyring, &runtime, snapshot) {
+                FetchOutcome::Fulfilled(record) => {
+                    runtime.record_manifest(record.clone())?;
+                    facts.push(crate::durable::Fact::Manifest(record));
+                    report.manifests += 1;
+                }
+                FetchOutcome::Missing => report.missing += 1,
+                FetchOutcome::Invalid => report.invalid += 1,
+                FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
+                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Local => report.local_failures += 1,
             }
         }
         for (id, link) in &plan.pending_manifests {
-            if let Some(record) = super::fetch::child(
-                &engine.drive,
-                bulk,
-                &keyring,
-                &runtime,
-                id,
-                link,
-                &mut report.transport_errors,
-            ) {
-                runtime.record_manifest(record.clone())?;
-                facts.push(crate::durable::Fact::Manifest(record));
-                report.manifests += 1;
+            match super::fetch::child(&engine.drive, bulk, &keyring, &runtime, id, link) {
+                FetchOutcome::Fulfilled(record) => {
+                    runtime.record_manifest(record.clone())?;
+                    facts.push(crate::durable::Fact::Manifest(record));
+                    report.manifests += 1;
+                }
+                FetchOutcome::Missing => report.missing += 1,
+                FetchOutcome::Invalid => report.invalid += 1,
+                FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
+                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Local => report.local_failures += 1,
             }
         }
         for (content, candidates) in &plan.pending_objects {
-            if super::fetch::object(
-                &engine.drive,
-                bulk,
-                &keyring,
-                objects,
-                content,
-                candidates,
-                &mut report.transport_errors,
-            ) {
-                runtime.mark_local_object(*content);
-                facts.push(crate::durable::Fact::LocalObject(*content));
-                report.objects += 1;
+            match super::fetch::object(&engine.drive, bulk, &keyring, objects, content, candidates)
+            {
+                FetchOutcome::Fulfilled(()) => {
+                    runtime.mark_local_object(*content);
+                    facts.push(crate::durable::Fact::LocalObject(*content));
+                    report.objects += 1;
+                }
+                FetchOutcome::Missing => report.missing += 1,
+                FetchOutcome::Invalid => report.invalid += 1,
+                FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
+                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Local => report.local_failures += 1,
             }
         }
 

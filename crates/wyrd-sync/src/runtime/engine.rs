@@ -101,6 +101,17 @@ pub struct ExecuteReport {
     /// a failing transport is worth distinguishing for operators:
     /// both retry later, only one needs investigating.
     pub transport_errors: usize,
+    /// Attempts finding peer absence: no bytes served, or no usable
+    /// fetch candidate at all.
+    pub missing: usize,
+    /// Attempts rejected on arrival: over ingest limits, undecodable,
+    /// wrong kind, failed AEAD/identity, or a wrong-snapshot manifest.
+    pub invalid: usize,
+    /// Attempts lacking the epoch secret to open the seal; retried
+    /// after the capability arrives.
+    pub unavailable_keys: usize,
+    /// Verified bytes the local store refused; never marked local.
+    pub local_failures: usize,
 }
 
 /// Cap on held messages: without one, distinct never-authorizable
@@ -256,16 +267,18 @@ impl Engine {
     /// objects in the next. A pass that commits nothing ends the run;
     /// its remaining items are reported as unfulfilled, never raised.
     ///
-    /// Per-item failure policy, stated exactly:
+    /// Per-item failure policy, stated exactly. Every row stays
+    /// fail-closed (nothing commits) and every counter counts attempts
+    /// across passes, like `transport_errors`:
     ///
     /// ```text
-    /// bulk bytes absent ........... unfulfilled, retried next run
+    /// bulk bytes absent ........... unfulfilled plus missing, retried next run
     /// bulk transport error ........ unfulfilled plus transport_errors, retried next run
-    /// epoch capability unheld ..... unfulfilled, retried next run
-    /// over ingest limits .......... unfulfilled, never committed
-    /// undecodable / wrong kind .... unfulfilled, never committed
-    /// failed AEAD / identity ...... unfulfilled, never committed
-    /// store import failure ........ unfulfilled, never marked local
+    /// epoch capability unheld ..... unfulfilled plus unavailable_keys, retried next run
+    /// over ingest limits .......... unfulfilled plus invalid, never committed
+    /// undecodable / wrong kind .... unfulfilled plus invalid, never committed
+    /// failed AEAD / identity ...... unfulfilled plus invalid, never committed
+    /// store import failure ........ unfulfilled plus local_failures, never marked local
     /// ```
     ///
     /// A failed import never marks the object local and never commits:
@@ -297,7 +310,7 @@ mod tests {
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        Change, ChildManifest, DeviceEncryptionKey, Manifest, MembershipTransition,
+        Change, ChildManifest, DeviceEncryptionKey, Manifest, ManifestEntry, MembershipTransition,
         MemoryObjectStore, ObjectKind, ObjectStore, SnapshotId, StorageId, TransitionId,
     };
 
@@ -1395,6 +1408,10 @@ mod tests {
                 objects: 0,
                 unfulfilled: 0,
                 transport_errors: 0,
+                missing: 0,
+                invalid: 0,
+                unavailable_keys: 0,
+                local_failures: 0,
             }
         );
     }
@@ -1986,6 +2003,10 @@ mod tests {
                     objects: 0,
                     unfulfilled: 0,
                     transport_errors: 0,
+                    missing: 0,
+                    invalid: 0,
+                    unavailable_keys: 0,
+                    local_failures: 0,
                 }
             );
             assert_eq!(pair.a.engine.current(), current, "no new commits");
@@ -2041,6 +2062,273 @@ mod tests {
         }
     }
 
+    /// A store that refuses every import: even verified bytes fail
+    /// locally, exercising the Local failure class. Fail-closed by
+    /// construction — nothing is ever retained.
+    struct RefusingStore;
+    #[derive(Debug)]
+    struct RefusingStoreError;
+
+    impl ObjectStore for RefusingStore {
+        type Error = RefusingStoreError;
+
+        fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, Self::Error> {
+            Err(RefusingStoreError)
+        }
+
+        fn insert_verified(
+            &mut self,
+            _kind: ObjectKind,
+            _expected: &ContentId,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
+            Err(RefusingStoreError)
+        }
+
+        fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(None)
+        }
+
+        fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn plan_counts_absent_object_bytes_as_missing() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"withheld bytes");
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+
+        // The manifests commit; the withheld object stays missing.
+        let mut hostile = WithoutObjects {
+            inner: published.bulk.clone(),
+            hidden: BTreeSet::from([published.object_storage]),
+        };
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1);
+        assert_eq!(report.missing, 2, "one attempt per pass");
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.unavailable_keys, 0);
+        assert_eq!(report.local_failures, 0);
+    }
+
+    #[test]
+    fn plan_counts_rejected_object_bytes_as_invalid() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"corrupt bytes");
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+
+        // The peer serves bytes no decoder accepts: rejected, never
+        // committed, retried next run.
+        let mut hostile = published.bulk.clone();
+        hostile.publish_sealed(published.object_storage, vec![0xFF; 64]);
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1);
+        assert_eq!(report.invalid, 2, "one attempt per pass");
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.unavailable_keys, 0);
+        assert_eq!(report.local_failures, 0);
+        assert!(!objects.has(&published.content).unwrap());
+    }
+
+    #[test]
+    fn plan_counts_unknown_epoch_objects_as_unavailable_keys() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // The manifest opens under the held epoch, but the object is
+        // sealed under an epoch whose capability never arrived.
+        let foreign = EpochSecret::from_bytes([0x0A; 32]);
+        let published = publish(&epoch_secret, 2, &foreign, 9, b"future epoch");
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1);
+        assert_eq!(report.unavailable_keys, 2, "one attempt per pass");
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.local_failures, 0);
+    }
+
+    #[test]
+    fn plan_counts_refused_imports_as_local_failures() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        let published = publish(&epoch_secret, 2, &epoch_secret, 2, b"refused bytes");
+        let mut objects = RefusingStore;
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+
+        // The bytes verify, but the local store refuses them: counted,
+        // never marked local, retried next run.
+        let report = fixture
+            .engine
+            .execute_plan(&mut published.bulk.clone(), &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1);
+        assert_eq!(report.local_failures, 2, "one attempt per pass");
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.unavailable_keys, 0);
+        assert_eq!(report.transport_errors, 0);
+    }
+
+    #[test]
+    fn plan_falls_back_to_the_next_candidate() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // One logical object, two representations across two snapshots:
+        // the first is corrupt bytes, the second is healthy. The plan
+        // must fulfill through the healthy one regardless of order.
+        let drive = member_drive();
+        let plaintext = b"fallback content";
+        let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+        let object_key =
+            epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let good = entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, plaintext).unwrap();
+        let bad_storage = StorageId::from_bytes([0xBD; 32]);
+        let bad = ManifestEntry {
+            content_id: content,
+            kind: ObjectKind::Chunk,
+            version: SEAL_VERSION,
+            storage_id: bad_storage,
+            encryption_epoch: 2,
+            size: plaintext.len() as u64,
+        };
+        let snapshot_a = SnapshotId::from_bytes([0x11; 32]);
+        let snapshot_b = SnapshotId::from_bytes([0x13; 32]);
+        let mut bulk = MemoryBulkSource::default();
+        for (snapshot, entry) in [(snapshot_a, bad), (snapshot_b, good)] {
+            let manifest = Manifest {
+                snapshot,
+                entries: vec![entry],
+                children: vec![],
+            };
+            let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+            let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+            bulk.publish_root(
+                snapshot,
+                SealedManifest {
+                    content_id: id,
+                    sealed: sealed.encode(),
+                },
+            );
+        }
+        let bound = announcement_msg(
+            snapshot_b,
+            DeviceId::from_bytes([0x22; 32]),
+            2,
+            admission.transition_id(),
+        );
+        let envelope = deliver(&fixture, 2, &bound);
+        queue(&mut fixture, vec![envelope]);
+        assert_eq!(drain(&mut fixture).accepted, 1);
+        bulk.publish_sealed(bad_storage, vec![0xFF; 64]);
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 2);
+        assert_eq!(report.objects, 1, "the healthy candidate fulfills");
+        assert_eq!(report.unfulfilled, 0);
+        assert!(objects.has(&content).unwrap());
+    }
+
     #[test]
     fn plan_counts_transport_errors_separately_from_absence() {
         let mut fixture = fixture();
@@ -2079,6 +2367,10 @@ mod tests {
         // tried once while its sibling child manifest still commits
         // and once more on the final empty pass.
         assert_eq!(report.transport_errors, 2);
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.unavailable_keys, 0);
+        assert_eq!(report.local_failures, 0);
         assert!(!objects.has(&published.content).unwrap());
 
         // The next run against the healthy peer converges with a
@@ -2090,6 +2382,64 @@ mod tests {
         assert_eq!(report.objects, 1);
         assert_eq!(report.unfulfilled, 0);
         assert_eq!(report.transport_errors, 0);
+    }
+
+    #[test]
+    fn plan_rejects_root_manifest_for_another_snapshot() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        intake_snapshot(
+            &mut fixture,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+
+        // A manifest sealed under this snapshot's key but embedding a
+        // different snapshot id: it opens cleanly, yet claims the wrong
+        // snapshot. fetch_root must reject it — same-snapshot is the
+        // enforced binding, not any-root-for-snapshot.
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
+        let rogue = Manifest {
+            snapshot: SnapshotId::from_bytes([0x22; 32]),
+            entries: vec![],
+            children: vec![],
+        };
+        let (rogue_id, sealed_rogue) = seal_manifest(&manifest_key, &rogue).unwrap();
+        let mut hostile = MemoryBulkSource::default();
+        hostile.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: rogue_id,
+                sealed: sealed_rogue.encode(),
+            },
+        );
+
+        let mut objects = MemoryObjectStore::default();
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0, "wrong-snapshot root commits nothing");
+        assert_eq!(report.unfulfilled, 1, "the snapshot stays pending");
+        assert_eq!(report.invalid, 1, "rejected bytes count as invalid");
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.unavailable_keys, 0);
+        assert_eq!(report.local_failures, 0);
+
+        // Rejection is stable: a second run still finds the snapshot
+        // pending and commits nothing.
+        let report = fixture
+            .engine
+            .execute_plan(&mut hostile, &mut objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0);
+        assert_eq!(report.unfulfilled, 1);
     }
 
     #[test]

@@ -2,16 +2,19 @@
 
 Wyrd's presentation layer: mount a Wyrd drive as a standard filesystem.
 
-## What belongs here
+## What belongs here (planned; only the read-only view exists so far)
 
 - The **live view**: the drive's current state as an ordinary read/write folder
+  (today: read-only, mount-free)
 - **Time travel**: browsing previous snapshot heads and restoring them, using
-  ordinary file tools
+  ordinary file tools (planned)
 - **Materialization**: remote-only paths are visible and open on demand
   (block-and-fetch, `EIO` when offline); cached content evicts by policy;
-  pinned content stays local
+  pinned content stays local (today: absent bytes report status instead of
+  fetching; the daemon will block-and-fetch)
 - **Conflict surfacing in the filesystem**: conflicted paths appear as
-  directories holding both versions
+  directories holding both versions (today: conflict nodes with union
+  listings, read-only)
 
 ## What does not belong here
 

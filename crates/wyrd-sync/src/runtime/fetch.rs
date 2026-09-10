@@ -41,8 +41,10 @@ pub(super) enum FetchOutcome<T> {
 /// A manifest for another snapshot is rejected even when its seal is
 /// well-formed. What fetch does *not* check is that the manifest's
 /// entries describe the snapshot's tree — that correspondence is
-/// author-attested and verified at consumption (lookup cross-checks
-/// the tree walk against manifest entries).
+/// author-attested. No consumer in the tree yet holds both sides at
+/// once (the mount-free FUSE view serves trees without seeing
+/// manifests), so the cross-check lands with the daemon that composes
+/// sync and fuse.
 pub(super) fn root(
     drive: &DriveId,
     bulk: &mut impl BulkSource,

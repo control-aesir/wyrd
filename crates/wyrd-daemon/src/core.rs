@@ -9,25 +9,30 @@
 //! mobile file surfaces later) consume the view and map errors at their
 //! own boundary.
 
-use wyrd_format::{ContentId, FetchStatus, ObjectStore};
+use wyrd_format::{ContentId, FetchStatus, ObjectStore, Snapshot, SnapshotId};
 use wyrd_fuse::{DriveView, Materialization};
-use wyrd_sync::runtime::Engine;
+use wyrd_sync::{bulk::BulkSource, runtime::Engine, transport::mailbox::Mailbox};
+
+/// Resolves durable snapshot announcements into verified snapshot bodies.
+/// Announcements carry only ids, so the sync transport or a local snapshot
+/// cache supplies the body at this explicit composition boundary.
+pub trait SnapshotSource {
+    type Error: std::fmt::Display;
+
+    fn snapshots(&mut self, ids: &[SnapshotId]) -> Result<Vec<Snapshot>, Self::Error>;
+}
 
 /// How the daemon reports fetch status for content the local store
 /// does not hold. Manifest-recorded content the store lacks is
 /// `RemoteOnly`; the fetch state machine wiring (tracked separately)
 /// will refine this into fetch-on-open behavior.
 pub struct DaemonMaterialization {
-    local: std::collections::HashSet<ContentId>,
+    runtime: wyrd_sync::runtime::RuntimeState,
 }
 
 impl Materialization for DaemonMaterialization {
     fn status(&self, id: &ContentId) -> FetchStatus {
-        if self.local.contains(id) {
-            FetchStatus::Available
-        } else {
-            FetchStatus::RemoteOnly
-        }
+        self.runtime.status(id)
     }
 }
 
@@ -47,13 +52,10 @@ where
     /// imports through. The store is shared: the engine imports
     /// verified bytes, the view serves them.
     pub fn new(engine: Engine, store: S) -> Self {
-        let view = DriveView::new(
-            store,
-            DaemonMaterialization {
-                local: std::collections::HashSet::new(),
-            },
-            Vec::new(),
-        );
+        let runtime = engine
+            .runtime_state()
+            .expect("engine runtime state must be readable during composition");
+        let view = DriveView::new(store, DaemonMaterialization { runtime }, Vec::new());
         Daemon { engine, view }
     }
 
@@ -62,14 +64,50 @@ where
         &self.view
     }
 
-    /// The mutable view: head updates ride durable state changes.
-    pub fn view_mut(&mut self) -> &mut DriveView<S, DaemonMaterialization> {
-        &mut self.view
+    /// Install resolved snapshot heads. Use [`Daemon::refresh_heads`] when
+    /// heads come from the engine's durable announcement set.
+    pub fn set_heads(&mut self, heads: Vec<Snapshot>) {
+        self.view.set_heads(heads);
     }
 
-    /// The engine, for drain/plan plumbing by the binary entry point.
-    pub fn engine(&mut self) -> &mut Engine {
-        &mut self.engine
+    /// Drain control-plane messages and refresh the materialization projection.
+    pub fn drain(
+        &mut self,
+        mailbox: &mut impl Mailbox,
+    ) -> Result<wyrd_sync::runtime::DrainReport, wyrd_sync::runtime::EngineError> {
+        let report = self.engine.drain(mailbox)?;
+        self.refresh_materialization()?;
+        Ok(report)
+    }
+
+    /// Refresh materialization facts after intake or fetch execution. Snapshot
+    /// heads are supplied separately because announcements do not carry trees.
+    pub fn refresh_materialization(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
+        self.view.set_materialization(DaemonMaterialization {
+            runtime: self.engine.runtime_state()?,
+        });
+        Ok(())
+    }
+
+    /// Fetch verified manifests and objects, then refresh the view's local
+    /// residency facts. Snapshot bodies are resolved separately with
+    /// [`Daemon::refresh_heads`].
+    pub fn execute_plan<B: BulkSource>(
+        &mut self,
+        bulk: &mut B,
+    ) -> Result<wyrd_sync::runtime::ExecuteReport, wyrd_sync::runtime::EngineError> {
+        let report = self.engine.execute_plan(bulk, self.view.store_mut())?;
+        self.refresh_materialization()?;
+        Ok(report)
+    }
+
+    /// Install the live heads corresponding to durable announcements.
+    pub fn refresh_heads<P: SnapshotSource>(&mut self, source: &mut P) -> Result<(), String> {
+        let runtime = self.engine.runtime_state().map_err(|e| e.to_string())?;
+        let ids: Vec<_> = runtime.announced_snapshots().collect();
+        let heads = source.snapshots(&ids).map_err(|e| e.to_string())?;
+        self.view.set_heads(heads);
+        Ok(())
     }
 }
 
@@ -118,7 +156,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = Engine::open(
-            dir,
+            dir.clone(),
             DriveId::from_bytes([0xEE; 32]),
             DeviceId::from_bytes([0xD0; 32]),
             "daemon-test",
@@ -128,10 +166,12 @@ mod tests {
         .unwrap();
 
         let mut daemon = Daemon::new(engine, store);
-        daemon.view_mut().set_heads(vec![head]);
+        daemon.set_heads(vec![head]);
 
         let node = daemon.view().lookup("sub/a.txt").unwrap();
         let file = daemon.view().open(&node).unwrap();
         assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"hello");
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

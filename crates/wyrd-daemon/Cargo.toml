@@ -8,7 +8,7 @@ description = "Wyrd's daemon: composes the sync engine with the drive view and p
 wyrd-format.workspace = true
 wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
-secp256k1.workspace = true
 fuser = "0.18"
-libc.workspace = true
-thiserror.workspace = true
+
+[dev-dependencies]
+secp256k1.workspace = true

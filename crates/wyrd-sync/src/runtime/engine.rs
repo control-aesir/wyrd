@@ -278,6 +278,12 @@ impl Engine {
         self.store.current()
     }
 
+    /// Replay durable runtime facts for presentation layers. The returned
+    /// state is a snapshot; fetch execution remains owned by the engine.
+    pub fn runtime_state(&self) -> Result<super::RuntimeState, EngineError> {
+        Ok(self.store.rebuild(self.device)?.runtime)
+    }
+
     /// Drain every envelope currently in the mailbox, committing facts
     /// per accepted message. Stops at the first empty `recv`.
     pub fn drain(&mut self, mailbox: &mut impl Mailbox) -> Result<DrainReport, EngineError> {

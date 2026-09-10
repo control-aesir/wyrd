@@ -4870,9 +4870,7 @@ name = "wyrd-daemon"
 version = "0.1.0"
 dependencies = [
  "fuser",
- "libc",
  "secp256k1",
- "thiserror 2.0.20",
  "wyrd-format",
  "wyrd-fuse",
  "wyrd-sync",

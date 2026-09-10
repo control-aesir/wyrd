@@ -155,6 +155,16 @@ where
         self.heads = heads;
     }
 
+    /// Replace the sync-backed materialization projection after engine work.
+    pub fn set_materialization(&mut self, materialization: M) {
+        self.materialization = materialization;
+    }
+
+    /// Borrow the backing object store for the daemon's verified fetch path.
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
     /// Resolve a path to its node, merging across heads. `/a/b` and
     /// `a/b` both work; `""` and `"/"` address the root.
     pub fn lookup(&self, path: &str) -> Result<Node, ViewError> {

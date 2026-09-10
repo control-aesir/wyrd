@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
-use wyrd_format::{ChildManifest, ContentId, DriveId, Manifest, ObjectKind, SnapshotId, StorageId};
+use wyrd_format::{
+    ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, SnapshotId, StorageId,
+};
 
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
@@ -121,6 +123,35 @@ impl RuntimeState {
     /// The drive this state belongs to.
     pub fn drive(&self) -> DriveId {
         self.drive
+    }
+
+    /// Snapshot announcements currently accepted by durable runtime state.
+    pub fn announced_snapshots(&self) -> impl Iterator<Item = SnapshotId> + '_ {
+        self.announcements.keys().copied()
+    }
+
+    /// Whether the verified plaintext object is present in the local store.
+    pub fn is_local(&self, id: &ContentId) -> bool {
+        self.local_objects.contains(id)
+    }
+
+    /// The durable materialization state projected into the view boundary.
+    pub fn status(&self, id: &ContentId) -> FetchStatus {
+        if self.is_local(id) {
+            FetchStatus::Available
+        } else {
+            match self
+                .materialization
+                .get(id)
+                .copied()
+                .unwrap_or(MaterializationState::RemoteOnly)
+            {
+                MaterializationState::RemoteOnly => FetchStatus::RemoteOnly,
+                MaterializationState::Cached | MaterializationState::Pinned => {
+                    FetchStatus::Fetching
+                }
+            }
+        }
     }
 
     /// Record a deduped control message id. Returns `true` if this was the

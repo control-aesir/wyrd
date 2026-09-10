@@ -11,6 +11,7 @@ in
   languages.rust.toolchainFile = ./rust-toolchain.toml;
 
   packages = with unstable; [
+    cargo-nextest
     pkg-config
   ] ++ optionals isLinux [
     # Fast parallel linker for large debug artifacts. Only wired up when we

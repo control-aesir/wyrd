@@ -46,6 +46,9 @@ jobs:
           toolchain: ${{ steps.pin.outputs.channel }}
           components: clippy
 
+      # Pre-built nextest binary (nextest-rs recommended installer).
+      - uses: taiki-e/install-action@nextest
+
       - name: Check
         run: cargo check --color never 2>&1 | tee /tmp/check.log
 
@@ -53,7 +56,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
 
       - name: Tests
-        run: cargo test --color never --workspace 2>&1 | tee /tmp/test.log
+        run: cargo nextest run --color never --workspace 2>&1 | tee /tmp/test.log
 
       # Disabled since it's not working for now
       # - if: github.event_name == 'pull_request'

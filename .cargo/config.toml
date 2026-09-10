@@ -1,0 +1,6 @@
+# Short habits dispatch to nextest. There is intentionally no `runner`
+# shim here: nextest cannot serve as a cargo test-runner backend, so a
+# `runner = "cargo-nextest run --"` line would break `cargo test`
+# outright. Use `cargo nextest run` (or `cargo t`) instead.
+[alias]
+t = "nextest run"

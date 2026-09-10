@@ -276,42 +276,56 @@ where
     }
 
     /// Resolve one head's tree walk. Single heads never conflict;
-    /// absence is `None`, fetch problems are errors.
+    /// absence is `None`, fetch problems are errors. Iterative: the walk
+    /// advances one level per path component, and kernel-supplied paths
+    /// are unbounded, so recursion here would overflow the stack on a
+    /// pathological drive.
     fn resolve_one(
         &self,
         tree_id: &ContentId,
         components: &[Component],
     ) -> Result<Option<Node>, ViewError> {
-        let tree = self.load_tree(tree_id)?;
-        let Some((first, rest)) = components.split_first() else {
-            return Ok(Some(Node::Dir { subtree: *tree_id }));
-        };
-        let Some(entry) = tree
-            .entries()
-            .iter()
-            .find(|entry| entry.name.as_str() == first.as_str())
-        else {
-            return Ok(None);
-        };
-        match &entry.content {
-            EntryContent::File {
-                size,
-                executable,
-                chunks,
-            } if rest.is_empty() => Ok(Some(Node::File {
-                size: *size,
-                executable: *executable,
-                chunks: chunks.clone(),
-            })),
-            EntryContent::Symlink { target } if rest.is_empty() => Ok(Some(Node::Symlink {
-                target: target.clone(),
-            })),
-            EntryContent::Dir { subtree } if rest.is_empty() => {
-                Ok(Some(Node::Dir { subtree: *subtree }))
-            }
-            EntryContent::Dir { subtree } => self.resolve_one(subtree, rest),
-            EntryContent::File { .. } | EntryContent::Symlink { .. } => {
-                Err(ViewError::NotADirectory)
+        let mut tree_id = *tree_id;
+        let mut rest = components;
+        loop {
+            let tree = self.load_tree(&tree_id)?;
+            let Some((first, remaining)) = rest.split_first() else {
+                return Ok(Some(Node::Dir { subtree: tree_id }));
+            };
+            let Some(entry) = tree
+                .entries()
+                .iter()
+                .find(|entry| entry.name.as_str() == first.as_str())
+            else {
+                return Ok(None);
+            };
+            match &entry.content {
+                EntryContent::File {
+                    size,
+                    executable,
+                    chunks,
+                } if remaining.is_empty() => {
+                    return Ok(Some(Node::File {
+                        size: *size,
+                        executable: *executable,
+                        chunks: chunks.clone(),
+                    }));
+                }
+                EntryContent::Symlink { target } if remaining.is_empty() => {
+                    return Ok(Some(Node::Symlink {
+                        target: target.clone(),
+                    }));
+                }
+                EntryContent::Dir { subtree } if remaining.is_empty() => {
+                    return Ok(Some(Node::Dir { subtree: *subtree }));
+                }
+                EntryContent::Dir { subtree } => {
+                    tree_id = *subtree;
+                    rest = remaining;
+                }
+                EntryContent::File { .. } | EntryContent::Symlink { .. } => {
+                    return Err(ViewError::NotADirectory);
+                }
             }
         }
     }
@@ -590,6 +604,26 @@ mod tests {
             view.readdir(&view.lookup("hello.txt").unwrap()),
             Err(ViewError::NotADirectory)
         );
+    }
+
+    #[test]
+    fn deep_lookup_does_not_overflow_the_stack() {
+        // A pathological chain: every level holds one dir entry pointing
+        // deeper. Lookup advances one level per path component, so a
+        // recursive walk overflows the stack here — the walk must stay
+        // iterative no matter how deep the drive goes.
+        const DEPTH: usize = 100_000;
+        let mut store = MemoryObjectStore::default();
+        let mut child = tree_of(&mut store, Vec::new());
+        for _ in 0..DEPTH {
+            child = tree_of(&mut store, vec![Entry::dir("d", child).unwrap()]);
+        }
+        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(child)]);
+        let path = std::iter::repeat("d")
+            .take(DEPTH)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(matches!(view.lookup(&path), Ok(Node::Dir { .. })));
     }
 
     #[test]

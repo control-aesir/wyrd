@@ -2587,12 +2587,15 @@ mod tests {
         queue(&mut fixture, mail);
 
         // Make the store unwritable (root can still write: probe and
-        // skip there instead of asserting a failure that never comes).
+        // skip before asserting a failure that never comes).
         let dir = fixture.dir.path.clone();
         let commits = dir.join("commits");
         let probe = dir.join(".writetest");
         let skip_if_root = std::fs::File::create(&probe).is_ok();
         std::fs::remove_file(&probe).unwrap();
+        if skip_if_root {
+            return;
+        }
         for path in [&dir, &commits] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
@@ -2609,9 +2612,6 @@ mod tests {
         assert!(fixture.engine.drain(&mut mailbox).is_err());
         for path in [&dir, &commits] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        if skip_if_root {
-            return;
         }
 
         // Retry after the outage: every envelope commits fresh and

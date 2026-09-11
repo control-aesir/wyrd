@@ -111,12 +111,6 @@ where
         &self.view
     }
 
-    /// Install verified snapshot heads directly. Use [`Daemon::refresh_heads`]
-    /// when heads come from the classified live-head projection.
-    pub fn set_heads(&mut self, heads: Vec<AuthorizedSnapshot>) {
-        self.view.set_heads(view_heads(heads));
-    }
-
     /// Drain control-plane messages and refresh the materialization projection.
     pub fn drain(
         &mut self,
@@ -258,7 +252,10 @@ mod tests {
             "an empty engine projects no heads"
         );
 
-        daemon.set_heads(vec![head]);
+        // Heads install only through the classified seam: there is no
+        // direct setter, so a composition feeds its source and the
+        // source's authorized bodies advance the view.
+        daemon.refresh_heads(&mut FixedHeads(vec![head])).unwrap();
 
         let node = daemon.view().lookup("sub/a.txt").unwrap();
         let file = daemon.view().open(&node).unwrap();
@@ -297,6 +294,18 @@ mod tests {
         s.signature = secp256k1::SECP256K1
             .sign_schnorr_no_aux_rand(&challenge, &kp)
             .to_byte_array();
+    }
+
+    /// A fixed head set as a [`LiveHeads`] source: the test-side shape
+    /// of "composition supplies exactly these verified bodies".
+    struct FixedHeads(Vec<AuthorizedSnapshot>);
+
+    impl LiveHeads for FixedHeads {
+        type Error = std::convert::Infallible;
+
+        fn live_heads(&mut self) -> Result<Vec<AuthorizedSnapshot>, Self::Error> {
+            Ok(self.0.clone())
+        }
     }
 
     #[test]

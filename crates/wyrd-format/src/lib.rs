@@ -13,6 +13,7 @@ pub mod fs_store;
 pub mod identity;
 pub mod manifest;
 pub mod membership;
+pub mod mutation;
 pub mod snapshot;
 pub mod store;
 pub mod tree;
@@ -26,6 +27,7 @@ pub use identity::{
 };
 pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_LEN, ENTRY_LEN};
 pub use membership::{Change, MembershipError, MembershipTransition};
+pub use mutation::{put, remove, MutationError, PathError};
 pub use snapshot::Snapshot;
 pub use store::{FetchStatus, MemoryObjectStore, ObjectStore};
 pub use tree::{Component, Entry, EntryContent, Tree};

@@ -32,6 +32,10 @@ pub enum MailboxError {
     Crypto,
     #[error("a device key is not a valid secp256k1 key")]
     InvalidKey,
+    #[error(
+        "identity mismatch: the signer, envelope, or open key disagree with the mailbox owner"
+    )]
+    Identity,
     #[error("relay transport failed: {0}")]
     Transport(String),
 }

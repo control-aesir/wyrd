@@ -170,11 +170,20 @@ struct Held {
 /// `S` is the signing backend for outbound seals: a NIP-46 [`NostrConnect`]
 /// session in the daemon, local [`Keys`] in tests. Both satisfy the
 /// `rust-nostr` async signer traits; the gift wrap itself is always signed
-/// locally with a fresh ephemeral key (NIP-59).
+/// locally with a fresh ephemeral key (NIP-59). Identity binding is
+/// enforced at construction: the signer must prove the same public key as
+/// `open_secret` (the mailbox owner), or [`connect`](Self::connect) fails
+/// with [`MailboxError::Identity`] — a mailbox that receives as one device
+/// and publishes as another is a misconfiguration, never a mode.
 pub struct LiveMailbox<S> {
     runtime: Runtime,
     client: Arc<Client>,
     signer: Arc<S>,
+    /// The signer's public key, validated equal to the owner at
+    /// construction and reused to author outbound rumors. If a remote
+    /// signer rotated keys mid-session, the NIP-59 receiver-side
+    /// seal/rumor-authority check rejects the stale wrap: fail closed.
+    sender_pk: PublicKey,
     open_keys: Keys,
     owner: DeviceId,
     incoming: tokio_mpsc::Receiver<Event>,
@@ -219,6 +228,15 @@ where
         let open_keys = Keys::new(open_secret);
         let owner_pk = open_keys.public_key();
         let owner = DeviceId::from_bytes(owner_pk.to_bytes());
+        // Identity binding: ask the signer to prove its key and require it
+        // to be this device's. A NIP-46 session pointed at the wrong
+        // identity must fail here, not publish as a stranger.
+        let signer_pk = runtime
+            .block_on(signer.get_public_key_async())
+            .map_err(|error| MailboxError::Transport(error.to_string()))?;
+        if signer_pk != owner_pk {
+            return Err(MailboxError::Identity);
+        }
         let relay_urls = relays
             .into_iter()
             .map(|relay| relay.as_ref().to_owned())
@@ -271,6 +289,7 @@ where
             runtime,
             client,
             signer,
+            sender_pk: signer_pk,
             open_keys,
             owner,
             incoming,
@@ -336,11 +355,13 @@ where
     S: AsyncGetPublicKey + AsyncSignEvent + AsyncNip44 + Send + Sync + 'static,
 {
     fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        // Identity binding on the envelope too: the caller's `sender` is
+        // metadata this adapter will not let lie — mail leaves under this
+        // device's identity or not at all.
+        if envelope.sender != self.owner {
+            return Err(MailboxError::Identity);
+        }
         let recipient = PublicKey::from_byte_array(*envelope.recipient.as_bytes());
-        let sender_pk = self
-            .runtime
-            .block_on(self.signer.get_public_key_async())
-            .map_err(|error| MailboxError::Transport(error.to_string()))?;
         // The rumor is authored by the real device key but never signed
         // directly: its JSON travels inside the NIP-59 seal, which the
         // signer session signs (and NIP-44-seals) remotely. The wrap is
@@ -350,7 +371,7 @@ where
             .tag(Tag::public_key(PublicKey::from_byte_array(
                 *envelope.recipient.as_bytes(),
             )))
-            .finalize_unsigned(sender_pk);
+            .finalize_unsigned(self.sender_pk);
         let wrap = self
             .runtime
             .block_on(GiftWrapBuilder::new(recipient, rumor).finalize_async(&*self.signer))
@@ -457,7 +478,7 @@ mod tests {
     /// delivery logic without network I/O.
     fn offline_mailbox(open: &Keys) -> LiveMailbox<Keys> {
         LiveMailbox::connect(
-            Keys::generate(),
+            open.clone(),
             open.secret_key().clone(),
             Vec::<String>::new(),
             temp_path("offline"),
@@ -859,12 +880,46 @@ mod tests {
     fn empty_relay_config_connects_and_stays_idle() {
         let open = keys();
         let mut mailbox = LiveMailbox::connect(
-            Keys::generate(),
+            open.clone(),
             open.secret_key().clone(),
             Vec::<String>::new(),
             temp_path("seen-empty"),
         )
         .expect("connects without relays");
         assert_quiet(&mut mailbox);
+    }
+
+    #[test]
+    fn signer_owner_mismatch_rejected() {
+        // A NIP-46 session pointed at the wrong identity must fail at
+        // construction, never receive-as-A-while-publishing-as-B.
+        let open = keys();
+        let stranger = keys();
+        assert!(matches!(
+            LiveMailbox::connect(
+                stranger,
+                open.secret_key().clone(),
+                Vec::<String>::new(),
+                temp_path("seen-mismatch"),
+            ),
+            Err(MailboxError::Identity)
+        ));
+    }
+
+    #[test]
+    fn foreign_envelope_sender_rejected() {
+        // The caller-supplied envelope sender is metadata the adapter will
+        // not let lie: mail leaves under this device's identity or errors.
+        let device = keys();
+        let stranger = keys();
+        let mut mailbox = offline_mailbox(&device);
+        assert!(matches!(
+            mailbox.send(envelope(
+                device_id(&stranger),
+                device_id(&keys()),
+                "smuggled bytes",
+            )),
+            Err(MailboxError::Identity)
+        ));
     }
 }

@@ -22,9 +22,16 @@ pub enum PathError {
     Empty,
     #[error("path has an empty component (leading, trailing, or doubled separator)")]
     EmptyComponent,
+    #[error("path is deeper than {max} components (got {depth})")]
+    TooDeep { depth: usize, max: usize },
     #[error("invalid path component: {0}")]
     Component(#[from] ComponentError),
 }
+
+/// The maximum number of path components a mutation accepts. The rebuild
+/// walk recurses once per component, so an unbounded path could exhaust
+/// the stack; this is the explicit bound (generous for a flat v0 tree).
+pub const MAX_PATH_DEPTH: usize = 256;
 
 /// A tree mutation failure. `E` is the object store's error type.
 #[derive(Debug, Error)]
@@ -88,6 +95,12 @@ fn parse_path(path: &str) -> Result<Vec<Component>, PathError> {
             return Err(PathError::EmptyComponent);
         }
         components.push(Component::new(part)?);
+        if components.len() > MAX_PATH_DEPTH {
+            return Err(PathError::TooDeep {
+                depth: components.len(),
+                max: MAX_PATH_DEPTH,
+            });
+        }
     }
     Ok(components)
 }
@@ -361,6 +374,85 @@ mod tests {
         assert!(matches!(
             put(&mut store, absent, "a", file("a", b"x")),
             Err(MutationError::MissingTree(_))
+        ));
+    }
+
+    #[test]
+    fn path_depth_is_bounded() {
+        let accepted = vec!["a"; MAX_PATH_DEPTH].join("/");
+        assert!(parse_path(&accepted).is_ok(), "exactly the maximum is fine");
+        let too_deep = vec!["a"; MAX_PATH_DEPTH + 1].join("/");
+        assert!(matches!(
+            parse_path(&too_deep),
+            Err(PathError::TooDeep { depth, max })
+                if depth == MAX_PATH_DEPTH + 1 && max == MAX_PATH_DEPTH
+        ));
+    }
+
+    #[test]
+    fn nested_removal_rebuilds_the_parent_and_keeps_the_old_root() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(&mut store, root, "a/b/c", file("c", b"c")).unwrap();
+        let with_x = put(&mut store, root, "a/x", file("x", b"x")).unwrap();
+        let removed = remove(&mut store, with_x, "a/b/c").unwrap();
+
+        assert_ne!(removed, with_x, "the rebuilt path changes the root");
+        assert!(matches!(
+            resolve(&store, removed, "a/x"),
+            Ok(EntryContent::File { .. })
+        ));
+        assert!(matches!(
+            resolve(&store, removed, "a/b"),
+            Ok(EntryContent::Dir { .. })
+        ));
+        assert!(matches!(
+            resolve(&store, removed, "a/b/c"),
+            Err(MutationError::NotFound(_))
+        ));
+        // The old root still resolves the removed leaf.
+        assert!(matches!(
+            resolve(&store, with_x, "a/b/c"),
+            Ok(EntryContent::File { .. })
+        ));
+    }
+
+    #[test]
+    fn removing_a_directory_leaf_keeps_the_directory_empty() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(&mut store, root, "d/f", file("f", b"x")).unwrap();
+        let root = remove(&mut store, root, "d/f").unwrap();
+
+        match resolve(&store, root, "d").unwrap() {
+            EntryContent::Dir { subtree } => assert!(
+                load_tree(&store, &subtree).unwrap().entries().is_empty(),
+                "the directory survives, empty"
+            ),
+            other => panic!("expected a directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn symlinks_are_not_traversed_on_put() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(
+            &mut store,
+            root,
+            "s",
+            Entry::symlink("s", "target").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            put(&mut store, root, "s/x", file("x", b"y")),
+            Err(MutationError::NotADirectory(_))
+        ));
+        // Replacing the symlink with a file is allowed.
+        let root = put(&mut store, root, "s", file("s", b"z")).unwrap();
+        assert!(matches!(
+            resolve(&store, root, "s"),
+            Ok(EntryContent::File { .. })
         ));
     }
 }

@@ -9,6 +9,7 @@ wyrd-format.workspace = true
 wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
 fuser = "0.18"
+thiserror.workspace = true
 
 [lints]
 workspace = true

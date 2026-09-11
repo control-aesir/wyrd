@@ -50,7 +50,10 @@ pub struct Snapshot {
     /// Reserved-flag bits; see [`RECOVERY_FLAG`] and
     /// [`RESERVED_FLAG_MASK`].
     pub flags: u8,
-    /// Milliseconds, HLC-ordered; display and tiebreak only.
+    /// Milliseconds. The authoring path keeps a value strictly greater
+    /// than every timestamp already observed in the local DAG (monotonic
+    /// across local writes, clock rollback, and restarts). Display and
+    /// `(timestamp, author)` tiebreak only — never authorization.
     pub timestamp: u64,
     /// BIP-340 signature over the drive-bound signing message.
     pub signature: [u8; 64],

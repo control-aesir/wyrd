@@ -3,7 +3,10 @@
 
 use wyrd_daemon::core::Daemon;
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_format::{Change, ContentId, FetchStatus, ObjectKind, Snapshot, SnapshotId, StorageId};
+use wyrd_format::{
+    Change, ContentId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot,
+    SnapshotId, StorageId, Tree,
+};
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::durable::DurableError;
@@ -171,6 +174,40 @@ fn failed_projection_leaves_installed_heads_untouched() {
 
     drop(daemon);
     loaded.rig.teardown();
+}
+
+/// The local write path, end to end: a member authors a snapshot for a
+/// tree in the local store, and the daemon's classified projection makes
+/// the drive serve it. Authorship binds the canonical membership state;
+/// the engine commits the body durably, and only the live-head projection
+/// advances the view (`architecture.md` invariant 3, `docs/epochs.md`
+/// local write).
+#[test]
+fn authored_snapshots_mount_through_the_daemon_view() {
+    let mut rig = Rig::new();
+    let mut engine = rig.take_engine();
+
+    let mut store = MemoryObjectStore::default();
+    let chunk = store.insert(ObjectKind::Chunk, b"alpha").unwrap();
+    let tree = Tree::from_entries(vec![
+        Entry::file("alpha.txt", 5, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+
+    let authored = engine.author_snapshot(&store, tree).unwrap();
+    assert_eq!(authored.snapshot().author, rig.recipient.id);
+    assert_eq!(authored.snapshot().epoch, 2, "bound to the canonical tip");
+
+    let mut daemon = Daemon::new(engine, store);
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("alpha.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"alpha");
+
+    drop(daemon);
+    rig.teardown();
 }
 
 /// The pending bound sheds to the relay without consuming: a drained

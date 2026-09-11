@@ -78,6 +78,24 @@ pub enum EngineError {
     Mailbox(#[from] crate::transport::mailbox::MailboxError),
     #[error("classified snapshot failed verification: {0:?}")]
     InvalidHead(crate::authorization::Rejection),
+    #[error("no canonical membership state to bind an authored snapshot")]
+    NoCanonicalMembership,
+    #[error("this device is not a member of the canonical membership state")]
+    NotAMember,
+    #[error("no held control key for epoch {0}")]
+    MissingEpochKey(u64),
+    #[error("control sealing failed: {0}")]
+    Crypto(#[from] crate::keys::CryptoError),
+    #[error("root tree {0} is not present in the local object store")]
+    TreeUnavailable(ContentId),
+    #[error("root {0} is not a canonical tree object")]
+    InvalidTree(ContentId),
+    #[error("root {0} does not hash back from the tree bytes served for it")]
+    TreeMismatch(ContentId),
+    #[error("object store read failed: {0}")]
+    ObjectStore(String),
+    #[error("the snapshot timestamp space is exhausted at u64::MAX")]
+    TimestampExhausted,
 }
 
 /// What one [`Engine::drain`] pass did.
@@ -173,7 +191,7 @@ pub struct Engine {
     /// resync (which rebuilds the inbox from durable facts) never
     /// drops key material the device still holds. Zeroizing values:
     /// revoked epochs must not linger in process memory.
-    epoch_keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
+    pub(super) epoch_keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
     pub(super) log: MembershipLog,
     pub(super) pending: HashMap<ControlMessageId, Message>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
@@ -331,6 +349,43 @@ impl Engine {
             .collect()
     }
 
+    /// Author a new snapshot over `tree`, signed by this device and bound
+    /// to the canonical membership state. `objects` is the plaintext
+    /// object store the drive materializes from; the root must be a
+    /// canonical tree object present there whose bytes hash back to
+    /// `tree`, so a snapshot whose root is absent or misaddressed is
+    /// refused before it is bound. Descendant trees and chunks are not
+    /// required to be local: materialization is local policy, and a
+    /// member may author a snapshot reusing content it does not hold.
+    /// Parents are the current eligible heads: a single-head drive
+    /// extends its live state, and a conflicted drive resolves onto every
+    /// head (`docs/epochs.md`, local write; `docs/object-model.md`,
+    /// resolution). The body is verified once and committed durably; the
+    /// live-head projection picks it up on the next rebuild. Fails closed
+    /// when the root is unavailable or misaddressed, the log has no
+    /// canonical tip, or this device is not a member of it.
+    pub fn author_snapshot<S: ObjectStore>(
+        &mut self,
+        objects: &S,
+        tree: ContentId,
+    ) -> Result<AuthorizedSnapshot, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::author(self, objects, tree)
+    }
+
+    /// Announce an authored snapshot over the control plane to every
+    /// other member, returning the number of envelopes sent. The epoch's
+    /// control key must be held; the author is not sent to itself.
+    pub fn announce_snapshot(
+        &self,
+        snapshot: &AuthorizedSnapshot,
+        mailbox: &mut impl Mailbox,
+    ) -> Result<usize, EngineError> {
+        super::author::announce(self, snapshot, mailbox)
+    }
+
     /// Drain every envelope currently in the mailbox, committing facts
     /// per accepted message. Stops at the first empty `recv`.
     pub fn drain(&mut self, mailbox: &mut impl Mailbox) -> Result<DrainReport, EngineError> {
@@ -444,17 +499,24 @@ mod tests {
 
     use crate::authorization::test_util::sign_snapshot;
     use wyrd_format::membership::Admission;
-    use wyrd_format::{Change, ContentId, MemoryObjectStore, Snapshot};
+    use wyrd_format::{
+        Change, ContentId, Entry, MemoryObjectStore, ObjectKind, Snapshot, TransitionId, Tree,
+    };
 
     use crate::bulk::MemoryBulkSource;
     use crate::control::seal;
+    use crate::durable::AuthorizedSnapshot;
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        announcement_msg, capability_message_for, encryption_key, identity, publish_into,
-        transition_message, MemoryMailbox, MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
+        announcement_msg, capability_message_for, deliver, drain, encryption_key, fixture,
+        identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
+        PublishedSnapshot, TestDir, WithoutObjects,
     };
-    use crate::transport::mailbox::seal_for_recipient;
+    use crate::transport::mailbox::{
+        seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
+        MailboxError,
+    };
     // --- two-device convergence ---------------------------------------
     //
     // Two engines with separate stores and object holdings share one
@@ -909,5 +971,318 @@ mod tests {
         let b_plan = execute_side(&mut pair.bulk, &mut pair.b);
         assert_eq!(b_plan.objects, 2);
         assert_agreement(&mut pair);
+    }
+
+    // --- local snapshot authoring -------------------------------------
+
+    /// A canonical tree object in a scratch store, ready to author.
+    fn local_tree(store: &mut MemoryObjectStore) -> ContentId {
+        let chunk = store.insert(ObjectKind::Chunk, b"payload").unwrap();
+        Tree::from_entries(vec![Entry::file("file.txt", 7, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(store)
+            .unwrap()
+    }
+
+    #[test]
+    fn member_authors_a_snapshot_that_becomes_the_live_head() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        // Fetch the published bodies so a live head exists to parent onto.
+        let plan = execute_side(&mut pair.bulk, &mut pair.a);
+        assert_eq!(plan.snapshot_bodies, 2, "A holds both published bodies");
+
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        assert_eq!(authored.snapshot().author, pair.a.device);
+        assert_eq!(authored.snapshot().epoch, 3, "bound to the canonical tip");
+        assert_eq!(authored.snapshot().parents.len(), 1, "onto the live head");
+
+        let heads = pair.a.engine.live_heads().unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .map(|h| h.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![authored.snapshot().snapshot_id()],
+            "the authored head supersedes the one it extends"
+        );
+    }
+
+    #[test]
+    fn successive_authored_snapshots_get_increasing_timestamps() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let first = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        let second = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        assert!(
+            second.snapshot().timestamp > first.snapshot().timestamp,
+            "local authoring is monotonic even within one millisecond"
+        );
+    }
+
+    #[test]
+    fn authoring_rejects_an_unavailable_noncanonical_or_misaddressed_root() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        let before = pair.a.engine.current();
+
+        // Absent from the store.
+        let empty = MemoryObjectStore::default();
+        assert!(matches!(
+            pair.a
+                .engine
+                .author_snapshot(&empty, ContentId::from_bytes([0xAB; 32])),
+            Err(EngineError::TreeUnavailable(_))
+        ));
+
+        // Address-consistent bytes that are not a canonical tree.
+        let mut noncanonical = MemoryObjectStore::default();
+        let bad = noncanonical
+            .insert(ObjectKind::Tree, b"not a canonical tree")
+            .unwrap();
+        assert!(matches!(
+            pair.a.engine.author_snapshot(&noncanonical, bad),
+            Err(EngineError::InvalidTree(_))
+        ));
+
+        // A chunk addressed as a root does not hash under the tree kind.
+        let mut chunks = MemoryObjectStore::default();
+        let chunk = chunks.insert(ObjectKind::Chunk, b"a chunk").unwrap();
+        assert!(matches!(
+            pair.a.engine.author_snapshot(&chunks, chunk),
+            Err(EngineError::TreeMismatch(_))
+        ));
+
+        assert_eq!(pair.a.engine.current(), before, "nothing committed");
+    }
+
+    #[test]
+    fn authoring_rejects_a_root_that_does_not_hash_to_its_id() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        let before = pair.a.engine.current();
+
+        // A canonical tree's bytes served under a different claimed id.
+        let mut real = MemoryObjectStore::default();
+        let tree = local_tree(&mut real);
+        let bytes = real.get(&tree).unwrap().unwrap();
+        let lying = LyingStore { bytes };
+        assert!(matches!(
+            pair.a
+                .engine
+                .author_snapshot(&lying, ContentId::from_bytes([0xAB; 32])),
+            Err(EngineError::TreeMismatch(_))
+        ));
+        assert_eq!(pair.a.engine.current(), before, "nothing committed");
+    }
+
+    /// A store that serves the same bytes for every address, modeling a
+    /// faulty implementation that violates the scrub invariant.
+    struct LyingStore {
+        bytes: Vec<u8>,
+    }
+
+    impl ObjectStore for LyingStore {
+        type Error = std::convert::Infallible;
+
+        fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, Self::Error> {
+            unreachable!("the lying store is read-only")
+        }
+
+        fn insert_verified(
+            &mut self,
+            _kind: ObjectKind,
+            _expected: &ContentId,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
+            unreachable!("the lying store is read-only")
+        }
+
+        fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(Some(self.bytes.clone()))
+        }
+
+        fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn authoring_without_canonical_membership_fails_closed() {
+        let mut f = fixture();
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        assert!(matches!(
+            f.engine.author_snapshot(&objects, tree),
+            Err(EngineError::NoCanonicalMembership)
+        ));
+    }
+
+    #[test]
+    fn authoring_requires_a_member_device() {
+        let mut f = fixture();
+        let (_, genesis) = Builder::genesis(10);
+        let envelope = deliver(&f, 1, &transition_message(&genesis));
+        queue(&mut f, vec![envelope]);
+        assert_eq!(drain(&mut f).accepted, 1);
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        assert!(matches!(
+            f.engine.author_snapshot(&objects, tree),
+            Err(EngineError::NotAMember)
+        ));
+    }
+
+    #[test]
+    fn announcing_delivers_the_snapshot_to_peers() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        let sent = {
+            let mut mailbox = MemoryMailbox {
+                relay: &mut pair.relay,
+                owner: pair.a.device,
+            };
+            pair.a
+                .engine
+                .announce_snapshot(&authored, &mut mailbox)
+                .unwrap()
+        };
+        assert_eq!(sent, 2, "owner and B; the author is skipped");
+
+        // B accepts the announcement; the body is fetched later.
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
+        let state = pair.b.engine.runtime_state().unwrap();
+        assert!(state
+            .announcement(&authored.snapshot().snapshot_id())
+            .is_some());
+    }
+
+    #[test]
+    fn announcing_to_a_single_member_sends_nothing() {
+        // Genesis admits only the fixture device, so it is the sole member.
+        let mut f = fixture();
+        let (_, genesis) = Builder::genesis(0x02);
+        let envelope = deliver(&f, 1, &transition_message(&genesis));
+        queue(&mut f, vec![envelope]);
+        assert_eq!(drain(&mut f).accepted, 1);
+
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = f.engine.author_snapshot(&objects, tree).unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut f.relay,
+            owner: f.recipient,
+        };
+        assert_eq!(
+            f.engine.announce_snapshot(&authored, &mut mailbox).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn announcing_without_the_epoch_key_fails_closed() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+        // A snapshot at an epoch the engine holds no control key for.
+        let mut body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0xAB; 32]),
+            pair.a.device,
+            TransitionId::from_bytes([0x33; 32]),
+            9,
+            0,
+            1,
+        );
+        sign_snapshot(&mut body, &pair.a.identity_sk.secret_key(), &member_drive());
+        let authorized = AuthorizedSnapshot::authorize(body, &member_drive()).unwrap();
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        assert!(matches!(
+            pair.a.engine.announce_snapshot(&authorized, &mut mailbox),
+            Err(EngineError::MissingEpochKey(9))
+        ));
+    }
+
+    /// A mailbox that fails after `fail_after` successful sends.
+    struct FailingMailbox {
+        sent: usize,
+        fail_after: usize,
+    }
+
+    impl Mailbox for FailingMailbox {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            if self.sent >= self.fail_after {
+                return Err(MailboxError::Crypto);
+            }
+            self.sent += 1;
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Option<Delivery> {
+            None
+        }
+
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_partial_send_surfaces_the_mailbox_failure() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+
+        let mut mailbox = FailingMailbox {
+            sent: 0,
+            fail_after: 1,
+        };
+        assert!(matches!(
+            pair.a.engine.announce_snapshot(&authored, &mut mailbox),
+            Err(EngineError::Mailbox(_))
+        ));
+        assert_eq!(mailbox.sent, 1, "the first recipient was reached");
+    }
+
+    #[test]
+    fn authored_snapshot_survives_restart() {
+        let (mut pair, controls, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        execute_side(&mut pair.bulk, &mut pair.a);
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        let id = authored.snapshot().snapshot_id();
+
+        restart(&mut pair.a, &controls);
+        let heads = pair.a.engine.live_heads().unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .map(|h| h.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![id],
+            "the authored head reclassifies from durable facts"
+        );
     }
 }

@@ -38,6 +38,13 @@
 //! rejection per relay redelivery — the same re-discard-per-pass cost the
 //! engine already pays for Wyrd-level poison.
 //!
+//! Acknowledgement is fsync-bound by design (one sync per ack): control
+//! traffic is low-rate, and the crash guarantee ("an acked delivery never
+//! replays") is not negotiable in v0. Payload bounds are not enforced
+//! here; the engine's ingest limits (`wyrd-sync` `Limits`/`check_total_len`)
+//! reject oversized control payloads, so a flood of oversized wraps is
+//! discarded per redelivery rather than queued.
+//!
 //! One `LiveMailbox` owns one Tokio runtime and one relay client: the
 //! daemon composes exactly one mailbox per process (see the review note on
 //! runtime-per-mailbox cost before ever changing that).
@@ -72,9 +79,18 @@ const RUMOR_KIND: u16 = 9_501;
 const INCOMING_CAPACITY: usize = 1024;
 
 /// Durable record of consumed gift wraps: one hex event id per line,
-/// appended (and fsynced) at every `Ack`. Rebuilt as an in-memory set on
-/// open; torn tail lines from a crash are skipped, never fatal. The file
-/// grows with consumed-delivery history and is never compacted in v0.
+/// appended (and fsynced) at every `Ack`; rebuilt as an in-memory set on
+/// open. Opening fails closed — only a missing file starts empty, while an
+/// unreadable, non-UTF-8, or corrupt ledger refuses startup, because
+/// silently replaying acknowledged wraps is the worse failure. A torn
+/// final line (crash mid-append, no trailing newline) is the one benign
+/// case: that ack never synced, so the tail is truncated away and the
+/// delivery comes back for re-acknowledgement. Throughput is fsync-bound
+/// by design (one sync per ack); batching is a future optimization that
+/// must not weaken the crash guarantee. The file grows with
+/// consumed-delivery history and is never compacted in v0 (append-only
+/// store posture; compaction/rekey is a tracked design item).
+#[derive(Debug)]
 struct SeenStore {
     seen: HashSet<EventId>,
     file: std::fs::File,
@@ -82,19 +98,39 @@ struct SeenStore {
 
 impl SeenStore {
     fn open(path: &Path) -> Result<Self, MailboxError> {
-        let mut seen = HashSet::new();
-        if let Ok(lines) = std::fs::read_to_string(path) {
-            for line in lines.lines() {
-                if let Ok(id) = EventId::from_hex(line) {
-                    seen.insert(id);
-                }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(MailboxError::Transport(format!("dedupe log: {error}")));
             }
+        };
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| MailboxError::Transport("dedupe log: not valid UTF-8".into()))?;
+        // A trailing segment without a newline is a torn append, not a
+        // record: truncate it so later appends cannot weld a fresh id
+        // onto the garbage. Its ack never synced, so redelivery is safe.
+        let (recorded, torn) = match text.rfind('\n') {
+            Some(cut) if cut + 1 == text.len() => (text, 0),
+            Some(cut) => (&text[..=cut], text.len() - cut - 1),
+            None if text.is_empty() => (text, 0),
+            None => ("", text.len()),
+        };
+        let mut seen = HashSet::new();
+        for line in recorded.lines() {
+            let id = EventId::from_hex(line)
+                .map_err(|_| MailboxError::Transport("dedupe log: corrupt entry".into()))?;
+            seen.insert(id);
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        if torn > 0 {
+            file.set_len((bytes.len() - torn) as u64)
+                .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        }
         Ok(Self { seen, file })
     }
 
@@ -105,6 +141,8 @@ impl SeenStore {
     /// Persist an acknowledgement durably before the caller may forget the
     /// delivery. A failed append keeps the delivery offered (the caller
     /// keeps it queued), so a disk failure cannot drop mail on the floor.
+    /// Re-recording an id (a repeated `Ack` after a lost response) appends
+    /// a duplicate line, which is harmless: the set keeps it unique.
     fn record(&mut self, id: &EventId) -> Result<(), MailboxError> {
         self.file
             .write_all(format!("{id}\n").as_bytes())
@@ -144,6 +182,10 @@ pub struct LiveMailbox<S> {
     /// `recv` prefers new mail and otherwise rotates this deque
     /// front-to-back, re-offering each delivery under its stable id.
     unacked: VecDeque<Held>,
+    /// Delivery ids already consumed durably this session, so a repeated
+    /// or delayed settle is an idempotent no-op instead of an error (the
+    /// `Mailbox` contract requires a repeated `Ack` to succeed).
+    settled: HashSet<DeliveryId>,
     next_delivery: u64,
     seen: SeenStore,
 }
@@ -233,6 +275,7 @@ where
             owner,
             incoming,
             unacked: VecDeque::new(),
+            settled: HashSet::new(),
             next_delivery: 1,
             seen,
         })
@@ -351,22 +394,27 @@ where
     }
 
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
-        let Some(pos) = self.unacked.iter().position(|held| held.id == id) else {
-            return Err(MailboxError::Transport("unknown delivery".into()));
-        };
-        match disposition {
-            Disposition::Ack => {
-                // Durable consume point: record before forgetting, so a
-                // log failure keeps the delivery held for redelivery.
-                let wrap_id = self.unacked[pos].wrap_id;
-                self.seen.record(&wrap_id)?;
-                self.unacked.remove(pos);
+        match self.unacked.iter().position(|held| held.id == id) {
+            Some(pos) => {
+                if matches!(disposition, Disposition::Ack) {
+                    // Durable consume point: record before forgetting, so
+                    // a log failure keeps the delivery held for redelivery.
+                    let wrap_id = self.unacked[pos].wrap_id;
+                    self.seen.record(&wrap_id)?;
+                    self.unacked.remove(pos);
+                    self.settled.insert(id);
+                }
+                // Retry leaves the delivery held; recv rotates held mail
+                // round-robin, so a retry is re-offered on a later pass
+                // behind everything else.
+                Ok(())
             }
-            // Stays held; recv rotates held mail round-robin, so a retry
-            // is re-offered on a later pass behind everything else.
-            Disposition::Retry => {}
+            // Idempotent settlement: an id already consumed this session
+            // is a no-op for either disposition — a lost ack response or
+            // repeated settlement must not fail the engine's drain.
+            None if self.settled.contains(&id) => Ok(()),
+            None => Err(MailboxError::Transport("unknown delivery".into())),
         }
-        Ok(())
     }
 }
 
@@ -443,12 +491,65 @@ mod tests {
             let mut store = SeenStore::open(&path).unwrap();
             assert!(!store.contains(&id));
             store.record(&id).unwrap();
-            // Torn tail line (crash mid-append) must not poison reloads.
-            use std::io::Write;
-            store.file.write_all(b"deadbeef").unwrap();
         }
         let store = SeenStore::open(&path).unwrap();
         assert!(store.contains(&id));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn dedupe_log_fails_closed_on_read_error() {
+        // A directory instead of a file: reading it fails with an I/O
+        // error (not NotFound), which must refuse startup rather than
+        // start an empty ledger and replay acknowledged wraps.
+        let dir = temp_path("seen-dir");
+        std::fs::create_dir(&dir).unwrap();
+        let error = SeenStore::open(&dir).unwrap_err();
+        assert!(matches!(error, MailboxError::Transport(_)));
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn dedupe_log_fails_closed_on_invalid_utf8() {
+        let path = temp_path("seen-utf8");
+        std::fs::write(&path, b"\xff\xfe\xfd\n").unwrap();
+        let error = SeenStore::open(&path).unwrap_err();
+        assert!(matches!(error, MailboxError::Transport(_)));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn dedupe_log_fails_closed_on_corrupt_line() {
+        let path = temp_path("seen-corrupt");
+        std::fs::write(&path, "not-a-hex-id\n").unwrap();
+        let error = SeenStore::open(&path).unwrap_err();
+        assert!(matches!(error, MailboxError::Transport(_)));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn dedupe_log_truncates_torn_tail_and_stays_appendable() {
+        let path = temp_path("seen-torn");
+        let first = EventId::from_byte_array([1u8; 32]);
+        let second = EventId::from_byte_array([2u8; 32]);
+        {
+            let mut store = SeenStore::open(&path).unwrap();
+            store.record(&first).unwrap();
+            // Crash mid-append: the torn tail never synced, so it must be
+            // truncated away — both to skip the bogus entry and so later
+            // appends cannot weld a fresh id onto it.
+            use std::io::Write;
+            store.file.write_all(b"deadbeef").unwrap();
+        }
+        {
+            let mut store = SeenStore::open(&path).expect("torn tail recovers");
+            assert!(store.contains(&first));
+            assert!(!store.contains(&second));
+            store.record(&second).unwrap();
+        }
+        let store = SeenStore::open(&path).unwrap();
+        assert!(store.contains(&first));
+        assert!(store.contains(&second));
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -680,6 +781,42 @@ mod tests {
             .settle(reoffered.id(), Disposition::Ack)
             .expect("ack");
         assert_quiet(&mut mailbox);
+    }
+
+    #[test]
+    fn settle_is_idempotent_after_ack() {
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+
+        let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-idempotent"));
+        {
+            let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-idempotent-sender"));
+            outbox
+                .send(envelope(
+                    device_id(&sender),
+                    device_id(&receiver),
+                    "payload",
+                ))
+                .expect("send");
+        }
+
+        let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("offered");
+        let id = delivery.id();
+        mailbox.settle(id, Disposition::Ack).expect("first ack");
+        // A repeated Ack (lost response, cleanup pass) must be a no-op.
+        mailbox.settle(id, Disposition::Ack).expect("repeated ack");
+        // A late Retry on a consumed id must not resurrect it either.
+        mailbox
+            .settle(id, Disposition::Retry)
+            .expect("retry after ack");
+        assert_quiet(&mut mailbox);
+        // A never-minted id remains an error: settling garbage is a bug.
+        assert!(mailbox
+            .settle(DeliveryId::new(99_999), Disposition::Ack)
+            .is_err());
     }
 
     #[test]

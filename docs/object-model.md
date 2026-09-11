@@ -191,7 +191,11 @@ Manifests are **core objects, not metadata**. They are what makes the
 encrypted physical representation navigable: sealed (encrypted to the drive)
 documents containing trees and the **content→storage mapping** for the
 objects a snapshot references. Only drive members can read them; vaults
-store them opaquely.
+store them opaquely. Ownership splits along the plaintext line: schema and
+canonical plaintext encoding belong to `wyrd-format` (a manifest's
+ContentId is derived over its canonical plaintext like every other object),
+while manifest encryption, StorageId addressing, and capability semantics
+belong to `wyrd-sync` (see `trust.md` for the authorization contract).
 
 Design decisions:
 - **Hierarchical, per-subtree manifests.** A device materializing
@@ -346,3 +350,4 @@ writes, stale-temp sweep on open, verify-on-read scrub.
 | 22 | `EncryptedObject` envelope `version (1) ‖ kind (1) ‖ nonce (24) ‖ ciphertext`; `StorageId` is derived over the sealed bytes; `ObjectKind::Manifest = 0x03` gives sealed manifests a kind byte (plaintext keeps a member-only ContentId; the sealed form is StorageId-addressed, no `ManifestId`) | equal plaintexts sealed twice stay unlinkable (fresh nonces); the kind byte keeps the AAD binding uniform across content and manifests without a new identity type |
 | 23 | Sync-layer ingest limits (`Limits::V0`): 64 MiB object ceiling pre-decode, structural count ceilings post-decode (64 parents/changes/resolves, 1M tree entries and manifest children, 750K manifest mappings calibrated to fit the byte ceiling, 1024-byte names, 65K chunks per file, 256 KiB chunks, 16 owners); format maxima stay generous | attacker-controlled bytes meet bounded allocation everywhere: the total-bytes gate fires before decode, counts validate after decode over pre-allocation-bounded decoders |
 | 24 | Bootstrap invitations under their own framing, never an epoch control key: `version ‖ drive ‖ ephemeral pk ‖ recipient ‖ encryption key ‖ inviter ‖ nonce ‖ ciphertext` (ECDH to the invitee key, owner signature over the payload inside); sealed control kinds carry no invitation tag | sealing an invitation under the key it delivers is a hard bootstrap cycle; delivery (ECDH) and authorship (owner signature) stay separate checks |
+| 25 | Manifest ownership split: schema and canonical plaintext encoding in `wyrd-format`; manifest encryption, storage addressing, and capability semantics in `wyrd-sync` | the format owns the manifest's byte-level identity (ContentId over canonical plaintext); everything key- or capability-shaped stays in sync — the earlier "manifests live in `wyrd-sync`" wording contradicted the code and invited moving the type the wrong way |

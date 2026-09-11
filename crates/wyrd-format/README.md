@@ -11,14 +11,17 @@ content-defined chunking, Merkle file trees, and the snapshot DAG.
 - The canonical object envelope (`wyrd ‖ version ‖ kind ‖ payload`)
 - File/tree entry model for the content drive (paths, kinds, exec bit,
   symlink targets) and the explicit unsupported-metadata list
+- Manifest schema and canonical plaintext encoding: a manifest is a core
+  object whose ContentId is derived over its canonical plaintext like every
+  other object (decision 22 in `docs/object-model.md`)
 - Snapshot DAG types: parents, heads, conflicts-as-forks
 - `ObjectStore` and its filesystem implementation(s)
 
 ## What does not belong here
 
 Anything with I/O beyond local object storage: no networking, no async, no
-keys or encryption (the format layer is the plaintext world — sync owns
-keys, ciphertext, and manifests), no FUSE.
+keys or encryption (the format layer is the plaintext world — keys,
+ciphertext, and manifest sealing live in `wyrd-sync`), no FUSE.
 
 ## Rules
 

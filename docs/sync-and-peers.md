@@ -143,6 +143,15 @@ differences between heads and surfaces conflicted paths with both versions
 snapshot whose parents are all heads. The `(timestamp, author)` tiebreak
 orders versions for display only — it never decides content.
 
+Version access is lookup grammar, never stored entries: a trailing `@N` on
+a component (`foo@1`) addresses version N of a conflicted `foo`, numbered
+deterministically in SnapshotId byte order. The grammar applies only where
+the literal path does not exist — real stored names always win — and
+`readdir` never lists version-qualified names. SnapshotIds themselves never
+enter the user-facing path. Conflict version selection is a property of
+path resolution, not of the stored filesystem namespace; the projected
+namespace stays the user's data only (invariant 8 in `architecture.md`).
+
 ## Operational patterns
 
 - Supervised tasks restart with capped exponential backoff

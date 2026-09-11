@@ -61,6 +61,14 @@ first backend, not a property of the core.
    conflict and path conflict are distinct.
 7. **Materialization is local policy.** Pin/evict changes what a device
    holds, never what the drive contains.
+8. **The projected namespace is the user's data only.** The mounted view
+   never introduces synthetic files, directories, or metadata entries —
+   it is a projection of the snapshot DAG, not a second metadata
+   filesystem layered on top of the drive. View controls (version
+   selection, conflict inspection, snapshot selection) are
+   path-resolution semantics or out-of-band control APIs; Wyrd's own
+   metadata lives in the internal object store, never the mounted
+   namespace.
 
 ## Non-goals (for now)
 

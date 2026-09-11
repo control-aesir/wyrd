@@ -106,7 +106,7 @@ fn only_engine_classification_mounts_the_daemon_view() {
 
     let mut engine = loaded.rig.take_engine();
     loaded.want_all(&mut engine);
-    let mut daemon = Daemon::new(engine, loaded.objects.clone());
+    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
 
     // Control plane through the daemon: the capability and the
     // announcement commit.
@@ -151,7 +151,7 @@ fn failed_projection_leaves_installed_heads_untouched() {
 
     let mut engine = loaded.rig.take_engine();
     loaded.want_all(&mut engine);
-    let mut daemon = Daemon::new(engine, loaded.objects.clone());
+    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
 
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
@@ -203,7 +203,7 @@ fn authored_snapshots_mount_through_the_daemon_view() {
     assert_eq!(authored.snapshot().author, rig.recipient.id);
     assert_eq!(authored.snapshot().epoch, 2, "bound to the canonical tip");
 
-    let mut daemon = Daemon::new(engine, store);
+    let mut daemon = Daemon::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("alpha.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();
@@ -233,7 +233,7 @@ fn a_bootstrapped_drive_serves_its_first_authored_snapshot() {
     let authored = engine.author_snapshot(&store, tree).unwrap();
     assert_eq!(authored.snapshot().epoch, 1, "the genesis epoch");
 
-    let mut daemon = Daemon::new(engine, store);
+    let mut daemon = Daemon::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("boot.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();

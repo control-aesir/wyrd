@@ -101,6 +101,13 @@ pub struct Daemon<S: ObjectStore> {
     view: DriveView<S, DaemonMaterialization>,
 }
 
+/// Failure while composing the engine with a presentation view.
+#[derive(Debug, thiserror::Error)]
+pub enum DaemonError {
+    #[error("runtime state could not be reconstructed: {0}")]
+    Runtime(#[from] wyrd_sync::runtime::EngineError),
+}
+
 impl<S: ObjectStore> Daemon<S>
 where
     S::Error: std::fmt::Debug,
@@ -108,12 +115,10 @@ where
     /// Compose the daemon from a running engine and the store it
     /// imports through. The store is shared: the engine imports
     /// verified bytes, the view serves them.
-    pub fn new(engine: Engine, store: S) -> Self {
-        let runtime = engine
-            .runtime_state()
-            .expect("engine runtime state must be readable during composition");
+    pub fn new(engine: Engine, store: S) -> Result<Self, DaemonError> {
+        let runtime = engine.runtime_state()?;
         let view = DriveView::new(store, DaemonMaterialization { runtime }, Vec::new());
-        Daemon { engine, view }
+        Ok(Daemon { engine, view })
     }
 
     /// The read-only drive view backends present.
@@ -330,7 +335,7 @@ mod tests {
         let store = MemoryObjectStore::default();
         let (engine, dir) = scratch_engine();
 
-        let mut daemon = Daemon::new(engine, store);
+        let mut daemon = Daemon::new(engine, store).unwrap();
         daemon.refresh_live_heads().unwrap();
         assert_eq!(
             daemon.view().lookup("sub/a.txt"),
@@ -348,7 +353,7 @@ mod tests {
     #[test]
     fn put_file_serves_bytes_and_extends_the_live_head() {
         let (engine, dir, _) = scratch_drive();
-        let mut daemon = Daemon::new(engine, MemoryObjectStore::default());
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
 
         daemon.put_file("docs/hello.txt", b"hello wyrd").unwrap();
         assert_eq!(read_through(&daemon, "docs/hello.txt"), b"hello wyrd");
@@ -377,7 +382,7 @@ mod tests {
     #[test]
     fn remove_drops_the_path_from_the_view() {
         let (engine, dir, _) = scratch_drive();
-        let mut daemon = Daemon::new(engine, MemoryObjectStore::default());
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
 
         daemon.put_file("gone.txt", b"bye").unwrap();
         daemon.remove("gone.txt").unwrap();
@@ -399,12 +404,12 @@ mod tests {
     #[test]
     fn writes_survive_keystore_reopen() {
         let (engine, dir, identity) = scratch_drive();
-        let mut daemon = Daemon::new(engine, FsObjectStore::open(dir.clone()).unwrap());
+        let mut daemon = Daemon::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
         daemon.put_file("keep.txt", b"persist me").unwrap();
         drop(daemon);
 
         let reopened = Engine::open_keystore(dir.clone(), "daemon-test-pass", identity).unwrap();
-        let mut daemon = Daemon::new(reopened, FsObjectStore::open(dir.clone()).unwrap());
+        let mut daemon = Daemon::new(reopened, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
         daemon.refresh_live_heads().unwrap();
         assert_eq!(read_through(&daemon, "keep.txt"), b"persist me");
 
@@ -415,7 +420,7 @@ mod tests {
     #[test]
     fn authored_writes_can_be_announced_through_the_daemon() {
         let (engine, dir, _) = scratch_drive();
-        let mut daemon = Daemon::new(engine, MemoryObjectStore::default());
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         let snapshot = daemon.put_file("published.txt", b"publish me").unwrap();
         let sent = daemon
             .announce_snapshot(&snapshot, &mut NoopMailbox)
@@ -431,7 +436,7 @@ mod tests {
     #[test]
     fn write_errors_are_typed() {
         let (engine, dir, _) = scratch_drive();
-        let mut daemon = Daemon::new(engine, MemoryObjectStore::default());
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
 
         assert!(
             matches!(daemon.remove("nothing.txt"), Err(WriteError::EmptyDrive)),

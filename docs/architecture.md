@@ -119,3 +119,10 @@ mount-free view behind the daemon's FUSE backend. All crypto and sync
 work follows `trust.md` and `epochs.md` as normative contracts; the
 open tracking issues name what comes next (durable snapshot-body
 consumers, runtime sync, recovery completion).
+
+The local `wyrd` CLI currently provides a static, read-only startup
+projection only. Its credential files are supported on Unix, must be regular
+files owned by the current user with private permissions, and are bounded and
+zeroized at the CLI boundary. Control-plane draining, fetch-on-open,
+materialization updates, and live mounted-head refresh remain tracked runtime
+work rather than behavior implied by the static mount command.

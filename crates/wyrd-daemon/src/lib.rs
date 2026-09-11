@@ -13,4 +13,4 @@
 pub mod core;
 pub mod fuse;
 
-pub use core::Daemon;
+pub use core::{Daemon, DaemonError};

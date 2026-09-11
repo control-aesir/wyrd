@@ -37,6 +37,8 @@ enum CliError {
     Identity(#[from] wyrd_sync::keys::CryptoError),
     #[error("engine failed: {0}")]
     Engine(#[from] wyrd_sync::runtime::EngineError),
+    #[error("daemon construction failed: {0}")]
+    Daemon(#[from] wyrd_daemon::DaemonError),
     #[error("object store failed: {0}")]
     Store(String),
     #[error("FUSE mount failed: {0}")]
@@ -191,7 +193,7 @@ fn mount(
     let mut daemon = Daemon::new(
         engine,
         FsObjectStore::open(drive_dir).map_err(|error| CliError::Store(error.to_string()))?,
-    );
+    )?;
     daemon.refresh_live_heads()?;
     let backend = daemon.into_fuse_backend();
     let mut config = Config::default();

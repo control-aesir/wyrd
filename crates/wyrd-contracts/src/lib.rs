@@ -26,8 +26,10 @@
 //!    sheds to the relay without consuming, and held messages commit
 //!    once their dependency lands (`sync-and-peers.md`, operational
 //!    patterns).
-//! 7. `bulk_sources_never_allocate_beyond_their_limit` — bulk bytes
-//!    are bounded before decode; oversize is invalid remote data.
+//! 7. `bulk_ceilings_stay_bounded_and_oversize_fails_closed` — the
+//!    engine never offers a ceiling above the configured limit, a
+//!    source refuses oversized payloads without serving bytes, and
+//!    oversize is invalid remote data.
 
 #[cfg(test)]
 mod fuse_contracts;

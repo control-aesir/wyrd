@@ -142,15 +142,37 @@ fn deferred_messages_survive_queue_pressure() {
     rig.teardown();
 }
 
-/// A bulk peer that records every ceiling it is offered: the fetch
-/// path must never ask for more than the configured limit, and
-/// oversize bulk bytes are invalid remote data — rejected before
-/// decode, never committed, retried later. The hostile root is
-/// refused without materializing any bytes (the in-crate plan test
-/// covers the pre-decode gate with real bytes); once the compliant
-/// manifest arrives, the same bounded path materializes everything.
+/// Both sides of the bounded-bulk boundary. The engine never offers
+/// a fetch ceiling above the configured limit, classifies a source's
+/// oversize report as invalid remote data (rejected, never committed,
+/// retried later), and materializes the compliant path under the same
+/// ceilings. A real source refuses any payload over the offered
+/// ceiling and hands over no bytes. The hostile root is refused
+/// without materializing hostile bytes anywhere (the in-crate plan
+/// test covers the pre-decode gate with real materialized bytes; a
+/// source presenting an oversized payload without allocating it is
+/// structurally impossible against the by-value bulk trait).
 #[test]
-fn bulk_sources_never_allocate_beyond_their_limit() {
+fn bulk_ceilings_stay_bounded_and_oversize_fails_closed() {
+    // The source side: a real bulk source refuses an oversized
+    // payload at a tight ceiling and serves exactly at it.
+    let storage = wyrd_format::StorageId::from_bytes([0xB0; 32]);
+    let mut peer = MemoryBulkSource::default();
+    peer.publish_sealed(storage, vec![0x5A; 128]);
+    assert_eq!(
+        peer.fetch_sealed(&storage, 64),
+        Err(BulkError::Oversize {
+            bytes: 128,
+            max: 64
+        }),
+        "a source must refuse, not truncate"
+    );
+    assert_eq!(
+        peer.fetch_sealed(&storage, 128),
+        Ok(Some(vec![0x5A; 128])),
+        "the served bytes stop exactly at the ceiling"
+    );
+
     let mut loaded = Loaded::new("bounded.txt", b"bounded body");
     // The snapshot body is served; only the root manifest is hostile.
     let snapshot_id = loaded.snapshot.snapshot_id();

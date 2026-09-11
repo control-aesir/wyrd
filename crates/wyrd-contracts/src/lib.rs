@@ -30,6 +30,9 @@
 //!    engine never offers a ceiling above the configured limit, a
 //!    source refuses oversized payloads without serving bytes, and
 //!    oversize is invalid remote data.
+//! 8. `unverified_snapshots_cannot_become_live_fuse_heads` — the view
+//!    accepts heads only through the verification capability; a forged
+//!    body is refused at the boundary and never mounts.
 
 #[cfg(test)]
 mod fuse_contracts;

@@ -12,7 +12,8 @@
 //! own boundary.
 
 use wyrd_format::{ContentId, FetchStatus, ObjectStore, Snapshot};
-use wyrd_fuse::{DriveView, Materialization};
+use wyrd_fuse::{DriveView, Materialization, VerifiedSnapshot, ViewHead};
+use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{bulk::BulkSource, runtime::Engine, transport::mailbox::Mailbox};
 
 /// The classified live-head boundary: supplies the verified snapshot
@@ -27,8 +28,41 @@ use wyrd_sync::{bulk::BulkSource, runtime::Engine, transport::mailbox::Mailbox};
 pub trait LiveHeads {
     type Error: std::fmt::Display;
 
-    /// The verified snapshot bodies to install as the view's heads.
-    fn live_heads(&mut self) -> Result<Vec<Snapshot>, Self::Error>;
+    /// The verified snapshot bodies to install as the view's heads,
+    /// typed as `AuthorizedSnapshot`: constructing one runs sync's
+    /// signature verification, so a plugin cannot hand over an
+    /// unverified body — rejections surface as plugin errors.
+    fn live_heads(&mut self) -> Result<Vec<AuthorizedSnapshot>, Self::Error>;
+}
+
+/// The daemon's bridge from `wyrd-sync`'s verified snapshots to the
+/// view's heads: the one in-tree implementation of [`VerifiedSnapshot`],
+/// constructible only from an `AuthorizedSnapshot` — and only sync's
+/// verification produces one of those. The field stays private: a
+/// `LiveHead` is usable only by handing it to [`ViewHead::new`].
+pub struct LiveHead(AuthorizedSnapshot);
+
+impl LiveHead {
+    pub fn new(verified: AuthorizedSnapshot) -> Self {
+        Self(verified)
+    }
+}
+
+impl VerifiedSnapshot for LiveHead {
+    fn into_snapshot(self) -> Snapshot {
+        self.0.snapshot().clone()
+    }
+}
+
+/// Bridge authorized snapshots into view heads. This is the only path
+/// from the sync layer's verified bodies to the view: a raw `Snapshot`
+/// cannot reach [`ViewHead`] in any downstream crate.
+fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<ViewHead> {
+    heads
+        .into_iter()
+        .map(LiveHead::new)
+        .map(ViewHead::new)
+        .collect()
 }
 
 /// How the daemon reports fetch status for content the local store
@@ -75,8 +109,8 @@ where
 
     /// Install verified snapshot heads directly. Use [`Daemon::refresh_heads`]
     /// when heads come from the classified live-head projection.
-    pub fn set_heads(&mut self, heads: Vec<Snapshot>) {
-        self.view.set_heads(heads);
+    pub fn set_heads(&mut self, heads: Vec<AuthorizedSnapshot>) {
+        self.view.set_heads(view_heads(heads));
     }
 
     /// Drain control-plane messages and refresh the materialization projection.
@@ -114,8 +148,7 @@ where
     /// stranded); only the classified eligible set advances the live
     /// view.
     pub fn refresh_heads<P: LiveHeads>(&mut self, source: &mut P) -> Result<(), P::Error> {
-        let heads = source.live_heads()?;
-        self.view.set_heads(heads);
+        self.view.set_heads(view_heads(source.live_heads()?));
         Ok(())
     }
 
@@ -125,8 +158,7 @@ where
     /// is the engine-backed projection; [`Daemon::refresh_heads`] stays
     /// for non-engine sources.
     pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
-        let heads = self.engine.live_heads()?;
-        self.view.set_heads(heads);
+        self.view.set_heads(view_heads(self.engine.live_heads()?));
         Ok(())
     }
 }
@@ -191,15 +223,22 @@ mod tests {
             .unwrap()
             .insert_into(&mut store)
             .unwrap();
-        let head = Snapshot::new(
+        // The head is signed by its author and authorized through the
+        // sync layer, exactly as the composition requires: a raw
+        // snapshot cannot reach the view.
+        let (head_sk, head_author) = key_pair(0x0A);
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let mut head = Snapshot::new(
             Vec::new(),
             root,
-            DeviceId::from_bytes([0xA0; 32]),
+            head_author,
             TransitionId::from_bytes([0x71; 32]),
             1,
             0,
             1,
         );
+        sign_snapshot(&mut head, &head_sk, &drive);
+        let head = AuthorizedSnapshot::authorize(head, &drive).unwrap();
 
         // Scratch engine: the daemon slice does not drive it yet, but
         // the composition holds the real dependency shape. The engine
@@ -389,16 +428,20 @@ mod tests {
             dag: SnapshotDag,
             log: MembershipLog,
             bodies: HashMap<SnapshotId, Snapshot>,
+            drive: DriveId,
         }
         impl LiveHeads for ClassifiedHeads {
             type Error = std::convert::Infallible;
 
-            fn live_heads(&mut self) -> Result<Vec<Snapshot>, Self::Error> {
+            fn live_heads(&mut self) -> Result<Vec<AuthorizedSnapshot>, Self::Error> {
                 Ok(self
                     .dag
                     .eligible_heads(&self.log)
                     .into_iter()
-                    .map(|id| self.bodies[&id].clone())
+                    .map(|id| {
+                        AuthorizedSnapshot::authorize(self.bodies[&id].clone(), &self.drive)
+                            .unwrap()
+                    })
                     .collect())
             }
         }
@@ -406,7 +449,12 @@ mod tests {
         let (engine, dir) = scratch_engine();
         let mut daemon = Daemon::new(engine, store);
         daemon
-            .refresh_heads(&mut ClassifiedHeads { dag, log, bodies })
+            .refresh_heads(&mut ClassifiedHeads {
+                dag,
+                log,
+                bodies,
+                drive,
+            })
             .unwrap();
 
         // The eligible head is the whole live view.

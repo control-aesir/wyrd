@@ -30,8 +30,8 @@ use std::ffi::OsStr;
 use std::sync::{Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use wyrd_format::{ObjectStore, Snapshot};
-use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
+use wyrd_format::ObjectStore;
+use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError, ViewHead};
 
 /// The attribute time-to-limit served to the kernel: short, since
 /// heads (and thus names and sizes) can advance at any drain.
@@ -183,8 +183,10 @@ where
 
     /// Advance the head set in place. Open file descriptors keep
     /// serving their open-time capture: they never consult heads
-    /// again.
-    pub fn set_heads(&self, heads: Vec<Snapshot>) -> Result<(), fuser::Errno> {
+    /// again. Only verified snapshots cross here — the composition
+    /// layer builds [`ViewHead`]s through the daemon's
+    /// `AuthorizedSnapshot` path.
+    pub fn set_heads(&self, heads: Vec<ViewHead>) -> Result<(), fuser::Errno> {
         self.view
             .write()
             .map_err(|_| fuser::Errno::EIO)?
@@ -618,6 +620,25 @@ mod tests {
         }
     }
 
+    /// A test-local verification capability: backend unit tests exercise
+    /// presentation behavior, not the upstream verification boundary
+    /// (the daemon adapter and the contract suite cover that path).
+    struct TestHead(Snapshot);
+
+    impl wyrd_fuse::VerifiedSnapshot for TestHead {
+        fn into_snapshot(self) -> Snapshot {
+            self.0
+        }
+    }
+
+    fn heads(snapshots: Vec<Snapshot>) -> Vec<ViewHead> {
+        snapshots
+            .into_iter()
+            .map(TestHead)
+            .map(ViewHead::new)
+            .collect()
+    }
+
     fn snapshot_of(tree: ContentId) -> Snapshot {
         Snapshot::new(
             Vec::new(),
@@ -639,7 +660,7 @@ mod tests {
         FuseBackend::new(DriveView::new(
             store,
             NoMaterialization,
-            vec![snapshot_of(root)],
+            heads(vec![snapshot_of(root)]),
         ))
     }
 
@@ -713,7 +734,7 @@ mod tests {
             .unwrap()
             .insert_into(&mut store)
             .unwrap();
-        let view = DriveView::new(store, NoMaterialization, vec![snapshot_of(root)]);
+        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
         assert_eq!(symlink_target(&view, "link"), Ok("../target".into()));
         assert_eq!(symlink_target(&view, "missing"), Err(fuser::Errno::ENOENT));
     }
@@ -752,7 +773,7 @@ mod tests {
         let backend = FuseBackend::new(DriveView::new(
             store,
             NoMaterialization,
-            vec![snapshot_of(root_a)],
+            heads(vec![snapshot_of(root_a)]),
         ));
         (backend, next)
     }
@@ -768,7 +789,7 @@ mod tests {
         assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
 
         // Heads advance underneath the open descriptor.
-        backend.set_heads(vec![next]).unwrap();
+        backend.set_heads(heads(vec![next])).unwrap();
         assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
         assert_eq!(backend.read_handle(handle, 1, 2).unwrap(), b"ir");
 

@@ -2,10 +2,10 @@
 //! descendants, and snapshot-stable descriptors.
 
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_format::{DeviceId, Entry, MemoryObjectStore, ObjectStore, Snapshot, TransitionId, Tree};
+use wyrd_format::{Entry, MemoryObjectStore, ObjectStore, Tree};
 use wyrd_fuse::{DriveView, Kind, Node, ViewError};
 
-use crate::support::{Loaded, RemoteOnlyMaterialization};
+use crate::support::{fixture_heads, mount_heads, signed_head, Loaded, RemoteOnlyMaterialization};
 
 /// A changed descendant never manufactures a directory path
 /// conflict: heads that both resolve `d` to a directory merge it
@@ -40,21 +40,10 @@ fn changed_descendants_never_create_directory_path_conflicts() {
         .unwrap()
         .insert_into(&mut store)
         .unwrap();
-    let head = |tree| {
-        Snapshot::new(
-            Vec::new(),
-            tree,
-            DeviceId::from_bytes([0xD0; 32]),
-            TransitionId::from_bytes([0x71; 32]),
-            1,
-            0,
-            1,
-        )
-    };
     let view = DriveView::new(
         store,
         RemoteOnlyMaterialization,
-        vec![head(root_a), head(root_b)],
+        fixture_heads(vec![signed_head(root_a), signed_head(root_b)]),
     );
 
     // The changed descendant `d` is a directory in every head: the
@@ -118,26 +107,31 @@ fn open_fds_remain_stable_across_head_advancement() {
     assert_eq!(report.objects, 2, "the tree and the chunk materialize");
     let heads = engine.live_heads().unwrap();
     assert_eq!(heads.len(), 1);
+    let prior = heads[0].snapshot().clone();
     let backend = FuseBackend::new(DriveView::new(
         loaded.objects,
         RemoteOnlyMaterialization,
-        heads,
+        mount_heads(heads),
     ));
 
     let handle = backend.open_at("stable.txt").unwrap();
     assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"version one");
 
-    // A head advance re-points the path at different bytes.
-    let advanced = Snapshot::new(
+    // A head advance re-points the path at different bytes. The
+    // advance is authored and signed like any real snapshot, then
+    // authorized: the raw body itself has no path to the view.
+    let advanced = crate::support::signed_snapshot(
         Vec::new(),
         tree_two,
-        DeviceId::from_bytes([0xD0; 32]),
-        TransitionId::from_bytes([0x71; 32]),
-        1,
-        0,
+        &loaded.rig.owner,
+        prior.membership,
+        prior.epoch,
         2,
     );
-    backend.set_heads(vec![advanced]).unwrap();
+    let advanced =
+        wyrd_sync::durable::AuthorizedSnapshot::authorize(advanced, &crate::support::drive())
+            .unwrap();
+    backend.set_heads(mount_heads(vec![advanced])).unwrap();
 
     // The open descriptor never noticed.
     assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"version one");
@@ -147,4 +141,60 @@ fn open_fds_remain_stable_across_head_advancement() {
     let fresh = backend.open_at("stable.txt").unwrap();
     assert_eq!(backend.read_handle(fresh, 0, 64).unwrap(), b"version two");
     loaded.rig.teardown();
+}
+
+/// An unverified `Snapshot` cannot become a live FUSE head. The view
+/// accepts heads only as `ViewHead`s, and in a downstream crate those
+/// can be built only from `AuthorizedSnapshot`s (the orphan rule
+/// rejects a raw-snapshot implementation of the capability; the
+/// `compile_fail` doctest on `VerifiedSnapshot` pins that). Here the
+/// semantic half: authorization runs the BIP-340 check, so a body
+/// whose bytes are not covered by its signature is refused at the
+/// boundary — while the signed body mounts and serves through the
+/// same path (architecture.md invariant 3).
+#[test]
+fn unverified_snapshots_cannot_become_live_fuse_heads() {
+    use wyrd_sync::authorization::Rejection;
+    use wyrd_sync::durable::AuthorizedSnapshot;
+
+    let mut store = MemoryObjectStore::default();
+    let good_chunk = store
+        .insert(wyrd_format::ObjectKind::Chunk, b"good")
+        .unwrap();
+    let other_chunk = store
+        .insert(wyrd_format::ObjectKind::Chunk, b"other")
+        .unwrap();
+    let good_tree = Tree::from_entries(vec![
+        Entry::file("good.txt", 4, false, vec![good_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let other_tree = Tree::from_entries(vec![
+        Entry::file("good.txt", 5, false, vec![other_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+
+    // The signed body crosses the boundary and serves.
+    let good = crate::support::signed_head(good_tree);
+    let view = DriveView::new(
+        store,
+        RemoteOnlyMaterialization,
+        fixture_heads(vec![good.clone()]),
+    );
+    let node = view.lookup("good.txt").unwrap();
+    let file = view.open(&node).unwrap();
+    assert_eq!(view.read(&file, 0, 8).unwrap(), b"good");
+
+    // The forged body — same signature bytes, different tree — is
+    // refused exactly where the boundary lives. No `ViewHead` can
+    // exist for it, so it never mounts.
+    let mut forged = good;
+    forged.tree = other_tree;
+    assert_eq!(
+        AuthorizedSnapshot::authorize(forged, &crate::support::drive()),
+        Err(Rejection::BadSignature)
+    );
 }

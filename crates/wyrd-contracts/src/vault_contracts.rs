@@ -6,7 +6,7 @@ use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::SealedManifest;
 use wyrd_sync::seal::{self, SEAL_VERSION};
 
-use crate::support::{drive, Loaded, RemoteOnlyMaterialization};
+use crate::support::{drive, mount_heads, Loaded, RemoteOnlyMaterialization};
 use wyrd_sync::keys::EpochSecret;
 
 /// The structural vault boundary: vault-visible records are
@@ -123,7 +123,11 @@ fn malformed_manifests_never_become_materialized_content() {
     // serving.
     let heads = engine.live_heads().unwrap();
     assert_eq!(heads.len(), 1);
-    let view = DriveView::new(loaded.objects.clone(), RemoteOnlyMaterialization, heads);
+    let view = DriveView::new(
+        loaded.objects.clone(),
+        RemoteOnlyMaterialization,
+        mount_heads(heads),
+    );
     assert_eq!(
         view.lookup("guarded.txt"),
         Err(ViewError::NotMaterialized),
@@ -139,7 +143,11 @@ fn malformed_manifests_never_become_materialized_content() {
     assert_eq!(report.manifests, 1);
     assert_eq!(report.objects, 2, "the tree and the chunk");
     let heads = engine.live_heads().unwrap();
-    let view = DriveView::new(loaded.objects, RemoteOnlyMaterialization, heads);
+    let view = DriveView::new(
+        loaded.objects,
+        RemoteOnlyMaterialization,
+        mount_heads(heads),
+    );
     let node = view.lookup("guarded.txt").unwrap();
     let file = view.open(&node).unwrap();
     assert_eq!(view.read(&file, 0, 64).unwrap(), b"guarded body");

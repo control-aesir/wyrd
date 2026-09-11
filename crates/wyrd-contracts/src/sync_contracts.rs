@@ -8,7 +8,7 @@ use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::ingest::Limits;
 use wyrd_sync::runtime::MAX_PENDING_MESSAGES as PENDING_BOUND;
 
-use crate::support::{signed_transition, Loaded, RemoteOnlyMaterialization, Rig};
+use crate::support::{mount_heads, signed_transition, Loaded, RemoteOnlyMaterialization, Rig};
 
 /// One head per verified body; a broken signature never becomes
 /// durable, never classified, and never mounts (architecture.md
@@ -75,7 +75,7 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
     let backend = FuseBackend::new(DriveView::new(
         loaded.objects,
         RemoteOnlyMaterialization,
-        heads,
+        mount_heads(heads),
     ));
     let handle = backend.open_at("keeper.txt").unwrap();
     assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"keeper");

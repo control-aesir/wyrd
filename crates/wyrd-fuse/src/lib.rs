@@ -9,5 +9,6 @@
 pub mod view;
 
 pub use view::{
-    Attr, ConflictVersion, DirEntry, DriveView, Kind, Materialization, Node, OpenFile, ViewError,
+    Attr, ConflictVersion, DirEntry, DriveView, Kind, Materialization, Node, OpenFile,
+    VerifiedSnapshot, ViewError, ViewHead,
 };

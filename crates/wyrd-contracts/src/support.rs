@@ -143,6 +143,44 @@ pub(crate) fn signed_snapshot(
     s
 }
 
+/// A hand-signed snapshot body from the fixture author device: full
+/// BIP-340 over the snapshot challenge, so it passes
+/// `AuthorizedSnapshot::authorize`. The membership reference is opaque
+/// to the view, so fixtures reuse the conformance placeholder id.
+pub(crate) fn signed_head(tree: ContentId) -> Snapshot {
+    let device = device(0x0A);
+    signed_snapshot(
+        Vec::new(),
+        tree,
+        &device,
+        TransitionId::from_bytes([0x71; 32]),
+        1,
+        1,
+    )
+}
+
+/// Wrap verified snapshots into view heads through the daemon's
+/// adapter — the only in-tree path from authorized bodies to
+/// [`wyrd_fuse::ViewHead`].
+pub(crate) fn mount_heads(
+    heads: impl IntoIterator<Item = wyrd_sync::durable::AuthorizedSnapshot>,
+) -> Vec<wyrd_fuse::ViewHead> {
+    heads
+        .into_iter()
+        .map(wyrd_daemon::core::LiveHead::new)
+        .map(wyrd_fuse::ViewHead::new)
+        .collect()
+}
+
+/// Wrap hand-signed fixture snapshots into view heads: each body runs
+/// through `AuthorizedSnapshot::authorize` exactly as the composition
+/// requires, so an unsigned fixture cannot slip past the boundary.
+pub(crate) fn fixture_heads(snapshots: Vec<Snapshot>) -> Vec<wyrd_fuse::ViewHead> {
+    mount_heads(snapshots.into_iter().map(|snapshot| {
+        wyrd_sync::durable::AuthorizedSnapshot::authorize(snapshot, &drive()).unwrap()
+    }))
+}
+
 /// A fake relay: envelopes stay until Acked; every pass offers each
 /// live envelope once, in arrival order, then yields.
 pub(crate) struct Relay {

@@ -47,13 +47,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, Snapshot, SnapshotId, StorageId};
+use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId};
 use zeroize::Zeroizing;
 
 use super::{MaterializationState, RuntimeError};
 
 use crate::bulk::BulkSource;
 use crate::control::{ControlInbox, ControlMessageId, Message};
+use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
@@ -75,6 +76,8 @@ pub enum EngineError {
     Runtime(#[from] RuntimeError),
     #[error("mailbox settlement failed: {0}")]
     Mailbox(#[from] crate::transport::mailbox::MailboxError),
+    #[error("classified snapshot failed verification: {0:?}")]
+    InvalidHead(crate::authorization::Rejection),
 }
 
 /// What one [`Engine::drain`] pass did.
@@ -310,14 +313,22 @@ impl Engine {
     /// durable snapshot-body facts and the membership log, so it survives
     /// restarts; backends install exactly this set as the view's heads.
     /// Everything else in the DAG is retained history and never advances
-    /// the live view.
-    pub fn live_heads(&self) -> Result<Vec<Snapshot>, EngineError> {
+    /// the live view. Each head is re-verified on the way out, so the
+    /// projection is typed as `AuthorizedSnapshot`: durable bytes that
+    /// no longer verify fail the projection instead of reaching a view.
+    pub fn live_heads(&self) -> Result<Vec<AuthorizedSnapshot>, EngineError> {
         let rebuilt = self.store.rebuild(self.device)?;
         let mut dag = crate::authorization::SnapshotDag::new(self.drive);
         for body in rebuilt.runtime.snapshot_bodies.values() {
             dag.observe(body.clone());
         }
-        Ok(dag.eligible_head_bodies(&rebuilt.log))
+        dag.eligible_head_bodies(&rebuilt.log)
+            .into_iter()
+            .map(|snapshot| {
+                AuthorizedSnapshot::authorize(snapshot, &self.drive)
+                    .map_err(EngineError::InvalidHead)
+            })
+            .collect()
     }
 
     /// Drain every envelope currently in the mailbox, committing facts

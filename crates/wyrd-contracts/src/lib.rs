@@ -38,6 +38,9 @@
 //!    production head path end to end: control plane and bulk fetch
 //!    run through the daemon, and only the engine's classified
 //!    projection mounts the drive (`architecture.md` invariant 3).
+//! 10. `failed_projection_leaves_installed_heads_untouched` — a
+//!     damaged durable store fails the projection closed and the view
+//!     keeps serving what it served before; refresh is all-or-nothing.
 
 #[cfg(test)]
 mod fuse_contracts;

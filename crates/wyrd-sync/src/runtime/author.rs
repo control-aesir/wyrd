@@ -11,10 +11,10 @@
 //! parents onto the locally live-lineage eligible heads, binds
 //! `membership` to the canonical epoch-K transition, and sets `epoch` to
 //! that transition's epoch. Failures are fail-closed: no canonical
-//! membership, a non-member author, or a signature that will not verify
-//! commits nothing.
+//! membership, a non-member author, an unavailable root tree, or a
+//! signature that will not verify commits nothing.
 
-use wyrd_format::{ContentId, Snapshot};
+use wyrd_format::{ContentId, ObjectStore, Snapshot, Tree};
 
 use super::engine::{Engine, EngineError};
 use crate::authorization::SnapshotDag;
@@ -22,16 +22,28 @@ use crate::control::{seal, Message, SnapshotAnnouncement};
 use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::transport::mailbox::{seal_for_recipient, Mailbox};
 
-/// Author a snapshot over `tree` on behalf of this engine's device.
-/// Parents are the current eligible heads, so a single-head drive
+/// Author a snapshot over `tree` on behalf of this engine's device. The
+/// root tree must be a canonical tree object present in `objects`: a
+/// snapshot whose tree no one can materialize is refused before it is
+/// bound. Parents are the current eligible heads, so a single-head drive
 /// extends its live state and a conflicted drive resolves onto every
 /// head (object-model.md, "Resolution"). The body is signed, verified
 /// once (fail-closed), and committed; it becomes live when a projection
 /// rebuilds the DAG.
-pub(super) fn author(
+pub(super) fn author<S: ObjectStore>(
     engine: &mut Engine,
+    objects: &S,
     tree: ContentId,
-) -> Result<AuthorizedSnapshot, EngineError> {
+) -> Result<AuthorizedSnapshot, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let bytes = objects
+        .get(&tree)
+        .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
+        .ok_or(EngineError::TreeUnavailable(tree))?;
+    Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree))?;
+
     let rebuilt = engine.store.rebuild(engine.device)?;
     let known = rebuilt
         .log
@@ -51,6 +63,15 @@ pub(super) fn author(
     }
     let parents = dag.eligible_heads(&rebuilt.log);
 
+    let max_seen = rebuilt
+        .runtime
+        .snapshot_bodies
+        .values()
+        .map(|snapshot| snapshot.timestamp)
+        .max()
+        .unwrap_or(0);
+    let timestamp = next_timestamp(max_seen, wall_clock_ms());
+
     let mut snapshot = Snapshot::new(
         parents,
         tree,
@@ -58,7 +79,7 @@ pub(super) fn author(
         known.transition_id,
         known.epoch,
         0,
-        now_ms(),
+        timestamp,
     );
     crate::authorization::predicates::sign_snapshot(
         &mut snapshot,
@@ -113,12 +134,39 @@ pub(super) fn announce(
     Ok(sent)
 }
 
-/// Wall-clock milliseconds for the display/tiebreak timestamp. HLC
-/// ordering is a display concern (object-model.md); authorization never
+/// The timestamp for the next locally authored snapshot: strictly
+/// greater than every timestamp already observed in the local DAG, and
+/// never below the wall clock. This keeps the local authoring sequence
+/// monotonic across clock rollback, same-millisecond writes, and
+/// restarts (the durable DAG carries the previous maximum). The field is
+/// display and `(timestamp, author)` tiebreak only; authorization never
 /// reads it.
-fn now_ms() -> u64 {
+pub(super) fn next_timestamp(max_seen: u64, now: u64) -> u64 {
+    now.max(max_seen.saturating_add(1))
+}
+
+/// Wall-clock milliseconds. A clock before the Unix epoch yields zero,
+/// which `next_timestamp` still prefers over the observed maximum.
+fn wall_clock_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_timestamp;
+
+    #[test]
+    fn local_timestamps_never_go_backwards() {
+        // Wall clock ahead of history: take the clock.
+        assert_eq!(next_timestamp(500, 900), 900);
+        // Same millisecond as the last write: step past it.
+        assert_eq!(next_timestamp(500, 500), 501);
+        // Clock rolled back: still step past the durable maximum.
+        assert_eq!(next_timestamp(500, 100), 501);
+        // Empty history: the clock stands.
+        assert_eq!(next_timestamp(0, 42), 42);
+    }
 }

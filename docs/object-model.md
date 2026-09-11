@@ -228,7 +228,8 @@ Snapshot {
     membership: hash of the MembershipTransition whose state authorizes it
     epoch:      u64 — must equal the referenced transition's epoch
     flags:      u8 — bit 0 = recovery snapshot (epochs.md); all other bits reserved zero
-    timestamp:  u64 (ms, HLC-ordered, display/tiebreak only)
+    timestamp:  u64 (ms; the authoring path keeps it strictly increasing
+                over the local DAG; display/tiebreak only)
     signature:  BIP-340 signature over
                 "wyrd snapshot v1" || DriveId || signing preimage (trust.md)
 }

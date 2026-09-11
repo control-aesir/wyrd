@@ -196,7 +196,7 @@ fn authored_snapshots_mount_through_the_daemon_view() {
     .insert_into(&mut store)
     .unwrap();
 
-    let authored = engine.author_snapshot(tree).unwrap();
+    let authored = engine.author_snapshot(&store, tree).unwrap();
     assert_eq!(authored.snapshot().author, rig.recipient.id);
     assert_eq!(authored.snapshot().epoch, 2, "bound to the canonical tip");
 

@@ -32,6 +32,7 @@ use crate::keys::capability::{Capability, WrappedCapability};
 use crate::keys::epoch::EpochSecret;
 use crate::keys::escrow::EscrowRecord;
 use crate::keys::keystore::{unwrap_root, WrappedSecret};
+use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive, Builder};
 use crate::seal;
 
@@ -260,7 +261,7 @@ fn message_seeds() -> Vec<(ControlKind, Vec<u8>)> {
 
 /// A delivery encryption pair for capability-wrap fuzzing, derived like
 /// the capability tests' fixture but local to this module.
-fn fuzz_enc_pair(pattern: u8) -> (SecretKey, DeviceEncryptionKey) {
+fn fuzz_enc_pair(pattern: u8) -> (DeviceEncryptionSecret, DeviceEncryptionKey) {
     let mut counter = 0u8;
     loop {
         let mut input = Vec::with_capacity(64);
@@ -268,8 +269,8 @@ fn fuzz_enc_pair(pattern: u8) -> (SecretKey, DeviceEncryptionKey) {
         input.push(pattern);
         input.push(counter);
         let hash = blake3::hash(&input);
-        if let Ok(sk) = SecretKey::from_slice(hash.as_bytes()) {
-            let kp = Keypair::from_secret_key(SECP256K1, &sk);
+        if let Ok(sk) = DeviceEncryptionSecret::from_bytes(*hash.as_bytes()) {
+            let kp = Keypair::from_secret_key(SECP256K1, &sk.secret_key());
             let pk = XOnlyPublicKey::from_keypair(&kp).0.serialize();
             return (sk, DeviceEncryptionKey::from_bytes(pk));
         }

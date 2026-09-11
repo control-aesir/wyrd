@@ -128,6 +128,7 @@ pub fn unwrap(escrow_key: &[u8; 32], record: &EscrowRecord) -> Result<EpochSecre
     let plaintext = super::aead::open(escrow_key, &record.nonce, &record.ciphertext, &aad)?;
     Ok(EpochSecret::from_bytes(
         plaintext
+            .as_slice()
             .try_into()
             .expect("48-byte ciphertext opens to 32 bytes"),
     ))

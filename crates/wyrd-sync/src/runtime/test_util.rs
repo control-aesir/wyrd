@@ -23,12 +23,13 @@ use wyrd_format::{
 use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use crate::control::{seal, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload};
 use crate::keys::capability::Capability;
-use crate::keys::EpochSecret;
+use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, Builder};
 use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
 use crate::transport::mailbox::{
     seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
+use zeroize::Zeroizing;
 
 use super::engine::{DrainReport, Engine};
 
@@ -130,14 +131,14 @@ pub(crate) struct Fixture {
     pub(crate) dir: TestDir,
     pub(crate) engine: Engine,
     pub(crate) relay: MemoryRelay,
-    pub(crate) sender_sk: SecretKey,
+    pub(crate) sender_sk: DeviceIdentitySecret,
     pub(crate) recipient: DeviceId,
 }
 
 /// Nostr identity: secret key plus the x-only device id it names.
-pub(crate) fn identity(pattern: u8) -> (SecretKey, DeviceId) {
-    let sk = SecretKey::from_slice(&[pattern; 32]).unwrap();
-    let kp = Keypair::from_secret_key(SECP256K1, &sk);
+pub(crate) fn identity(pattern: u8) -> (DeviceIdentitySecret, DeviceId) {
+    let sk = DeviceIdentitySecret::from_bytes([pattern; 32]).unwrap();
+    let kp = Keypair::from_secret_key(SECP256K1, &sk.secret_key());
     let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
     (sk, DeviceId::from_bytes(xonly.serialize()))
 }
@@ -152,7 +153,7 @@ pub(crate) fn control_key(epoch: u64) -> [u8; 32] {
 pub(crate) fn fixture() -> Fixture {
     let dir = TestDir::new("intake");
     let (identity_sk, device) = identity(0x02);
-    let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
     let (sender_sk, _) = identity(0x01);
     let mut engine = Engine::open(
         dir.path.clone(),
@@ -164,7 +165,7 @@ pub(crate) fn fixture() -> Fixture {
     )
     .unwrap();
     for epoch in [1, 2] {
-        engine.add_epoch_key(epoch, control_key(epoch));
+        engine.add_epoch_key(epoch, Zeroizing::new(control_key(epoch)));
     }
     Fixture {
         dir,
@@ -227,8 +228,8 @@ pub(crate) fn transition_message(t: &MembershipTransition) -> Message {
 
 /// The engine's device encryption key, derived from its secret the
 /// way fixtures do (registered on-chain by the capability test).
-pub(crate) fn encryption_key(secret: &SecretKey) -> DeviceEncryptionKey {
-    let kp = Keypair::from_secret_key(SECP256K1, secret);
+pub(crate) fn encryption_key(secret: &DeviceEncryptionSecret) -> DeviceEncryptionKey {
+    let kp = Keypair::from_secret_key(SECP256K1, &secret.secret_key());
     let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
     DeviceEncryptionKey::from_bytes(xonly.serialize())
 }
@@ -240,7 +241,7 @@ pub(crate) fn encryption_key(secret: &SecretKey) -> DeviceEncryptionKey {
 pub(crate) fn reopen(fixture: &mut Fixture) -> Engine {
     fixture.engine.release_store_lock();
     let (identity_sk, device) = identity(0x02);
-    let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
     let mut engine = Engine::open(
         fixture.dir.path.clone(),
         member_drive(),
@@ -251,7 +252,7 @@ pub(crate) fn reopen(fixture: &mut Fixture) -> Engine {
     )
     .unwrap();
     for epoch in [1, 2, 9] {
-        engine.add_epoch_key(epoch, control_key(epoch));
+        engine.add_epoch_key(epoch, Zeroizing::new(control_key(epoch)));
     }
     engine
 }
@@ -259,8 +260,8 @@ pub(crate) fn owner() -> (SecretKey, DeviceId) {
     key(10)
 }
 /// The engine device's encryption secret (mirrors `fixture`).
-pub(crate) fn engine_encryption_sk() -> SecretKey {
-    SecretKey::from_slice(&[0xE0; 32]).unwrap()
+pub(crate) fn engine_encryption_sk() -> DeviceEncryptionSecret {
+    DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap()
 }
 
 /// Admit the engine device with its real encryption key, epoch 2.
@@ -284,7 +285,7 @@ pub(crate) fn capability_message(
 
 /// A capability for any device/key pair (two-device scenarios).
 pub(crate) fn capability_message_for(
-    encryption_sk: &SecretKey,
+    encryption_sk: &DeviceEncryptionSecret,
     device: DeviceId,
     transition: TransitionId,
     epoch: u64,

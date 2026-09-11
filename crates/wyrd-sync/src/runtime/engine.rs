@@ -46,9 +46,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use secp256k1::SecretKey;
 use thiserror::Error;
 use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, Snapshot, SnapshotId, StorageId};
+use zeroize::Zeroizing;
 
 use super::{MaterializationState, RuntimeError};
 
@@ -57,6 +57,7 @@ use crate::control::{ControlInbox, ControlMessageId, Message};
 #[cfg(test)]
 use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
+use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
 
@@ -158,14 +159,18 @@ pub(super) enum FetchKey {
 pub struct Engine {
     pub(super) drive: DriveId,
     pub(super) device: DeviceId,
-    pub(super) identity_secret: SecretKey,
-    pub(super) encryption_secret: SecretKey,
+    /// Long-lived device secrets in scrubbing wrappers: upstream
+    /// `secp256k1` offers no drop-time zeroization, so the engine
+    /// never holds a bare `SecretKey` past one curve-API call.
+    pub(super) identity_secret: DeviceIdentitySecret,
+    pub(super) encryption_secret: DeviceEncryptionSecret,
     pub(super) store: DurableStore,
     pub(super) inbox: ControlInbox,
     /// Held epoch control keys, retained outside the inbox so a
     /// resync (which rebuilds the inbox from durable facts) never
-    /// drops key material the device still holds.
-    epoch_keys: BTreeMap<u64, [u8; 32]>,
+    /// drops key material the device still holds. Zeroizing values:
+    /// revoked epochs must not linger in process memory.
+    epoch_keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
     pub(super) log: MembershipLog,
     pub(super) pending: HashMap<ControlMessageId, Message>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
@@ -194,8 +199,8 @@ impl Engine {
         drive: DriveId,
         device: DeviceId,
         passphrase: &str,
-        identity_secret: SecretKey,
-        encryption_secret: SecretKey,
+        identity_secret: DeviceIdentitySecret,
+        encryption_secret: DeviceEncryptionSecret,
     ) -> Result<Self, EngineError> {
         let store = DurableStore::open(dir, drive, passphrase)?;
         let mut engine = Engine {
@@ -248,9 +253,9 @@ impl Engine {
     /// Hold an epoch's control key for inbox ingest. Keys live with
     /// the engine (not just the inbox) so restarts and resyncs keep
     /// them.
-    pub fn add_epoch_key(&mut self, epoch: u64, key: [u8; 32]) {
+    pub fn add_epoch_key(&mut self, epoch: u64, key: Zeroizing<[u8; 32]>) {
+        self.inbox.add_epoch_key(epoch, key.clone());
         self.epoch_keys.insert(epoch, key);
-        self.inbox.add_epoch_key(epoch, key);
     }
 
     /// The drive this engine serves.
@@ -275,7 +280,7 @@ impl Engine {
         let facts = self.store.load()?;
         self.inbox = ControlInbox::new(self.drive);
         for (epoch, key) in &self.epoch_keys {
-            self.inbox.add_epoch_key(*epoch, *key);
+            self.inbox.add_epoch_key(*epoch, key.clone());
         }
         for id in &facts.seen {
             self.inbox.remember(id);
@@ -434,7 +439,7 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        announcement_msg, capability_message_for, encryption_key, identity, owner, publish_into,
+        announcement_msg, capability_message_for, encryption_key, identity, publish_into,
         transition_message, MemoryMailbox, MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::transport::mailbox::seal_for_recipient;
@@ -457,8 +462,8 @@ mod tests {
     struct Device {
         dir: TestDir,
         engine: Engine,
-        identity_sk: SecretKey,
-        encryption_sk: SecretKey,
+        identity_sk: DeviceIdentitySecret,
+        encryption_sk: DeviceEncryptionSecret,
         device: DeviceId,
         objects: MemoryObjectStore,
     }
@@ -481,18 +486,18 @@ mod tests {
     ) -> Device {
         let dir = TestDir::new(name);
         let (identity_sk, device) = identity(identity_byte);
-        let encryption_sk = SecretKey::from_slice(&[encryption_byte; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([encryption_byte; 32]).unwrap();
         let mut engine = Engine::open(
             dir.path.clone(),
             member_drive(),
             device,
             "test-pass",
-            identity_sk,
-            encryption_sk,
+            identity_sk.clone(),
+            encryption_sk.clone(),
         )
         .unwrap();
         for (epoch, key) in controls {
-            engine.add_epoch_key(*epoch, *key);
+            engine.add_epoch_key(*epoch, Zeroizing::new(*key));
         }
         Device {
             dir,
@@ -507,7 +512,7 @@ mod tests {
     /// Seal a control message for a device under a scenario epoch key.
     fn send_to(
         pair: &mut Pair,
-        from_sk: &SecretKey,
+        from_sk: &DeviceIdentitySecret,
         to: DeviceId,
         epoch: u64,
         key: &[u8; 32],
@@ -544,12 +549,12 @@ mod tests {
             member_drive(),
             device.device,
             "test-pass",
-            device.identity_sk,
-            device.encryption_sk,
+            device.identity_sk.clone(),
+            device.encryption_sk.clone(),
         )
         .unwrap();
         for (epoch, key) in controls {
-            engine.add_epoch_key(*epoch, *key);
+            engine.add_epoch_key(*epoch, Zeroizing::new(*key));
         }
         device.engine = engine;
     }
@@ -601,7 +606,7 @@ mod tests {
             b: open_device("conv-b", 0x03, 0xE1, &controls),
         };
 
-        let (owner_sk, _) = owner();
+        let owner_sk = DeviceIdentitySecret::from_bytes([10; 32]).unwrap();
         let (mut builder, genesis) = Builder::genesis(10);
         let admit_a = builder.child(vec![Change::Admit(Admission {
             device: pair.a.device,
@@ -612,8 +617,8 @@ mod tests {
             encryption_key: encryption_key(&pair.b.encryption_sk),
         })]);
 
-        let a_sk = pair.a.identity_sk;
-        let b_sk = pair.b.identity_sk;
+        let a_sk = pair.a.identity_sk.clone();
+        let b_sk = pair.b.identity_sk.clone();
         let a_dev = pair.a.device;
         let b_dev = pair.b.device;
         // Each device authors one snapshot: the body is signed by the
@@ -629,7 +634,7 @@ mod tests {
             0,
             1002,
         );
-        sign_snapshot(&mut body_a, &a_sk, &drive);
+        sign_snapshot(&mut body_a, &a_sk.secret_key(), &drive);
         pair.bulk
             .publish_snapshot(body_a.snapshot_id(), body_a.encode());
         let snapshot_a = body_a.snapshot_id();
@@ -642,7 +647,7 @@ mod tests {
             0,
             1003,
         );
-        sign_snapshot(&mut body_b, &b_sk, &drive);
+        sign_snapshot(&mut body_b, &b_sk.secret_key(), &drive);
         pair.bulk
             .publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();

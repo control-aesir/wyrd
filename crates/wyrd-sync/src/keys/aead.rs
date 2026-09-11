@@ -4,10 +4,14 @@
 //! [`open`], so the AEAD construction — key handling, nonce placement,
 //! AAD binding — has exactly one place to audit. Callers pass the key
 //! as a borrowed slice (typically from a `Zeroizing<[u8; 32]>`); the
-//! helpers never retain key material.
+//! helpers never retain key material. Opened plaintext returns in a
+//! [`Zeroizing`] wrapper so secret-bearing envelopes (capabilities,
+//! bootstrap invitations, keystore secrets) are wiped on drop;
+//! content-bearing envelopes ride the same helper and inherit it.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
+use zeroize::Zeroizing;
 
 use super::CryptoError;
 
@@ -30,17 +34,20 @@ pub(crate) fn seal(
 
 /// Open `msg` sealed under `key` with `nonce` and associated data `aad`.
 /// A tag mismatch surfaces as [`CryptoError::OpenFailed`]: callers learn
-/// only that the envelope did not open, never which byte differed.
+/// only that the envelope did not open, never which byte differed. The
+/// plaintext is [`Zeroizing`] so secret-bearing envelopes are wiped
+/// when the caller drops them.
 pub(crate) fn open(
     key: &[u8],
     nonce: &[u8; 24],
     msg: &[u8],
     aad: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key))
         .decrypt(
             chacha20poly1305::XNonce::from_slice(nonce),
             Payload { msg, aad },
         )
+        .map(Zeroizing::new)
         .map_err(|_| CryptoError::OpenFailed)
 }

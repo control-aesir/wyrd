@@ -39,6 +39,7 @@ pub mod nip46;
 use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 use wyrd_format::DriveId;
+use zeroize::Zeroizing;
 
 use crate::keys::{random_bytes, CryptoError};
 
@@ -251,11 +252,25 @@ pub enum IngestReport {
 /// documented, not exercised.
 ///
 /// [`DriveKeyring`]: crate::keys::DriveKeyring
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlInbox {
     drive: DriveId,
-    keys: BTreeMap<u64, [u8; 32]>,
+    /// Held epoch control keys. Zeroizing values: key material must
+    /// not linger past inbox rebuilds or drops. `Zeroizing` offers no
+    /// `Debug`, so the manual impl below prints epochs held, never
+    /// material.
+    keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
     seen: HashSet<ControlMessageId>,
+}
+
+impl std::fmt::Debug for ControlInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlInbox")
+            .field("drive", &self.drive)
+            .field("key_epochs", &self.keys.keys().collect::<Vec<_>>())
+            .field("seen_len", &self.seen.len())
+            .finish()
+    }
 }
 
 impl ControlInbox {
@@ -272,7 +287,7 @@ impl ControlInbox {
     /// Hold an epoch's control key. Knowledge and key material are
     /// distinct: learning of epoch N+1 confers nothing until its key
     /// arrives here.
-    pub fn add_epoch_key(&mut self, epoch: u64, key: [u8; 32]) {
+    pub fn add_epoch_key(&mut self, epoch: u64, key: Zeroizing<[u8; 32]>) {
         self.keys.insert(epoch, key);
     }
 
@@ -292,9 +307,8 @@ impl ControlInbox {
         let key = self
             .keys
             .get(&sealed.epoch)
-            .copied()
             .ok_or(ControlError::UnknownEpoch(sealed.epoch))?;
-        let (_, _, message) = open(&key, &sealed)?;
+        let (_, _, message) = open(key, &sealed)?;
         let id = sealed.message_id();
         if !self.seen.insert(id) {
             return Ok(IngestReport::Duplicate);
@@ -349,7 +363,7 @@ mod tests {
 
     fn inbox() -> ControlInbox {
         let mut inbox = ControlInbox::new(drive());
-        inbox.add_epoch_key(5, control_key(5));
+        inbox.add_epoch_key(5, Zeroizing::new(control_key(5)));
         inbox
     }
 
@@ -367,14 +381,14 @@ mod tests {
         // The inbox holds the wrong key for epoch 5: the tag fails and
         // nothing is recorded, so the true key still lands afterwards.
         let mut inbox = ControlInbox::new(drive());
-        inbox.add_epoch_key(5, [0x99; 32]);
+        inbox.add_epoch_key(5, Zeroizing::new([0x99; 32]));
         let sealed = seal(&control_key(5), &drive(), 5, &announcement()).unwrap();
         assert_eq!(
             inbox.ingest(&sealed.encode()),
             Err(ControlError::Crypto(CryptoError::OpenFailed))
         );
         assert!(!inbox.has_seen(&sealed.message_id()));
-        inbox.add_epoch_key(5, control_key(5));
+        inbox.add_epoch_key(5, Zeroizing::new(control_key(5)));
         assert!(matches!(
             inbox.ingest(&sealed.encode()),
             Ok(IngestReport::Accepted { .. })

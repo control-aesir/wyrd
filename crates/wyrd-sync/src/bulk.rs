@@ -11,10 +11,10 @@
 //! undecodable bytes. Both sources enforce the ceiling before buffering
 //! the representation: the memory source checks its stored bytes, and
 //! the iroh source checks the cryptographically verified blob size
-//! first, then streams the body into a bounded buffer that checks each
-//! leaf against the remaining budget before copying — a hostile peer
-//! cannot force more than `max` bytes of allocation no matter what it
-//! claims or streams.
+//! first, then streams the body into a buffer pre-sized from that
+//! size which checks each leaf against the remaining budget before
+//! copying — a hostile peer cannot force more than `max` bytes of
+//! content, and accepted fetches allocate exactly what was verified.
 //!
 //! Addressing mirrors what each party may know. Sealed objects are
 //! vault-visible, so they fetch by [`StorageId`]. The root manifest of
@@ -182,10 +182,11 @@ impl IrohBulkSource {
 
     fn fetch(&self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
         // The ceiling is enforced twice: the verified size rejects an
-        // oversize blob before anything transfers or allocates, and the
-        // bounded accumulator below caps allocation while streaming, so
-        // a peer that streams past its announced size still cannot force
-        // more than `max` bytes of buffering.
+        // oversize blob before anything transfers, and the bounded
+        // accumulator below pre-sizes from that verified size and
+        // checks each leaf before copying — a peer that streams past
+        // its announced size is refused, and accepted fetches return
+        // at most `max` bytes without geometric over-reservation.
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
@@ -203,25 +204,27 @@ impl IrohBulkSource {
                     max,
                 });
             }
-            bounded_blob_bytes(get_blob(connection, hash), max).await
+            bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
         })
     }
 }
 
 /// Concatenate one blob stream into a buffer capped at `max` content
-/// bytes: each leaf is checked against the remaining budget before it
-/// is copied, so the buffer never holds more than `max` bytes; parents
-/// are protocol overhead (tree hashes, never content) and skip the
-/// count, and the bytes return only after `Done` — transport
-/// verification completes before the engine sees anything. Generic
-/// over the item stream so tests can prove the bound without a
-/// network; the live path passes the real `GetBlobResult`.
-async fn bounded_blob_bytes<S>(stream: S, max: usize) -> Result<Vec<u8>, BulkError>
+/// bytes: the buffer is pre-sized from `reserve` — the verified blob
+/// size on the live path, so accepted fetches never reallocate — and
+/// each leaf is checked against the remaining budget before it is
+/// copied, so the returned content never exceeds `max`. Parents are
+/// protocol overhead (tree hashes, never content) and skip the count,
+/// and the bytes return only after `Done` — transport verification
+/// completes before the engine sees anything. Generic over the item
+/// stream so tests can prove the bound without a network; the live
+/// path passes the real `GetBlobResult`.
+async fn bounded_blob_bytes<S>(stream: S, max: usize, reserve: usize) -> Result<Vec<u8>, BulkError>
 where
     S: Stream<Item = GetBlobItem>,
 {
     let mut stream = Box::pin(stream);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(reserve.min(max));
     while let Some(item) = stream.next().await {
         match item {
             GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
@@ -428,7 +431,7 @@ mod tests {
             leaf(10, Bytes::from_static(b"0123456789")),
             leaf(20, Bytes::from_static(b"0123456789")),
         ]);
-        let result = runtime.block_on(bounded_blob_bytes(&mut items, 15));
+        let result = runtime.block_on(bounded_blob_bytes(&mut items, 15, 15));
         assert_eq!(result, Err(BulkError::Oversize { bytes: 20, max: 15 }));
         // The third leaf was never pulled: allocation stopped at the
         // ceiling instead of draining the stream.
@@ -453,7 +456,7 @@ mod tests {
             leaf(0, Bytes::from(vec![0xAA; 1024])),
             leaf(1024, Bytes::from_static(b"tail")),
         ]);
-        let result = runtime.block_on(bounded_blob_bytes(&mut items, 16));
+        let result = runtime.block_on(bounded_blob_bytes(&mut items, 16, 16));
         assert_eq!(
             result,
             Err(BulkError::Oversize {
@@ -483,12 +486,12 @@ mod tests {
             leaf(20, Bytes::from_static(b"x")),
         ]);
         assert_eq!(
-            runtime.block_on(bounded_blob_bytes(items, 20)),
+            runtime.block_on(bounded_blob_bytes(items, 20, 20)),
             Err(BulkError::Oversize { bytes: 21, max: 20 })
         );
         let items = stream::iter(vec![leaf(0, Bytes::from_static(b"x"))]);
         assert_eq!(
-            runtime.block_on(bounded_blob_bytes(items, 0)),
+            runtime.block_on(bounded_blob_bytes(items, 0, 0)),
             Err(BulkError::Oversize { bytes: 1, max: 0 })
         );
     }
@@ -503,7 +506,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(bounded_blob_bytes(stream::iter(vec![]), usize::MAX));
+        let result = runtime.block_on(bounded_blob_bytes(stream::iter(vec![]), usize::MAX, 0));
         assert!(matches!(result, Err(BulkError::Transport(_))));
     }
 

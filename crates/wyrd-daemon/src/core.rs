@@ -161,6 +161,18 @@ where
         Ok(())
     }
 
+    /// Announce an authored local snapshot through the control plane. The
+    /// snapshot returned by [`Daemon::put_file`] or [`Daemon::remove`] is
+    /// already durable; announcement failure therefore leaves it available
+    /// for a later retry and never rolls the local write back.
+    pub fn announce_snapshot(
+        &self,
+        snapshot: &AuthorizedSnapshot,
+        mailbox: &mut impl Mailbox,
+    ) -> Result<usize, wyrd_sync::runtime::EngineError> {
+        self.engine.announce_snapshot(snapshot, mailbox)
+    }
+
     /// The tree a write builds from when the drive has exactly one live
     /// head. A conflicted drive is rejected rather than silently losing
     /// entries from any head; explicit resolution is a separate API
@@ -224,6 +236,32 @@ mod tests {
     use wyrd_format::{DeviceId, DriveId, FsObjectStore, MemoryObjectStore};
     use wyrd_fuse::{Node, ViewError};
     use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
+    use wyrd_sync::transport::mailbox::{
+        Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
+    };
+
+    struct NoopMailbox;
+
+    impl Mailbox for NoopMailbox {
+        fn send(
+            &mut self,
+            _envelope: MailboxEnvelope,
+        ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Option<Delivery> {
+            None
+        }
+
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(())
+        }
+    }
 
     /// An isolated engine over a scratch directory, removed by the caller
     /// after the daemon (and with it the store lock) is dropped.
@@ -362,6 +400,20 @@ mod tests {
         let mut daemon = Daemon::new(reopened, FsObjectStore::open(dir.clone()).unwrap());
         daemon.refresh_live_heads().unwrap();
         assert_eq!(read_through(&daemon, "keep.txt"), b"persist me");
+
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authored_writes_can_be_announced_through_the_daemon() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default());
+        let snapshot = daemon.put_file("published.txt", b"publish me").unwrap();
+        let sent = daemon
+            .announce_snapshot(&snapshot, &mut NoopMailbox)
+            .unwrap();
+        assert_eq!(sent, 0, "a single-member drive has no peer recipients");
 
         drop(daemon);
         std::fs::remove_dir_all(dir).unwrap();

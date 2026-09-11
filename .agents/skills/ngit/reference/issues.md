@@ -6,7 +6,7 @@ Part of the ngit skill. Read this when working with issues.
 
 ```bash
 ngit issue create --subject "Bug title" --body "Details as markdown" --label bug --json
-ngit issue create --subject "Feature" --body "..." --label enhancement --label help-wanted --json
+ngit issue create --subject "Feature" --body "..." --label enhancement --json
 ngit issue list --json
 ngit issue list --json --status closed
 ngit issue list --json --label bug
@@ -26,6 +26,19 @@ ngit issue set-cover-note <ID|nevent> \
   --body "$(cat cover-note.md)" \
   --defaults --json
 ```
+
+## Labels
+
+Labels passed to `ngit issue create --label` are embedded in the issue event
+and cannot be removed through a later ngit label event. Labels applied later
+with `ngit issue label` are separate additive events. A deployment may provide
+other removal mechanisms, such as a web UI or NIP-09 deletion.
+
+Creation-time labels are lowercased; labels applied with `ngit issue label`
+preserve case. Apply case-sensitive labels after creation.
+
+Project-specific label taxonomy and triage rules belong in the repository's
+contributor documentation, not this generic ngit reference.
 
 ## Auto-resolve
 

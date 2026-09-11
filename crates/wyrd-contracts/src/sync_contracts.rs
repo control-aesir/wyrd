@@ -82,6 +82,54 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
     loaded.rig.teardown();
 }
 
+/// Only the engine's classification mounts the daemon's view. The
+/// production head path, end to end: an honest peer publishes the
+/// capability, the announcement, the snapshot body, the root
+/// manifest, and the sealed objects; the daemon drains the control
+/// plane, fetches through its shared store — and the drive serves
+/// only once `refresh_live_heads` installs the engine's classified
+/// projection. Residency alone mounts nothing (architecture.md
+/// invariant 3, `docs/epochs.md`).
+#[test]
+fn only_engine_classification_mounts_the_daemon_view() {
+    use wyrd_daemon::core::Daemon;
+
+    let mut loaded = Loaded::new("hello.txt", b"hello");
+    loaded.publish_body_and_announcement();
+    loaded.publish_all();
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon = Daemon::new(engine, loaded.objects.clone());
+
+    // Control plane through the daemon: the capability and the
+    // announcement commit.
+    let report = daemon.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+
+    // Bulk fetch through the daemon: the body verifies durably and the
+    // sealed objects materialize into the shared store.
+    let report = daemon.execute_plan(&mut loaded.bulk).unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the verified body commits");
+    assert_eq!(report.objects, 2, "the tree and the chunk materialize");
+
+    // Residency alone mounts nothing.
+    assert_eq!(
+        daemon.view().lookup("hello.txt"),
+        Err(ViewError::NotFound),
+        "local bytes are not a live head"
+    );
+
+    // Only the engine's classified projection advances the view.
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("hello.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"hello");
+
+    drop(daemon);
+    loaded.rig.teardown();
+}
+
 /// The pending bound sheds to the relay without consuming: a drained
 /// overflow stays the relay's problem, every held message commits
 /// once its transition lands, and the shed envelope re-offers against

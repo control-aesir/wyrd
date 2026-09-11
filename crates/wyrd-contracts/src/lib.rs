@@ -34,6 +34,10 @@
 //!    heads cross the view boundary only as verified bodies through
 //!    the supported composition path; a forged body is refused before
 //!    any head can exist.
+//! 9. `only_engine_classification_mounts_the_daemon_view` — the
+//!    production head path end to end: control plane and bulk fetch
+//!    run through the daemon, and only the engine's classified
+//!    projection mounts the drive (`architecture.md` invariant 3).
 
 #[cfg(test)]
 mod fuse_contracts;

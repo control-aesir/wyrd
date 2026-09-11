@@ -200,8 +200,10 @@ where
 
     /// Open the file at `path`: the view's immutable file identity is
     /// captured at open and keyed by a fresh handle, so later reads
-    /// serve the opened version even after heads advance.
-    fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
+    /// serve the opened version even after heads advance. The
+    /// non-callback form of the kernel `open` op — the contract
+    /// surface the descriptor-stability tests ride.
+    pub fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
         let view = self.view_guard()?;
         let node = view.lookup(path).map_err(|error| errno_of(&error))?;
         let file = view.open(&node).map_err(|error| errno_of(&error))?;
@@ -219,8 +221,14 @@ where
     /// bytes, so head advancement cannot change what an open
     /// descriptor returns. Unknown handles are EBADF. The capture is
     /// cloned out before the view is touched, keeping the lock order
-    /// view-before-files everywhere.
-    fn read_handle(&self, fh: FileHandle, offset: u64, size: u32) -> Result<Vec<u8>, fuser::Errno> {
+    /// view-before-files everywhere. The non-callback form of the
+    /// kernel `read` op.
+    pub fn read_handle(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, fuser::Errno> {
         let file = {
             let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
             files

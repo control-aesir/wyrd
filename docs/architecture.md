@@ -27,6 +27,7 @@ arbitrary subsets of that drive locally.
 | `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format` only |
 | `wyrd-daemon` | Composition: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-sync`, `wyrd-fuse`, `fuser` |
+| `wyrd-contracts` | Test suite: one named test per architectural contract, composed end to end | all of the above |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
 async, or FUSE dependency. `wyrd-fuse` must never know that iroh exists — the

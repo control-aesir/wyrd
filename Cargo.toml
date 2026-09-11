@@ -5,6 +5,7 @@ members = [
     "crates/wyrd-sync",
     "crates/wyrd-fuse",
     "crates/wyrd-daemon",
+    "crates/wyrd-contracts",
 ]
 
 [workspace.package]

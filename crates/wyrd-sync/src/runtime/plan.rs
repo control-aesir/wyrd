@@ -1334,7 +1334,13 @@ mod tests {
         // The genesis snapshot is the only live head: an eligible head
         // at the current epoch, classified from durable facts.
         assert_eq!(
-            fixture.engine.live_heads().unwrap(),
+            fixture
+                .engine
+                .live_heads()
+                .unwrap()
+                .iter()
+                .map(|head| head.snapshot().clone())
+                .collect::<Vec<_>>(),
             vec![genesis_body.clone()]
         );
 
@@ -1388,7 +1394,13 @@ mod tests {
             .unwrap();
         assert_eq!(report.snapshot_bodies, 1);
         assert_eq!(
-            fixture.engine.live_heads().unwrap(),
+            fixture
+                .engine
+                .live_heads()
+                .unwrap()
+                .iter()
+                .map(|head| head.snapshot().clone())
+                .collect::<Vec<_>>(),
             vec![child.clone()],
             "only the eligible head advances the live view"
         );
@@ -1397,7 +1409,12 @@ mod tests {
         // facts and the membership log, and the heads come back.
         let restarted = reopen(&mut fixture);
         assert_eq!(
-            restarted.live_heads().unwrap(),
+            restarted
+                .live_heads()
+                .unwrap()
+                .iter()
+                .map(|head| head.snapshot().clone())
+                .collect::<Vec<_>>(),
             vec![child],
             "heads survive the restart without any re-fetch"
         );

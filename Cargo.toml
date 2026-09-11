@@ -12,6 +12,13 @@ members = [
 version = "0.1.0"
 edition = "2021"
 
+[workspace.lints.rust]
+# The verified-head boundary rests on unsafe-impl auditability (see
+# `wyrd_fuse::VerifiedSnapshot`): every unsafe surface in the workspace
+# is an explicit, commented exception. Crates without an exception have
+# none, so an accidental capability impl cannot compile.
+unsafe_code = "deny"
+
 [workspace.dependencies]
 # wyrd crates
 wyrd-format = { path = "crates/wyrd-format" }

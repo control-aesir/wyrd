@@ -1,14 +1,16 @@
 //! The sync-facing contracts: verified heads, queue pressure, and
 //! bounded bulk.
 
+use wyrd_daemon::core::Daemon;
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{Change, ContentId, FetchStatus, ObjectKind, Snapshot, SnapshotId, StorageId};
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
-use wyrd_sync::runtime::MAX_PENDING_MESSAGES as PENDING_BOUND;
+use wyrd_sync::runtime::{EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
 
-use crate::support::{signed_transition, Loaded, RemoteOnlyMaterialization, Rig};
+use crate::support::{mount_heads, signed_transition, Loaded, RemoteOnlyMaterialization, Rig};
 
 /// One head per verified body; a broken signature never becomes
 /// durable, never classified, and never mounts (architecture.md
@@ -75,10 +77,99 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
     let backend = FuseBackend::new(DriveView::new(
         loaded.objects,
         RemoteOnlyMaterialization,
-        heads,
+        mount_heads(heads),
     ));
     let handle = backend.open_at("keeper.txt").unwrap();
     assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"keeper");
+    loaded.rig.teardown();
+}
+
+/// Only the engine's classification mounts the daemon's view. The
+/// production head path, end to end: an honest peer publishes the
+/// capability, the announcement, the snapshot body, the root
+/// manifest, and the sealed objects; the daemon drains the control
+/// plane, fetches through its shared store — and the drive serves
+/// only once `refresh_live_heads` installs the engine's classified
+/// projection. Residency alone mounts nothing (architecture.md
+/// invariant 3, `docs/epochs.md`).
+#[test]
+fn only_engine_classification_mounts_the_daemon_view() {
+    let mut loaded = Loaded::new("hello.txt", b"hello");
+    loaded.publish_body_and_announcement();
+    loaded.publish_all();
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon = Daemon::new(engine, loaded.objects.clone());
+
+    // Control plane through the daemon: the capability and the
+    // announcement commit.
+    let report = daemon.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+
+    // Bulk fetch through the daemon: the body verifies durably and the
+    // sealed objects materialize into the shared store.
+    let report = daemon.execute_plan(&mut loaded.bulk).unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the verified body commits");
+    assert_eq!(report.objects, 2, "the tree and the chunk materialize");
+
+    // Residency alone mounts nothing.
+    assert_eq!(
+        daemon.view().lookup("hello.txt"),
+        Err(ViewError::NotFound),
+        "local bytes are not a live head"
+    );
+
+    // Only the engine's classified projection advances the view.
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("hello.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"hello");
+
+    drop(daemon);
+    loaded.rig.teardown();
+}
+
+/// A failed projection leaves the installed heads untouched. The
+/// production path installs a live head and serves it; then the
+/// durable store is damaged (the commit watermark rots) and
+/// `refresh_live_heads` fails closed — the engine refuses to rebuild
+/// rather than projecting from untrustworthy state. The view keeps
+/// serving exactly what it served before: refresh is all-or-nothing,
+/// never a partial head set, never a clear.
+#[test]
+fn failed_projection_leaves_installed_heads_untouched() {
+    let mut loaded = Loaded::new("hello.txt", b"hello");
+    loaded.publish_body_and_announcement();
+    loaded.publish_all();
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon = Daemon::new(engine, loaded.objects.clone());
+
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("hello.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"hello");
+
+    // Durable damage: the commit watermark is no longer a sequence
+    // plus commit hash, so no rebuild can be trusted.
+    std::fs::write(loaded.rig.dir.join("CURRENT"), b"rot").unwrap();
+
+    let err = daemon.refresh_live_heads().unwrap_err();
+    assert!(
+        matches!(err, EngineError::Durable(DurableError::CorruptCurrent)),
+        "the damaged store fails the projection: {err:?}"
+    );
+
+    // The view keeps its heads: stale service, never false emptiness.
+    let node = daemon.view().lookup("hello.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"hello");
+
+    drop(daemon);
     loaded.rig.teardown();
 }
 

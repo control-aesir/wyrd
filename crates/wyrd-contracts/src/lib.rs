@@ -30,6 +30,17 @@
 //!    engine never offers a ceiling above the configured limit, a
 //!    source refuses oversized payloads without serving bytes, and
 //!    oversize is invalid remote data.
+//! 8. `forged_snapshots_are_rejected_before_fuse_head_installation` —
+//!    heads cross the view boundary only as verified bodies through
+//!    the supported composition path; a forged body is refused before
+//!    any head can exist.
+//! 9. `only_engine_classification_mounts_the_daemon_view` — the
+//!    production head path end to end: control plane and bulk fetch
+//!    run through the daemon, and only the engine's classified
+//!    projection mounts the drive (`architecture.md` invariant 3).
+//! 10. `failed_projection_leaves_installed_heads_untouched` — a
+//!     damaged durable store fails the projection closed and the view
+//!     keeps serving what it served before; refresh is all-or-nothing.
 
 #[cfg(test)]
 mod fuse_contracts;

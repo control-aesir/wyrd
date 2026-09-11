@@ -155,10 +155,89 @@ pub enum ViewError {
 /// construction. Manifests are uninvolved: materialized reads address
 /// plaintext by content id, and entry/tree correspondence is sync's
 /// concern, checked where manifests are fetched.
+///
+/// Only verified snapshots become heads: [`DriveView::new`] and
+/// [`DriveView::set_heads`] accept [`ViewHead`] values, which safe code
+/// can only construct through the [`VerifiedSnapshot`] capability.
 pub struct DriveView<S, M> {
     store: S,
     materialization: M,
     heads: Vec<Snapshot>,
+}
+
+/// A snapshot that may cross the head boundary: verification already
+/// happened upstream, and this trait is the only way to name it.
+///
+/// `VerifiedSnapshot` is an **unsafe capability**, not a general
+/// conversion trait: it exists to install a cryptographically verified
+/// snapshot as a FUSE view head — nothing else. The boundary is
+/// safe-by-default, not compile-enforced: crossing it requires an
+/// explicit `unsafe impl`. The orphan rule prevents implementing the
+/// capability directly for a foreign `Snapshot`; the unsafe contract
+/// makes wrapper-based bypasses an explicit, auditable trust assertion.
+/// Rust offers no stronger cross-crate seal for a layering reason: the
+/// view cannot name `wyrd-sync`'s `AuthorizedSnapshot` (no dependency
+/// edge may run from the view to sync), and a constructor with a
+/// private body cannot be shared between crates at all. Every
+/// `unsafe impl` is a visible, greppable claim that the implementing
+/// type's construction is owned by the verification authority. In-tree
+/// the production impl is exactly one: the daemon's `LiveHead`, whose
+/// inner `AuthorizedSnapshot` can only be produced by sync's BIP-340
+/// verification; every other in-tree impl is a deliberately forged
+/// test fixture documented as asserting nothing real.
+///
+/// A downstream wrapper around a raw snapshot cannot implement the
+/// capability in safe code — the audit marker is the only way across:
+///
+/// # Safety
+///
+/// Implementors assert that the wrapped snapshot's signature has been
+/// verified by the trust authority (in-tree: `wyrd-sync`'s
+/// `AuthorizedSnapshot` construction), so a false `unsafe impl` puts an
+/// unverified body in the live view. Keep implementations few, local to
+/// the composing crate, and review each like an `unsafe` block.
+///
+/// ```compile_fail
+/// use wyrd_fuse::VerifiedSnapshot;
+/// use wyrd_format::Snapshot;
+///
+/// struct Unchecked(Snapshot);
+///
+/// // A local wrapper type around a foreign `Snapshot`: the orphan
+/// // rule allows this impl shape, but the capability is unsafe, so
+/// // implementing it in safe code does not compile — an unverified
+/// // snapshot has no quiet path to a view head.
+/// impl VerifiedSnapshot for Unchecked {
+///     fn into_snapshot(self) -> Snapshot {
+///         self.0
+///     }
+/// }
+/// ```
+// The one intentional unsafe surface in this crate: the capability
+// declaration itself. Everything else holds the workspace-wide
+// `unsafe_code` deny.
+#[allow(unsafe_code)]
+pub unsafe trait VerifiedSnapshot {
+    /// The verified snapshot body. Consuming preserves the one-way
+    /// flow: a head is built from verified material and never exposed
+    /// as bare, re-wrappable state.
+    fn into_snapshot(self) -> Snapshot;
+}
+
+/// One installed head: a snapshot that entered the view only through
+/// the verification capability. The body is unreachable except as the
+/// view's own head state.
+pub struct ViewHead {
+    snapshot: Snapshot,
+}
+
+impl ViewHead {
+    /// Install a verified snapshot as a head.
+    pub fn new(verified: impl VerifiedSnapshot) -> Self {
+        ViewHead {
+            snapshot: verified.into_snapshot(),
+        }
+    }
 }
 
 impl<S, M> DriveView<S, M>
@@ -167,18 +246,20 @@ where
     S::Error: std::fmt::Debug,
     M: Materialization,
 {
-    pub fn new(store: S, materialization: M, heads: Vec<Snapshot>) -> Self {
+    /// A view over the given verified heads.
+    pub fn new(store: S, materialization: M, heads: Vec<ViewHead>) -> Self {
         DriveView {
             store,
             materialization,
-            heads,
+            heads: heads.into_iter().map(|head| head.snapshot).collect(),
         }
     }
 
     /// Replace the head set: "current" is policy over heads, and the
-    /// policy owner updates the mount as heads advance.
-    pub fn set_heads(&mut self, heads: Vec<Snapshot>) {
-        self.heads = heads;
+    /// policy owner updates the mount as heads advance. Only verified
+    /// snapshots cross here.
+    pub fn set_heads(&mut self, heads: Vec<ViewHead>) {
+        self.heads = heads.into_iter().map(|head| head.snapshot).collect();
     }
 
     /// Replace the sync-backed materialization projection after engine work.
@@ -692,6 +773,30 @@ mod tests {
         }
     }
 
+    /// A test-local verification capability: fuse-internal unit tests
+    /// exercise view behavior, not the upstream verification boundary
+    /// (the daemon adapter and the contract suite cover that path).
+    struct TestHead(Snapshot);
+
+    // SAFETY: a deliberately forged capability for view-mechanics
+    // fixtures — it asserts nothing real and must never escape test
+    // code. The upstream verification boundary is covered by the
+    // daemon adapter and the contract suite, not here.
+    #[allow(unsafe_code)]
+    unsafe impl VerifiedSnapshot for TestHead {
+        fn into_snapshot(self) -> Snapshot {
+            self.0
+        }
+    }
+
+    fn heads(snapshots: Vec<Snapshot>) -> Vec<ViewHead> {
+        snapshots
+            .into_iter()
+            .map(TestHead)
+            .map(ViewHead::new)
+            .collect()
+    }
+
     fn snapshot(tree: ContentId) -> Snapshot {
         Snapshot::new(vec![], tree, device(), transition(), 1, 0, 1)
     }
@@ -740,7 +845,11 @@ mod tests {
     }
 
     fn view(drive: SmallDrive) -> DriveView<MemoryObjectStore, FakeMaterialization> {
-        DriveView::new(drive.store, FakeMaterialization::empty(), vec![drive.head])
+        DriveView::new(
+            drive.store,
+            FakeMaterialization::empty(),
+            heads(vec![drive.head]),
+        )
     }
 
     #[test]
@@ -818,7 +927,11 @@ mod tests {
         for _ in 0..DEPTH {
             child = tree_of(&mut store, vec![Entry::dir("d", child).unwrap()]);
         }
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(child)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(child)]),
+        );
         let path = vec!["d"; DEPTH].join("/");
         assert!(matches!(view.lookup(&path), Ok(Node::Dir { .. })));
     }
@@ -848,7 +961,7 @@ mod tests {
                 (missing_chunk, FetchStatus::Unavailable),
                 (corrupt_chunk, FetchStatus::Corrupt),
             ]),
-            vec![snapshot(root)],
+            heads(vec![snapshot(root)]),
         );
 
         // Lookup succeeds (trees are local); reads fail by status.
@@ -868,12 +981,16 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::with(vec![(absent, FetchStatus::Unavailable)]),
-            vec![snapshot(absent)],
+            heads(vec![snapshot(absent)]),
         );
         assert_eq!(view.lookup("anything"), Err(ViewError::Unavailable));
 
         let store = MemoryObjectStore::default();
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(absent)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(absent)]),
+        );
         assert_eq!(view.lookup("anything"), Err(ViewError::NotMaterialized));
     }
 
@@ -884,7 +1001,7 @@ mod tests {
         let view = DriveView::new(
             drive.store,
             FakeMaterialization::empty(),
-            vec![head.clone(), head],
+            heads(vec![head.clone(), head]),
         );
 
         // DAG conflict without path conflict: served normally.
@@ -912,7 +1029,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snap_a.clone(), snap_b.clone()],
+            heads(vec![snap_a.clone(), snap_b.clone()]),
         );
 
         let node = view.lookup("f.txt").unwrap();
@@ -951,7 +1068,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         let root = view.lookup("").unwrap();
@@ -999,7 +1116,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         let dir = view.lookup("dir").unwrap();
@@ -1062,7 +1179,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         assert!(matches!(view.lookup("dir"), Ok(Node::Dir { .. })));
@@ -1102,7 +1219,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         let dir = view.lookup("dir").unwrap();
@@ -1138,7 +1255,7 @@ mod tests {
         let empty = DriveView::new(
             MemoryObjectStore::default(),
             FakeMaterialization::empty(),
-            vec![],
+            heads(vec![]),
         );
         assert_eq!(empty.lookup("hello.txt"), Err(ViewError::NotFound));
     }
@@ -1160,7 +1277,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::with(vec![(missing, FetchStatus::Unavailable)]),
-            vec![snapshot(root)],
+            heads(vec![snapshot(root)]),
         );
         let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();
         assert_eq!(view.read(&gone, 0, 0).unwrap(), b"");
@@ -1184,7 +1301,11 @@ mod tests {
             inner,
             gets: std::cell::Cell::new(0),
         };
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        );
 
         let file = view.open(&view.lookup("wide.bin").unwrap()).unwrap();
         // The lookup loaded the root tree; count deltas per read from
@@ -1237,7 +1358,11 @@ mod tests {
             &mut store,
             vec![Entry::file("lies.txt", 600, false, vec![data]).unwrap()],
         );
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        );
         let file = view.open(&view.lookup("lies.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 600, 8), Err(ViewError::Corrupt));
         assert_eq!(view.read(&file, 700, 8), Err(ViewError::Corrupt));
@@ -1250,7 +1375,11 @@ mod tests {
             &mut store,
             vec![Entry::file("zero.txt", 0, false, vec![data]).unwrap()],
         );
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        );
         let file = view.open(&view.lookup("zero.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 4), Err(ViewError::Corrupt));
     }
@@ -1267,7 +1396,11 @@ mod tests {
             &mut store,
             vec![Entry::file("tail.txt", 5, false, vec![first, extra]).unwrap()],
         );
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        );
         let file = view.open(&view.lookup("tail.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 5), Err(ViewError::Corrupt));
 
@@ -1281,7 +1414,11 @@ mod tests {
             &mut store,
             vec![Entry::file("tail.txt", 5, false, vec![first, absent]).unwrap()],
         );
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        );
         let file = view.open(&view.lookup("tail.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 5), Err(ViewError::NotMaterialized));
     }
@@ -1294,7 +1431,11 @@ mod tests {
             &mut store,
             vec![Entry::file("lies.txt", 600, false, vec![data]).unwrap()],
         );
-        let view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root)]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        );
 
         let file = view.open(&view.lookup("lies.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 1024), Err(ViewError::Corrupt));
@@ -1313,7 +1454,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snap_a.clone(), snapshot(root_b)],
+            heads(vec![snap_a.clone(), snapshot(root_b)]),
         );
 
         // Present in one head, deleted in the other: a path conflict,
@@ -1341,7 +1482,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         // Both heads resolve /d to a directory: the DAG conflict at
@@ -1388,7 +1529,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         // The parent path is a directory in every head: merged.
@@ -1426,7 +1567,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         // The conflict itself stays unreadable.
@@ -1489,7 +1630,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         let literal = view.lookup("f.txt@1").unwrap();
@@ -1527,7 +1668,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         let node = view.lookup("d").unwrap();
@@ -1595,7 +1736,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
         let root = view.readdir(&view.lookup("").unwrap()).unwrap();
         assert_eq!(
@@ -1622,7 +1763,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
         let union = view.readdir(&view.lookup("d").unwrap()).unwrap();
         let names: Vec<_> = union.iter().map(|e| e.name.as_str()).collect();
@@ -1658,7 +1799,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
         assert_eq!(view.lookup("f.txt@3"), Err(ViewError::NotFound));
         assert_eq!(view.lookup("f.txt@0"), Err(ViewError::NotFound));
@@ -1694,7 +1835,7 @@ mod tests {
         let view = DriveView::new(
             store,
             FakeMaterialization::empty(),
-            vec![snapshot(root_a), snapshot(root_b)],
+            heads(vec![snapshot(root_a), snapshot(root_b)]),
         );
 
         // The stored `name@1` diverges: its spelling is the conflict.
@@ -1741,11 +1882,15 @@ mod tests {
             &mut store,
             vec![Entry::file("f.txt", 3, false, vec![b]).unwrap()],
         );
-        let mut view = DriveView::new(store, FakeMaterialization::empty(), vec![snapshot(root_a)]);
+        let mut view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root_a)]),
+        );
 
         let file = view.open(&view.lookup("f.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 3).unwrap(), b"aaa");
-        view.set_heads(vec![snapshot(root_b)]);
+        view.set_heads(heads(vec![snapshot(root_b)]));
         let file = view.open(&view.lookup("f.txt").unwrap()).unwrap();
         assert_eq!(view.read(&file, 0, 3).unwrap(), b"bbb");
     }

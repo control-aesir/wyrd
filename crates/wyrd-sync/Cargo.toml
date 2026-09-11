@@ -32,3 +32,6 @@ zeroize = { version = "1.9", features = ["derive"] }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

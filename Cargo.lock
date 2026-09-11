@@ -4866,6 +4866,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-contracts"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "secp256k1",
+ "wyrd-daemon",
+ "wyrd-format",
+ "wyrd-fuse",
+ "wyrd-sync",
+ "zeroize",
+]
+
+[[package]]
 name = "wyrd-daemon"
 version = "0.1.0"
 dependencies = [

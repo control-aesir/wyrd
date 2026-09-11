@@ -1,0 +1,16 @@
+[package]
+name = "wyrd-contracts"
+version.workspace = true
+edition.workspace = true
+description = "Wyrd's cross-crate architectural contract suite: one named test per review contract, composed end to end over the public API"
+
+[dependencies]
+wyrd-format.workspace = true
+wyrd-sync.workspace = true
+wyrd-fuse.workspace = true
+wyrd-daemon = { path = "../wyrd-daemon" }
+
+[dev-dependencies]
+secp256k1.workspace = true
+blake3.workspace = true
+zeroize = "1.9"

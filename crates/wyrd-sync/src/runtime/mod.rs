@@ -26,7 +26,7 @@ mod plan;
 #[cfg(test)]
 pub(crate) mod test_util;
 
-pub use engine::{DrainReport, Engine, EngineError, ExecuteReport};
+pub use engine::{DrainReport, Engine, EngineError, ExecuteReport, MAX_PENDING_MESSAGES};
 
 /// Local residency policy for one content object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

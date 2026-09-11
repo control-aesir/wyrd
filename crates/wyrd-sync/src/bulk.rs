@@ -8,11 +8,13 @@
 //! Fetches are size-aware: the caller passes the pre-decode byte ceiling
 //! with every request, and the source classifies an oversize
 //! representation as [`BulkError::Oversize`] instead of handing over
-//! undecodable bytes. The memory source and the engine tests enforce the
-//! ceiling exactly; the iroh source enforces it after transfer (its
-//! streaming API verifies the whole Bao tree before bytes are usable —
-//! aborting mid-transfer once the header announces an oversize blob is
-//! transport-internals work that rides with the iroh version set).
+//! undecodable bytes. Both sources enforce the ceiling before buffering
+//! the representation: the memory source checks its stored bytes, and
+//! the iroh source checks the cryptographically verified blob size
+//! first, then streams the body into a buffer pre-sized from that
+//! size which checks each leaf against the remaining budget before
+//! copying — a hostile peer cannot force more than `max` bytes of
+//! content, and accepted fetches allocate exactly what was verified.
 //!
 //! Addressing mirrors what each party may know. Sealed objects are
 //! vault-visible, so they fetch by [`StorageId`]. The root manifest of
@@ -29,8 +31,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use bao_tree::io::BaoContentItem;
 use iroh::{Endpoint, EndpointAddr};
-use iroh_blobs::{get::request::get_blob, Hash};
+use iroh_blobs::{
+    get::request::{get_blob, get_verified_size, GetBlobItem},
+    Hash,
+};
+use n0_future::{Stream, StreamExt};
 use thiserror::Error;
 use tokio::runtime::Runtime;
 use wyrd_format::{ContentId, SnapshotId, StorageId};
@@ -174,28 +181,73 @@ impl IrohBulkSource {
     }
 
     fn fetch(&self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
+        // The ceiling is enforced twice: the verified size rejects an
+        // oversize blob before anything transfers, and the bounded
+        // accumulator below pre-sizes from that verified size and
+        // checks each leaf before copying — a peer that streams past
+        // its announced size is refused, and accepted fetches return
+        // at most `max` bytes without geometric over-reservation.
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
-        let bytes = self
-            .runtime
-            .block_on(async move {
-                let connection = endpoint.connect(provider, iroh_blobs::ALPN).await?;
-                let bytes = get_blob(connection, hash).bytes().await?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes.to_vec())
-            })
-            .map_err(|error| BulkError::Transport(error.to_string()))?;
-        // The iroh path enforces the ceiling after transfer; the module
-        // doc records why (Bao-verified streaming before bytes are
-        // usable) and the streaming abort rides the iroh version set.
-        if bytes.len() > max {
-            return Err(BulkError::Oversize {
-                bytes: bytes.len(),
-                max,
-            });
-        }
-        Ok(bytes)
+        self.runtime.block_on(async move {
+            let connection = endpoint
+                .connect(provider, iroh_blobs::ALPN)
+                .await
+                .map_err(|error| BulkError::Transport(error.to_string()))?;
+            let (size, _) = get_verified_size(&connection, &hash)
+                .await
+                .map_err(|error| BulkError::Transport(error.to_string()))?;
+            if size > max as u64 {
+                return Err(BulkError::Oversize {
+                    bytes: usize::try_from(size).unwrap_or(usize::MAX),
+                    max,
+                });
+            }
+            bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
+        })
     }
+}
+
+/// Concatenate one blob stream into a buffer capped at `max` content
+/// bytes: the buffer is pre-sized from `reserve` — the verified blob
+/// size on the live path, so accepted fetches never reallocate — and
+/// each leaf is checked against the remaining budget before it is
+/// copied, so the returned content never exceeds `max`. Parents are
+/// protocol overhead (tree hashes, never content) and skip the count,
+/// and the bytes return only after `Done` — transport verification
+/// completes before the engine sees anything. Generic over the item
+/// stream so tests can prove the bound without a network; the live
+/// path passes the real `GetBlobResult`.
+async fn bounded_blob_bytes<S>(stream: S, max: usize, reserve: usize) -> Result<Vec<u8>, BulkError>
+where
+    S: Stream<Item = GetBlobItem>,
+{
+    let mut stream = Box::pin(stream);
+    let mut out = Vec::with_capacity(reserve.min(max));
+    while let Some(item) = stream.next().await {
+        match item {
+            GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
+                // Budget before copy: a single hostile leaf must not
+                // force more than the remaining ceiling of allocation.
+                if leaf.data.len() > max.saturating_sub(out.len()) {
+                    return Err(BulkError::Oversize {
+                        bytes: out.len().saturating_add(leaf.data.len()),
+                        max,
+                    });
+                }
+                out.extend_from_slice(&leaf.data);
+            }
+            GetBlobItem::Item(BaoContentItem::Parent(_)) => {}
+            GetBlobItem::Done(_) => return Ok(out),
+            GetBlobItem::Error(cause) => {
+                return Err(BulkError::Transport(cause.to_string()));
+            }
+        }
+    }
+    Err(BulkError::Transport(
+        "blob stream ended without completion".to_string(),
+    ))
 }
 
 impl BulkSource for IrohBulkSource {
@@ -320,9 +372,15 @@ impl BulkSource for MemoryBulkSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bao_tree::io::{BaoContentItem, Leaf};
+    use bytes::Bytes;
 
     fn snapshot() -> SnapshotId {
         SnapshotId::from_bytes([0x11; 32])
+    }
+
+    fn leaf(offset: u64, data: Bytes) -> GetBlobItem {
+        GetBlobItem::Item(BaoContentItem::Leaf(Leaf { offset, data }))
     }
 
     #[test]
@@ -355,6 +413,101 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn bounded_accumulator_aborts_past_ceiling_without_consuming_tail() {
+        use n0_future::stream;
+
+        // A lying or broken peer streams past its announced size: the
+        // accumulator must refuse the leaf that crosses the ceiling,
+        // never buffering the tail.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut items = stream::iter(vec![
+            leaf(0, Bytes::from_static(b"0123456789")),
+            leaf(10, Bytes::from_static(b"0123456789")),
+            leaf(20, Bytes::from_static(b"0123456789")),
+        ]);
+        let result = runtime.block_on(bounded_blob_bytes(&mut items, 15, 15));
+        assert_eq!(result, Err(BulkError::Oversize { bytes: 20, max: 15 }));
+        // The third leaf was never pulled: allocation stopped at the
+        // ceiling instead of draining the stream.
+        assert!(
+            runtime.block_on(items.next()).is_some(),
+            "abort must leave the tail unconsumed"
+        );
+    }
+
+    #[test]
+    fn bounded_accumulator_rejects_single_leaf_over_remaining_budget() {
+        use n0_future::stream;
+
+        // One leaf larger than the whole ceiling: it must be refused
+        // before copying, not buffered and then rejected — otherwise a
+        // hostile leaf of arbitrary size blows the allocation bound.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut items = stream::iter(vec![
+            leaf(0, Bytes::from(vec![0xAA; 1024])),
+            leaf(1024, Bytes::from_static(b"tail")),
+        ]);
+        let result = runtime.block_on(bounded_blob_bytes(&mut items, 16, 16));
+        assert_eq!(
+            result,
+            Err(BulkError::Oversize {
+                bytes: 1024,
+                max: 16
+            })
+        );
+        assert!(
+            runtime.block_on(items.next()).is_some(),
+            "refusal must happen before the leaf is consumed"
+        );
+    }
+
+    #[test]
+    fn bounded_accumulator_holds_exact_boundary_and_zero_max() {
+        use n0_future::stream;
+
+        // Exactly `max` bytes fit; the next byte does not — and with a
+        // zero ceiling even the first byte is refused uncopied.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let items = stream::iter(vec![
+            leaf(0, Bytes::from_static(b"0123456789")),
+            leaf(10, Bytes::from_static(b"0123456789")),
+            leaf(20, Bytes::from_static(b"x")),
+        ]);
+        assert_eq!(
+            runtime.block_on(bounded_blob_bytes(items, 20, 20)),
+            Err(BulkError::Oversize { bytes: 21, max: 20 })
+        );
+        let items = stream::iter(vec![leaf(0, Bytes::from_static(b"x"))]);
+        assert_eq!(
+            runtime.block_on(bounded_blob_bytes(items, 0, 0)),
+            Err(BulkError::Oversize { bytes: 1, max: 0 })
+        );
+    }
+
+    #[test]
+    fn bounded_accumulator_rejects_stream_without_completion() {
+        use n0_future::stream;
+
+        // Bytes that arrive without the transport's completion signal
+        // are unverified by definition: they must fail, never return.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(bounded_blob_bytes(stream::iter(vec![]), usize::MAX, 0));
+        assert!(matches!(result, Err(BulkError::Transport(_))));
     }
 
     #[test]
@@ -421,6 +574,66 @@ mod tests {
         assert_eq!(
             source.fetch_sealed(&storage, usize::MAX).unwrap(),
             Some(b"verified over iroh".to_vec())
+        );
+
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
+        source.shutdown();
+    }
+
+    #[test]
+    fn iroh_source_rejects_oversize_blob_before_buffering() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        // Multi-chunk blob (bao leaves are 1 KiB) over the ceiling: the
+        // verified size rejects it before anything transfers, so this
+        // returns fast without ever buffering the 8 KiB.
+        let oversize = vec![0xCC; 8192];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(oversize.clone()).await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+
+        let provider = direct_addr(&server);
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+        let storage = StorageId::from_bytes([0x88; 32]);
+        source.publish_sealed(
+            storage,
+            IrohBlobRef {
+                provider,
+                hash: *hash.as_bytes(),
+            },
+        );
+
+        assert_eq!(
+            source.fetch_sealed(&storage, 4096),
+            Err(BulkError::Oversize {
+                bytes: 8192,
+                max: 4096
+            })
         );
 
         runtime.block_on(async {

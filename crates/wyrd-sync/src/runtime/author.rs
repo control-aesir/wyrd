@@ -14,7 +14,7 @@
 //! membership, a non-member author, an unavailable root tree, or a
 //! signature that will not verify commits nothing.
 
-use wyrd_format::{ContentId, ObjectStore, Snapshot, Tree};
+use wyrd_format::{ContentId, ObjectKind, ObjectStore, Snapshot, Tree};
 
 use super::engine::{Engine, EngineError};
 use crate::authorization::SnapshotDag;
@@ -23,13 +23,16 @@ use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::transport::mailbox::{seal_for_recipient, Mailbox};
 
 /// Author a snapshot over `tree` on behalf of this engine's device. The
-/// root tree must be a canonical tree object present in `objects`: a
-/// snapshot whose tree no one can materialize is refused before it is
-/// bound. Parents are the current eligible heads, so a single-head drive
-/// extends its live state and a conflicted drive resolves onto every
-/// head (object-model.md, "Resolution"). The body is signed, verified
-/// once (fail-closed), and committed; it becomes live when a projection
-/// rebuilds the DAG.
+/// root must be a canonical tree object present in `objects` whose bytes
+/// hash back to `tree` (the store's scrub invariant, re-checked here so a
+/// faulty store cannot launder a wrong address). Descendant trees and
+/// chunks are deliberately not required to be local: materialization is
+/// local policy, and a member may author a snapshot reusing content it
+/// does not hold. Parents are the current eligible heads, so a
+/// single-head drive extends its live state and a conflicted drive
+/// resolves onto every head (object-model.md, "Resolution"). The body is
+/// signed, verified once (fail-closed), and committed; it becomes live
+/// when a projection rebuilds the DAG.
 pub(super) fn author<S: ObjectStore>(
     engine: &mut Engine,
     objects: &S,
@@ -42,6 +45,9 @@ where
         .get(&tree)
         .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
         .ok_or(EngineError::TreeUnavailable(tree))?;
+    if ContentId::derive(ObjectKind::Tree, &bytes) != tree {
+        return Err(EngineError::TreeMismatch(tree));
+    }
     Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree))?;
 
     let rebuilt = engine.store.rebuild(engine.device)?;
@@ -70,7 +76,8 @@ where
         .map(|snapshot| snapshot.timestamp)
         .max()
         .unwrap_or(0);
-    let timestamp = next_timestamp(max_seen, wall_clock_ms());
+    let timestamp =
+        next_timestamp(max_seen, wall_clock_ms()).ok_or(EngineError::TimestampExhausted)?;
 
     let mut snapshot = Snapshot::new(
         parents,
@@ -140,9 +147,12 @@ pub(super) fn announce(
 /// monotonic across clock rollback, same-millisecond writes, and
 /// restarts (the durable DAG carries the previous maximum). The field is
 /// display and `(timestamp, author)` tiebreak only; authorization never
-/// reads it.
-pub(super) fn next_timestamp(max_seen: u64, now: u64) -> u64 {
-    now.max(max_seen.saturating_add(1))
+/// reads it. Returns `None` once the observed maximum reaches
+/// `u64::MAX`, where no strictly greater value exists, so the caller
+/// fails instead of repeating the maximum.
+pub(super) fn next_timestamp(max_seen: u64, now: u64) -> Option<u64> {
+    let next = max_seen.checked_add(1)?;
+    Some(now.max(next))
 }
 
 /// Wall-clock milliseconds. A clock before the Unix epoch yields zero,
@@ -161,12 +171,14 @@ mod tests {
     #[test]
     fn local_timestamps_never_go_backwards() {
         // Wall clock ahead of history: take the clock.
-        assert_eq!(next_timestamp(500, 900), 900);
+        assert_eq!(next_timestamp(500, 900), Some(900));
         // Same millisecond as the last write: step past it.
-        assert_eq!(next_timestamp(500, 500), 501);
+        assert_eq!(next_timestamp(500, 500), Some(501));
         // Clock rolled back: still step past the durable maximum.
-        assert_eq!(next_timestamp(500, 100), 501);
+        assert_eq!(next_timestamp(500, 100), Some(501));
         // Empty history: the clock stands.
-        assert_eq!(next_timestamp(0, 42), 42);
+        assert_eq!(next_timestamp(0, 42), Some(42));
+        // Exhausted space: fail rather than repeat the maximum.
+        assert_eq!(next_timestamp(u64::MAX, 0), None);
     }
 }

@@ -90,8 +90,12 @@ pub enum EngineError {
     TreeUnavailable(ContentId),
     #[error("root {0} is not a canonical tree object")]
     InvalidTree(ContentId),
+    #[error("root {0} does not hash back from the tree bytes served for it")]
+    TreeMismatch(ContentId),
     #[error("object store read failed: {0}")]
     ObjectStore(String),
+    #[error("the snapshot timestamp space is exhausted at u64::MAX")]
+    TimestampExhausted,
 }
 
 /// What one [`Engine::drain`] pass did.
@@ -347,16 +351,19 @@ impl Engine {
 
     /// Author a new snapshot over `tree`, signed by this device and bound
     /// to the canonical membership state. `objects` is the plaintext
-    /// object store the drive materializes from; the root tree must be a
-    /// canonical tree object present there, so a snapshot whose tree no
-    /// one can serve is refused before it is bound. Parents are the
-    /// current eligible heads: a single-head drive extends its live
-    /// state, and a conflicted drive resolves onto every head
-    /// (`docs/epochs.md`, local write; `docs/object-model.md`,
+    /// object store the drive materializes from; the root must be a
+    /// canonical tree object present there whose bytes hash back to
+    /// `tree`, so a snapshot whose root is absent or misaddressed is
+    /// refused before it is bound. Descendant trees and chunks are not
+    /// required to be local: materialization is local policy, and a
+    /// member may author a snapshot reusing content it does not hold.
+    /// Parents are the current eligible heads: a single-head drive
+    /// extends its live state, and a conflicted drive resolves onto every
+    /// head (`docs/epochs.md`, local write; `docs/object-model.md`,
     /// resolution). The body is verified once and committed durably; the
     /// live-head projection picks it up on the next rebuild. Fails closed
-    /// when the tree is unavailable, the log has no canonical tip, or
-    /// this device is not a member of it.
+    /// when the root is unavailable or misaddressed, the log has no
+    /// canonical tip, or this device is not a member of it.
     pub fn author_snapshot<S: ObjectStore>(
         &mut self,
         objects: &S,
@@ -1019,27 +1026,90 @@ mod tests {
     }
 
     #[test]
-    fn authoring_rejects_an_unknown_or_non_tree_root() {
+    fn authoring_rejects_an_unavailable_noncanonical_or_misaddressed_root() {
         let (mut pair, _, _) = scenario();
         assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
         let before = pair.a.engine.current();
 
-        let objects = MemoryObjectStore::default();
+        // Absent from the store.
+        let empty = MemoryObjectStore::default();
         assert!(matches!(
             pair.a
                 .engine
-                .author_snapshot(&objects, ContentId::from_bytes([0xAB; 32])),
+                .author_snapshot(&empty, ContentId::from_bytes([0xAB; 32])),
             Err(EngineError::TreeUnavailable(_))
         ));
-        assert_eq!(pair.a.engine.current(), before, "nothing committed");
 
-        let mut objects = MemoryObjectStore::default();
-        let chunk = objects.insert(ObjectKind::Chunk, b"not a tree").unwrap();
+        // Address-consistent bytes that are not a canonical tree.
+        let mut noncanonical = MemoryObjectStore::default();
+        let bad = noncanonical
+            .insert(ObjectKind::Tree, b"not a canonical tree")
+            .unwrap();
         assert!(matches!(
-            pair.a.engine.author_snapshot(&objects, chunk),
+            pair.a.engine.author_snapshot(&noncanonical, bad),
             Err(EngineError::InvalidTree(_))
         ));
+
+        // A chunk addressed as a root does not hash under the tree kind.
+        let mut chunks = MemoryObjectStore::default();
+        let chunk = chunks.insert(ObjectKind::Chunk, b"a chunk").unwrap();
+        assert!(matches!(
+            pair.a.engine.author_snapshot(&chunks, chunk),
+            Err(EngineError::TreeMismatch(_))
+        ));
+
         assert_eq!(pair.a.engine.current(), before, "nothing committed");
+    }
+
+    #[test]
+    fn authoring_rejects_a_root_that_does_not_hash_to_its_id() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        let before = pair.a.engine.current();
+
+        // A canonical tree's bytes served under a different claimed id.
+        let mut real = MemoryObjectStore::default();
+        let tree = local_tree(&mut real);
+        let bytes = real.get(&tree).unwrap().unwrap();
+        let lying = LyingStore { bytes };
+        assert!(matches!(
+            pair.a
+                .engine
+                .author_snapshot(&lying, ContentId::from_bytes([0xAB; 32])),
+            Err(EngineError::TreeMismatch(_))
+        ));
+        assert_eq!(pair.a.engine.current(), before, "nothing committed");
+    }
+
+    /// A store that serves the same bytes for every address, modeling a
+    /// faulty implementation that violates the scrub invariant.
+    struct LyingStore {
+        bytes: Vec<u8>,
+    }
+
+    impl ObjectStore for LyingStore {
+        type Error = std::convert::Infallible;
+
+        fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, Self::Error> {
+            unreachable!("the lying store is read-only")
+        }
+
+        fn insert_verified(
+            &mut self,
+            _kind: ObjectKind,
+            _expected: &ContentId,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
+            unreachable!("the lying store is read-only")
+        }
+
+        fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(Some(self.bytes.clone()))
+        }
+
+        fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
     }
 
     #[test]

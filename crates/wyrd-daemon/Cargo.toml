@@ -14,7 +14,9 @@ wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
 fuser = "0.18"
 hex.workspace = true
+libc.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

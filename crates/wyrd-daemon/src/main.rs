@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use fuser::{Config, MountOption};
@@ -7,8 +8,17 @@ use wyrd_daemon::Daemon;
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
+use zeroize::Zeroizing;
 
 const USAGE: &str = "usage:\n  wyrd init <drive-dir> --identity-file <path> --passphrase-file <path>\n  wyrd mount <drive-dir> <mountpoint> --identity-file <path> --passphrase-file <path>\n\nThe mount is a static startup projection; live sync and fetch-on-open are not yet enabled.";
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no pointer or aliasing preconditions and only
+    // reads the calling process's kernel credential.
+    unsafe { libc::geteuid() }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -19,6 +29,8 @@ enum CliError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("credential file {path}: {reason}")]
+    Credential { path: PathBuf, reason: &'static str },
     #[error("identity file must contain exactly 32 raw bytes or 64 hex characters")]
     IdentityFormat,
     #[error("identity secret is invalid: {0}")]
@@ -45,15 +57,66 @@ fn required_option(args: &mut Vec<String>, name: &str) -> Result<PathBuf, CliErr
     Ok(PathBuf::from(args.remove(index)))
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, CliError> {
-    fs::read(path).map_err(|source| CliError::Io {
+/// Read a bounded credential file without following symlinks. On Unix the
+/// file must belong to the current user and not grant group/other access.
+fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CliError> {
+    const MAX_BYTES: usize = 4096;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    let mut file = options.open(path).map_err(|source| CliError::Io {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(CliError::Credential {
+            path: path.to_path_buf(),
+            reason: "not a regular file",
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != current_uid() {
+            return Err(CliError::Credential {
+                path: path.to_path_buf(),
+                reason: "must be owned by the current user",
+            });
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(CliError::Credential {
+                path: path.to_path_buf(),
+                reason: "must not be accessible by group or other users",
+            });
+        }
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.by_ref()
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > MAX_BYTES {
+        return Err(CliError::Credential {
+            path: path.to_path_buf(),
+            reason: "exceeds the 4096-byte size limit",
+        });
+    }
+    Ok(bytes)
 }
 
 fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
-    let bytes = read_file(path)?;
+    let bytes = read_secret_file(path)?;
     let raw = if bytes.len() == 32 {
         let mut raw = [0; 32];
         raw.copy_from_slice(&bytes);
@@ -84,8 +147,10 @@ fn command(mut args: Vec<String>) -> Result<(), CliError> {
         return Err(CliError::Usage("unknown option".into()));
     }
     let identity = read_identity(&identity_file)?;
-    let passphrase = String::from_utf8(read_file(&passphrase_file)?)
-        .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?;
+    let passphrase = Zeroizing::new(
+        String::from_utf8(read_secret_file(&passphrase_file)?.to_vec())
+            .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?,
+    );
     let passphrase = passphrase
         .strip_suffix("\r\n")
         .or_else(|| passphrase.strip_suffix('\n'))
@@ -163,14 +228,23 @@ mod tests {
         }
     }
 
+    fn write_secret(path: &Path, bytes: impl AsRef<[u8]>) {
+        fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn init_command_creates_a_reopenable_drive() {
         let temp = TempDir::new();
         let identity_file = temp.0.join("identity");
         let passphrase_file = temp.0.join("passphrase");
         let drive = temp.0.join("drive");
-        fs::write(&identity_file, [0x11; 32]).unwrap();
-        fs::write(&passphrase_file, b"test-pass\n").unwrap();
+        write_secret(&identity_file, [0x11; 32]);
+        write_secret(&passphrase_file, b"test-pass\n");
 
         command(vec![
             "init".into(),
@@ -193,7 +267,7 @@ mod tests {
     fn hex_identity_files_are_supported() {
         let temp = TempDir::new();
         let identity_file = temp.0.join("identity");
-        fs::write(&identity_file, format!("{}\r\n", hex::encode([0x11; 32]))).unwrap();
+        write_secret(&identity_file, format!("{}\r\n", hex::encode([0x11; 32])));
         assert_eq!(
             read_identity(&identity_file).unwrap().as_bytes(),
             &[0x11; 32]
@@ -206,8 +280,21 @@ mod tests {
         let identity_file = temp.0.join("identity");
         let mut identity = [0x11; 32];
         identity[31] = b'\n';
-        fs::write(&identity_file, identity).unwrap();
+        write_secret(&identity_file, identity);
         assert!(read_identity(&identity_file).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_credential_permissions_are_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        write_secret(&identity_file, [0x11; 32]);
+        fs::set_permissions(&identity_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_identity(&identity_file).unwrap_err();
+        assert!(matches!(error, CliError::Credential { .. }));
     }
 
     #[test]

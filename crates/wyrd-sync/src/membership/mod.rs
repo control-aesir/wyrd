@@ -133,6 +133,21 @@ impl MembershipLog {
         self.transitions.get(id)
     }
 
+    /// The observed transition together with the state it produces, from
+    /// one analysis pass. This is the authorization source for capability
+    /// checks: the pair is inseparable, so a caller can never supply a
+    /// state whose correspondence to its transition is unverified. Only
+    /// valid history (canonical, contested, or voided) has a state —
+    /// pending or invalid transitions yield `None`.
+    pub fn authoritative(
+        &self,
+        id: &TransitionId,
+    ) -> Option<(&MembershipTransition, MembershipState)> {
+        let transition = self.transitions.get(id)?;
+        let state = chain::analyse(self).states.get(id).cloned()?;
+        Some((transition, state))
+    }
+
     /// All observed ids, in deterministic (ascending) order. The
     /// ascending order is a contract, not an implementation detail:
     /// the per-analyse children index (`chain`) builds sorted child

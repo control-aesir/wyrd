@@ -78,6 +78,8 @@ pub enum CapabilityError {
         expected: TransitionId,
         found: TransitionId,
     },
+    #[error("capability is bound to transition {0}, which is not observed valid history")]
+    UnknownTransition(TransitionId),
     #[error("capability targets drive {found} but is authorized for {expected}")]
     DriveMismatch { expected: DriveId, found: DriveId },
 }
@@ -175,17 +177,20 @@ impl Capability {
 
     /// The full authorization predicate, shared by every path that
     /// turns a capability into installed secrets: it targets `drive`,
-    /// is bound to exactly `transition` (id and covered epoch), and its
-    /// recipient is a member of the state `transition` produces with
-    /// the registered encryption key. Intake, durable replay, and
-    /// keyring install all go through here, so no path can launder a
-    /// capability minted, wrapped, or hand-built for another drive,
-    /// transition, or epoch.
+    /// and its authorizing transition plus the state that transition
+    /// produces are fetched from `log` under the `transition_id` the
+    /// caller names — the recipient must be a member of that state with
+    /// the registered encryption key, the capability must be bound to
+    /// exactly that transition (id and covered epoch). The state is
+    /// never a caller-supplied input, so intake, durable replay, and
+    /// keyring install cannot launder a capability minted, wrapped, or
+    /// hand-built for another drive, transition, or epoch, nor authorize
+    /// it against a state its transition does not produce.
     pub fn authorize_against(
         &self,
         drive: DriveId,
-        state: &crate::membership::MembershipState,
-        transition: &MembershipTransition,
+        log: &crate::membership::MembershipLog,
+        transition_id: &TransitionId,
     ) -> Result<(), CapabilityError> {
         if self.drive != drive {
             return Err(CapabilityError::DriveMismatch {
@@ -193,7 +198,10 @@ impl Capability {
                 found: self.drive,
             });
         }
-        self.validate_against(state)?;
+        let (transition, state) = log
+            .authoritative(transition_id)
+            .ok_or(CapabilityError::UnknownTransition(*transition_id))?;
+        self.validate_against(&state)?;
         if self.transition != transition.transition_id() {
             return Err(CapabilityError::TransitionMismatch {
                 expected: transition.transition_id(),
@@ -425,20 +433,19 @@ impl DriveKeyring {
     /// capability is a no-op, and a disagreement about an already-held
     /// epoch's secret is an error (forgery or corruption). The capability
     /// envelope alone proves nothing about authorization: anyone holding
-    /// the epoch secrets can wrap them, so installation additionally
-    /// requires the authorizing `transition` and the membership state it
-    /// produces — the full [`Capability::authorize_against`] predicate
-    /// (drive, member/key registration, exact transition id, exact
-    /// covered epoch) runs before any mutation. There is no install path
-    /// that skips this check. Conflicts are detected before any
-    /// mutation, so a failed install leaves the held set untouched.
-    /// Capabilities for another drive or device are rejected before
-    /// anything else.
+    /// the epoch secrets can wrap them, so installation runs the full
+    /// [`Capability::authorize_against`] predicate — the capability
+    /// names its own authorizing transition, and the log supplies that
+    /// transition together with the state it produces (drive, member/key
+    /// registration, exact binding, exact epoch coverage) before any
+    /// mutation. There is no install path that skips this check.
+    /// Conflicts are detected before any mutation, so a failed install
+    /// leaves the held set untouched. Capabilities for another drive or
+    /// device are rejected before anything else.
     pub fn install(
         &mut self,
         capability: &Capability,
-        state: &crate::membership::MembershipState,
-        transition: &MembershipTransition,
+        log: &crate::membership::MembershipLog,
     ) -> Result<InstallReport, InstallError> {
         if capability.drive != self.drive {
             return Err(InstallError::WrongDrive(
@@ -452,7 +459,7 @@ impl DriveKeyring {
                 self.device.to_string(),
             ));
         }
-        capability.authorize_against(self.drive, state, transition)?;
+        capability.authorize_against(self.drive, log, &capability.transition)?;
         for (i, secret) in capability.secrets.iter().enumerate() {
             let epoch = i as u64 + 1;
             if let Some(held) = self.secrets.get(&epoch) {

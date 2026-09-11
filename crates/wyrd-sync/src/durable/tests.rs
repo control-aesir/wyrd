@@ -3,7 +3,7 @@ use super::store::{atomic_write, commit_name, DurableStore};
 use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
 use crate::authorization::test_util::sign_snapshot;
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
-use crate::keys::capability::{Capability, CapabilityError};
+use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::epoch::EpochSecret;
 use crate::membership::test_util::{admit, drive, key, sign, Builder};
 use crate::membership::{MembershipLog, TransitionStatus};
@@ -95,7 +95,7 @@ fn authorized_capability(
         vec![EpochSecret::from_bytes([0xAA; 32])],
     )
     .unwrap();
-    AuthorizedCapability::authorize(cap, drive(), &state, genesis).unwrap()
+    AuthorizedCapability::authorize(cap, drive(), log, &genesis.transition_id()).unwrap()
 }
 
 fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
@@ -623,9 +623,10 @@ fn unauthorized_capability_cannot_commit() {
     );
 }
 
-/// The binding gate: a capability bound to one transition cannot
-/// authorize against another, and the covered epoch must equal the
-/// authorizing transition's epoch — however the capability was built.
+/// The binding gate: a capability presented under a transition id it
+/// is not bound to, or carrying the wrong secret count for its own
+/// authorizing transition, never authorizes — however the capability
+/// was built.
 #[test]
 fn authorize_rejects_foreign_transition_and_epoch() {
     let (genesis, child) = chain();
@@ -634,8 +635,8 @@ fn authorize_rejects_foreign_transition_and_epoch() {
     log.observe(child.clone());
     let genesis_state = log.state_of(&genesis.transition_id()).unwrap();
     let child_state = log.state_of(&child.transition_id()).unwrap();
-    // Minted for genesis (epoch 1): authorizing against the child
-    // fails on the bound id.
+    // Minted for genesis (epoch 1) but presented naming the child:
+    // the log resolves the named id, and the binding check fires.
     let cap = Capability::mint(
         drive(),
         owner(),
@@ -645,7 +646,7 @@ fn authorize_rejects_foreign_transition_and_epoch() {
     )
     .unwrap();
     assert_eq!(
-        AuthorizedCapability::authorize(cap, drive(), &child_state, &child),
+        AuthorizedCapability::authorize(cap, drive(), &log, &child.transition_id()),
         Err(CapabilityError::TransitionMismatch {
             expected: child.transition_id(),
             found: genesis.transition_id(),
@@ -664,11 +665,36 @@ fn authorize_rejects_foreign_transition_and_epoch() {
     )
     .unwrap();
     assert_eq!(
-        AuthorizedCapability::authorize(short, drive(), &child_state, &child),
+        AuthorizedCapability::authorize(short, drive(), &log, &child.transition_id()),
         Err(CapabilityError::EpochMismatch {
             declared: 2,
             carried: 1
         })
+    );
+    // A named id with no observed history: unknown, not a mismatch —
+    // intake defers on this, it may still arrive.
+    let unknown = Capability::new(
+        drive(),
+        owner(),
+        *registered,
+        child.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0xAA; 32]),
+            EpochSecret::from_bytes([0xBB; 32]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        AuthorizedCapability::authorize(
+            unknown,
+            drive(),
+            &log,
+            &TransitionId::from_bytes([0x77; 32])
+        ),
+        Err(CapabilityError::UnknownTransition(
+            TransitionId::from_bytes([0x77; 32])
+        ))
     );
 }
 
@@ -706,10 +732,12 @@ fn rebuild_rejects_a_capability_inconsistent_with_its_transition() {
     let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     assert!(matches!(
         store.rebuild(owner()),
-        Err(DurableError::Capability(CapabilityError::EpochMismatch {
-            declared: 1,
-            carried: 3
-        }))
+        Err(DurableError::Install(InstallError::Unauthorized(
+            CapabilityError::EpochMismatch {
+                declared: 1,
+                carried: 3
+            }
+        )))
     ));
 }
 

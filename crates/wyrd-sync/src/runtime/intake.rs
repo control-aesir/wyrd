@@ -8,7 +8,7 @@ use super::engine::{DrainReport, Engine, EngineError};
 use crate::control::{ControlError, ControlMessageId, IngestReport, Message, SealedControl};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
-use crate::keys::capability::WrappedCapability;
+use crate::keys::capability::{CapabilityError, WrappedCapability};
 use crate::membership::TransitionStatus;
 use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxEnvelope};
 
@@ -227,30 +227,19 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
     if payload.device != capability.device || payload.epoch != capability.covered_epoch() {
         return Action::Commit(vec![Fact::ControlMessage(*id)]);
     }
-    // The authorizing transition is fetched with the state it
-    // produces: authorize checks the capability's bound id and covered
-    // epoch against it, so a capability minted for another transition
-    // or carrying another epoch's secrets suppresses here instead of
-    // committing. Unknown transitions defer — the history may simply
-    // not have arrived yet.
-    let transition = match engine.log.transition(&capability.transition) {
-        Some(transition) => transition,
-        None => return Action::Defer,
-    };
-    // The authorizing state and transition are fetched together (the
-    // log analysis is identical for both), and the engine's own drive
-    // is part of the authorization predicate: a capability targeting a
-    // different drive suppresses here, even when its membership
-    // binding is otherwise valid.
-    let state = match engine.log.state_of(&capability.transition) {
-        Some(state) => state,
-        None => return Action::Defer,
-    };
-    match AuthorizedCapability::authorize(capability, engine.drive(), &state, transition) {
+    // One authoritative lookup inside authorize: the transition and
+    // the state it produces are inseparable, so the capability is
+    // checked against exactly its own authorizing history. Unknown
+    // transitions defer — the history may simply not have arrived
+    // yet; everything else suppresses without a durable capability
+    // fact.
+    let transition_id = capability.transition;
+    match AuthorizedCapability::authorize(capability, engine.drive(), &engine.log, &transition_id) {
         Ok(authorized) => Action::Commit(vec![
             Fact::Capability(authorized),
             Fact::ControlMessage(*id),
         ]),
+        Err(CapabilityError::UnknownTransition(_)) => Action::Defer,
         Err(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
     }
 }

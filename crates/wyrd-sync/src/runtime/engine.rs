@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! duplicate delivery ............ no-op (already committed)
-//! undecodable / wrong drive ..... skipped, left unacked for redelivery
+//! undecodable / wrong drive ..... discarded as terminal poison (no fact)
 //! unknown epoch key ............. skipped, left unacked for redelivery
 //! forged or undecryptable ....... seen-id committed (poison suppression)
 //! capability, state unknown ..... held in-memory, retried as transitions land
@@ -83,8 +83,12 @@ pub struct DrainReport {
     pub duplicates: usize,
     /// Messages held for a future transition.
     pub deferred: usize,
-    /// Envelopes that could not be processed (left for redelivery).
+    /// Envelopes not yet processable (unknown epoch key); left unacked
+    /// for redelivery.
     pub skipped: usize,
+    /// Terminal poison consumed without a fact (unopenable outer seal,
+    /// undecodable payload); never redelivered.
+    pub discarded: usize,
 }
 
 /// What one [`Engine::execute_plan`] pass committed.
@@ -819,6 +823,7 @@ mod tests {
                     duplicates: 0,
                     deferred: 0,
                     skipped: 0,
+                    discarded: 0,
                 }
             );
             let plan = execute_side(&mut pair.bulk, &mut pair.a);

@@ -74,7 +74,7 @@ pub(crate) struct MemoryRelay {
 
 impl MemoryRelay {
     pub(crate) fn push(&mut self, envelope: MailboxEnvelope) {
-        let id = DeliveryId(self.next_id);
+        let id = DeliveryId::new(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
         self.queue.push_back(Slot { id, envelope });
     }

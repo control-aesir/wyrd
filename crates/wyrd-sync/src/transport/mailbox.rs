@@ -124,7 +124,10 @@ pub trait Mailbox {
     /// available for redelivery until settled with [`Disposition::Ack`].
     /// A later `recv` MAY re-offer an unsettled delivery, always under
     /// the same id; the drain loop offers each id once per pass, so a
-    /// pass always terminates.
+    /// pass always terminates. Ids must be stable across re-offers and
+    /// unique per envelope: a cursor derived from queue position (which
+    /// shifts when predecessors are acked) violates this — derive
+    /// cursors from content or a monotonic counter instead.
     fn recv(&mut self) -> Option<Delivery>;
 
     /// Settle one handover: `Ack` permanently consumes (the relay may
@@ -139,7 +142,15 @@ pub trait Mailbox {
 /// which only compares ids within a pass; minted by mailbox
 /// implementations (a relay pool uses cursor ids, the fake a counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DeliveryId(pub u64);
+pub struct DeliveryId(u64);
+
+impl DeliveryId {
+    /// Mint an id (mailbox implementations only; must be stable across
+    /// re-offers of one envelope and unique per envelope).
+    pub fn new(value: u64) -> Self {
+        DeliveryId(value)
+    }
+}
 
 /// One envelope handover: the envelope plus the id the engine hands
 /// back to settle it. Plain data, no behavior; constructed by
@@ -215,7 +226,7 @@ mod tests {
 
     impl MemoryRelay {
         fn push(&mut self, envelope: MailboxEnvelope) {
-            let id = DeliveryId(self.next_id);
+            let id = DeliveryId::new(self.next_id);
             self.next_id = self.next_id.wrapping_add(1);
             self.queue.push_back(Slot { id, envelope });
         }
@@ -464,6 +475,35 @@ mod tests {
         assert_eq!(third.id(), first_id);
         // Acknowledging consumes: the relay holds nothing more.
         mailbox.settle(third.id(), Disposition::Ack).unwrap();
+        assert!(mailbox.recv().is_none());
+    }
+
+    #[test]
+    fn delivery_ids_survive_predecessor_ack() {
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let mut relay = MemoryRelay::default();
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"first").expect("seals"));
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"second").expect("seals"));
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: recipient,
+        };
+        // Ack the predecessor: the successor's handover must keep a
+        // distinct id, and a dropped (unsettled) successor must come
+        // back under that same id. A cursor derived from queue position
+        // would shift on ack and violate the contract.
+        let first = mailbox.recv().expect("first offered");
+        let first_id = first.id();
+        mailbox.settle(first_id, Disposition::Ack).unwrap();
+        let second = mailbox.recv().expect("second offered");
+        assert_ne!(second.id(), first_id);
+        let second_id = second.id();
+        drop(second);
+        let reoffered = mailbox.recv().expect("unsettled successor re-offered");
+        assert_eq!(reoffered.id(), second_id);
+        mailbox.settle(second_id, Disposition::Ack).unwrap();
         assert!(mailbox.recv().is_none());
     }
 

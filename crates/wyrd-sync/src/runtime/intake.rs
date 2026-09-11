@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use wyrd_format::MembershipTransition;
 
 use super::engine::{DrainReport, Engine, EngineError};
-use crate::control::{ControlMessageId, IngestReport, Message, SealedControl};
+use crate::control::{ControlError, ControlMessageId, IngestReport, Message, SealedControl};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::WrappedCapability;
@@ -28,7 +28,15 @@ enum Outcome {
     /// Shed past the pending bound: the engine holds nothing, so the
     /// drain settles `Retry` and the relay retains the envelope.
     RelayHeld,
+    /// Not yet processable (unknown epoch key); the drain settles
+    /// `Retry` and the relay retains the envelope.
     Skipped,
+    /// Terminal poison (unopenable outer seal, undecodable payload):
+    /// the bytes can never become a message, so the drain settles
+    /// `Ack` without writing any fact. There is no message id to
+    /// record — the bytes never decoded — and nothing legitimate is
+    /// lost by consuming them.
+    Discarded,
 }
 
 pub(super) fn drain(
@@ -65,6 +73,10 @@ pub(super) fn drain(
                 report.skipped += 1;
                 Disposition::Retry
             }
+            Outcome::Discarded => {
+                report.discarded += 1;
+                Disposition::Ack
+            }
         };
         mailbox.settle(delivery.id(), disposition)?;
     }
@@ -76,11 +88,21 @@ fn accept_envelope(
     envelope: &MailboxEnvelope,
 ) -> Result<Outcome, EngineError> {
     let bytes = match open_from_sender(&engine.identity_secret, engine.device, envelope) {
+        // The outer seal opens with our always-held identity key or
+        // never will: an unopenable envelope is terminal poison, not a
+        // retryable unknown. Consume it without a fact.
         Ok(bytes) => bytes,
-        Err(_) => return Ok(Outcome::Skipped),
+        Err(_) => return Ok(Outcome::Discarded),
     };
     match engine.inbox.ingest(&bytes) {
-        Err(_) => Ok(Outcome::Skipped),
+        // Only a missing epoch key can heal: the bytes are well-formed
+        // for our drive and may become openable when the key arrives.
+        Err(ControlError::UnknownEpoch(_)) => Ok(Outcome::Skipped),
+        // Decode, version, drive, and crypto failures under a held key
+        // are terminal: the bytes can never become a processable
+        // message. Consume without a fact so poison cannot accumulate
+        // in the relay.
+        Err(_) => Ok(Outcome::Discarded),
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
             Some(id) => match engine.pending.remove(&id) {
                 Some(message) => commit_action(engine, &id, &message, false),
@@ -288,6 +310,7 @@ mod tests {
                 duplicates: 0,
                 deferred: 0,
                 skipped: 0,
+                discarded: 0,
             }
         );
         assert_eq!(fixture.engine.current(), 3);
@@ -385,17 +408,26 @@ mod tests {
     }
 
     #[test]
-    fn forged_envelope_skips_without_commit() {
+    fn forged_envelope_discarded_without_commit() {
         let mut fixture = fixture();
         let genesis_id = Builder::genesis(10).1.transition_id();
         let mut envelope = deliver(&fixture, 1, &announcement_for(1, genesis_id));
         // Truncation breaks the base64 framing deterministically, so
-        // the transport seal can never open.
+        // the transport seal can never open: terminal poison, not a
+        // retryable unknown.
         envelope.ciphertext.pop();
         queue(&mut fixture, vec![envelope]);
         let report = drain(&mut fixture);
-        assert_eq!(report.skipped, 1);
+        assert_eq!(report.discarded, 1);
         assert_eq!(fixture.engine.current(), 0);
+        // A second pass with nothing requeued sees nothing: the relay
+        // no longer retains the poison message.
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.duplicates, 0);
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.discarded, 0);
     }
 
     #[test]

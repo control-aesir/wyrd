@@ -121,6 +121,13 @@ where
         &self.view
     }
 
+    /// Consume the composed daemon and hand its shared view to the FUSE
+    /// presentation backend. The engine has already projected authorized
+    /// heads before this handoff; the backend only serves that view.
+    pub fn into_fuse_backend(self) -> crate::fuse::FuseBackend<S, DaemonMaterialization> {
+        crate::fuse::FuseBackend::new(self.view)
+    }
+
     /// Drain control-plane messages and refresh the materialization projection.
     pub fn drain(
         &mut self,

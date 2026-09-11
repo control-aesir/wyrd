@@ -4,11 +4,16 @@ version.workspace = true
 edition.workspace = true
 description = "Wyrd's daemon: composes the sync engine with the drive view and presentation backends (FUSE today, platform file surfaces later)"
 
+[[bin]]
+name = "wyrd"
+path = "src/main.rs"
+
 [dependencies]
 wyrd-format.workspace = true
 wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
 fuser = "0.18"
+hex.workspace = true
 thiserror.workspace = true
 
 [lints]

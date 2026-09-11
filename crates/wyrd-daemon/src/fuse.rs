@@ -11,6 +11,12 @@
 //! Synthetic ownership: v0 preserves no uid/gid or permission metadata, so
 //! this backend presents uid/gid zero and read-only mode bits as policy.
 //!
+//! Lock discipline: a poisoned lock is a local data-path failure, so
+//! kernel callbacks answer `EIO` instead of panicking the mount. File
+//! descriptors are snapshot-stable: `open` captures the immutable file
+//! identity and `read` serves from the capture, never by re-resolving
+//! the path against advanced heads.
+//!
 //! Symlink confinement: format symlink targets are arbitrary by design;
 //! the adapter serves targets verbatim via `readlink` and never follows
 //! them — resolution is the consumer's job, and the view's component
@@ -186,6 +192,27 @@ where
             flags: 0,
         }
     }
+
+    /// The path an ino was minted for. A poisoned lock is a local
+    /// data-path failure: EIO, never a panic inside a kernel callback.
+    fn inode_path(&self, ino: u64) -> Result<String, fuser::Errno> {
+        let inodes = self.inodes.read().map_err(|_| fuser::Errno::EIO)?;
+        inodes
+            .path(ino)
+            .map(str::to_string)
+            .ok_or(fuser::Errno::ENOENT)
+    }
+
+    /// The cached entries of an open directory. Poison maps to EIO
+    /// like every other lock failure; an unknown handle is EBADF.
+    fn dir_entries(&self, fh: u64) -> Result<DirectoryEntries, fuser::Errno> {
+        let directories = self.directories.read().map_err(|_| fuser::Errno::EIO)?;
+        directories
+            .entries
+            .get(&fh)
+            .cloned()
+            .ok_or(fuser::Errno::EBADF)
+    }
 }
 
 impl<S: ObjectStore + Send + Sync + 'static, M: Materialization + Send + Sync + 'static>
@@ -212,17 +239,21 @@ where
             reply.error(fuser::Errno::ENOENT);
             return;
         };
-        let parent_path = match self.inodes.read().expect("inode lock").path(parent.0) {
-            Some(path) => path.to_string(),
-            None => {
-                reply.error(fuser::Errno::ENOENT);
+        let parent_path = match self.inode_path(parent.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
                 return;
             }
         };
         let child_path = join(&parent_path, name);
         match self.view.lookup(&child_path) {
             Ok(node) => {
-                let ino = match self.inodes.write().expect("inode lock").intern(&child_path) {
+                let Ok(mut inodes) = self.inodes.write() else {
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                };
+                let ino = match inodes.intern(&child_path) {
                     Ok(ino) => ino,
                     Err(error) => {
                         reply.error(inode_error(error));
@@ -243,15 +274,12 @@ where
         _fh: Option<FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        let Some(path) = self
-            .inodes
-            .read()
-            .expect("inode lock")
-            .path(ino.0)
-            .map(str::to_string)
-        else {
-            reply.error(fuser::Errno::ENOENT);
-            return;
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         match self.view.lookup(&path) {
             Ok(node) => {
@@ -270,16 +298,10 @@ where
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        let all = match self
-            .directories
-            .read()
-            .expect("directory lock")
-            .entries
-            .get(&fh.0)
-        {
-            Some(entries) => entries.clone(),
-            None => {
-                reply.error(fuser::Errno::EBADF);
+        let all = match self.dir_entries(fh.0) {
+            Ok(all) => all,
+            Err(error) => {
+                reply.error(error);
                 return;
             }
         };
@@ -303,15 +325,12 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        let Some(path) = self
-            .inodes
-            .read()
-            .expect("inode lock")
-            .path(ino.0)
-            .map(str::to_string)
-        else {
-            reply.error(fuser::Errno::ENOENT);
-            return;
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         let node = match self.view.lookup(&path) {
             Ok(node) => node,
@@ -331,7 +350,10 @@ where
             (ino.0, fuser::FileType::Directory, ".".into()),
             (ino.0, fuser::FileType::Directory, "..".into()),
         ];
-        let mut inodes = self.inodes.write().expect("inode lock");
+        let Ok(mut inodes) = self.inodes.write() else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
         for entry in entries {
             let child_path = join(&path, &entry.name);
             let child_ino = match inodes.intern(&child_path) {
@@ -345,7 +367,10 @@ where
             all.push((child_ino, kind, entry.name));
         }
         drop(inodes);
-        let mut directories = self.directories.write().expect("directory lock");
+        let Ok(mut directories) = self.directories.write() else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
         let handle = directories.next_handle;
         directories.next_handle = match handle.checked_add(1) {
             Some(next) => next,
@@ -366,11 +391,11 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        self.directories
-            .write()
-            .expect("directory lock")
-            .entries
-            .remove(&fh.0);
+        let Ok(mut directories) = self.directories.write() else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
+        directories.entries.remove(&fh.0);
         reply.ok();
     }
 
@@ -380,15 +405,12 @@ where
             reply.error(fuser::Errno::EROFS);
             return;
         }
-        let Some(path) = self
-            .inodes
-            .read()
-            .expect("inode lock")
-            .path(ino.0)
-            .map(str::to_string)
-        else {
-            reply.error(fuser::Errno::ENOENT);
-            return;
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         let node = match self.view.lookup(&path) {
             Ok(node) => node,
@@ -404,15 +426,12 @@ where
     }
 
     fn readlink(&self, _req: &fuser::Request, ino: INodeNo, reply: fuser::ReplyData) {
-        let Some(path) = self
-            .inodes
-            .read()
-            .expect("inode lock")
-            .path(ino.0)
-            .map(str::to_string)
-        else {
-            reply.error(fuser::Errno::ENOENT);
-            return;
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         match symlink_target(&self.view, &path) {
             Ok(target) => reply.data(target.as_bytes()),
@@ -431,15 +450,12 @@ where
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        let Some(path) = self
-            .inodes
-            .read()
-            .expect("inode lock")
-            .path(ino.0)
-            .map(str::to_string)
-        else {
-            reply.error(fuser::Errno::ENOENT);
-            return;
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         let node = match self.view.lookup(&path) {
             Ok(node) => node,
@@ -485,8 +501,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_format::ContentId;
+    use wyrd_format::{ContentId, FetchStatus, MemoryObjectStore, Snapshot, Tree};
     use wyrd_fuse::ViewError;
+
+    /// Test materialization: everything is remote-only. Local reads
+    /// never consult it — the store answers from memory.
+    struct NoMaterialization;
+    impl Materialization for NoMaterialization {
+        fn status(&self, _id: &ContentId) -> FetchStatus {
+            FetchStatus::RemoteOnly
+        }
+    }
+
+    fn snapshot_of(tree: ContentId) -> Snapshot {
+        Snapshot::new(
+            Vec::new(),
+            tree,
+            wyrd_format::DeviceId::from_bytes([0xD0; 32]),
+            wyrd_format::TransitionId::from_bytes([0x71; 32]),
+            1,
+            0,
+            1,
+        )
+    }
+
+    fn backend() -> FuseBackend<MemoryObjectStore, NoMaterialization> {
+        let mut store = MemoryObjectStore::default();
+        let root = Tree::from_entries(Vec::new())
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        FuseBackend::new(DriveView::new(
+            store,
+            NoMaterialization,
+            vec![snapshot_of(root)],
+        ))
+    }
 
     /// The errno mapping is the POSIX contract at the mount boundary:
     /// pinned variant by variant.
@@ -551,34 +601,42 @@ mod tests {
 
     #[test]
     fn symlink_target_is_served_verbatim() {
-        use wyrd_format::{Entry, FetchStatus, MemoryObjectStore, Snapshot, TransitionId, Tree};
-
-        struct NoMaterialization;
-        impl Materialization for NoMaterialization {
-            fn status(&self, _id: &ContentId) -> FetchStatus {
-                FetchStatus::RemoteOnly
-            }
-        }
+        use wyrd_format::Entry;
 
         let mut store = MemoryObjectStore::default();
         let root = Tree::from_entries(vec![Entry::symlink("link", "../target").unwrap()])
             .unwrap()
             .insert_into(&mut store)
             .unwrap();
-        let view = DriveView::new(
-            store,
-            NoMaterialization,
-            vec![Snapshot::new(
-                Vec::new(),
-                root,
-                wyrd_format::DeviceId::from_bytes([0xD0; 32]),
-                TransitionId::from_bytes([0x71; 32]),
-                1,
-                0,
-                1,
-            )],
-        );
+        let view = DriveView::new(store, NoMaterialization, vec![snapshot_of(root)]);
         assert_eq!(symlink_target(&view, "link"), Ok("../target".into()));
         assert_eq!(symlink_target(&view, "missing"), Err(fuser::Errno::ENOENT));
+    }
+
+    /// Kernel callbacks never panic on a poisoned lock: the failure
+    /// mode is EIO (M10). Poisoning happens only when a panic strikes
+    /// while a lock is held; the tests force it and demand the
+    /// controlled error.
+    #[test]
+    fn poisoned_locks_error_instead_of_panicking() {
+        let backend = backend();
+        // Healthy locks keep their ordinary error: an unknown directory
+        // handle is EBADF, not EIO.
+        assert_eq!(backend.dir_entries(7), Err(fuser::Errno::EBADF));
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend.inodes.write().unwrap();
+            panic!("poison the inode lock");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend.directories.write().unwrap();
+            panic!("poison the directory lock");
+        }));
+        std::panic::set_hook(previous);
+
+        assert_eq!(backend.inode_path(1), Err(fuser::Errno::EIO));
+        assert_eq!(backend.dir_entries(0), Err(fuser::Errno::EIO));
     }
 }

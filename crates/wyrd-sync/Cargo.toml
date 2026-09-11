@@ -10,6 +10,9 @@ wyrd-format.workspace = true
 iroh.workspace = true
 iroh-blobs.workspace = true
 iroh-gossip.workspace = true
+bao-tree.workspace = true
+bytes.workspace = true
+n0-future.workspace = true
 nostr.workspace = true
 
 secp256k1.workspace = true

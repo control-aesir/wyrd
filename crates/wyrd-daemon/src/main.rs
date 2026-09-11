@@ -61,6 +61,12 @@ fn required_option(args: &mut Vec<String>, name: &str) -> Result<PathBuf, CliErr
 /// file must belong to the current user and not grant group/other access.
 fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CliError> {
     const MAX_BYTES: usize = 4096;
+    #[cfg(not(unix))]
+    return Err(CliError::Credential {
+        path: path.to_path_buf(),
+        reason: "credential-file protection is only implemented on Unix",
+    });
+
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -147,10 +153,10 @@ fn command(mut args: Vec<String>) -> Result<(), CliError> {
         return Err(CliError::Usage("unknown option".into()));
     }
     let identity = read_identity(&identity_file)?;
-    let passphrase = Zeroizing::new(
-        String::from_utf8(read_secret_file(&passphrase_file)?.to_vec())
-            .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?,
-    );
+    let passphrase_bytes = read_secret_file(&passphrase_file)?;
+    let passphrase_text = std::str::from_utf8(&passphrase_bytes)
+        .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?;
+    let passphrase = Zeroizing::new(passphrase_text.to_owned());
     let passphrase = passphrase
         .strip_suffix("\r\n")
         .or_else(|| passphrase.strip_suffix('\n'))

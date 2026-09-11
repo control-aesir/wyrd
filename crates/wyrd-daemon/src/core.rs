@@ -52,15 +52,17 @@ impl LiveHead {
 // capability. `LiveHead` wraps `AuthorizedSnapshot`, and sync's BIP-340
 // verification is the only thing that can construct one — the claim
 // matches the type's own construction contract.
+#[allow(unsafe_code)]
 unsafe impl VerifiedSnapshot for LiveHead {
     fn into_snapshot(self) -> Snapshot {
         self.0.snapshot().clone()
     }
 }
 
-/// Bridge authorized snapshots into view heads. This is the only path
-/// from the sync layer's verified bodies to the view: a raw `Snapshot`
-/// cannot reach [`ViewHead`] in any downstream crate.
+/// Bridge authorized snapshots into view heads. In safe code this is
+/// the only path from the sync layer's verified bodies to the view:
+/// crossing the boundary any other way requires an explicit
+/// [`VerifiedSnapshot`] `unsafe impl`.
 fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<ViewHead> {
     heads
         .into_iter()

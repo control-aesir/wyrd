@@ -143,17 +143,18 @@ fn open_fds_remain_stable_across_head_advancement() {
     loaded.rig.teardown();
 }
 
-/// An unverified `Snapshot` cannot become a live FUSE head. The view
-/// accepts heads only as `ViewHead`s, and in a downstream crate those
-/// can be built only from `AuthorizedSnapshot`s (the orphan rule
-/// rejects a raw-snapshot implementation of the capability; the
-/// `compile_fail` doctest on `VerifiedSnapshot` pins that). Here the
-/// semantic half: authorization runs the BIP-340 check, so a body
-/// whose bytes are not covered by its signature is refused at the
-/// boundary — while the signed body mounts and serves through the
-/// same path (architecture.md invariant 3).
+/// A forged snapshot is rejected before FUSE head installation. The
+/// view's boundary is safe-by-default: heads cross as `ViewHead`s,
+/// which safe code can build only from the verification capability —
+/// bypassing it takes an explicit `unsafe impl` (pinned by the
+/// `compile_fail` doctest on `VerifiedSnapshot`). Here the semantic
+/// half, through the supported composition path: authorization runs
+/// the BIP-340 check, so a body whose bytes are not covered by its
+/// signature is refused before any head can exist — while the signed
+/// body mounts and serves through the same path (architecture.md
+/// invariant 3).
 #[test]
-fn unverified_snapshots_cannot_become_live_fuse_heads() {
+fn forged_snapshots_are_rejected_before_fuse_head_installation() {
     use wyrd_sync::authorization::Rejection;
     use wyrd_sync::durable::AuthorizedSnapshot;
 

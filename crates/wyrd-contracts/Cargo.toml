@@ -14,3 +14,6 @@ wyrd-daemon = { path = "../wyrd-daemon" }
 secp256k1.workspace = true
 blake3.workspace = true
 zeroize = "1.9"
+
+[lints]
+workspace = true

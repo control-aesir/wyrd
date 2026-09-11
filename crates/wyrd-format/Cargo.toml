@@ -9,3 +9,6 @@ blake3.workspace = true
 fastcdc.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -170,12 +170,15 @@ pub struct DriveView<S, M> {
 ///
 /// `VerifiedSnapshot` is an **unsafe capability**, not a general
 /// conversion trait: it exists to install a cryptographically verified
-/// snapshot as a FUSE view head — nothing else. Rust offers no stronger
-/// cross-crate seal for a layering reason: the view cannot name
-/// `wyrd-sync`'s `AuthorizedSnapshot` (no dependency edge may run from
-/// the view to sync), and a constructor with a private body cannot be
-/// shared between crates at all. So the boundary rests on the language's
-/// audit mechanism: implementing this trait is `unsafe`, and every
+/// snapshot as a FUSE view head — nothing else. The boundary is
+/// safe-by-default, not compile-enforced: crossing it requires an
+/// explicit `unsafe impl`. The orphan rule prevents implementing the
+/// capability directly for a foreign `Snapshot`; the unsafe contract
+/// makes wrapper-based bypasses an explicit, auditable trust assertion.
+/// Rust offers no stronger cross-crate seal for a layering reason: the
+/// view cannot name `wyrd-sync`'s `AuthorizedSnapshot` (no dependency
+/// edge may run from the view to sync), and a constructor with a
+/// private body cannot be shared between crates at all. Every
 /// `unsafe impl` is a visible, greppable claim that the implementing
 /// type's construction is owned by the verification authority. In-tree
 /// there is exactly one: the daemon's `LiveHead`, whose inner
@@ -209,6 +212,10 @@ pub struct DriveView<S, M> {
 ///     }
 /// }
 /// ```
+// The one intentional unsafe surface in this crate: the capability
+// declaration itself. Everything else holds the workspace-wide
+// `unsafe_code` deny.
+#[allow(unsafe_code)]
 pub unsafe trait VerifiedSnapshot {
     /// The verified snapshot body. Consuming preserves the one-way
     /// flow: a head is built from verified material and never exposed
@@ -770,9 +777,11 @@ mod tests {
     /// (the daemon adapter and the contract suite cover that path).
     struct TestHead(Snapshot);
 
-    // SAFETY: test-local capability for view-mechanics fixtures; the
-    // upstream verification boundary is covered by the daemon adapter
-    // and the contract suite, not here.
+    // SAFETY: a deliberately forged capability for view-mechanics
+    // fixtures — it asserts nothing real and must never escape test
+    // code. The upstream verification boundary is covered by the
+    // daemon adapter and the contract suite, not here.
+    #[allow(unsafe_code)]
     unsafe impl VerifiedSnapshot for TestHead {
         fn into_snapshot(self) -> Snapshot {
             self.0

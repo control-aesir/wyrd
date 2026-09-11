@@ -10,7 +10,7 @@ use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 use zeroize::Zeroizing;
 
-const USAGE: &str = "usage:\n  wyrd init <drive-dir> --identity-file <path> --passphrase-file <path>\n  wyrd mount <drive-dir> <mountpoint> --identity-file <path> --passphrase-file <path>\n\nThe mount is a static startup projection; live sync and fetch-on-open are not yet enabled.";
+const USAGE: &str = "usage:\n  wyrd init <drive-dir> --identity-file <path> --passphrase-file <path>\n  wyrd mount <drive-dir> <mountpoint> --identity-file <path> --passphrase-file <path>\n\nThe mount is a static startup projection; live sync and fetch-on-open are not yet enabled. Credential files are supported on Unix only and must be private.";
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
@@ -132,7 +132,7 @@ fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
         if text.len() != 64 {
             return Err(CliError::IdentityFormat);
         }
-        let decoded = hex::decode(text).map_err(|_| CliError::IdentityFormat)?;
+        let decoded = Zeroizing::new(hex::decode(text).map_err(|_| CliError::IdentityFormat)?);
         let mut raw = [0; 32];
         raw.copy_from_slice(&decoded);
         raw

@@ -3,7 +3,7 @@ use super::store::{atomic_write, commit_name, DurableStore};
 use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
 use crate::authorization::test_util::sign_snapshot;
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
-use crate::keys::capability::Capability;
+use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::epoch::EpochSecret;
 use crate::membership::test_util::{admit, drive, key, sign, Builder};
 use crate::membership::{MembershipLog, TransitionStatus};
@@ -91,12 +91,11 @@ fn authorized_capability(
         drive(),
         owner(),
         &state,
-        genesis.transition_id(),
-        1,
+        genesis,
         vec![EpochSecret::from_bytes([0xAA; 32])],
     )
     .unwrap();
-    AuthorizedCapability::authorize(cap, &state).unwrap()
+    AuthorizedCapability::authorize(cap, drive(), log, &genesis.transition_id()).unwrap()
 }
 
 fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
@@ -615,14 +614,161 @@ fn unauthorized_capability_cannot_commit() {
         drive(),
         stranger,
         &state,
-        genesis.transition_id(),
-        1,
+        &genesis,
         vec![EpochSecret::from_bytes([0xAA; 32])],
     );
     assert!(
         cap.is_err(),
         "minting for a non-member fails before authorization"
     );
+}
+
+/// The binding gate: a capability presented under a transition id it
+/// is not bound to, or carrying the wrong secret count for its own
+/// authorizing transition, never authorizes — however the capability
+/// was built.
+#[test]
+fn authorize_rejects_foreign_transition_and_epoch() {
+    let (genesis, child) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    log.observe(child.clone());
+    let genesis_state = log.state_of(&genesis.transition_id()).unwrap();
+    let child_state = log.state_of(&child.transition_id()).unwrap();
+    // Minted for genesis (epoch 1) but presented naming the child:
+    // the log resolves the named id, and the binding check fires.
+    let cap = Capability::mint(
+        drive(),
+        owner(),
+        &genesis_state,
+        &genesis,
+        vec![EpochSecret::from_bytes([0xAA; 32])],
+    )
+    .unwrap();
+    assert_eq!(
+        AuthorizedCapability::authorize(cap, drive(), &log, &child.transition_id()),
+        Err(CapabilityError::TransitionMismatch {
+            expected: child.transition_id(),
+            found: genesis.transition_id(),
+        })
+    );
+    // Bound to the child (epoch 2) but carrying one secret: the epoch
+    // check fires.
+    let registered = child_state.encryption_key_of(&owner()).unwrap();
+    let short = Capability::new(
+        drive(),
+        owner(),
+        *registered,
+        child.transition_id(),
+        1,
+        vec![EpochSecret::from_bytes([0xAA; 32])],
+    )
+    .unwrap();
+    assert_eq!(
+        AuthorizedCapability::authorize(short, drive(), &log, &child.transition_id()),
+        Err(CapabilityError::EpochMismatch {
+            declared: 2,
+            carried: 1
+        })
+    );
+    // A named id with no observed history: unknown, not a mismatch —
+    // intake defers on this, it may still arrive.
+    let unknown = Capability::new(
+        drive(),
+        owner(),
+        *registered,
+        child.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0xAA; 32]),
+            EpochSecret::from_bytes([0xBB; 32]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        AuthorizedCapability::authorize(
+            unknown,
+            drive(),
+            &log,
+            &TransitionId::from_bytes([0x77; 32])
+        ),
+        Err(CapabilityError::UnknownTransition(
+            TransitionId::from_bytes([0x77; 32])
+        ))
+    );
+}
+
+/// A capability record can be authenticated under the store key and
+/// still disagree with the transition it names — disk tampering or a
+/// buggy writer. Rebuild re-applies the full authorization predicate
+/// and refuses to install; the store cannot be opened into a state
+/// holding foreign secrets.
+#[test]
+fn rebuild_rejects_a_capability_inconsistent_with_its_transition() {
+    let (genesis, _) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    let state = log.state_of(&genesis.transition_id()).unwrap();
+    let registered = state.encryption_key_of(&owner()).unwrap();
+    // Bound to genesis but covering three epochs: the type gate never
+    // produces this (genesis is epoch 1), so only a tampered or
+    // legacy record could.
+    let tampered = AuthorizedCapability {
+        cap: Capability::new(
+            drive(),
+            owner(),
+            *registered,
+            genesis.transition_id(),
+            3,
+            vec![EpochSecret::from_bytes([0xAA; 32]); 3],
+        )
+        .unwrap(),
+    };
+    let dir = TestDir::new("rebuild-binding");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&[Fact::Transition(genesis)]).unwrap();
+    store.commit(&[Fact::Capability(tampered)]).unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(matches!(
+        store.rebuild(owner()),
+        Err(DurableError::Install(InstallError::Unauthorized(
+            CapabilityError::EpochMismatch {
+                declared: 1,
+                carried: 3
+            }
+        )))
+    ));
+}
+
+/// A capability record for another drive, sealed under the store key:
+/// the decode boundary already drops it, so the commit is unreadable
+/// store damage and nothing installs.
+#[test]
+fn rebuild_rejects_a_record_for_another_drive() {
+    let (genesis, _) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    let state = log.state_of(&genesis.transition_id()).unwrap();
+    let registered = state.encryption_key_of(&owner()).unwrap();
+    let foreign = AuthorizedCapability {
+        cap: Capability::new(
+            DriveId::from_bytes([0xDE; 32]),
+            owner(),
+            *registered,
+            genesis.transition_id(),
+            1,
+            vec![EpochSecret::from_bytes([0xAA; 32])],
+        )
+        .unwrap(),
+    };
+    let dir = TestDir::new("rebuild-drive");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&[Fact::Transition(genesis)]).unwrap();
+    store.commit(&[Fact::Capability(foreign)]).unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
 }
 
 /// A clean commit round-trips exactly: no crash, no loss.

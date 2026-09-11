@@ -106,7 +106,8 @@ pub use store::DurableStore;
 
 use thiserror::Error;
 use wyrd_format::{
-    ContentId, DeviceId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
+    ContentId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
+    TransitionId,
 };
 
 use crate::authorization::predicates::verify_snapshot;
@@ -115,7 +116,6 @@ use crate::control::{ControlError, ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::keystore::KeystoreError;
 use crate::keys::CryptoError;
-use crate::membership::MembershipState;
 use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
 
 // --- errors ----------------------------------------------------------------
@@ -154,10 +154,6 @@ pub enum DurableError {
     MissingCommit(u64),
     #[error("commit sequence exhausted")]
     SequenceExhausted,
-    #[error("capability for {0:?} no longer validates on rebuild")]
-    CapabilityChanged(DeviceId),
-    #[error("capability references a transition with no derived state")]
-    CapabilityTransitionUnknown,
 }
 
 // --- facts -----------------------------------------------------------------
@@ -171,11 +167,20 @@ pub struct AuthorizedCapability {
 }
 
 impl AuthorizedCapability {
-    /// Validate the capability against the authoritative membership state
-    /// (member with the registered encryption key) and wrap it for
-    /// durability.
-    pub fn authorize(cap: Capability, state: &MembershipState) -> Result<Self, CapabilityError> {
-        cap.validate_against(state)?;
+    /// The single authorization predicate for a capability: it is
+    /// authorized for the engine's `drive`, against the transition
+    /// named by `transition_id` together with the state that
+    /// transition produces — both fetched from the authoritative log,
+    /// never supplied separately. A capability minted, wrapped, or
+    /// hand-built for another drive, another transition, or another
+    /// epoch never commits — whatever path produced it.
+    pub fn authorize(
+        cap: Capability,
+        drive: DriveId,
+        log: &crate::membership::MembershipLog,
+        transition_id: &TransitionId,
+    ) -> Result<Self, CapabilityError> {
+        cap.authorize_against(drive, log, transition_id)?;
         Ok(AuthorizedCapability { cap })
     }
 

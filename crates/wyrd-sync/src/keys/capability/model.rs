@@ -26,12 +26,13 @@ use secp256k1::{Keypair, Parity, PublicKey, SecretKey, XOnlyPublicKey, SECP256K1
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use thiserror::Error;
-use wyrd_format::{DeviceId, DriveId, TransitionId};
+use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 use zeroize::Zeroizing;
 
 use super::encoding;
 use crate::keys::epoch::EpochSecret;
 use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret};
+use crate::membership::Authorizable;
 use wyrd_format::DeviceEncryptionKey;
 
 /// The wrapping's HKDF info context (trust.md, T12).
@@ -73,6 +74,17 @@ pub enum CapabilityError {
     NotAMember,
     #[error("capability targets an encryption key that is not the device's registered key")]
     StaleEncryptionKey,
+    #[error("capability is bound to transition {found} but authorized against {expected}")]
+    TransitionMismatch {
+        expected: TransitionId,
+        found: TransitionId,
+    },
+    #[error("capability is bound to transition {0}, which is unobserved or still pending")]
+    UnknownTransition(TransitionId),
+    #[error("capability is bound to transition {0}, which is observed but can never authorize")]
+    UnauthorizableTransition(TransitionId),
+    #[error("capability targets drive {found} but is authorized for {expected}")]
+    DriveMismatch { expected: DriveId, found: DriveId },
 }
 
 impl Capability {
@@ -114,20 +126,31 @@ impl Capability {
 
     /// Mint a capability from the authoritative membership state: the
     /// registered encryption key (never the caller's choice) is in the
-    /// envelope, and the device must be a member of `state`.
+    /// envelope, and the device must be a member of `state`. The
+    /// transition binding is structural, not caller-assembled: the
+    /// bound id and covered epoch derive from `transition`, and the
+    /// secret count must equal its epoch. `state` must be the state
+    /// that `transition` produces — the log lookup at authorize time
+    /// is the enforcement point for that correspondence.
     pub fn mint(
         drive: DriveId,
         device: DeviceId,
         state: &crate::membership::MembershipState,
-        transition: TransitionId,
-        epoch: u64,
+        transition: &MembershipTransition,
         secrets: Vec<EpochSecret>,
     ) -> Result<Self, CapabilityError> {
         let encryption_key = state
             .encryption_key_of(&device)
             .copied()
             .ok_or(CapabilityError::NotAMember)?;
-        Self::new(drive, device, encryption_key, transition, epoch, secrets)
+        Self::new(
+            drive,
+            device,
+            encryption_key,
+            transition.transition_id(),
+            transition.epoch,
+            secrets,
+        )
     }
 
     /// The epoch this capability covers: exactly `1..=epoch`, where the
@@ -153,6 +176,58 @@ impl Capability {
             Some(registered) if registered == &self.encryption_key => Ok(()),
             Some(_) => Err(CapabilityError::StaleEncryptionKey),
         }
+    }
+
+    /// The full authorization predicate, shared by every path that
+    /// turns a capability into installed secrets: it targets `drive`,
+    /// and its authorizing transition plus the state that transition
+    /// produces are fetched from `log` under the `transition_id` the
+    /// caller names — the recipient must be a member of that state with
+    /// the registered encryption key, the capability must be bound to
+    /// exactly that transition (id and covered epoch). The state is
+    /// never a caller-supplied input, so intake, durable replay, and
+    /// keyring install cannot launder a capability minted, wrapped, or
+    /// hand-built for another drive, transition, or epoch, nor authorize
+    /// it against a state its transition does not produce.
+    pub fn authorize_against(
+        &self,
+        drive: DriveId,
+        log: &crate::membership::MembershipLog,
+        transition_id: &TransitionId,
+    ) -> Result<(), CapabilityError> {
+        if self.drive != drive {
+            return Err(CapabilityError::DriveMismatch {
+                expected: drive,
+                found: self.drive,
+            });
+        }
+        // The classification is the liveness contract: unobserved and
+        // pending history may still arrive or resolve, terminal history
+        // never can. Callers defer on the first and suppress on the
+        // second.
+        let (transition, state) = match log.authoritative(transition_id) {
+            Some(Authorizable::Valid(transition, state)) => (transition, state),
+            Some(Authorizable::Pending) | None => {
+                return Err(CapabilityError::UnknownTransition(*transition_id));
+            }
+            Some(Authorizable::Terminal) => {
+                return Err(CapabilityError::UnauthorizableTransition(*transition_id));
+            }
+        };
+        self.validate_against(&state)?;
+        if self.transition != transition.transition_id() {
+            return Err(CapabilityError::TransitionMismatch {
+                expected: transition.transition_id(),
+                found: self.transition,
+            });
+        }
+        if self.covered_epoch() != transition.epoch {
+            return Err(CapabilityError::EpochMismatch {
+                declared: transition.epoch,
+                carried: self.covered_epoch(),
+            });
+        }
+        Ok(())
     }
 
     /// N is the number of secrets; the AAD epoch field is `N`.
@@ -333,8 +408,8 @@ pub enum InstallError {
     WrongDrive(String, String),
     #[error("capability is for device {0}, keyring holds {1}")]
     WrongDevice(String, String),
-    #[error("capability device or key does not match membership state")]
-    NotAuthorized,
+    #[error("capability is not authorized: {0}")]
+    Unauthorized(#[from] CapabilityError),
     #[error("two capabilities disagree about the secret for epoch {0}")]
     EpochConflict(u64),
     #[error("crypto operation failed")]
@@ -371,17 +446,19 @@ impl DriveKeyring {
     /// capability is a no-op, and a disagreement about an already-held
     /// epoch's secret is an error (forgery or corruption). The capability
     /// envelope alone proves nothing about authorization: anyone holding
-    /// the epoch secrets can wrap them, so installation additionally
-    /// requires the authoritative membership state: the device must be a
-    /// member and the envelope's encryption key must equal the registered
-    /// key. There is no install path that skips this check. Conflicts are
-    /// detected before any mutation, so a failed install leaves the held
-    /// set untouched. Capabilities for another drive or device are
-    /// rejected before anything else.
+    /// the epoch secrets can wrap them, so installation runs the full
+    /// [`Capability::authorize_against`] predicate — the capability
+    /// names its own authorizing transition, and the log supplies that
+    /// transition together with the state it produces (drive, member/key
+    /// registration, exact binding, exact epoch coverage) before any
+    /// mutation. There is no install path that skips this check.
+    /// Conflicts are detected before any mutation, so a failed install
+    /// leaves the held set untouched. Capabilities for another drive or
+    /// device are rejected before anything else.
     pub fn install(
         &mut self,
         capability: &Capability,
-        state: &crate::membership::MembershipState,
+        log: &crate::membership::MembershipLog,
     ) -> Result<InstallReport, InstallError> {
         if capability.drive != self.drive {
             return Err(InstallError::WrongDrive(
@@ -395,9 +472,7 @@ impl DriveKeyring {
                 self.device.to_string(),
             ));
         }
-        capability
-            .validate_against(state)
-            .map_err(|_| InstallError::NotAuthorized)?;
+        capability.authorize_against(self.drive, log, &capability.transition)?;
         for (i, secret) in capability.secrets.iter().enumerate() {
             let epoch = i as u64 + 1;
             if let Some(held) = self.secrets.get(&epoch) {

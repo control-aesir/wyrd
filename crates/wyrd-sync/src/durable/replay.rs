@@ -117,12 +117,12 @@ pub(super) fn rebuild_facts(
             // devices, but a keyring serves exactly one.
             continue;
         }
-        let state = log
-            .state_of(&cap.transition)
-            .ok_or(DurableError::CapabilityTransitionUnknown)?;
-        cap.validate_against(&state)
-            .map_err(|_| DurableError::CapabilityChanged(cap.device))?;
-        keyring.install(cap, &state)?;
+        // Install re-applies the full predicate through one
+        // authoritative lookup — the transition and the state it
+        // produces are inseparable — so a record that passed the
+        // store-key envelope can never install a capability whose
+        // drive, binding, or secret count is stale.
+        keyring.install(cap, &log)?;
     }
     let mut runtime = RuntimeState::new(*drive);
     for fact in facts.runtime_facts {

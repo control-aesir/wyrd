@@ -3,25 +3,15 @@
 //! signed snapshots bound to its canonical tip. Fixtures never use the
 //! engine under test to construct themselves.
 
-use secp256k1::{Keypair, SecretKey, SECP256K1};
+use secp256k1::SecretKey;
 use wyrd_format::{Change, ContentId, DeviceId, DriveId, Snapshot, SnapshotId, TransitionId};
 
 use crate::membership::test_util::Builder;
 use crate::membership::MembershipLog;
 
-/// The BIP-340 challenge context for snapshots (trust.md).
-pub(crate) const SNAPSHOT_CHALLENGE_CONTEXT: &str = "wyrd snapshot challenge v1";
-
-pub(crate) fn snapshot_challenge(s: &Snapshot, drive: &DriveId) -> [u8; 32] {
-    blake3::derive_key(SNAPSHOT_CHALLENGE_CONTEXT, &s.signing_message(drive))
-}
-
-/// Sign a snapshot in place with canonical BIP-340 nonces.
-pub(crate) fn sign_snapshot(s: &mut Snapshot, sk: &SecretKey, drive: &DriveId) {
-    let keypair = Keypair::from_secret_key(SECP256K1, sk);
-    let sig = SECP256K1.sign_schnorr_no_aux_rand(&snapshot_challenge(s, drive), &keypair);
-    s.signature = sig.to_byte_array();
-}
+// The production signing helper, reused so the fixture and the authoring
+// path cannot drift on the pinned challenge.
+pub(crate) use super::predicates::sign_snapshot;
 
 /// A dummy root-tree ContentId for fixtures.
 pub(crate) fn tree_id(pattern: u8) -> ContentId {

@@ -19,6 +19,7 @@ use wyrd_format::{
 
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
+mod author;
 pub mod engine;
 mod fetch;
 mod intake;

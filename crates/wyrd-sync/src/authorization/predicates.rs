@@ -2,7 +2,7 @@
 //! and the per-snapshot predicate inputs the engine consumes.
 
 use secp256k1::schnorr::Signature;
-use secp256k1::{XOnlyPublicKey, SECP256K1};
+use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use wyrd_format::{DriveId, Snapshot};
 
 /// BIP-340 challenge context for snapshots (trust.md).
@@ -11,6 +11,15 @@ pub const SNAPSHOT_CHALLENGE_CONTEXT: &str = "wyrd snapshot challenge v1";
 /// The 32-byte BIP-340 challenge for a snapshot's signing message.
 pub fn snapshot_challenge(s: &Snapshot, drive: &DriveId) -> [u8; 32] {
     blake3::derive_key(SNAPSHOT_CHALLENGE_CONTEXT, &s.signing_message(drive))
+}
+
+/// Sign a snapshot in place with canonical BIP-340 nonces (trust.md,
+/// "Exact signing construction"). Authors sign their own bodies; the
+/// authoring path is the only production caller.
+pub(crate) fn sign_snapshot(s: &mut Snapshot, sk: &SecretKey, drive: &DriveId) {
+    let keypair = Keypair::from_secret_key(SECP256K1, sk);
+    let sig = SECP256K1.sign_schnorr_no_aux_rand(&snapshot_challenge(s, drive), &keypair);
+    s.signature = sig.to_byte_array();
 }
 
 /// Whether the snapshot's signature verifies. Full key validation

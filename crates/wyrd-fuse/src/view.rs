@@ -220,16 +220,20 @@ where
         merge(resolutions)
     }
 
-    /// The version-selection grammar: a trailing `@N` on a component
-    /// addresses version N of a conflicted path — `foo@1` is version 1
-    /// of a conflicted `foo`, and `foo@1/bar` descends inside version
-    /// 1's subtree. `@N` is lookup syntax, never a stored entry:
-    /// nothing synthetic exists in the projected namespace and
-    /// `readdir` never lists it. Versions are numbered deterministically
-    /// in SnapshotId byte order, so the same head set always numbers the
-    /// same way. The grammar requires a conflict at the unversioned
-    /// name, applies only where the literal path does not exist, and is
-    /// not nested (one suffix per component).
+    /// The version-selection grammar: a trailing `@N` on the final
+    /// component addresses version N of a conflicted path — `foo@1`
+    /// is version 1 of a conflicted `foo`, and `foo@1/bar` descends
+    /// inside version 1's subtree. `@N` is lookup syntax, never a
+    /// stored entry: nothing synthetic exists in the projected
+    /// namespace and `readdir` never lists it. Versions are numbered
+    /// deterministically in SnapshotId byte order, so the same head
+    /// set always numbers the same way. The grammar requires a
+    /// conflict at the unversioned name and applies only where the
+    /// literal path does not exist — real stored names win at every
+    /// level — so a stored name containing `@` is addressed by its
+    /// own spelling first, and if that stored name is itself
+    /// conflicted, its versions are reachable one suffix further
+    /// (`name@1@2`). Only the final suffix is ever interpreted.
     fn lookup_versioned(&self, components: &[Component]) -> Result<Node, ViewError> {
         let Some((index, (name, version))) =
             components
@@ -1452,7 +1456,9 @@ mod tests {
         assert!(contents.contains(&b"bbb".to_vec()));
         assert_ne!(contents[0], contents[1]);
 
-        // One suffix per component: nesting is not grammar.
+        // No stored `f.txt@1` exists, so a further suffix has nothing
+        // to select: the intermediate name must resolve somewhere
+        // first.
         assert_eq!(view.lookup("f.txt@1@2"), Err(ViewError::NotFound));
     }
 
@@ -1656,6 +1662,70 @@ mod tests {
         );
         assert_eq!(view.lookup("f.txt@3"), Err(ViewError::NotFound));
         assert_eq!(view.lookup("f.txt@0"), Err(ViewError::NotFound));
+    }
+
+    #[test]
+    fn stored_names_with_at_are_addressed_by_their_own_spelling() {
+        // Only the final `@N` of a path is ever the selector. A
+        // stored name containing `@` is addressed by its own spelling
+        // first — here the stored `name@1` is itself a conflict, so
+        // `name@1` resolves that conflict node (not version 1 of
+        // `name`), and its versions are reachable one suffix further:
+        // `name@1@2` selects version 2 of the stored `name@1`.
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let x = chunk(&mut store, b"xxx");
+        let y = chunk(&mut store, b"yyy");
+        let root_a = tree_of(
+            &mut store,
+            vec![
+                Entry::file("name", 3, false, vec![a]).unwrap(),
+                Entry::file("name@1", 3, false, vec![x]).unwrap(),
+            ],
+        );
+        let root_b = tree_of(
+            &mut store,
+            vec![
+                Entry::file("name", 3, false, vec![b]).unwrap(),
+                Entry::file("name@1", 3, false, vec![y]).unwrap(),
+            ],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        // The stored `name@1` diverges: its spelling is the conflict.
+        let stored = view.lookup("name@1").unwrap();
+        let Node::Conflict { versions } = &stored else {
+            panic!("the stored name@1 diverges and must conflict");
+        };
+        assert_eq!(versions.len(), 2);
+        let mut ordered = versions.clone();
+        ordered.sort_by(|x, w| x.snapshot.as_bytes().cmp(w.snapshot.as_bytes()));
+
+        // One suffix further selects that conflict's versions, in the
+        // same canonical order.
+        assert_eq!(view.lookup("name@1@1").unwrap(), ordered[0].node);
+        assert_eq!(view.lookup("name@1@2").unwrap(), ordered[1].node);
+        let selected = view.open(&ordered[1].node).unwrap();
+        let via_grammar = view.open(&view.lookup("name@1@2").unwrap()).unwrap();
+        assert_eq!(
+            view.read(&via_grammar, 0, 8).unwrap(),
+            view.read(&selected, 0, 8).unwrap()
+        );
+
+        // The outer conflict is unaffected: `name@2` still selects
+        // version 2 of the conflicted `name`.
+        let outer = view.lookup("name").unwrap();
+        let Node::Conflict { versions } = &outer else {
+            panic!("the divergent name must conflict");
+        };
+        let mut outer_ordered = versions.clone();
+        outer_ordered.sort_by(|x, w| x.snapshot.as_bytes().cmp(w.snapshot.as_bytes()));
+        assert_eq!(view.lookup("name@2").unwrap(), outer_ordered[1].node);
     }
 
     #[test]

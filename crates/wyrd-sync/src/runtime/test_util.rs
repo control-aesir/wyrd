@@ -26,7 +26,9 @@ use crate::keys::capability::Capability;
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, key, Builder};
 use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
-use crate::transport::mailbox::{seal_for_recipient, Mailbox, MailboxEnvelope, MailboxError};
+use crate::transport::mailbox::{
+    seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+};
 
 use super::engine::{DrainReport, Engine};
 
@@ -56,10 +58,32 @@ impl Drop for TestDir {
 }
 
 /// An in-memory relay: every sent envelope lands in a shared queue;
-/// `recv` filters by the owning device. No network, no async.
+/// `recv` filters by the owning device. Handovers clone out of the
+/// slot, so the queue retains every envelope until `Ack`. No network,
+/// no async.
+struct Slot {
+    id: DeliveryId,
+    envelope: MailboxEnvelope,
+}
+
 #[derive(Default)]
 pub(crate) struct MemoryRelay {
-    pub(crate) queue: VecDeque<MailboxEnvelope>,
+    queue: VecDeque<Slot>,
+    next_id: u64,
+}
+
+impl MemoryRelay {
+    pub(crate) fn push(&mut self, envelope: MailboxEnvelope) {
+        let id = DeliveryId::new(self.next_id);
+        // Test-only counter: exhausting u64 is unreachable, but wrap
+        // would silently violate the uniqueness contract, so fail
+        // loudly instead of wrapping.
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("delivery id space exhausted");
+        self.queue.push_back(Slot { id, envelope });
+    }
 }
 
 pub(crate) struct MemoryMailbox<'a> {
@@ -69,17 +93,36 @@ pub(crate) struct MemoryMailbox<'a> {
 
 impl Mailbox for MemoryMailbox<'_> {
     fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-        self.relay.queue.push_back(envelope);
+        self.relay.push(envelope);
         Ok(())
     }
 
-    fn recv(&mut self) -> Option<MailboxEnvelope> {
-        let pos = self
+    fn recv(&mut self) -> Option<Delivery> {
+        let slot = self
             .relay
             .queue
             .iter()
-            .position(|e| e.recipient == self.owner)?;
-        self.relay.queue.remove(pos)
+            .find(|s| s.envelope.recipient == self.owner)?;
+        Some(Delivery::new(slot.id, slot.envelope.clone()))
+    }
+
+    fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+        if let Some(pos) = self.relay.queue.iter().position(|s| s.id == id) {
+            match disposition {
+                Disposition::Ack => {
+                    self.relay.queue.remove(pos);
+                }
+                // Retry requeues at the back: the envelope is offered
+                // again on a later pass, never ahead of mail it has not
+                // blocked, and a pass still terminates on re-offer.
+                Disposition::Retry => {
+                    if let Some(slot) = self.relay.queue.remove(pos) {
+                        self.relay.queue.push_back(slot);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -139,7 +182,9 @@ pub(crate) fn deliver(fixture: &Fixture, epoch: u64, message: &Message) -> Mailb
 }
 
 pub(crate) fn queue(fixture: &mut Fixture, envelopes: Vec<MailboxEnvelope>) {
-    fixture.relay.queue.extend(envelopes);
+    for envelope in envelopes {
+        fixture.relay.push(envelope);
+    }
 }
 
 pub(crate) fn drain(fixture: &mut Fixture) -> DrainReport {

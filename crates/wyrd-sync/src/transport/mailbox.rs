@@ -11,9 +11,10 @@
 //! used for capability delivery (T14).
 //!
 //! No live relay client lives here (see the module doc on scope): the
-//! [`Mailbox`] trait is a synchronous send/receive boundary so tests run
+//! [`Mailbox`] trait is a synchronous handover boundary so tests run
 //! against an in-memory fake without an async runtime; a real relay
-//! pool wraps whatever I/O model it needs behind the same trait.
+//! pool wraps whatever I/O model it needs behind the same trait,
+//! honoring the retain-until-ack contract with cursor semantics.
 
 use nostr::key::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use nostr::nips::nip44;
@@ -105,12 +106,98 @@ pub fn open_from_sender(
 /// design: no client lives in this crate yet, so the trait does not
 /// prematurely commit to an async runtime; relay-wiring work chooses
 /// that when it lands.
+///
+/// Handover, not consumption: `recv` lends one envelope at a time and
+/// the relay retains it until the engine settles the handover. A
+/// relay-pool implementation honors this with cursor semantics —
+/// an unsettled delivery's cursor never advances, so the next sync
+/// re-fetches it — never by dropping mail on the floor. Do not build
+/// a client that consumes on `recv`: the engine's crash recovery
+/// ("a crash can only lose envelopes the relay still holds for
+/// redelivery") depends on unacked mail surviving.
 pub trait Mailbox {
     /// Publish one sealed envelope.
     fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError>;
 
-    /// Take the next envelope addressed to this mailbox's owner, if any.
-    fn recv(&mut self) -> Option<MailboxEnvelope>;
+    /// Hand over the next envelope addressed to this mailbox's owner,
+    /// if any. The handover does NOT consume the envelope: it stays
+    /// available for redelivery until settled with [`Disposition::Ack`].
+    /// A later `recv` MAY re-offer an unsettled delivery, always under
+    /// the same id; the drain loop offers each id once per pass, so a
+    /// pass always terminates. Ids must be stable across re-offers and
+    /// unique per envelope: a cursor derived from queue position (which
+    /// shifts when predecessors are acked) violates this — derive
+    /// cursors from content or a monotonic counter instead.
+    fn recv(&mut self) -> Option<Delivery>;
+
+    /// Settle one handover: `Ack` permanently consumes (the relay may
+    /// discard the envelope), `Retry` retains it for redelivery.
+    /// Settling is idempotent — a repeated `Ack` is a no-op — and
+    /// dropping a [`Delivery`] without settling is an implicit `Retry`.
+    fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError>;
+}
+
+/// Mailbox-scoped identity for one handover: stable across re-offers
+/// of the same envelope, unique per envelope. Opaque to the engine,
+/// which only compares ids within a pass; minted by mailbox
+/// implementations (a relay pool uses cursor ids, the fake a counter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeliveryId(u64);
+
+impl DeliveryId {
+    /// Mint an id (mailbox implementations only; must be stable across
+    /// re-offers of one envelope and unique per envelope).
+    pub fn new(value: u64) -> Self {
+        DeliveryId(value)
+    }
+}
+
+/// One envelope handover: the envelope plus the id the engine hands
+/// back to settle it. Plain data, no behavior; constructed by
+/// [`Mailbox`] implementations via [`Delivery::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    id: DeliveryId,
+    envelope: MailboxEnvelope,
+}
+
+impl Delivery {
+    /// Hand over `envelope` under `id` (mailbox implementations only;
+    /// ids must be stable across re-offers and unique per envelope).
+    pub fn new(id: DeliveryId, envelope: MailboxEnvelope) -> Self {
+        Delivery { id, envelope }
+    }
+
+    /// This handover's stable id.
+    pub fn id(&self) -> DeliveryId {
+        self.id
+    }
+
+    /// The envelope under handover.
+    pub fn envelope(&self) -> &MailboxEnvelope {
+        &self.envelope
+    }
+}
+
+/// How the engine settles a handover: exactly by responsibility. The
+/// engine settles every handover it processes; anything unsettled is
+/// retained by the relay. Dropping a [`Delivery`] without settling is
+/// an implicit `Retry` — crash-safety falls out of the contract: a
+/// crash is every live handover dropped at once, and the relay
+/// retains them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Permanently consume: the engine took durable responsibility —
+    /// facts committed (including poison-suppression commits), or an
+    /// already-committed id redelivered — so the relay may discard the
+    /// envelope. Safe to repeat: redelivery of a committed message is
+    /// a duplicate no-op, so a lost ack degrades to one redundant
+    /// offer. In-memory pending holds are NOT durable responsibility:
+    /// they settle `Retry` so the relay keeps the crash backstop.
+    Ack,
+    /// Leave for redelivery: the engine holds nothing for this
+    /// envelope, so the relay MUST retain it.
+    Retry,
 }
 
 #[cfg(test)]
@@ -124,10 +211,32 @@ mod tests {
     use wyrd_format::{DriveId, SnapshotId, TransitionId};
 
     /// An in-memory relay: every sent envelope lands in a shared queue;
-    /// `recv` filters by the owning device. No network, no async.
+    /// `recv` filters by the owning device. Handovers clone out of the
+    /// slot, so the queue retains every envelope until `Ack`. No
+    /// network, no async.
+    struct Slot {
+        id: DeliveryId,
+        envelope: MailboxEnvelope,
+    }
+
     #[derive(Default)]
     struct MemoryRelay {
-        queue: VecDeque<MailboxEnvelope>,
+        queue: VecDeque<Slot>,
+        next_id: u64,
+    }
+
+    impl MemoryRelay {
+        fn push(&mut self, envelope: MailboxEnvelope) {
+            let id = DeliveryId::new(self.next_id);
+            // Test-only counter: exhausting u64 is unreachable, but wrap
+            // would silently violate the uniqueness contract, so fail
+            // loudly instead of wrapping.
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .expect("delivery id space exhausted");
+            self.queue.push_back(Slot { id, envelope });
+        }
     }
 
     struct MemoryMailbox<'a> {
@@ -137,17 +246,36 @@ mod tests {
 
     impl Mailbox for MemoryMailbox<'_> {
         fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-            self.relay.queue.push_back(envelope);
+            self.relay.push(envelope);
             Ok(())
         }
 
-        fn recv(&mut self) -> Option<MailboxEnvelope> {
-            let pos = self
+        fn recv(&mut self) -> Option<Delivery> {
+            let slot = self
                 .relay
                 .queue
                 .iter()
-                .position(|e| e.recipient == self.owner)?;
-            self.relay.queue.remove(pos)
+                .find(|s| s.envelope.recipient == self.owner)?;
+            Some(Delivery::new(slot.id, slot.envelope.clone()))
+        }
+
+        fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+            if let Some(pos) = self.relay.queue.iter().position(|s| s.id == id) {
+                match disposition {
+                    Disposition::Ack => {
+                        self.relay.queue.remove(pos);
+                    }
+                    // Retry requeues at the back: the envelope is offered
+                    // again on a later pass, never ahead of mail it has
+                    // not blocked, and a pass still terminates on re-offer.
+                    Disposition::Retry => {
+                        if let Some(slot) = self.relay.queue.remove(pos) {
+                            self.relay.queue.push_back(slot);
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
     }
 
@@ -246,9 +374,13 @@ mod tests {
             owner: recipient,
         };
         let received = recipient_mailbox.recv().expect("envelope delivered");
-        assert!(recipient_mailbox.recv().is_none(), "queue drained once");
+        recipient_mailbox
+            .settle(received.id(), Disposition::Ack)
+            .unwrap();
+        assert!(recipient_mailbox.recv().is_none(), "acked deliveries go");
 
-        let control_bytes = open_from_sender(&recipient_sk, recipient, &received).unwrap();
+        let control_bytes =
+            open_from_sender(&recipient_sk, recipient, received.envelope()).unwrap();
         let mut inbox = ControlInbox::new(drive());
         inbox.add_epoch_key(5, control_key(5));
         assert!(matches!(
@@ -266,7 +398,7 @@ mod tests {
         let (_, other) = identity(0x03);
         let mut relay = MemoryRelay::default();
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
-        relay.queue.push_back(envelope);
+        relay.push(envelope);
 
         let mut other_mailbox = MemoryMailbox {
             relay: &mut relay,
@@ -320,6 +452,66 @@ mod tests {
         let invitation = open_bootstrap(&enc_secret, &parsed).unwrap();
         assert_eq!(invitation.invitee, device);
         assert_eq!(invitation.capability, cap.as_bytes());
+    }
+
+    #[test]
+    fn unacked_delivery_is_reoffered_until_acked() {
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let mut relay = MemoryRelay::default();
+        let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        relay.push(envelope.clone());
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: recipient,
+        };
+        // The handover does not consume: dropping it without settling
+        // leaves the envelope retained, like an explicit retry.
+        let first = mailbox.recv().expect("offered");
+        assert_eq!(first.envelope(), &envelope);
+        let first_id = first.id();
+        drop(first);
+        let second = mailbox.recv().expect("reoffered after drop");
+        assert_eq!(second.id(), first_id);
+        assert_eq!(second.envelope(), &envelope);
+        mailbox
+            .settle(second.id(), Disposition::Retry)
+            .expect("retry retains");
+        let third = mailbox.recv().expect("reoffered after retry");
+        assert_eq!(third.id(), first_id);
+        // Acknowledging consumes: the relay holds nothing more.
+        mailbox.settle(third.id(), Disposition::Ack).unwrap();
+        assert!(mailbox.recv().is_none());
+    }
+
+    #[test]
+    fn delivery_ids_survive_predecessor_ack() {
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let mut relay = MemoryRelay::default();
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"first").expect("seals"));
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"second").expect("seals"));
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: recipient,
+        };
+        // Ack the predecessor: the successor's handover must keep a
+        // distinct id, and a dropped (unsettled) successor must come
+        // back under that same id. A cursor derived from queue position
+        // would shift on ack and violate the contract.
+        let first = mailbox.recv().expect("first offered");
+        let first_id = first.id();
+        mailbox.settle(first_id, Disposition::Ack).unwrap();
+        let second = mailbox.recv().expect("second offered");
+        assert_ne!(second.id(), first_id);
+        let second_id = second.id();
+        drop(second);
+        let reoffered = mailbox.recv().expect("unsettled successor re-offered");
+        assert_eq!(reoffered.id(), second_id);
+        mailbox.settle(second_id, Disposition::Ack).unwrap();
+        assert!(mailbox.recv().is_none());
     }
 
     #[test]

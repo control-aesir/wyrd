@@ -4883,10 +4883,13 @@ name = "wyrd-daemon"
 version = "0.1.0"
 dependencies = [
  "fuser",
+ "hex",
+ "libc",
  "thiserror 2.0.20",
  "wyrd-format",
  "wyrd-fuse",
  "wyrd-sync",
+ "zeroize",
 ]
 
 [[package]]

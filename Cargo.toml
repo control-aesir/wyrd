@@ -47,6 +47,7 @@ sha2 = "0.10"
 argon2 = "0.5"
 # CSPRNG (the OsRng rand itself builds on)
 getrandom = "0.2"
+zeroize = "1.9"
 
 # async runtime
 tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal"] }

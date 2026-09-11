@@ -32,6 +32,7 @@ use zeroize::Zeroizing;
 use super::encoding;
 use crate::keys::epoch::EpochSecret;
 use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret};
+use crate::membership::Authorizable;
 use wyrd_format::DeviceEncryptionKey;
 
 /// The wrapping's HKDF info context (trust.md, T12).
@@ -78,8 +79,10 @@ pub enum CapabilityError {
         expected: TransitionId,
         found: TransitionId,
     },
-    #[error("capability is bound to transition {0}, which is not observed valid history")]
+    #[error("capability is bound to transition {0}, which is unobserved or still pending")]
     UnknownTransition(TransitionId),
+    #[error("capability is bound to transition {0}, which is observed but can never authorize")]
+    UnauthorizableTransition(TransitionId),
     #[error("capability targets drive {found} but is authorized for {expected}")]
     DriveMismatch { expected: DriveId, found: DriveId },
 }
@@ -198,9 +201,19 @@ impl Capability {
                 found: self.drive,
             });
         }
-        let (transition, state) = log
-            .authoritative(transition_id)
-            .ok_or(CapabilityError::UnknownTransition(*transition_id))?;
+        // The classification is the liveness contract: unobserved and
+        // pending history may still arrive or resolve, terminal history
+        // never can. Callers defer on the first and suppress on the
+        // second.
+        let (transition, state) = match log.authoritative(transition_id) {
+            Some(Authorizable::Valid(transition, state)) => (transition, state),
+            Some(Authorizable::Pending) | None => {
+                return Err(CapabilityError::UnknownTransition(*transition_id));
+            }
+            Some(Authorizable::Terminal) => {
+                return Err(CapabilityError::UnauthorizableTransition(*transition_id));
+            }
+        };
         self.validate_against(&state)?;
         if self.transition != transition.transition_id() {
             return Err(CapabilityError::TransitionMismatch {

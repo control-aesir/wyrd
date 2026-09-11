@@ -88,6 +88,20 @@ pub enum TransitionStatus {
     Invalid(InvalidReason),
 }
 
+/// What a capability's named transition offers an authorization check.
+/// The distinction is a liveness contract: pending history may still
+/// arrive or resolve, terminal history never can — a caller that
+/// defers on both parks poison forever.
+#[derive(Debug)]
+pub enum Authorizable<'a> {
+    /// Observed valid history: the transition and the state it produces.
+    Valid(&'a MembershipTransition, MembershipState),
+    /// Observed but not yet derivable (ancestry unresolved); may heal.
+    Pending,
+    /// Observed and terminally unauthorizable (invalid or orphaned).
+    Terminal,
+}
+
 /// The peer's authoritative knowledge: the canonical tip's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnownState {
@@ -133,19 +147,27 @@ impl MembershipLog {
         self.transitions.get(id)
     }
 
-    /// The observed transition together with the state it produces, from
-    /// one analysis pass. This is the authorization source for capability
-    /// checks: the pair is inseparable, so a caller can never supply a
-    /// state whose correspondence to its transition is unverified. Only
-    /// valid history (canonical, contested, or voided) has a state —
-    /// pending or invalid transitions yield `None`.
-    pub fn authoritative(
-        &self,
-        id: &TransitionId,
-    ) -> Option<(&MembershipTransition, MembershipState)> {
+    /// The observed transition's authorization standing, from one
+    /// analysis pass. This is the authorization source for capability
+    /// checks: the transition and the state it produces are inseparable,
+    /// so a caller can never supply a state whose correspondence to its
+    /// transition is unverified. Only valid history (canonical,
+    /// contested, or voided) yields `Valid`; pending yields `Pending`;
+    /// invalid and orphaned yield `Terminal`. Unobserved ids yield
+    /// `None`.
+    pub fn authoritative(&self, id: &TransitionId) -> Option<Authorizable<'_>> {
         let transition = self.transitions.get(id)?;
-        let state = chain::analyse(self).states.get(id).cloned()?;
-        Some((transition, state))
+        let analysis = chain::analyse(self);
+        match analysis.states.get(id).cloned() {
+            Some(state) => Some(Authorizable::Valid(transition, state)),
+            None => match analysis.status.get(id) {
+                Some(TransitionStatus::Pending) => Some(Authorizable::Pending),
+                // Every observed transition is classified; a
+                // classification without a derived state can never
+                // become derivable.
+                _ => Some(Authorizable::Terminal),
+            },
+        }
     }
 
     /// All observed ids, in deterministic (ascending) order. The

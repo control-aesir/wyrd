@@ -229,10 +229,11 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
     }
     // One authoritative lookup inside authorize: the transition and
     // the state it produces are inseparable, so the capability is
-    // checked against exactly its own authorizing history. Unknown
-    // transitions defer — the history may simply not have arrived
-    // yet; everything else suppresses without a durable capability
-    // fact.
+    // checked against exactly its own authorizing history. Unobserved
+    // or pending transitions defer — the history may still arrive or
+    // resolve; terminally invalid or orphaned history, and every other
+    // authorization failure, suppress without a durable capability
+    // fact, so poison is never parked for retry.
     let transition_id = capability.transition;
     match AuthorizedCapability::authorize(capability, engine.drive(), &engine.log, &transition_id) {
         Ok(authorized) => Action::Commit(vec![
@@ -969,6 +970,116 @@ mod tests {
         assert_eq!(report.accepted, 1, "mismatch suppresses, never defers");
         let facts = fixture.engine.store.load().expect("loads");
         assert!(facts.capabilities.is_empty(), "no capability installs");
+    }
+
+    #[test]
+    fn capability_on_invalid_transition_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+
+        // The admission transition with a corrupted signature: still
+        // decodable, so the log observes it — and classifies it
+        // invalid, terminally.
+        let (mut builder, genesis) = Builder::genesis(10);
+        let mut broken = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+        broken.signature[10] ^= 0xFF;
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&broken)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2, "invalid history still observes");
+
+        // A capability bound to the invalid transition can never
+        // authorize: suppress, never defer — this history cannot heal.
+        let delivery = capability_message(
+            device,
+            broken.transition_id(),
+            2,
+            vec![EpochSecret::from_bytes([0x07; 32]); 2],
+        );
+        let mail = vec![deliver(&fixture, 2, &delivery)];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(
+            report.accepted, 1,
+            "terminal history suppresses, never defers"
+        );
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty(), "no capability installs");
+        // Redelivery stays a duplicate: the suppression committed.
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    #[test]
+    fn capability_on_orphaned_transition_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+
+        // An admission with a corrupted signature (invalid), then a
+        // properly signed child chained onto the observed broken id:
+        // structurally sound, but its ancestry is invalid — orphaned,
+        // terminally.
+        let (mut builder, genesis) = Builder::genesis(10);
+        let (owner_sk, owner_device) = owner();
+        let mut broken = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+        broken.signature[10] ^= 0xFF;
+        let orphan = signed(
+            3,
+            Some(broken.transition_id()),
+            Vec::new(),
+            vec![Change::Rotate],
+            &[owner_device, device],
+            &[owner_device],
+            &owner_sk,
+            owner_device,
+        );
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&broken)),
+            deliver(&fixture, 1, &transition_message(&orphan)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 3, "orphaned history still observes");
+
+        // A capability bound to the orphaned transition can never
+        // authorize: suppress, never defer.
+        fixture
+            .engine
+            .add_epoch_key(3, Zeroizing::new(control_key(3)));
+        let delivery = capability_message(
+            device,
+            orphan.transition_id(),
+            3,
+            vec![EpochSecret::from_bytes([0x07; 32]); 3],
+        );
+        let mail = vec![deliver(&fixture, 3, &delivery)];
+        queue(&mut fixture, mail.clone());
+        let report = drain(&mut fixture);
+        assert_eq!(
+            report.accepted, 1,
+            "terminal history suppresses, never defers"
+        );
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty(), "no capability installs");
+        // Redelivery stays a duplicate: the suppression committed.
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.duplicates, 1);
     }
 
     #[test]

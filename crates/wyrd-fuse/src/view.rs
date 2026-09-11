@@ -9,6 +9,10 @@
 //!
 //! Presentation policy (v0, from `docs/sync-and-peers.md`):
 //!
+//! - The projected namespace is the user's data only. The view never
+//!   introduces synthetic entries — no hidden directories, no virtual
+//!   files, no metadata objects. View controls are path-resolution
+//!   semantics or out-of-band APIs; `readdir` lists only stored names.
 //! - DAG conflict and path conflict are distinct. Multiple heads that
 //!   resolve a path identically serve it normally. A path that is a
 //!   directory in every head serves as one directory
@@ -18,10 +22,17 @@
 //!   divergence — including presence versus deletion — and differing
 //!   leaf identity surface as [`Node::Conflict`]. Heads never merge
 //!   silently and no winner is picked.
+//! - Version selection is a property of path resolution, not of the
+//!   stored filesystem namespace: a trailing `@N` on a component
+//!   (`foo@1`) addresses version N of a conflicted `foo`, numbered
+//!   deterministically in SnapshotId byte order. The grammar applies
+//!   only where the literal path does not exist — real stored names
+//!   always win — and it never appears in `readdir` listings.
 //! - `readdir` on a conflicted or merged directory lists the union of
 //!   children, each resolved across the versions, so navigation keeps
 //!   working through conflicts. Reading through a conflict node itself
-//!   fails with [`ViewError::Conflict`].
+//!   fails with [`ViewError::Conflict`]; the version-qualified paths
+//!   (`foo@N`) are the readable surfaces.
 //! - POSIX mapping happens only at the FUSE boundary, outside this
 //!   crate: [`ViewError::Unavailable`] becomes `EIO`, and
 //!   [`ViewError::Corrupt`] triggers scrub/repair before surfacing.
@@ -63,7 +74,10 @@ pub enum Node {
     },
     /// The heads disagree at this path. Versions list only the heads
     /// where the path resolves; absence elsewhere is part of the
-    /// divergence, not a separate version.
+    /// divergence, not a separate version. The conflict itself is not
+    /// readable: version-qualified lookup paths (`foo@N`, counted in
+    /// SnapshotId byte order) address the versions, and nothing
+    /// synthetic is ever listed by `readdir`.
     Conflict {
         versions: Vec<ConflictVersion>,
     },
@@ -121,7 +135,9 @@ pub enum ViewError {
     NotADirectory,
     #[error("not a file")]
     NotAFile,
-    #[error("path is conflicted across heads; resolve before reading")]
+    #[error(
+        "path is conflicted across heads; read a version via `path@N` or resolve before reading"
+    )]
     Conflict,
     #[error("content is remote-only; the daemon would block and fetch")]
     NotMaterialized,
@@ -176,17 +192,77 @@ where
     }
 
     /// Resolve a path to its node, merging across heads. `/a/b` and
-    /// `a/b` both work; `""` and `"/"` address the root.
+    /// `a/b` both work; `""` and `"/"` address the root. A trailing
+    /// `@N` on a component selects version N of a conflicted path
+    /// (see [`DriveView::lookup_versioned`]); real stored names always
+    /// win over the grammar.
     pub fn lookup(&self, path: &str) -> Result<Node, ViewError> {
         let components = parse_path(path)?;
+        match self.lookup_literal(&components) {
+            Ok(node) => Ok(node),
+            // The grammar applies only where the literal path exists
+            // nowhere: real names win by construction.
+            Err(ViewError::NotFound) => self.lookup_versioned(&components),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The literal walk: every component is a stored name, merged
+    /// across heads.
+    fn lookup_literal(&self, components: &[Component]) -> Result<Node, ViewError> {
         let mut resolutions = Vec::with_capacity(self.heads.len());
         for head in &self.heads {
             resolutions.push((
                 head.snapshot_id(),
-                self.resolve_one(&head.tree, &components)?,
+                self.resolve_one(&head.tree, components)?,
             ));
         }
         merge(resolutions)
+    }
+
+    /// The version-selection grammar: a trailing `@N` on a component
+    /// addresses version N of a conflicted path — `foo@1` is version 1
+    /// of a conflicted `foo`, and `foo@1/bar` descends inside version
+    /// 1's subtree. `@N` is lookup syntax, never a stored entry:
+    /// nothing synthetic exists in the projected namespace and
+    /// `readdir` never lists it. Versions are numbered deterministically
+    /// in SnapshotId byte order, so the same head set always numbers the
+    /// same way. The grammar requires a conflict at the unversioned
+    /// name, applies only where the literal path does not exist, and is
+    /// not nested (one suffix per component).
+    fn lookup_versioned(&self, components: &[Component]) -> Result<Node, ViewError> {
+        let Some((index, (name, version))) =
+            components
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, component)| {
+                    let (name, suffix) = component.as_str().rsplit_once('@')?;
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let version: u32 = suffix.parse().ok()?;
+                    (version >= 1).then_some((index, (name.to_string(), version)))
+                })
+        else {
+            return Err(ViewError::NotFound);
+        };
+        let mut prefix: Vec<Component> = components[..index].to_vec();
+        prefix.push(Component::new(name).map_err(|_| ViewError::NotFound)?);
+        let mut versions = match self.lookup_literal(&prefix)? {
+            Node::Conflict { versions } => versions,
+            _ => return Err(ViewError::NotFound),
+        };
+        versions.sort_by(|a, b| a.snapshot.as_bytes().cmp(b.snapshot.as_bytes()));
+        let selected = versions
+            .get((version - 1) as usize)
+            .ok_or(ViewError::NotFound)?;
+        let rest = &components[index + 1..];
+        match &selected.node {
+            node if rest.is_empty() => Ok(node.clone()),
+            Node::Dir { subtree } => self.resolve_one(subtree, rest)?.ok_or(ViewError::NotFound),
+            _ => Err(ViewError::NotADirectory),
+        }
     }
 
     /// Attributes for a path: `lookup` plus the attr projection.
@@ -1328,6 +1404,258 @@ mod tests {
         let union = view.readdir(&entries[0].node).unwrap();
         assert_eq!(union.len(), 1);
         assert_eq!(union[0].name, "deep.txt");
+    }
+
+    #[test]
+    fn version_grammar_reads_both_versions_of_a_conflicted_file() {
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let root_a = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 3, false, vec![a]).unwrap()],
+        );
+        let root_b = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 3, false, vec![b]).unwrap()],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        // The conflict itself stays unreadable.
+        let node = view.lookup("f.txt").unwrap();
+        assert_eq!(view.open(&node), Err(ViewError::Conflict));
+        assert_eq!(view.stat("f.txt").unwrap().kind, Kind::Conflict);
+
+        // Version numbers follow SnapshotId byte order: `f.txt@N` is
+        // exactly the Nth version of that canonical order.
+        let Node::Conflict { mut versions } = node else {
+            panic!("divergent path must conflict");
+        };
+        versions.sort_by(|x, y| x.snapshot.as_bytes().cmp(y.snapshot.as_bytes()));
+        for (index, version) in versions.iter().enumerate() {
+            let qualified = format!("f.txt@{}", index + 1);
+            assert_eq!(view.lookup(&qualified).unwrap(), version.node);
+            assert_eq!(view.stat(&qualified).unwrap().kind, Kind::File);
+        }
+        // Both versions read with their own content, never a winner.
+        let first = view.open(&view.lookup("f.txt@1").unwrap()).unwrap();
+        let second = view.open(&view.lookup("f.txt@2").unwrap()).unwrap();
+        let contents = [
+            view.read(&first, 0, 8).unwrap(),
+            view.read(&second, 0, 8).unwrap(),
+        ];
+        assert!(contents.contains(&b"aaa".to_vec()));
+        assert!(contents.contains(&b"bbb".to_vec()));
+        assert_ne!(contents[0], contents[1]);
+
+        // One suffix per component: nesting is not grammar.
+        assert_eq!(view.lookup("f.txt@1@2"), Err(ViewError::NotFound));
+    }
+
+    #[test]
+    fn real_names_win_over_the_version_grammar() {
+        // A stored file literally named `f.txt@1` (in every head, so
+        // the literal resolves unanimously) shadows version selection
+        // for that name; `f.txt@2` has no stored entry, so the grammar
+        // resolves version 2 of the conflicted `f.txt`.
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let z = chunk(&mut store, b"zzz");
+        let root_a = tree_of(
+            &mut store,
+            vec![
+                Entry::file("f.txt", 3, false, vec![a]).unwrap(),
+                Entry::file("f.txt@1", 3, false, vec![z]).unwrap(),
+            ],
+        );
+        let root_b = tree_of(
+            &mut store,
+            vec![
+                Entry::file("f.txt", 3, false, vec![b]).unwrap(),
+                Entry::file("f.txt@1", 3, false, vec![z]).unwrap(),
+            ],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        let literal = view.lookup("f.txt@1").unwrap();
+        assert_eq!(
+            literal,
+            Node::File {
+                size: 3,
+                executable: false,
+                chunks: vec![z],
+            }
+        );
+        let versioned = view.lookup("f.txt@2").unwrap();
+        let file = view.open(&versioned).unwrap();
+        assert_eq!(view.read(&file, 0, 8).unwrap(), b"bbb");
+    }
+
+    #[test]
+    fn version_grammar_descends_into_conflicted_dirs() {
+        // `d` is a directory in one head and a file in the other: a
+        // kind divergence at `d` itself. The dir version selects like
+        // any other version, and its subtree behaves as an ordinary
+        // directory from there down; the file version refuses walks.
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let f = chunk(&mut store, b"fff");
+        let sub_a = tree_of(
+            &mut store,
+            vec![Entry::file("a.txt", 3, false, vec![a]).unwrap()],
+        );
+        let root_a = tree_of(&mut store, vec![Entry::dir("d", sub_a).unwrap()]);
+        let root_b = tree_of(
+            &mut store,
+            vec![Entry::file("d", 3, false, vec![f]).unwrap()],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        let node = view.lookup("d").unwrap();
+        let Node::Conflict { mut versions } = node else {
+            panic!("kind divergence must conflict");
+        };
+        assert_eq!(versions.len(), 2);
+        versions.sort_by(|x, y| x.snapshot.as_bytes().cmp(y.snapshot.as_bytes()));
+        for (index, version) in versions.iter().enumerate() {
+            let qualified = format!("d@{}", index + 1);
+            assert_eq!(view.lookup(&qualified).unwrap(), version.node);
+            match &version.node {
+                Node::Dir { .. } => {
+                    assert_eq!(view.stat(&qualified).unwrap().kind, Kind::Dir);
+                    let selected = view.lookup(&qualified).unwrap();
+                    let entries = view.readdir(&selected).unwrap();
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].name, "a.txt");
+                    assert_eq!(
+                        view.lookup(&format!("{qualified}/a.txt")).unwrap(),
+                        Node::File {
+                            size: 3,
+                            executable: false,
+                            chunks: vec![a],
+                        }
+                    );
+                    assert_eq!(
+                        view.lookup(&format!("{qualified}/b.txt")),
+                        Err(ViewError::NotFound)
+                    );
+                    // Descending through a version's file is not a
+                    // directory walk.
+                    assert_eq!(
+                        view.lookup(&format!("{qualified}/a.txt/inner")),
+                        Err(ViewError::NotADirectory)
+                    );
+                }
+                Node::File { .. } => {
+                    assert_eq!(view.stat(&qualified).unwrap().kind, Kind::File);
+                    assert_eq!(
+                        view.lookup(&format!("{qualified}/a.txt")),
+                        Err(ViewError::NotADirectory)
+                    );
+                }
+                _ => unreachable!("single-tree versions are files, dirs, or symlinks"),
+            }
+        }
+    }
+
+    #[test]
+    fn readdir_never_lists_version_grammar() {
+        // The projected namespace is the user's data only: listings
+        // contain stored names, never version selectors.
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let root_a = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 3, false, vec![a]).unwrap()],
+        );
+        let root_b = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 3, false, vec![b]).unwrap()],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+        let root = view.readdir(&view.lookup("").unwrap()).unwrap();
+        assert_eq!(
+            root.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["f.txt"]
+        );
+        assert!(root.iter().all(|e| !e.name.contains('@')));
+
+        // A merged directory's union listing likewise carries only
+        // stored names, however many heads contributed them.
+        let mut store = MemoryObjectStore::default();
+        let x = chunk(&mut store, b"1");
+        let y = chunk(&mut store, b"2");
+        let sub_a = tree_of(
+            &mut store,
+            vec![Entry::file("a.txt", 1, false, vec![x]).unwrap()],
+        );
+        let sub_b = tree_of(
+            &mut store,
+            vec![Entry::file("b.txt", 1, false, vec![y]).unwrap()],
+        );
+        let root_a = tree_of(&mut store, vec![Entry::dir("d", sub_a).unwrap()]);
+        let root_b = tree_of(&mut store, vec![Entry::dir("d", sub_b).unwrap()]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+        let union = view.readdir(&view.lookup("d").unwrap()).unwrap();
+        let names: Vec<_> = union.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "b.txt"]);
+        assert!(names.iter().all(|name| !name.contains('@')));
+    }
+
+    #[test]
+    fn grammar_requires_a_conflict() {
+        // `@N` is only special behind a conflicted path: unconflicted
+        // or missing names have no version semantics, and their
+        // version-qualified spellings resolve as (absent) literals.
+        let view = view(small_drive());
+        assert_eq!(view.lookup("hello.txt@1"), Err(ViewError::NotFound));
+        assert_eq!(view.lookup("missing@1"), Err(ViewError::NotFound));
+        assert_eq!(view.lookup("hello.txt@x"), Err(ViewError::NotFound));
+        assert_eq!(view.lookup("hello.txt@0"), Err(ViewError::NotFound));
+    }
+
+    #[test]
+    fn out_of_range_versions_fail() {
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let root_a = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 3, false, vec![a]).unwrap()],
+        );
+        let root_b = tree_of(
+            &mut store,
+            vec![Entry::file("f.txt", 3, false, vec![b]).unwrap()],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+        assert_eq!(view.lookup("f.txt@3"), Err(ViewError::NotFound));
+        assert_eq!(view.lookup("f.txt@0"), Err(ViewError::NotFound));
     }
 
     #[test]

@@ -26,12 +26,14 @@ use crate::keys::random_bytes;
 use crate::keys::DeviceIdentitySecret;
 use zeroize::Zeroizing;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MailboxError {
     #[error("NIP-44 seal/open failed")]
     Crypto,
     #[error("a device key is not a valid secp256k1 key")]
     InvalidKey,
+    #[error("relay transport failed: {0}")]
+    Transport(String),
 }
 
 /// One NIP-44 sealed delivery: sender and recipient are Nostr-visible

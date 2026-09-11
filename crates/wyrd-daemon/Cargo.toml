@@ -13,9 +13,14 @@ wyrd-format.workspace = true
 wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
 fuser = "0.18"
+futures-util.workspace = true
 hex.workspace = true
 libc.workspace = true
+nostr.workspace = true
+nostr-connect.workspace = true
+nostr-sdk.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [lints]

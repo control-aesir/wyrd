@@ -12,5 +12,6 @@
 
 pub mod core;
 pub mod fuse;
+pub mod live_mailbox;
 
 pub use core::{Daemon, DaemonError};

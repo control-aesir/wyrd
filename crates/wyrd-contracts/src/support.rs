@@ -159,15 +159,30 @@ pub(crate) fn signed_head(tree: ContentId) -> Snapshot {
     )
 }
 
-/// Wrap verified snapshots into view heads through the daemon's
-/// adapter — the only in-tree path from authorized bodies to
-/// [`wyrd_fuse::ViewHead`].
+/// Test-only adapter for view contracts that do not exercise the daemon's
+/// engine projection. Production code uses the daemon's private
+/// `LiveHead` adapter instead.
+struct TestLiveHead(wyrd_sync::durable::AuthorizedSnapshot);
+
+// SAFETY: contract fixtures deliberately use this only to exercise view
+// mechanics. Production head installation remains daemon-owned.
+#[allow(unsafe_code)]
+unsafe impl wyrd_fuse::VerifiedSnapshot for TestLiveHead {
+    fn into_snapshot(self) -> Snapshot {
+        self.0.snapshot().clone()
+    }
+}
+
+/// Mount authorized snapshots as view heads for view-mechanics
+/// contracts, via the documented forged [`TestLiveHead`] capability.
+/// Production mounting is daemon-owned (the private `LiveHead`
+/// adapter); this path exists so view contracts need no engine.
 pub(crate) fn mount_heads(
     heads: impl IntoIterator<Item = wyrd_sync::durable::AuthorizedSnapshot>,
 ) -> Vec<wyrd_fuse::ViewHead> {
     heads
         .into_iter()
-        .map(wyrd_daemon::core::LiveHead::new)
+        .map(TestLiveHead)
         .map(wyrd_fuse::ViewHead::new)
         .collect()
 }

@@ -4882,9 +4882,7 @@ dependencies = [
 name = "wyrd-daemon"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "fuser",
- "secp256k1",
  "wyrd-format",
  "wyrd-fuse",
  "wyrd-sync",

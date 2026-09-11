@@ -147,12 +147,12 @@ fn open_fds_remain_stable_across_head_advancement() {
 /// view's boundary is safe-by-default: heads cross as `ViewHead`s,
 /// which safe code can build only from the verification capability —
 /// bypassing it takes an explicit `unsafe impl` (pinned by the
-/// `compile_fail` doctest on `VerifiedSnapshot`). Here the semantic
-/// half, through the supported composition path: authorization runs
-/// the BIP-340 check, so a body whose bytes are not covered by its
-/// signature is refused before any head can exist — while the signed
-/// body mounts and serves through the same path (architecture.md
-/// invariant 3).
+/// `compile_fail` doctest on `VerifiedSnapshot`; production mounting
+/// is the daemon's private `LiveHead` adapter). Here the semantic
+/// half: authorization runs the BIP-340 check before any head can
+/// exist, so a body whose bytes are not covered by its signature is
+/// refused — while the signed body mounts and serves through the
+/// same path (architecture.md invariant 3).
 #[test]
 fn forged_snapshots_are_rejected_before_fuse_head_installation() {
     use wyrd_sync::authorization::Rejection;

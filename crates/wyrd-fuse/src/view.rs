@@ -181,9 +181,10 @@ pub struct DriveView<S, M> {
 /// private body cannot be shared between crates at all. Every
 /// `unsafe impl` is a visible, greppable claim that the implementing
 /// type's construction is owned by the verification authority. In-tree
-/// there is exactly one: the daemon's `LiveHead`, whose inner
-/// `AuthorizedSnapshot` can only be produced by sync's BIP-340
-/// verification.
+/// the production impl is exactly one: the daemon's `LiveHead`, whose
+/// inner `AuthorizedSnapshot` can only be produced by sync's BIP-340
+/// verification; every other in-tree impl is a deliberately forged
+/// test fixture documented as asserting nothing real.
 ///
 /// A downstream wrapper around a raw snapshot cannot implement the
 /// capability in safe code — the audit marker is the only way across:

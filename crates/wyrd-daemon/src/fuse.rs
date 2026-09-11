@@ -123,7 +123,7 @@ fn attr_of(node: &Node) -> (fuser::FileType, u64, bool) {
         Node::File {
             size, executable, ..
         } => (fuser::FileType::RegularFile, *size, *executable),
-        Node::Dir { .. } => (fuser::FileType::Directory, 0, false),
+        Node::Dir { .. } | Node::MergedDir { .. } => (fuser::FileType::Directory, 0, false),
         Node::Symlink { .. } => (fuser::FileType::Symlink, 0, false),
         Node::Conflict { .. } => (fuser::FileType::Directory, 0, false),
     }

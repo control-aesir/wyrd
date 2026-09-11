@@ -10,14 +10,16 @@
 //! Presentation policy (v0, from `docs/sync-and-peers.md`):
 //!
 //! - DAG conflict and path conflict are distinct. Multiple heads that
-//!   resolve a path identically serve it normally; only genuine
-//!   per-path differences surface as [`Node::Conflict`]. Heads never
-//!   merge silently and no winner is picked.
-//! - Directory equality is structural (subtree identity). Differing
-//!   subtree ids surface as conflict even when the listings might
-//!   coincide — conservative and visible, never a quiet merge.
-//! - `readdir` on a conflicted directory lists the union of children,
-//!   each resolved across the conflicted versions, so navigation keeps
+//!   resolve a path identically serve it normally. A path that is a
+//!   directory in every head serves as one directory
+//!   ([`Node::MergedDir`]) whose children resolve per-path, so a DAG
+//!   conflict never manufactures a path conflict; subtree identity
+//!   short-circuits the merge but never defines it. Genuine kind
+//!   divergence — including presence versus deletion — and differing
+//!   leaf identity surface as [`Node::Conflict`]. Heads never merge
+//!   silently and no winner is picked.
+//! - `readdir` on a conflicted or merged directory lists the union of
+//!   children, each resolved across the versions, so navigation keeps
 //!   working through conflicts. Reading through a conflict node itself
 //!   fails with [`ViewError::Conflict`].
 //! - POSIX mapping happens only at the FUSE boundary, outside this
@@ -50,6 +52,14 @@ pub enum Node {
     },
     Symlink {
         target: String,
+    },
+    /// Every head resolves this path to a directory, but the directory
+    /// contents differ: a DAG conflict that is not a path conflict. The
+    /// path itself serves as one directory — `readdir` lists the union
+    /// of children, each resolved across the per-head subtrees, so a
+    /// child that agrees everywhere serves normally.
+    MergedDir {
+        subtrees: Vec<(wyrd_format::SnapshotId, ContentId)>,
     },
     /// The heads disagree at this path. Versions list only the heads
     /// where the path resolves; absence elsewhere is part of the
@@ -184,9 +194,11 @@ where
         Ok(attr(&self.lookup(path)?))
     }
 
-    /// List a directory's children. On a conflicted directory, lists
-    /// the union of children with each resolved across the conflicted
-    /// versions.
+    /// List a directory's children. On a conflicted or merged
+    /// directory, lists the union of children with each resolved
+    /// across the versions, so navigation keeps working: children that
+    /// agree everywhere serve normally, and only genuine per-child
+    /// divergence conflicts.
     pub fn readdir(&self, node: &Node) -> Result<Vec<DirEntry>, ViewError> {
         match node {
             Node::Dir { subtree } => {
@@ -201,6 +213,7 @@ where
                     })
                     .collect()
             }
+            Node::MergedDir { subtrees } => self.readdir_union(subtrees.clone()),
             Node::Conflict { versions } => {
                 let mut subtrees = Vec::with_capacity(versions.len());
                 for version in versions {
@@ -210,39 +223,49 @@ where
                         // only the dir side; the non-dir versions stay
                         // visible on the conflict node itself.
                         Node::File { .. } | Node::Symlink { .. } => {}
-                        Node::Conflict { .. } => {}
+                        Node::MergedDir { .. } | Node::Conflict { .. } => {}
                     }
                 }
-                let mut names = BTreeSet::new();
-                let mut trees = BTreeMap::new();
-                for (snapshot, subtree) in subtrees {
-                    let tree = self.load_tree(&subtree)?;
-                    for entry in tree.entries() {
-                        names.insert(entry.name.as_str().to_string());
-                    }
-                    trees.insert(snapshot, tree);
-                }
-                names
-                    .into_iter()
-                    .map(|name| {
-                        let mut resolutions = Vec::with_capacity(trees.len());
-                        for (snapshot, tree) in &trees {
-                            let node = tree
-                                .entries()
-                                .iter()
-                                .find(|entry| entry.name.as_str() == name)
-                                .map(|entry| leaf(&entry.content));
-                            resolutions.push((*snapshot, node));
-                        }
-                        Ok(DirEntry {
-                            name,
-                            node: merge(resolutions)?,
-                        })
-                    })
-                    .collect()
+                self.readdir_union(subtrees)
             }
             Node::File { .. } | Node::Symlink { .. } => Err(ViewError::NotADirectory),
         }
+    }
+
+    /// The union of children across per-head directory subtrees, each
+    /// name resolved across every source (absence included, so a child
+    /// deleted in one head conflicts rather than vanishing).
+    fn readdir_union(
+        &self,
+        subtrees: Vec<(wyrd_format::SnapshotId, ContentId)>,
+    ) -> Result<Vec<DirEntry>, ViewError> {
+        let mut names = BTreeSet::new();
+        let mut trees = BTreeMap::new();
+        for (snapshot, subtree) in &subtrees {
+            let tree = self.load_tree(subtree)?;
+            for entry in tree.entries() {
+                names.insert(entry.name.as_str().to_string());
+            }
+            trees.insert(*snapshot, tree);
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let mut resolutions = Vec::with_capacity(trees.len());
+                for (snapshot, tree) in &trees {
+                    let node = tree
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.name.as_str() == name)
+                        .map(|entry| leaf(&entry.content));
+                    resolutions.push((*snapshot, node));
+                }
+                Ok(DirEntry {
+                    name,
+                    node: merge(resolutions)?,
+                })
+            })
+            .collect()
     }
 
     /// Open a file for reading. Directory, symlink, and conflict
@@ -254,7 +277,9 @@ where
                 size: *size,
             }),
             Node::Conflict { .. } => Err(ViewError::Conflict),
-            Node::Dir { .. } | Node::Symlink { .. } => Err(ViewError::NotAFile),
+            Node::Dir { .. } | Node::MergedDir { .. } | Node::Symlink { .. } => {
+                Err(ViewError::NotAFile)
+            }
         }
     }
 
@@ -400,10 +425,14 @@ where
 }
 
 /// Merge per-head resolutions: unanimous absence is not-found,
-/// unanimous presence with agreement serves, anything else is a
-/// conflict. Presence versus deletion disagrees — deletion is a state
-/// change, so a path surviving in only some heads never serves
-/// quietly. Versions list only the heads where the path resolves.
+/// unanimous presence with agreement serves, presence with all-dir
+/// disagreement merges structurally — the path is a directory in every
+/// head, so it serves as one directory and only its children can
+/// conflict. Anything else — kind divergence, presence versus deletion,
+/// differing leaf identity — is a path conflict. Presence versus
+/// deletion disagrees — deletion is a state change, so a path surviving
+/// in only some heads never serves quietly. Versions list only the
+/// heads where the path resolves.
 fn merge(resolutions: Vec<(wyrd_format::SnapshotId, Option<Node>)>) -> Result<Node, ViewError> {
     let mut present = Vec::with_capacity(resolutions.len());
     for (snapshot, node) in &resolutions {
@@ -414,9 +443,14 @@ fn merge(resolutions: Vec<(wyrd_format::SnapshotId, Option<Node>)>) -> Result<No
     if present.is_empty() {
         return Err(ViewError::NotFound);
     }
-    let first = &present[0].1;
-    if present.len() == resolutions.len() && present.iter().all(|(_, node)| node == first) {
-        return Ok(first.clone());
+    if present.len() == resolutions.len() {
+        let first = &present[0].1;
+        if present.iter().all(|(_, node)| node == first) {
+            return Ok(first.clone());
+        }
+        if let Some(subtrees) = all_dirs(&present) {
+            return Ok(Node::MergedDir { subtrees });
+        }
     }
     Ok(Node::Conflict {
         versions: present
@@ -424,6 +458,20 @@ fn merge(resolutions: Vec<(wyrd_format::SnapshotId, Option<Node>)>) -> Result<No
             .map(|(snapshot, node)| ConflictVersion { snapshot, node })
             .collect(),
     })
+}
+
+/// The per-head subtrees when every head resolves the path to a
+/// directory, or `None` when any head resolves to a different kind.
+fn all_dirs(
+    present: &[(wyrd_format::SnapshotId, Node)],
+) -> Option<Vec<(wyrd_format::SnapshotId, ContentId)>> {
+    present
+        .iter()
+        .map(|(snapshot, node)| match node {
+            Node::Dir { subtree } => Some((*snapshot, *subtree)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A single tree entry's content as a node.
@@ -455,7 +503,7 @@ fn attr(node: &Node) -> Attr {
             size: *size,
             executable: *executable,
         },
-        Node::Dir { .. } => Attr {
+        Node::Dir { .. } | Node::MergedDir { .. } => Attr {
             kind: Kind::Dir,
             size: 0,
             executable: false,
@@ -803,7 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn divergent_dirs_list_the_union() {
+    fn divergent_root_dirs_merge_structurally() {
+        // The roots differ per head, but every head resolves the root
+        // to a directory: the DAG conflict must not manufacture a path
+        // conflict at the root itself. The union lists both names, and
+        // each name resolves per-path — present in one head and absent
+        // in the other is a state change, so it conflicts.
         let mut store = MemoryObjectStore::default();
         let x = chunk(&mut store, b"1");
         let y = chunk(&mut store, b"2");
@@ -822,7 +875,8 @@ mod tests {
         );
 
         let root = view.lookup("").unwrap();
-        assert!(matches!(root, Node::Conflict { .. }));
+        assert!(matches!(root, Node::MergedDir { .. }));
+        assert_eq!(view.stat("").unwrap().kind, Kind::Dir);
         let mut names: Vec<String> = view
             .readdir(&root)
             .unwrap()
@@ -831,6 +885,162 @@ mod tests {
             .collect();
         names.sort_unstable();
         assert_eq!(names, vec!["x.txt", "y.txt"]);
+        // Each name survives in exactly one head: deletion is a state
+        // change, so the child conflicts instead of serving.
+        assert!(matches!(view.lookup("x.txt"), Ok(Node::Conflict { .. })));
+    }
+
+    #[test]
+    fn same_path_dirs_merge_structurally() {
+        // The M1 scenario: /dir differs per head only below itself.
+        // The DAG conflict stays at the subtree level — /dir serves as
+        // one directory, the shared child serves normally, and each
+        // head's private child serves through the merged path.
+        let mut store = MemoryObjectStore::default();
+        let common = chunk(&mut store, b"shared");
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let dir_a = tree_of(
+            &mut store,
+            vec![
+                Entry::file("common.txt", 6, false, vec![common]).unwrap(),
+                Entry::file("file-a.txt", 3, false, vec![a]).unwrap(),
+            ],
+        );
+        let dir_b = tree_of(
+            &mut store,
+            vec![
+                Entry::file("common.txt", 6, false, vec![common]).unwrap(),
+                Entry::file("file-b.txt", 3, false, vec![b]).unwrap(),
+            ],
+        );
+        let root_a = tree_of(&mut store, vec![Entry::dir("dir", dir_a).unwrap()]);
+        let root_b = tree_of(&mut store, vec![Entry::dir("dir", dir_b).unwrap()]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        let dir = view.lookup("dir").unwrap();
+        assert!(matches!(dir, Node::MergedDir { .. }));
+        assert_eq!(view.stat("dir").unwrap().kind, Kind::Dir);
+
+        let mut entries: Vec<(String, Node)> = view
+            .readdir(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name, entry.node))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries.len(), 3);
+        // The shared child exists in every head: it serves as a file.
+        assert!(matches!(entries[0], (ref name, Node::File { .. }) if name == "common.txt"));
+        // Each private child survives in exactly one head: the union
+        // lists it, and the survival-versus-deletion disagreement
+        // conflicts at the child — never quietly serving one side.
+        assert!(
+            matches!(&entries[1], (name, Node::Conflict { versions }) if name == "file-a.txt" && versions.len() == 1)
+        );
+        assert!(
+            matches!(&entries[2], (name, Node::Conflict { versions }) if name == "file-b.txt" && versions.len() == 1)
+        );
+
+        // The shared child opens and reads through the merged dir.
+        let file = view.open(&view.lookup("dir/common.txt").unwrap()).unwrap();
+        assert_eq!(view.read(&file, 0, 6).unwrap(), b"shared");
+    }
+
+    #[test]
+    fn identical_subtrees_short_circuit() {
+        // Heads diverge at the root but agree on /dir: the subtree id
+        // is the merge short-circuit, so the path serves as a plain
+        // directory — and a child inside it resolves without any
+        // per-head walk.
+        let mut store = MemoryObjectStore::default();
+        let x = chunk(&mut store, b"1");
+        let y = chunk(&mut store, b"2");
+        let nested = chunk(&mut store, b"nested");
+        let inner = tree_of(
+            &mut store,
+            vec![Entry::file("n.txt", 6, false, vec![nested]).unwrap()],
+        );
+        let root_a = tree_of(
+            &mut store,
+            vec![
+                Entry::dir("dir", inner).unwrap(),
+                Entry::file("x.txt", 1, false, vec![x]).unwrap(),
+            ],
+        );
+        let root_b = tree_of(
+            &mut store,
+            vec![
+                Entry::dir("dir", inner).unwrap(),
+                Entry::file("y.txt", 1, false, vec![y]).unwrap(),
+            ],
+        );
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        assert!(matches!(view.lookup("dir"), Ok(Node::Dir { .. })));
+        let root = view.lookup("").unwrap();
+        let dir_entry = view
+            .readdir(&root)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "dir")
+            .unwrap();
+        assert!(matches!(dir_entry.node, Node::Dir { .. }));
+        // The other root child is a presence/deletion conflict.
+        assert!(matches!(view.lookup("x.txt"), Ok(Node::Conflict { .. })));
+    }
+
+    #[test]
+    fn nested_divergence_merges_recursively() {
+        // /dir agrees on its name everywhere but its /dir/sub differs
+        // per head: listing the merged /dir must surface sub as a
+        // merged directory too, not a conflict — the structural merge
+        // applies at every level.
+        let mut store = MemoryObjectStore::default();
+        let a = chunk(&mut store, b"aaa");
+        let b = chunk(&mut store, b"bbb");
+        let sub_a = tree_of(
+            &mut store,
+            vec![Entry::file("a.txt", 3, false, vec![a]).unwrap()],
+        );
+        let sub_b = tree_of(
+            &mut store,
+            vec![Entry::file("b.txt", 3, false, vec![b]).unwrap()],
+        );
+        let dir_a = tree_of(&mut store, vec![Entry::dir("sub", sub_a).unwrap()]);
+        let dir_b = tree_of(&mut store, vec![Entry::dir("sub", sub_b).unwrap()]);
+        let root_a = tree_of(&mut store, vec![Entry::dir("dir", dir_a).unwrap()]);
+        let root_b = tree_of(&mut store, vec![Entry::dir("dir", dir_b).unwrap()]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        let dir = view.lookup("dir").unwrap();
+        let sub_entry = view
+            .readdir(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "sub")
+            .unwrap();
+        assert!(matches!(sub_entry.node, Node::MergedDir { .. }));
+        // Navigating into it works, and the shared structure resolves
+        // per-path: a.txt survives in one head only, so it conflicts
+        // there rather than serving quietly.
+        let child = view.lookup("dir/sub/a.txt").unwrap();
+        let Node::Conflict { versions } = &child else {
+            panic!("one-sided child must conflict, got {child:?}");
+        };
+        assert_eq!(versions.len(), 1);
     }
 
     #[test]
@@ -1038,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_child_inside_a_conflicted_dir() {
+    fn deleted_child_inside_a_merged_dir() {
         let mut store = MemoryObjectStore::default();
         let x = chunk(&mut store, b"1");
         let sub_a = tree_of(
@@ -1054,8 +1264,14 @@ mod tests {
             vec![snapshot(root_a), snapshot(root_b)],
         );
 
+        // Both heads resolve /d to a directory: the DAG conflict at
+        // the subtree must not surface as a path conflict — /d merges
+        // structurally.
         let dir = view.lookup("d").unwrap();
-        assert!(matches!(dir, Node::Conflict { .. }));
+        assert!(matches!(dir, Node::MergedDir { .. }));
+        // The deletion lives at the child: present in one head,
+        // deleted in the other, so the child conflicts and the union
+        // still lists it.
         let entries = view.readdir(&dir).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "x.txt");
@@ -1066,6 +1282,52 @@ mod tests {
             );
         };
         assert_eq!(versions.len(), 1);
+    }
+
+    #[test]
+    fn merged_dir_child_kind_divergence_conflicts() {
+        // A MergedDir's child that is a directory in one head and a
+        // file in the other: the structural merge applies only where
+        // every head agrees on the kind, so the child is a genuine
+        // path conflict — both versions visible on the conflict node,
+        // and the dir side stays navigable through the union.
+        let mut store = MemoryObjectStore::default();
+        let f = chunk(&mut store, b"fff");
+        let inner = chunk(&mut store, b"iii");
+        let x_dir = tree_of(
+            &mut store,
+            vec![Entry::file("deep.txt", 3, false, vec![inner]).unwrap()],
+        );
+        let dir_a = tree_of(&mut store, vec![Entry::dir("x", x_dir).unwrap()]);
+        let dir_b = tree_of(
+            &mut store,
+            vec![Entry::file("x", 3, false, vec![f]).unwrap()],
+        );
+        let root_a = tree_of(&mut store, vec![Entry::dir("dir", dir_a).unwrap()]);
+        let root_b = tree_of(&mut store, vec![Entry::dir("dir", dir_b).unwrap()]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        // The parent path is a directory in every head: merged.
+        let dir = view.lookup("dir").unwrap();
+        assert!(matches!(dir, Node::MergedDir { .. }));
+        // The child disagrees on kind: a real path conflict.
+        let entries = view.readdir(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x");
+        let Node::Conflict { versions } = &entries[0].node else {
+            panic!("kind divergence must conflict, got {:?}", entries[0].node);
+        };
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().any(|v| matches!(v.node, Node::Dir { .. })));
+        assert!(versions.iter().any(|v| matches!(v.node, Node::File { .. })));
+        // The conflict node lists only the dir side's children.
+        let union = view.readdir(&entries[0].node).unwrap();
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].name, "deep.txt");
     }
 
     #[test]

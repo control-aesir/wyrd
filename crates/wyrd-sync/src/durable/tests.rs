@@ -95,7 +95,7 @@ fn authorized_capability(
         vec![EpochSecret::from_bytes([0xAA; 32])],
     )
     .unwrap();
-    AuthorizedCapability::authorize(cap, &state, genesis).unwrap()
+    AuthorizedCapability::authorize(cap, drive(), &state, genesis).unwrap()
 }
 
 fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
@@ -645,7 +645,7 @@ fn authorize_rejects_foreign_transition_and_epoch() {
     )
     .unwrap();
     assert_eq!(
-        AuthorizedCapability::authorize(cap, &child_state, &child),
+        AuthorizedCapability::authorize(cap, drive(), &child_state, &child),
         Err(CapabilityError::TransitionMismatch {
             expected: child.transition_id(),
             found: genesis.transition_id(),
@@ -664,12 +664,83 @@ fn authorize_rejects_foreign_transition_and_epoch() {
     )
     .unwrap();
     assert_eq!(
-        AuthorizedCapability::authorize(short, &child_state, &child),
+        AuthorizedCapability::authorize(short, drive(), &child_state, &child),
         Err(CapabilityError::EpochMismatch {
             declared: 2,
             carried: 1
         })
     );
+}
+
+/// A capability record can be authenticated under the store key and
+/// still disagree with the transition it names — disk tampering or a
+/// buggy writer. Rebuild re-applies the full authorization predicate
+/// and refuses to install; the store cannot be opened into a state
+/// holding foreign secrets.
+#[test]
+fn rebuild_rejects_a_capability_inconsistent_with_its_transition() {
+    let (genesis, _) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    let state = log.state_of(&genesis.transition_id()).unwrap();
+    let registered = state.encryption_key_of(&owner()).unwrap();
+    // Bound to genesis but covering three epochs: the type gate never
+    // produces this (genesis is epoch 1), so only a tampered or
+    // legacy record could.
+    let tampered = AuthorizedCapability {
+        cap: Capability::new(
+            drive(),
+            owner(),
+            *registered,
+            genesis.transition_id(),
+            3,
+            vec![EpochSecret::from_bytes([0xAA; 32]); 3],
+        )
+        .unwrap(),
+    };
+    let dir = TestDir::new("rebuild-binding");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&[Fact::Transition(genesis)]).unwrap();
+    store.commit(&[Fact::Capability(tampered)]).unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(matches!(
+        store.rebuild(owner()),
+        Err(DurableError::Capability(CapabilityError::EpochMismatch {
+            declared: 1,
+            carried: 3
+        }))
+    ));
+}
+
+/// A capability record for another drive, sealed under the store key:
+/// the decode boundary already drops it, so the commit is unreadable
+/// store damage and nothing installs.
+#[test]
+fn rebuild_rejects_a_record_for_another_drive() {
+    let (genesis, _) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    let state = log.state_of(&genesis.transition_id()).unwrap();
+    let registered = state.encryption_key_of(&owner()).unwrap();
+    let foreign = AuthorizedCapability {
+        cap: Capability::new(
+            DriveId::from_bytes([0xDE; 32]),
+            owner(),
+            *registered,
+            genesis.transition_id(),
+            1,
+            vec![EpochSecret::from_bytes([0xAA; 32])],
+        )
+        .unwrap(),
+    };
+    let dir = TestDir::new("rebuild-drive");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&[Fact::Transition(genesis)]).unwrap();
+    store.commit(&[Fact::Capability(foreign)]).unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
 }
 
 /// A clean commit round-trips exactly: no crash, no loss.

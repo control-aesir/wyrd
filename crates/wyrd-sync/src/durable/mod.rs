@@ -106,7 +106,7 @@ pub use store::DurableStore;
 
 use thiserror::Error;
 use wyrd_format::{
-    ContentId, DeviceId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
+    ContentId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
 };
 
 use crate::authorization::predicates::verify_snapshot;
@@ -154,8 +154,6 @@ pub enum DurableError {
     MissingCommit(u64),
     #[error("commit sequence exhausted")]
     SequenceExhausted,
-    #[error("capability for {0:?} no longer validates on rebuild")]
-    CapabilityChanged(DeviceId),
     #[error("capability references a transition with no derived state")]
     CapabilityTransitionUnknown,
 }
@@ -171,18 +169,24 @@ pub struct AuthorizedCapability {
 }
 
 impl AuthorizedCapability {
-    /// Validate the capability against the authoritative membership state
-    /// (member with the registered encryption key) and the transition
-    /// that authorizes it, then wrap it for durability. The transition
-    /// binding is checked, not trusted: the bound id must equal the
-    /// authorizing transition's id, and the covered epoch must equal
-    /// its epoch — a capability carrying secrets for another epoch
-    /// never commits, however it was constructed.
+    /// The single authorization predicate for a capability: it is
+    /// authorized for the engine's `drive`, against the membership
+    /// state `transition` produces, and bound to that transition's
+    /// id and epoch. A capability minted, wrapped, or hand-built for
+    /// another drive, another transition, or another epoch never
+    /// commits — whatever path produced it.
     pub fn authorize(
         cap: Capability,
+        drive: DriveId,
         state: &MembershipState,
         transition: &MembershipTransition,
     ) -> Result<Self, CapabilityError> {
+        if cap.drive != drive {
+            return Err(CapabilityError::DriveMismatch {
+                expected: drive,
+                found: cap.drive,
+            });
+        }
         cap.validate_against(state)?;
         if cap.transition != transition.transition_id() {
             return Err(CapabilityError::TransitionMismatch {

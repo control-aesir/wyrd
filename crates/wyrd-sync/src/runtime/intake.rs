@@ -237,11 +237,16 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
         Some(transition) => transition,
         None => return Action::Defer,
     };
+    // The authorizing state and transition are fetched together (the
+    // log analysis is identical for both), and the engine's own drive
+    // is part of the authorization predicate: a capability targeting a
+    // different drive suppresses here, even when its membership
+    // binding is otherwise valid.
     let state = match engine.log.state_of(&capability.transition) {
         Some(state) => state,
         None => return Action::Defer,
     };
-    match AuthorizedCapability::authorize(capability, &state, transition) {
+    match AuthorizedCapability::authorize(capability, engine.drive(), &state, transition) {
         Ok(authorized) => Action::Commit(vec![
             Fact::Capability(authorized),
             Fact::ControlMessage(*id),
@@ -262,7 +267,7 @@ mod tests {
 
     use secp256k1::SecretKey;
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-    use wyrd_format::{Change, DeviceId, TransitionId};
+    use wyrd_format::{Change, DeviceId, DriveId, TransitionId};
     use zeroize::Zeroizing;
 
     use crate::control::{CapabilityPayload, Message, TransitionPayload};
@@ -920,6 +925,56 @@ mod tests {
             wrapped: cap.wrap().expect("wraps").as_bytes().to_vec(),
         });
         let mail = vec![deliver(&fixture, 1, &delivery)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1, "mismatch suppresses, never defers");
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty(), "no capability installs");
+    }
+
+    #[test]
+    fn capability_for_another_drive_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+
+        // Transitions land first so the capability authorizes against
+        // observed history instead of deferring.
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&admission)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+
+        // Well-formed against the admission transition in every other
+        // checked field — member, registered key, bound transition,
+        // covered epoch — except the drive. The control envelope is
+        // valid for the local drive; the nested capability is not, so
+        // the drive gate is what suppresses, without a capability fact.
+        let cap = Capability::new(
+            DriveId::from_bytes([0xDE; 32]),
+            device,
+            encryption_key(&encryption_sk),
+            admission.transition_id(),
+            2,
+            vec![EpochSecret::from_bytes([0x07; 32]); 2],
+        )
+        .expect("well-formed");
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped: cap.wrap().expect("wraps").as_bytes().to_vec(),
+        });
+        // Envelope epoch must equal the payload epoch, so the delivery
+        // is sealed with the epoch-2 control key.
+        let mail = vec![deliver(&fixture, 2, &delivery)];
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
         assert_eq!(report.accepted, 1, "mismatch suppresses, never defers");

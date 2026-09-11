@@ -78,6 +78,8 @@ pub enum CapabilityError {
         expected: TransitionId,
         found: TransitionId,
     },
+    #[error("capability targets drive {found} but is authorized for {expected}")]
+    DriveMismatch { expected: DriveId, found: DriveId },
 }
 
 impl Capability {

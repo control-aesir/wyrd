@@ -13,7 +13,7 @@
 use wyrd_format::{ContentId, DeviceId, DriveId, MembershipTransition, Snapshot};
 
 use super::codec::DecodedFact;
-use super::DurableError;
+use super::{AuthorizedCapability, DurableError};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::capability::DriveKeyring;
@@ -117,12 +117,19 @@ pub(super) fn rebuild_facts(
             // devices, but a keyring serves exactly one.
             continue;
         }
+        // The full authorization predicate — drive, membership/key
+        // binding, exact transition id, exact covered epoch — is
+        // re-applied at the persistence boundary so a record that
+        // passed the store-key envelope can never install a capability
+        // whose transition binding was tampered or stale.
+        let transition = log
+            .transition(&cap.transition)
+            .ok_or(DurableError::CapabilityTransitionUnknown)?;
         let state = log
             .state_of(&cap.transition)
             .ok_or(DurableError::CapabilityTransitionUnknown)?;
-        cap.validate_against(&state)
-            .map_err(|_| DurableError::CapabilityChanged(cap.device))?;
-        keyring.install(cap, &state)?;
+        let authorized = AuthorizedCapability::authorize(cap.clone(), *drive, &state, transition)?;
+        keyring.install(authorized.capability(), &state)?;
     }
     let mut runtime = RuntimeState::new(*drive);
     for fact in facts.runtime_facts {

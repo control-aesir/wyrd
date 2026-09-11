@@ -63,10 +63,10 @@ bytes = "1"
 futures-util = "0.3"
 n0-future = "0.3"
 
-# nostr protocol (control-plane transport only: NIP-44 mailbox encryption;
-# object encryption stays Wyrd-owned per T11). Pinned with the iroh set above:
-# bump together and run the full suite.
-nostr = { version = "0.45", default-features = false, features = ["std", "nip44"] }
+# nostr protocol (control-plane transport only: NIP-44 + NIP-59 gift wrap
+# mailbox framing; object encryption stays Wyrd-owned per T11). Pinned with
+# the iroh set above: bump together and run the full suite.
+nostr = { version = "0.45.5", default-features = false, features = ["std", "nip44", "nip59", "os-rng"] }
 nostr-connect = "0.45"
 nostr-sdk = { version = "0.45.2", default-features = false, features = ["rustls-tls-webpki-roots"] }
 

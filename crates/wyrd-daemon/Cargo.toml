@@ -23,5 +23,11 @@ thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+serde_json = "1"
+# In-process websocket relay for live mailbox integration tests (test-only:
+# a minimal NIP-01 server; never a runtime dependency).
+tokio-tungstenite = "0.28"
+
 [lints]
 workspace = true

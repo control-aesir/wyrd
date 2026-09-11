@@ -8,7 +8,7 @@ use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 
-const USAGE: &str = "usage:\n  wyrd-daemon init <drive-dir> --identity-file <path> --passphrase-file <path>\n  wyrd-daemon mount <drive-dir> <mountpoint> --identity-file <path> --passphrase-file <path>";
+const USAGE: &str = "usage:\n  wyrd init <drive-dir> --identity-file <path> --passphrase-file <path>\n  wyrd mount <drive-dir> <mountpoint> --identity-file <path> --passphrase-file <path>\n\nThe mount is a static startup projection; live sync and fetch-on-open are not yet enabled.";
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -32,6 +32,9 @@ enum CliError {
 }
 
 fn required_option(args: &mut Vec<String>, name: &str) -> Result<PathBuf, CliError> {
+    if args.iter().filter(|arg| arg.as_str() == name).count() > 1 {
+        return Err(CliError::Usage(format!("duplicate option {name}")));
+    }
     let Some(index) = args.iter().position(|arg| arg == name) else {
         return Err(CliError::Usage(format!("missing {name}")));
     };
@@ -51,13 +54,16 @@ fn read_file(path: &Path) -> Result<Vec<u8>, CliError> {
 
 fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
     let bytes = read_file(path)?;
-    let trimmed = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    let raw = if trimmed.len() == 32 {
+    let raw = if bytes.len() == 32 {
         let mut raw = [0; 32];
-        raw.copy_from_slice(trimmed);
+        raw.copy_from_slice(&bytes);
         raw
-    } else if trimmed.len() == 64 {
-        let decoded = hex::decode(trimmed).map_err(|_| CliError::IdentityFormat)?;
+    } else if let Ok(text) = std::str::from_utf8(&bytes) {
+        let text = text.trim_matches(|character: char| character.is_ascii_whitespace());
+        if text.len() != 64 {
+            return Err(CliError::IdentityFormat);
+        }
+        let decoded = hex::decode(text).map_err(|_| CliError::IdentityFormat)?;
         let mut raw = [0; 32];
         raw.copy_from_slice(&decoded);
         raw
@@ -80,7 +86,10 @@ fn command(mut args: Vec<String>) -> Result<(), CliError> {
     let identity = read_identity(&identity_file)?;
     let passphrase = String::from_utf8(read_file(&passphrase_file)?)
         .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?;
-    let passphrase = passphrase.trim_end_matches(['\r', '\n']);
+    let passphrase = passphrase
+        .strip_suffix("\r\n")
+        .or_else(|| passphrase.strip_suffix('\n'))
+        .unwrap_or(&passphrase);
 
     match subcommand.as_str() {
         "init" if args.len() == 1 => {
@@ -104,6 +113,9 @@ fn mount(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    // This local slice installs the durable projection once. The live
+    // mailbox drainer and fetch-on-open lifecycle are a later runtime
+    // issue; they must not be implied by this blocking mount command.
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
     let mut daemon = Daemon::new(
         engine,
@@ -181,7 +193,7 @@ mod tests {
     fn hex_identity_files_are_supported() {
         let temp = TempDir::new();
         let identity_file = temp.0.join("identity");
-        fs::write(&identity_file, hex::encode([0x11; 32])).unwrap();
+        fs::write(&identity_file, format!("{}\r\n", hex::encode([0x11; 32]))).unwrap();
         assert_eq!(
             read_identity(&identity_file).unwrap().as_bytes(),
             &[0x11; 32]
@@ -189,8 +201,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_identity_bytes_are_not_trimmed() {
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        let mut identity = [0x11; 32];
+        identity[31] = b'\n';
+        fs::write(&identity_file, identity).unwrap();
+        assert!(read_identity(&identity_file).is_ok());
+    }
+
+    #[test]
     fn missing_options_are_usage_errors() {
         let error = command(vec!["init".into(), "/tmp/drive".into()]).unwrap_err();
         assert!(matches!(error, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn duplicate_options_are_usage_errors() {
+        let error = command(vec![
+            "init".into(),
+            "/tmp/drive".into(),
+            "--identity-file".into(),
+            "one".into(),
+            "--identity-file".into(),
+            "two".into(),
+            "--passphrase-file".into(),
+            "pass".into(),
+        ])
+        .unwrap_err();
+        assert!(matches!(error, CliError::Usage(message) if message.contains("duplicate")));
     }
 }

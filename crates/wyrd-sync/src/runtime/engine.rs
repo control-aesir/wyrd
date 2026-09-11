@@ -20,20 +20,22 @@
 //! undecodable / wrong drive ..... discarded as terminal poison (no fact)
 //! unknown epoch key ............. skipped, left unacked for redelivery
 //! forged or undecryptable ....... seen-id committed (poison suppression)
-//! capability, state unknown ..... held in-memory, retried as transitions land
+//! capability, state unknown ..... held pending and relay-retained; retried as transitions land
 //! capability, unauthorized ..... seen-id committed (derived state is immutable)
 //! capability, undecryptable ..... seen-id committed (deterministic)
-//! announcement, membership unseen  held in-memory, retried as transitions land
-//! announcement, noncanonical .... held in-memory, retried as membership resolves
+//! announcement, membership unseen  held pending and relay-retained; retried as transitions land
+//! announcement, noncanonical .... held pending and relay-retained; retried as membership resolves
 //! announcement, invalid ......... seen-id committed (verdicts are final)
 //! announcement, epoch mismatched . seen-id committed (epochs are immutable)
 //! held-message overflow ......... left unacked (pending is bounded; relay retains)
 //! ```
 //!
-//! A message held in memory is lost on crash, but it was never
-//! committed — so the durable seen set lacks it and relay redelivery
-//! processes it fresh after rehydration. The relay retaining unacked
-//! deliveries is the assumption this depends on.
+//! Pending is a fast path, not the recovery path: a held message is
+//! also retained by the relay, so a crash loses only the in-memory
+//! fast path. The message was never committed, so the durable seen set
+//! lacks it, and relay redelivery processes it fresh after rehydration.
+//! The relay retaining unacked deliveries is the assumption this
+//! depends on.
 //!
 //! [`Mailbox`]: crate::transport::mailbox::Mailbox
 //! [`BulkSource`]: crate::bulk::BulkSource

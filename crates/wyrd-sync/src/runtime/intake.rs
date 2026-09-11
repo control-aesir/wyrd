@@ -22,8 +22,9 @@ enum Action {
 enum Outcome {
     Accepted,
     Duplicate,
-    /// Held in the engine's pending map; the drain settles `Ack` (the
-    /// engine, not the relay, owns the retry).
+    /// Held in the engine's pending map for transition-triggered
+    /// re-drive. The relay retains the envelope as the crash backstop
+    /// (pending is volatile), so the drain settles `Retry`.
     Deferred,
     /// Shed past the pending bound: the engine holds nothing, so the
     /// drain settles `Retry` and the relay retains the envelope.
@@ -63,7 +64,7 @@ pub(super) fn drain(
             }
             Outcome::Deferred => {
                 report.deferred += 1;
-                Disposition::Ack
+                Disposition::Retry
             }
             Outcome::RelayHeld => {
                 report.deferred += 1;
@@ -343,6 +344,42 @@ mod tests {
         assert_eq!(report.duplicates, 2);
         assert_eq!(report.accepted, 0);
         assert_eq!(engine.current(), 2);
+    }
+
+    #[test]
+    fn deferred_message_survives_restart_before_unblock() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let bound = announcement_for(2, child.transition_id());
+        // The announcement arrives before its transition: held in
+        // pending, nothing committed.
+        let mail = vec![deliver(&fixture, 2, &bound)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(fixture.engine.pending_count(), 1);
+
+        // Restart before the transition lands: volatile pending is
+        // gone, but the unsettled relay copy must survive the crash.
+        let mut engine = reopen(&mut fixture);
+        let unblock = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, unblock);
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        let report = engine.drain(&mut mailbox).unwrap();
+        assert_eq!(report.accepted, 2);
+        // ...and the redelivered announcement commits against the
+        // transitions exactly once.
+        let facts = engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1);
+        assert_eq!(engine.pending_count(), 0);
     }
 
     #[test]

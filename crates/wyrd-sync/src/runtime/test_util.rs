@@ -75,7 +75,13 @@ pub(crate) struct MemoryRelay {
 impl MemoryRelay {
     pub(crate) fn push(&mut self, envelope: MailboxEnvelope) {
         let id = DeliveryId::new(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1);
+        // Test-only counter: exhausting u64 is unreachable, but wrap
+        // would silently violate the uniqueness contract, so fail
+        // loudly instead of wrapping.
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("delivery id space exhausted");
         self.queue.push_back(Slot { id, envelope });
     }
 }

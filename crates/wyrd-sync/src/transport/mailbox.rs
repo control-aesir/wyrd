@@ -187,12 +187,13 @@ impl Delivery {
 /// retains them all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
-    /// Permanently consume: the engine took responsibility — durably
-    /// committed (including poison-suppression commits), or held in
-    /// the in-memory pending map — so the relay may discard the
+    /// Permanently consume: the engine took durable responsibility —
+    /// facts committed (including poison-suppression commits), or an
+    /// already-committed id redelivered — so the relay may discard the
     /// envelope. Safe to repeat: redelivery of a committed message is
     /// a duplicate no-op, so a lost ack degrades to one redundant
-    /// offer.
+    /// offer. In-memory pending holds are NOT durable responsibility:
+    /// they settle `Retry` so the relay keeps the crash backstop.
     Ack,
     /// Leave for redelivery: the engine holds nothing for this
     /// envelope, so the relay MUST retain it.
@@ -227,7 +228,13 @@ mod tests {
     impl MemoryRelay {
         fn push(&mut self, envelope: MailboxEnvelope) {
             let id = DeliveryId::new(self.next_id);
-            self.next_id = self.next_id.wrapping_add(1);
+            // Test-only counter: exhausting u64 is unreachable, but wrap
+            // would silently violate the uniqueness contract, so fail
+            // loudly instead of wrapping.
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .expect("delivery id space exhausted");
             self.queue.push_back(Slot { id, envelope });
         }
     }

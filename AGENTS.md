@@ -22,8 +22,11 @@ to. The README carries the vision; `docs/` carries the current design contract.
 
 - `wyrd-format` must not gain networking, async, or FUSE dependencies.
   Allowed: blake3, hex, thiserror, fastcdc, serde (when serialization lands).
-- `wyrd-format` is the plaintext world: keys, ciphertext, and manifests live
-  in `wyrd-sync`. Content IDs never reach vault-visible metadata.
+- `wyrd-format` is the plaintext world: keys and ciphertext live in
+  `wyrd-sync`. Manifests split across the two: schema and canonical
+  plaintext representation belong to `wyrd-format`; manifest encryption,
+  storage addressing, and capability semantics belong to `wyrd-sync`.
+  Content IDs never reach vault-visible metadata.
 - Objects are immutable; never mutate stored content in place; `put` of
   existing content is a no-op. GC does not exist — the store is
   append-only indefinitely in v0.

@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 
 use super::encoding;
 use crate::keys::epoch::EpochSecret;
-use crate::keys::{random_bytes, CryptoError};
+use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret};
 use wyrd_format::DeviceEncryptionKey;
 
 /// The wrapping's HKDF info context (trust.md, T12).
@@ -207,7 +207,10 @@ impl WrappedCapability {
     /// the header (drive, device, encryption key, transition, epoch)
     /// fails the AEAD tag; a header that does not match the plaintext
     /// fails the inner comparison.
-    pub fn unwrap(&self, encryption_secret: &SecretKey) -> Result<Capability, CryptoError> {
+    pub fn unwrap(
+        &self,
+        encryption_secret: &DeviceEncryptionSecret,
+    ) -> Result<Capability, CryptoError> {
         let bytes = &self.bytes;
         // ephemeral(32) ‖ drive(32) ‖ device(32) ‖ encryption key(32)
         // ‖ transition(32) ‖ epoch(8) ‖ nonce(24) ‖ at least secret(32)
@@ -229,7 +232,7 @@ impl WrappedCapability {
             .map_err(|_| CryptoError::Malformed)?;
         let ciphertext = &bytes[192..];
 
-        let shared = ecdh_shared(encryption_secret, &ephemeral_pk)?;
+        let shared = ecdh_shared(&encryption_secret.secret_key(), &ephemeral_pk)?;
         let aead_key = hkdf_capability_key(shared.as_slice());
         let aad = capability_aad(
             &drive,
@@ -283,7 +286,7 @@ impl WrappedCapability {
         // opening (ECDH alone relies on the header being honest).
         // Deriving the same pubkey proves the secret matches.
         let proven_pk = {
-            let kp = Keypair::from_secret_key(SECP256K1, encryption_secret);
+            let kp = Keypair::from_secret_key(SECP256K1, &encryption_secret.secret_key());
             XOnlyPublicKey::from_keypair(&kp).0
         };
         if proven_pk.serialize() != *claimed_encryption_key.as_bytes() {

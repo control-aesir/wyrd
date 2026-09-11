@@ -23,6 +23,8 @@ use thiserror::Error;
 use wyrd_format::DeviceId;
 
 use crate::keys::random_bytes;
+use crate::keys::DeviceIdentitySecret;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MailboxError {
@@ -58,12 +60,13 @@ fn device_id_from_secret(secret: &SecretKey) -> DeviceId {
 /// identity is derived from the same secret so the relay-visible metadata
 /// cannot lie about who sealed the envelope.
 pub fn seal_for_recipient(
-    sender_secret: &SecretKey,
+    sender_secret: &DeviceIdentitySecret,
     recipient: DeviceId,
     control_bytes: &[u8],
 ) -> Result<MailboxEnvelope, MailboxError> {
-    let sk = nostr_secret(sender_secret)?;
-    let sender = device_id_from_secret(sender_secret);
+    let sender_key = sender_secret.secret_key();
+    let sk = nostr_secret(&sender_key)?;
+    let sender = device_id_from_secret(&sender_key);
     let pk = NostrPublicKey::from_byte_array(*recipient.as_bytes());
     // Fresh 32-byte nonces keep NIP-44 v2 conversations from reusing a
     // payload nonce under the same ECDH-derived conversation key.
@@ -86,19 +89,29 @@ pub fn seal_for_recipient(
 /// misdelivered envelope can fail with an addressing error before the
 /// AEAD path.
 ///
+/// The outer buffer is [`Zeroizing`]: it holds the inner sealed
+/// envelope (ciphertext, not key material), but defense in depth
+/// wipes it anyway once ingest and parsing are done. Parsed control
+/// and bootstrap structures intentionally stay plain — they carry
+/// sealed envelopes and member-visible metadata, never secrets.
+/// Key material appears only past the inner open, which is zeroizing
+/// on its own path.
+///
 /// [`ControlInbox::ingest`]: crate::control::ControlInbox::ingest
 /// [`open_bootstrap`]: crate::control::bootstrap::open_bootstrap
 pub fn open_from_sender(
-    recipient_secret: &SecretKey,
+    recipient_secret: &DeviceIdentitySecret,
     expected_recipient: DeviceId,
     envelope: &MailboxEnvelope,
-) -> Result<Vec<u8>, MailboxError> {
+) -> Result<Zeroizing<Vec<u8>>, MailboxError> {
     if envelope.recipient != expected_recipient {
         return Err(MailboxError::Crypto);
     }
-    let sk = nostr_secret(recipient_secret)?;
+    let sk = nostr_secret(&recipient_secret.secret_key())?;
     let pk = NostrPublicKey::from_byte_array(*envelope.sender.as_bytes());
-    nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).map_err(|_| MailboxError::Crypto)
+    nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext)
+        .map(Zeroizing::new)
+        .map_err(|_| MailboxError::Crypto)
 }
 
 /// The relay send/receive boundary a concrete client implements
@@ -205,10 +218,12 @@ mod tests {
     use super::*;
     use crate::control::bootstrap::{open_bootstrap, seal_bootstrap, SealedBootstrap};
     use crate::control::{seal, ControlInbox, IngestReport, Message, SnapshotAnnouncement};
+    use crate::keys::DeviceEncryptionSecret;
     use crate::keys::EpochSecret;
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
     use std::collections::VecDeque;
     use wyrd_format::{DriveId, SnapshotId, TransitionId};
+    use zeroize::Zeroizing;
 
     /// An in-memory relay: every sent envelope lands in a shared queue;
     /// `recv` filters by the owning device. Handovers clone out of the
@@ -279,9 +294,9 @@ mod tests {
         }
     }
 
-    fn identity(pattern: u8) -> (SecretKey, DeviceId) {
-        let sk = SecretKey::from_slice(&[pattern; 32]).unwrap();
-        let kp = Keypair::from_secret_key(SECP256K1, &sk);
+    fn identity(pattern: u8) -> (DeviceIdentitySecret, DeviceId) {
+        let sk = DeviceIdentitySecret::from_bytes([pattern; 32]).unwrap();
+        let kp = Keypair::from_secret_key(SECP256K1, &sk.secret_key());
         let pk = XOnlyPublicKey::from_keypair(&kp).0;
         (sk, DeviceId::from_bytes(pk.serialize()))
     }
@@ -311,8 +326,11 @@ mod tests {
         )
         .unwrap();
         let envelope = seal_for_recipient(&sender_sk, recipient, &sealed.encode()).unwrap();
-        let opened = open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
-        assert_eq!(opened, sealed.encode());
+        // The annotation pins the contract: mailbox plaintext wipes
+        // on drop rather than lingering as an ordinary buffer.
+        let opened: Zeroizing<Vec<u8>> =
+            open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
+        assert_eq!(opened.as_slice(), sealed.encode().as_slice());
     }
 
     #[test]
@@ -321,10 +339,10 @@ mod tests {
         let (_, recipient) = identity(0x02);
         let (wrong_sk, _) = identity(0x03);
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
-        assert_eq!(
+        assert!(matches!(
             open_from_sender(&wrong_sk, recipient, &envelope),
             Err(MailboxError::Crypto)
-        );
+        ));
     }
 
     #[test]
@@ -338,10 +356,10 @@ mod tests {
         let mid = bytes.len() / 2;
         bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
         envelope.ciphertext = String::from_utf8(bytes).unwrap();
-        assert_eq!(
+        assert!(matches!(
             open_from_sender(&recipient_sk, recipient, &envelope),
             Err(MailboxError::Crypto)
-        );
+        ));
     }
 
     #[test]
@@ -382,7 +400,7 @@ mod tests {
         let control_bytes =
             open_from_sender(&recipient_sk, recipient, received.envelope()).unwrap();
         let mut inbox = ControlInbox::new(drive());
-        inbox.add_epoch_key(5, control_key(5));
+        inbox.add_epoch_key(5, Zeroizing::new(control_key(5)));
         assert!(matches!(
             inbox.ingest(&control_bytes),
             Ok(IngestReport::Accepted { .. })
@@ -421,8 +439,8 @@ mod tests {
         // the mailbox seal wrapping it is the same NIP-44 layer.
         let (owner_sk, _owner) = identity(0x0A);
         let (device_sk, device) = identity(0x0B);
-        let enc_secret = SecretKey::from_slice(&[0x30; 32]).unwrap();
-        let enc_kp = Keypair::from_secret_key(SECP256K1, &enc_secret);
+        let enc_secret = DeviceEncryptionSecret::from_bytes([0x30; 32]).unwrap();
+        let enc_kp = Keypair::from_secret_key(SECP256K1, &enc_secret.secret_key());
         let enc_key = wyrd_format::DeviceEncryptionKey::from_bytes(
             XOnlyPublicKey::from_keypair(&enc_kp).0.serialize(),
         );
@@ -520,9 +538,9 @@ mod tests {
         let (_, recipient) = identity(0x02);
         let (_, other) = identity(0x03);
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
-        assert_eq!(
+        assert!(matches!(
             open_from_sender(&sender_sk, other, &envelope),
             Err(MailboxError::Crypto)
-        );
+        ));
     }
 }

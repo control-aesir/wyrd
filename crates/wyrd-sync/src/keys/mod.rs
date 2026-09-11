@@ -25,6 +25,7 @@
 use thiserror::Error;
 
 pub mod capability;
+pub mod device;
 pub mod epoch;
 pub mod escrow;
 pub mod keystore;
@@ -36,6 +37,7 @@ pub(crate) mod ephemeral;
 pub use capability::{
     Capability, CapabilityError, DriveKeyring, InstallError, InstallReport, WrappedCapability,
 };
+pub use device::{DeviceEncryptionSecret, DeviceIdentitySecret};
 pub use epoch::EpochSecret;
 pub use escrow::{EscrowRecord, ESCROW_RECORD_LEN, ESCROW_VERSION};
 pub use keystore::{

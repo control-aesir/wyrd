@@ -30,6 +30,7 @@ use thiserror::Error;
 use wyrd_format::{ContentId, Manifest, ManifestEntry, ManifestError, ObjectKind, StorageId};
 
 use crate::keys::{random_bytes, CryptoError};
+use zeroize::Zeroizing;
 
 /// The only sealed-envelope version. Bumping it is a format change with
 /// new derived-key contexts, never a runtime branch.
@@ -139,7 +140,7 @@ pub fn open(
     key: &[u8; 32],
     expected: &ContentId,
     obj: &EncryptedObject,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if obj.version != SEAL_VERSION {
         return Err(CryptoError::Malformed);
     }
@@ -199,7 +200,10 @@ pub fn verify(
     if plaintext.len() as u64 != entry.size {
         return Err(CryptoError::HeaderMismatch);
     }
-    Ok(plaintext)
+    // Content bytes, not key material: verified member-visible data
+    // takes one plain copy for the fetch path; the AEAD buffer itself
+    // is still wiped on drop.
+    Ok(plaintext.to_vec())
 }
 
 /// Build the entry for freshly sealed content: the caller seals under
@@ -258,7 +262,10 @@ mod tests {
     fn seal_open_round_trips() {
         let (id, plaintext) = chunk_fixture();
         let obj = seal(&object_key(), ObjectKind::Chunk, &id, &plaintext).unwrap();
-        assert_eq!(open(&object_key(), &id, &obj).unwrap(), plaintext);
+        assert_eq!(
+            open(&object_key(), &id, &obj).unwrap().as_slice(),
+            plaintext.as_slice()
+        );
     }
 
     #[test]

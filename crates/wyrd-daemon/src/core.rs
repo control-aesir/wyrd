@@ -142,6 +142,7 @@ mod tests {
     };
     use wyrd_fuse::ViewError;
     use wyrd_sync::authorization::SnapshotDag;
+    use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
     use wyrd_sync::membership::MembershipLog;
 
     // The trust.md challenge contexts. Wyrd-sync's signing helpers are
@@ -167,8 +168,8 @@ mod tests {
             DriveId::from_bytes([0xEE; 32]),
             DeviceId::from_bytes([0xD0; 32]),
             "daemon-test",
-            secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap(),
-            secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap(),
+            DeviceIdentitySecret::from_bytes([0x11; 32]).unwrap(),
+            DeviceEncryptionSecret::from_bytes([0x22; 32]).unwrap(),
         )
         .unwrap();
         (engine, dir)

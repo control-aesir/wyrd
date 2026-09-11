@@ -42,7 +42,7 @@ use zeroize::Zeroizing;
 
 use super::ControlError;
 use crate::keys::capability::ecdh_shared;
-use crate::keys::{random_bytes, CryptoError};
+use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret, DeviceIdentitySecret};
 
 /// The only bootstrap-envelope version.
 pub const BOOTSTRAP_VERSION: u8 = 0x00;
@@ -64,6 +64,9 @@ const BOOTSTRAP_CHALLENGE_CONTEXT: &str = "wyrd bootstrap challenge v1";
 /// The opened invitation: who invited whom, with what delivery key,
 /// carrying the chain root and the wrapped first capability. The owner
 /// signature over all of it is verified inside [`open_bootstrap`].
+/// `genesis` is member-visible chain data and `capability` is still
+/// sealed ciphertext — neither is key material — so both stay plain
+/// `Vec<u8>`; they open later through the zeroizing capability path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapInvitation {
     pub drive: DriveId,
@@ -188,14 +191,15 @@ fn inviter_id(owner_sk: &SecretKey) -> DeviceId {
 /// encryption key under a fresh ephemeral key, plus the owner's
 /// signature over the payload. The inviter is the owner key itself.
 pub fn seal_bootstrap(
-    owner_sk: &SecretKey,
+    owner_sk: &DeviceIdentitySecret,
     drive: &DriveId,
     invitee: DeviceId,
     encryption_key: &DeviceEncryptionKey,
     genesis: &[u8],
     capability: &[u8],
 ) -> Result<SealedBootstrap, CryptoError> {
-    let inviter = inviter_id(owner_sk);
+    let owner_key = owner_sk.secret_key();
+    let inviter = inviter_id(&owner_key);
     let target = XOnlyPublicKey::from_slice(encryption_key.as_bytes())
         .map_err(|_| CryptoError::Malformed)?;
     // Fresh ephemeral keypair; the seed sibling is scrubbed on drop (see
@@ -212,7 +216,7 @@ pub fn seal_bootstrap(
         capability,
     );
     let challenge = bootstrap_challenge(&unsigned);
-    let owner_kp = Keypair::from_secret_key(SECP256K1, owner_sk);
+    let owner_kp = Keypair::from_secret_key(SECP256K1, &owner_key);
     let sig = SECP256K1
         .sign_schnorr_no_aux_rand(&challenge, &owner_kp)
         .to_byte_array();
@@ -241,7 +245,7 @@ pub fn seal_bootstrap(
 /// not invite, or bytes that did not come from the inviter, open
 /// nothing.
 pub fn open_bootstrap(
-    encryption_secret: &SecretKey,
+    encryption_secret: &DeviceEncryptionSecret,
     sealed: &SealedBootstrap,
 ) -> Result<BootstrapInvitation, ControlError> {
     if sealed.version != BOOTSTRAP_VERSION {
@@ -249,7 +253,7 @@ pub fn open_bootstrap(
     }
     let ephemeral_pk =
         XOnlyPublicKey::from_slice(&sealed.ephemeral).map_err(|_| CryptoError::Malformed)?;
-    let shared = ecdh_shared(encryption_secret, &ephemeral_pk)?;
+    let shared = ecdh_shared(&encryption_secret.secret_key(), &ephemeral_pk)?;
     let aead_key = hkdf_bootstrap_key(&shared);
     let aad = bootstrap_aad(
         &sealed.drive,
@@ -306,7 +310,7 @@ pub fn open_bootstrap(
     // payload must be signed by the claimed inviter: delivery and
     // authorship are separate checks.
     let proven_pk = {
-        let kp = Keypair::from_secret_key(SECP256K1, encryption_secret);
+        let kp = Keypair::from_secret_key(SECP256K1, &encryption_secret.secret_key());
         XOnlyPublicKey::from_keypair(&kp).0
     };
     if proven_pk.serialize() != *sealed.encryption_key.as_bytes() {
@@ -350,11 +354,11 @@ mod tests {
     /// The invitee's encryption pair and the owner's signing key. Fixed
     /// scalars keep fixtures deterministic; the seals stay fresh via the
     /// ephemeral key and nonce.
-    fn owner_sk() -> SecretKey {
-        SecretKey::from_slice(&[0x0A; 32]).unwrap()
+    fn owner_sk() -> DeviceIdentitySecret {
+        DeviceIdentitySecret::from_bytes([0x0A; 32]).unwrap()
     }
 
-    fn enc_pair(pattern: u8) -> (SecretKey, DeviceEncryptionKey) {
+    fn enc_pair(pattern: u8) -> (DeviceEncryptionSecret, DeviceEncryptionKey) {
         let mut counter = 0u8;
         loop {
             let mut input = Vec::new();
@@ -362,8 +366,8 @@ mod tests {
             input.push(pattern);
             input.push(counter);
             let hash = blake3::hash(&input);
-            if let Ok(sk) = SecretKey::from_slice(hash.as_bytes()) {
-                let kp = Keypair::from_secret_key(SECP256K1, &sk);
+            if let Ok(sk) = DeviceEncryptionSecret::from_bytes(*hash.as_bytes()) {
+                let kp = Keypair::from_secret_key(SECP256K1, &sk.secret_key());
                 let pk = XOnlyPublicKey::from_keypair(&kp).0.serialize();
                 return (sk, DeviceEncryptionKey::from_bytes(pk));
             }
@@ -420,7 +424,7 @@ mod tests {
         assert_eq!(opened.encryption_key, enc_key);
         assert_eq!(opened.genesis, genesis);
         assert_eq!(opened.capability, capability);
-        assert_eq!(opened.inviter, inviter_id(&owner_sk()));
+        assert_eq!(opened.inviter, inviter_id(&owner_sk().secret_key()));
     }
 
     #[test]
@@ -448,7 +452,7 @@ mod tests {
         // owner as inviter but signed by the attacker. The tag verifies;
         // authorship must still fail.
         let (device, enc_key, genesis, capability) = invitation_parts();
-        let owner = inviter_id(&owner_sk());
+        let owner = inviter_id(&owner_sk().secret_key());
         let attacker_sk = SecretKey::from_slice(&[0x0B; 32]).unwrap();
         let eph_sk = SecretKey::from_slice(&[0x0C; 32]).unwrap();
         let eph_pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(SECP256K1, &eph_sk)).0;

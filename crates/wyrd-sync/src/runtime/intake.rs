@@ -253,10 +253,11 @@ mod tests {
     use secp256k1::SecretKey;
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
     use wyrd_format::{Change, DeviceId, TransitionId};
+    use zeroize::Zeroizing;
 
     use crate::control::{CapabilityPayload, Message, TransitionPayload};
     use crate::keys::capability::Capability;
-    use crate::keys::EpochSecret;
+    use crate::keys::{DeviceEncryptionSecret, EpochSecret};
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
     use crate::membership::MembershipLog;
     use crate::runtime::test_util::{
@@ -432,7 +433,9 @@ mod tests {
 
         // The epoch key arrives with the chain behind it: the
         // transitions commit, then the announcement validates.
-        fixture.engine.add_epoch_key(9, control_key(9));
+        fixture
+            .engine
+            .add_epoch_key(9, Zeroizing::new(control_key(9)));
         let mut mail: Vec<MailboxEnvelope> = chain
             .iter()
             .map(|t| deliver(&fixture, 1, &transition_message(t)))
@@ -499,7 +502,7 @@ mod tests {
     fn capability_defers_until_its_transition_lands() {
         let mut fixture = fixture();
         let device = fixture.recipient;
-        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
 
         // Admit the engine device on-chain with its encryption key.
         let (mut builder, genesis) = Builder::genesis(10);
@@ -610,7 +613,7 @@ mod tests {
     fn pending_holds_are_bounded() {
         let mut fixture = fixture();
         let device = fixture.recipient;
-        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
 
         // A well-formed capability for a transition the engine never
         // observes: every redelivery defers under a distinct message
@@ -780,7 +783,7 @@ mod tests {
     fn tampered_capability_wrap_suppresses() {
         let mut fixture = fixture();
         let device = fixture.recipient;
-        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
 
         // A well-formed wrap for the engine device, then tampered: the
         // AEAD open fails deterministically.
@@ -856,7 +859,7 @@ mod tests {
     fn mismatched_capability_device_suppresses() {
         let mut fixture = fixture();
         let device = fixture.recipient;
-        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = builder.child(vec![Change::Admit(Admission {
             device,
@@ -890,7 +893,7 @@ mod tests {
     fn mismatched_capability_epoch_suppresses() {
         let mut fixture = fixture();
         let device = fixture.recipient;
-        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
         let (mut builder, genesis) = Builder::genesis(10);
         let admission = builder.child(vec![Change::Admit(Admission {
             device,
@@ -908,7 +911,9 @@ mod tests {
             panic!("capability delivery");
         };
         payload.epoch = 3;
-        fixture.engine.add_epoch_key(3, control_key(3));
+        fixture
+            .engine
+            .add_epoch_key(3, Zeroizing::new(control_key(3)));
         let mail = vec![deliver(&fixture, 3, &Message::Capability(payload))];
         queue(&mut fixture, mail.clone());
         let report = drain(&mut fixture);
@@ -924,7 +929,9 @@ mod tests {
     #[test]
     fn announcement_bound_to_orphaned_transition_defers() {
         let mut fixture = fixture();
-        fixture.engine.add_epoch_key(3, control_key(3));
+        fixture
+            .engine
+            .add_epoch_key(3, Zeroizing::new(control_key(3)));
         let (owner_sk, owner_id) = owner();
         let (outsider_sk, outsider_id) = key(20);
         let (_, genesis) = Builder::genesis(10);
@@ -1040,7 +1047,9 @@ mod tests {
     #[test]
     fn announcement_bound_to_invalid_transition_suppresses() {
         let mut fixture = fixture();
-        fixture.engine.add_epoch_key(5, control_key(5));
+        fixture
+            .engine
+            .add_epoch_key(5, Zeroizing::new(control_key(5)));
         let (owner_sk, owner_id) = owner();
         let (_, genesis) = Builder::genesis(10);
         let genesis_id = genesis.transition_id();
@@ -1075,7 +1084,7 @@ mod tests {
     fn unauthorized_capability_suppresses_without_pending() {
         let mut fixture = fixture();
         let device = fixture.recipient;
-        let encryption_sk = SecretKey::from_slice(&[0xE0; 32]).unwrap();
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
         let secret = EpochSecret::from_bytes([0x07; 32]);
 
         // Genesis observed: the engine device is not a member of its

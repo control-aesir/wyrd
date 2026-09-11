@@ -1,4 +1,5 @@
 use super::model::*;
+use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::key;
 use crate::membership::MembershipState;
 use std::collections::BTreeSet;
@@ -8,7 +9,7 @@ use std::collections::BTreeSet;
 /// `BLAKE3("wyrd test capability key v1" || pattern || counter)` so
 /// the scalar is valid by construction and independent of any device
 /// fixture's byte pattern.
-fn enc_pair(pattern: u8) -> (SecretKey, DeviceEncryptionKey) {
+fn enc_pair(pattern: u8) -> (DeviceEncryptionSecret, DeviceEncryptionKey) {
     let mut counter = 0u8;
     loop {
         let mut input = Vec::with_capacity(64);
@@ -16,8 +17,8 @@ fn enc_pair(pattern: u8) -> (SecretKey, DeviceEncryptionKey) {
         input.push(pattern);
         input.push(counter);
         let hash = blake3::hash(&input);
-        if let Ok(sk) = SecretKey::from_slice(hash.as_bytes()) {
-            let kp = Keypair::from_secret_key(SECP256K1, &sk);
+        if let Ok(sk) = DeviceEncryptionSecret::from_bytes(*hash.as_bytes()) {
+            let kp = Keypair::from_secret_key(SECP256K1, &sk.secret_key());
             let pk = XOnlyPublicKey::from_keypair(&kp).0.serialize();
             return (sk, DeviceEncryptionKey::from_bytes(pk));
         }
@@ -76,7 +77,15 @@ fn unwrap_uses_the_encryption_secret_not_the_identity_key() {
     let (sk_identity, device) = key(5);
     let (sk_enc, enc_key) = enc_pair(0x30);
     let wrapped = capability(device, enc_key, 2).wrap().unwrap();
-    assert_eq!(wrapped.unwrap(&sk_identity), Err(CryptoError::OpenFailed));
+    // Purpose separation is structural now — production code cannot
+    // pass an identity secret here at all — but the crypto behavior
+    // is pinned too: the identity scalar opens nothing.
+    let identity_as_encryption =
+        DeviceEncryptionSecret::from_bytes(sk_identity.secret_bytes()).unwrap();
+    assert_eq!(
+        wrapped.unwrap(&identity_as_encryption),
+        Err(CryptoError::OpenFailed)
+    );
     assert_eq!(wrapped.unwrap(&sk_enc).unwrap().device, device);
 }
 

@@ -251,7 +251,7 @@ mod tests {
         let plaintext =
             crate::keys::aead::open(key.as_slice(), &nonce, &ciphertext, KEYSTORE_AAD_DOMAIN)
                 .unwrap();
-        assert_eq!(plaintext, b"prod params work");
+        assert_eq!(plaintext.as_slice(), b"prod params work");
         // A wrong passphrase derives a key that fails the tag.
         let wrong = kdf_key_with_params(
             "wrong passphrase",

@@ -102,8 +102,8 @@ pub enum EngineError {
     MalformedDrive,
     #[error("the custody record is malformed")]
     MalformedKeystore,
-    #[error("the drive was created without completing its bootstrap")]
-    IncompleteBootstrap,
+    #[error("the supplied identity is not this drive's owner")]
+    OwnerMismatch,
     #[error("keystore failed: {0}")]
     Keystore(#[from] crate::keys::KeystoreError),
     #[error("keystore I/O failed: {0}")]

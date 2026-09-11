@@ -50,7 +50,7 @@ use crate::membership::sign_transition;
 const KEYSTORE_FILE: &str = "keystore";
 
 /// The only custody-record version.
-const KEYSTORE_VERSION: u8 = 0x01;
+const KEYSTORE_VERSION: u8 = 0x02;
 
 /// Create a new single-device drive. `identity` is the owner's Nostr
 /// identity (the signer's key, T6); everything else is generated and
@@ -75,11 +75,11 @@ pub(super) fn create(
     let device = device_id(&identity);
     let genesis = genesis_transition(drive, &identity, &encryption);
 
-    // Seal the custody record before the drive is usable. The genesis
-    // commit is the completion marker: a crash between the two leaves a
-    // drive with no canonical membership, which `open_keystore` refuses
-    // as incomplete rather than serving a half-created drive.
+    // Seal the custody record before the drive is usable. A crash before
+    // the genesis commit is recoverable: `open_keystore` completes the
+    // deterministic, owner-verified genesis.
     let custody = encode_custody(
+        &device,
         &wrap_root(root.as_bytes(), passphrase)?,
         &wrap_device_secret(encryption.as_bytes(), passphrase)?,
         &escrow::wrap(&root.escrow_key(&drive, 1), &drive, 1, &epoch)?,
@@ -98,10 +98,9 @@ pub(super) fn create(
         return Err(EngineError::DriveExists);
     }
 
-    // From here the fresh store is ours. The genesis commit is the
-    // completion marker: a crash between the custody write and the commit
-    // leaves a drive with no canonical membership, which `open_keystore`
-    // refuses as incomplete rather than serving a half-created drive.
+    // From here the fresh store is ours. A crash between the custody
+    // write and the genesis commit resumes on the next open: the genesis
+    // is deterministic and owner-verified.
     let result = (|| -> Result<Engine, EngineError> {
         let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
         atomic_write(&dir, KEYSTORE_FILE, &custody)?;
@@ -130,22 +129,31 @@ pub(super) fn open_keystore(
     identity: DeviceIdentitySecret,
 ) -> Result<Engine, EngineError> {
     let drive = read_drive(&dir)?;
-    let (root_wrapped, device_wrapped, escrow_record) = read_custody(&dir)?;
+    let (owner, root_wrapped, device_wrapped, escrow_record) = read_custody(&dir)?;
 
+    let device = device_id(&identity);
+    if device != owner {
+        return Err(EngineError::OwnerMismatch);
+    }
     let encryption =
         DeviceEncryptionSecret::from_bytes(unwrap_device_secret(&device_wrapped, passphrase)?)?;
-    let device = device_id(&identity);
-    let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
-
     let root = DriveRootKey::from_bytes(unwrap_root(&root_wrapped, passphrase)?);
     let epoch = escrow::unwrap(&root.escrow_key(&drive, 1), &escrow_record)?;
+
+    // The genesis is a deterministic function of the (drive, owner,
+    // encryption) triple, used to complete an interrupted bootstrap below.
+    let genesis = genesis_transition(drive, &identity, &encryption);
+
+    let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
     engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
 
-    // A complete bootstrap committed the genesis transition. If it is
-    // absent, creation crashed before completing; refuse rather than
-    // presenting a drive with no membership.
+    // Resume an interrupted bootstrap: the custody record is durable but
+    // the genesis commit was lost to a crash. The genesis is deterministic
+    // and the supplied identity was checked against the recorded owner, so
+    // completing it is safe and idempotent.
     if engine.log.known_state().is_none() {
-        return Err(EngineError::IncompleteBootstrap);
+        engine.commit_facts(&[Fact::Transition(genesis)])?;
+        engine.resync()?;
     }
     Ok(engine)
 }
@@ -179,9 +187,12 @@ fn genesis_transition(
     transition
 }
 
-/// The custody record: `version ‖ len(root) ‖ len(device) ‖ len(escrow) ‖
-/// root ‖ device ‖ escrow`, each length a `u16` LE.
+/// The custody record: `version ‖ owner (32) ‖ len(root) ‖ len(device) ‖
+/// len(escrow) ‖ root ‖ device ‖ escrow`, each length a `u16` LE. The
+/// owner is the public `DeviceId` that owns the drive; it lets a resume
+/// verify the supplied identity before completing an interrupted genesis.
 fn encode_custody(
+    owner: &DeviceId,
     root: &WrappedSecret,
     device: &WrappedSecret,
     escrow_record: &escrow::EscrowRecord,
@@ -189,8 +200,9 @@ fn encode_custody(
     let root = root.as_bytes();
     let device = device.as_bytes();
     let escrow = escrow_record.encode();
-    let mut out = Vec::with_capacity(7 + root.len() + device.len() + escrow.len());
+    let mut out = Vec::with_capacity(1 + 32 + 6 + root.len() + device.len() + escrow.len());
     out.push(KEYSTORE_VERSION);
+    out.extend_from_slice(owner.as_bytes());
     out.extend_from_slice(&(root.len() as u16).to_le_bytes());
     out.extend_from_slice(&(device.len() as u16).to_le_bytes());
     out.extend_from_slice(&(escrow.len() as u16).to_le_bytes());
@@ -200,15 +212,17 @@ fn encode_custody(
     out
 }
 
-fn decode_custody(
-    bytes: &[u8],
-) -> Result<(WrappedSecret, WrappedSecret, escrow::EscrowRecord), EngineError> {
-    if bytes.len() < 7 || bytes[0] != KEYSTORE_VERSION {
+type Custody = (DeviceId, WrappedSecret, WrappedSecret, escrow::EscrowRecord);
+
+fn decode_custody(bytes: &[u8]) -> Result<Custody, EngineError> {
+    const HEADER: usize = 1 + 32 + 6;
+    if bytes.len() < HEADER || bytes[0] != KEYSTORE_VERSION {
         return Err(EngineError::MalformedKeystore);
     }
+    let owner = DeviceId::from_bytes(bytes[1..33].try_into().expect("bounds checked"));
     let len = |pos: usize| u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-    let (root_len, device_len, escrow_len) = (len(1), len(3), len(5));
-    let mut pos = 7usize;
+    let (root_len, device_len, escrow_len) = (len(33), len(35), len(37));
+    let mut pos = HEADER;
     let mut take = |n: usize| -> Result<Vec<u8>, EngineError> {
         let end = pos.checked_add(n).ok_or(EngineError::MalformedKeystore)?;
         if end > bytes.len() {
@@ -224,7 +238,7 @@ fn decode_custody(
     if pos != bytes.len() {
         return Err(EngineError::MalformedKeystore);
     }
-    Ok((root, device, escrow_record))
+    Ok((owner, root, device, escrow_record))
 }
 
 /// Undo a failed create. The custody record always goes; the store
@@ -242,9 +256,7 @@ fn rollback(dir: &Path, dir_created: bool) {
     let _ = std::fs::remove_dir_all(dir.join("commits"));
 }
 
-fn read_custody(
-    dir: &Path,
-) -> Result<(WrappedSecret, WrappedSecret, escrow::EscrowRecord), EngineError> {
+fn read_custody(dir: &Path) -> Result<Custody, EngineError> {
     decode_custody(&std::fs::read(dir.join(KEYSTORE_FILE))?)
 }
 
@@ -267,4 +279,55 @@ fn device_id(identity: &DeviceIdentitySecret) -> DeviceId {
 fn encryption_key(encryption: &DeviceEncryptionSecret) -> DeviceEncryptionKey {
     let keypair = Keypair::from_secret_key(SECP256K1, &encryption.secret_key());
     DeviceEncryptionKey::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::test_util::TestDir;
+
+    #[test]
+    fn an_interrupted_bootstrap_resumes_on_open() {
+        let dir = TestDir::new("bootstrap-resume");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let encryption = DeviceEncryptionSecret::generate().unwrap();
+        let root = DriveRootKey::generate().unwrap();
+        let epoch = EpochSecret::generate().unwrap();
+        let mut bytes = [0u8; 32];
+        random_bytes(&mut bytes).unwrap();
+        let drive = DriveId::from_bytes(bytes);
+
+        // Simulate the crash window: the custody record is durable but the
+        // genesis transition was never committed.
+        let custody = encode_custody(
+            &device_id(&identity),
+            &wrap_root(root.as_bytes(), "test-pass").unwrap(),
+            &wrap_device_secret(encryption.as_bytes(), "test-pass").unwrap(),
+            &escrow::wrap(&root.escrow_key(&drive, 1), &drive, 1, &epoch).unwrap(),
+        );
+        {
+            let _store = DurableStore::open(dir.path.clone(), drive, "test-pass").unwrap();
+            atomic_write(&dir.path, KEYSTORE_FILE, &custody).unwrap();
+        }
+
+        // Opening resumes and completes the deterministic genesis.
+        let engine = open_keystore(dir.path.clone(), "test-pass", identity).unwrap();
+        assert!(
+            engine.log.known_state().is_some(),
+            "the interrupted bootstrap is completed on open"
+        );
+        assert!(engine.live_heads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn opening_with_a_different_identity_is_refused() {
+        let dir = TestDir::new("bootstrap-owner");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        drop(create(dir.path.clone(), "test-pass", identity).unwrap());
+        let other = DeviceIdentitySecret::generate().unwrap();
+        assert!(matches!(
+            open_keystore(dir.path.clone(), "test-pass", other),
+            Err(EngineError::OwnerMismatch)
+        ));
+    }
 }

@@ -11,9 +11,12 @@ use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
-use wyrd_sync::runtime::{EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
+use wyrd_sync::keys::DeviceIdentitySecret;
+use wyrd_sync::runtime::{Engine, EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
 
-use crate::support::{mount_heads, signed_transition, Loaded, RemoteOnlyMaterialization, Rig};
+use crate::support::{
+    mount_heads, scratch_dir, signed_transition, Loaded, RemoteOnlyMaterialization, Rig,
+};
 
 /// One head per verified body; a broken signature never becomes
 /// durable, never classified, and never mounts (architecture.md
@@ -208,6 +211,36 @@ fn authored_snapshots_mount_through_the_daemon_view() {
 
     drop(daemon);
     rig.teardown();
+}
+
+/// A drive created without fixtures serves an authored snapshot through
+/// the daemon view: the identity, root key, and genesis membership all
+/// come from the production bootstrap, not test scaffolding
+/// (`docs/epochs.md` genesis).
+#[test]
+fn a_bootstrapped_drive_serves_its_first_authored_snapshot() {
+    let dir = scratch_dir("bootstrap");
+
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.clone(), "contracts-pass", identity).unwrap();
+    let mut store = MemoryObjectStore::default();
+    let chunk = store.insert(ObjectKind::Chunk, b"boot").unwrap();
+    let tree = Tree::from_entries(vec![Entry::file("boot.txt", 4, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+
+    let authored = engine.author_snapshot(&store, tree).unwrap();
+    assert_eq!(authored.snapshot().epoch, 1, "the genesis epoch");
+
+    let mut daemon = Daemon::new(engine, store);
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("boot.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 4).unwrap(), b"boot");
+
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// The pending bound sheds to the relay without consuming: a drained

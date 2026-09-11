@@ -5,12 +5,26 @@
 use super::state::{apply, MembershipState};
 use super::InvalidReason;
 use secp256k1::schnorr::Signature;
-use secp256k1::{XOnlyPublicKey, SECP256K1};
+use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{DriveId, MembershipTransition};
 
 /// BIP-340 challenge context for membership transitions (trust.md).
 pub const CHALLENGE_CONTEXT: &str = "wyrd membership challenge v1";
+
+/// Sign a transition in place with canonical BIP-340 nonces (trust.md,
+/// "Exact signing construction"). The genesis bootstrap is the production
+/// caller; fixtures reuse it so the pinned challenge cannot drift.
+pub(crate) fn sign_transition(
+    t: &mut MembershipTransition,
+    sk: &secp256k1::SecretKey,
+    drive: &DriveId,
+) {
+    let keypair = Keypair::from_secret_key(SECP256K1, sk);
+    let challenge = blake3::derive_key(CHALLENGE_CONTEXT, &t.signing_message(drive));
+    let sig = SECP256K1.sign_schnorr_no_aux_rand(&challenge, &keypair);
+    t.signature = sig.to_byte_array();
+}
 
 /// Whether the transition's signature verifies. Full key validation
 /// (lift_x, 64-byte signatures) is delegated to the audited secp256k1

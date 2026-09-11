@@ -10,9 +10,6 @@ use wyrd_format::{
     Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, TransitionId,
 };
 
-/// The BIP-340 challenge context for membership transitions (trust.md).
-pub(crate) const CHALLENGE_CONTEXT: &str = "wyrd membership challenge v1";
-
 /// A deterministic device encryption key for fixtures: the x-only pubkey
 /// of a test scalar derived as `BLAKE3("wyrd test encryption key
 /// v1" || device || counter)`, retried until it is a valid secp256k1
@@ -41,17 +38,10 @@ pub(crate) fn admit(device: DeviceId) -> Change {
     })
 }
 
-/// The 32-byte BIP-340 challenge for a transition's signing message.
-pub(crate) fn challenge(t: &MembershipTransition, drive: &DriveId) -> [u8; 32] {
-    blake3::derive_key(CHALLENGE_CONTEXT, &t.signing_message(drive))
-}
-
-/// Sign a transition in place with canonical BIP-340 nonces (no auxiliary
-/// randomness), exactly as the machine expects.
+/// Sign a transition in place: delegate to the production helper so the
+/// fixture and the genesis bootstrap cannot drift on the pinned challenge.
 pub(crate) fn sign(t: &mut MembershipTransition, sk: &SecretKey, drive: &DriveId) {
-    let keypair = Keypair::from_secret_key(SECP256K1, sk);
-    let sig = SECP256K1.sign_schnorr_no_aux_rand(&challenge(t, drive), &keypair);
-    t.signature = sig.to_byte_array();
+    super::validate::sign_transition(t, sk, drive);
 }
 
 /// A deterministic key: secret key and the DeviceId it names. Test scalars

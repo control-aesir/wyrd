@@ -156,9 +156,9 @@ pub enum ViewError {
 /// plaintext by content id, and entry/tree correspondence is sync's
 /// concern, checked where manifests are fetched.
 ///
-/// Only verified snapshots become heads: [`DriveView::new`] starts
-/// headless and [`DriveView::set_heads`] accepts [`ViewHead`] values,
-/// which raw `Snapshot`s cannot construct (see [`VerifiedSnapshot`]).
+/// Only verified snapshots become heads: [`DriveView::new`] and
+/// [`DriveView::set_heads`] accept [`ViewHead`] values, which safe code
+/// can only construct through the [`VerifiedSnapshot`] capability.
 pub struct DriveView<S, M> {
     store: S,
     materialization: M,
@@ -168,27 +168,48 @@ pub struct DriveView<S, M> {
 /// A snapshot that may cross the head boundary: verification already
 /// happened upstream, and this trait is the only way to name it.
 ///
-/// `VerifiedSnapshot` is a capability sealed by the orphan rule, not a
-/// general conversion trait. It exists to install a cryptographically
-/// verified snapshot as a FUSE view head — nothing else. Implement it
-/// only for a type whose construction the verifier owns (in-tree: the
-/// daemon's `LiveHead` over `wyrd-sync`'s `AuthorizedSnapshot`). A
-/// downstream crate cannot implement it for a foreign `Snapshot`:
+/// `VerifiedSnapshot` is an **unsafe capability**, not a general
+/// conversion trait: it exists to install a cryptographically verified
+/// snapshot as a FUSE view head — nothing else. Rust offers no stronger
+/// cross-crate seal for a layering reason: the view cannot name
+/// `wyrd-sync`'s `AuthorizedSnapshot` (no dependency edge may run from
+/// the view to sync), and a constructor with a private body cannot be
+/// shared between crates at all. So the boundary rests on the language's
+/// audit mechanism: implementing this trait is `unsafe`, and every
+/// `unsafe impl` is a visible, greppable claim that the implementing
+/// type's construction is owned by the verification authority. In-tree
+/// there is exactly one: the daemon's `LiveHead`, whose inner
+/// `AuthorizedSnapshot` can only be produced by sync's BIP-340
+/// verification.
+///
+/// A downstream wrapper around a raw snapshot cannot implement the
+/// capability in safe code — the audit marker is the only way across:
+///
+/// # Safety
+///
+/// Implementors assert that the wrapped snapshot's signature has been
+/// verified by the trust authority (in-tree: `wyrd-sync`'s
+/// `AuthorizedSnapshot` construction), so a false `unsafe impl` puts an
+/// unverified body in the live view. Keep implementations few, local to
+/// the composing crate, and review each like an `unsafe` block.
 ///
 /// ```compile_fail
 /// use wyrd_fuse::VerifiedSnapshot;
 /// use wyrd_format::Snapshot;
 ///
-/// // Both the trait and `Snapshot` are foreign to a downstream
-/// // crate, so the orphan rule rejects this impl: an unverified
-/// // snapshot has no path to a view head.
-/// impl VerifiedSnapshot for Snapshot {
+/// struct Unchecked(Snapshot);
+///
+/// // A local wrapper type around a foreign `Snapshot`: the orphan
+/// // rule allows this impl shape, but the capability is unsafe, so
+/// // implementing it in safe code does not compile — an unverified
+/// // snapshot has no quiet path to a view head.
+/// impl VerifiedSnapshot for Unchecked {
 ///     fn into_snapshot(self) -> Snapshot {
-///         self
+///         self.0
 ///     }
 /// }
 /// ```
-pub trait VerifiedSnapshot {
+pub unsafe trait VerifiedSnapshot {
     /// The verified snapshot body. Consuming preserves the one-way
     /// flow: a head is built from verified material and never exposed
     /// as bare, re-wrappable state.
@@ -749,7 +770,10 @@ mod tests {
     /// (the daemon adapter and the contract suite cover that path).
     struct TestHead(Snapshot);
 
-    impl VerifiedSnapshot for TestHead {
+    // SAFETY: test-local capability for view-mechanics fixtures; the
+    // upstream verification boundary is covered by the daemon adapter
+    // and the contract suite, not here.
+    unsafe impl VerifiedSnapshot for TestHead {
         fn into_snapshot(self) -> Snapshot {
             self.0
         }

@@ -48,7 +48,11 @@ impl LiveHead {
     }
 }
 
-impl VerifiedSnapshot for LiveHead {
+// SAFETY: the sole in-tree implementation of the verification
+// capability. `LiveHead` wraps `AuthorizedSnapshot`, and sync's BIP-340
+// verification is the only thing that can construct one — the claim
+// matches the type's own construction contract.
+unsafe impl VerifiedSnapshot for LiveHead {
     fn into_snapshot(self) -> Snapshot {
         self.0.snapshot().clone()
     }

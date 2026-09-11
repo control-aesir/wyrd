@@ -625,7 +625,10 @@ mod tests {
     /// (the daemon adapter and the contract suite cover that path).
     struct TestHead(Snapshot);
 
-    impl wyrd_fuse::VerifiedSnapshot for TestHead {
+    // SAFETY: test-local capability for presentation fixtures; the
+    // upstream verification boundary is covered by the daemon adapter
+    // and the contract suite, not here.
+    unsafe impl wyrd_fuse::VerifiedSnapshot for TestHead {
         fn into_snapshot(self) -> Snapshot {
             self.0
         }

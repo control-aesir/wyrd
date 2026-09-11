@@ -284,7 +284,7 @@ pub(crate) fn sealed_envelope(
     seal_for_recipient(sender, recipient, &sealed.encode()).unwrap()
 }
 
-fn scratch_dir(label: &str) -> PathBuf {
+pub(crate) fn scratch_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "wyrd-contracts-{label}-{}-{}",
         std::process::id(),

@@ -48,6 +48,19 @@ macro_rules! device_secret {
                 Ok(Self(bytes))
             }
 
+            /// Mint a fresh random secret: once per device, at drive
+            /// creation. Retries until the bytes form a valid scalar (a
+            /// negligible fraction fail).
+            pub fn generate() -> Result<Self, CryptoError> {
+                loop {
+                    let mut bytes = [0u8; 32];
+                    super::random_bytes(&mut bytes)?;
+                    if SecretKey::from_slice(&bytes).is_ok() {
+                        return Ok(Self(bytes));
+                    }
+                }
+            }
+
             /// The raw secret bytes. Callers must treat these as secret
             /// material.
             pub fn as_bytes(&self) -> &[u8; 32] {

@@ -109,11 +109,12 @@ traits) — the protocol/core layers are covered by example, conformance,
 and generative suites with commit hooks clean. The runtime pieces that
 turn those primitives into a full distributed system are still
 incomplete: durable snapshot bodies with the engine-backed live-head
-projection have landed, and the engine can author and durably commit
-member snapshots (the local write path), but the relay pool /
-signer-client wiring, the daemon binary entry point, and the live
-fetch-on-open loop are still open, and garbage collection does not
-exist. `wyrd-fuse` is a
+projection have landed, the engine can author and durably commit member
+snapshots (the local write path), and a drive can be created locally
+from scratch (identity, root custody, genesis membership); but the
+relay pool / signer-client wiring, the daemon binary entry point, and
+the live fetch-on-open loop are still open, and garbage collection does
+not exist. `wyrd-fuse` is a
 mount-free view behind the daemon's FUSE backend. All crypto and sync
 work follows `trust.md` and `epochs.md` as normative contracts; the
 open tracking issues name what comes next (durable snapshot-body

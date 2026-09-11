@@ -44,6 +44,9 @@
 //! 11. `authored_snapshots_mount_through_the_daemon_view` — the local
 //!     write path: a member authors a snapshot and the daemon's
 //!     classified projection serves its tree (`docs/epochs.md`).
+//! 12. `a_bootstrapped_drive_serves_its_first_authored_snapshot` — a
+//!     drive created by the production bootstrap (identity, root,
+//!     genesis) serves its first authored snapshot (`docs/epochs.md`).
 
 #[cfg(test)]
 mod fuse_contracts;

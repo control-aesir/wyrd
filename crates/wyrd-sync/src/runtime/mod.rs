@@ -20,6 +20,7 @@ use wyrd_format::{
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 
 mod author;
+mod bootstrap;
 pub mod engine;
 mod fetch;
 mod intake;
@@ -27,6 +28,7 @@ mod plan;
 #[cfg(test)]
 pub(crate) mod test_util;
 
+pub use bootstrap::CreatedDrive;
 pub use engine::{DrainReport, Engine, EngineError, ExecuteReport, MAX_PENDING_MESSAGES};
 
 /// Local residency policy for one content object.

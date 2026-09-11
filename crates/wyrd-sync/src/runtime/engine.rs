@@ -244,6 +244,20 @@ impl Engine {
         Ok(engine)
     }
 
+    /// Create a new single-device drive: generate the owner's identity and
+    /// encryption secrets and the drive root, author and sign the genesis
+    /// membership transition, open the durable store, and return the
+    /// running engine plus the minted key material ([`CreatedDrive`][super::CreatedDrive]).
+    /// The drive starts headless; author the first snapshot with
+    /// [`Engine::author_snapshot`]. Admitting more devices and root
+    /// recovery are later slices.
+    pub fn create(
+        dir: PathBuf,
+        passphrase: &str,
+    ) -> Result<(Engine, super::CreatedDrive), EngineError> {
+        super::bootstrap::create(dir, passphrase)
+    }
+
     /// Arm the crash hook: the next durable commit stops after `stage`
     /// (test-only; production commits always run to completion).
     #[cfg(test)]
@@ -1283,6 +1297,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![id],
             "the authored head reclassifies from durable facts"
+        );
+    }
+
+    // --- drive bootstrap ----------------------------------------------
+
+    #[test]
+    fn create_bootstraps_a_drive_and_authors_the_first_head() {
+        let dir = TestDir::new("bootstrap");
+        let (mut engine, _keys) = Engine::create(dir.path.clone(), "test-pass").unwrap();
+        assert!(
+            engine.live_heads().unwrap().is_empty(),
+            "a new drive starts headless"
+        );
+
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = engine.author_snapshot(&objects, tree).unwrap();
+        assert_eq!(authored.snapshot().epoch, 1, "genesis epoch");
+
+        let heads = engine.live_heads().unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .map(|h| h.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![authored.snapshot().snapshot_id()]
+        );
+    }
+
+    #[test]
+    fn a_created_drive_reopens_with_the_same_secrets() {
+        let dir = TestDir::new("bootstrap-reopen");
+        let (mut engine, keys) = Engine::create(dir.path.clone(), "test-pass").unwrap();
+        let device = engine.device();
+
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let id = engine
+            .author_snapshot(&objects, tree)
+            .unwrap()
+            .snapshot()
+            .snapshot_id();
+        drop(engine);
+
+        let mut reopened = Engine::open(
+            dir.path.clone(),
+            keys.drive,
+            device,
+            "test-pass",
+            keys.identity.clone(),
+            keys.encryption.clone(),
+        )
+        .unwrap();
+        reopened.add_epoch_key(1, Zeroizing::new(keys.epoch.control_key(&keys.drive, 1)));
+
+        let heads = reopened.live_heads().unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .map(|h| h.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![id],
+            "the created drive reopens from durable facts"
         );
     }
 }

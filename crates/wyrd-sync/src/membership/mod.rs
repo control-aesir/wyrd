@@ -28,6 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 
 pub use state::{apply, ApplyError, MembershipState};
+pub(crate) use validate::sign_transition;
 pub use validate::CHALLENGE_CONTEXT;
 
 /// Why a transition fails validation. The machine never deletes rejected

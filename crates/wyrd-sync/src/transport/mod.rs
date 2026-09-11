@@ -7,7 +7,9 @@
 //! `nostr-connect` session are relay/signer-client wiring for whatever
 //! composes this crate (`docs/architecture.md`'s "application/daemon
 //! composes sync and fuse"), so every test in this module runs against
-//! an in-memory fake, never a live network. What this module *does* pin:
+//! an in-memory fake, never a live network. A pool honors the
+//! retain-until-ack contract by holding its sync cursor on unsettled
+//! deliveries. What this module *does* pin:
 //! the NIP-44 sealing of Wyrd's control bytes for mailbox delivery, and
 //! the request/response shape a signer session must honor.
 //!
@@ -24,5 +26,5 @@
 pub mod mailbox;
 pub mod signer;
 
-pub use mailbox::{Mailbox, MailboxEnvelope, MailboxError};
+pub use mailbox::{Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError};
 pub use signer::{SignerError, SignerSession};

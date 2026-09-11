@@ -17,8 +17,8 @@
 //!
 //! ```text
 //! duplicate delivery ............ no-op (already committed)
-//! undecodable / wrong drive ..... skipped, never committed
-//! unknown epoch key ............. skipped, retried on redelivery
+//! undecodable / wrong drive ..... skipped, left unacked for redelivery
+//! unknown epoch key ............. skipped, left unacked for redelivery
 //! forged or undecryptable ....... seen-id committed (poison suppression)
 //! capability, state unknown ..... held in-memory, retried as transitions land
 //! capability, unauthorized ..... seen-id committed (derived state is immutable)
@@ -27,7 +27,7 @@
 //! announcement, noncanonical .... held in-memory, retried as membership resolves
 //! announcement, invalid ......... seen-id committed (verdicts are final)
 //! announcement, epoch mismatched . seen-id committed (epochs are immutable)
-//! held-message overflow ......... seen-id committed (pending is bounded)
+//! held-message overflow ......... left unacked (pending is bounded; relay retains)
 //! ```
 //!
 //! A message held in memory is lost on crash, but it was never
@@ -58,18 +58,20 @@ use crate::durable::{DurableError, DurableStore, Fact};
 use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
 
-/// Engine failures: durable-commit trouble and runtime-record
-/// trouble are fatal. Per-envelope mailbox, decode, and ingest
-/// failures are counted in the [`DrainReport`], never raised, so one
-/// hostile envelope cannot wedge the drain. Bulk fetch failures are
-/// never raised either: a missing or corrupt bulk object just leaves
-/// its plan item unfulfilled for the next pass.
+/// Engine failures: durable-commit, runtime-record, and mailbox-
+/// settlement trouble are fatal. Per-envelope mailbox, decode, and
+/// ingest failures are counted in the [`DrainReport`], never raised,
+/// so one hostile envelope cannot wedge the drain. Bulk fetch failures
+/// are never raised either: a missing or corrupt bulk object just
+/// leaves its plan item unfulfilled for the next pass.
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("durable commit failed: {0}")]
     Durable(#[from] DurableError),
     #[error("runtime record failed: {0}")]
     Runtime(#[from] RuntimeError),
+    #[error("mailbox settlement failed: {0}")]
+    Mailbox(#[from] crate::transport::mailbox::MailboxError),
 }
 
 /// What one [`Engine::drain`] pass did.
@@ -118,8 +120,10 @@ pub struct ExecuteReport {
 
 /// Cap on held messages: without one, distinct never-authorizable
 /// deliveries accumulate without bound, each owning its full sealed
-/// payload. Over-limit deferrals suppress instead (a seen-id commit):
-/// the sender can redeliver once legitimate holds drain.
+/// payload. Over-limit deferrals shed without consuming instead (no
+/// seen-id commit): the relay retains the envelope for redelivery,
+/// and the inbox forgets the id so the redelivery ingests fresh.
+/// Memory stays bounded without writing false "processed" facts.
 pub const MAX_PENDING_MESSAGES: usize = 1024;
 
 /// Backoff policy for repeatedly invalid representations: a fetch that
@@ -505,8 +509,7 @@ mod tests {
     ) {
         let sealed = seal(key, &member_drive(), epoch, message).unwrap();
         pair.relay
-            .queue
-            .push_back(seal_for_recipient(from_sk, to, &sealed.encode()).unwrap());
+            .push(seal_for_recipient(from_sk, to, &sealed.encode()).unwrap());
     }
 
     fn drain_side(relay: &mut MemoryRelay, device: &mut Device) -> DrainReport {

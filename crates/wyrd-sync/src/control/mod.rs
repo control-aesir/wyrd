@@ -313,6 +313,15 @@ impl ControlInbox {
     pub fn remember(&mut self, id: &ControlMessageId) -> bool {
         self.seen.insert(*id)
     }
+
+    /// Withdraw a seen id that will never commit (pending-overflow
+    /// shedding): the next redelivery ingests fresh instead of
+    /// reporting a false duplicate. Only call for ids with no durable
+    /// facts and no pending entry; forgetting a committed id would
+    /// allow double-processing.
+    pub fn forget(&mut self, id: &ControlMessageId) {
+        self.seen.remove(id);
+    }
 }
 
 #[cfg(test)]

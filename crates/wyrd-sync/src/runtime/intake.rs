@@ -1,5 +1,7 @@
 //! Control-plane intake and message classification for the runtime engine.
 
+use std::collections::HashSet;
+
 use wyrd_format::MembershipTransition;
 
 use super::engine::{DrainReport, Engine, EngineError};
@@ -8,7 +10,7 @@ use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::WrappedCapability;
 use crate::membership::TransitionStatus;
-use crate::transport::mailbox::{open_from_sender, Mailbox, MailboxEnvelope};
+use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxEnvelope};
 
 const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
@@ -20,7 +22,12 @@ enum Action {
 enum Outcome {
     Accepted,
     Duplicate,
+    /// Held in the engine's pending map; the drain settles `Ack` (the
+    /// engine, not the relay, owns the retry).
     Deferred,
+    /// Shed past the pending bound: the engine holds nothing, so the
+    /// drain settles `Retry` and the relay retains the envelope.
+    RelayHeld,
     Skipped,
 }
 
@@ -29,13 +36,37 @@ pub(super) fn drain(
     mailbox: &mut impl Mailbox,
 ) -> Result<DrainReport, EngineError> {
     let mut report = DrainReport::default();
-    while let Some(envelope) = mailbox.recv() {
-        match accept_envelope(engine, &envelope)? {
-            Outcome::Accepted => report.accepted += 1,
-            Outcome::Duplicate => report.duplicates += 1,
-            Outcome::Deferred => report.deferred += 1,
-            Outcome::Skipped => report.skipped += 1,
+    // Each handover is offered once per pass: a re-offered id ends the
+    // pass with the envelope still unacked, so a pass always terminates
+    // even when every envelope is retried.
+    let mut offered = HashSet::new();
+    while let Some(delivery) = mailbox.recv() {
+        if !offered.insert(delivery.id()) {
+            break;
         }
+        let disposition = match accept_envelope(engine, delivery.envelope())? {
+            Outcome::Accepted => {
+                report.accepted += 1;
+                Disposition::Ack
+            }
+            Outcome::Duplicate => {
+                report.duplicates += 1;
+                Disposition::Ack
+            }
+            Outcome::Deferred => {
+                report.deferred += 1;
+                Disposition::Ack
+            }
+            Outcome::RelayHeld => {
+                report.deferred += 1;
+                Disposition::Retry
+            }
+            Outcome::Skipped => {
+                report.skipped += 1;
+                Disposition::Retry
+            }
+        };
+        mailbox.settle(delivery.id(), disposition)?;
     }
     Ok(report)
 }
@@ -70,7 +101,14 @@ fn commit_action(
     let mut facts = match message_action(engine, id, message) {
         Action::Commit(facts) => facts,
         Action::Defer if engine.pending.len() >= MAX_PENDING_MESSAGES => {
-            vec![Fact::ControlMessage(*id)]
+            // Shed without consuming: the bound protects memory, but a
+            // resource decision must never write a semantic fact. The
+            // relay retains the envelope (the drain settles `Retry`),
+            // and the inbox forgets the id so the redelivery ingests
+            // fresh instead of reporting a false duplicate. No durable
+            // fact is written for a message never processed.
+            engine.inbox.forget(id);
+            return Ok(Outcome::RelayHeld);
         }
         Action::Defer => {
             engine.pending.insert(*id, message.clone());
@@ -282,6 +320,35 @@ mod tests {
         assert_eq!(report.duplicates, 2);
         assert_eq!(report.accepted, 0);
         assert_eq!(engine.current(), 2);
+    }
+
+    #[test]
+    fn crash_before_commit_redelivers() {
+        let mut fixture = fixture();
+        let (_, genesis) = Builder::genesis(10);
+        let mail = vec![deliver(&fixture, 1, &transition_message(&genesis))];
+        queue(&mut fixture, mail);
+
+        // Take the handover but never process or acknowledge it: crash
+        // before any durable commit.
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        let delivery = mailbox.recv().expect("offered");
+        drop(delivery);
+
+        // Restart: the unacked envelope is still held by the relay and
+        // processes fresh instead of staying lost.
+        let mut engine = reopen(&mut fixture);
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        let report = engine.drain(&mut mailbox).unwrap();
+        assert_eq!(report.accepted, 1);
+        assert_eq!(engine.current(), 1);
     }
 
     #[test]
@@ -512,11 +579,52 @@ mod tests {
         }
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
-        assert_eq!(report.deferred, MAX_PENDING_MESSAGES);
-        // The overflow suppresses with a seen-id commit instead of
-        // accumulating without bound.
-        assert_eq!(report.accepted, 1);
+        assert_eq!(report.deferred, MAX_PENDING_MESSAGES + 1);
+        // The overflow sheds without a seen-id commit instead of
+        // accumulating without bound: nothing is durably consumed.
+        assert_eq!(report.accepted, 0);
         assert_eq!(fixture.engine.pending_count(), MAX_PENDING_MESSAGES);
+    }
+
+    #[test]
+    fn overflowed_hold_survives_queue_pressure() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        // Announcements bound to a transition the engine has not seen:
+        // every delivery defers under a distinct message id (fresh
+        // seal nonces), so the last one overflows the pending bound.
+        let bound = announcement_for(2, child.transition_id());
+        let mut mail = Vec::with_capacity(MAX_PENDING_MESSAGES + 1);
+        for _ in 0..=MAX_PENDING_MESSAGES {
+            mail.push(deliver(&fixture, 2, &bound));
+        }
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        // The overflow must not be durably consumed: nothing commits.
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.deferred, MAX_PENDING_MESSAGES + 1);
+        assert_eq!(fixture.engine.pending_count(), MAX_PENDING_MESSAGES);
+
+        // The transition lands: everything held commits with it. The
+        // relay-held overflow was already offered this pass (ahead of
+        // the transitions, in arrival order), so it sheds once more
+        // and waits for the next pass — honest relay ordering.
+        let unblock = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, unblock);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        // Next pass the overflow is re-offered against resolved state
+        // and commits instead of staying lost.
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), MAX_PENDING_MESSAGES + 1);
     }
 
     #[test]
@@ -992,7 +1100,7 @@ mod tests {
             deliver(&fixture, 2, &cap),
             deliver(&fixture, 2, &bound),
         ];
-        queue(&mut fixture, mail.clone());
+        queue(&mut fixture, mail);
 
         // Make the store unwritable. Root bypasses permissions, so
         // probe writability after the chmod and skip when the commit
@@ -1026,19 +1134,19 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // Retry after the outage: the failed drain consumed genesis
-        // from the relay, so redeliver the whole batch fresh. Leftover
-        // admission commits at once; the orphaned capability and
-        // announcement defer until genesis lands, then ride genesis's
-        // commit; the redelivered copies deduplicate. Every effect lands
-        // durably exactly once.
-        queue(&mut fixture, mail);
+        // Retry after the outage: the failed drain settled nothing, so
+        // the relay still holds the whole batch in arrival order — no
+        // redelivery needed. Genesis commits first this time, so the
+        // capability and announcement validate on first sight instead
+        // of deferring. Every effect lands durably exactly once.
         let report = drain(&mut fixture);
-        assert_eq!(report.accepted, 2);
-        assert_eq!(report.deferred, 2);
-        assert_eq!(report.duplicates, 3);
+        assert_eq!(report.accepted, 4);
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.duplicates, 0);
+        assert_eq!(fixture.engine.pending_count(), 0);
         let facts = fixture.engine.store.load().expect("loads");
         assert_eq!(facts.transitions.len(), 2);
+        assert_eq!(facts.capabilities.len(), 1);
         assert_eq!(facts.announcements.len(), 1);
     }
 }

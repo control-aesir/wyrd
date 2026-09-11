@@ -24,6 +24,7 @@ use wyrd_format::DeviceId;
 
 use crate::keys::random_bytes;
 use crate::keys::DeviceIdentitySecret;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MailboxError {
@@ -88,19 +89,29 @@ pub fn seal_for_recipient(
 /// misdelivered envelope can fail with an addressing error before the
 /// AEAD path.
 ///
+/// The outer buffer is [`Zeroizing`]: it holds the inner sealed
+/// envelope (ciphertext, not key material), but defense in depth
+/// wipes it anyway once ingest and parsing are done. Parsed control
+/// and bootstrap structures intentionally stay plain — they carry
+/// sealed envelopes and member-visible metadata, never secrets.
+/// Key material appears only past the inner open, which is zeroizing
+/// on its own path.
+///
 /// [`ControlInbox::ingest`]: crate::control::ControlInbox::ingest
 /// [`open_bootstrap`]: crate::control::bootstrap::open_bootstrap
 pub fn open_from_sender(
     recipient_secret: &DeviceIdentitySecret,
     expected_recipient: DeviceId,
     envelope: &MailboxEnvelope,
-) -> Result<Vec<u8>, MailboxError> {
+) -> Result<Zeroizing<Vec<u8>>, MailboxError> {
     if envelope.recipient != expected_recipient {
         return Err(MailboxError::Crypto);
     }
     let sk = nostr_secret(&recipient_secret.secret_key())?;
     let pk = NostrPublicKey::from_byte_array(*envelope.sender.as_bytes());
-    nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).map_err(|_| MailboxError::Crypto)
+    nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext)
+        .map(Zeroizing::new)
+        .map_err(|_| MailboxError::Crypto)
 }
 
 /// The relay send/receive boundary a concrete client implements
@@ -315,8 +326,11 @@ mod tests {
         )
         .unwrap();
         let envelope = seal_for_recipient(&sender_sk, recipient, &sealed.encode()).unwrap();
-        let opened = open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
-        assert_eq!(opened, sealed.encode());
+        // The annotation pins the contract: mailbox plaintext wipes
+        // on drop rather than lingering as an ordinary buffer.
+        let opened: Zeroizing<Vec<u8>> =
+            open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
+        assert_eq!(opened.as_slice(), sealed.encode().as_slice());
     }
 
     #[test]
@@ -325,10 +339,10 @@ mod tests {
         let (_, recipient) = identity(0x02);
         let (wrong_sk, _) = identity(0x03);
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
-        assert_eq!(
+        assert!(matches!(
             open_from_sender(&wrong_sk, recipient, &envelope),
             Err(MailboxError::Crypto)
-        );
+        ));
     }
 
     #[test]
@@ -342,10 +356,10 @@ mod tests {
         let mid = bytes.len() / 2;
         bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
         envelope.ciphertext = String::from_utf8(bytes).unwrap();
-        assert_eq!(
+        assert!(matches!(
             open_from_sender(&recipient_sk, recipient, &envelope),
             Err(MailboxError::Crypto)
-        );
+        ));
     }
 
     #[test]
@@ -524,9 +538,9 @@ mod tests {
         let (_, recipient) = identity(0x02);
         let (_, other) = identity(0x03);
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
-        assert_eq!(
+        assert!(matches!(
             open_from_sender(&sender_sk, other, &envelope),
             Err(MailboxError::Crypto)
-        );
+        ));
     }
 }

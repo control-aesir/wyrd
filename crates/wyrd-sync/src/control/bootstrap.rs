@@ -64,6 +64,9 @@ const BOOTSTRAP_CHALLENGE_CONTEXT: &str = "wyrd bootstrap challenge v1";
 /// The opened invitation: who invited whom, with what delivery key,
 /// carrying the chain root and the wrapped first capability. The owner
 /// signature over all of it is verified inside [`open_bootstrap`].
+/// `genesis` is member-visible chain data and `capability` is still
+/// sealed ciphertext — neither is key material — so both stay plain
+/// `Vec<u8>`; they open later through the zeroizing capability path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapInvitation {
     pub drive: DriveId,

@@ -252,7 +252,8 @@ impl Engine {
 
     /// Hold an epoch's control key for inbox ingest. Keys live with
     /// the engine (not just the inbox) so restarts and resyncs keep
-    /// them.
+    /// them; both copies are zeroizing, so replacement briefly holds
+    /// old and new without either lingering past its drop.
     pub fn add_epoch_key(&mut self, epoch: u64, key: Zeroizing<[u8; 32]>) {
         self.inbox.add_epoch_key(epoch, key.clone());
         self.epoch_keys.insert(epoch, key);

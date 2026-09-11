@@ -55,8 +55,10 @@ macro_rules! device_secret {
             }
 
             /// A transient curve key for one API call. Short-lived by
-            /// construction: convert, call, drop.
-            pub fn secret_key(&self) -> SecretKey {
+            /// construction: convert, call, drop. Crate-private so no
+            /// downstream layer can bind the bare key to a local or a
+            /// struct field and defeat the wrapper's guarantee.
+            pub(crate) fn secret_key(&self) -> SecretKey {
                 SecretKey::from_slice(&self.0).expect("scalar validity established by from_bytes")
             }
         }

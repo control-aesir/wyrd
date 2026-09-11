@@ -129,7 +129,7 @@ pub(super) fn rebuild_facts(
             .state_of(&cap.transition)
             .ok_or(DurableError::CapabilityTransitionUnknown)?;
         let authorized = AuthorizedCapability::authorize(cap.clone(), *drive, &state, transition)?;
-        keyring.install(authorized.capability(), &state)?;
+        keyring.install(authorized.capability(), &state, transition)?;
     }
     let mut runtime = RuntimeState::new(*drive);
     for fact in facts.runtime_facts {

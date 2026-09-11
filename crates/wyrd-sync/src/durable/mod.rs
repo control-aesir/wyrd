@@ -181,25 +181,7 @@ impl AuthorizedCapability {
         state: &MembershipState,
         transition: &MembershipTransition,
     ) -> Result<Self, CapabilityError> {
-        if cap.drive != drive {
-            return Err(CapabilityError::DriveMismatch {
-                expected: drive,
-                found: cap.drive,
-            });
-        }
-        cap.validate_against(state)?;
-        if cap.transition != transition.transition_id() {
-            return Err(CapabilityError::TransitionMismatch {
-                expected: transition.transition_id(),
-                found: cap.transition,
-            });
-        }
-        if cap.covered_epoch() != transition.epoch {
-            return Err(CapabilityError::EpochMismatch {
-                declared: transition.epoch,
-                carried: cap.covered_epoch(),
-            });
-        }
+        cap.authorize_against(drive, state, transition)?;
         Ok(AuthorizedCapability { cap })
     }
 

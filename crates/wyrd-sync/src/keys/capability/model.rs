@@ -173,6 +173,42 @@ impl Capability {
         }
     }
 
+    /// The full authorization predicate, shared by every path that
+    /// turns a capability into installed secrets: it targets `drive`,
+    /// is bound to exactly `transition` (id and covered epoch), and its
+    /// recipient is a member of the state `transition` produces with
+    /// the registered encryption key. Intake, durable replay, and
+    /// keyring install all go through here, so no path can launder a
+    /// capability minted, wrapped, or hand-built for another drive,
+    /// transition, or epoch.
+    pub fn authorize_against(
+        &self,
+        drive: DriveId,
+        state: &crate::membership::MembershipState,
+        transition: &MembershipTransition,
+    ) -> Result<(), CapabilityError> {
+        if self.drive != drive {
+            return Err(CapabilityError::DriveMismatch {
+                expected: drive,
+                found: self.drive,
+            });
+        }
+        self.validate_against(state)?;
+        if self.transition != transition.transition_id() {
+            return Err(CapabilityError::TransitionMismatch {
+                expected: transition.transition_id(),
+                found: self.transition,
+            });
+        }
+        if self.covered_epoch() != transition.epoch {
+            return Err(CapabilityError::EpochMismatch {
+                declared: transition.epoch,
+                carried: self.covered_epoch(),
+            });
+        }
+        Ok(())
+    }
+
     /// N is the number of secrets; the AAD epoch field is `N`.
     pub fn up_to_epoch(&self) -> u64 {
         self.secrets.len() as u64
@@ -351,8 +387,8 @@ pub enum InstallError {
     WrongDrive(String, String),
     #[error("capability is for device {0}, keyring holds {1}")]
     WrongDevice(String, String),
-    #[error("capability device or key does not match membership state")]
-    NotAuthorized,
+    #[error("capability is not authorized: {0}")]
+    Unauthorized(#[from] CapabilityError),
     #[error("two capabilities disagree about the secret for epoch {0}")]
     EpochConflict(u64),
     #[error("crypto operation failed")]
@@ -390,16 +426,19 @@ impl DriveKeyring {
     /// epoch's secret is an error (forgery or corruption). The capability
     /// envelope alone proves nothing about authorization: anyone holding
     /// the epoch secrets can wrap them, so installation additionally
-    /// requires the authoritative membership state: the device must be a
-    /// member and the envelope's encryption key must equal the registered
-    /// key. There is no install path that skips this check. Conflicts are
-    /// detected before any mutation, so a failed install leaves the held
-    /// set untouched. Capabilities for another drive or device are
-    /// rejected before anything else.
+    /// requires the authorizing `transition` and the membership state it
+    /// produces — the full [`Capability::authorize_against`] predicate
+    /// (drive, member/key registration, exact transition id, exact
+    /// covered epoch) runs before any mutation. There is no install path
+    /// that skips this check. Conflicts are detected before any
+    /// mutation, so a failed install leaves the held set untouched.
+    /// Capabilities for another drive or device are rejected before
+    /// anything else.
     pub fn install(
         &mut self,
         capability: &Capability,
         state: &crate::membership::MembershipState,
+        transition: &MembershipTransition,
     ) -> Result<InstallReport, InstallError> {
         if capability.drive != self.drive {
             return Err(InstallError::WrongDrive(
@@ -413,9 +452,7 @@ impl DriveKeyring {
                 self.device.to_string(),
             ));
         }
-        capability
-            .validate_against(state)
-            .map_err(|_| InstallError::NotAuthorized)?;
+        capability.authorize_against(self.drive, state, transition)?;
         for (i, secret) in capability.secrets.iter().enumerate() {
             let epoch = i as u64 + 1;
             if let Some(held) = self.secrets.get(&epoch) {

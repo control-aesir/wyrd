@@ -3,6 +3,7 @@ use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::key;
 use crate::membership::MembershipState;
 use std::collections::BTreeSet;
+use wyrd_format::{DeviceId, MembershipTransition, TransitionId};
 
 /// The device's registered encryption pair: the secret unwrap uses
 /// and the x-only pubkey capabilities target. Derived as
@@ -31,7 +32,7 @@ fn capability(device: DeviceId, enc_key: DeviceEncryptionKey, n: u64) -> Capabil
         DriveId::from_bytes([0xEE; 32]),
         device,
         enc_key,
-        TransitionId::from_bytes([0x11; 32]),
+        stub_transition(n, 0).transition_id(),
         n,
         (1..=n)
             .map(|e| EpochSecret::from_bytes([e as u8; 32]))
@@ -42,6 +43,28 @@ fn capability(device: DeviceId, enc_key: DeviceEncryptionKey, n: u64) -> Capabil
 
 fn keyring(device: DeviceId) -> DriveKeyring {
     DriveKeyring::new(DriveId::from_bytes([0xEE; 32]), device)
+}
+
+/// An unsigned stand-in transition for install tests: install's
+/// predicate reads only the derived id and epoch (signature validity
+/// is the log's job, upstream of install). `salt` separates
+/// transitions that share an epoch.
+fn stub_transition(epoch: u64, salt: u8) -> MembershipTransition {
+    MembershipTransition {
+        epoch,
+        prev: None,
+        resolves: Vec::new(),
+        changes: Vec::new(),
+        members_root: [salt; 32],
+        owners_root: [0; 32],
+        author: DeviceId::from_bytes([0; 32]),
+        signature: [0; 64],
+    }
+}
+
+/// The transition the `capability` helper output binds to.
+fn bound_transition(n: u64) -> MembershipTransition {
+    stub_transition(n, 0)
 }
 
 /// The authoritative state tests install against: `device` a member
@@ -205,7 +228,7 @@ fn capability_for_another_drive_is_rejected() {
     let mut other = capability(device, enc_key, 2);
     other.drive = DriveId::from_bytes([0x77; 32]);
     assert!(matches!(
-        keyring.install(&other, &member_state(device, enc_key)),
+        keyring.install(&other, &member_state(device, enc_key), &bound_transition(2)),
         Err(InstallError::WrongDrive(_, _))
     ));
     assert!(keyring.is_empty(), "rejected installs must not mutate");
@@ -219,7 +242,11 @@ fn capability_for_another_device_is_rejected() {
     let mut keyring = keyring(device);
     let foreign = capability(other_device, enc_key, 2);
     assert!(matches!(
-        keyring.install(&foreign, &member_state(device, enc_key)),
+        keyring.install(
+            &foreign,
+            &member_state(device, enc_key),
+            &bound_transition(2)
+        ),
         Err(InstallError::WrongDevice(_, _))
     ));
     assert!(keyring.is_empty());
@@ -235,7 +262,7 @@ fn capability_epoch_must_match_the_secret_count() {
             DriveId::from_bytes([0xEE; 32]),
             device,
             enc_key,
-            TransitionId::from_bytes([0x11; 32]),
+            stub_transition(5, 0).transition_id(),
             5,
             secrets.clone(),
         ),
@@ -249,7 +276,7 @@ fn capability_epoch_must_match_the_secret_count() {
             DriveId::from_bytes([0xEE; 32]),
             device,
             enc_key,
-            TransitionId::from_bytes([0x11; 32]),
+            stub_transition(0, 0).transition_id(),
             0,
             Vec::new(),
         ),
@@ -259,7 +286,7 @@ fn capability_epoch_must_match_the_secret_count() {
         DriveId::from_bytes([0xEE; 32]),
         device,
         enc_key,
-        TransitionId::from_bytes([0x11; 32]),
+        stub_transition(3, 0).transition_id(),
         3,
         secrets,
     )
@@ -276,11 +303,11 @@ fn replay_of_an_older_capability_is_a_noop() {
     let newer = capability(device, enc_key, 5);
     let older = capability(device, enc_key, 3);
     assert_eq!(
-        held.install(&newer, &state).unwrap(),
+        held.install(&newer, &state, &bound_transition(5)).unwrap(),
         InstallReport::Added { from: 1, to: 5 }
     );
     assert_eq!(
-        held.install(&older, &state).unwrap(),
+        held.install(&older, &state, &bound_transition(3)).unwrap(),
         InstallReport::NoChange
     );
     assert_eq!(held.up_to(), 5, "a replay must never roll back");
@@ -292,11 +319,19 @@ fn replay_after_removal_confers_no_future_secrets() {
     let (_, enc_key) = enc_pair(0x30);
     let mut held = keyring(device);
     let state = member_state(device, enc_key);
-    held.install(&capability(device, enc_key, 3), &state)
-        .unwrap();
+    held.install(
+        &capability(device, enc_key, 3),
+        &state,
+        &bound_transition(3),
+    )
+    .unwrap();
     assert!(held.secret(4).is_none());
-    held.install(&capability(device, enc_key, 3), &state)
-        .unwrap();
+    held.install(
+        &capability(device, enc_key, 3),
+        &state,
+        &bound_transition(3),
+    )
+    .unwrap();
     assert!(held.secret(4).is_none(), "replay adds nothing new");
 }
 
@@ -307,11 +342,11 @@ fn epoch_conflict_is_an_error() {
     let mut held = keyring(device);
     let state = member_state(device, enc_key);
     let cap = capability(device, enc_key, 2);
-    held.install(&cap, &state).unwrap();
+    held.install(&cap, &state, &bound_transition(2)).unwrap();
     let mut forged = capability(device, enc_key, 2);
     forged.secrets[0] = EpochSecret::from_bytes([0xFF; 32]);
     assert_eq!(
-        held.install(&forged, &state),
+        held.install(&forged, &state, &bound_transition(2)),
         Err(InstallError::EpochConflict(1))
     );
     assert_eq!(held.secret(1), Some(&EpochSecret::from_bytes([1; 32])));
@@ -331,8 +366,12 @@ fn install_rejects_capabilities_outside_membership() {
     let (_, stranger) = key(6);
     let lone_state = member_state(stranger, other_key);
     assert_eq!(
-        held.install(&capability(device, enc_key, 2), &lone_state),
-        Err(InstallError::NotAuthorized)
+        held.install(
+            &capability(device, enc_key, 2),
+            &lone_state,
+            &bound_transition(2)
+        ),
+        Err(InstallError::Unauthorized(CapabilityError::NotAMember))
     );
     // The device is a member, but the envelope targets a key that is
     // not the registered one.
@@ -341,7 +380,7 @@ fn install_rejects_capabilities_outside_membership() {
         DriveId::from_bytes([0xEE; 32]),
         device,
         other_key,
-        TransitionId::from_bytes([0x11; 32]),
+        stub_transition(2, 0).transition_id(),
         2,
         vec![
             EpochSecret::from_bytes([1; 32]),
@@ -350,10 +389,52 @@ fn install_rejects_capabilities_outside_membership() {
     )
     .unwrap();
     assert_eq!(
-        held.install(&stale, &state),
-        Err(InstallError::NotAuthorized)
+        held.install(&stale, &state, &bound_transition(2)),
+        Err(InstallError::Unauthorized(
+            CapabilityError::StaleEncryptionKey
+        ))
     );
     assert!(held.is_empty(), "rejected installs must not mutate");
+}
+
+#[test]
+fn install_requires_the_authorizing_transition() {
+    // The binding gate at the keyring: a capability bound to one
+    // transition cannot install against another, however similar the
+    // two states are — the same device with the same registered key
+    // under both. The predicate rejects it and the keyring stays
+    // untouched; the same capability installs cleanly against its own
+    // transition.
+    let (_, device) = key(5);
+    let (_, enc_key) = enc_pair(0x30);
+    let mut held = keyring(device);
+    let state = member_state(device, enc_key);
+    let a = stub_transition(2, 1);
+    let b = stub_transition(2, 2);
+    let cap = Capability::new(
+        DriveId::from_bytes([0xEE; 32]),
+        device,
+        enc_key,
+        a.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([1; 32]),
+            EpochSecret::from_bytes([2; 32]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        held.install(&cap, &state, &b),
+        Err(InstallError::Unauthorized(
+            CapabilityError::TransitionMismatch {
+                expected: b.transition_id(),
+                found: a.transition_id(),
+            }
+        ))
+    );
+    assert!(held.is_empty(), "rejected installs must not mutate");
+    held.install(&cap, &state, &a).unwrap();
+    assert_eq!(held.up_to(), 2);
 }
 
 #[test]
@@ -627,4 +708,4 @@ use crate::keys::CryptoError;
 use proptest::prelude::*;
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use std::collections::BTreeMap;
-use wyrd_format::{DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
+use wyrd_format::{DeviceEncryptionKey, DriveId};

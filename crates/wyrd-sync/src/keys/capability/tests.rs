@@ -449,6 +449,7 @@ fn mint_uses_the_state_registered_encryption_key() {
     // The owner (caller of mint) does not choose the key: `state`
     // is the source of truth. A caller passing any other key gets
     // the registered one, not their choice.
+    use crate::membership::test_util::Builder;
     use crate::membership::MembershipState;
     use std::collections::BTreeSet;
     let (drive, device) = (
@@ -462,16 +463,60 @@ fn mint_uses_the_state_registered_encryption_key() {
         encryption_keys: BTreeMap::from([(device, registered_key)]),
     };
     let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
-    let cap = Capability::mint(
-        drive,
-        device,
-        &state,
-        TransitionId::from_bytes([0x11; 32]),
-        1,
-        secrets,
-    )
-    .unwrap();
+    let (_, transition) = Builder::genesis(10);
+    let cap = Capability::mint(drive, device, &state, &transition, secrets).unwrap();
     assert_eq!(cap.encryption_key, registered_key);
+}
+
+#[test]
+fn mint_derives_the_transition_binding() {
+    // The structural guarantee: the bound id and covered epoch come
+    // from the transition object, never from caller-supplied fields.
+    use crate::membership::test_util::Builder;
+    use crate::membership::MembershipState;
+    use std::collections::BTreeSet;
+    let drive = DriveId::from_bytes([0x33; 32]);
+    let (_, device) = key(5);
+    let (_, registered_key) = enc_pair(0x42);
+    let state = MembershipState {
+        members: BTreeSet::from([device]),
+        owners: BTreeSet::from([device]),
+        encryption_keys: BTreeMap::from([(device, registered_key)]),
+    };
+    let (mut builder, genesis) = Builder::genesis(10);
+    let child = builder.child(vec![]);
+    for (transition, epoch) in [(&genesis, 1), (&child, 2)] {
+        let secrets = vec![EpochSecret::from_bytes([0xAA; 32]); epoch as usize];
+        let cap = Capability::mint(drive, device, &state, transition, secrets).unwrap();
+        assert_eq!(cap.transition, transition.transition_id());
+        assert_eq!(cap.covered_epoch(), epoch);
+    }
+}
+
+#[test]
+fn mint_rejects_secrets_mismatching_the_transition_epoch() {
+    // Two secrets for an epoch-1 transition: the count check fires
+    // against the transition's epoch, not a caller-supplied number.
+    use crate::membership::test_util::Builder;
+    use crate::membership::MembershipState;
+    use std::collections::BTreeSet;
+    let drive = DriveId::from_bytes([0x33; 32]);
+    let (_, device) = key(5);
+    let (_, registered_key) = enc_pair(0x42);
+    let state = MembershipState {
+        members: BTreeSet::from([device]),
+        owners: BTreeSet::from([device]),
+        encryption_keys: BTreeMap::from([(device, registered_key)]),
+    };
+    let (_, genesis) = Builder::genesis(10);
+    let secrets = vec![EpochSecret::from_bytes([0xAA; 32]); 2];
+    assert_eq!(
+        Capability::mint(drive, device, &state, &genesis, secrets),
+        Err(CapabilityError::EpochMismatch {
+            declared: 1,
+            carried: 2
+        })
+    );
 }
 
 #[test]
@@ -480,6 +525,7 @@ fn capability_for_a_superseded_encryption_key_is_rejected() {
     // admitting K1 must never pair with a capability delivering to
     // K2. `mint` cannot produce this (it reads the registered key);
     // a hand-built or foreign capability must fail before install.
+    use crate::membership::test_util::Builder;
     use crate::membership::MembershipState;
     use std::collections::BTreeSet;
     let drive = DriveId::from_bytes([0x33; 32]);
@@ -506,15 +552,8 @@ fn capability_for_a_superseded_encryption_key_is_rejected() {
         stale.validate_against(&state),
         Err(CapabilityError::StaleEncryptionKey)
     );
-    let good = Capability::mint(
-        drive,
-        device,
-        &state,
-        TransitionId::from_bytes([0x11; 32]),
-        1,
-        secrets,
-    )
-    .unwrap();
+    let (_, genesis) = Builder::genesis(10);
+    let good = Capability::mint(drive, device, &state, &genesis, secrets).unwrap();
     assert!(good.validate_against(&state).is_ok());
 }
 
@@ -522,6 +561,7 @@ fn capability_for_a_superseded_encryption_key_is_rejected() {
 fn mint_rejects_a_non_member() {
     // A capability for a device that is not a member of the
     // authoritative state must not exist.
+    use crate::membership::test_util::Builder;
     use crate::membership::MembershipState;
     use std::collections::BTreeSet;
     let drive = DriveId::from_bytes([0x33; 32]);
@@ -533,15 +573,9 @@ fn mint_rejects_a_non_member() {
         encryption_keys: BTreeMap::from([(member, DeviceEncryptionKey::from_bytes([0x5A; 32]))]),
     };
     let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
+    let (_, genesis) = Builder::genesis(10);
     assert!(matches!(
-        Capability::mint(
-            drive,
-            stranger,
-            &state,
-            TransitionId::from_bytes([0x11; 32]),
-            1,
-            secrets,
-        ),
+        Capability::mint(drive, stranger, &state, &genesis, secrets),
         Err(CapabilityError::NotAMember)
     ));
 }

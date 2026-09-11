@@ -172,10 +172,30 @@ pub struct AuthorizedCapability {
 
 impl AuthorizedCapability {
     /// Validate the capability against the authoritative membership state
-    /// (member with the registered encryption key) and wrap it for
-    /// durability.
-    pub fn authorize(cap: Capability, state: &MembershipState) -> Result<Self, CapabilityError> {
+    /// (member with the registered encryption key) and the transition
+    /// that authorizes it, then wrap it for durability. The transition
+    /// binding is checked, not trusted: the bound id must equal the
+    /// authorizing transition's id, and the covered epoch must equal
+    /// its epoch — a capability carrying secrets for another epoch
+    /// never commits, however it was constructed.
+    pub fn authorize(
+        cap: Capability,
+        state: &MembershipState,
+        transition: &MembershipTransition,
+    ) -> Result<Self, CapabilityError> {
         cap.validate_against(state)?;
+        if cap.transition != transition.transition_id() {
+            return Err(CapabilityError::TransitionMismatch {
+                expected: transition.transition_id(),
+                found: cap.transition,
+            });
+        }
+        if cap.covered_epoch() != transition.epoch {
+            return Err(CapabilityError::EpochMismatch {
+                declared: transition.epoch,
+                carried: cap.covered_epoch(),
+            });
+        }
         Ok(AuthorizedCapability { cap })
     }
 

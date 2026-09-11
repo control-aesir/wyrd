@@ -227,11 +227,21 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
     if payload.device != capability.device || payload.epoch != capability.covered_epoch() {
         return Action::Commit(vec![Fact::ControlMessage(*id)]);
     }
+    // The authorizing transition is fetched with the state it
+    // produces: authorize checks the capability's bound id and covered
+    // epoch against it, so a capability minted for another transition
+    // or carrying another epoch's secrets suppresses here instead of
+    // committing. Unknown transitions defer — the history may simply
+    // not have arrived yet.
+    let transition = match engine.log.transition(&capability.transition) {
+        Some(transition) => transition,
+        None => return Action::Defer,
+    };
     let state = match engine.log.state_of(&capability.transition) {
         Some(state) => state,
         None => return Action::Defer,
     };
-    match AuthorizedCapability::authorize(capability, &state) {
+    match AuthorizedCapability::authorize(capability, &state, transition) {
         Ok(authorized) => Action::Commit(vec![
             Fact::Capability(authorized),
             Fact::ControlMessage(*id),
@@ -517,15 +527,8 @@ mod tests {
             .state_of(&admission.transition_id())
             .expect("admission is valid");
         let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
-        let capability = Capability::mint(
-            member_drive(),
-            device,
-            &state,
-            admission.transition_id(),
-            2,
-            secrets,
-        )
-        .expect("device is a member");
+        let capability = Capability::mint(member_drive(), device, &state, &admission, secrets)
+            .expect("device is a member");
         let wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
         let delivery = Message::Capability(CapabilityPayload {
             device,
@@ -630,15 +633,8 @@ mod tests {
             .state_of(&admission.transition_id())
             .expect("admission is valid");
         let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
-        let capability = Capability::mint(
-            member_drive(),
-            device,
-            &state,
-            admission.transition_id(),
-            2,
-            secrets,
-        )
-        .expect("device is a member");
+        let capability = Capability::mint(member_drive(), device, &state, &admission, secrets)
+            .expect("device is a member");
         let wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
         let delivery = Message::Capability(CapabilityPayload {
             device,
@@ -799,15 +795,8 @@ mod tests {
             .state_of(&admission.transition_id())
             .expect("admission is valid");
         let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
-        let capability = Capability::mint(
-            member_drive(),
-            device,
-            &state,
-            admission.transition_id(),
-            2,
-            secrets,
-        )
-        .expect("device is a member");
+        let capability = Capability::mint(member_drive(), device, &state, &admission, secrets)
+            .expect("device is a member");
         let mut wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
         wrapped[20] ^= 0xFF;
         let delivery = Message::Capability(CapabilityPayload {
@@ -843,8 +832,7 @@ mod tests {
             member_drive(),
             device,
             &state,
-            admission.transition_id(),
-            2,
+            admission,
             vec![EpochSecret::from_bytes([0x07; 32]); 2],
         )
         .expect("device is a member");
@@ -887,6 +875,56 @@ mod tests {
         queue(&mut fixture, mail);
         let report = drain(&mut fixture);
         assert_eq!(report.duplicates, 1);
+    }
+
+    #[test]
+    fn mismatched_capability_secrets_suppresses() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+
+        // The transitions land first so the capability authorizes
+        // against observed history instead of deferring.
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&admission)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+
+        // Bound to the admission transition (epoch 2) but carrying one
+        // secret: mint cannot produce this — the count check fires
+        // against the transition's epoch — so a hand-built capability
+        // stands in for a foreign or broken sender. Envelope and
+        // payload epochs agree, so the redundant-field check passes
+        // and the authorize gate is what suppresses, without a
+        // capability fact.
+        let cap = Capability::new(
+            member_drive(),
+            device,
+            encryption_key(&encryption_sk),
+            admission.transition_id(),
+            1,
+            vec![EpochSecret::from_bytes([0x07; 32])],
+        )
+        .expect("well-formed");
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 1,
+            wrapped: cap.wrap().expect("wraps").as_bytes().to_vec(),
+        });
+        let mail = vec![deliver(&fixture, 1, &delivery)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 1, "mismatch suppresses, never defers");
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.capabilities.is_empty(), "no capability installs");
     }
 
     #[test]

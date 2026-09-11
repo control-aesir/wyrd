@@ -26,7 +26,7 @@ use secp256k1::{Keypair, Parity, PublicKey, SecretKey, XOnlyPublicKey, SECP256K1
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use thiserror::Error;
-use wyrd_format::{DeviceId, DriveId, TransitionId};
+use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 use zeroize::Zeroizing;
 
 use super::encoding;
@@ -73,6 +73,11 @@ pub enum CapabilityError {
     NotAMember,
     #[error("capability targets an encryption key that is not the device's registered key")]
     StaleEncryptionKey,
+    #[error("capability is bound to transition {found} but authorized against {expected}")]
+    TransitionMismatch {
+        expected: TransitionId,
+        found: TransitionId,
+    },
 }
 
 impl Capability {
@@ -114,20 +119,31 @@ impl Capability {
 
     /// Mint a capability from the authoritative membership state: the
     /// registered encryption key (never the caller's choice) is in the
-    /// envelope, and the device must be a member of `state`.
+    /// envelope, and the device must be a member of `state`. The
+    /// transition binding is structural, not caller-assembled: the
+    /// bound id and covered epoch derive from `transition`, and the
+    /// secret count must equal its epoch. `state` must be the state
+    /// that `transition` produces — the log lookup at authorize time
+    /// is the enforcement point for that correspondence.
     pub fn mint(
         drive: DriveId,
         device: DeviceId,
         state: &crate::membership::MembershipState,
-        transition: TransitionId,
-        epoch: u64,
+        transition: &MembershipTransition,
         secrets: Vec<EpochSecret>,
     ) -> Result<Self, CapabilityError> {
         let encryption_key = state
             .encryption_key_of(&device)
             .copied()
             .ok_or(CapabilityError::NotAMember)?;
-        Self::new(drive, device, encryption_key, transition, epoch, secrets)
+        Self::new(
+            drive,
+            device,
+            encryption_key,
+            transition.transition_id(),
+            transition.epoch,
+            secrets,
+        )
     }
 
     /// The epoch this capability covers: exactly `1..=epoch`, where the

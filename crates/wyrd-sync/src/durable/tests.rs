@@ -3,7 +3,7 @@ use super::store::{atomic_write, commit_name, DurableStore};
 use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
 use crate::authorization::test_util::sign_snapshot;
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
-use crate::keys::capability::Capability;
+use crate::keys::capability::{Capability, CapabilityError};
 use crate::keys::epoch::EpochSecret;
 use crate::membership::test_util::{admit, drive, key, sign, Builder};
 use crate::membership::{MembershipLog, TransitionStatus};
@@ -91,12 +91,11 @@ fn authorized_capability(
         drive(),
         owner(),
         &state,
-        genesis.transition_id(),
-        1,
+        genesis,
         vec![EpochSecret::from_bytes([0xAA; 32])],
     )
     .unwrap();
-    AuthorizedCapability::authorize(cap, &state).unwrap()
+    AuthorizedCapability::authorize(cap, &state, genesis).unwrap()
 }
 
 fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
@@ -615,13 +614,61 @@ fn unauthorized_capability_cannot_commit() {
         drive(),
         stranger,
         &state,
-        genesis.transition_id(),
-        1,
+        &genesis,
         vec![EpochSecret::from_bytes([0xAA; 32])],
     );
     assert!(
         cap.is_err(),
         "minting for a non-member fails before authorization"
+    );
+}
+
+/// The binding gate: a capability bound to one transition cannot
+/// authorize against another, and the covered epoch must equal the
+/// authorizing transition's epoch — however the capability was built.
+#[test]
+fn authorize_rejects_foreign_transition_and_epoch() {
+    let (genesis, child) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    log.observe(child.clone());
+    let genesis_state = log.state_of(&genesis.transition_id()).unwrap();
+    let child_state = log.state_of(&child.transition_id()).unwrap();
+    // Minted for genesis (epoch 1): authorizing against the child
+    // fails on the bound id.
+    let cap = Capability::mint(
+        drive(),
+        owner(),
+        &genesis_state,
+        &genesis,
+        vec![EpochSecret::from_bytes([0xAA; 32])],
+    )
+    .unwrap();
+    assert_eq!(
+        AuthorizedCapability::authorize(cap, &child_state, &child),
+        Err(CapabilityError::TransitionMismatch {
+            expected: child.transition_id(),
+            found: genesis.transition_id(),
+        })
+    );
+    // Bound to the child (epoch 2) but carrying one secret: the epoch
+    // check fires.
+    let registered = child_state.encryption_key_of(&owner()).unwrap();
+    let short = Capability::new(
+        drive(),
+        owner(),
+        *registered,
+        child.transition_id(),
+        1,
+        vec![EpochSecret::from_bytes([0xAA; 32])],
+    )
+    .unwrap();
+    assert_eq!(
+        AuthorizedCapability::authorize(short, &child_state, &child),
+        Err(CapabilityError::EpochMismatch {
+            declared: 2,
+            carried: 1
+        })
     );
 }
 

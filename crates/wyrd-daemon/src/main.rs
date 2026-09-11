@@ -126,7 +126,7 @@ fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CliError> {
 fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
     let bytes = read_secret_file(path)?;
     let raw = if bytes.len() == 32 {
-        let mut raw = [0; 32];
+        let mut raw = Zeroizing::new([0; 32]);
         raw.copy_from_slice(&bytes);
         raw
     } else if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -135,13 +135,13 @@ fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
             return Err(CliError::IdentityFormat);
         }
         let decoded = Zeroizing::new(hex::decode(text).map_err(|_| CliError::IdentityFormat)?);
-        let mut raw = [0; 32];
+        let mut raw = Zeroizing::new([0; 32]);
         raw.copy_from_slice(&decoded);
         raw
     } else {
         return Err(CliError::IdentityFormat);
     };
-    DeviceIdentitySecret::from_bytes(raw).map_err(CliError::Identity)
+    DeviceIdentitySecret::from_bytes(*raw).map_err(CliError::Identity)
 }
 
 fn command(mut args: Vec<String>) -> Result<(), CliError> {

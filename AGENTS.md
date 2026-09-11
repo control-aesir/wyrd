@@ -62,5 +62,9 @@ devenv shell                # enter the dev environment (rust, git-hooks)
 
 - Conventional Commits. Nothing commits to `master` directly; use `pr/<name>`
   branches (see the ngit skill).
+- Follow `docs/collaboration-workflow.md` for issue triage, PR review, merge,
+  and issue resolution. Project labels are applied after issue creation:
+  exactly one type (`bug`, `enhancement`, or `chore`), one priority (`P0` to
+  `P4`), and one `release:*` milestone.
 - Comments explain how code is used, not what it does line-by-line. Keep them
   in sync with the code.

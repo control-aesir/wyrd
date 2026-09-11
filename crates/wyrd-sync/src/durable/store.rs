@@ -76,7 +76,7 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// Durably create-or-replace one file: temp + `fsync` + rename +
 /// directory `fsync`. Fixed `.tmp` sibling; stale temps are overwritten,
 /// never read.
-pub(super) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
     let mut f = File::create(&tmp)?;
     f.write_all(bytes)?;

@@ -100,6 +100,7 @@ mod store;
 mod tests;
 
 pub use replay::{LoadedFacts, Rebuilt};
+pub(crate) use store::atomic_write;
 #[allow(unused_imports)]
 pub(crate) use store::CrashStage;
 pub use store::DurableStore;

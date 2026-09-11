@@ -100,6 +100,10 @@ pub enum EngineError {
     DriveExists,
     #[error("drive file is not a 32-byte drive id")]
     MalformedDrive,
+    #[error("the custody record is malformed")]
+    MalformedKeystore,
+    #[error("the drive was created without completing its bootstrap")]
+    IncompleteBootstrap,
     #[error("keystore failed: {0}")]
     Keystore(#[from] crate::keys::KeystoreError),
     #[error("keystore I/O failed: {0}")]
@@ -232,6 +236,19 @@ impl Engine {
         encryption_secret: DeviceEncryptionSecret,
     ) -> Result<Self, EngineError> {
         let store = DurableStore::open(dir, drive, passphrase)?;
+        Self::open_with_store(store, drive, device, identity_secret, encryption_secret)
+    }
+
+    /// Assemble an engine over an already-open durable store. The caller
+    /// holds the store lock (bootstrap acquires it before writing any
+    /// drive or custody state, so creation is serialized).
+    pub(super) fn open_with_store(
+        store: DurableStore,
+        drive: DriveId,
+        device: DeviceId,
+        identity_secret: DeviceIdentitySecret,
+        encryption_secret: DeviceEncryptionSecret,
+    ) -> Result<Self, EngineError> {
         let mut engine = Engine {
             drive,
             device,
@@ -1398,5 +1415,60 @@ mod tests {
             Engine::create(dir.path.clone(), "test-pass", identity),
             Err(EngineError::DriveExists)
         ));
+    }
+
+    #[test]
+    fn concurrent_creates_leave_exactly_one_drive() {
+        let dir = TestDir::new("bootstrap-race");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let dir = dir.path.clone();
+                    let identity = identity.clone();
+                    scope.spawn(move || Engine::create(dir, "test-pass", identity))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one creator wins"
+        );
+        // The returned engines stayed alive through the race (the winner
+        // held the store lock); release them, then reopen the survivor.
+        drop(results);
+        let reopened = Engine::open_keystore(dir.path.clone(), "test-pass", identity).unwrap();
+        assert!(reopened.live_heads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_custody_record_fails_closed() {
+        let dir = TestDir::new("bootstrap-custody");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        drop(Engine::create(dir.path.clone(), "test-pass", identity.clone()).unwrap());
+
+        let keystore = dir.path.join("keystore");
+        let good = std::fs::read(&keystore).unwrap();
+
+        // A truncated custody record never opens.
+        std::fs::write(&keystore, &good[..good.len() - 1]).unwrap();
+        assert!(matches!(
+            Engine::open_keystore(dir.path.clone(), "test-pass", identity.clone()),
+            Err(EngineError::MalformedKeystore)
+        ));
+
+        // A missing custody record fails as I/O, not a half-drive.
+        std::fs::remove_file(&keystore).unwrap();
+        assert!(matches!(
+            Engine::open_keystore(dir.path.clone(), "test-pass", identity),
+            Err(EngineError::Io(_))
+        ));
+
+        let _ = std::fs::write(&keystore, &good);
     }
 }

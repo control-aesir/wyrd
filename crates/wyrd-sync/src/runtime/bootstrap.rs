@@ -7,8 +7,8 @@
 //! trust model assigns to the local keystore so the drive survives the
 //! creating process.
 //!
-//! Custody (trust.md T2, T6, T8, T13, T14), under `<dir>/keystore/`
-//! beside the durable store:
+//! Custody (trust.md T2, T6, T8, T13, T14) is one atomically written
+//! record, `<dir>/keystore`, so a crash can never leave part of it:
 //!
 //! ```text
 //! root       DriveRootKey, wrapped under the passphrase (root domain)
@@ -18,8 +18,12 @@
 //! ```
 //!
 //! The Nostr identity secret is deliberately absent: it is the
-//! caller/signer's key and is supplied on every open (T6, NIP-46). A
-//! single-device drive only; admitting more devices (bootstrap
+//! caller/signer's key and is supplied on every open (T6, NIP-46).
+//!
+//! Creation acquires the durable store lock before it writes the drive
+//! marker or any custody state, so two concurrent creators cannot
+//! clobber each other: exactly one wins, the other sees `StoreLocked`.
+//! A single-device drive only; admitting more devices (bootstrap
 //! invitations, capabilities) and root recovery are later slices. The
 //! drive starts headless; the first snapshot comes from
 //! [`Engine::author_snapshot`](super::engine::Engine::author_snapshot).
@@ -33,7 +37,7 @@ use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition};
 
 use super::engine::{Engine, EngineError};
-use crate::durable::Fact;
+use crate::durable::{atomic_write, DurableStore, Fact};
 use crate::keys::keystore::{
     unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, WrappedSecret,
 };
@@ -42,14 +46,17 @@ use crate::keys::{
 };
 use crate::membership::sign_transition;
 
-/// The custody subdirectory inside a drive directory.
-const KEYSTORE_DIR: &str = "keystore";
+/// The custody record file inside a drive directory.
+const KEYSTORE_FILE: &str = "keystore";
+
+/// The only custody-record version.
+const KEYSTORE_VERSION: u8 = 0x01;
 
 /// Create a new single-device drive. `identity` is the owner's Nostr
 /// identity (the signer's key, T6); everything else is generated and
 /// persisted under `passphrase`. Fails if the directory already holds a
 /// drive, so creation never clobbers one. On any failure the call rolls
-/// back what it created, so it never leaves a half-initialized drive.
+/// back what it created.
 pub(super) fn create(
     dir: PathBuf,
     passphrase: &str,
@@ -68,63 +75,78 @@ pub(super) fn create(
     let device = device_id(&identity);
     let genesis = genesis_transition(drive, &identity, &encryption);
 
-    let existed = dir.exists();
+    // Seal the custody record before the drive is usable. The genesis
+    // commit is the completion marker: a crash between the two leaves a
+    // drive with no canonical membership, which `open_keystore` refuses
+    // as incomplete rather than serving a half-created drive.
+    let custody = encode_custody(
+        &wrap_root(root.as_bytes(), passphrase)?,
+        &wrap_device_secret(encryption.as_bytes(), passphrase)?,
+        &escrow::wrap(&root.escrow_key(&drive, 1), &drive, 1, &epoch)?,
+    );
+
+    let dir_created = !dir.exists();
     std::fs::create_dir_all(&dir)?;
-    let keystore = dir.join(KEYSTORE_DIR);
 
+    // Acquire exclusive ownership before writing any drive or custody
+    // state. This is the authoritative concurrency guard: the `DRIVE`
+    // check above is only a friendly fast path. A failure here (contention
+    // or an existing drive) means the state is somebody else's, so it is
+    // deliberately outside the rollback below.
+    let store = DurableStore::open(dir.clone(), drive, passphrase)?;
+    if read_drive(&dir)? != drive {
+        return Err(EngineError::DriveExists);
+    }
+
+    // From here the fresh store is ours. The genesis commit is the
+    // completion marker: a crash between the custody write and the commit
+    // leaves a drive with no canonical membership, which `open_keystore`
+    // refuses as incomplete rather than serving a half-created drive.
     let result = (|| -> Result<Engine, EngineError> {
-        std::fs::create_dir_all(&keystore)?;
-        write_bytes(
-            &keystore.join("root"),
-            wrap_root(root.as_bytes(), passphrase)?.as_bytes(),
-        )?;
-        write_bytes(
-            &keystore.join("device"),
-            wrap_device_secret(encryption.as_bytes(), passphrase)?.as_bytes(),
-        )?;
-        let record = escrow::wrap(&root.escrow_key(&drive, 1), &drive, 1, &epoch)?;
-        write_bytes(&keystore.join("escrow-1"), &record.encode())?;
-
-        let mut engine =
-            Engine::open(dir.clone(), drive, device, passphrase, identity, encryption)?;
+        let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
+        atomic_write(&dir, KEYSTORE_FILE, &custody)?;
         engine.commit_facts(&[Fact::Transition(genesis)])?;
         engine.resync()?;
         engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
         Ok(engine)
     })();
 
-    if result.is_err() {
-        rollback(&dir, &keystore, existed);
+    match result {
+        Ok(engine) => Ok(engine),
+        Err(error) => {
+            rollback(&dir, dir_created);
+            Err(error)
+        }
     }
-    result
 }
 
 /// Open a drive created by [`create`]: the drive id comes from the store
-/// directory, the encryption secret and root are unwrapped from the local
-/// keystore, and the epoch-1 secret is un-escrowed under the root. The
-/// caller supplies the identity secret (the signer's key).
+/// directory, the encryption secret and root are unwrapped from the
+/// custody record, and the epoch-1 secret is un-escrowed under the root.
+/// The caller supplies the identity secret (the signer's key).
 pub(super) fn open_keystore(
     dir: PathBuf,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<Engine, EngineError> {
     let drive = read_drive(&dir)?;
-    let keystore = dir.join(KEYSTORE_DIR);
+    let (root_wrapped, device_wrapped, escrow_record) = read_custody(&dir)?;
 
-    let encryption = DeviceEncryptionSecret::from_bytes(unwrap_device_secret(
-        &read_wrapped(&keystore.join("device"))?,
-        passphrase,
-    )?)?;
+    let encryption =
+        DeviceEncryptionSecret::from_bytes(unwrap_device_secret(&device_wrapped, passphrase)?)?;
     let device = device_id(&identity);
     let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
 
-    let root = DriveRootKey::from_bytes(unwrap_root(
-        &read_wrapped(&keystore.join("root"))?,
-        passphrase,
-    )?);
-    let record = escrow::EscrowRecord::decode(&read_bytes(&keystore.join("escrow-1"))?)?;
-    let epoch = escrow::unwrap(&root.escrow_key(&drive, 1), &record)?;
+    let root = DriveRootKey::from_bytes(unwrap_root(&root_wrapped, passphrase)?);
+    let epoch = escrow::unwrap(&root.escrow_key(&drive, 1), &escrow_record)?;
     engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
+
+    // A complete bootstrap committed the genesis transition. If it is
+    // absent, creation crashed before completing; refuse rather than
+    // presenting a drive with no membership.
+    if engine.log.known_state().is_none() {
+        return Err(EngineError::IncompleteBootstrap);
+    }
     Ok(engine)
 }
 
@@ -157,27 +179,73 @@ fn genesis_transition(
     transition
 }
 
-/// Undo a failed create: remove the whole directory when this call made
-/// it, otherwise only the custody subdirectory it added.
-fn rollback(dir: &Path, keystore: &Path, dir_created: bool) {
+/// The custody record: `version ‖ len(root) ‖ len(device) ‖ len(escrow) ‖
+/// root ‖ device ‖ escrow`, each length a `u16` LE.
+fn encode_custody(
+    root: &WrappedSecret,
+    device: &WrappedSecret,
+    escrow_record: &escrow::EscrowRecord,
+) -> Vec<u8> {
+    let root = root.as_bytes();
+    let device = device.as_bytes();
+    let escrow = escrow_record.encode();
+    let mut out = Vec::with_capacity(7 + root.len() + device.len() + escrow.len());
+    out.push(KEYSTORE_VERSION);
+    out.extend_from_slice(&(root.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(device.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(escrow.len() as u16).to_le_bytes());
+    out.extend_from_slice(root);
+    out.extend_from_slice(device);
+    out.extend_from_slice(&escrow);
+    out
+}
+
+fn decode_custody(
+    bytes: &[u8],
+) -> Result<(WrappedSecret, WrappedSecret, escrow::EscrowRecord), EngineError> {
+    if bytes.len() < 7 || bytes[0] != KEYSTORE_VERSION {
+        return Err(EngineError::MalformedKeystore);
+    }
+    let len = |pos: usize| u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+    let (root_len, device_len, escrow_len) = (len(1), len(3), len(5));
+    let mut pos = 7usize;
+    let mut take = |n: usize| -> Result<Vec<u8>, EngineError> {
+        let end = pos.checked_add(n).ok_or(EngineError::MalformedKeystore)?;
+        if end > bytes.len() {
+            return Err(EngineError::MalformedKeystore);
+        }
+        let slice = bytes[pos..end].to_vec();
+        pos = end;
+        Ok(slice)
+    };
+    let root = WrappedSecret::from_bytes(take(root_len)?);
+    let device = WrappedSecret::from_bytes(take(device_len)?);
+    let escrow_record = escrow::EscrowRecord::decode(&take(escrow_len)?)?;
+    if pos != bytes.len() {
+        return Err(EngineError::MalformedKeystore);
+    }
+    Ok((root, device, escrow_record))
+}
+
+/// Undo a failed create. The custody record always goes; the store
+/// artifacts go when this call created the store, so a pre-existing
+/// directory keeps unrelated files.
+fn rollback(dir: &Path, dir_created: bool) {
+    let _ = std::fs::remove_file(dir.join(KEYSTORE_FILE));
     if dir_created {
         let _ = std::fs::remove_dir_all(dir);
-    } else {
-        let _ = std::fs::remove_dir_all(keystore);
+        return;
     }
+    for name in ["DRIVE", "store-key.wrap", "CURRENT", "LOCK"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let _ = std::fs::remove_dir_all(dir.join("commits"));
 }
 
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
-fn read_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
-    Ok(std::fs::read(path)?)
-}
-
-fn read_wrapped(path: &Path) -> Result<WrappedSecret, EngineError> {
-    Ok(WrappedSecret::from_bytes(std::fs::read(path)?))
+fn read_custody(
+    dir: &Path,
+) -> Result<(WrappedSecret, WrappedSecret, escrow::EscrowRecord), EngineError> {
+    decode_custody(&std::fs::read(dir.join(KEYSTORE_FILE))?)
 }
 
 fn read_drive(dir: &Path) -> Result<DriveId, EngineError> {

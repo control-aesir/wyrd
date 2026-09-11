@@ -11,9 +11,10 @@
 //! undecodable bytes. Both sources enforce the ceiling before buffering
 //! the representation: the memory source checks its stored bytes, and
 //! the iroh source checks the cryptographically verified blob size
-//! first, then streams the body into a bounded buffer that aborts past
-//! the ceiling — a hostile peer cannot force more than `max` plus one
-//! chunk of allocation no matter what it claims or streams.
+//! first, then streams the body into a bounded buffer that checks each
+//! leaf against the remaining budget before copying — a hostile peer
+//! cannot force more than `max` bytes of allocation no matter what it
+//! claims or streams.
 //!
 //! Addressing mirrors what each party may know. Sealed objects are
 //! vault-visible, so they fetch by [`StorageId`]. The root manifest of
@@ -184,7 +185,7 @@ impl IrohBulkSource {
         // oversize blob before anything transfers or allocates, and the
         // bounded accumulator below caps allocation while streaming, so
         // a peer that streams past its announced size still cannot force
-        // more than `max` plus one leaf of buffering.
+        // more than `max` bytes of buffering.
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
@@ -208,7 +209,8 @@ impl IrohBulkSource {
 }
 
 /// Concatenate one blob stream into a buffer capped at `max` content
-/// bytes: leaf data accumulates until the ceiling is crossed, parents
+/// bytes: each leaf is checked against the remaining budget before it
+/// is copied, so the buffer never holds more than `max` bytes; parents
 /// are protocol overhead (tree hashes, never content) and skip the
 /// count, and the bytes return only after `Done` — transport
 /// verification completes before the engine sees anything. Generic
@@ -223,13 +225,15 @@ where
     while let Some(item) = stream.next().await {
         match item {
             GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
-                out.extend_from_slice(&leaf.data);
-                if out.len() > max {
+                // Budget before copy: a single hostile leaf must not
+                // force more than the remaining ceiling of allocation.
+                if leaf.data.len() > max.saturating_sub(out.len()) {
                     return Err(BulkError::Oversize {
-                        bytes: out.len(),
+                        bytes: out.len().saturating_add(leaf.data.len()),
                         max,
                     });
                 }
+                out.extend_from_slice(&leaf.data);
             }
             GetBlobItem::Item(BaoContentItem::Parent(_)) => {}
             GetBlobItem::Done(_) => return Ok(out),
@@ -365,9 +369,15 @@ impl BulkSource for MemoryBulkSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bao_tree::io::{BaoContentItem, Leaf};
+    use bytes::Bytes;
 
     fn snapshot() -> SnapshotId {
         SnapshotId::from_bytes([0x11; 32])
+    }
+
+    fn leaf(offset: u64, data: Bytes) -> GetBlobItem {
+        GetBlobItem::Item(BaoContentItem::Leaf(Leaf { offset, data }))
     }
 
     #[test]
@@ -404,30 +414,19 @@ mod tests {
 
     #[test]
     fn bounded_accumulator_aborts_past_ceiling_without_consuming_tail() {
-        use bao_tree::io::{BaoContentItem, Leaf};
-        use bytes::Bytes;
         use n0_future::stream;
 
         // A lying or broken peer streams past its announced size: the
-        // accumulator must abort at the ceiling plus one leaf, never
-        // buffering the tail.
+        // accumulator must refuse the leaf that crosses the ceiling,
+        // never buffering the tail.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let mut items = stream::iter(vec![
-            GetBlobItem::Item(BaoContentItem::Leaf(Leaf {
-                offset: 0,
-                data: Bytes::from_static(b"0123456789"),
-            })),
-            GetBlobItem::Item(BaoContentItem::Leaf(Leaf {
-                offset: 10,
-                data: Bytes::from_static(b"0123456789"),
-            })),
-            GetBlobItem::Item(BaoContentItem::Leaf(Leaf {
-                offset: 20,
-                data: Bytes::from_static(b"0123456789"),
-            })),
+            leaf(0, Bytes::from_static(b"0123456789")),
+            leaf(10, Bytes::from_static(b"0123456789")),
+            leaf(20, Bytes::from_static(b"0123456789")),
         ]);
         let result = runtime.block_on(bounded_blob_bytes(&mut items, 15));
         assert_eq!(result, Err(BulkError::Oversize { bytes: 20, max: 15 }));
@@ -436,6 +435,61 @@ mod tests {
         assert!(
             runtime.block_on(items.next()).is_some(),
             "abort must leave the tail unconsumed"
+        );
+    }
+
+    #[test]
+    fn bounded_accumulator_rejects_single_leaf_over_remaining_budget() {
+        use n0_future::stream;
+
+        // One leaf larger than the whole ceiling: it must be refused
+        // before copying, not buffered and then rejected — otherwise a
+        // hostile leaf of arbitrary size blows the allocation bound.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut items = stream::iter(vec![
+            leaf(0, Bytes::from(vec![0xAA; 1024])),
+            leaf(1024, Bytes::from_static(b"tail")),
+        ]);
+        let result = runtime.block_on(bounded_blob_bytes(&mut items, 16));
+        assert_eq!(
+            result,
+            Err(BulkError::Oversize {
+                bytes: 1024,
+                max: 16
+            })
+        );
+        assert!(
+            runtime.block_on(items.next()).is_some(),
+            "refusal must happen before the leaf is consumed"
+        );
+    }
+
+    #[test]
+    fn bounded_accumulator_holds_exact_boundary_and_zero_max() {
+        use n0_future::stream;
+
+        // Exactly `max` bytes fit; the next byte does not — and with a
+        // zero ceiling even the first byte is refused uncopied.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let items = stream::iter(vec![
+            leaf(0, Bytes::from_static(b"0123456789")),
+            leaf(10, Bytes::from_static(b"0123456789")),
+            leaf(20, Bytes::from_static(b"x")),
+        ]);
+        assert_eq!(
+            runtime.block_on(bounded_blob_bytes(items, 20)),
+            Err(BulkError::Oversize { bytes: 21, max: 20 })
+        );
+        let items = stream::iter(vec![leaf(0, Bytes::from_static(b"x"))]);
+        assert_eq!(
+            runtime.block_on(bounded_blob_bytes(items, 0)),
+            Err(BulkError::Oversize { bytes: 1, max: 0 })
         );
     }
 

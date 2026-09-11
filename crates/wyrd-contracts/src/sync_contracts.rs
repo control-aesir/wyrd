@@ -2,10 +2,11 @@
 //! bounded bulk.
 
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_format::{Change, ContentId, ObjectKind, Snapshot, SnapshotId, StorageId};
+use wyrd_format::{Change, ContentId, FetchStatus, ObjectKind, Snapshot, SnapshotId, StorageId};
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::ingest::Limits;
+use wyrd_sync::runtime::MAX_PENDING_MESSAGES as PENDING_BOUND;
 
 use crate::support::{signed_transition, Loaded, RemoteOnlyMaterialization, Rig};
 
@@ -49,11 +50,11 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
         .execute_plan(&mut loaded.bulk, &mut loaded.objects)
         .unwrap();
     assert_eq!(report.snapshot_bodies, 1, "only the verified body commits");
-    assert_eq!(report.objects, 2, "the tree and the chunk materialize");
     assert!(
         report.invalid >= 1,
         "the forged body is rejected outright (retries may repeat it)"
     );
+    assert_eq!(report.objects, 2, "the tree and the chunk materialize");
 
     // Durable announcements and bodies are not heads: an empty
     // classification serves nothing.
@@ -85,28 +86,34 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
 /// overflow stays the relay's problem, every held message commits
 /// once its transition lands, and the shed envelope re-offers against
 /// resolved state instead of staying lost. Every delivery carries a
-/// fresh seal and therefore a distinct message id; one past the
-/// engine's pending bound (1024 — if the bound changes, these counts
-/// fail loudly and are revisited).
+/// fresh seal and therefore a distinct message id; one delivery
+/// beyond the engine's configured pending capacity.
 #[test]
 fn deferred_messages_survive_queue_pressure() {
     let mut rig = Rig::new();
     let child = epoch3_child(&rig);
     let child_id = child.transition_id();
+    let id_for = |index: u32| {
+        let mut bytes = [0x77u8; 32];
+        bytes[0] = index as u8;
+        bytes[1] = (index >> 8) as u8;
+        SnapshotId::from_bytes(bytes)
+    };
 
     // Announcements bound to a transition the engine has not seen:
     // every delivery defers under its own message id, and the last
     // one sheds to the relay.
-    for index in 1..=1025u32 {
-        let mut bytes = [0x77u8; 32];
-        bytes[0] = index as u8;
-        bytes[1] = (index >> 8) as u8;
-        rig.enqueue_announcement(SnapshotId::from_bytes(bytes), child_id, 3);
+    for index in 1..=(PENDING_BOUND as u32 + 1) {
+        rig.enqueue_announcement(id_for(index), child_id, 3);
     }
     let report = rig.drain();
     assert_eq!(report.accepted, 0);
-    assert_eq!(report.deferred, 1025);
-    assert_eq!(rig.engine_pending(), 1024, "the bound holds the rest");
+    assert_eq!(report.deferred, PENDING_BOUND + 1);
+    assert_eq!(
+        rig.engine_pending(),
+        PENDING_BOUND,
+        "the bound holds the rest"
+    );
 
     // The transition lands: the held messages commit with it. The
     // relay-held overflow was offered first in arrival order, so it
@@ -121,22 +128,14 @@ fn deferred_messages_survive_queue_pressure() {
     let report = rig.drain();
     assert_eq!(report.accepted, 1, "the shed envelope");
     assert_eq!(rig.engine_pending(), 0);
-    let mut first = [0x77u8; 32];
-    first[0] = 1;
-    first[1] = 0;
-    let mut last = [0x77u8; 32];
-    last[0] = 1;
-    last[1] = 4;
     let runtime = rig.runtime_state();
     assert!(
-        runtime
-            .announcement(&SnapshotId::from_bytes(first))
-            .is_some(),
+        runtime.announcement(&id_for(1)).is_some(),
         "held and committed"
     );
     assert!(
         runtime
-            .announcement(&SnapshotId::from_bytes(last))
+            .announcement(&id_for(PENDING_BOUND as u32 + 1))
             .is_some(),
         "shed, re-offered, committed"
     );
@@ -146,9 +145,10 @@ fn deferred_messages_survive_queue_pressure() {
 /// A bulk peer that records every ceiling it is offered: the fetch
 /// path must never ask for more than the configured limit, and
 /// oversize bulk bytes are invalid remote data — rejected before
-/// decode, never committed, retried later. Once the compliant
-/// manifest arrives, the same bounded path materializes everything
-/// and the content reads.
+/// decode, never committed, retried later. The hostile root is
+/// refused without materializing any bytes (the in-crate plan test
+/// covers the pre-decode gate with real bytes); once the compliant
+/// manifest arrives, the same bounded path materializes everything.
 #[test]
 fn bulk_sources_never_allocate_beyond_their_limit() {
     let mut loaded = Loaded::new("bounded.txt", b"bounded body");
@@ -158,67 +158,78 @@ fn bulk_sources_never_allocate_beyond_their_limit() {
     let report = loaded.drain();
     assert_eq!(report.accepted, 2, "capability and announcement");
 
-    let mut oversize = SealedManifest {
-        content_id: loaded.content.manifest_id,
-        sealed: vec![0xAA; 64 * 1024 * 1024 + 1],
-    };
-    oversize.sealed[0] = 0xBB;
-    loaded.bulk.publish_root(snapshot_id, oversize);
-
     let mut engine = loaded.rig.take_engine();
-    let mut bounded = Bounded {
-        inner: &mut loaded.bulk,
-        maxes: Vec::new(),
-    };
-    let report = engine
-        .execute_plan(&mut bounded, &mut loaded.objects)
-        .unwrap();
-    assert_eq!(report.manifests, 0, "the oversize root never commits");
-    assert!(
-        report.invalid >= 1,
-        "oversize is invalid, not a transport error (retries may repeat it)"
-    );
-    let runtime = engine.runtime_state().unwrap();
-    for id in &loaded.content.content_ids {
-        assert_eq!(
-            runtime.status(id),
-            wyrd_format::FetchStatus::RemoteOnly,
-            "nothing became materialized"
+    let mut all_maxes = Vec::new();
+
+    // First run: the root manifest fetch is refused with an oversize
+    // report and nothing materializes.
+    {
+        let mut bounded = Bounded {
+            inner: &mut loaded.bulk,
+            maxes: Vec::new(),
+            hostile_root: Some(snapshot_id),
+        };
+        let report = engine
+            .execute_plan(&mut bounded, &mut loaded.objects)
+            .unwrap();
+        assert_eq!(report.manifests, 0, "the oversize root never commits");
+        assert!(
+            report.invalid >= 1,
+            "oversize is invalid, not a transport error (retries may repeat it)"
         );
+        let runtime = engine.runtime_state().unwrap();
+        for id in &loaded.content.content_ids {
+            assert_eq!(
+                runtime.status(id),
+                FetchStatus::RemoteOnly,
+                "nothing became materialized"
+            );
+        }
+        all_maxes.append(&mut bounded.maxes);
     }
-    assert!(
-        bounded
-            .maxes
-            .iter()
-            .all(|max| *max <= Limits::V0.max_object_bytes),
-        "the fetch path never offers a ceiling above the configured limit"
-    );
-    assert!(
-        bounded.maxes.contains(&Limits::V0.max_object_bytes),
-        "the root manifest fetch rides the full configured ceiling"
-    );
 
     // The compliant manifest and its objects materialize on the next
     // run, under the same bounded path.
     loaded.publish_all();
     loaded.want_all(&mut engine);
-    let report = engine
-        .execute_plan(&mut loaded.bulk, &mut loaded.objects)
-        .unwrap();
-    assert_eq!(report.manifests, 1);
-    assert_eq!(report.objects, 2, "the tree and the chunk");
-    let runtime = engine.runtime_state().unwrap();
-    for id in &loaded.content.content_ids {
-        assert_eq!(runtime.status(id), wyrd_format::FetchStatus::Available);
+    {
+        let mut bounded = Bounded {
+            inner: &mut loaded.bulk,
+            maxes: Vec::new(),
+            hostile_root: None,
+        };
+        let report = engine
+            .execute_plan(&mut bounded, &mut loaded.objects)
+            .unwrap();
+        assert_eq!(report.manifests, 1);
+        assert_eq!(report.objects, 2, "the tree and the chunk");
+        let runtime = engine.runtime_state().unwrap();
+        for id in &loaded.content.content_ids {
+            assert_eq!(runtime.status(id), FetchStatus::Available);
+        }
+        all_maxes.append(&mut bounded.maxes);
     }
+
+    assert!(
+        all_maxes
+            .iter()
+            .all(|max| *max <= Limits::V0.max_object_bytes),
+        "the fetch path never offers a ceiling above the configured limit"
+    );
+    assert!(
+        all_maxes.contains(&Limits::V0.max_object_bytes),
+        "the root manifest fetch rides the full configured ceiling"
+    );
     loaded.rig.teardown();
 }
 
 /// A wrapper that records the ceilings it is offered, then delegates
-/// to the in-memory peer.
+/// to the in-memory peer — except for its hostile root, which it
+/// refuses with an oversize report without materializing any bytes.
 struct Bounded<'a> {
     inner: &'a mut MemoryBulkSource,
     maxes: Vec<usize>,
+    hostile_root: Option<SnapshotId>,
 }
 
 impl BulkSource for Bounded<'_> {
@@ -228,6 +239,12 @@ impl BulkSource for Bounded<'_> {
         max: usize,
     ) -> Result<Option<SealedManifest>, BulkError> {
         self.maxes.push(max);
+        if self.hostile_root == Some(*snapshot) {
+            return Err(BulkError::Oversize {
+                bytes: max + 1,
+                max,
+            });
+        }
         self.inner.fetch_root_manifest(snapshot, max)
     }
 

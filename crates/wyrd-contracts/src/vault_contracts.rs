@@ -9,12 +9,14 @@ use wyrd_sync::seal::{self, SEAL_VERSION};
 use crate::support::{drive, Loaded, RemoteOnlyMaterialization};
 use wyrd_sync::keys::EpochSecret;
 
-/// Vault-visible bytes never carry a member-only ContentId: the
-/// sealed manifest and every sealed object are addressed by
-/// StorageId, and no 32-byte ContentId window appears anywhere in
-/// their encodings (architecture.md invariant 4). The records are
-/// still exactly usable — opened under the member-only manifest key,
-/// and each object verified against its own manifest entry.
+/// The structural vault boundary: vault-visible records are
+/// addressed by StorageId and carry AEAD bytes; only the member-only
+/// key path (`open_manifest`, `verify`) recovers ContentIds, and each
+/// object verifies against its own manifest entry. The byte-window
+/// scan below is defense-in-depth — a heuristic, not a proof, since a
+/// transformed encoding could leak a ContentId in split form. It
+/// includes the manifest id even though the root-manifest record's
+/// fetch address is member-visible by design.
 #[test]
 fn content_ids_never_appear_in_vault_transport_records() {
     let drive = drive();

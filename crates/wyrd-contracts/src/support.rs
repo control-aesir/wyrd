@@ -39,10 +39,10 @@ impl wyrd_fuse::Materialization for RemoteOnlyMaterialization {
     }
 }
 
-// The trust.md challenge contexts. wyrd-sync's signing helpers are
-// crate-private; the suite pins the normative strings instead, and a
-// drift fails loudly as a bad signature.
-const MEMBER_CHALLENGE: &str = "wyrd membership challenge v1";
+// The snapshot challenge context has no public spelling in wyrd-sync
+// (the membership one does), so the fixture pins the normative string
+// and `fixture_signatures_verify_through_the_public_path` fails with
+// a local diagnostic if it drifts.
 const SNAPSHOT_CHALLENGE: &str = "wyrd snapshot challenge v1";
 
 pub(crate) fn drive() -> DriveId {
@@ -86,7 +86,10 @@ fn xonly_device_id(sk: &SecretKey) -> DeviceId {
 
 pub(crate) fn sign_transition(t: &mut MembershipTransition, sk: &SecretKey, drive: &DriveId) {
     let kp = Keypair::from_secret_key(secp256k1::SECP256K1, sk);
-    let challenge = blake3::derive_key(MEMBER_CHALLENGE, &t.signing_message(drive));
+    let challenge = blake3::derive_key(
+        wyrd_sync::membership::CHALLENGE_CONTEXT,
+        &t.signing_message(drive),
+    );
     t.signature = secp256k1::SECP256K1
         .sign_schnorr_no_aux_rand(&challenge, &kp)
         .to_byte_array();
@@ -625,4 +628,55 @@ impl Loaded {
     pub(crate) fn drain(&mut self) -> DrainReport {
         self.rig.drain()
     }
+}
+
+/// The fixture's own signatures verify through wyrd-sync's real
+/// public verification paths: membership classification derives a
+/// state only for signature-valid transitions, and durable
+/// authorization gatekeeps snapshot bodies. A drift in the pinned
+/// snapshot challenge context fails here, locally, instead of as a
+/// generic rejection in whichever contract runs first.
+#[test]
+fn fixture_signatures_verify_through_the_public_path() {
+    let owner = device(0x10);
+    let recipient = device(0x20);
+    let genesis = signed_transition(
+        1,
+        None,
+        vec![],
+        vec![
+            Change::Admit(Admission {
+                device: owner.id,
+                encryption_key: owner.encryption_key,
+            }),
+            Change::SetOwners(vec![owner.id]),
+        ],
+        &[owner.id],
+        &[owner.id],
+        &owner,
+    );
+    let genesis_id = genesis.transition_id();
+    let admit = signed_transition(
+        2,
+        Some(genesis_id),
+        vec![],
+        vec![Change::Admit(Admission {
+            device: recipient.id,
+            encryption_key: recipient.encryption_key,
+        })],
+        &[owner.id, recipient.id],
+        &[owner.id],
+        &owner,
+    );
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis);
+    log.observe(admit.clone());
+    assert!(
+        log.state_of(&admit.transition_id()).is_some(),
+        "membership fixture signatures must classify"
+    );
+    let tree = plain_files(&[("probe.txt", b"signature probe")]).tree_id;
+    let snapshot = signed_snapshot(Vec::new(), tree, &owner, admit.transition_id(), 2, 1_000);
+    wyrd_sync::durable::AuthorizedSnapshot::authorize(snapshot, &drive())
+        .expect("snapshot fixture signature must authorize durably");
 }

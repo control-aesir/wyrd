@@ -96,6 +96,14 @@ pub enum EngineError {
     ObjectStore(String),
     #[error("the snapshot timestamp space is exhausted at u64::MAX")]
     TimestampExhausted,
+    #[error("a drive already exists at this directory")]
+    DriveExists,
+    #[error("drive file is not a 32-byte drive id")]
+    MalformedDrive,
+    #[error("keystore failed: {0}")]
+    Keystore(#[from] crate::keys::KeystoreError),
+    #[error("keystore I/O failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// What one [`Engine::drain`] pass did.
@@ -244,18 +252,31 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Create a new single-device drive: generate the owner's identity and
-    /// encryption secrets and the drive root, author and sign the genesis
-    /// membership transition, open the durable store, and return the
-    /// running engine plus the minted key material ([`CreatedDrive`][super::CreatedDrive]).
-    /// The drive starts headless; author the first snapshot with
-    /// [`Engine::author_snapshot`]. Admitting more devices and root
-    /// recovery are later slices.
+    /// Create a new single-device drive. `identity` is the owner's Nostr
+    /// identity (the signer's key, trust.md T6). The device encryption
+    /// secret and the drive root are generated and persisted under
+    /// `passphrase`, and the epoch-1 secret is escrowed under the root, so
+    /// the drive survives the creating process. Fails if `dir` already
+    /// holds a drive. The drive starts headless; author the first snapshot
+    /// with [`Engine::author_snapshot`].
     pub fn create(
         dir: PathBuf,
         passphrase: &str,
-    ) -> Result<(Engine, super::CreatedDrive), EngineError> {
-        super::bootstrap::create(dir, passphrase)
+        identity: DeviceIdentitySecret,
+    ) -> Result<Engine, EngineError> {
+        super::bootstrap::create(dir, passphrase, identity)
+    }
+
+    /// Open a drive created by [`Engine::create`]: the drive id, root, and
+    /// device encryption secret come from the drive directory, and the
+    /// epoch-1 secret is recovered from escrow under the root. The caller
+    /// supplies the identity secret (the signer's key).
+    pub fn open_keystore(
+        dir: PathBuf,
+        passphrase: &str,
+        identity: DeviceIdentitySecret,
+    ) -> Result<Engine, EngineError> {
+        super::bootstrap::open_keystore(dir, passphrase, identity)
     }
 
     /// Arm the crash hook: the next durable commit stops after `stage`
@@ -1305,7 +1326,8 @@ mod tests {
     #[test]
     fn create_bootstraps_a_drive_and_authors_the_first_head() {
         let dir = TestDir::new("bootstrap");
-        let (mut engine, _keys) = Engine::create(dir.path.clone(), "test-pass").unwrap();
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
         assert!(
             engine.live_heads().unwrap().is_empty(),
             "a new drive starts headless"
@@ -1327,10 +1349,10 @@ mod tests {
     }
 
     #[test]
-    fn a_created_drive_reopens_with_the_same_secrets() {
+    fn a_created_drive_reopens_from_the_keystore() {
         let dir = TestDir::new("bootstrap-reopen");
-        let (mut engine, keys) = Engine::create(dir.path.clone(), "test-pass").unwrap();
-        let device = engine.device();
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", identity.clone()).unwrap();
 
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
@@ -1341,17 +1363,10 @@ mod tests {
             .snapshot_id();
         drop(engine);
 
-        let mut reopened = Engine::open(
-            dir.path.clone(),
-            keys.drive,
-            device,
-            "test-pass",
-            keys.identity.clone(),
-            keys.encryption.clone(),
-        )
-        .unwrap();
-        reopened.add_epoch_key(1, Zeroizing::new(keys.epoch.control_key(&keys.drive, 1)));
-
+        // Only the signer's identity is supplied; the root, the device
+        // encryption secret, and the epoch-1 secret come from the drive's
+        // persisted custody.
+        let reopened = Engine::open_keystore(dir.path.clone(), "test-pass", identity).unwrap();
         let heads = reopened.live_heads().unwrap();
         assert_eq!(
             heads
@@ -1359,7 +1374,29 @@ mod tests {
                 .map(|h| h.snapshot().snapshot_id())
                 .collect::<Vec<_>>(),
             vec![id],
-            "the created drive reopens from durable facts"
+            "the created drive reopens from its persisted custody"
         );
+    }
+
+    #[test]
+    fn opening_a_created_drive_with_the_wrong_passphrase_fails_closed() {
+        let dir = TestDir::new("bootstrap-wrong-pass");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        drop(Engine::create(dir.path.clone(), "test-pass", identity.clone()).unwrap());
+        assert!(matches!(
+            Engine::open_keystore(dir.path.clone(), "wrong-pass", identity),
+            Err(EngineError::Keystore(_))
+        ));
+    }
+
+    #[test]
+    fn creating_over_an_existing_drive_is_refused() {
+        let dir = TestDir::new("bootstrap-exists");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        drop(Engine::create(dir.path.clone(), "test-pass", identity.clone()).unwrap());
+        assert!(matches!(
+            Engine::create(dir.path.clone(), "test-pass", identity),
+            Err(EngineError::DriveExists)
+        ));
     }
 }

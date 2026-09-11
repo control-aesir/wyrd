@@ -1,19 +1,30 @@
-//! Local drive bootstrap: create a new drive from scratch.
+//! Local drive bootstrap: create a new drive from scratch and reopen it.
 //!
 //! The rest of the runtime assumes a drive already exists: `Engine::open`
 //! needs a durable store bound to a drive id, and the write path needs a
 //! canonical membership state. In tests both came from fixtures. This is
-//! the production producer: it mints the owner device's secrets and the
-//! drive root, authors and signs the genesis membership transition, opens
-//! the store, and hands back the running engine plus the minted key
-//! material.
+//! the production producer, and it persists the custody material the
+//! trust model assigns to the local keystore so the drive survives the
+//! creating process.
 //!
-//! Scope: a single-device drive. Admitting more devices (bootstrap
+//! Custody (trust.md T2, T6, T8, T13, T14), under `<dir>/keystore/`
+//! beside the durable store:
+//!
+//! ```text
+//! root       DriveRootKey, wrapped under the passphrase (root domain)
+//! device     device encryption secret, wrapped under the passphrase
+//!            (device domain); the capability-ECDH target
+//! escrow-1   epoch-1 secret, escrowed under the root (T13)
+//! ```
+//!
+//! The Nostr identity secret is deliberately absent: it is the
+//! caller/signer's key and is supplied on every open (T6, NIP-46). A
+//! single-device drive only; admitting more devices (bootstrap
 //! invitations, capabilities) and root recovery are later slices. The
 //! drive starts headless; the first snapshot comes from
 //! [`Engine::author_snapshot`](super::engine::Engine::author_snapshot).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
 use zeroize::Zeroizing;
@@ -23,34 +34,30 @@ use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTran
 
 use super::engine::{Engine, EngineError};
 use crate::durable::Fact;
+use crate::keys::keystore::{
+    unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, WrappedSecret,
+};
 use crate::keys::{
-    random_bytes, DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey, EpochSecret,
+    escrow, random_bytes, DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey, EpochSecret,
 };
 use crate::membership::sign_transition;
 
-/// The key material minted when a drive is created. The caller owns
-/// persistence: the identity and encryption secrets and the root belong
-/// in the local keystore (wrapped under the passphrase, see
-/// `crate::keys::keystore`); the epoch secret is control-plane knowledge
-/// the device must retain across restarts (escrow under the root in a
-/// later slice). The drive id is public.
-pub struct CreatedDrive {
-    pub drive: DriveId,
-    pub identity: DeviceIdentitySecret,
-    pub encryption: DeviceEncryptionSecret,
-    pub root: DriveRootKey,
-    pub epoch: EpochSecret,
-}
+/// The custody subdirectory inside a drive directory.
+const KEYSTORE_DIR: &str = "keystore";
 
-/// Create a new drive: generate the owner's secrets and the drive root,
-/// author and sign the genesis membership transition, open the durable
-/// store, and return the running engine plus the minted key material. The
-/// caller supplies the passphrase that wraps the store key at rest.
+/// Create a new single-device drive. `identity` is the owner's Nostr
+/// identity (the signer's key, T6); everything else is generated and
+/// persisted under `passphrase`. Fails if the directory already holds a
+/// drive, so creation never clobbers one. On any failure the call rolls
+/// back what it created, so it never leaves a half-initialized drive.
 pub(super) fn create(
     dir: PathBuf,
     passphrase: &str,
-) -> Result<(Engine, CreatedDrive), EngineError> {
-    let identity = DeviceIdentitySecret::generate()?;
+    identity: DeviceIdentitySecret,
+) -> Result<Engine, EngineError> {
+    if dir.join("DRIVE").exists() {
+        return Err(EngineError::DriveExists);
+    }
     let encryption = DeviceEncryptionSecret::generate()?;
     let root = DriveRootKey::generate()?;
     let epoch = EpochSecret::generate()?;
@@ -59,31 +66,66 @@ pub(super) fn create(
     random_bytes(&mut drive_bytes)?;
     let drive = DriveId::from_bytes(drive_bytes);
     let device = device_id(&identity);
-
-    let mut engine = Engine::open(
-        dir,
-        drive,
-        device,
-        passphrase,
-        identity.clone(),
-        encryption.clone(),
-    )?;
-
     let genesis = genesis_transition(drive, &identity, &encryption);
-    engine.commit_facts(&[Fact::Transition(genesis)])?;
-    engine.resync()?;
-    engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
 
-    Ok((
-        engine,
-        CreatedDrive {
-            drive,
-            identity,
-            encryption,
-            root,
-            epoch,
-        },
-    ))
+    let existed = dir.exists();
+    std::fs::create_dir_all(&dir)?;
+    let keystore = dir.join(KEYSTORE_DIR);
+
+    let result = (|| -> Result<Engine, EngineError> {
+        std::fs::create_dir_all(&keystore)?;
+        write_bytes(
+            &keystore.join("root"),
+            wrap_root(root.as_bytes(), passphrase)?.as_bytes(),
+        )?;
+        write_bytes(
+            &keystore.join("device"),
+            wrap_device_secret(encryption.as_bytes(), passphrase)?.as_bytes(),
+        )?;
+        let record = escrow::wrap(&root.escrow_key(&drive, 1), &drive, 1, &epoch)?;
+        write_bytes(&keystore.join("escrow-1"), &record.encode())?;
+
+        let mut engine =
+            Engine::open(dir.clone(), drive, device, passphrase, identity, encryption)?;
+        engine.commit_facts(&[Fact::Transition(genesis)])?;
+        engine.resync()?;
+        engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
+        Ok(engine)
+    })();
+
+    if result.is_err() {
+        rollback(&dir, &keystore, existed);
+    }
+    result
+}
+
+/// Open a drive created by [`create`]: the drive id comes from the store
+/// directory, the encryption secret and root are unwrapped from the local
+/// keystore, and the epoch-1 secret is un-escrowed under the root. The
+/// caller supplies the identity secret (the signer's key).
+pub(super) fn open_keystore(
+    dir: PathBuf,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<Engine, EngineError> {
+    let drive = read_drive(&dir)?;
+    let keystore = dir.join(KEYSTORE_DIR);
+
+    let encryption = DeviceEncryptionSecret::from_bytes(unwrap_device_secret(
+        &read_wrapped(&keystore.join("device"))?,
+        passphrase,
+    )?)?;
+    let device = device_id(&identity);
+    let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
+
+    let root = DriveRootKey::from_bytes(unwrap_root(
+        &read_wrapped(&keystore.join("root"))?,
+        passphrase,
+    )?);
+    let record = escrow::EscrowRecord::decode(&read_bytes(&keystore.join("escrow-1"))?)?;
+    let epoch = escrow::unwrap(&root.escrow_key(&drive, 1), &record)?;
+    engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
+    Ok(engine)
 }
 
 /// The genesis membership transition (epochs.md): the owner admits itself
@@ -113,6 +155,38 @@ fn genesis_transition(
     };
     sign_transition(&mut transition, &identity.secret_key(), &drive);
     transition
+}
+
+/// Undo a failed create: remove the whole directory when this call made
+/// it, otherwise only the custody subdirectory it added.
+fn rollback(dir: &Path, keystore: &Path, dir_created: bool) {
+    if dir_created {
+        let _ = std::fs::remove_dir_all(dir);
+    } else {
+        let _ = std::fs::remove_dir_all(keystore);
+    }
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
+    Ok(std::fs::read(path)?)
+}
+
+fn read_wrapped(path: &Path) -> Result<WrappedSecret, EngineError> {
+    Ok(WrappedSecret::from_bytes(std::fs::read(path)?))
+}
+
+fn read_drive(dir: &Path) -> Result<DriveId, EngineError> {
+    let bytes = std::fs::read(dir.join("DRIVE"))?;
+    let id: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EngineError::MalformedDrive)?;
+    Ok(DriveId::from_bytes(id))
 }
 
 /// The device id an identity secret names: the x-only public key.

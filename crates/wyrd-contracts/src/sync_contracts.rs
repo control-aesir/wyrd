@@ -11,6 +11,7 @@ use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
+use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::{Engine, EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
 
 use crate::support::{
@@ -220,7 +221,8 @@ fn authored_snapshots_mount_through_the_daemon_view() {
 fn a_bootstrapped_drive_serves_its_first_authored_snapshot() {
     let dir = scratch_dir("bootstrap");
 
-    let (mut engine, _keys) = Engine::create(dir.clone(), "contracts-pass").unwrap();
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.clone(), "contracts-pass", identity).unwrap();
     let mut store = MemoryObjectStore::default();
     let chunk = store.insert(ObjectKind::Chunk, b"boot").unwrap();
     let tree = Tree::from_entries(vec![Entry::file("boot.txt", 4, false, vec![chunk]).unwrap()])

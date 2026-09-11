@@ -60,6 +60,10 @@ pub enum WriteError<E: std::fmt::Debug> {
     /// remove from.
     #[error("cannot remove: the drive has no snapshots")]
     EmptyDrive,
+    /// A write cannot implicitly choose content from one side of a
+    /// multi-head conflict. Callers must provide an explicit resolution.
+    #[error("cannot write while the drive has {heads} live heads")]
+    Conflicted { heads: usize },
     /// The final path component is not a valid entry name.
     #[error("invalid entry name: {0}")]
     Name(#[from] wyrd_format::tree::ComponentError),
@@ -157,18 +161,18 @@ where
         Ok(())
     }
 
-    /// The tree a write builds from: the lowest live head's tree, or
-    /// `None` when the drive is headless. Heads arrive sorted ascending,
-    /// so the choice is deterministic. On a conflicted drive the write
-    /// is an explicit resolution — content builds from the lowest head
-    /// while the snapshot parents onto every head (see
-    /// [`Engine::author_snapshot`].
+    /// The tree a write builds from when the drive has exactly one live
+    /// head. A conflicted drive is rejected rather than silently losing
+    /// entries from any head; explicit resolution is a separate API
+    /// concern. A headless drive returns `None` so `put_file` can create
+    /// its initial empty tree.
     fn live_base(&self) -> Result<Option<ContentId>, WriteError<S::Error>> {
-        Ok(self
-            .engine
-            .live_heads()?
-            .first()
-            .map(|head| head.snapshot().tree))
+        let heads = self.engine.live_heads()?;
+        match heads.as_slice() {
+            [] => Ok(None),
+            [head] => Ok(Some(head.snapshot().tree)),
+            _ => Err(WriteError::Conflicted { heads: heads.len() }),
+        }
     }
 
     /// Write `data` to `path`: chunk the bytes into the view's store,
@@ -381,5 +385,14 @@ mod tests {
 
         drop(daemon);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn conflicted_write_error_requires_explicit_resolution() {
+        let error = WriteError::<std::convert::Infallible>::Conflicted { heads: 2 };
+        assert_eq!(
+            error.to_string(),
+            "cannot write while the drive has 2 live heads"
+        );
     }
 }

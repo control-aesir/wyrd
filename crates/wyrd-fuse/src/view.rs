@@ -1285,6 +1285,52 @@ mod tests {
     }
 
     #[test]
+    fn merged_dir_child_kind_divergence_conflicts() {
+        // A MergedDir's child that is a directory in one head and a
+        // file in the other: the structural merge applies only where
+        // every head agrees on the kind, so the child is a genuine
+        // path conflict — both versions visible on the conflict node,
+        // and the dir side stays navigable through the union.
+        let mut store = MemoryObjectStore::default();
+        let f = chunk(&mut store, b"fff");
+        let inner = chunk(&mut store, b"iii");
+        let x_dir = tree_of(
+            &mut store,
+            vec![Entry::file("deep.txt", 3, false, vec![inner]).unwrap()],
+        );
+        let dir_a = tree_of(&mut store, vec![Entry::dir("x", x_dir).unwrap()]);
+        let dir_b = tree_of(
+            &mut store,
+            vec![Entry::file("x", 3, false, vec![f]).unwrap()],
+        );
+        let root_a = tree_of(&mut store, vec![Entry::dir("dir", dir_a).unwrap()]);
+        let root_b = tree_of(&mut store, vec![Entry::dir("dir", dir_b).unwrap()]);
+        let view = DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            vec![snapshot(root_a), snapshot(root_b)],
+        );
+
+        // The parent path is a directory in every head: merged.
+        let dir = view.lookup("dir").unwrap();
+        assert!(matches!(dir, Node::MergedDir { .. }));
+        // The child disagrees on kind: a real path conflict.
+        let entries = view.readdir(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x");
+        let Node::Conflict { versions } = &entries[0].node else {
+            panic!("kind divergence must conflict, got {:?}", entries[0].node);
+        };
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().any(|v| matches!(v.node, Node::Dir { .. })));
+        assert!(versions.iter().any(|v| matches!(v.node, Node::File { .. })));
+        // The conflict node lists only the dir side's children.
+        let union = view.readdir(&entries[0].node).unwrap();
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].name, "deep.txt");
+    }
+
+    #[test]
     fn set_heads_moves_the_mount() {
         let mut store = MemoryObjectStore::default();
         let a = chunk(&mut store, b"aaa");

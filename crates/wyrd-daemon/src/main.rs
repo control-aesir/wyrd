@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_daemon::{Daemon, LiveConfig, LiveError, LiveSummary};
 use wyrd_format::FsObjectStore;
@@ -11,7 +12,52 @@ use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 use zeroize::Zeroizing;
 
-const USAGE: &str = "usage:\n  wyrd init <drive-dir> --identity-file <path> --passphrase-file <path>\n  wyrd mount <drive-dir> <mountpoint> --identity-file <path> --passphrase-file <path> [--relay <url>]...\n\nThe mount serves a live projection: control-plane intake drains on an interval and heads refresh without remounting. Fetch from peers is not yet wired (no peer addressing); --relay may be repeated, and with none given intake stays idle. Credential files are supported on Unix only and must be private.";
+/// The `wyrd` binary: create a drive, or mount its live projection.
+/// Both subcommands need the credential files (read and hardened by
+/// wyrd code, never by clap); `--relay` is mount-only deployment
+/// state — nothing in the keystore names relays, so they arrive as
+/// flags.
+#[derive(Debug, Parser)]
+#[command(name = "wyrd", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Args)]
+struct Credentials {
+    /// Nostr identity secret: 32 raw bytes or 64 hex characters.
+    #[arg(long, value_name = "PATH")]
+    identity_file: PathBuf,
+
+    /// Keystore passphrase, UTF-8 text.
+    #[arg(long, value_name = "PATH")]
+    passphrase_file: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Create a new drive: identity, root custody, genesis membership.
+    Init {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Mount a live read-only projection at `mountpoint`.
+    Mount {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Where to serve the projection.
+        mountpoint: PathBuf,
+        /// Control-plane relay; repeatable. With none given, intake
+        /// stays idle.
+        #[arg(long, value_name = "URL")]
+        relay: Vec<String>,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+}
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
@@ -23,7 +69,7 @@ fn current_uid() -> u32 {
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
-    #[error("{0}\n\n{USAGE}")]
+    #[error("{0}")]
     Usage(String),
     #[error("{path}: {source}")]
     Io {
@@ -50,63 +96,55 @@ enum CliError {
     Mount(#[from] std::io::Error),
 }
 
-fn required_option(args: &mut Vec<String>, name: &str) -> Result<PathBuf, CliError> {
-    if args.iter().filter(|arg| arg.as_str() == name).count() > 1 {
-        return Err(CliError::Usage(format!("duplicate option {name}")));
-    }
-    let Some(index) = args.iter().position(|arg| arg == name) else {
-        return Err(CliError::Usage(format!("missing {name}")));
-    };
-    if index + 1 >= args.len() {
-        return Err(CliError::Usage(format!("missing value for {name}")));
-    }
-    args.remove(index);
-    Ok(PathBuf::from(args.remove(index)))
-}
-
-/// Collect every `--name value` pair, removing them from the argument
-/// list. Repeatable options (`--relay`) accumulate; a dangling flag is
-/// a usage error. Unknown flags are left for the caller's own check.
-fn collect_options(args: &mut Vec<String>, name: &str) -> Result<Vec<String>, CliError> {
-    let mut values = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        if args[index].as_str() == name {
-            if index + 1 >= args.len() {
-                return Err(CliError::Usage(format!("missing value for {name}")));
-            }
-            args.remove(index);
-            values.push(args.remove(index));
-        } else {
-            index += 1;
+fn command(args: Vec<String>) -> Result<(), CliError> {
+    // `args` carries user arguments only (main strips argv[0]); clap's
+    // parse_from expects the binary name first. Help/version requests
+    // arrive as errors too: print them as asked and exit successfully.
+    let cli = match Cli::try_parse_from(std::iter::once("wyrd".to_owned()).chain(args)) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            return Ok(());
         }
+        Err(error) => return Err(CliError::Usage(error.to_string())),
+    };
+    let (identity, passphrase) = match &cli.command {
+        Command::Init { credentials, .. } => read_credentials(credentials)?,
+        Command::Mount { credentials, .. } => read_credentials(credentials)?,
+    };
+
+    match cli.command {
+        Command::Init { drive_dir, .. } => {
+            Engine::create(drive_dir, &passphrase, identity)?;
+            Ok(())
+        }
+        Command::Mount {
+            drive_dir,
+            mountpoint,
+            relay,
+            ..
+        } => mount(drive_dir, mountpoint, relay, &passphrase, identity),
     }
-    Ok(values)
 }
 
-/// A parsed `mount` invocation: positional paths plus the operator's
-/// relay configuration. Relays are deployment state, not drive state:
-/// nothing in the keystore names them, so they arrive as flags.
-struct MountArgs {
-    drive_dir: PathBuf,
-    mountpoint: PathBuf,
-    relays: Vec<String>,
-}
-
-fn parse_mount(mut positional: Vec<String>, relays: Vec<String>) -> Result<MountArgs, CliError> {
-    if positional.iter().any(|arg| arg.starts_with('-')) {
-        return Err(CliError::Usage("unknown option".into()));
-    }
-    if positional.len() != 2 {
-        return Err(CliError::Usage("wrong number of arguments".into()));
-    }
-    let mountpoint = PathBuf::from(positional.pop().expect("len is 2"));
-    let drive_dir = PathBuf::from(positional.pop().expect("only drive remains"));
-    Ok(MountArgs {
-        drive_dir,
-        mountpoint,
-        relays,
-    })
+/// Read and harden the credential files. The passphrase keeps its
+/// trailing newline stripped; the identity may be raw or hex.
+fn read_credentials(creds: &Credentials) -> Result<(DeviceIdentitySecret, String), CliError> {
+    let identity = read_identity(&creds.identity_file)?;
+    let passphrase_bytes = read_secret_file(&creds.passphrase_file)?;
+    let passphrase_text = std::str::from_utf8(&passphrase_bytes)
+        .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?;
+    let passphrase = Zeroizing::new(passphrase_text.to_owned());
+    let passphrase = passphrase
+        .strip_suffix("\r\n")
+        .or_else(|| passphrase.strip_suffix('\n'))
+        .unwrap_or(&passphrase);
+    Ok((identity, passphrase.to_owned()))
 }
 
 /// Read a bounded credential file without following symlinks. On Unix the
@@ -237,54 +275,17 @@ fn install_shutdown_handler() -> Result<(), CliError> {
     Ok(())
 }
 
-fn command(mut args: Vec<String>) -> Result<(), CliError> {
-    let Some(subcommand) = args.first().cloned() else {
-        return Err(CliError::Usage("missing subcommand".into()));
-    };
-    args.remove(0);
-    let identity_file = required_option(&mut args, "--identity-file")?;
-    let passphrase_file = required_option(&mut args, "--passphrase-file")?;
-    let relays = collect_options(&mut args, "--relay")?;
-    if args.iter().any(|arg| arg.starts_with('-')) {
-        return Err(CliError::Usage("unknown option".into()));
-    }
-    let identity = read_identity(&identity_file)?;
-    let passphrase_bytes = read_secret_file(&passphrase_file)?;
-    let passphrase_text = std::str::from_utf8(&passphrase_bytes)
-        .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?;
-    let passphrase = Zeroizing::new(passphrase_text.to_owned());
-    let passphrase = passphrase
-        .strip_suffix("\r\n")
-        .or_else(|| passphrase.strip_suffix('\n'))
-        .unwrap_or(&passphrase);
-
-    match subcommand.as_str() {
-        "init" if args.len() == 1 => {
-            if !relays.is_empty() {
-                return Err(CliError::Usage("--relay is a mount-only option".into()));
-            }
-            Engine::create(PathBuf::from(&args[0]), passphrase, identity)?;
-            Ok(())
-        }
-        "mount" if args.len() == 2 => mount(
-            parse_mount(std::mem::take(&mut args), relays)?,
-            passphrase,
-            identity,
-        ),
-        "init" | "mount" => Err(CliError::Usage("wrong number of arguments".into())),
-        _ => Err(CliError::Usage(format!("unknown subcommand {subcommand}"))),
-    }
-}
-
 fn mount(
-    args: MountArgs,
+    drive_dir: PathBuf,
+    mountpoint: PathBuf,
+    relays: Vec<String>,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    let engine = Engine::open_keystore(args.drive_dir.clone(), passphrase, identity.clone())?;
+    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
     let mut daemon = Daemon::new(
         engine,
-        FsObjectStore::open(args.drive_dir.clone())
+        FsObjectStore::open(drive_dir.clone())
             .map_err(|error| CliError::Store(error.to_string()))?,
     )?;
     daemon.refresh_live_heads()?;
@@ -296,14 +297,14 @@ fn mount(
     // session is a separate tracked issue.
     let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
         .map_err(|_| CliError::IdentityFormat)?;
-    let seen_path = args.drive_dir.join("mailbox.seen");
+    let seen_path = drive_dir.join("mailbox.seen");
     let mut mailbox = wyrd_daemon::live_mailbox::LiveMailbox::connect(
         nostr::key::Keys::new(nostr_secret.clone()),
         nostr_secret,
-        args.relays.clone(),
+        relays.clone(),
         seen_path,
     )?;
-    if args.relays.is_empty() {
+    if relays.is_empty() {
         eprintln!("warning: no --relay given; control-plane intake stays idle");
     }
 
@@ -311,7 +312,7 @@ fn mount(
     // below returns through the unmount-and-join sequence, never
     // leaking a detached session.
     install_shutdown_handler()?;
-    let mut session = fuser::Session::new(backend, &args.mountpoint, &session_config())?;
+    let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
     let server = std::thread::spawn(move || session.run());
     // No peer addressing exists yet, so the loop drains and publishes
@@ -472,46 +473,26 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_options_are_usage_errors() {
+    fn relay_flag_is_rejected_for_init() {
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        let passphrase_file = temp.0.join("passphrase");
+        write_secret(&identity_file, [0x11; 32]);
+        write_secret(&passphrase_file, b"test-pass\n");
         let error = command(vec![
             "init".into(),
             "/tmp/drive".into(),
             "--identity-file".into(),
-            "one".into(),
-            "--identity-file".into(),
-            "two".into(),
+            identity_file.display().to_string(),
             "--passphrase-file".into(),
-            "pass".into(),
-        ])
-        .unwrap_err();
-        assert!(matches!(error, CliError::Usage(message) if message.contains("duplicate")));
-    }
-
-    #[test]
-    fn relay_flags_collect_and_leave_positionals() {
-        let mut args = vec![
-            "/drive".into(),
-            "/mnt".into(),
+            passphrase_file.display().to_string(),
             "--relay".into(),
             "ws://one.example".into(),
-            "--relay".into(),
-            "ws://two.example".into(),
-        ];
-        let relays = collect_options(&mut args, "--relay").unwrap();
-        assert_eq!(relays, vec!["ws://one.example", "ws://two.example"]);
-        assert_eq!(args, vec!["/drive", "/mnt"]);
-
-        let parsed = parse_mount(args, relays).unwrap();
-        assert_eq!(parsed.drive_dir, PathBuf::from("/drive"));
-        assert_eq!(parsed.mountpoint, PathBuf::from("/mnt"));
-        assert_eq!(parsed.relays.len(), 2);
-    }
-
-    #[test]
-    fn dangling_relay_flag_is_a_usage_error() {
-        let mut args = vec!["/drive".into(), "--relay".into()];
-        let error = collect_options(&mut args, "--relay").unwrap_err();
-        assert!(matches!(error, CliError::Usage(_)));
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(error, CliError::Usage(message) if message.contains("unrecognized subcommand") || message.contains("unexpected"))
+        );
     }
 
     #[test]
@@ -546,26 +527,5 @@ mod tests {
             combine_status(Err(LiveError::Lock), Err(std::io::Error::other("dead"))).is_err(),
             "both failing still fails"
         );
-    }
-
-    #[test]
-    fn relay_flag_is_rejected_for_init() {
-        let temp = TempDir::new();
-        let identity_file = temp.0.join("identity");
-        let passphrase_file = temp.0.join("passphrase");
-        write_secret(&identity_file, [0x11; 32]);
-        write_secret(&passphrase_file, b"test-pass\n");
-        let error = command(vec![
-            "init".into(),
-            "/tmp/drive".into(),
-            "--identity-file".into(),
-            identity_file.display().to_string(),
-            "--passphrase-file".into(),
-            passphrase_file.display().to_string(),
-            "--relay".into(),
-            "ws://one.example".into(),
-        ])
-        .unwrap_err();
-        assert!(matches!(error, CliError::Usage(message) if message.contains("mount-only")));
     }
 }

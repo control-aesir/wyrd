@@ -38,7 +38,7 @@ Peers serve specialized functions, and what a peer *holds* is a separate decisio
 A phone is not a replica; it is a materialized view of the drive. Pin and evict decisions change what a device holds, never what the drive contains.
 
 ### 4. Continuous Self-Healing Integrity
-Because objects are addressed directly by their cryptographic hashes, integrity checking (scrubbing) is low-overhead. If a chunk becomes corrupted, Wyrd detects the hash mismatch and automatically repairs the chunk from another peer holding the object.
+Because objects are addressed directly by their cryptographic hashes, integrity checking (scrubbing) is low-overhead. If a chunk becomes corrupted, Wyrd detects the hash mismatch and automatically repairs the chunk from another peer holding the object (automatic peer repair is not yet wired at runtime: the bulk transport contract and fetch-on-open demand machinery exist, peer serving is pending).
 
 ### 5. Zero-Trust Storage Peers
 Objects are encrypted client-side before they ever leave the device—in transit and at rest. Vault peers store and replicate only opaque, encrypted blobs, so offsite backends can run on untrusted VPS providers or remote drives without compromising data privacy. The precise claim: **vaults cannot decrypt object contents**—they see ciphertext, sizes, and timing, never paths, structure, or equality between objects.
@@ -47,7 +47,7 @@ Objects are encrypted client-side before they ever leave the device—in transit
 When concurrent modifications occur across peers, Wyrd keeps both heads reachable and retains both versions as separate immutable objects. Conflicts are surfaced in the filesystem/UI for user resolution rather than automatically merged or overwritten.
 
 ### 7. No Data Lock-In
-The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing a chosen snapshot into a standard directory tree on a conventional filesystem.
+The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing a chosen snapshot into a standard directory tree on a conventional filesystem (no wyrd export CLI yet; the view API supports this).
 
 ---
 
@@ -63,16 +63,16 @@ When GC arrives, it will be the only way data is removed, and it will require:
 
 ## User Interface & Presentation
 
-Wyrd mounts via **FUSE** to present standard filesystem interfaces:
+Wyrd mounts via **FUSE** to present standard filesystem interfaces (pre-alpha today: a read-only FUSE mount via the daemon):
 
-* **Live View:** Operates as a standard read/write local folder.
-* **Time Travel:** Historical snapshots and previous roots can be browsed or restored using ordinary file manipulation tools or a web UI.
+* **Live View:** Operates as a standard read-only local folder.
+* **Time Travel:** Historical snapshots and previous roots can be browsed using ordinary file manipulation tools.
 
 ---
 
 ## Operational Tradeoffs
 
-* **Storage Overhead:** Maintaining snapshot history requires storage space. Deduplication mitigates growth, but at least one dedicated **Vault peer** is strongly recommended.
+* **Storage Overhead:** Maintaining snapshot history requires storage space. Deduplication mitigates growth, but at least one dedicated **Vault peer** is strongly recommended (peer roles and bulk transport are not yet wired at runtime).
 * **Dedup Topology:** Deduplication happens at devices, via encrypted manifests—a member that knows another member already uploaded ciphertext for a given content reuses it. Vaults cannot dedup on their own (they must never learn equality), so redundant ciphertext can accumulate across devices and requires eventual reconciliation.
 * **GC Distributed Consensus:** Coordinating garbage collection across multiple nodes is a complex distributed systems problem—with offline vaults it requires a retention/acknowledgement protocol, not just quorum. Initial versions default to an *append-only indefinitely* model prior to full distributed GC enablement.
 
@@ -86,10 +86,13 @@ format and sync **protocol/core** layers implement them: content-addressed
 store, snapshot DAG, membership and authorization engines, epoch keys and
 capabilities, sealed objects and manifests, escrow records, the
 control-plane message set, ingest limits, and the control-plane transport
-boundary. The runtime pieces that turn those protocol primitives into a
-real distributed filesystem are still incomplete: relay pool / signer-
-client wiring, bulk data transport, persistent local state, FUSE mounting,
-and garbage collection come later.
+boundary. The runtime is assembling: durable local state with crash
+recovery and restart reconciliation, author-side manifest generation,
+fetch-on-open demand machinery, author-signed snapshot announcements with
+transport identities, and a read-only FUSE mount via the daemon (`wyrd
+mount`) are in place and under test. Still pending: the real-iroh serving
+router peers dial into, relay pool / signer-client wiring (NIP-46),
+automatic peer repair, and garbage collection (post-v1 by contract).
 
 See `ROADMAP.md` for the current phase plan and issue links.
 
@@ -119,6 +122,8 @@ Wyrd's bet is that these are one system: git's object model, Syncthing's replica
 | `crates/wyrd-format` | The format contract: two identities (content/storage), canonical encoding, chunking, Merkle file trees, snapshot DAG |
 | `crates/wyrd-sync` | Peer replication on iroh: snapshot announcements, encrypted manifests, roles × materialization, two-phase content, zero-trust encryption |
 | `crates/wyrd-fuse` | The drive as a filesystem: live view, time travel, visible conflicts |
+| `crates/wyrd-daemon` | Composition: engine + view + presentation backends (read-only FUSE today) and the `wyrd` binary (`init`, `mount`) |
+| `crates/wyrd-contracts` | Cross-crate architectural contract suite: one named test per review contract, composed end to end |
 
 Design docs live in `docs/` (`architecture.md` is the one-page entry point);
 `AGENTS.md` holds repository conventions and hard rules.
@@ -139,5 +144,6 @@ cargo nextest run
 ```
 
 `crates/wyrd-format` carries the format contract and `crates/wyrd-sync`
-the cryptography and state machines (both under test); mounting arrives
-with `crates/wyrd-fuse`, still a skeleton.
+the cryptography and state machines (both under test); the read-only FUSE
+backend is implemented in `crates/wyrd-daemon` (`wyrd init`, `wyrd
+mount`), while bulk peer transport and write support are pending.

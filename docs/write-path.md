@@ -168,6 +168,15 @@ path does not invalidate it. Only a change to the same path's file
 identity (or its removal/type change) is stale. `truncate` and any
 future handle-derived content mutation obey the same rule.
 
+A stale or failed commit is **terminal for the handle**: the buffered
+overlay is discarded and the committing boundary returns `EIO`; the
+application must close and reopen (a transient store failure is not
+retried with the old buffer, and the daemon keeps no per-handle error
+state). A handle whose path was removed or replaced by an external
+`unlink`, `rename`, or another handle's commit is stale in exactly this
+sense: `write` still buffers into the overlay, and the divergence
+surfaces at the committing boundary.
+
 **`O_APPEND` is the explicit exception.** Append is position-independent,
 so an append handle does not carry a content base to compare: its
 buffered bytes are appended to the **current** head's file at commit
@@ -248,6 +257,21 @@ that never calls `flush`/`fsync` can lose acknowledged writes. This is
 standard POSIX-without-`O_SYNC`: `write` is not durable. The mount states
 it plainly.
 
+### Error timing
+
+Write-time and commit-time failures are distinct surfaces:
+
+- **`write` itself can fail** without buffering anything: a read-only or
+  read-only-opened handle (`EBADF`), a range that overflows the file
+  offset (`EFBIG`), an invalid argument (`EINVAL`), or a buffered/dirty
+  budget (`ENOSPC`). These are returned by `write`.
+- **Commit failures are returned by `flush`/`fsync`** (and best-effort by
+  `release`): `EIO` for a stale handle, a conflicted drive, or a
+  store/authoring/durability failure; `EFBIG` when the resulting file or
+  tree exceeds a protocol ingest ceiling; `ENOSPC` when a protocol object
+  budget is exceeded. A `write` that succeeded never implies the later
+  commit will.
+
 ## Namespace operations
 
 Each operation is one snapshot unless stated otherwise. `sqlite`-style
@@ -264,6 +288,14 @@ valid filesystem.
 | `rename` | File→file replaces; file→dir `EISDIR`; dir→empty-dir replaces; dir→nonempty-dir `ENOTEMPTY`; dir→file `ENOTDIR`; a directory into its own descendant `EINVAL`; same path is a no-op. A trailing slash on the source requires a directory. |
 | `truncate` | The conceptual operation behind `setattr(size)`: materialize the file plaintext (path-scoped, through the normal demand path), re-chunk to the target size. Growing zero-fills; shrinking discards the tail. Obeys the stale-handle rule. |
 | `set-exec` | The conceptual operation behind `setattr(mode)`: toggles the exec bit, the only mode state represented. |
+
+`rename` notes: cross-directory rename within the drive is allowed
+(unchanged subtrees are reused; only the two path walks are rebuilt).
+There are no hard links, so entry identity is the *pathname*, not a
+shared node — `rename(p, p)` is the only same-identity case, and it is a
+no-op. Both paths are parsed as canonical components before the
+mutation, so `rename("a//b", "c/./d")` cannot smuggle a non-canonical
+spelling.
 
 **Final-component symlinks are never followed.** `unlink`, `rmdir`,
 `rename`, and metadata operations target the directory entry itself, not
@@ -302,6 +334,12 @@ path mutation and has no mount surface in v0. Reads keep serving the
 merged view; writes wait for resolution by other means (resolution UX is
 future work).
 
+**Zero heads is not a conflict.** A fresh drive has no live head; its
+first mutation authors the initial root from an empty tree (the same
+bootstrap `Daemon::put_file` performs), so `create`/`mkdir`/`write` on an
+empty drive succeed. The conflicted rule applies only to *multiple* live
+heads.
+
 ## Coherence
 
 1. Every commit advances a **projection generation**. The backend's
@@ -334,6 +372,13 @@ limits elsewhere:
 Buffered state is memory, so these are daemon-write budgets; overflow
 fails closed rather than allocating without limit.
 
+These budgets are new and local; they are independent of the **protocol
+ingest limits** (`Limits::V0`), which still bound every committed object.
+A mutation whose resulting file, tree, or manifest exceeds an ingest
+ceiling is refused at the commit boundary (`EFBIG`), never committed as
+an unrepresentable tree; the mount cannot be used to bypass
+`check_tree`/`check_manifest`.
+
 ## Permissions and ownership (v0)
 
 The mount is single-user. Reads present policy owner/group and mode bits
@@ -360,7 +405,9 @@ and ignored (the format does not represent them). There are no ACLs.
 | non-empty `rmdir` / replacing a non-empty directory | `ENOTEMPTY` |
 | illegal rename (into descendant, trailing-slash mismatch) | `EINVAL` |
 | offset + length overflow | `EFBIG` |
+| mutation exceeds a protocol ingest ceiling (file/tree/manifest) | `EFBIG` |
 | invalid range/argument | `EINVAL` |
+| write/truncate on a handle without write access | `EBADF` |
 | buffer/dirty-handle budget exceeded | `ENOSPC` |
 | mutation queue full | `EAGAIN` |
 | operation not implemented | `ENOSYS` |
@@ -414,6 +461,9 @@ Each row locks a decided invariant.
   committing boundary.
 - **`create` then content**: two snapshots, both roots readable; a crash
   after `create` leaves the empty file.
+- **Failed commit is terminal**: after a stale/`EIO` commit the overlay is
+  dropped; a second commit on the handle is refused rather than
+  retrying the old buffer.
 
 **POSIX surface**
 
@@ -424,9 +474,13 @@ Each row locks a decided invariant.
   chmod exec bit; chmod unsupported bits (accepted, not persistent, stat
   unchanged).
 - Rename matrix: file→file, file→dir, dir→empty, dir→nonempty,
-  dir→descendant, same path, trailing slash.
+  dir→descendant, same path, trailing slash, cross-directory.
 - Directory-handle coherence: a `readdir` stream opened before a commit
   keeps its capture; a new `opendir` sees the change.
+- Error timing: `write` on a read-only handle returns `EBADF`; a range
+  overflow returns `EFBIG` from `write`, not from the commit; a commit
+  that exceeds a protocol ingest ceiling returns `EFBIG` from
+  `flush`/`fsync`.
 
 **Failure at each stage**
 
@@ -444,3 +498,5 @@ Each row locks a decided invariant.
 **Conflicted drives**
 
 - Write → `EIO` (`ConflictedHeads`); read still serves the merged view.
+- Zero heads: the first `create`/`mkdir` authors an initial root and
+  succeeds.

@@ -27,6 +27,9 @@ use crate::transport::decode_node_addr;
 /// errors — routing metadata is untrusted and a refusal must not fail a
 /// sync pass.
 pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) -> RouteReport {
+    // The pass owns the maps: clear before republishing, so a provider
+    // whose route was superseded does not linger as a stale candidate.
+    bulk.clear_routes();
     let mut report = RouteReport::default();
     let mut providers: BTreeMap<SnapshotId, iroh::EndpointAddr> = BTreeMap::new();
     for snapshot in state.recorded_snapshots() {

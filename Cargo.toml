@@ -49,8 +49,9 @@ argon2 = "0.5"
 getrandom = "0.2"
 zeroize = "1.9"
 
-# async runtime
-tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal"] }
+# async runtime (time: the daemon mailbox supervisor polls relay health on a
+# tick and backs off drainer recovery; same audited crate, additive feature)
+tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal", "time"] }
 
 # iroh stack — validated as a set, change all three together and test
 iroh = "1.0.3"

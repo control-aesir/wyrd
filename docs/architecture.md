@@ -113,9 +113,10 @@ projection have landed, the engine can author and durably commit member
 snapshots (the local write path), and a drive can be created locally
 from scratch (identity, root custody, genesis membership); the daemon
 composes a live NIP-59 relay mailbox (`LiveMailbox`: kind 1059 gift
-wraps over a durable seen-event-id dedupe log) and the `wyrd` binary
-provides local init/mount. Still open: reconnect supervision in the
-mailbox adapter, the NIP-46 signer-session client wiring, and the
+wraps over a durable seen-event-id dedupe log, supervised with relay
+health polling and capped-backoff drainer recovery) and the `wyrd` binary
+provides local init/mount. Still open: the NIP-46 signer-session client
+wiring, and the
 live fetch-on-open loop; garbage collection does
 not exist. `wyrd-fuse` is a
 mount-free view behind the daemon's FUSE backend. All crypto and sync

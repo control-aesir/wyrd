@@ -689,6 +689,7 @@ member/vault boundary is a security boundary, not an implementation detail.
    later demands one.
 9. ~~Concrete relay pool event kind/tag conventions~~ — resolved for v0:
    NIP-59 gift wrap over rumor kind 9501, durable seen-event-id dedupe
-   (T16); the daemon's `LiveMailbox` implements it. Still open: reconnect
-   supervision posture (capped backoff) in the daemon adapter, and the
-   `nostr-connect` session client composition.
+   (T16); the daemon's `LiveMailbox` implements it with a supervisor that
+   polls relay connection status into `MailboxHealth` and rebuilds a dead
+   notification stream (reconnect plus resubscribe with capped backoff).
+   Still open: the `nostr-connect` session client composition.

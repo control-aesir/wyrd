@@ -390,10 +390,9 @@ where
     S::Error: std::fmt::Debug,
 {
     /// Mark content wanted locally (`Cached`) so fetch plans retrieve
-    /// it: the daemon's fetch-policy surface. `RemoteOnly` content is
-    /// never fetched; the composer decides what to want. (The CLI does
-    /// not call this yet — fetch triggers land with peer addressing
-    /// on the parent tracker.)
+    /// it: the composer's manual fetch-policy lever on top of the
+    /// want registry (FUSE registers demand; the loop admits it).
+    /// `RemoteOnly` content is never fetched without either path.
     pub fn want(&mut self, content: ContentId) -> Result<(), LiveError> {
         self.engine
             .set_materialization(content, MaterializationState::Cached)?;

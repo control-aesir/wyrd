@@ -443,10 +443,13 @@ where
         // Admit outstanding FUSE demand ahead of fetching: each pending
         // want becomes Cached materialization, which the plan then
         // fetches. Admission is durable (`set_materialization` commits
-        // a fact), so a failed pass never loses a registered demand.
-        for want in self.wants.drain_pending() {
+        // a fact) and changes the serving projection, so the count
+        // feeds the publication gate below.
+        let wants = self.wants.drain_pending();
+        let wants_admitted = !wants.is_empty();
+        for want in &wants {
             self.engine
-                .set_materialization(want, MaterializationState::Cached)?;
+                .set_materialization(*want, MaterializationState::Cached)?;
         }
         let fetched = match bulk {
             Some(bulk) => {
@@ -455,14 +458,21 @@ where
             }
             None => ExecuteReport::default(),
         };
-        if !self.dirty && !sync_changed(&drained, &fetched) {
+        // Retire admitted wants whose fetch landed: the demand entry
+        // is done and its slot frees for the next demand. The runtime
+        // snapshot is shared with publication below.
+        let completed_runtime = self.engine.runtime_state()?;
+        self.wants
+            .complete_local(|content| completed_runtime.status(content) == FetchStatus::Available);
+        if !self.dirty && !wants_admitted && !sync_changed(&drained, &fetched) {
             return Ok(SyncReport { drained, fetched });
         }
-        let runtime = self.engine.runtime_state()?;
         let heads = view_heads(self.engine.live_heads()?);
         {
             let mut view = self.view.write().map_err(|_| LiveError::Lock)?;
-            view.set_materialization(DaemonMaterialization { runtime });
+            view.set_materialization(DaemonMaterialization {
+                runtime: completed_runtime,
+            });
             view.set_heads(heads);
         }
         self.dirty = false;
@@ -895,6 +905,35 @@ mod tests {
 
         drop(live);
         drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reviewer's publication-gate regression: admitting a pending
+    /// want is a durable commit (`Cached` fact) even when nothing else
+    /// changed — the serving projection must republish so the view stops
+    /// reporting `RemoteOnly` for content the engine has admitted.
+    #[test]
+    fn want_admission_publishes_without_other_changes() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("anchor.txt", b"anchor").unwrap();
+        let (mut live, _backend) = daemon.into_live(Duration::from_secs(30));
+
+        // Demand content nobody holds yet; no mailbox traffic, no bulk.
+        let missing = ContentId::from_bytes([0xEE; 32]);
+        live.wants.register(missing).unwrap();
+        live.sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+        let status = live.view.read().unwrap().status(&missing);
+        assert_eq!(
+            status,
+            FetchStatus::Fetching,
+            "want admission must publish even with no other pass changes"
+        );
+        // The sweep left the still-unfulfilled want in flight.
+        assert!(live.wants.is_admitted(&missing));
+
+        drop(live);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

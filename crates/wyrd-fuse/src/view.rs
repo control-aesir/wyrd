@@ -309,6 +309,13 @@ where
         self.materialization = materialization;
     }
 
+    /// The serving policy's status for one content id: a projection
+    /// query for composers and tests (the load paths consult it for
+    /// absent content; this exposes it directly).
+    pub fn status(&self, id: &ContentId) -> FetchStatus {
+        self.materialization.status(id)
+    }
+
     /// Resolve a path to its node, merging across heads. `/a/b` and
     /// `a/b` both work; `""` and `"/"` address the root. A trailing
     /// `@N` on a component selects version N of a conflicted path

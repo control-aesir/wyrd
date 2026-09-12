@@ -59,11 +59,25 @@ struct RegistryState {
     /// Demanded identities the loop has not yet admitted into the
     /// engine (via `set_materialization(Cached)`).
     pending: BTreeSet<ContentId>,
-    /// Waiter count per outstanding identity. `waiting[X] == 0` after
-    /// the last waiter leaves, at which point the demand entry is
-    /// retired — the engine-side fetch, once admitted, continues on
-    /// its own materialization policy and is never cancelled here.
+    /// Identities the loop admitted: the demand is durably `Cached`
+    /// and the fetch is the engine's business. A waiter may time out
+    /// and leave, but the admitted fetch continues until the loop
+    /// observes it local ([`WantRegistry::complete_local`]) — the
+    /// slow first open makes the next one instant.
+    admitted: BTreeSet<ContentId>,
+    /// Waiter count per outstanding identity (keys of `pending` ∪
+    /// `admitted`). When the last waiter of a pending identity
+    /// leaves, the demand dies — nothing fetches for a nobody. An
+    /// admitted fetch outlives its waiters.
     waiting: BTreeMap<ContentId, usize>,
+}
+
+impl RegistryState {
+    /// A new registration beyond the bound fails; outstanding
+    /// identities (pending or admitted) count toward it.
+    fn saturated(&self) -> bool {
+        self.pending.len() + self.admitted.len() >= MAX_PENDING_WANTS
+    }
 }
 
 /// Shared demand registry: FUSE registers and waits, the daemon loop
@@ -75,72 +89,92 @@ pub struct WantRegistry {
 }
 
 impl WantRegistry {
-    /// Register a demand for `content`. Returns immediately if the
-    /// caller reports it already local; attaches to an existing
-    /// outstanding want otherwise; creates a bounded new entry when
-    /// neither holds. The caller then drives waiting against the view.
+    /// Register a demand for `content`. Identical outstanding wants
+    /// coalesce: an identity that is pending (awaiting admission) or
+    /// admitted (fetch in flight) merely gains a waiter, so a second
+    /// demand never re-queues an in-flight fetch. A never-demanded
+    /// identity creates a bounded new entry. The caller then drives
+    /// waiting against the view.
     pub fn register(&self, content: ContentId) -> Result<(), WantError> {
         let mut state = self.state.lock().map_err(|_| WantError::Lock)?;
-        let count = state.waiting.entry(content).or_insert(0);
-        *count += 1;
-        if state.pending.insert(content) {
-            // A fresh demand entry counts once: the waiting map holds
-            // every registered identity, so its length is the distinct
-            // count. A retired entry frees its slot when the last
-            // waiter leaves.
-            if state.waiting.len() > MAX_PENDING_WANTS {
-                // Admit nothing new: roll back and fail the demand.
-                match state.waiting.entry(content) {
-                    std::collections::btree_map::Entry::Occupied(mut slot) => {
-                        *slot.get_mut() -= 1;
-                        if *slot.get() == 0 {
-                            slot.remove();
-                        }
-                    }
-                    std::collections::btree_map::Entry::Vacant(_) => {
-                        unreachable!("the entry was just inserted")
-                    }
-                }
-                state.pending.remove(&content);
+        let outstanding = state.pending.contains(&content) || state.admitted.contains(&content);
+        if !outstanding {
+            // Admit nothing new past the bound.
+            if state.saturated() {
                 return Err(WantError::Saturated);
             }
+            state.pending.insert(content);
         }
+        *state.waiting.entry(content).or_insert(0) += 1;
         Ok(())
     }
 
     /// Retire one waiter: called when the waiter observed success or
-    /// gave up. The last waiter out retires the demand entry; a
-    /// pending (not yet admitted) demand dies with it — nothing
-    /// fetches for a nobody. An already-admitted fetch is the
-    /// engine's business and continues.
+    /// gave up. Poisoned locks skip the cleanup instead of panicking a
+    /// waiter thread (fail closed: the leaked slot is bounded by the
+    /// admission bound; a poisoned lock already means the daemon is
+    /// coming down). The last waiter out retires a pending demand; an
+    /// admitted fetch keeps its in-flight mark and continues.
     pub fn release(&self, content: &ContentId) {
-        let mut state = self.state.lock().expect("want registry poisoned");
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
         if let std::collections::btree_map::Entry::Occupied(mut slot) =
             state.waiting.entry(*content)
         {
             *slot.get_mut() -= 1;
             if *slot.get() == 0 {
                 slot.remove();
+                // An unadmitted demand dies with its waiters — nothing
+                // fetches for a nobody. An admitted fetch keeps its
+                // in-flight mark and continues; the loop retires it
+                // when it lands.
                 state.pending.remove(content);
             }
         }
     }
 
-    /// Snapshot of pending demands for the loop: admission empties the
-    /// pending set (the engine's materialization state is the truth
-    /// from there), waiter counts stay for bookkeeping.
-    /// Snapshot of pending demands for the loop: admission empties the
-    /// pending set (the engine's materialization state is the truth
-    /// from there); waiter counts stay for bookkeeping. A poisoned
-    /// lock yields an empty drain — the next registration re-demand,
-    /// and the loop never blocks on registry health.
+    /// Hand the loop the pending demands and mark them admitted: the
+    /// engine's durable `Cached` state is the truth from here, so a
+    /// later registration coalesces instead of re-demanding. A
+    /// poisoned lock yields an empty drain — the next registration
+    /// re-demands, and the loop never blocks on registry health.
     pub fn drain_pending(&self) -> Vec<ContentId> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
-        std::mem::take(&mut state.pending)
-            .into_iter()
-            .collect::<Vec<_>>()
+        let drained: Vec<ContentId> = std::mem::take(&mut state.pending).into_iter().collect();
+        for content in &drained {
+            state.admitted.insert(*content);
+        }
+        drained
+    }
+
+    /// Loop-side completion sweep: retire every admitted identity the
+    /// probe reports local (the fetch landed and is cached). Entries
+    /// still unfulfilled stay in flight for the next pass.
+    pub fn complete_local(&self, probe: impl Fn(&ContentId) -> bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let landed: Vec<ContentId> = state
+            .admitted
+            .iter()
+            .filter(|id| probe(id))
+            .copied()
+            .collect();
+        for id in landed {
+            state.admitted.remove(&id);
+        }
+    }
+
+    /// Test access to the in-flight mark.
+    #[cfg(test)]
+    pub(crate) fn is_admitted(&self, content: &ContentId) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.admitted.contains(content))
+            .unwrap_or(false)
     }
 }
 
@@ -196,14 +230,14 @@ mod tests {
             vec![content(1), content(2)],
             "identical wants coalesce into one demand entry"
         );
-        // A second register after drain re-registers demand.
+        // A second register after admission coalesces: the fetch is in
+        // flight, so no new demand entry appears.
         registry.register(content(1)).unwrap();
-        assert_eq!(registry.drain_pending(), vec![content(1)]);
-        // Releasing a single waiter of two leaves the demand alive.
-        registry.release(&content(1));
         assert!(registry.drain_pending().is_empty());
+        // Releasing a single waiter of two leaves the in-flight fetch.
         registry.release(&content(1));
-        assert!(registry.drain_pending().is_empty());
+        assert!(registry.is_admitted(&content(1)));
+        registry.release(&content(1));
         // Releasing an unknown identity is a no-op.
         registry.release(&content(9));
     }
@@ -247,6 +281,52 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error, WantError::TimedOut);
         assert!(registry.drain_pending().is_empty());
+    }
+
+    /// The reviewer's coalescing regression: once a demand is admitted
+    /// (drained), a second waiter must attach to the in-flight fetch,
+    /// never re-queue a second pending demand.
+    #[test]
+    fn registration_after_admission_does_not_re_demand() {
+        let registry = WantRegistry::default();
+        registry.register(content(1)).unwrap();
+        let admitted = registry.drain_pending();
+        assert_eq!(admitted, vec![content(1)], "the loop admitted the want");
+        // A second waiter arrives while the fetch is in flight.
+        registry.register(content(1)).unwrap();
+        assert!(
+            registry.drain_pending().is_empty(),
+            "an admitted identity must not be re-demanded"
+        );
+    }
+
+    /// Timeout removes the waiter, not the fetch: an admitted identity
+    /// keeps its in-flight mark after its last waiter leaves, and the
+    /// loop retires it once the probe reports it local.
+    #[test]
+    fn release_after_admission_keeps_the_fetch_in_flight() {
+        let registry = WantRegistry::default();
+        registry.register(content(1)).unwrap();
+        assert_eq!(registry.drain_pending(), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
+        registry.release(&content(1));
+        assert!(
+            registry.is_admitted(&content(1)),
+            "an admitted fetch outlives its last waiter"
+        );
+        registry.register(content(2)).unwrap();
+        let next = registry.drain_pending();
+        assert_eq!(next, vec![content(2)], "only the new pending demand drains");
+        // The loop sweep retires the landed fetch.
+        registry.complete_local(|id| *id == content(1));
+        assert!(
+            !registry.is_admitted(&content(1)),
+            "a landed fetch is retired"
+        );
+        assert!(
+            registry.is_admitted(&content(2)),
+            "still-unfulfilled fetches stay in flight"
+        );
     }
 
     /// Timeout cancels the wait, not the fetch: when the probe flips

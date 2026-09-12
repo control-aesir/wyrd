@@ -355,7 +355,12 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
         }
         let storage = StorageId::from_bytes(record[pos..pos + 32].try_into().ok()?);
         let transport = BaoRoot::from_bytes(record[pos + 32..end].try_into().ok()?);
-        representations.insert(storage, transport);
+        // The encoder emits unique map keys, so a repeated StorageId is
+        // malformed input; silently keeping one entry would lose the
+        // representation the record actually committed to.
+        if representations.insert(storage, transport).is_some() {
+            return None;
+        }
         pos = end;
     }
     let manifest = Manifest::from_canonical_bytes(&record[pos..]).ok()?;
@@ -385,4 +390,47 @@ pub(super) enum DecodedFact {
     ObjectRemoved(ContentId),
     Materialization(ContentId, MaterializationState),
     ControlMessage(ControlMessageId),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use wyrd_format::{Manifest, SnapshotId};
+
+    use super::*;
+
+    /// The encoder emits unique map keys, so a record declaring the same
+    /// StorageId twice is malformed; keeping one entry silently would
+    /// drop the representation the record committed to.
+    #[test]
+    fn manifest_decode_rejects_duplicate_storage_ids() {
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let key = [0x11u8; 32];
+        let manifest = Manifest {
+            snapshot: SnapshotId::from_bytes([0x11; 32]),
+            entries: Vec::new(),
+            children: Vec::new(),
+        };
+        let manifest_id = ContentId::derive(ObjectKind::Manifest, &manifest.canonical_bytes());
+        let record = ManifestRecord {
+            is_root: true,
+            manifest_id,
+            representations: BTreeMap::from([(
+                StorageId::from_bytes([0xA0; 32]),
+                BaoRoot::from_bytes([0xC0; 32]),
+            )]),
+            transport: BaoRoot::from_bytes([0xC0; 32]),
+            manifest,
+        };
+        let (tag, good) = encode_fact(&key, &drive, &Fact::Manifest(record)).unwrap();
+        assert!(decode_record(&drive, &key, tag, &good).is_some());
+
+        // Duplicate the one representation entry and bump the count.
+        let mut bad = good.clone();
+        bad[65..69].copy_from_slice(&2u32.to_le_bytes());
+        let entry = good[69..133].to_vec();
+        bad.splice(133..133, entry);
+        assert!(decode_record(&drive, &key, tag, &bad).is_none());
+    }
 }

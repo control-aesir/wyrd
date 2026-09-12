@@ -274,9 +274,12 @@ impl RuntimeState {
             // StorageId names exactly one ciphertext, so it names
             // exactly one transport root; two records disagreeing on
             // the root behind one StorageId is corruption, not an
-            // alternate representation, and fails closed.
-            for (storage, transport) in record.representations {
-                if let Some(held) = existing.representations.insert(storage, transport) {
+            // alternate representation, and fails closed. Validate
+            // every pair before mutating: this method is also a
+            // replay/state-building primitive, so `Err` must mean no
+            // state change.
+            for (storage, transport) in &record.representations {
+                if let Some(held) = existing.representations.get(storage) {
                     if held != transport {
                         return Err(RuntimeError::ConflictingManifest {
                             manifest: manifest_id,
@@ -284,6 +287,7 @@ impl RuntimeState {
                     }
                 }
             }
+            existing.representations.extend(record.representations);
             return Ok(false);
         }
 
@@ -723,6 +727,49 @@ mod tests {
             BaoRoot::from_bytes([0xD0; 32]),
             "each storage id keeps its own root"
         );
+    }
+
+    #[test]
+    fn conflicting_representation_roots_leave_the_record_untouched() {
+        let mut state = RuntimeState::new(drive());
+        let mut first = root_manifest(1, 9, 4, 5);
+        first.representations = BTreeMap::from([(
+            StorageId::from_bytes([0xB0; 32]),
+            BaoRoot::from_bytes([0xC1; 32]),
+        )]);
+        first.transport = BaoRoot::from_bytes([0xC1; 32]);
+        assert!(state.record_manifest(first.clone()).unwrap());
+
+        // The new representation sorts before the conflicting one, so a
+        // non-atomic merge would leave it behind after the error.
+        let mut second = first.clone();
+        second.representations = BTreeMap::from([
+            (
+                StorageId::from_bytes([0xA0; 32]),
+                BaoRoot::from_bytes([0xC2; 32]),
+            ),
+            (
+                StorageId::from_bytes([0xB0; 32]),
+                BaoRoot::from_bytes([0xC3; 32]),
+            ),
+        ]);
+        assert!(matches!(
+            state.record_manifest(second),
+            Err(RuntimeError::ConflictingManifest { .. })
+        ));
+
+        let stored = state
+            .manifests
+            .get(&manifest_id_for(&root_manifest(1, 9, 4, 5)))
+            .unwrap();
+        assert_eq!(stored.representations.len(), 1, "no partial merge");
+        assert_eq!(
+            stored.representations[&StorageId::from_bytes([0xB0; 32])],
+            BaoRoot::from_bytes([0xC1; 32])
+        );
+        assert!(!stored
+            .representations
+            .contains_key(&StorageId::from_bytes([0xA0; 32])));
     }
 
     #[test]

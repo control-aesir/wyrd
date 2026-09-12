@@ -214,6 +214,32 @@ pub(crate) fn announcement_msg_with(
     root_manifest: ContentId,
     root_transport: BaoRoot,
 ) -> Message {
+    announcement_msg_routed(
+        author_sk,
+        snapshot,
+        epoch,
+        membership,
+        body_root,
+        root_manifest,
+        root_transport,
+        None,
+    )
+}
+
+/// `announcement_msg_with` plus an explicit retrieval route: the sender's
+/// `node_addr` is the one mutable announcement field (a route update
+/// replaces it; every other field is identity).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn announcement_msg_routed(
+    author_sk: &DeviceIdentitySecret,
+    snapshot: SnapshotId,
+    epoch: u64,
+    membership: TransitionId,
+    body_root: BaoRoot,
+    root_manifest: ContentId,
+    root_transport: BaoRoot,
+    node_addr: Option<Vec<u8>>,
+) -> Message {
     let kp = Keypair::from_secret_key(SECP256K1, &author_sk.secret_key());
     let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
     let mut announcement = SnapshotAnnouncement {
@@ -224,7 +250,7 @@ pub(crate) fn announcement_msg_with(
         body_root,
         root_manifest,
         root_manifest_transport: root_transport,
-        node_addr: None,
+        node_addr,
         signature: [0; 64],
     };
     crate::control::sign_announcement(&mut announcement, author_sk, &member_drive());
@@ -352,14 +378,19 @@ pub(crate) fn capability_message_for(
 /// announcement bound to the body. Returns the body; its snapshot id is
 /// the address every manifest of the scenario must embed (the plan
 /// validates the binding), so callers thread it into `publish_into`.
-pub(crate) fn intake_snapshot(
-    fixture: &mut Fixture,
-    bulk: &mut MemoryBulkSource,
-    builder: &Builder,
-    genesis: &MembershipTransition,
-    admission: &MembershipTransition,
-    secrets: Vec<EpochSecret>,
-) -> Snapshot {
+/// The transport identities an honest announcement names: the root
+/// manifest the fetch plane will open against, and its sealed
+/// representation's transport root (decision 26).
+pub(crate) struct AnnouncedRoots {
+    pub(crate) manifest: ContentId,
+    pub(crate) transport: BaoRoot,
+}
+
+/// The deterministic intake body: the snapshot every intake-based test
+/// publishes for the admitted device. Signing is deterministic, so the
+/// id computed here is the id `intake_snapshot` will announce — tests
+/// build manifests against this id before the control plane lands.
+pub(crate) fn intake_body(builder: &Builder, admission: &MembershipTransition) -> Snapshot {
     let owner = *builder.owners.iter().next().expect("tracked owner");
     let mut body = Snapshot::new(
         Vec::new(),
@@ -371,6 +402,57 @@ pub(crate) fn intake_snapshot(
         1000 + admission.epoch,
     );
     crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
+    body
+}
+
+/// Seal and publish an empty root manifest for the snapshot under the
+/// delivered epoch material: the honest announcement roots for tests
+/// that map nothing beyond the body.
+pub(crate) fn empty_roots(
+    bulk: &mut MemoryBulkSource,
+    epoch_secret: &EpochSecret,
+    epoch: u64,
+    snapshot: &SnapshotId,
+) -> AnnouncedRoots {
+    let manifest = Manifest {
+        snapshot: *snapshot,
+        entries: Vec::new(),
+        children: Vec::new(),
+    };
+    let key = epoch_secret.manifest_key(&member_drive(), epoch, snapshot);
+    let (manifest_id, obj) = crate::seal::seal_manifest(&key, &manifest).unwrap();
+    bulk.publish_root(
+        *snapshot,
+        SealedManifest {
+            content_id: manifest_id,
+            sealed: obj.encode(),
+        },
+    );
+    bulk.publish_sealed(obj.storage_id(), obj.encode());
+    bulk.publish_transport(obj.encode());
+    AnnouncedRoots {
+        manifest: manifest_id,
+        transport: BaoRoot::from_bytes(*blake3::hash(obj.encode().as_slice()).as_bytes()),
+    }
+}
+
+fn intake_with_roots(
+    fixture: &mut Fixture,
+    bulk: &mut MemoryBulkSource,
+    builder: &Builder,
+    genesis: &MembershipTransition,
+    admission: &MembershipTransition,
+    secrets: Vec<EpochSecret>,
+    roots: Option<AnnouncedRoots>,
+) -> Snapshot {
+    let body = intake_body(builder, admission);
+    let epoch_secret = secrets
+        .get(admission.epoch as usize - 1)
+        .expect("the capability carries the admission epoch's secret");
+    let roots = match roots {
+        Some(roots) => roots,
+        None => empty_roots(bulk, epoch_secret, admission.epoch, &body.snapshot_id()),
+    };
     bulk.publish_snapshot(body.snapshot_id(), body.encode());
     bulk.publish_transport(body.encode());
 
@@ -380,11 +462,14 @@ pub(crate) fn intake_snapshot(
         admission.epoch,
         secrets,
     );
-    let bound = announcement_msg(
+    let bound = announcement_msg_with(
         &identity_secret(&builder.sk),
         body.snapshot_id(),
         admission.epoch,
         admission.transition_id(),
+        body_root(&body),
+        roots.manifest,
+        roots.transport,
     );
     let mail = vec![
         deliver(fixture, 1, &transition_message(genesis)),
@@ -395,6 +480,44 @@ pub(crate) fn intake_snapshot(
     queue(fixture, mail);
     assert_eq!(drain(fixture).accepted, 4);
     body
+}
+
+pub(crate) fn intake_snapshot(
+    fixture: &mut Fixture,
+    bulk: &mut MemoryBulkSource,
+    builder: &Builder,
+    genesis: &MembershipTransition,
+    admission: &MembershipTransition,
+    secrets: Vec<EpochSecret>,
+) -> Snapshot {
+    // The announcement names a real published root manifest (decision
+    // 26): an empty one under the delivered epoch material, so identity
+    // continuity holds on every fetch route.
+    intake_with_roots(fixture, bulk, builder, genesis, admission, secrets, None)
+}
+
+/// `intake_snapshot` for tests that publish a real manifest hierarchy:
+/// the manifest lands in the bulk peer BEFORE the control plane lands,
+/// and the announcement names it — identity continuity holds when the
+/// fetch plane opens against it.
+pub(crate) fn intake_published(
+    fixture: &mut Fixture,
+    bulk: &mut MemoryBulkSource,
+    builder: &Builder,
+    genesis: &MembershipTransition,
+    admission: &MembershipTransition,
+    secrets: Vec<EpochSecret>,
+    roots: AnnouncedRoots,
+) -> Snapshot {
+    intake_with_roots(
+        fixture,
+        bulk,
+        builder,
+        genesis,
+        admission,
+        secrets,
+        Some(roots),
+    )
 }
 
 /// One published snapshot: the chunk's content id, the storage address

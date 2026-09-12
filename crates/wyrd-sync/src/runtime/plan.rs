@@ -239,8 +239,9 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, deliver, drain, fixture, identity_secret, intake_snapshot,
-        publish_into, queue, reopen, transition_message, WithoutObjects,
+        admit_engine, announcement_msg, announcement_msg_with, body_root, deliver, drain, fixture,
+        identity_secret, intake_body, intake_published, intake_snapshot, publish_into, queue,
+        reopen, transition_message, AnnouncedRoots, WithoutObjects,
     };
     use crate::runtime::MaterializationState;
     use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
@@ -282,15 +283,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -299,6 +292,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"hello wyrd",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -349,15 +354,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -366,6 +363,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"pinned import",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = NoBareInsert(MemoryObjectStore::default());
         fixture
@@ -389,15 +398,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -406,6 +407,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"late bytes",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -445,13 +458,30 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
+        let body = intake_body(&builder, &admission);
+        // The honest roots exist before intake: the announcement names
+        // them (decision 26), so the hostile peers below are measured
+        // against a real announced identity.
+        let published = publish_into(
+            &mut bulk,
+            &epoch_secret,
+            2,
+            &epoch_secret,
+            2,
+            body.snapshot_id(),
+            b"honest bytes",
+        );
+        let _body = intake_published(
             &mut fixture,
             &mut bulk,
             &builder,
             &genesis,
             &admission,
             vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
 
         let snapshot = body.snapshot_id();
@@ -505,15 +535,6 @@ mod tests {
 
         // The honest peer replaces the hostile bytes: the plan
         // converges, proving skips never poisoned the snapshot.
-        let published = publish_into(
-            &mut bulk,
-            &epoch_secret,
-            2,
-            &epoch_secret,
-            2,
-            body.snapshot_id(),
-            b"honest bytes",
-        );
         fixture
             .engine
             .set_materialization(published.content, MaterializationState::Pinned)
@@ -535,14 +556,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
+        let body = intake_body(&builder, &admission);
 
         // The manifest opens under the held epoch, but its entry names
         // an epoch the device holds no capability for: the manifest
@@ -557,6 +571,19 @@ mod tests {
             body.snapshot_id(),
             b"future epoch",
         );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
+        );
+
         let mut objects = MemoryObjectStore::default();
         fixture
             .engine
@@ -703,15 +730,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -720,6 +739,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"withheld bytes",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -755,15 +786,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -772,6 +795,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"corrupt bytes",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -813,15 +848,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         // The manifest opens under the held epoch, but the object is
         // sealed under an epoch whose capability never arrived.
         let foreign = EpochSecret::from_bytes([0x0A; 32]);
@@ -833,6 +860,18 @@ mod tests {
             9,
             body.snapshot_id(),
             b"future epoch",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -862,15 +901,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -879,6 +910,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"refused bytes",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = RefusingStore;
         fixture
@@ -910,14 +953,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
+        let body = intake_body(&builder, &admission);
 
         // One logical object, two representations across two snapshots:
         // the first is corrupt bytes, the second is healthy. The plan
@@ -943,7 +979,7 @@ mod tests {
         let snapshot_a = body.snapshot_id();
         // A second authored snapshot carrying the healthy representation:
         // its body is signed by the owner (a member of the admitted
-        // state) and its announcement rides the same intake.
+        // state).
         let owner = *builder.owners.iter().next().expect("tracked owner");
         let mut body_b = Snapshot::new(
             Vec::new(),
@@ -957,27 +993,53 @@ mod tests {
         crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
         bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();
-        for (snapshot, entry) in [(snapshot_a, bad), (snapshot_b, good)] {
-            let manifest = Manifest {
-                snapshot,
-                entries: vec![entry],
-                children: vec![],
-            };
-            let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
-            let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
-            bulk.publish_root(
-                snapshot,
-                SealedManifest {
-                    content_id: id,
-                    sealed: sealed.encode(),
-                },
-            );
-        }
-        let bound = announcement_msg(
+        // Both roots are published before intake, and each announcement
+        // names its own published root (decision 26): the intake
+        // announcement names the corrupt candidate, snapshot_b's names
+        // the healthy one, so both candidates record and the fallback
+        // between them is exercised. Index 0 is snapshot_a's root,
+        // index 1 snapshot_b's.
+        let roots: Vec<(ContentId, BaoRoot)> = [(snapshot_a, bad), (snapshot_b, good)]
+            .into_iter()
+            .map(|(snapshot, entry)| {
+                let manifest = Manifest {
+                    snapshot,
+                    entries: vec![entry],
+                    children: vec![],
+                };
+                let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+                let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+                bulk.publish_root(
+                    snapshot,
+                    SealedManifest {
+                        content_id: id,
+                        sealed: sealed.encode(),
+                    },
+                );
+                bulk.publish_transport(sealed.encode());
+                (id, crate::seal::transport_root(&sealed))
+            })
+            .collect();
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: roots[0].0,
+                transport: roots[0].1,
+            },
+        );
+        let bound = announcement_msg_with(
             &identity_secret(&builder.sk),
             snapshot_b,
             2,
             admission.transition_id(),
+            body_root(&body_b),
+            roots[1].0,
+            roots[1].1,
         );
         let envelope = deliver(&fixture, 2, &bound);
         queue(&mut fixture, vec![envelope]);
@@ -1008,15 +1070,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -1025,6 +1079,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"counted errors",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -1144,15 +1210,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let first = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -1161,6 +1219,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"stable record",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: first.root_manifest,
+                transport: first.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -1485,15 +1555,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -1502,6 +1564,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"torn batch",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut objects = MemoryObjectStore::default();
         fixture
@@ -1587,14 +1661,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
+        let body = intake_body(&builder, &admission);
 
         // One object, one sealed representation, referenced by two
         // snapshot manifests: the plan must carry a single candidate
@@ -1609,8 +1676,7 @@ mod tests {
         let entry = entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, plaintext).unwrap();
         let snapshot_a = body.snapshot_id();
         // A second authored snapshot carrying the same entry: its body
-        // is signed by the owner (a member of the admitted state) and
-        // its announcement rides the same intake.
+        // is signed by the owner (a member of the admitted state).
         let owner = *builder.owners.iter().next().expect("tracked owner");
         let mut body_b = Snapshot::new(
             Vec::new(),
@@ -1624,31 +1690,54 @@ mod tests {
         crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
         bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();
-        for snapshot in [snapshot_a, snapshot_b] {
-            let manifest = Manifest {
-                snapshot,
-                entries: vec![entry.clone()],
-                children: vec![],
-            };
-            let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
-            let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
-            bulk.publish_root(
-                snapshot,
-                SealedManifest {
-                    content_id: id,
-                    sealed: sealed.encode(),
-                },
-            );
-            let bound = announcement_msg(
-                &identity_secret(&builder.sk),
-                snapshot,
-                2,
-                admission.transition_id(),
-            );
-            let envelope = deliver(&fixture, 2, &bound);
-            queue(&mut fixture, vec![envelope]);
-        }
-        assert_eq!(drain(&mut fixture).accepted, 2);
+        // Both roots are published before intake and each announcement
+        // names its own published root (decision 26). Index 0 is
+        // snapshot_a's root, index 1 snapshot_b's.
+        let roots: Vec<(ContentId, BaoRoot)> = [snapshot_a, snapshot_b]
+            .into_iter()
+            .map(|snapshot| {
+                let manifest = Manifest {
+                    snapshot,
+                    entries: vec![entry.clone()],
+                    children: vec![],
+                };
+                let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+                let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+                bulk.publish_root(
+                    snapshot,
+                    SealedManifest {
+                        content_id: id,
+                        sealed: sealed.encode(),
+                    },
+                );
+                bulk.publish_transport(sealed.encode());
+                (id, crate::seal::transport_root(&sealed))
+            })
+            .collect();
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: roots[0].0,
+                transport: roots[0].1,
+            },
+        );
+        let bound = announcement_msg_with(
+            &identity_secret(&builder.sk),
+            snapshot_b,
+            2,
+            admission.transition_id(),
+            body_root(&body_b),
+            roots[1].0,
+            roots[1].1,
+        );
+        let envelope = deliver(&fixture, 2, &bound);
+        queue(&mut fixture, vec![envelope]);
+        assert_eq!(drain(&mut fixture).accepted, 1);
         bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
 
         let mut objects = MemoryObjectStore::default();

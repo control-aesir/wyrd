@@ -49,7 +49,8 @@ pub use bootstrap::{
     BootstrapInvitation, SealedBootstrap, BOOTSTRAP_HEADER_LEN, BOOTSTRAP_VERSION,
 };
 pub use message::{
-    CapabilityPayload, ControlKind, KeyRotation, Message, SnapshotAnnouncement, TransitionPayload,
+    AnnouncementUpdate, CapabilityPayload, ControlKind, KeyRotation, Message, SnapshotAnnouncement,
+    TransitionPayload,
 };
 pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
 

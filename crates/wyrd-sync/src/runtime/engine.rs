@@ -27,6 +27,8 @@
 //! announcement, noncanonical .... held pending and relay-retained; retried as membership resolves
 //! announcement, invalid ......... seen-id committed (verdicts are final)
 //! announcement, epoch mismatched . seen-id committed (epochs are immutable)
+//! announcement, immutable fork .. seen-id committed, no announcement fact (forks never commit)
+//! announcement, route update .... fresh announcement fact (last accepted route wins)
 //! held-message overflow ......... left unacked (pending is bounded; relay retains)
 //! ```
 //!
@@ -50,10 +52,10 @@ use thiserror::Error;
 use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId};
 use zeroize::Zeroizing;
 
-use super::{MaterializationState, RuntimeError};
+use super::{MaterializationState, RuntimeError, RuntimeState};
 
 use crate::bulk::BulkSource;
-use crate::control::{ControlInbox, ControlMessageId, Message};
+use crate::control::{ControlInbox, ControlMessageId, Message, SnapshotAnnouncement};
 use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;
@@ -224,6 +226,14 @@ pub struct Engine {
     /// `serving.rs`.
     pub(super) vault: crate::serving::Vault,
     pub(super) log: MembershipLog,
+    /// The authoritative announcement projection intake validates
+    /// against: one hydrated announcement per snapshot, kept in lockstep
+    /// with the durable facts (updated only after a commit succeeds).
+    /// Announcement compatibility is checked here before
+    /// `Fact::Announcement` commits — route updates replace, immutable
+    /// forks never become facts — so replay never encounters a conflict
+    /// intake could have detected.
+    pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
     pub(super) pending: HashMap<ControlMessageId, Message>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
     /// happened, per-representation strike counts with the run they were
@@ -279,6 +289,7 @@ impl Engine {
             inbox: ControlInbox::new(drive),
             epoch_keys: BTreeMap::new(),
             log: MembershipLog::new(drive),
+            announcements: BTreeMap::new(),
             pending: HashMap::new(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
@@ -384,6 +395,15 @@ impl Engine {
         for t in &facts.transitions {
             self.log.observe(t.clone());
         }
+        // The announcement projection replays through the same mutator
+        // the durable fact path uses: route updates replace (last
+        // accepted wins), and a fork error here means store facts intake
+        // could never have produced.
+        let mut state = RuntimeState::new(self.drive);
+        for a in facts.announcements {
+            state.record_announcement(a)?;
+        }
+        self.announcements = state.announcements;
         Ok(())
     }
 
@@ -593,9 +613,9 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, capability_message_for, deliver, drain, encryption_key,
-        fixture, identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
-        PublishedSnapshot, TestDir, WithoutObjects,
+        admit_engine, capability_message_for, deliver, drain, encryption_key, fixture, identity,
+        publish_into, queue, transition_message, MemoryMailbox, MemoryRelay, PublishedSnapshot,
+        TestDir, WithoutObjects,
     };
     use crate::transport::mailbox::{
         seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
@@ -869,8 +889,27 @@ mod tests {
         send_to(&mut pair, &owner_sk, a_dev, 2, &key(2), &cap_a2);
         send_to(&mut pair, &owner_sk, a_dev, 3, &key(3), &cap_a3);
         send_to(&mut pair, &owner_sk, b_dev, 3, &key(3), &cap_b);
-        let ann_a = announcement_msg(&pair.a.identity_sk, snapshot_a, 2, admit_a.transition_id());
-        let ann_b = announcement_msg(&pair.b.identity_sk, snapshot_b, 3, admit_b.transition_id());
+        // Honest announcements: each names the root manifest the publisher
+        // actually sealed, with its transport root (decision 26) — identity
+        // continuity holds on every fetch route.
+        let ann_a = crate::runtime::test_util::announcement_msg_with(
+            &pair.a.identity_sk,
+            snapshot_a,
+            2,
+            admit_a.transition_id(),
+            crate::runtime::test_util::body_root(&body_a),
+            snap_a.root_manifest,
+            snap_a.root_transport,
+        );
+        let ann_b = crate::runtime::test_util::announcement_msg_with(
+            &pair.b.identity_sk,
+            snapshot_b,
+            3,
+            admit_b.transition_id(),
+            crate::runtime::test_util::body_root(&body_b),
+            snap_b.root_manifest,
+            snap_b.root_transport,
+        );
         for target in [a_dev, b_dev] {
             send_to(&mut pair, &a_sk, target, 2, &key(2), &ann_a);
             send_to(&mut pair, &b_sk, target, 3, &key(3), &ann_b);

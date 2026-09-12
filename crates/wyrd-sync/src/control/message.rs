@@ -178,6 +178,49 @@ impl SnapshotAnnouncement {
         message.extend_from_slice(&covered);
         message
     }
+
+    /// The normative reannouncement classification: what a second
+    /// announcement for the same snapshot means relative to this one.
+    ///
+    /// Identity/authentication fields (`author`, `epoch`, `membership`,
+    /// `body_root`, `root_manifest`, `root_manifest_transport`) are
+    /// immutable — the snapshot id already pins most of the statement,
+    /// and a differing field is a fork of the author's statement, not a
+    /// refresh of it. Only routing (`node_addr`) is mutable: the signed
+    /// region covers it, so a route update is a fresh author-signed
+    /// statement with the same immutable core, and the last accepted
+    /// route wins. Intake gates forks before `Fact::Announcement`
+    /// commits; replay applies the same rule as a backstop.
+    pub fn check_update(&self, candidate: &SnapshotAnnouncement) -> AnnouncementUpdate {
+        if self == candidate {
+            return AnnouncementUpdate::Same;
+        }
+        let immutable_agrees = self.author == candidate.author
+            && self.epoch == candidate.epoch
+            && self.membership == candidate.membership
+            && self.body_root == candidate.body_root
+            && self.root_manifest == candidate.root_manifest
+            && self.root_manifest_transport == candidate.root_manifest_transport;
+        if immutable_agrees {
+            AnnouncementUpdate::RouteUpdate
+        } else {
+            AnnouncementUpdate::Fork
+        }
+    }
+}
+
+/// What a reannouncement for an already-known snapshot means. See
+/// [`SnapshotAnnouncement::check_update`] for the normative definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnouncementUpdate {
+    /// Byte-identical replay: nothing changes.
+    Same,
+    /// Same immutable statement, different routing: a route update, the
+    /// last accepted route wins.
+    RouteUpdate,
+    /// A differing immutable field: a fork of the author's statement,
+    /// never committed over the known announcement.
+    Fork,
 }
 
 /// One control-plane message: the kind plus its payload.

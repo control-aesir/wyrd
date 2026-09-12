@@ -17,7 +17,7 @@ use wyrd_format::{
     Snapshot, SnapshotId, StorageId,
 };
 
-use crate::control::{ControlMessageId, SnapshotAnnouncement};
+use crate::control::{AnnouncementUpdate, ControlMessageId, SnapshotAnnouncement};
 
 mod author;
 mod bootstrap;
@@ -180,7 +180,14 @@ impl RuntimeState {
     }
 
     /// Record a snapshot announcement. Replaying the same announcement is a
-    /// no-op; a different announcement for the same snapshot is rejected.
+    /// no-op; a reannouncement that differs only in `node_addr` is a route
+    /// update — the last accepted route wins, deterministically under
+    /// replay (which walks the same commit order). A difference in any
+    /// immutable identity field is a fork of the author's statement and is
+    /// rejected. Intake gates forks before `Fact::Announcement` commits
+    /// (the engine's announcement projection), so replay only reaches the
+    /// fork error for facts hand-crafted into the store.
+    ///
     /// A body recorded for the snapshot must agree with the announcement's
     /// `author`, `epoch`, and `membership` (`record_snapshot_body`
     /// enforces the pairing symmetrically), so replay can never represent
@@ -203,8 +210,16 @@ impl RuntimeState {
                 self.announcements.insert(id, announcement);
                 Ok(true)
             }
-            Some(existing) if existing == &announcement => Ok(false),
-            Some(_) => Err(RuntimeError::ConflictingAnnouncement { snapshot: id }),
+            Some(existing) => match existing.check_update(&announcement) {
+                AnnouncementUpdate::Same => Ok(false),
+                AnnouncementUpdate::RouteUpdate => {
+                    self.announcements.insert(id, announcement);
+                    Ok(true)
+                }
+                AnnouncementUpdate::Fork => {
+                    Err(RuntimeError::ConflictingAnnouncement { snapshot: id })
+                }
+            },
         }
     }
 
@@ -679,6 +694,47 @@ mod tests {
         assert!(matches!(
             state.record_manifest(conflicting),
             Err(RuntimeError::ManifestIdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn reannouncements_update_routes_and_reject_forks() {
+        let mut state = RuntimeState::new(drive());
+        let mut first = announcement(1, 2, 3);
+        first.node_addr = Some(vec![0x01, 0x02]);
+        assert!(state.record_announcement(first.clone()).unwrap());
+
+        // Same announcement: no-op. Same immutable statement with a new
+        // route: a route update — the last accepted route wins, so
+        // replay (the same commit order) is deterministic.
+        assert!(!state.record_announcement(first).unwrap());
+        let mut rerouted = announcement(1, 2, 3);
+        rerouted.node_addr = Some(vec![0x03, 0x04]);
+        assert!(state.record_announcement(rerouted.clone()).unwrap());
+        assert_eq!(
+            state.announcements[&SnapshotId::from_bytes([1; 32])].node_addr,
+            rerouted.node_addr
+        );
+        // A route update that drops the address is still only routing.
+        let mut unrouted = announcement(1, 2, 3);
+        unrouted.node_addr = None;
+        assert!(state.record_announcement(unrouted).unwrap());
+        assert!(state.announcements[&SnapshotId::from_bytes([1; 32])]
+            .node_addr
+            .is_none());
+
+        // Any immutable difference is a fork, never a replacement.
+        let mut forked_root = announcement(1, 2, 3);
+        forked_root.root_manifest = ContentId::from_bytes([0x99; 32]);
+        assert!(matches!(
+            state.record_announcement(forked_root),
+            Err(RuntimeError::ConflictingAnnouncement { .. })
+        ));
+        let mut forked_body = announcement(1, 2, 3);
+        forked_body.body_root = BaoRoot::from_bytes([0x98; 32]);
+        assert!(matches!(
+            state.record_announcement(forked_body),
+            Err(RuntimeError::ConflictingAnnouncement { .. })
         ));
     }
 

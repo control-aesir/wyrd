@@ -76,11 +76,18 @@ pub(super) fn root(
             sealed: bytes,
         }),
         // Absence and a dead transport route both fall back to the eager
-        // exchange; oversize is representation-terminal (see
-        // fetch_representation).
+        // exchange — which serves under the SAME author-signed identity:
+        // the announced `root_manifest` is the only acceptable open-record
+        // expectation, so a source cannot swap the logical identity
+        // through the legacy route. Oversize is representation-terminal.
         Ok(None) | Err(BulkError::Transport(_)) => {
             match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
-                Ok(served) => served,
+                Ok(Some(served)) if served.content_id == announcement.root_manifest => Some(served),
+                // A well-sealed manifest for this snapshot under a
+                // different identity is a fork of the author's claim:
+                // invalid, never recorded.
+                Ok(Some(_)) => return FetchOutcome::Invalid,
+                Ok(None) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
                 Err(_) => return FetchOutcome::Transport,
             }
@@ -478,9 +485,10 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::engine::{FETCH_COOLDOWN_PASSES, FETCH_MAX_STRIKES};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, announcement_msg_with, body_root, capability_message,
-        deliver, drain, fixture, identity_secret, intake_snapshot, publish_into, queue,
-        transition_message, Fixture, TransportFault, TransportOnly, WithoutObjects,
+        admit_engine, announcement_msg_with, body_root, capability_message, deliver, drain,
+        fixture, identity_secret, intake_body, intake_published, intake_snapshot, publish_into,
+        queue, reopen, transition_message, AnnouncedRoots, Fixture, TransportFault, TransportOnly,
+        WithoutObjects,
     };
 
     /// A hostile peer on the storage route only: the transport map stays
@@ -508,14 +516,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut inner = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut inner,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut inner,
             &epoch_secret,
@@ -524,6 +525,18 @@ mod tests {
             admission.epoch,
             body.snapshot_id(),
             b"fallback hello",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut inner,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let mut bulk = TransportFault {
             inner,
@@ -545,6 +558,130 @@ mod tests {
         assert_eq!(
             objects.get(&published.content).unwrap().as_deref(),
             Some(b"fallback hello".as_slice())
+        );
+    }
+
+    #[test]
+    fn fallback_route_serving_a_forked_identity_commits_nothing() {
+        // The eager fallback names the announced identity as the only
+        // acceptable open-record expectation: a peer serving a
+        // well-sealed manifest for the same snapshot under a different
+        // content id is a fork of the author's statement — invalid,
+        // never recorded. The matching control-plane fork (a second
+        // announcement changing an immutable field) is likewise
+        // rejected at intake, so no immutable divergence reaches the
+        // fact log.
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        let mut bulk = MemoryBulkSource::default();
+        let body = intake_body(&builder, &admission);
+        let snapshot = body.snapshot_id();
+        let manifest_key = epoch_secret.manifest_key(&member_drive(), admission.epoch, &snapshot);
+        // The announced root A: sealed, but its bytes are published
+        // nowhere — the transport route is absent and the eager route
+        // serves the fork instead.
+        let (root_a, sealed_a) = seal_manifest(
+            &manifest_key,
+            &Manifest {
+                snapshot,
+                entries: vec![],
+                children: vec![],
+            },
+        )
+        .unwrap();
+        // Root B: a well-sealed manifest under the same snapshot key
+        // with a different identity, served by the eager route. The
+        // entry distinguishes the plaintext, so the content ids
+        // diverge.
+        let probe = b"fork probe";
+        let probe_content = ContentId::derive(ObjectKind::Chunk, probe);
+        let probe_key = epoch_secret.object_key(
+            &member_drive(),
+            admission.epoch,
+            &probe_content,
+            ObjectKind::Chunk,
+            SEAL_VERSION,
+        );
+        let probe_object =
+            crate::seal::seal(&probe_key, ObjectKind::Chunk, &probe_content, probe).unwrap();
+        let probe_entry = entry_for(
+            ObjectKind::Chunk,
+            admission.epoch,
+            &probe_object,
+            &probe_content,
+            probe,
+        )
+        .unwrap();
+        let (root_b, sealed_b) = seal_manifest(
+            &manifest_key,
+            &Manifest {
+                snapshot,
+                entries: vec![probe_entry],
+                children: vec![],
+            },
+        )
+        .unwrap();
+        assert_ne!(root_a, root_b, "distinct manifests must yield distinct ids");
+        bulk.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: root_b,
+                sealed: sealed_b.encode(),
+            },
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: root_a,
+                transport: crate::seal::transport_root(&sealed_a),
+            },
+        );
+
+        let mut objects = MemoryObjectStore::default();
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(
+            report.manifests, 0,
+            "a forked identity commits no manifest record"
+        );
+        // Two passes: the body commits in the first, so the plan runs a
+        // second; the forked root is invalidated once per pass.
+        assert_eq!(report.invalid, 2);
+        assert_eq!(report.snapshot_bodies, 1, "the body still converges");
+
+        // The control-plane fork: the same immutable core except the
+        // root manifest identity. Intake rejects it before any fact
+        // commits, so the log keeps exactly the first announcement.
+        let fork = announcement_msg_with(
+            &identity_secret(&builder.sk),
+            snapshot,
+            admission.epoch,
+            admission.transition_id(),
+            body_root(&body),
+            ContentId::from_bytes([0x99; 32]),
+            crate::seal::transport_root(&sealed_a),
+        );
+        let envelope = deliver(&fixture, admission.epoch, &fork);
+        queue(&mut fixture, vec![envelope]);
+        assert_eq!(drain(&mut fixture).accepted, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1, "no fork fact");
+        // Replay stays healthy: reopen reconstructs the projection with
+        // the first statement only.
+        let engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].root_manifest, root_a,
+            "the projection keeps the announced root, never the fork"
         );
     }
 
@@ -668,14 +805,9 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body_a = intake_snapshot(
-            fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
+        let body_a = intake_body(&builder, &admission);
+        let snapshot_a = body_a.snapshot_id();
+        bulk.publish_snapshot(snapshot_a, body_a.encode());
         let drive = member_drive();
         let plaintext = b"two-rep content";
         let content = ContentId::derive(ObjectKind::Chunk, plaintext);
@@ -694,7 +826,6 @@ mod tests {
             size: plaintext.len() as u64,
             transport: BaoRoot::from_bytes([0xB0; 32]),
         };
-        let snapshot_a = body_a.snapshot_id();
         // A second authored snapshot carrying the healthy representation:
         // its body is signed by the owner (a member of the admitted
         // state) and its announcement rides the same intake.
@@ -711,7 +842,15 @@ mod tests {
         crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
         bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();
-        for (snapshot, entry) in [(snapshot_a, bad), (snapshot_b, good)] {
+        // Both roots are sealed and published before the control plane
+        // lands, and each announcement names its real published root
+        // (decision 26): identity continuity holds on every route.
+        let mut roots_a: Option<(ContentId, BaoRoot)> = None;
+        let mut roots_b: Option<(ContentId, BaoRoot)> = None;
+        for (snapshot, entry, roots) in [
+            (snapshot_a, bad, &mut roots_a),
+            (snapshot_b, good, &mut roots_b),
+        ] {
             let manifest = Manifest {
                 snapshot,
                 entries: vec![entry],
@@ -726,12 +865,35 @@ mod tests {
                     sealed: sealed.encode(),
                 },
             );
+            bulk.publish_transport(sealed.encode());
+            *roots = Some((id, crate::seal::transport_root(&sealed)));
         }
-        let bound = announcement_msg(
+        let Some((manifest_a, transport_a)) = roots_a else {
+            panic!("snapshot A's roots");
+        };
+        let Some((roots_b, transport_b)) = roots_b else {
+            panic!("snapshot B's roots");
+        };
+        let _body_a = intake_published(
+            fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: manifest_a,
+                transport: transport_a,
+            },
+        );
+        let bound = announcement_msg_with(
             &identity_secret(&builder.sk),
             snapshot_b,
             2,
             admission.transition_id(),
+            body_root(&body_b),
+            roots_b,
+            transport_b,
         );
         let envelope = deliver(fixture, 2, &bound);
         queue(fixture, vec![envelope]);
@@ -747,15 +909,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -764,6 +918,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"backoff probe",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let healthy = bulk.clone();
         let mut objects = MemoryObjectStore::default();
@@ -835,15 +1001,7 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
-
+        let body = intake_body(&builder, &admission);
         let published = publish_into(
             &mut bulk,
             &epoch_secret,
@@ -852,6 +1010,18 @@ mod tests {
             2,
             body.snapshot_id(),
             b"strike probe",
+        );
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: published.root_manifest,
+                transport: published.root_transport,
+            },
         );
         let healthy = bulk.clone();
         let mut objects = MemoryObjectStore::default();
@@ -945,14 +1115,9 @@ mod tests {
         let admission = admit_engine(&mut builder, device);
         let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
         let mut bulk = MemoryBulkSource::default();
-        let body = intake_snapshot(
-            &mut fixture,
-            &mut bulk,
-            &builder,
-            &genesis,
-            &admission,
-            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
-        );
+        let body = intake_body(&builder, &admission);
+        let good_snapshot = body.snapshot_id();
+        bulk.publish_snapshot(good_snapshot, body.encode());
 
         // Two manifests for the same content: the corrupt representation
         // in one, the healthy fallback in the other. Candidate order
@@ -977,7 +1142,6 @@ mod tests {
             size: plaintext.len() as u64,
             transport: BaoRoot::from_bytes([0xB0; 32]),
         };
-        let good_snapshot = body.snapshot_id();
         let good_key = epoch_secret.manifest_key(&drive, 2, &good_snapshot);
         let (good_id, good_sealed) = seal_manifest(
             &good_key,
@@ -1008,7 +1172,8 @@ mod tests {
         };
 
         // The intake bulk already serves the good snapshot's body; the
-        // two roots (good and corrupt) are published beside it.
+        // two roots (good and corrupt) are published beside it, and both
+        // announcements name their real published roots (decision 26).
         bulk.publish_root(
             bad_snapshot,
             SealedManifest {
@@ -1023,12 +1188,31 @@ mod tests {
                 sealed: good_sealed.encode(),
             },
         );
-        // Both roots must be announced to become pending.
-        let bound = announcement_msg(
-            &identity_secret(&crate::membership::test_util::key(0x22).0),
+        bulk.publish_transport(good_sealed.encode());
+        let _body = intake_published(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+            AnnouncedRoots {
+                manifest: good_id,
+                transport: crate::seal::transport_root(&good_sealed),
+            },
+        );
+        // The corrupt manifest's announcement: signed by the same member
+        // device, naming the manifest the peer sealed. The body root is a
+        // placeholder — no body exists for this snapshot, so its body
+        // stage stays absent by construction.
+        let bound = announcement_msg_with(
+            &identity_secret(&builder.sk),
             bad_snapshot,
             2,
             admission.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            bad_id,
+            crate::seal::transport_root(&bad_sealed),
         );
         let envelope = deliver(&fixture, 2, &bound);
         queue(&mut fixture, vec![envelope]);

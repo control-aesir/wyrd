@@ -48,9 +48,12 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
     loaded
         .bulk
         .publish_snapshot(forged.snapshot_id(), forged.encode());
-    loaded
-        .rig
-        .enqueue_announcement(forged.snapshot_id(), loaded.rig.admit_id, 2);
+    loaded.rig.enqueue_announcement(
+        forged.snapshot_id(),
+        loaded.rig.admit_id,
+        2,
+        crate::support::AnnouncedRoots::placeholders(),
+    );
 
     let report = loaded.drain();
     assert_eq!(report.accepted, 3, "the capability and both announcements");
@@ -358,7 +361,12 @@ fn deferred_messages_survive_queue_pressure() {
     // every delivery defers under its own message id, and the last
     // one sheds to the relay.
     for index in 1..=(PENDING_BOUND as u32 + 1) {
-        rig.enqueue_announcement(id_for(index), child_id, 3);
+        rig.enqueue_announcement(
+            id_for(index),
+            child_id,
+            3,
+            crate::support::AnnouncedRoots::placeholders(),
+        );
     }
     let report = rig.drain();
     assert_eq!(report.accepted, 0);

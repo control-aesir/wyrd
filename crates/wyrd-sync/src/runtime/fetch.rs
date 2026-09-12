@@ -8,7 +8,7 @@ use wyrd_format::{
 };
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
-use crate::bulk::{BulkError, BulkSource};
+use crate::bulk::{BulkError, BulkSource, SealedManifest};
 use crate::ingest::{check_manifest, Limits};
 use crate::keys::capability::DriveKeyring;
 use crate::seal::{open_manifest, verify, EncryptedObject};
@@ -37,12 +37,15 @@ pub(super) enum FetchOutcome<T> {
 /// Fetch and validate a pending root manifest.
 ///
 /// The enforced binding is same-snapshot, not any-root-for-snapshot: the
-/// bytes must open under this snapshot's manifest key with the served
+/// bytes must open under this snapshot's manifest key with the expected
 /// content id as AAD, hash to that id, and embed this snapshot's id.
-/// A manifest for another snapshot is rejected even when its seal is
-/// well-formed. What fetch does *not* check is that the manifest's
-/// entries describe the snapshot's tree — that correspondence is
-/// author-attested. No consumer in the tree yet holds both sides at
+/// The expected identity prefers the announcement's author-signed
+/// `root_manifest` (decision 26) over the served claim: the transport
+/// root fetch names exactly the envelope the author signed. Absent that
+/// route, the eager exchange serves its own claim, which `open_record`
+/// then enforces as AAD. What fetch does *not* check is that the
+/// manifest's entries describe the snapshot's tree — that correspondence
+/// is author-attested. No consumer in the tree yet holds both sides at
 /// once (the mount-free FUSE view serves trees without seeing
 /// manifests), so the cross-check lands with the daemon that composes
 /// sync and fuse.
@@ -60,10 +63,23 @@ pub(super) fn root(
         return FetchOutcome::UnavailableKey;
     };
     let key = secret.manifest_key(drive, announcement.epoch, snapshot);
-    let served = match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
-        Ok(served) => served,
-        // Oversize representations are invalid remote data, not
-        // transport trouble: the boundary classified them already.
+    let served = match bulk.fetch_transport(
+        &announcement.root_manifest_transport,
+        Limits::V0.max_object_bytes,
+    ) {
+        // The transport route names exactly the representation the
+        // author signed: the identity travels inside the signature.
+        Ok(Some(bytes)) => Some(SealedManifest {
+            content_id: announcement.root_manifest,
+            sealed: bytes,
+        }),
+        Ok(None) => match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
+            Ok(served) => served,
+            // Oversize representations are invalid remote data, not
+            // transport trouble: the boundary classified them already.
+            Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+            Err(_) => return FetchOutcome::Transport,
+        },
         Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
         Err(_) => return FetchOutcome::Transport,
     };
@@ -82,19 +98,33 @@ pub(super) fn root(
 /// can hash to it); the announcement's *metadata* must also agree with
 /// the body's own binding, which the plan stage compares before
 /// committing, and the signature gate happens at the commit boundary,
-/// because durable facts only carry verified bodies.
+/// because durable facts only carry verified bodies. The transport
+/// route fetches by the announcement's author-signed body root.
 pub(super) fn snapshot_body(
     bulk: &mut impl BulkSource,
+    runtime: &RuntimeState,
     snapshot: &SnapshotId,
 ) -> FetchOutcome<Snapshot> {
-    let served = match bulk.fetch_snapshot(snapshot, Limits::V0.max_object_bytes) {
-        Ok(served) => served,
-        // Oversize representations are invalid remote data, not
-        // transport trouble: the boundary classified them already.
-        Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-        Err(_) => return FetchOutcome::Transport,
+    let served = match runtime.announcement(snapshot) {
+        Some(announcement) => {
+            match bulk.fetch_transport(&announcement.body_root, Limits::V0.max_object_bytes) {
+                Ok(Some(bytes)) => Some(bytes),
+                Ok(None) => None,
+                Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+                Err(_) => return FetchOutcome::Transport,
+            }
+        }
+        None => None,
     };
-    let Some(bytes) = served else {
+    let bytes = match served {
+        Some(bytes) => Some(bytes),
+        None => match bulk.fetch_snapshot(snapshot, Limits::V0.max_object_bytes) {
+            Ok(served) => served,
+            Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+            Err(_) => return FetchOutcome::Transport,
+        },
+    };
+    let Some(bytes) = bytes else {
         return FetchOutcome::Missing;
     };
     let derived = ContentId::derive(ObjectKind::Snapshot, &bytes);
@@ -128,8 +158,11 @@ pub(super) fn child(
         return FetchOutcome::UnavailableKey;
     };
     let key = secret.manifest_key(drive, announcement.epoch, &snapshot);
-    let sealed = match bulk.fetch_sealed(&link.storage, Limits::V0.max_object_bytes) {
-        Ok(sealed) => sealed,
+    let sealed = match fetch_representation(bulk, &link.transport, &link.storage) {
+        Ok(Some(sealed)) => Some(sealed),
+        Ok(None) => return FetchOutcome::Missing,
+        // Oversize representations are invalid remote data, not
+        // transport trouble: the boundary classified them already.
         Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
         Err(_) => return FetchOutcome::Transport,
     };
@@ -139,6 +172,24 @@ pub(super) fn child(
     match open_record(&sealed, &key, &link.manifest, snapshot, false) {
         Some(record) => FetchOutcome::Fulfilled(record),
         None => FetchOutcome::Invalid,
+    }
+}
+
+/// Fetch one representation preferring its transport root and falling
+/// back to the vault-visible storage address. The two are the same bytes
+/// under two addresses (decision 26); the transport root wins when the
+/// transport map holds it because it is the author-signed routing
+/// column. Errors propagate from whichever fetch ran — the boundary's
+/// classification is authoritative, and the storage fallback only
+/// covers absence.
+fn fetch_representation(
+    bulk: &mut impl BulkSource,
+    transport: &BaoRoot,
+    storage: &StorageId,
+) -> Result<Option<Vec<u8>>, BulkError> {
+    match bulk.fetch_transport(transport, Limits::V0.max_object_bytes)? {
+        Some(bytes) => Ok(Some(bytes)),
+        None => bulk.fetch_sealed(storage, Limits::V0.max_object_bytes),
     }
 }
 
@@ -212,9 +263,9 @@ pub(super) fn object(
             storage_id: candidate.storage_id,
             encryption_epoch: candidate.encryption_epoch,
             size: candidate.size,
-            transport: BaoRoot::from_bytes([0xB0; 32]),
+            transport: candidate.transport,
         };
-        let sealed = match bulk.fetch_sealed(&candidate.storage_id, Limits::V0.max_object_bytes) {
+        let sealed = match fetch_representation(bulk, &candidate.transport, &candidate.storage_id) {
             Ok(Some(sealed)) => sealed,
             Ok(None) => {
                 aggregate = worse(aggregate, FetchOutcome::Missing);
@@ -335,6 +386,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transport_root_falls_back_to_the_storage_address() {
+        // A mapping whose transport root the peer's map does not hold is
+        // a dead hint, not a failure: the vault-visible storage address
+        // still serves, and the AEAD/identity checks remain the sole
+        // admission (decision 26's untrusted-hint pattern).
+        let mut peer = MemoryBulkSource::default();
+        let storage = StorageId::from_bytes([0x5A; 32]);
+        let sealed = vec![0x42; 40];
+        peer.publish_sealed(storage, sealed.clone());
+        assert_eq!(
+            fetch_representation(&mut peer, &BaoRoot::from_bytes([0xEE; 32]), &storage).unwrap(),
+            Some(sealed),
+            "the forged root names nothing; the storage address serves"
+        );
+    }
+
     // --- engine-level fetch behavior -------------------------------------
     //
     // The publisher side seals manifests and objects under keys derived
@@ -347,13 +415,109 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::engine::{FETCH_COOLDOWN_PASSES, FETCH_MAX_STRIKES};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, deliver, drain, fixture, identity_secret, intake_snapshot,
-        publish_into, queue, Fixture,
+        admit_engine, announcement_msg, announcement_msg_with, body_root, capability_message,
+        deliver, drain, fixture, identity_secret, intake_snapshot, publish_into, queue,
+        transition_message, Fixture, TransportOnly, WithoutObjects,
     };
+
+    /// A hostile peer on the storage route only: the transport map stays
+    /// honest-but-absent for the withheld root, so strikes accrue where
+    /// the corruption lives (the memory model cannot place bytes under a
+    /// root they do not hash to).
+    fn hostile_transport(peer: &MemoryBulkSource, transport: BaoRoot) -> WithoutObjects {
+        WithoutObjects {
+            inner: peer.clone(),
+            hidden: BTreeSet::new(),
+            hidden_transport: BTreeSet::from([transport]),
+        }
+    }
     use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
     use wyrd_format::{Manifest, MemoryObjectStore, ObjectKind};
 
     use crate::runtime::MaterializationState;
+
+    /// The full fetch path runs on the author-signed transport roots alone:
+    /// with the eager snapshot/storage routes returning absence, the plan
+    /// still converges by fetching the root manifest by the announcement's
+    /// `root_manifest_transport`, the child manifest by its link's transport
+    /// root, the object by its entry's transport root, and the body by the
+    /// announcement's `body_root` (decision 26). If the planner dropped any
+    /// of those signed columns, this plan would starve instead of converge.
+    #[test]
+    fn fetch_converges_through_the_signed_transport_roots_alone() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        let mut inner = MemoryBulkSource::default();
+
+        let owner = *builder.owners.iter().next().expect("tracked owner");
+        let mut body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0xC1; 32]),
+            owner,
+            admission.transition_id(),
+            admission.epoch,
+            0,
+            1000 + admission.epoch,
+        );
+        crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
+        let snapshot = body.snapshot_id();
+        inner.publish_transport(body.encode());
+        let published = publish_into(
+            &mut inner,
+            &epoch_secret,
+            admission.epoch,
+            &epoch_secret,
+            admission.epoch,
+            snapshot,
+            b"transport hello",
+        );
+        let cap = capability_message(
+            device,
+            admission.transition_id(),
+            admission.epoch,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+        let bound = announcement_msg_with(
+            &identity_secret(&builder.sk),
+            snapshot,
+            admission.epoch,
+            admission.transition_id(),
+            body_root(&body),
+            published.root_manifest,
+            published.root_transport,
+        );
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&admission)),
+            deliver(&fixture, admission.epoch, &cap),
+            deliver(&fixture, admission.epoch, &bound),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 4);
+
+        let mut bulk = TransportOnly(inner);
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(report.snapshot_bodies, 1, "the body rides the signed root");
+        assert_eq!(report.manifests, 2, "root plus child, both via transport");
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+        assert_eq!(
+            objects.get(&published.content).unwrap().as_deref(),
+            Some(b"transport hello".as_slice())
+        );
+    }
+
     /// One logical object under two representations across two snapshots
     /// (one manifest per snapshot), announced and intake-ready: the corrupt
     /// representation serves at `bad_storage`, and the caller decides what
@@ -471,15 +635,17 @@ mod tests {
             .engine
             .set_materialization(published.content, MaterializationState::Pinned)
             .unwrap();
-        // Corrupt bytes under the served address: every fetch attempt
-        // verifies and rejects.
+        // Corrupt bytes under the served storage address: every fetch
+        // attempt verifies and rejects (the honest-but-withheld transport
+        // route leaves the storage fallback as the served route).
         bulk.publish_sealed(published.object_storage, vec![0xFF; 64]);
+        let corrupt = |peer: &MemoryBulkSource| hostile_transport(peer, published.object_transport);
 
         // The first call converges manifests (two passes), so the object is
         // attempted twice while striking once — attempts count per pass.
         let report = fixture
             .engine
-            .execute_plan(&mut bulk.clone(), &mut objects)
+            .execute_plan(&mut corrupt(&bulk), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 2, "attempted while striking");
 
@@ -487,7 +653,7 @@ mod tests {
         for _ in 0..FETCH_MAX_STRIKES - 1 {
             let report = fixture
                 .engine
-                .execute_plan(&mut bulk.clone(), &mut objects)
+                .execute_plan(&mut corrupt(&bulk), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 1, "attempted while striking");
         }
@@ -496,7 +662,7 @@ mod tests {
         for _ in 0..FETCH_COOLDOWN_PASSES {
             let report = fixture
                 .engine
-                .execute_plan(&mut bulk.clone(), &mut objects)
+                .execute_plan(&mut corrupt(&bulk), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 0, "backing off");
             assert_eq!(report.unfulfilled, 1);
@@ -505,12 +671,12 @@ mod tests {
         // and the strike count restarts from one rather than resuming.
         let report = fixture
             .engine
-            .execute_plan(&mut bulk.clone(), &mut objects)
+            .execute_plan(&mut corrupt(&bulk), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 1, "retried after the cooldown");
         let next = fixture
             .engine
-            .execute_plan(&mut bulk.clone(), &mut objects)
+            .execute_plan(&mut corrupt(&bulk), &mut objects)
             .unwrap();
         assert_eq!(next.invalid, 1, "strike count restarted, not resumed");
 
@@ -518,7 +684,7 @@ mod tests {
         // is attempted and fulfills.
         let report = fixture
             .engine
-            .execute_plan(&mut healthy.clone(), &mut objects)
+            .execute_plan(&mut corrupt(&healthy), &mut objects)
             .unwrap();
         assert_eq!(report.objects, 1);
         assert_eq!(report.unfulfilled, 0);
@@ -561,9 +727,10 @@ mod tests {
         // One invalid run: the call converges manifests in pass one, so the
         // object attempt repeats in pass two while striking once.
         bulk.publish_sealed(published.object_storage, vec![0xFF; 64]);
+        let corrupt = |peer: &MemoryBulkSource| hostile_transport(peer, published.object_transport);
         let report = fixture
             .engine
-            .execute_plan(&mut bulk.clone(), &mut objects)
+            .execute_plan(&mut corrupt(&bulk), &mut objects)
             .unwrap();
         assert_eq!(report.invalid, 2);
         assert_eq!(report.manifests, 2);
@@ -572,7 +739,7 @@ mod tests {
         // converging clears the accumulated strike.
         let report = fixture
             .engine
-            .execute_plan(&mut healthy.clone(), &mut objects)
+            .execute_plan(&mut corrupt(&healthy), &mut objects)
             .unwrap();
         assert_eq!(report.objects, 1, "valid bytes fulfill and clear strikes");
 
@@ -587,7 +754,7 @@ mod tests {
         for _ in 0..3 {
             let report = fixture
                 .engine
-                .execute_plan(&mut bulk.clone(), &mut objects)
+                .execute_plan(&mut corrupt(&bulk), &mut objects)
                 .unwrap();
             assert_eq!(report.invalid, 1, "attempted while striking");
         }

@@ -453,6 +453,18 @@ mod tests {
             verify_announcement(&drive, &tampered),
             Err(ControlError::BadSignature)
         );
+        let mut tampered = a.clone();
+        tampered.root_manifest = wyrd_format::ContentId::from_bytes([0x98; 32]);
+        assert_eq!(
+            verify_announcement(&drive, &tampered),
+            Err(ControlError::BadSignature)
+        );
+        let mut tampered = a.clone();
+        tampered.root_manifest_transport = wyrd_format::BaoRoot::from_bytes([0x98; 32]);
+        assert_eq!(
+            verify_announcement(&drive, &tampered),
+            Err(ControlError::BadSignature)
+        );
         // An author field that is not a valid x-only key is malformed
         // evidence, reported distinctly from a failed challenge.
         let mut bad_author = a.clone();

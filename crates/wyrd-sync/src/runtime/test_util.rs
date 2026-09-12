@@ -202,6 +202,35 @@ pub(crate) fn announcement_for(epoch: u64, membership: TransitionId) -> Message 
     announcement_msg(&sk, SnapshotId::from_bytes([0x11; 32]), epoch, membership)
 }
 
+/// A signed announcement naming real transport identities: the fetch
+/// planner consumes these as the author-signed routing columns
+/// (decision 26).
+pub(crate) fn announcement_msg_with(
+    author_sk: &DeviceIdentitySecret,
+    snapshot: SnapshotId,
+    epoch: u64,
+    membership: TransitionId,
+    body_root: BaoRoot,
+    root_manifest: ContentId,
+    root_transport: BaoRoot,
+) -> Message {
+    let kp = Keypair::from_secret_key(SECP256K1, &author_sk.secret_key());
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
+    let mut announcement = SnapshotAnnouncement {
+        snapshot,
+        author: DeviceId::from_bytes(xonly.serialize()),
+        epoch,
+        membership,
+        body_root,
+        root_manifest,
+        root_manifest_transport: root_transport,
+        node_addr: None,
+        signature: [0; 64],
+    };
+    crate::control::sign_announcement(&mut announcement, author_sk, &member_drive());
+    Message::SnapshotAnnouncement(announcement)
+}
+
 /// A signed announcement: the author derives from the signing key (so
 /// intake verification accepts it), the transport identities are
 /// placeholders (map population wires the real ones), and the
@@ -212,21 +241,15 @@ pub(crate) fn announcement_msg(
     epoch: u64,
     membership: TransitionId,
 ) -> Message {
-    let kp = Keypair::from_secret_key(SECP256K1, &author_sk.secret_key());
-    let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
-    let mut announcement = SnapshotAnnouncement {
+    announcement_msg_with(
+        author_sk,
         snapshot,
-        author: DeviceId::from_bytes(xonly.serialize()),
         epoch,
         membership,
-        body_root: BaoRoot::from_bytes([0x44; 32]),
-        root_manifest: ContentId::from_bytes([0x55; 32]),
-        root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
-        node_addr: None,
-        signature: [0; 64],
-    };
-    crate::control::sign_announcement(&mut announcement, author_sk, &member_drive());
-    Message::SnapshotAnnouncement(announcement)
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+    )
 }
 
 /// The identity-secret wrapper for a test scalar: same key, typed for
@@ -349,6 +372,7 @@ pub(crate) fn intake_snapshot(
     );
     crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
     bulk.publish_snapshot(body.snapshot_id(), body.encode());
+    bulk.publish_transport(body.encode());
 
     let cap = capability_message(
         fixture.recipient,
@@ -373,16 +397,20 @@ pub(crate) fn intake_snapshot(
     body
 }
 
-/// One published snapshot: the chunk's content id plus the
-/// storage address of its sealed object, so tests can withhold
-/// individual representations from the bulk peer.
+/// One published snapshot: the chunk's content id, the storage address
+/// of its sealed object, and the transport identities the mappings and
+/// announcements carry (decision 26), so tests can withhold individual
+/// representations or prove the transport path is the one used.
 pub(crate) struct PublishedSnapshot {
     pub(crate) content: ContentId,
     pub(crate) object_storage: StorageId,
+    pub(crate) object_transport: BaoRoot,
+    pub(crate) root_manifest: ContentId,
+    pub(crate) root_transport: BaoRoot,
 }
 /// Publish one snapshot's manifest tree into a shared bulk peer
 /// (two devices publish side by side). Returns the chunk's
-/// content id.
+/// content id and the announcement's transport identities.
 pub(crate) fn publish_into(
     bulk: &mut MemoryBulkSource,
     manifest_secret: &EpochSecret,
@@ -418,6 +446,7 @@ pub(crate) fn publish_into(
         children: vec![],
     };
     let manifest_key = manifest_secret.manifest_key(&drive, manifest_epoch, &snapshot);
+    let object_transport = entry.transport;
     let (child_id, sealed_child) = seal_manifest(&manifest_key, &child_manifest).unwrap();
     let link = ChildManifest {
         tree: ContentId::from_bytes([0xC1; 32]),
@@ -444,17 +473,74 @@ pub(crate) fn publish_into(
     bulk.publish_sealed(sealed_child.storage_id(), sealed_child.encode());
     let object_storage = sealed_object.storage_id();
     bulk.publish_sealed(object_storage, sealed_object.encode());
+    // Every representation also rides the transport-root map: the
+    // announcement names the root-manifest roots, and the mappings name
+    // the rest (decision 26).
+    bulk.publish_transport(sealed_root.encode());
+    bulk.publish_transport(sealed_child.encode());
+    bulk.publish_transport(sealed_object.encode());
     PublishedSnapshot {
         content,
         object_storage,
+        object_transport,
+        root_manifest: root_id,
+        root_transport: BaoRoot::from_bytes(
+            *blake3::hash(sealed_root.encode().as_slice()).as_bytes(),
+        ),
     }
 }
-/// A bulk peer that withholds listed sealed objects (absence,
-/// not error): the plan commits what it can and leaves the rest
-/// unfulfilled.
+/// The transport root over a snapshot body's canonical bytes — the
+/// announcement's `body_root` (decision 26).
+pub(crate) fn body_root(body: &Snapshot) -> BaoRoot {
+    BaoRoot::from_bytes(*blake3::hash(body.encode().as_slice()).as_bytes())
+}
+
+/// A bulk peer exposing ONLY the transport-root addresses: the eager
+/// snapshot/storage routes return absence, so a successful fetch proves
+/// the planner consumed the author-signed roots.
+pub(crate) struct TransportOnly(pub(crate) MemoryBulkSource);
+
+impl BulkSource for TransportOnly {
+    fn fetch_root_manifest(
+        &mut self,
+        _snapshot: &SnapshotId,
+        _max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        Ok(None)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        _snapshot: &SnapshotId,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        Ok(None)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        _storage: &StorageId,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        Ok(None)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.0.fetch_transport(root, max)
+    }
+}
+
+/// A bulk peer that withholds listed representations (absence,
+/// not error) on BOTH routes: the storage address and the transport
+/// root. The plan commits what it can and leaves the rest unfulfilled.
 pub(crate) struct WithoutObjects {
     pub(crate) inner: MemoryBulkSource,
     pub(crate) hidden: BTreeSet<StorageId>,
+    pub(crate) hidden_transport: BTreeSet<BaoRoot>,
 }
 
 impl BulkSource for WithoutObjects {
@@ -483,5 +569,16 @@ impl BulkSource for WithoutObjects {
             return Ok(None);
         }
         self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.hidden_transport.contains(root) {
+            return Ok(None);
+        }
+        self.inner.fetch_transport(root, max)
     }
 }

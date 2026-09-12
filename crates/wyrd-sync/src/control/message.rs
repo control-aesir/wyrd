@@ -140,15 +140,30 @@ pub struct SnapshotAnnouncement {
     /// evidence is not re-verified).
     pub signature: [u8; 64],
 }
-
 impl SnapshotAnnouncement {
-    /// The payload region covered by the author signature: everything
-    /// [`Message::encode_payload`] emits for this kind except the
-    /// trailing 64-byte signature. The signing and verify helpers sign
-    /// exactly these bytes.
+    /// The payload region covered by the author signature: the fixed
+    /// body, the routing byte, and the optional address blob —
+    /// everything the encoding carries except the trailing 64-byte
+    /// signature. A dedicated unsigned encoder, not a slice of the full
+    /// encoding: the signed region is defined structurally, so a future
+    /// field reorder cannot silently shift what the signature covers.
     pub fn covered_payload(&self) -> Vec<u8> {
-        let full = Message::SnapshotAnnouncement(self.clone()).encode_payload();
-        full[..full.len() - 64].to_vec()
+        let mut out = Vec::with_capacity(200 + 5);
+        out.extend_from_slice(self.snapshot.as_bytes());
+        out.extend_from_slice(self.author.as_bytes());
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(self.membership.as_bytes());
+        out.extend_from_slice(self.body_root.as_bytes());
+        out.extend_from_slice(self.root_manifest.as_bytes());
+        out.extend_from_slice(self.root_manifest_transport.as_bytes());
+        match &self.node_addr {
+            None => out.push(0x00),
+            Some(addr) => {
+                out.push(0x01);
+                push_blob(&mut out, addr);
+            }
+        }
+        out
     }
 
     /// The BIP-340 message: `ASCII("wyrd announcement v1") ‖ DriveId ‖

@@ -34,7 +34,7 @@ pub(super) fn execute(
             if !engine.fetch_eligible(&body_key) {
                 continue;
             }
-            match super::fetch::snapshot_body(bulk, snapshot) {
+            match super::fetch::snapshot_body(bulk, &runtime, snapshot) {
                 FetchOutcome::Fulfilled(body) => {
                     // The cross-record binding: the body must be the one
                     // the accepted announcement describes. The snapshot
@@ -620,6 +620,14 @@ mod tests {
             }
             self.inner.fetch_sealed(storage, max)
         }
+
+        fn fetch_transport(
+            &mut self,
+            _root: &BaoRoot,
+            _max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
+            Ok(None)
+        }
     }
 
     /// A store that refuses every import: even verified bytes fail
@@ -690,6 +698,7 @@ mod tests {
         let mut hostile = WithoutObjects {
             inner: bulk.clone(),
             hidden: BTreeSet::from([published.object_storage]),
+            hidden_transport: BTreeSet::from([published.object_transport]),
         };
         let report = fixture
             .engine
@@ -737,10 +746,17 @@ mod tests {
             .set_materialization(published.content, MaterializationState::Pinned)
             .unwrap();
 
-        // The peer serves bytes no decoder accepts: rejected, never
-        // committed, retried next run.
-        let mut hostile = bulk.clone();
-        hostile.publish_sealed(published.object_storage, vec![0xFF; 64]);
+        // The peer serves bytes no decoder accepts on the storage route (the
+        // honest-but-withheld transport route leaves the storage fallback
+        // as the served route): rejected, never committed, retried next
+        // run.
+        let mut hostile_bulk = bulk.clone();
+        hostile_bulk.publish_sealed(published.object_storage, vec![0xFF; 64]);
+        let mut hostile = WithoutObjects {
+            inner: hostile_bulk,
+            hidden: BTreeSet::new(),
+            hidden_transport: BTreeSet::from([published.object_transport]),
+        };
         let report = fixture
             .engine
             .execute_plan(&mut hostile, &mut objects)
@@ -1520,6 +1536,14 @@ mod tests {
             *self.fetches.entry(*storage).or_default() += 1;
             self.inner.fetch_sealed(storage, max)
         }
+
+        fn fetch_transport(
+            &mut self,
+            _root: &BaoRoot,
+            _max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
+            Ok(None)
+        }
     }
 
     #[test]
@@ -1660,6 +1684,15 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, BulkError> {
             self.stall();
             self.inner.fetch_sealed(storage, max)
+        }
+
+        fn fetch_transport(
+            &mut self,
+            _root: &BaoRoot,
+            _max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
+            self.stall();
+            Ok(None)
         }
     }
 

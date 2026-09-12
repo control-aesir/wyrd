@@ -17,16 +17,21 @@
 //! content, and accepted fetches allocate exactly what was verified.
 //!
 //! Addressing mirrors what each party may know. Sealed objects are
-//! vault-visible, so they fetch by [`StorageId`]. The root manifest of
-//! a snapshot is fetched by [`SnapshotId`] from a member peer holding
-//! that snapshot's metadata — this is the eager manifest exchange of
-//! sync-and-peers.md, not a vault read; the transport root the
-//! announcement now carries seeds the fetch-by-root path when map
-//! population lands. Snapshot bodies fetch the same way: they are
-//! plaintext CAS objects whose content id equals the snapshot id
-//! (`ObjectKind::Snapshot`). The returned [`ContentId`] of a root fetch
-//! is an untrusted hint: `seal::open_manifest` still enforces it as AAD
-//! before the record is trusted.
+//! vault-visible, so they fetch by [`StorageId`]; representations also
+//! carry their transport root (object-model.md decision 26), and
+//! [`BulkSource::fetch_transport`] serves a representation whose raw
+//! BLAKE3 (Bao root) is the requested address — the author-attested
+//! routing column, verified by the transfer itself. The root manifest of
+//! a snapshot is additionally fetchable by [`SnapshotId`] from a member
+//! peer holding that snapshot's metadata (the eager manifest exchange of
+//! sync-and-peers.md, not a vault read); fetch::root prefers the
+//! announcement's transport root and falls back to the exchange. Snapshot
+//! bodies are plaintext CAS objects whose content id equals the snapshot
+//! id (`ObjectKind::Snapshot`), fetchable the same way; the transport
+//! path prefers the announcement's body root. The returned
+//! [`ContentId`] of a root fetch is an untrusted hint:
+//! `seal::open_manifest` still enforces it as AAD before the record is
+//! trusted.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,7 +45,7 @@ use iroh_blobs::{
 use n0_future::{Stream, StreamExt};
 use thiserror::Error;
 use tokio::runtime::Runtime;
-use wyrd_format::{ContentId, SnapshotId, StorageId};
+use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
 /// A sealed root manifest as a member peer serves it: the claimed
 /// logical identity alongside the sealed bytes. The claim verifies as
@@ -92,6 +97,15 @@ pub trait BulkSource {
         storage: &StorageId,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError>;
+
+    /// Sealed (or plaintext, for bodies) bytes at a transport-root
+    /// address: the representation whose raw BLAKE3 over its bytes is
+    /// `root` (object-model.md decision 26). The address is the
+    /// author-attested routing column carried by announcements and
+    /// manifest mappings; the transfer itself verifies against it on the
+    /// live path. Absence is `Ok(None)`.
+    fn fetch_transport(&mut self, root: &BaoRoot, max: usize)
+        -> Result<Option<Vec<u8>>, BulkError>;
 }
 
 /// A remotely addressable iroh blob.
@@ -124,6 +138,7 @@ pub struct IrohBulkSource {
     roots: BTreeMap<SnapshotId, (ContentId, IrohBlobRef)>,
     snapshots: BTreeMap<SnapshotId, IrohBlobRef>,
     sealed: BTreeMap<StorageId, IrohBlobRef>,
+    transport: BTreeMap<BaoRoot, IrohBlobRef>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -133,6 +148,7 @@ impl std::fmt::Debug for IrohBulkSource {
             .field("roots", &self.roots.len())
             .field("snapshots", &self.snapshots.len())
             .field("sealed", &self.sealed.len())
+            .field("transport", &self.transport.len())
             .finish()
     }
 }
@@ -149,6 +165,7 @@ impl IrohBulkSource {
             roots: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             sealed: BTreeMap::new(),
+            transport: BTreeMap::new(),
         }
     }
 
@@ -173,6 +190,15 @@ impl IrohBulkSource {
     /// Publish the transport address for a sealed manifest or object.
     pub fn publish_sealed(&mut self, storage: StorageId, blob: IrohBlobRef) {
         self.sealed.insert(storage, blob);
+    }
+
+    /// Publish the transport address for a representation by its Bao
+    /// root (object-model.md decision 26): the fetch address the
+    /// announcement and manifest mappings name. The caller derives
+    /// `root` from the representation's own bytes at wiring time — the
+    /// map never asserts the pairing, the verified transfer does.
+    pub fn publish_transport(&mut self, root: BaoRoot, blob: IrohBlobRef) {
+        self.transport.insert(root, blob);
     }
 
     /// Close the owned endpoint after all in-flight transfers have finished.
@@ -288,6 +314,17 @@ impl BulkSource for IrohBulkSource {
         };
         self.fetch(blob, max).map(Some)
     }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        let Some(blob) = self.transport.get(root) else {
+            return Ok(None);
+        };
+        self.fetch(blob, max).map(Some)
+    }
 }
 
 /// An in-memory bulk peer for tests: preloaded sealed bytes keyed by
@@ -297,12 +334,22 @@ pub struct MemoryBulkSource {
     roots: BTreeMap<SnapshotId, SealedManifest>,
     snapshots: BTreeMap<SnapshotId, Vec<u8>>,
     sealed: BTreeMap<StorageId, Vec<u8>>,
+    transport: BTreeMap<BaoRoot, Vec<u8>>,
 }
 
 impl MemoryBulkSource {
     /// Serve a sealed root manifest for a snapshot.
     pub fn publish_root(&mut self, snapshot: SnapshotId, manifest: SealedManifest) {
         self.roots.insert(snapshot, manifest);
+    }
+
+    /// Publish sealed (or plaintext) bytes under the transport root the
+    /// bytes themselves carry: the map key is derived from the content,
+    /// so the address the publisher hands out is exactly what the
+    /// transfer verifies against. A publisher cannot place bytes under a
+    /// root they do not hash to.
+    pub fn publish_transport(&mut self, bytes: Vec<u8>) {
+        self.transport.insert(crate::seal::blob_root(&bytes), bytes);
     }
 
     /// Serve a snapshot body at its snapshot address.
@@ -367,6 +414,23 @@ impl BulkSource for MemoryBulkSource {
         }
         Ok(Some(sealed))
     }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        let Some(bytes) = self.transport.get(root).cloned() else {
+            return Ok(None);
+        };
+        if bytes.len() > max {
+            return Err(BulkError::Oversize {
+                bytes: bytes.len(),
+                max,
+            });
+        }
+        Ok(Some(bytes))
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +476,37 @@ mod tests {
             bulk.fetch_sealed(&StorageId::from_bytes([0x22; 32]), usize::MAX)
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            bulk.fetch_transport(&BaoRoot::from_bytes([0x33; 32]), usize::MAX)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_addresses_name_only_their_own_bytes() {
+        // Publishing derives the map key from the content itself: the
+        // bytes are reachable exactly under the root they hash to, so a
+        // wrong root is absence before any transfer, never unverified
+        // bytes (decision 26: the transfer is the verification).
+        let bytes = b"sealed representation bytes".to_vec();
+        let root = crate::seal::blob_root(&bytes);
+        let mut bulk = MemoryBulkSource::default();
+        bulk.publish_transport(bytes.clone());
+        assert_eq!(
+            bulk.fetch_transport(&root, usize::MAX).unwrap(),
+            Some(bytes)
+        );
+        assert_eq!(
+            bulk.fetch_transport(&BaoRoot::from_bytes([0x77; 32]), usize::MAX)
+                .unwrap(),
+            None,
+            "a root the bytes do not hash to names nothing"
+        );
+        assert_eq!(
+            bulk.fetch_transport(&root, 4),
+            Err(BulkError::Oversize { bytes: 27, max: 4 })
         );
     }
 

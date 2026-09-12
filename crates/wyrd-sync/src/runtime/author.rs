@@ -196,7 +196,7 @@ where
                     .iter()
                     .next()
                     .copied()
-                    .expect("an authored child holds exactly its own envelope");
+                    .ok_or_else(|| EngineError::RepresentationMissing(child.manifest_id))?;
                 links.push(ChildManifest {
                     tree: *subtree,
                     manifest: child.manifest_id,
@@ -290,6 +290,12 @@ pub(super) fn announce(
     node_addr: Option<&[u8]>,
 ) -> Result<usize, EngineError> {
     let body = snapshot.snapshot();
+    // The announcement is signed by this engine's identity, so it may
+    // only carry a snapshot this engine authored: anything else produces
+    // authorship every recipient rejects, before any mailbox traffic.
+    if body.author != engine.device {
+        return Err(EngineError::NotAnnounceAuthor(body.snapshot_id()));
+    }
     let key = engine
         .epoch_keys
         .get(&body.epoch)

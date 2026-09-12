@@ -64,6 +64,10 @@ pub struct PendingObjectFetch {
     pub content_id: ContentId,
     /// The sealed representation address from the manifest entry.
     pub storage_id: StorageId,
+    /// The representation's transport root — the author-attested fetch
+    /// address (object-model.md decision 26), preferred over the storage
+    /// address when the transport map holds it.
+    pub transport: BaoRoot,
     pub kind: ObjectKind,
     pub version: u8,
     pub encryption_epoch: u64,
@@ -269,16 +273,21 @@ impl RuntimeState {
         self.manifests.get(manifest)
     }
 
-    /// The root-manifest record for one snapshot, if recorded. More than
-    /// one root manifest can be recorded for a snapshot only through
-    /// hostile or buggy records; the deterministic smallest manifest id
-    /// wins, and the announcement path (which must name exactly one)
-    /// surfaces the ambiguity by construction: an authoring device has
-    /// exactly one.
+    /// The root-manifest record for one snapshot, if recorded. The
+    /// announcement names exactly one root manifest identity (decision
+    /// 26); when one is recorded, that identity is the record this state
+    /// serves — a hostile or stale extra root for the same snapshot can
+    /// never outvote the author-signed claim. Without an announcement
+    /// (the authoring side), the deterministic smallest manifest id wins.
     pub fn root_manifest_record(&self, snapshot: &SnapshotId) -> Option<&ManifestRecord> {
         let roots = self.root_manifests_by_snapshot.get(snapshot)?;
-        let manifest_id = roots.iter().next()?;
-        self.manifests.get(manifest_id)
+        let manifest_id = match self.announcements.get(snapshot) {
+            Some(announcement) if roots.contains(&announcement.root_manifest) => {
+                announcement.root_manifest
+            }
+            _ => *roots.iter().next()?,
+        };
+        self.manifests.get(&manifest_id)
     }
 
     /// The first recorded mapping for one plaintext content, in
@@ -362,7 +371,8 @@ impl RuntimeState {
 
         for snapshot in self.announcements.keys() {
             // Root manifests are the snapshot anchors; child manifests share
-            // the snapshot id but do not resolve the announcement on their own.
+            // the snapshot id but do not resolve the announcement on their
+            // own.
             if !self.root_manifests_by_snapshot.contains_key(snapshot) {
                 pending_snapshots.insert(*snapshot);
             }
@@ -402,6 +412,7 @@ impl RuntimeState {
                 let candidate = PendingObjectFetch {
                     content_id: entry.content_id,
                     storage_id: entry.storage_id,
+                    transport: entry.transport,
                     kind: entry.kind,
                     version: entry.version,
                     encryption_epoch: entry.encryption_epoch,

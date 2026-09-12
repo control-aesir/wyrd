@@ -541,6 +541,14 @@ impl BulkSource for Bounded<'_> {
         self.maxes.push(max);
         self.inner.fetch_sealed(storage, max)
     }
+
+    fn fetch_transport(
+        &mut self,
+        _root: &wyrd_format::BaoRoot,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        Ok(None)
+    }
 }
 
 /// The rig's epoch-3 child transition, signed by the owner: the

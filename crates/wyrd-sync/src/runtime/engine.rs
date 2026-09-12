@@ -84,12 +84,16 @@ pub enum EngineError {
     NotAMember,
     #[error("no held control key for epoch {0}")]
     MissingEpochKey(u64),
+    #[error("snapshot {0} was authored by another device: an engine announces only its own work")]
+    NotAnnounceAuthor(SnapshotId),
     #[error("capability authorization failed: {0}")]
     Capability(#[from] crate::keys::CapabilityError),
     #[error("ingest limits rejected authored content: {0:?}")]
     Ingest(#[from] crate::ingest::IngestError),
     #[error("chunk {0} is neither locally sealed nor covered by a held recorded mapping")]
     ChunkUnavailable(ContentId),
+    #[error("authored manifest {0} holds no sealed representation to link")]
+    RepresentationMissing(ContentId),
     #[error("no root manifest record for snapshot {0}: author the manifest before announcing")]
     RootManifestUnavailable(SnapshotId),
     #[error("control sealing failed: {0}")]
@@ -588,8 +592,8 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        announcement_msg, capability_message_for, deliver, drain, encryption_key, fixture,
-        identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
+        admit_engine, announcement_msg, capability_message_for, deliver, drain, encryption_key,
+        fixture, identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
         PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::transport::mailbox::{
@@ -1028,6 +1032,7 @@ mod tests {
         let mut partial = WithoutObjects {
             inner: pair.bulk.clone(),
             hidden: BTreeSet::from([snap_b.object_storage]),
+            hidden_transport: BTreeSet::from([snap_b.object_transport]),
         };
         let a_plan = pair
             .a
@@ -1407,6 +1412,47 @@ mod tests {
                 .announce_snapshot(&authorized, &mut mailbox, None),
             Err(EngineError::MissingEpochKey(9))
         ));
+    }
+
+    #[test]
+    fn announcing_a_foreign_snapshot_fails_closed() {
+        let mut f = fixture();
+        let device = f.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let mail = vec![
+            deliver(&f, 1, &transition_message(&genesis)),
+            deliver(&f, 1, &transition_message(&admission)),
+        ];
+        queue(&mut f, mail);
+        assert_eq!(drain(&mut f).accepted, 2);
+
+        // A valid snapshot authored by another member: this engine's
+        // identity cannot announce it, and nothing reaches the mailbox.
+        let mut body = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0xC1; 32]),
+            *builder.owners.iter().next().expect("tracked owner"),
+            admission.transition_id(),
+            admission.epoch,
+            0,
+            1000,
+        );
+        crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
+        let authorized = AuthorizedSnapshot::authorize(body, &member_drive()).unwrap();
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut f.relay,
+            owner: f.recipient,
+        };
+        assert!(matches!(
+            f.engine.announce_snapshot(&authorized, &mut mailbox, None),
+            Err(EngineError::NotAnnounceAuthor(_))
+        ));
+        assert!(
+            mailbox.recv().is_none(),
+            "a refused announcement never sends"
+        );
     }
 
     /// A mailbox that fails after `fail_after` successful sends.

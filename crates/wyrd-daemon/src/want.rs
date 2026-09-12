@@ -151,15 +151,20 @@ impl WantRegistry {
     }
 
     /// Move exactly the durably committed identities from pending to
-    /// admitted. Ids not in pending (already retired or unknown) are
-    /// ignored, so marking a committed prefix twice is harmless.
+    /// admitted — and only those still pending. A waiter that left
+    /// between the peek and this mark must not leave an orphaned
+    /// in-flight entry: its demand is gone, so the durable `Cached`
+    /// fact stays as harmless policy but no admitted slot is consumed.
+    /// Ids never in pending are ignored, so marking a committed prefix
+    /// twice is harmless.
     pub fn mark_admitted(&self, committed: &[ContentId]) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         for content in committed {
-            state.pending.remove(content);
-            state.admitted.insert(*content);
+            if state.pending.remove(content) {
+                state.admitted.insert(*content);
+            }
         }
     }
 
@@ -398,5 +403,29 @@ mod tests {
         registry.mark_admitted(&registry.peek_pending());
         assert!(registry.peek_pending().is_empty());
         assert!(registry.is_admitted(&content(2)));
+    }
+
+    /// The reviewer's release-versus-admission race: a waiter that
+    /// leaves between the loop's peek and its mark must not leave an
+    /// orphaned in-flight entry. The durable fact may exist; the
+    /// admitted slot must not.
+    #[test]
+    fn mark_skips_waiters_that_left_before_admission() {
+        let registry = WantRegistry::default();
+        registry.register(content(1)).unwrap();
+        // The loop peeks; the last waiter times out before the mark.
+        let peeked = registry.peek_pending();
+        assert_eq!(peeked, vec![content(1)]);
+        registry.release(&content(1));
+        assert!(
+            registry.peek_pending().is_empty(),
+            "the demand died with its last waiter"
+        );
+        // The loop promotes what it persisted: the leave wins.
+        registry.mark_admitted(&peeked);
+        assert!(
+            !registry.is_admitted(&content(1)),
+            "no orphaned in-flight entry for a departed waiter"
+        );
     }
 }

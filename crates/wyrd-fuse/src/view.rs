@@ -38,6 +38,7 @@
 //!   [`ViewError::Corrupt`] triggers scrub/repair before surfacing.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use thiserror::Error;
 use wyrd_format::{Component, ContentId, EntryContent, FetchStatus, ObjectStore, Snapshot, Tree};
@@ -156,11 +157,15 @@ pub enum ViewError {
 /// plaintext by content id, and entry/tree correspondence is sync's
 /// concern, checked where manifests are fetched.
 ///
-/// Only verified snapshots become heads: [`DriveView::new`] and
-/// [`DriveView::set_heads`] accept [`ViewHead`] values, which safe code
-/// can only construct through the [`VerifiedSnapshot`] capability.
+/// The object store sits behind a reference-counted lock, separate
+/// from the view's own (head/materialization) mutation: fetch and
+/// intake write bytes without stalling namespace serving, and a live
+/// daemon loop shares the same store handle the backend serves from.
+/// A poisoned store lock maps to [`ViewError::Store`]: a thread
+/// panicked mid-write, so subsequent reads fail closed rather than
+/// serve a torn store.
 pub struct DriveView<S, M> {
-    store: S,
+    store: Arc<RwLock<S>>,
     materialization: M,
     heads: Vec<Snapshot>,
 }
@@ -246,13 +251,47 @@ where
     S::Error: std::fmt::Debug,
     M: Materialization,
 {
-    /// A view over the given verified heads.
+    /// A view over the given verified heads. The store handle is
+    /// reference-counted internally so the view can later share it.
     pub fn new(store: S, materialization: M, heads: Vec<ViewHead>) -> Self {
+        DriveView {
+            store: Arc::new(RwLock::new(store)),
+            materialization,
+            heads: heads.into_iter().map(|head| head.snapshot).collect(),
+        }
+    }
+
+    /// A view over a shared store handle: the live daemon loop and the
+    /// serving backend address the same bytes. Each side locks only for
+    /// the duration of its own operation.
+    pub fn shared(store: Arc<RwLock<S>>, materialization: M, heads: Vec<ViewHead>) -> Self {
         DriveView {
             store,
             materialization,
             heads: heads.into_iter().map(|head| head.snapshot).collect(),
         }
+    }
+
+    /// Clone the shared store handle: fetch/intake address the store
+    /// without taking the view lock, so bulk I/O never stalls serving.
+    pub fn store_handle(&self) -> Arc<RwLock<S>> {
+        Arc::clone(&self.store)
+    }
+
+    /// Read the backing object store. Poison (a panicking holder) fails
+    /// as a store error: fail closed, never serve a torn store.
+    pub fn store_read(&self) -> Result<RwLockReadGuard<'_, S>, ViewError> {
+        self.store
+            .read()
+            .map_err(|_| ViewError::Store("store lock poisoned".into()))
+    }
+
+    /// Write the backing object store. Same fail-closed poison mapping
+    /// as [`DriveView::store_read`].
+    pub fn store_write(&self) -> Result<RwLockWriteGuard<'_, S>, ViewError> {
+        self.store
+            .write()
+            .map_err(|_| ViewError::Store("store lock poisoned".into()))
     }
 
     /// Replace the head set: "current" is policy over heads, and the
@@ -265,11 +304,6 @@ where
     /// Replace the sync-backed materialization projection after engine work.
     pub fn set_materialization(&mut self, materialization: M) {
         self.materialization = materialization;
-    }
-
-    /// Borrow the backing object store for the daemon's verified fetch path.
-    pub fn store_mut(&mut self) -> &mut S {
-        &mut self.store
     }
 
     /// Resolve a path to its node, merging across heads. `/a/b` and
@@ -557,7 +591,7 @@ where
     /// Load and decode a tree. Present-but-undecodable bytes are
     /// corrupt local data, never served.
     fn load_tree(&self, id: &ContentId) -> Result<Tree, ViewError> {
-        match self.store.get(id) {
+        match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Tree::decode(&bytes).map_err(|_| ViewError::Corrupt),
             Ok(None) => Err(self.absent(id)),
             Err(error) => Err(ViewError::Store(format!("{error:?}"))),
@@ -566,7 +600,7 @@ where
 
     /// Load one chunk's bytes.
     fn load_chunk(&self, id: &ContentId) -> Result<Vec<u8>, ViewError> {
-        match self.store.get(id) {
+        match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Ok(bytes),
             Ok(None) => Err(self.absent(id)),
             Err(error) => Err(ViewError::Store(format!("{error:?}"))),
@@ -1310,33 +1344,33 @@ mod tests {
         let file = view.open(&view.lookup("wide.bin").unwrap()).unwrap();
         // The lookup loaded the root tree; count deltas per read from
         // here so every assertion pins chunk loads only.
-        let loads_since = |before: usize| view.store.gets.get() - before;
+        let loads_since = |before: usize| view.store.read().unwrap().gets.get() - before;
 
         // A small mid-file read touches exactly one chunk's bytes, but chunk
         // sizes are content-defined and unknown without fetching, so the
         // walk loads chunks sequentially from the start: bounded by the
         // offset (16 chunks to reach chunk 15), not by the file.
-        let before = view.store.gets.get();
+        let before = view.store.read().unwrap().gets.get();
         let served = view.read(&file, 155, 3).unwrap();
         assert_eq!(served, vec![15, 15, 15]);
         assert_eq!(loads_since(before), 16, "walk is bounded by the offset");
 
         // A read spanning a boundary near the start loads only those
         // two chunks.
-        let before = view.store.gets.get();
+        let before = view.store.read().unwrap().gets.get();
         let served = view.read(&file, 8, 4).unwrap();
         assert_eq!(served, vec![0, 0, 1, 1]);
         assert_eq!(loads_since(before), 2, "the range spans two chunks");
 
         // Reading through EOF walks to the offset, serves to the
         // declared size, and checks the total.
-        let before = view.store.gets.get();
+        let before = view.store.read().unwrap().gets.get();
         let served = view.read(&file, 312, 100).unwrap();
         assert_eq!(served, vec![31, 31, 31, 31, 31, 31, 31, 31]);
         assert_eq!(loads_since(before), 32, "walk reaches the declared end");
 
         // The full read loads every chunk (and checks the total).
-        let before = view.store.gets.get();
+        let before = view.store.read().unwrap().gets.get();
         let served = view.read(&file, 0, 320).unwrap();
         assert_eq!(served.len(), 320);
         assert_eq!(

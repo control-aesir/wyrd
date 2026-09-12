@@ -123,9 +123,12 @@ work follows `trust.md` and `epochs.md` as normative contracts; the
 open tracking issues name what comes next (durable snapshot-body
 consumers, runtime sync, recovery completion).
 
-The local `wyrd` CLI currently provides a static, read-only startup
-projection only. Its credential files are supported on Unix, must be regular
-files owned by the current user with private permissions, and are bounded and
-zeroized at the CLI boundary. Control-plane draining, fetch-on-open,
-materialization updates, and live mounted-head refresh remain tracked runtime
-work rather than behavior implied by the static mount command.
+The local `wyrd` CLI mounts a live read-only projection: a supervised
+loop drains the NIP-59 control-plane mailbox, refreshes materialization
+facts and live heads into the serving view without remounting, and shuts
+down cleanly on SIGINT/SIGTERM. Fetch from peers is not yet wired (no
+peer addressing, so the loop runs without a bulk source) and fetch-on-open
+stays disabled; relays arrive as repeatable `--relay` flags. Credential
+files are supported on Unix, must be regular files owned by the current
+user with private permissions, and are bounded and zeroized at the CLI
+boundary.

@@ -440,17 +440,16 @@ where
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
-        // Admit outstanding FUSE demand ahead of fetching: each pending
-        // want becomes Cached materialization, which the plan then
-        // fetches. Admission is durable (`set_materialization` commits
-        // a fact) and changes the serving projection, so the count
-        // feeds the publication gate below.
-        let wants = self.wants.drain_pending();
-        let wants_admitted = !wants.is_empty();
-        for want in &wants {
+        // Admit outstanding FUSE demand ahead of fetching, atomically
+        // from the registry's perspective: only durably committed
+        // identities are marked admitted, so a failing commit leaves
+        // the rest pending for the next pass and no waiter ever
+        // coalesces onto an unadmitted fetch.
+        let committed = admit_wants(&self.wants, &mut |want| {
             self.engine
-                .set_materialization(*want, MaterializationState::Cached)?;
-        }
+                .set_materialization(want, MaterializationState::Cached)
+        })?;
+        let wants_admitted = !committed.is_empty();
         let fetched = match bulk {
             Some(bulk) => {
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
@@ -550,6 +549,33 @@ fn sync_changed(drained: &DrainReport, fetched: &ExecuteReport) -> bool {
         || fetched.manifests > 0
         || fetched.snapshot_bodies > 0
         || fetched.objects > 0
+}
+
+/// Persist pending wants into durable `Cached` materialization,
+/// atomically from the registry's perspective: each identity's fact is
+/// written first, and only the committed prefix is marked admitted. A
+/// failing commit leaves the failing identity and everything after it
+/// pending — the next pass retries them, and no waiter ever coalesces
+/// onto a fetch that was never admitted. Returns the committed
+/// identities (which feed the publication gate: a committed fact
+/// changes the serving projection even when nothing else did).
+fn admit_wants<E>(
+    registry: &WantRegistry,
+    commit: &mut dyn FnMut(ContentId) -> Result<(), E>,
+) -> Result<Vec<ContentId>, E> {
+    let pending = registry.peek_pending();
+    let mut committed = Vec::with_capacity(pending.len());
+    for want in pending {
+        match commit(want) {
+            Ok(()) => committed.push(want),
+            Err(error) => {
+                registry.mark_admitted(&committed);
+                return Err(error);
+            }
+        }
+    }
+    registry.mark_admitted(&committed);
+    Ok(committed)
 }
 
 /// Sleep in short slices so a set `stop` flag is noticed promptly even
@@ -937,6 +963,44 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The reviewer's admission-atomicity regression: a durable
+    /// admission failure must leave the uncommitted wants pending — never
+    /// stranded as admitted — so the next pass retries them and no waiter
+    /// ever coalesces onto a fetch that was never admitted. The commit
+    /// step fails mid-batch: the committed prefix is marked, the failing
+    /// suffix stays pending, and the retry admits the rest.
+    #[test]
+    fn failed_want_admission_stays_pending_and_retries() {
+        let registry = WantRegistry::default();
+        let first = ContentId::from_bytes([0xE1; 32]);
+        let second = ContentId::from_bytes([0xE2; 32]);
+        registry.register(first).unwrap();
+        registry.register(second).unwrap();
+
+        let committed = admit_wants(&registry, &mut |want| {
+            if want == second {
+                Err("durable store failed")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            committed,
+            Err("durable store failed"),
+            "the failing commit surfaces"
+        );
+        assert!(registry.is_admitted(&first), "the prefix is admitted");
+        assert!(
+            !registry.is_admitted(&second),
+            "a failed admission never strands the identity as admitted"
+        );
+        assert_eq!(registry.peek_pending(), vec![second]);
+
+        // The next pass retries the pending suffix and finishes the batch.
+        let retry = admit_wants(&registry, &mut |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(retry, vec![second]);
+        assert!(registry.peek_pending().is_empty());
+    }
     /// Poison arriving through the mailbox is consumed (acked) rather
     /// than retained: an unopenable envelope is terminal, and the
     /// serving projection is untouched by the pass.

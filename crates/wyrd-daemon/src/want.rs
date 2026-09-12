@@ -134,20 +134,33 @@ impl WantRegistry {
         }
     }
 
-    /// Hand the loop the pending demands and mark them admitted: the
-    /// engine's durable `Cached` state is the truth from here, so a
-    /// later registration coalesces instead of re-demanding. A
-    /// poisoned lock yields an empty drain — the next registration
+    /// Hand the loop the pending demands without moving anything: the
+    /// caller persists the durable admissions first and only then marks
+    /// the committed ones ([`WantRegistry::mark_admitted`]). Keeping
+    /// the registry transition behind the durable commit is what makes
+    /// admission atomic from the registry's perspective: a failed
+    /// commit leaves the identity pending, so the next pass retries it
+    /// and no waiter ever coalesces onto an unadmitted fetch. A
+    /// poisoned lock yields an empty peek — the next registration
     /// re-demands, and the loop never blocks on registry health.
-    pub fn drain_pending(&self) -> Vec<ContentId> {
-        let Ok(mut state) = self.state.lock() else {
+    pub fn peek_pending(&self) -> Vec<ContentId> {
+        let Ok(state) = self.state.lock() else {
             return Vec::new();
         };
-        let drained: Vec<ContentId> = std::mem::take(&mut state.pending).into_iter().collect();
-        for content in &drained {
+        state.pending.iter().copied().collect()
+    }
+
+    /// Move exactly the durably committed identities from pending to
+    /// admitted. Ids not in pending (already retired or unknown) are
+    /// ignored, so marking a committed prefix twice is harmless.
+    pub fn mark_admitted(&self, committed: &[ContentId]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        for content in committed {
+            state.pending.remove(content);
             state.admitted.insert(*content);
         }
-        drained
     }
 
     /// Loop-side completion sweep: retire every admitted identity the
@@ -217,6 +230,13 @@ mod tests {
         ContentId::from_bytes([byte; 32])
     }
 
+    /// The loop's atomic admission: peek, persist (fake), then mark.
+    fn admit_all(registry: &WantRegistry) -> Vec<ContentId> {
+        let pending = registry.peek_pending();
+        registry.mark_admitted(&pending);
+        pending
+    }
+
     /// Registration must be an obligation, never a silent drop: a
     /// demand is either tracked or explicitly rejected.
     #[test]
@@ -226,14 +246,14 @@ mod tests {
         registry.register(content(1)).unwrap();
         registry.register(content(2)).unwrap();
         assert_eq!(
-            registry.drain_pending(),
+            admit_all(&registry),
             vec![content(1), content(2)],
             "identical wants coalesce into one demand entry"
         );
         // A second register after admission coalesces: the fetch is in
         // flight, so no new demand entry appears.
         registry.register(content(1)).unwrap();
-        assert!(registry.drain_pending().is_empty());
+        assert!(registry.peek_pending().is_empty());
         // Releasing a single waiter of two leaves the in-flight fetch.
         registry.release(&content(1));
         assert!(registry.is_admitted(&content(1)));
@@ -280,7 +300,7 @@ mod tests {
             wait_for_materialization(&registry, content(3), Duration::from_millis(120), || false)
                 .unwrap_err();
         assert_eq!(error, WantError::TimedOut);
-        assert!(registry.drain_pending().is_empty());
+        assert!(registry.peek_pending().is_empty());
     }
 
     /// The reviewer's coalescing regression: once a demand is admitted
@@ -290,12 +310,15 @@ mod tests {
     fn registration_after_admission_does_not_re_demand() {
         let registry = WantRegistry::default();
         registry.register(content(1)).unwrap();
-        let admitted = registry.drain_pending();
-        assert_eq!(admitted, vec![content(1)], "the loop admitted the want");
+        assert_eq!(
+            admit_all(&registry),
+            vec![content(1)],
+            "the loop admitted the want"
+        );
         // A second waiter arrives while the fetch is in flight.
         registry.register(content(1)).unwrap();
         assert!(
-            registry.drain_pending().is_empty(),
+            registry.peek_pending().is_empty(),
             "an admitted identity must not be re-demanded"
         );
     }
@@ -307,7 +330,7 @@ mod tests {
     fn release_after_admission_keeps_the_fetch_in_flight() {
         let registry = WantRegistry::default();
         registry.register(content(1)).unwrap();
-        assert_eq!(registry.drain_pending(), vec![content(1)]);
+        assert_eq!(admit_all(&registry), vec![content(1)]);
         assert!(registry.is_admitted(&content(1)));
         registry.release(&content(1));
         assert!(
@@ -315,7 +338,7 @@ mod tests {
             "an admitted fetch outlives its last waiter"
         );
         registry.register(content(2)).unwrap();
-        let next = registry.drain_pending();
+        let next = admit_all(&registry);
         assert_eq!(next, vec![content(2)], "only the new pending demand drains");
         // The loop sweep retires the landed fetch.
         registry.complete_local(|id| *id == content(1));
@@ -349,6 +372,31 @@ mod tests {
         // Second waiter: immediate success, no new demand entry.
         wait_for_materialization(&registry, content(4), Duration::from_millis(80), || true)
             .unwrap();
-        assert!(registry.drain_pending().is_empty());
+        assert!(registry.peek_pending().is_empty());
+    }
+
+    /// Admission is atomic from the registry's perspective: a peek
+    /// never moves anything, and marking only a committed prefix
+    /// leaves the failing suffix pending for the next pass.
+    #[test]
+    fn partial_admission_leaves_the_rest_pending() {
+        let registry = WantRegistry::default();
+        registry.register(content(1)).unwrap();
+        registry.register(content(2)).unwrap();
+        // The loop persists content(1) and fails on content(2): only
+        // the committed prefix is marked.
+        let pending = registry.peek_pending();
+        assert_eq!(pending, vec![content(1), content(2)]);
+        registry.mark_admitted(&[content(1)]);
+        assert!(registry.is_admitted(&content(1)));
+        assert_eq!(
+            registry.peek_pending(),
+            vec![content(2)],
+            "the uncommitted suffix stays pending"
+        );
+        // The retry admits the rest without re-demanding the prefix.
+        registry.mark_admitted(&registry.peek_pending());
+        assert!(registry.peek_pending().is_empty());
+        assert!(registry.is_admitted(&content(2)));
     }
 }

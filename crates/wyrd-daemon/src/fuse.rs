@@ -1004,7 +1004,7 @@ mod tests {
         );
         worker.join().unwrap();
         assert!(
-            registry.drain_pending().is_empty(),
+            registry.peek_pending().is_empty(),
             "success released the demand"
         );
     }
@@ -1023,7 +1023,7 @@ mod tests {
             "deadline expiry is EIO, never a partial read"
         );
         assert!(
-            registry.drain_pending().is_empty(),
+            registry.peek_pending().is_empty(),
             "expiry released the demand"
         );
     }
@@ -1048,7 +1048,7 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(
-            registry.drain_pending().len(),
+            registry.peek_pending().len(),
             1,
             "two waiters, one demand entry"
         );

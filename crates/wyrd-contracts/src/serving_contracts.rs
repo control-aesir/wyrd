@@ -46,7 +46,10 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
 
     let mut engine = loaded.rig.take_engine();
     let mut bulk = loopback_bulk_source();
-    let routes = bulk.publish_routes(&engine).unwrap();
+    let routes = bulk
+        .publish_routes(&engine.runtime_state().unwrap())
+        .unwrap()
+        .published;
     assert_eq!(routes, 4, "the announcement publishes its four routes");
     let mut objects = loaded.objects.clone();
     // Round one: body and root manifest over live transport. Objects
@@ -69,7 +72,10 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
     let report = engine.drain(&mut loaded.rig.relay).unwrap();
     assert_eq!(report.accepted, 1, "the route update reannouncement");
     loaded.want_all(&mut engine);
-    let second_routes = bulk.publish_routes(&engine).unwrap();
+    let second_routes = bulk
+        .publish_routes(&engine.runtime_state().unwrap())
+        .unwrap()
+        .published;
     assert!(second_routes > routes, "the recorded manifest adds routes");
     let second = engine.execute_plan(&mut bulk, &mut objects).unwrap();
     assert_eq!(

@@ -446,86 +446,6 @@ impl Engine {
         &self.vault
     }
 
-    /// Publish every recorded route into a real-iroh bulk source: the
-    /// interpretation of announcement `node_addr` bytes the control
-    /// plane carries opaquely. Content serves from the announcing peer
-    /// (v0 has no replication serving), so one address per snapshot
-    /// feeds the announcement's own routes plus every manifest record
-    /// that snapshot introduced. Undecodable or absent addresses skip
-    /// silently — nothing publishes, the plan reports absence, and a
-    /// later route update rewrites the maps. Returns the number of
-    /// routes published.
-    pub fn publish_bulk_routes(
-        &self,
-        bulk: &mut crate::bulk::IrohBulkSource,
-    ) -> Result<usize, EngineError> {
-        let runtime = self.runtime_state()?;
-        let mut published = 0usize;
-        let mut providers = BTreeMap::new();
-        for (snapshot, announcement) in &self.announcements {
-            let Some(bytes) = &announcement.node_addr else {
-                continue;
-            };
-            let Ok(provider) = crate::transport::decode_node_addr(bytes) else {
-                continue;
-            };
-            bulk.publish_root(
-                *snapshot,
-                announcement.root_manifest,
-                crate::bulk::IrohBlobRef {
-                    provider: provider.clone(),
-                    hash: *announcement.root_manifest_transport.as_bytes(),
-                },
-            );
-            bulk.publish_snapshot(
-                *snapshot,
-                crate::bulk::IrohBlobRef {
-                    provider: provider.clone(),
-                    hash: *announcement.body_root.as_bytes(),
-                },
-            );
-            // The transport routes the fetch plane prefers: the author
-            // signed root manifest (fetch::root's primary route) and the
-            // body root (fetch::snapshot_body's only route).
-            bulk.publish_transport(crate::bulk::IrohBlobRef {
-                provider: provider.clone(),
-                hash: *announcement.root_manifest_transport.as_bytes(),
-            });
-            bulk.publish_transport(crate::bulk::IrohBlobRef {
-                provider: provider.clone(),
-                hash: *announcement.body_root.as_bytes(),
-            });
-            providers.insert(*snapshot, provider);
-            published += 4;
-        }
-        for record in runtime.manifest_records() {
-            let Some(address) = providers.get(&record.manifest.snapshot) else {
-                continue;
-            };
-            let reference = |hash: &wyrd_format::BaoRoot| crate::bulk::IrohBlobRef {
-                provider: address.clone(),
-                hash: *hash.as_bytes(),
-            };
-            bulk.publish_transport(reference(&record.transport));
-            published += 1;
-            for storage in &record.storage_ids {
-                bulk.publish_sealed(*storage, reference(&record.transport));
-                published += 1;
-            }
-            for entry in &record.manifest.entries {
-                bulk.publish_transport(reference(&entry.transport));
-                bulk.publish_sealed(entry.storage_id, reference(&entry.transport));
-                published += 2;
-            }
-            for link in &record.manifest.children {
-                bulk.publish_transport(reference(&link.transport));
-                bulk.publish_sealed(link.storage, reference(&link.transport));
-                published += 2;
-            }
-        }
-        Ok(published)
-    }
-
     /// The classified live-head projection: the verified snapshot bodies
     /// the authorization engine currently marks `Eligible` — live-lineage
     /// DAG heads at the current epoch (`docs/epochs.md`). Built from
@@ -718,6 +638,7 @@ mod tests {
         fixture, identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
         PublishedSnapshot, TestDir, WithoutObjects,
     };
+    use crate::runtime::RoutePublishing;
     use crate::transport::mailbox::{
         seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
         MailboxError,
@@ -2283,7 +2204,8 @@ mod tests {
                 .unwrap()
         });
         let mut bulk = IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
-        let routes = fixture.engine.publish_bulk_routes(&mut bulk).unwrap();
+        let state = fixture.engine.runtime_state().unwrap();
+        let routes = bulk.publish_routes(&state).unwrap().published;
         assert_eq!(
             routes, 4,
             "root-manifest transport, body, eager root, eager body"
@@ -2302,7 +2224,8 @@ mod tests {
         assert_eq!(first.unfulfilled, 1, "the object waits for its route");
         // Pass two: the recorded manifest now publishes its object's
         // routes, and the fetch completes over live transport.
-        let second_routes = fixture.engine.publish_bulk_routes(&mut bulk).unwrap();
+        let state = fixture.engine.runtime_state().unwrap();
+        let second_routes = bulk.publish_routes(&state).unwrap().published;
         assert!(second_routes > routes, "the manifest record adds routes");
         let second = fixture
             .engine

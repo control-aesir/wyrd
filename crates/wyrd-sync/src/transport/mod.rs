@@ -25,8 +25,10 @@
 
 pub mod addr;
 pub mod mailbox;
+pub mod routes;
 pub mod signer;
 
 pub use addr::{decode_node_addr, encode_node_addr};
 pub use mailbox::{Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError};
+pub use routes::publish_recorded_routes;
 pub use signer::{SignerError, SignerSession};

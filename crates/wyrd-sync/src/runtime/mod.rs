@@ -30,15 +30,26 @@ pub(crate) mod test_util;
 
 pub use engine::{DrainReport, Engine, EngineError, ExecuteReport, MAX_PENDING_MESSAGES};
 
-/// Sources the engine pushes recorded routes into before a fetch pass:
-/// the interpretation of the announcement's opaque `node_addr` bytes.
-/// The engine owns the recorded state; the source owns its address
-/// maps. No-op defaults keep in-memory fakes honest about not carrying
-/// live routes.
+/// What one route-publication pass did. `published` counts the address
+/// maps filled; `undecodable` counts announcements whose opaque
+/// `node_addr` bytes the route codec refused — operability signal for a
+/// snapshot that will report absent until a decodable route arrives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteReport {
+    pub published: usize,
+    pub undecodable: usize,
+}
+
+/// Sources the engine's recorded routes feed before a fetch pass: the
+/// interpretation of the announcement's opaque `node_addr` bytes into a
+/// concrete source's address maps. The state is the engine's plain-data
+/// projection ([`RuntimeState`]), so the engine itself never learns
+/// which transport interprets it. No-op impls keep the in-memory fakes
+/// honest about not carrying live routes.
 pub trait RoutePublishing: crate::bulk::BulkSource {
-    /// Push every route the engine's durable state records. Returns the
-    /// number of routes published.
-    fn publish_routes(&mut self, engine: &Engine) -> Result<usize, EngineError>;
+    /// Push every route the durable state records. Returns what the
+    /// pass published and what it refused to decode.
+    fn publish_routes(&mut self, state: &RuntimeState) -> Result<RouteReport, EngineError>;
 }
 
 /// Local residency policy for one content object.

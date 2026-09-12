@@ -493,9 +493,8 @@ where
                 // cascade body -> manifest -> objects). The count is
                 // informational for now; surfacing it in the report is
                 // observability work, separately tracked.
-                let _routes = bulk
-                    .publish_routes(&self.engine)
-                    .map_err(LiveError::Engine)?;
+                let state = self.engine.runtime_state()?;
+                let _routes = bulk.publish_routes(&state).map_err(LiveError::Engine)?;
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
                 self.engine.execute_plan(bulk, &mut shared)?
             }

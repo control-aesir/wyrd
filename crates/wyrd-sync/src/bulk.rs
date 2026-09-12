@@ -252,24 +252,14 @@ impl IrohBulkSource {
     }
 }
 
-impl crate::runtime::RoutePublishing for IrohBulkSource {
-    /// Push the engine's recorded routes into the address maps.
-    fn publish_routes(
-        &mut self,
-        engine: &crate::runtime::Engine,
-    ) -> Result<usize, crate::runtime::EngineError> {
-        engine.publish_bulk_routes(self)
-    }
-}
-
 impl crate::runtime::RoutePublishing for MemoryBulkSource {
     /// The in-memory fake never carries live routes: its tests publish
     /// addresses by hand.
     fn publish_routes(
         &mut self,
-        _engine: &crate::runtime::Engine,
-    ) -> Result<usize, crate::runtime::EngineError> {
-        Ok(0)
+        _state: &crate::runtime::RuntimeState,
+    ) -> Result<crate::runtime::RouteReport, crate::runtime::EngineError> {
+        Ok(crate::runtime::RouteReport::default())
     }
 }
 

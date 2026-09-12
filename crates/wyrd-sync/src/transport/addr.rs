@@ -8,11 +8,12 @@
 //! same address must encode identically or a benign reannouncement
 //! degrades into a spurious route update.
 //!
-//! Layout v0: `version (1) ‖ node id (32) ‖ u16 LE ip count ‖ per ip
+//! Layout v0: `version (1) ‖ node id (32) ‖ u32 LE ip count ‖ per ip
 //! `family (1: 0x04 IPv4, 0x06 IPv6) ‖ ip octets ‖ u16 LE port` ‖
-//! u16 LE relay count ‖ per relay `u32 LE length ‖ utf8 url`'.
+//! u32 LE relay count ‖ per relay `u32 LE length ‖ utf8 url`'.
 //! The address set is a `BTreeSet`, so the encoding order is stable by
-//! construction.
+//! construction; decode additionally rejects any byte string that does
+//! not re-encode identically, so exactly one encoding names an address.
 
 use std::str::FromStr;
 
@@ -40,7 +41,7 @@ pub fn encode_node_addr(address: &EndpointAddr) -> Vec<u8> {
             _ => None,
         })
         .collect();
-    out.extend_from_slice(&(ips.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(ips.len() as u32).to_le_bytes());
     for ip in ips {
         match ip {
             std::net::SocketAddr::V4(v4) => {
@@ -62,7 +63,7 @@ pub fn encode_node_addr(address: &EndpointAddr) -> Vec<u8> {
             _ => None,
         })
         .collect();
-    out.extend_from_slice(&(relays.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(relays.len() as u32).to_le_bytes());
     for relay in relays {
         let url = relay.to_string();
         out.extend_from_slice(&(url.len() as u32).to_le_bytes());
@@ -72,10 +73,12 @@ pub fn encode_node_addr(address: &EndpointAddr) -> Vec<u8> {
 }
 
 /// Decode route bytes back to a connectable address. Trailing garbage,
-/// version drift, and truncated fields all fail closed: a route the
-/// codec cannot fully consume is not a route to try.
+/// version drift, truncated fields, and non-canonical spellings (a
+/// different byte order, duplicate addresses, or alternate URL text)
+/// all fail closed: exactly one encoding names an address, so
+/// route-update classification compares bytes without ambiguity.
 pub fn decode_node_addr(bytes: &[u8]) -> Result<EndpointAddr, NodeAddrError> {
-    if bytes.len() < 33 || bytes[0] != NODE_ADDR_VERSION {
+    if bytes.len() < 37 || bytes[0] != NODE_ADDR_VERSION {
         return Err(NodeAddrError);
     }
     let id_bytes: [u8; 32] = bytes[1..33].try_into().map_err(|_| NodeAddrError)?;
@@ -88,8 +91,14 @@ pub fn decode_node_addr(bytes: &[u8]) -> Result<EndpointAddr, NodeAddrError> {
             .map(|slice| u16::from_le_bytes(slice.try_into().expect("u16 slice")))
             .ok_or(NodeAddrError)
     };
-    let ip_count = read_u16(cursor)? as usize;
-    cursor += 2;
+    let read_u32 = |cursor: usize| -> Result<u32, NodeAddrError> {
+        bytes
+            .get(cursor..cursor + 4)
+            .map(|slice| u32::from_le_bytes(slice.try_into().expect("u32 slice")))
+            .ok_or(NodeAddrError)
+    };
+    let ip_count = read_u32(cursor)? as usize;
+    cursor += 4;
     for _ in 0..ip_count {
         let (family, size) = match bytes.get(cursor) {
             Some(0x04) => (4usize, 4usize),
@@ -111,16 +120,10 @@ pub fn decode_node_addr(bytes: &[u8]) -> Result<EndpointAddr, NodeAddrError> {
         };
         address = address.with_ip_addr(std::net::SocketAddr::new(ip, port));
     }
-    let relay_count = read_u16(cursor)? as usize;
-    cursor += 2;
+    let relay_count = read_u32(cursor)? as usize;
+    cursor += 4;
     for _ in 0..relay_count {
-        let len = u32::from_le_bytes(
-            bytes
-                .get(cursor..cursor + 4)
-                .ok_or(NodeAddrError)?
-                .try_into()
-                .expect("u32 length bytes"),
-        ) as usize;
+        let len = read_u32(cursor)? as usize;
         cursor += 4;
         let url = std::str::from_utf8(bytes.get(cursor..cursor + len).ok_or(NodeAddrError)?)
             .ok()
@@ -129,7 +132,7 @@ pub fn decode_node_addr(bytes: &[u8]) -> Result<EndpointAddr, NodeAddrError> {
         address = address.with_relay_url(url);
         cursor += len;
     }
-    if cursor != bytes.len() {
+    if cursor != bytes.len() || encode_node_addr(&address) != bytes {
         return Err(NodeAddrError);
     }
     Ok(address)
@@ -185,6 +188,35 @@ mod tests {
     fn decode_rejects_unknown_version() {
         let mut bytes = encode_node_addr(&sample());
         bytes[0] = 0x99;
+        assert!(decode_node_addr(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_canonical_spellings() {
+        // Two identical ip addresses: the set collapses them on decode,
+        // so the bytes re-encode differently and are not canonical.
+        let id = key(0x77);
+        let mut bytes = vec![NODE_ADDR_VERSION];
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            bytes.push(0x04);
+            bytes.extend_from_slice(&[127, 0, 0, 1]);
+            bytes.extend_from_slice(&4242u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_node_addr(&bytes).is_err());
+
+        // Same for a repeated relay url.
+        let mut bytes = vec![NODE_ADDR_VERSION];
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        let url = "https://relay.example";
+        for _ in 0..2 {
+            bytes.extend_from_slice(&(url.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(url.as_bytes());
+        }
         assert!(decode_node_addr(&bytes).is_err());
     }
 }

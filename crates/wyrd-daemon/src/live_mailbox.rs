@@ -85,6 +85,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use nostr::event::{AsyncSignEvent, FinalizeEventAsync, FinalizeUnsignedEvent};
+use nostr::message::RelayMessage;
 use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
 use nostr::prelude::{AsyncGetPublicKey, AsyncNip44};
 use nostr::prelude::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, UnsignedEvent};
@@ -465,6 +466,20 @@ where
     fn held_by_wrap(&self, wrap_id: &EventId) -> bool {
         self.unacked.iter().any(|held| &held.wrap_id == wrap_id)
     }
+
+    /// Test-only drainer kill: abandon the incoming channel so the live
+    /// drainer's next forward fails and it exits through the production
+    /// stream-death path (flag set, supervisor observation, recovery).
+    /// Models a dead notification stream without shutting down the client,
+    /// which is terminal and unrecoverable by design. The caller must
+    /// publish after killing: a drainer parked on an idle stream has
+    /// nothing to fail on until the next event arrives.
+    #[cfg(test)]
+    fn kill_drainer(&mut self) {
+        let (_, fresh) = tokio_mpsc::channel(INCOMING_CAPACITY);
+        let mut incoming = self.incoming.lock().expect("mailbox channel lock");
+        let _abandoned = std::mem::replace(&mut *incoming, fresh);
+    }
 }
 
 /// Forward relay events into the mailbox channel. Signals readiness once
@@ -484,7 +499,21 @@ async fn drain_notifications(
     // emitted afterwards is caught, so readiness is exact, not timed.
     let _ = ready.send(());
     while let Some(notification) = notifications.next().await {
-        if let ClientNotification::Event { event, .. } = notification {
+        // Both arms: `Event` fires only the first time the pool sees an
+        // event, while `Message` fires for every EVENT frame — including
+        // relay replay of already-seen history after a resubscribe on the
+        // same client. The mailbox needs the replay (abandoned-channel and
+        // never-pulled mail converge through it), so it listens to both;
+        // double forwarding collapses downstream in held/seen dedupe.
+        let event = match notification {
+            ClientNotification::Event { event, .. } => Some(event),
+            ClientNotification::Message { message, .. } => match *message {
+                RelayMessage::Event { event, .. } => Some(Box::new(event.into_owned())),
+                _ => None,
+            },
+            ClientNotification::Shutdown => None,
+        };
+        if let Some(event) = event {
             if sender.send(*event).await.is_err() {
                 break;
             }
@@ -1291,13 +1320,15 @@ mod tests {
     }
 
     /// Stream-death recovery without losing unacked or in-flight mail.
-    /// The replacement drainer listens before the resubscribe whose replay
-    /// it has to catch, so relay history converges into the new channel
-    /// instead of the broadcast void: one held (unacked) delivery keeps its
-    /// stable id, a backlog abandoned in the old channel is recovered
-    /// through replay, and mail published mid-recovery arrives exactly
-    /// once. The relay stays up throughout, so this runs the supervisor's
-    /// real recovery path without SDK-retry pacing.
+    /// The drainer is killed for real (its channel abandoned, so its next
+    /// forward fails and it exits through the production death path) and
+    /// the supervisor runs the genuine recovery: the replacement drainer
+    /// listens before the resubscribe whose replay it has to catch, so
+    /// relay history converges into the new channel instead of the
+    /// broadcast void. One held (unacked) delivery keeps its stable id, a
+    /// backlog abandoned in the old channel is recovered through replay,
+    /// and mail published after the kill arrives exactly once. The relay
+    /// stays up throughout, so this runs without SDK-retry pacing.
     #[test]
     fn unacked_and_mid_recovery_mail_survive_stream_recovery() {
         const BACKLOG: usize = 20;
@@ -1329,14 +1360,14 @@ mod tests {
                 .expect("send queued");
         }
 
-        // Simulate notification-stream death: the supervisor's next tick
-        // runs the real recovery path. (The old drainer is still alive
-        // here; its channel is abandoned at swap either way, so outcomes
-        // match a real death, and it exits on its own when the swap drops
-        // its receiver.)
-        mailbox.health.stream_alive.store(false, Ordering::Relaxed);
-        // Published mid-recovery — before, during, or after the
-        // resubscribe, it must arrive exactly once.
+        // Kill the drainer for real: abandoning its channel makes its next
+        // forward fail, so it exits through the production stream-death
+        // path (flag set by its own code, observed by the supervisor on
+        // the next tick). The kill needs a subsequent event to trip on,
+        // so the mid-recovery mail doubles as the tripwire: published
+        // after the death, before recovery can complete, it must arrive
+        // exactly once.
+        mailbox.kill_drainer();
         outbox
             .send(envelope(device_id(&sender), device_id(&receiver), "during"))
             .expect("send during");

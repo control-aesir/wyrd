@@ -449,6 +449,7 @@ impl Rig {
             author: self.owner.id,
             epoch,
             membership,
+            node_addr: None,
         });
         let envelope = sealed_envelope(
             &self.owner.identity,

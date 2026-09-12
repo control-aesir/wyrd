@@ -109,6 +109,7 @@ pub(super) fn announce(
     engine: &Engine,
     snapshot: &AuthorizedSnapshot,
     mailbox: &mut impl Mailbox,
+    node_addr: Option<&[u8]>,
 ) -> Result<usize, EngineError> {
     let body = snapshot.snapshot();
     let key = engine
@@ -120,6 +121,9 @@ pub(super) fn announce(
         author: body.author,
         epoch: body.epoch,
         membership: body.membership,
+        // The composer's current retrieval route, sealed with the rest
+        // (T17): authenticated routing metadata, opaque to control.
+        node_addr: node_addr.map(<[u8]>::to_vec),
     });
     let sealed = seal(key, &engine.drive, body.epoch, &message)?;
 

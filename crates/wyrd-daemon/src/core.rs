@@ -203,8 +203,9 @@ where
         &self,
         snapshot: &AuthorizedSnapshot,
         mailbox: &mut impl Mailbox,
+        node_addr: Option<&[u8]>,
     ) -> Result<usize, wyrd_sync::runtime::EngineError> {
-        self.engine.announce_snapshot(snapshot, mailbox)
+        self.engine.announce_snapshot(snapshot, mailbox, node_addr)
     }
 
     /// The tree a write builds from when the drive has exactly one live
@@ -717,7 +718,7 @@ mod tests {
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         let snapshot = daemon.put_file("published.txt", b"publish me").unwrap();
         let sent = daemon
-            .announce_snapshot(&snapshot, &mut NoopMailbox)
+            .announce_snapshot(&snapshot, &mut NoopMailbox, None)
             .unwrap();
         assert_eq!(sent, 0, "a single-member drive has no peer recipients");
 

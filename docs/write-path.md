@@ -56,13 +56,14 @@ create/mkdir/rename ───┘         ▼
 truncate/unlink ...      bounded MutationQueue (FIFO, total order)
                                  │
                                  ▼
-                            daemon loop (the only engine user)
+                             daemon loop (the only engine user)
                               1 validate current base (stale?)
                               2 apply the mutation in the store
                               3 author + durably commit the snapshot
+                                (records the announcement obligation)
                               4 publish the projection
                               5 flush serving residency
-                              6 enqueue the announcement outbox
+                              6 discharge the announcement obligation
 ```
 
 ## Writable handles
@@ -70,12 +71,25 @@ truncate/unlink ...      bounded MutationQueue (FIFO, total order)
 One writable open handle owns one buffer; it is the only mutable write
 state in the system. A handle captures:
 
-- its **path** and the **base snapshot** it opened against;
-- the **base file identity** — the tree entry's content at open (size,
-  exec bit, ordered chunk ids) — the value the stale check compares;
+- its **path** (also the namespace location the stale check resolves) and
+  the **base snapshot** it opened against;
+- the **base file identity** — the opened tree entry's identity: kind
+  (`RegularFile`), size, exec bit, and ordered chunk ids. This is the
+  value the stale check compares; an implementation may compare a
+  domain-separated digest of the tuple rather than retain the chunk list
+  literally, but the comparison must cover kind, size, exec, and content.
+  A change of kind — file→directory, file→symlink, or removal — is
+  stale, not just a content change;
 - the **buffered overlay** (a logical file image, see below);
 - its **open flags** (`O_APPEND` changes commit semantics);
 - a **dirty** bit.
+
+The overlay is an **implementation abstraction**: the semantic contract is
+that a read of the handle returns `overlay(base, buffered_mutations)` over
+the requested range. Whether the implementation stores a dense buffer,
+patches, a rope, a spill file, or chunk-scoped overlays is free. The
+overlay is bounded (see resource bounds); it is not required to hold a
+whole large file in memory.
 
 Overlay semantics, stated exactly:
 
@@ -90,9 +104,17 @@ Overlay semantics, stated exactly:
 3. The overlay's logical size is the max of the base size and every write
    end; `truncate` resets it. `write` past the end then re-extends with
    zeros.
-4. `O_APPEND` does not use the buffer offset: each buffered write is
-   appended at the handle's current logical end, and the append is
-   resolved against the **current** file end at commit time (below).
+4. **`O_APPEND` is an ordered byte-string sequence, not positioned
+   writes.** Each write appends its bytes to the handle's append sequence
+   in submission order; the sequence is not resolved against any offset
+   until commit. At commit the sequence is appended to the **current**
+   file contents (below). This is why an append handle's base identity is
+   used only for existence/kind, not for content equality.
+
+A handle returned by `create` is **ordinary writable-handle state** once
+returned: it captures the created empty file's identity and path like any
+other handle. There is no privileged relationship between a handle and
+the snapshot that created it, and it can go stale exactly like any other.
 
 ## Commit admission: the mutation queue
 
@@ -114,18 +136,22 @@ MutationRequest {
    Submission order and execution order coincide, so snapshot parent
    selection is deterministic: each mutation's snapshot parents are the
    heads after the previous mutation.
-2. **Bounded.** At most `MAX_PENDING_MUTATIONS` requests may be queued;
-   admission failure returns `EAGAIN`. The queue has its own lock, never
-   the view's or the store's.
+2. **Bounded.** `MAX_PENDING_MUTATIONS` bounds all admitted, incomplete
+   requests — including the request currently executing, not just those
+   waiting. Admission beyond it returns `EAGAIN`. The queue has its own
+   lock, never the view's or the store's.
 3. **Synchronous, no silent post-timeout commit.** Unlike a fetch want
    (which may outlive its waiter), a mutation has no wait timeout:
    admission is immediate (or `EAGAIN`), and once admitted the request
    either commits or fails before the caller returns. There is no path
    where `fsync` fails with `EIO` and the mutation nevertheless applies
-   later. A wedged loop therefore blocks the caller, which is a daemon
-   health failure bounded by the process supervisor — not a per-request
-   cancellation.
-4. **Publication is the same path as fetch.** A mutation applies under
+   later.
+4. **Liveness consequence (named).** The daemon synchronization loop is a
+   hard liveness dependency for every committing FUSE operation: a wedged
+   loop blocks the caller indefinitely. That is a daemon health failure
+   bounded by the process supervisor, not a per-request cancellation, and
+   it is the deliberate price of the no-post-timeout guarantee.
+5. **Publication is the same path as fetch.** A mutation applies under
    the store write path and publishes heads and materialization under
    one short view write lock, exactly as a fetch pass does. Neither lock
    is ever held across a network wait.
@@ -165,29 +191,56 @@ Two distinct conflicts, both surfaced as `EIO` with separate diagnostics:
 The rebase rule is deliberately narrow: a handle commit applies its file
 change onto the **current** head, so a concurrent commit to a *different*
 path does not invalidate it. Only a change to the same path's file
-identity (or its removal/type change) is stale. `truncate` and any
-future handle-derived content mutation obey the same rule.
+identity — including a kind change or removal — is stale. `truncate` and
+any future handle-derived content mutation obey the same rule.
 
 A stale or failed commit is **terminal for the handle**: the buffered
 overlay is discarded and the committing boundary returns `EIO`; the
 application must close and reopen (a transient store failure is not
 retried with the old buffer, and the daemon keeps no per-handle error
-state). A handle whose path was removed or replaced by an external
-`unlink`, `rename`, or another handle's commit is stale in exactly this
-sense: `write` still buffers into the overlay, and the divergence
-surfaces at the committing boundary.
+state).
 
-**`O_APPEND` is the explicit exception.** Append is position-independent,
-so an append handle does not carry a content base to compare: its
-buffered bytes are appended to the **current** head's file at commit
-time. Two append handles therefore serialize in queue order and yield
-`old ‖ A ‖ B`; neither loses. This is the only content mutation without a
-stale check, and it exists because POSIX defines append against the
-current end.
+### Rename and unlink versus open handles (v0 decision)
 
-Namespace mutations (`mkdir`, `unlink`, `rmdir`, `rename`) carry no
-handle base: they read-modify-write the current head under the queue's
-total order.
+Wyrd v0 chooses the **path-based** rule: a writable handle does not
+survive a namespace change to its target.
+
+- If `/a` is renamed to `/b` or unlinked by another commit, the handle's
+  captured path `/a` no longer carries its base identity in the current
+  head, so its next commit fails `EIO` (`StaleHandle`). `write` still
+  buffers; the divergence surfaces at the committing boundary.
+- **Read handles keep the captured identity until `release`** even if the
+  target is renamed or unlinked: reads do not write back, so the
+  open-time capture survives. Only the committing path is strict.
+
+This is a deliberate POSIX divergence: POSIX lets a writable descriptor
+survive `rename`/`unlink` and write to the unlinked inode. Wyrd has no
+inode and no GC — a write to a node unreachable from the live tree could
+not appear in any snapshot — so v0 rejects rather than accepting a write
+that could never commit. True node-identity survival (following a renamed
+node, or an unlinked open file) is future work that would need a stable
+entry identity; it is out of scope here.
+
+**`O_APPEND` is the explicit content exception.** Append is
+position-independent, so an append handle does not compare content
+identity; it still requires that the target path **exists as a regular
+file** in the current head (otherwise `EIO`/`StaleHandle` — append never
+creates and never resurrects). Its append sequence is concatenated to the
+**current** file contents at commit time, so:
+
+- two append handles serialize in queue order as `old ‖ A ‖ B`;
+- an intervening ordinary commit is observed, not rejected:
+  `H0 foo=AAAA`, `B` commits `BBBB`, then an append `X` commits → `BBBBX`;
+- an intervening change to the path's kind or its removal is still stale.
+
+Append is the only content mutation with this privilege, and it exists
+because POSIX defines append against the current end.
+
+Namespace mutations (`mkdir`, `unlink`, `rmdir`, `rename`, and
+path-addressed `set-exec`) carry no handle base: they read-modify-write
+the current head under the queue's total order, so each is evaluated
+against the state its queue predecessor committed, never against the
+state visible when the FUSE syscall began.
 
 ## The commit pipeline and durability ordering
 
@@ -202,21 +255,50 @@ A commit proceeds in this order, and the order is the contract:
    snapshot body into the durable vault, and commits the snapshot-body
    and manifest facts.
 3. **Commit durability boundary.** The object store, the vault, and the
-   fact log are durable on this device. The fact-log commit is already
-   append-only and crash-safe; the vault-directory fsync
-   (`fix(sync): fsync the vault directory after publication`) and the
-   object-store fsync path close the remaining gap.
+   fact log become durable **together at this boundary** (steps 1-2 only
+   *prepared* state; neither is independently durable). The fact-log
+   commit is already append-only and crash-safe; the vault-directory
+   fsync (`fix(sync): fsync the vault directory after publication`) and
+   the object-store fsync path close the remaining gap. The **announcement
+   obligation is recorded durably here**, atomically with the snapshot
+   (see below), so a crash after commit still knows the snapshot must be
+   announced.
 4. **Publication.** Heads and materialization are swapped into the shared
    view under one short write lock. The view sees the old head until this
    step.
 5. **Serving readiness.** The vault write-through to the serving mirror
    is flushed (`ServingEndpoint::flush`) so the new representations are
    servable by transport root.
-6. **Announcement.** The snapshot is enqueued into the durable
-   announcement outbox and announced asynchronously with retry
+6. **Announcement discharge.** The recorded obligation is sent
+   asynchronously with retry through the durable outbox
    (`feat(sync): durable announcement outbox and retry contract`).
 
-**Durable at 1-3, visible at 4, servable at 5, propagated at 6.**
+**Objects prepared at 1; authoring prepared at 2; durable at 3 (with the
+announcement obligation recorded); visible at 4; servable at 5;
+obligation discharged at 6.**
+
+### Commit state is monotonic (invariant)
+
+> Later-stage failure never rolls back an earlier durable state.
+
+The state machine is monotonic: `prepared → durable → visible →
+servable → obligation recorded → discharged`. A failure at a later stage
+leaves the earlier states standing; nothing after step 3 undoes step 3.
+This is what forbids transactional coupling between the local commit and
+network propagation.
+
+### Announcement obligation durability
+
+The obligation to announce a locally authored snapshot is **created at
+step 3, atomically with the commit**, not at step 6. Step 6 only
+*discharges* it. Therefore outbox-enqueue failure cannot lose an
+announcement: if step 3 committed, the obligation is durable, and a
+restart reconciles un-discharged obligations back through the outbox
+(this is the mechanism `feat(sync): durable announcement outbox and retry
+contract` must provide; the write path requires only that the
+obligation is durable with the commit). The outbox entry is eligible for
+discharge only once serving readiness (step 5) has succeeded for that
+snapshot.
 
 Failure at each stage, explicitly:
 
@@ -228,13 +310,18 @@ Failure at each stage, explicitly:
   the existing "a pass may commit durably before publication" invariant,
   inherited here, makes this recoverable rather than rollback territory.
 - **At 5 (visible but not servable):** the new head is legitimate: local
-  reads work from the object store, the snapshot stays durable, and
-  **no announcement occurs**; peer fetches fail and retry, and the daemon
-  retries serving. Serving failure is never a reason to roll back a
-  durable, published snapshot.
+  reads work from the object store, the snapshot stays durable, and the
+  obligation stays recorded but **ineligible** — no announcement is
+  emitted. Peer fetches fail and retry; the daemon retries serving, and
+  the obligation is discharged only after serving succeeds. Serving
+  failure is never a reason to roll back a durable, published snapshot.
 - **At 6:** local commit and visibility stand regardless of announcement
-  success; the outbox retries. Peer propagation is never part of local
-  filesystem durability.
+  success; the durable obligation retries. Peer propagation is never part
+  of local filesystem durability.
+
+A contract test pins the serving gate: serving failure → projection
+remains the new head, the obligation is recorded but not discharged, and
+after serving is retried the obligation is discharged.
 
 ## flush, fsync, release
 
@@ -256,6 +343,11 @@ Because `release` is best-effort and drops the buffer, an application
 that never calls `flush`/`fsync` can lose acknowledged writes. This is
 standard POSIX-without-`O_SYNC`: `write` is not durable. The mount states
 it plainly.
+
+`O_SYNC`/`O_DSYNC` deliberately sacrifice write coalescing: because the
+unit of commit is the snapshot, each successful `write` on such a handle
+is its **own durable snapshot** (a committing boundary per syscall). That
+is expensive and correct by construction.
 
 ### Error timing
 
@@ -286,8 +378,21 @@ valid filesystem.
 | `unlink` | Removes a file or symlink entry; `EISDIR` on a directory; `ENOENT` when absent. |
 | `rmdir` | Removes an empty directory only (`ENOTEMPTY` otherwise); `ENOTDIR` on a file. |
 | `rename` | File→file replaces; file→dir `EISDIR`; dir→empty-dir replaces; dir→nonempty-dir `ENOTEMPTY`; dir→file `ENOTDIR`; a directory into its own descendant `EINVAL`; same path is a no-op. A trailing slash on the source requires a directory. |
-| `truncate` | The conceptual operation behind `setattr(size)`: materialize the file plaintext (path-scoped, through the normal demand path), re-chunk to the target size. Growing zero-fills; shrinking discards the tail. Obeys the stale-handle rule. |
+| `truncate` | The conceptual operation behind `setattr(size)`: construct the new file representation at the target size. Growing preserves the existing bytes and zero-fills; shrinking preserves the prefix and discards the tail. Obeys the stale-handle rule. |
 | `set-exec` | The conceptual operation behind `setattr(mode)`: toggles the exec bit, the only mode state represented. |
+
+`truncate` is a **representation construction**, not a mandate to read a
+file: the implementation materializes only the ranges needed to build the
+new chunk list (shrinking a huge file need not read it; growing appends
+zeros). The v0 implementation may materialize the file plaintext through
+the normal demand path — that is an implementation strategy, not part of
+the contract.
+
+`set-exec` addressed by path is a **namespace mutation** against current
+state, so two `set-exec` requests serialize through the queue naturally.
+An `fchmod`-style exec change issued through a writable handle is
+handle-derived and obeys the stale-handle rule (the exec bit is part of
+the file identity).
 
 `rename` notes: cross-directory rename within the drive is allowed
 (unchanged subtrees are reused; only the two path walks are rebuilt).
@@ -307,8 +412,15 @@ strings.
 > Every namespace mutation publishes exactly one new root or none; no
 > reader can observe an intermediate tree state.
 
-This is a named cross-crate contract (a `wyrd-contracts` test), not
-merely an implementation property.
+### Format validation is not bypassable (contract)
+
+> All mounted mutations pass through the same canonical format
+> validation and ingest limits as remotely received state
+> (`check_tree`/`check_manifest`, `Limits::V0`); the mount is never an
+> alternate parser or validator.
+
+Both are named cross-crate contracts (a `wyrd-contracts` test), not
+merely implementation properties.
 
 ## Open flags
 
@@ -317,9 +429,9 @@ merely an implementation property.
 | `O_RDONLY` / `O_WRONLY` / `O_RDWR` | Access mode; a write handle is required for `write`/`truncate`. |
 | `O_CREAT` | Create the file if absent (its own empty-file snapshot, per `create`). |
 | `O_EXCL` | With `O_CREAT`, `EEXIST` if the name exists. |
-| `O_APPEND` | Appends at the current end at commit time (see handles). |
-| `O_TRUNC` | The handle's overlay starts **empty**; the truncation commits at the next `flush`/`fsync`/`release`, not at open. |
-| `O_SYNC` / `O_DSYNC` | Accepted; every write takes the `fsync` path (a commit per write). |
+| `O_APPEND` | Appends at the current end at commit time (see handles); the target must remain a regular file. |
+| `O_TRUNC` | The handle's overlay starts **empty**; the truncation commits at the next `flush`/`fsync`/`release`, not at open. It captures the opened file's base identity and **obeys the normal stale-handle rule**: if another commit changed the file before the truncation commits, the handle is stale (`EIO`). |
+| `O_SYNC` / `O_DSYNC` | Accepted; every write is its own durable snapshot (see flush/fsync). |
 | `O_DIRECT`, `O_PATH` | `EOPNOTSUPP` (not representable). |
 
 ## Conflicted drives
@@ -367,10 +479,15 @@ limits elsewhere:
 | `MAX_WRITE_BUFFER_BYTES` per dirty handle | `ENOSPC` |
 | `MAX_BUFFERED_BYTES` aggregate across handles | `ENOSPC` |
 | `MAX_DIRTY_HANDLES` | `ENOSPC` |
-| `MAX_PENDING_MUTATIONS` | `EAGAIN` |
+| `MAX_PENDING_MUTATIONS` (including the executing one) | `EAGAIN` |
 
 Buffered state is memory, so these are daemon-write budgets; overflow
 fails closed rather than allocating without limit.
+
+Total open handles are bounded by the mount/runtime's existing
+descriptor limit (the kernel/FUSE layer already caps them); the
+write-specific limits above bound only the *dirty* subset and its bytes.
+This section does not claim to bound total descriptors.
 
 These budgets are new and local; they are independent of the **protocol
 ingest limits** (`Limits::V0`), which still bound every committed object.
@@ -412,6 +529,30 @@ and ignored (the format does not represent them). There are no ACLs.
 | mutation queue full | `EAGAIN` |
 | operation not implemented | `ENOSYS` |
 
+`EOPNOTSUPP` and `ENOSYS` are distinct: `EOPNOTSUPP` means the operation
+is **known and deliberately unsupported** by Wyrd v0 (symlink creation,
+hard links, xattrs, `O_DIRECT`); `ENOSYS` means the FUSE handler does not
+exist yet. The first is a policy contract, the second an implementation
+gap.
+
+## Layering (where the state machine lives)
+
+The write state machine lives in the daemon and sync crates; FUSE stays
+an adapter:
+
+```text
+wyrd-fuse        POSIX translation only
+                     ↓
+wyrd-daemon      WritableHandle, MutationQueue, commit orchestration,
+                 stale checks, publication
+                     ↓
+wyrd-sync        immutable tree mutation, snapshot authoring,
+                 durable commit, announcement obligation
+```
+
+Stale checks, snapshot creation, tree mutation, and commit sequencing
+must not be implemented inside FUSE callbacks.
+
 ## Non-goals (v0)
 
 - No sparse files, hard links, symlink creation, xattrs, ACLs, mtimes,
@@ -441,6 +582,21 @@ Each row locks a decided invariant.
   → B commits onto A's head; both survive.
 - **Append ordering**: A and B open `O_APPEND`; commits serialize as
   `old ‖ A ‖ B`.
+- **Append versus an intervening writer**: `H0 foo=AAAA`; a normal writer
+  commits `BBBB`; an append handle then commits `X` → `BBBBX` (observed,
+  not rejected).
+- **Append after removal**: append handle; another commit unlinks the
+  target; append commits → `EIO`/`StaleHandle` (append never recreates).
+
+**Handle lifetime**
+
+- **Rename breaks a writable handle**: open `/a`, rename `/a`→`/b`, write
+  the old handle, commit → `EIO` (`StaleHandle`); a read on the handle
+  still serves the captured identity until `release`.
+- **Unlink breaks a writable handle**: open `/a`, unlink `/a`, write,
+  commit → `EIO`; the pre-unlink read capture still serves.
+- **Kind change is stale**: open a file, replace it with a directory,
+  commit → `EIO`.
 
 **Mutation lifetime**
 
@@ -448,6 +604,9 @@ Each row locks a decided invariant.
   never executes; a caller error is never followed by a later commit.
 - **Queue total order**: M1 then M2 → M1's snapshot parent is H0, M2's
   parent is M1's snapshot.
+- **Namespace versus predecessor**: `M1 mkdir(foo)` then `M2 mkdir(foo)`
+  → M1 succeeds, M2 is `EEXIST`; each is evaluated against its
+  predecessor's committed state, not the state at syscall entry.
 
 **Commit boundaries**
 
@@ -457,8 +616,11 @@ Each row locks a decided invariant.
   clean second `flush` commits nothing.
 - **flush ≡ fsync durability**: a file survives a simulated restart
   after either; it may be lost after `write` without a commit boundary.
+- **`O_SYNC` per write**: each successful `write` produces its own
+  durable snapshot before returning.
 - **`O_TRUNC`**: open truncates nothing; the empty commit happens at the
-  committing boundary.
+  committing boundary; a concurrent change to the file makes the
+  truncation commit stale (`EIO`).
 - **`create` then content**: two snapshots, both roots readable; a crash
   after `create` leaves the empty file.
 - **Failed commit is terminal**: after a stale/`EIO` commit the overlay is
@@ -470,9 +632,8 @@ Each row locks a decided invariant.
 - `O_APPEND`, `O_TRUNC`, `O_CREAT`, `O_EXCL`; `pwrite` beyond EOF
   (zero-fill); truncate grow/shrink/while-dirty; overlapping buffered
   writes; zero-length write; offset overflow (`EFBIG`); write to a
-  directory (`EISDIR`); write after `unlink`; write after `rename`;
-  chmod exec bit; chmod unsupported bits (accepted, not persistent, stat
-  unchanged).
+  directory (`EISDIR`); chmod exec bit; chmod unsupported bits (accepted,
+  not persistent, stat unchanged).
 - Rename matrix: file→file, file→dir, dir→empty, dir→nonempty,
   dir→descendant, same path, trailing slash, cross-directory.
 - Directory-handle coherence: a `readdir` stream opened before a commit
@@ -481,13 +642,20 @@ Each row locks a decided invariant.
   overflow returns `EFBIG` from `write`, not from the commit; a commit
   that exceeds a protocol ingest ceiling returns `EFBIG` from
   `flush`/`fsync`.
+- `EOPNOTSUPP` (deliberate) versus `ENOSYS` (handler missing).
 
 **Failure at each stage**
 
 - Object insertion fails; authoring fails; fact commit fails; publication
-  fails; serving flush fails; outbox enqueue fails; announcement fails.
-  Each asserts the durable/visible/servable/propagated state from the
-  pipeline section independently.
+  fails; serving flush fails; announcement discharge fails. Each asserts
+  the durable/visible/servable/obligation state from the pipeline section
+  independently — and, because commit state is monotonic, that a later
+  failure never rolls back an earlier durable state.
+- **Serving gates announcement**: serving failure leaves the obligation
+  recorded but undisclosed; a retry of serving then discharges it.
+- **Outbox failure is survivable**: durable + visible + servable, the
+  discharge fails, restart — the snapshot is rediscovered as
+  un-discharged and announced.
 
 **Resources**
 
@@ -500,3 +668,9 @@ Each row locks a decided invariant.
 - Write → `EIO` (`ConflictedHeads`); read still serves the merged view.
 - Zero heads: the first `create`/`mkdir` authors an initial root and
   succeeds.
+
+**Validation**
+
+- A mutation that would produce an over-limit tree/manifest is refused
+  (`EFBIG`) and never committed: the mount cannot bypass
+  `check_tree`/`check_manifest`.

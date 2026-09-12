@@ -168,20 +168,28 @@ impl WantRegistry {
         }
     }
 
-    /// Loop-side completion sweep: retire every admitted identity the
-    /// probe reports local (the fetch landed and is cached). Entries
-    /// still unfulfilled stay in flight for the next pass.
-    pub fn complete_local(&self, probe: impl Fn(&ContentId) -> bool) {
+    /// Loop-side settlement sweep: retire admitted identities the probe
+    /// reports settled — materialized (success) or failed with no
+    /// waiter left. An admitted fetch whose demand died must not hold
+    /// a slot indefinitely: the engine's durable `Cached` policy keeps
+    /// retrying it independently of the registry, and a later FUSE
+    /// demand re-registers transiently. The probe receives the waiter
+    /// count; an identity with active waiters never retires, so
+    /// waiters keep coalescing onto the fetch.
+    pub fn retire_where(&self, settled: impl Fn(&ContentId, usize) -> bool) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let landed: Vec<ContentId> = state
+        let retired: Vec<ContentId> = state
             .admitted
             .iter()
-            .filter(|id| probe(id))
+            .filter(|id| {
+                let waiters = state.waiting.get(*id).copied().unwrap_or(0);
+                settled(id, waiters)
+            })
             .copied()
             .collect();
-        for id in landed {
+        for id in retired {
             state.admitted.remove(&id);
         }
     }
@@ -328,33 +336,60 @@ mod tests {
         );
     }
 
-    /// Timeout removes the waiter, not the fetch: an admitted identity
-    /// keeps its in-flight mark after its last waiter leaves, and the
-    /// loop retires it once the probe reports it local.
+    /// The sweep retires on materialization or on demand death: a landed
+    /// fetch retires, an admitted fetch with active waiters stays, and
+    /// a demand whose last waiter left retires — the engine's durable
+    /// policy keeps retrying it, so no slot is held for a nobody.
     #[test]
-    fn release_after_admission_keeps_the_fetch_in_flight() {
+    fn sweep_retires_landed_and_waiterless_fetches() {
         let registry = WantRegistry::default();
         registry.register(content(1)).unwrap();
         assert_eq!(admit_all(&registry), vec![content(1)]);
         assert!(registry.is_admitted(&content(1)));
+        // A waiter still polling: the fetch stays in flight even
+        // though it has not landed.
+        registry.register(content(1)).unwrap();
+        registry.retire_where(|_id, waiters| waiters == 0);
+        assert!(registry.is_admitted(&content(1)));
         registry.release(&content(1));
-        assert!(
-            registry.is_admitted(&content(1)),
-            "an admitted fetch outlives its last waiter"
-        );
+        registry.release(&content(1));
+        // Last waiter gone: the sweep retires the slot; the engine's
+        // durable policy is unaffected (nothing to assert here — the
+        // registry no longer owns the fetch).
+        registry.retire_where(|_id, waiters| waiters == 0);
+        assert!(!registry.is_admitted(&content(1)));
+        // A landed fetch retires even with waiters still attached.
         registry.register(content(2)).unwrap();
-        let next = admit_all(&registry);
-        assert_eq!(next, vec![content(2)], "only the new pending demand drains");
-        // The loop sweep retires the landed fetch.
-        registry.complete_local(|id| *id == content(1));
-        assert!(
-            !registry.is_admitted(&content(1)),
-            "a landed fetch is retired"
-        );
-        assert!(
-            registry.is_admitted(&content(2)),
-            "still-unfulfilled fetches stay in flight"
-        );
+        assert_eq!(admit_all(&registry), vec![content(2)]);
+        registry.retire_where(|id, _| *id == content(2));
+        assert!(!registry.is_admitted(&content(2)));
+    }
+
+    /// The reviewer's capacity regression: repeated failed demand
+    /// cycles never permanently exhaust the registry — each cycle's
+    /// sweep frees its slot, so distinct identities over the bound can
+    /// still register after their predecessors' demands died.
+    #[test]
+    fn failed_demand_cycles_do_not_permanently_exhaust_capacity() {
+        let registry = WantRegistry::default();
+        for index in 0..MAX_PENDING_WANTS + 16 {
+            let [a, b, ..] = index.to_le_bytes();
+            let mut id = [0u8; 32];
+            id[0] = a;
+            id[1] = b;
+            let id = ContentId::from_bytes(id);
+            // Demand, admit, abandon (the waiter's deadline expired),
+            // sweep: one slot, freed every cycle.
+            registry.register(id).unwrap();
+            assert_eq!(admit_all(&registry), vec![id]);
+            registry.release(&id);
+            registry.retire_where(|_, waiters| waiters == 0);
+            assert!(!registry.is_admitted(&id));
+        }
+        // Capacity was never exhausted.
+        registry
+            .register(ContentId::from_bytes([0xAA; 32]))
+            .unwrap();
     }
 
     /// Timeout cancels the wait, not the fetch: when the probe flips

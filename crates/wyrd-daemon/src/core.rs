@@ -457,12 +457,14 @@ where
             }
             None => ExecuteReport::default(),
         };
-        // Retire admitted wants whose fetch landed: the demand entry
-        // is done and its slot frees for the next demand. The runtime
-        // snapshot is shared with publication below.
+        // Settle admitted wants: retire a landed fetch, and retire a fetch
+        // whose demand died — the engine's durable `Cached` policy keeps
+        // retrying independently of the registry, so a permanently
+        // unavailable identity never permanently consumes capacity.
         let completed_runtime = self.engine.runtime_state()?;
-        self.wants
-            .complete_local(|content| completed_runtime.status(content) == FetchStatus::Available);
+        self.wants.retire_where(|content, waiters| {
+            completed_runtime.status(content) == FetchStatus::Available || waiters == 0
+        });
         if !self.dirty && !wants_admitted && !sync_changed(&drained, &fetched) {
             return Ok(SyncReport { drained, fetched });
         }

@@ -54,8 +54,10 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
 ## What is exchanged
 
 - **Snapshot announcements** (small, gossip-propagated): "my head set now
-  includes snapshot S" — signed, verified against known member identity keys
-  (`trust.md`).
+  includes snapshot S, and here is my current `NodeAddr` for retrieval" —
+  signed, verified against known member identity keys (`trust.md`). The
+  endpoint is authenticated routing metadata inside the same sealed
+  plaintext, never identity and never snapshot content (`fetch-on-open.md`).
 - **Encrypted manifests** (hierarchical, per-subtree — see
   `object-model.md`): trees plus the content→storage mapping for every
   object the snapshot references, sealed to the drive. Drive members
@@ -164,7 +166,9 @@ namespace stays the user's data only (invariant 8 in `architecture.md`).
 
 ## FUSE behavior for non-local content (contract between sync and fuse)
 
-FUSE talks to an abstract materialization interface — lookup, read,
+The normative design for this boundary — demand channel, blocking open,
+timeouts, daemon serving — is `fetch-on-open.md`. FUSE talks to an
+abstract materialization interface — lookup, read,
 ensure_local, publish — which an application composes from format + sync;
 the filesystem layer never knows iroh exists. Internally the fetch state
 machine is richer than the POSIX boundary it maps to:

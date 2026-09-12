@@ -12,6 +12,8 @@ One page. Read this, then the focused docs:
 - `epochs.md` — **normative** membership/epoch state machine: transition
   validation, membership conflicts, snapshot → membership binding, snapshot
   authorization, classification, recovery
+- `fetch-on-open.md` — **normative** demand-driven fetch design:
+  announcement endpoints, daemon serving, want channel, blocking open
 
 ## The system in one sentence
 

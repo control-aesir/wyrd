@@ -3,7 +3,7 @@
 Normative design for demand-driven fetch: the daemon serving its
 objects over iroh, peers announcing how to reach them, and the live
 mount blocking on `open()` until the bytes it needs arrive. One
-vertical feature (announcement schema, serving, demand channel,
+vertical feature (announcement schema, serving, demand registry,
 driver, CLI composition land together in `pr/daemon-fetch-on-open`,
 tracking issue `nostr:nevent1qqsfmctguvn9g9l4dtcy235fypty6k66wr3m2tjugnyzmffc9s0z9nspz9mhxue69uhkwunpwdczuap49eehg3l23hj`).
 
@@ -17,7 +17,7 @@ engine, driven by the daemon loop.
                  ┌──────────────────────────────┐
                  │  Snapshot announcement       │
                  │  (sealed, authenticated)     │
-                 │  SnapshotId · epoch · NodeAddr │
+                 │  SnapshotId · epoch · node_addr │
                  └──────────────┬───────────────┘
                                 │  candidate peer (untrusted)
                                 ▼
@@ -32,12 +32,19 @@ engine, driven by the daemon loop.
         materialization fact → DriveView publish
                                 ▲
                                 │
-FUSE open/read ── Want channel ─► LiveDaemon loop ─► engine plan
+FUSE open/read ── WantRegistry ─► LiveDaemon loop ─► engine plan
+      (waiter)     (wakeup channel)
 ```
+
+Terminology is fixed: the protocol field is **`node_addr`** and carries
+iroh's `NodeAddr` representation. The word *endpoint* is reserved for
+the transport implementation (`EndpointAddr` is iroh-internal). IDs
+never collide: `ContentId ≠ StorageId ≠ NodeAddr`, and nothing is ever
+derived from an address.
 
 ## Peer addressing
 
-The snapshot announcement gains the sender's current **`NodeAddr`**
+The snapshot announcement gains the sender's current **`node_addr`**
 (routing metadata inside the authenticated sealed plaintext — same
 envelope, same signature, no sidecar channel). What an announcement
 then means:
@@ -47,32 +54,44 @@ then means:
 
 Rules, all decided:
 
-1. **Routing metadata, not identity.** `ContentId ≠ StorageId ≠
-   NodeAddr`; nothing is ever derived from an endpoint. Endpoint
-   failure never invalidates the advertised content.
-2. **Authenticated association.** The endpoint rides inside the
+1. **Routing metadata, not identity.** Nothing is derived from a
+   `NodeAddr`. NodeAddr failure never invalidates the advertised
+   content — a dead address is simply a stale advertisement, and the
+   snapshot does not change.
+2. **Authenticated association.** `node_addr` rides inside the
    announcement's sealed plaintext — never alongside it. An
-   unauthenticated endpoint would be a redirection surface even
+   unauthenticated address would be a redirection surface even
    against unforgeable announcements.
 3. **Untrusted infrastructure.** The announcement proves only
-   *peer → endpoint* association. The endpoint may lie, vanish, or
+   *peer → node_addr* association. A peer's node may lie, vanish, or
    serve garbage; Bao verification and content hashing reject all of
    it before `insert_verified`. Zero-trust storage is unchanged.
-4. **Replaceable, not durable.** Announcements are mutable routing
-   advertisements; snapshots stay immutable. Endpoint fields never
+4. **Freshness is not validity.** Multiple authentic announcements may
+   carry different addresses for the same peer across history. There
+   is no cryptographic invalidation of an older announcement by a
+   newer one — announcement history stays append-only; the
+   operational layer prefers the newest address and falls back on
+   failure (retry, alternate peer, reannouncement).
+5. **Replaceable, not durable.** Announcements are mutable routing
+   advertisements; snapshots stay immutable. Address fields never
    enter `Snapshot` or any content-addressed object — an address
    change must never look like a snapshot change.
-5. **Wyrd invents no address format.** The announcement carries
-   iroh's `NodeAddr` representation; relay fallback and address
-   selection remain iroh's responsibility.
-6. Content verification remains the only admission control: a
+6. **Wyrd invents no address format.** The announcement carries iroh's
+   `NodeAddr`; relay fallback and address selection remain iroh's
+   responsibility.
+7. Content verification remains the only admission control: a
    transfer counts if and only if it proves the advertised identity.
 
-## Daemon serving
+## Serving authorization (v0 posture, normative in `trust.md` T17)
 
-The daemon (composition layer) owns an iroh-blobs `Router` serving
-from the local object store. The engine never learns iroh exists; the
-serve surface is **object-oriented, not filesystem-oriented**:
+Authorization = membership; object admission = content verification;
+there are **no per-object ACLs in v0**. Consequence, stated
+deliberately: a member who can name a `StorageId` can request its
+ciphertext from any serving member. This is an object
+availability/enumeration property, not a confidentiality breach — a
+member already holds the epoch material that makes the ciphertext
+meaningful. The serve surface is **object-oriented, not
+filesystem-oriented**:
 
 - answer: "can I prove this `StorageId` exists in my local store?" →
   stream its ciphertext;
@@ -81,47 +100,117 @@ serve surface is **object-oriented, not filesystem-oriented**:
   outside the content-addressed object space. An arbitrary file in
   the drive directory is not servable.
 
-v0 posture: serve whatever the store holds; no admission control
-beyond the content-addressed lookup itself (members are admitted via
-`trust.md`; an admitted member may pull any object of the drive it
-can name).
+The daemon (composition layer) owns the iroh-blobs serving `Router`;
+the engine never learns iroh exists.
 
-## Demand channel
+## The WantRegistry: demand is state, the channel is just a wakeup
 
-One producer, one consumer, one authority — FUSE never performs
-synchronization directly and never calls the engine, bulk source, or
-store from its own thread:
+The registry is the primary abstraction; a channel is merely the
+daemon-loop wakeup signal. The registry owns the semantic state:
 
 ```text
-FUSE open/read (demand producer)
-      │  Want{ content identity, deadline }
-      ▼
-   Want channel (bounded)
-      ▼
-LiveDaemon loop (consumer, existing task)
-      │  expands demand: one open may need
-      │  snapshot → dir tree → file tree → chunks
-      ▼
-engine plan + IrohBulkSource fetch
+WantRegistry
+  ├── pending identities   (demanded, not yet in flight)
+  ├── in-flight identities (fetch admitted by the engine)
+  └── waiters by identity  (FUSE openers waiting for completion)
 ```
 
-- The demand unit is a `Want` naming the required content identity,
-  not an opaque "fetch something" — the waiter waits on the exact
-  missing materialization, which is what makes timeout, dedup,
-  cancellation, and progress well-defined.
-- Merkle-chain expansion belongs to the materialization/engine layer.
-  The FUSE contract stays: "make this path readable within the
-  deadline" — never "fetch object X".
-- `open()` on non-local content enqueues demand and **blocks with a
-  bounded timeout**, showing `Fetching` for the file's materialization
-  while waiting; it serves once the required objects are verified and
-  published, and fails with `EIO` on deadline expiry. A timeout never
-  fabricates a partially readable file.
-- The timeout bounds **materialization of the requested objects**, not
-  a sync pass: the waiter wakes when the specific identities arrive,
-  not when unrelated daemon work happens to finish.
-- The view is published only after verified materialization; readers
-  never see half-served projections.
+```text
+FUSE open/read
+  │ register Want{ identity, deadline }
+  ▼
+  ├── identity already local        → immediate success
+  ├── identity in flight            → attach waiter
+  └── identity absent               → mark pending + attach waiter
+                                       │
+                                       ▼
+                                 wake daemon loop
+```
+
+```text
+daemon loop
+  │ drain registry pending wants
+  ▼
+engine expands demand (Merkle chain: snapshot → dir trees →
+file tree → chunk objects) and fetches
+  ▼
+complete(identity) → wake all waiters of that identity
+```
+
+Decided properties:
+
+1. **Single authority.** FUSE never calls the engine, bulk source, or
+   store; it registers demand and waits. The engine remains the only
+   synchronizer.
+2. **Registration is an obligation.** Registering a want either
+   attaches to an existing pending/in-flight identity, creates a
+   tracked pending entry, or fails. A demand is never dropped
+   silently — the pre-alpha mailbox lesson, not repeated here.
+3. **Bounded admission.** The registry holds at most
+   `MAX_PENDING_WANTS` distinct identities. A registration beyond the
+   bound fails and the caller gets `EIO` (same POSIX surface as a
+   timeout; distinguished in daemon diagnostics only). Identical
+   outstanding wants coalesce: N registrations for identity X produce
+   one in-flight materialization and N waiter wakeups on success or
+   terminal failure.
+4. **The channel may lose wakeups; the registry may not lose wants.**
+   The loop drains the registry every pass regardless of the channel,
+   so a dropped wakeup costs latency, never demand. Losing the
+   channel is not losing the work.
+5. **Delivery, deduplication, completion are distinct.** Delivery:
+   the daemon observed the demand (registry entry exists). Dedup:
+   identical outstanding identities collapse to one in-flight
+   operation. Completion: every waiter for the identity is notified
+   on success or terminal failure. A retrying FUSE caller may
+   legitimately re-register; that is delivery again, not a second
+   fetch.
+6. **Timeout cancels the wait, not the fetch.** A waiter that expires
+   is removed and returns `EIO`; an in-flight materialization for
+   that identity continues and, on success, is published and cached.
+   A slow first open therefore makes the next one instantaneous.
+   Cancellation of the transfer itself, if ever built, is an
+   optimization layered on this base — never part of correctness.
+7. **`Fetching` is a projection, not a second state machine.** The
+   registry (pending/in-flight) and engine materialization state are
+   the truth; the daemon merges them at publish and the view exposes
+   the result. FUSE never mutates materialization state, so
+   "FUSE says Fetching while engine says Cached" cannot arise.
+
+## What open() materializes vs what read() demands
+
+Wyrd is a Merkle system: resolving a path needs the manifest chain
+(snapshot → directory trees → file tree); reading bytes needs the
+chunk objects the file tree names. The two have different sizes and
+different failure profiles, so v0 splits them explicitly:
+
+- **`open()` materializes the manifest chain** for the resolved path
+  and captures the snapshot-stable file handle (chunk identity list).
+  Manifests are bounded and small; this is the part that must exist
+  before an FD exists. A chain the daemon cannot fully materialize
+  within the deadline fails the open with `EIO`.
+- **`read()` demands chunk objects on first touch** through the same
+  want path, with the same bounded blocking and `EIO` on timeout.
+  Once a chunk is materialized it is cached; a sequential reader pays
+  demand latency once per chunk.
+
+Full-file-at-open (materializing every chunk before returning the FD)
+is **rejected**: it makes open latency proportional to file size and
+turns one flaky chunk into total open failure. The cost of the split
+is accepted explicitly: **network availability is an `open()` concern
+for metadata and a `read()` concern for chunks** — the strict "reads
+never touch the network after open" invariant is traded away for
+unbounded-open-latency avoidance. What is *not* traded away:
+
+- the FD pins the file's content identity at open;
+- `read()` never re-resolves paths or re-decides versions;
+- a read blocks only on chunks of that pinned identity, and serves
+  only verified local bytes;
+- the common path after a warmed open is entirely local.
+
+The filesystem-visible contract stays one sentence: **"make this path
+readable within the deadline"** — never "fetch object X"; the
+materialization layer decides whether that means one object or twenty,
+and FUSE never knows.
 
 ## Locking discipline
 
@@ -130,10 +219,12 @@ Established by the store-lock work and extended here — normative:
 1. Fetch network I/O runs under **no view lock and no store guard**:
    `execute_plan` addresses the store through `SharedStore` per-op
    handles; the view write lock is taken only for the bounded publish
-   step. (This is why a slow transfer cannot stall serving.)
-2. The want registry (pending wants, waiters, in-flight marks) gets
-   its **own lock** — never the view lock, never the store lock.
-   FUSE enqueues under it and waits; the loop drains it per pass.
+   step. This is why a slow transfer cannot stall serving — the
+   critical path is network → verified store → projection → short
+   write lock.
+2. The WantRegistry gets its **own lock** — never the view lock,
+   never the store lock. FUSE registers under it and waits; the loop
+   drains it per pass.
 3. Store guards are per-op, synchronous, and never held across a
    fetch call or a waiter wait.
 4. FUSE and the daemon loop never both mutate synchronization state;
@@ -141,25 +232,45 @@ Established by the store-lock work and extended here — normative:
 
 ## CLI
 
-The binary surface grows (`--peer`-style options or none at all, since
-discovery is announcement-driven; timeouts; status). Migrate argv
-parsing to **clap derive** in this PR: subcommand structs replace the
-hand-rolled option surgery in `main.rs`; credential-file hardening
-(stays in-repo: 0o600, O_NOFOLLOW, bounds) is unaffected. No other
-arg crates.
+Migrate argv parsing to **clap derive** in this PR — mechanically
+boring: existing commands → derive structs → same semantics. No
+configuration hierarchy, environment handling, credential loading,
+command renaming, or output-format changes ride along. The
+credential-file hardening (0o600, O_NOFOLLOW, bounds, zeroizing)
+stays in-repo and is untouched by clap.
 
 ## PR boundary
 
-One vertical feature, one PR: announcements + serving + demand +
-blocking open + CLI composition. Intermediate states cannot
-demonstrate the feature, and none of it redesigns the sync protocol —
-the announcement schema gains a field; everything else is new plumbing
-around decided invariants.
+One vertical feature, one PR: announcement `node_addr` + serving
+router + want registry + blocking open + CLI composition.
+Intermediate states cannot demonstrate the feature, and none of it
+redesigns the sync protocol — the announcement schema gains a field;
+everything else is new plumbing around decided invariants.
 
-Commit plan: this design doc → clap migration → announcement endpoint
-+ serving router → want channel + blocking open → docs status. Tests
-along the way: announcement auth binding (endpoint inside sealed
-plaintext), serve-surface object-only contract, want-channel
-exactly-once/dedup under the daemon loop, bounded-open timeout →
-`EIO`, and the existing contracts suite extended with a
-fetch-on-open-over-loopback iroh case.
+Commit plan: this design doc → clap migration → announcement
+`node_addr` + serving router → want registry + blocking open → docs
+status.
+
+Test matrix (each locks a decided invariant):
+
+- **Address auth binding**: the `node_addr` is part of the sealed
+  plaintext; tampering fails verification and never redirects a
+  fetch.
+- **Stale address**: announcement names a dead node_addr → fetch
+  fails → no invalid object committed → the announcement and its
+  content identity remain valid.
+- **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
+  complete (and a terminal failure wakes all three with failure).
+- **Timeout then completion**: want times out → `EIO` → materialization
+  completes anyway → identity cached → next open succeeds
+  immediately.
+- **Registry overflow**: pending wants beyond the bound fail
+  registration with `EIO`; no silent drop.
+- **Read-side demand**: a read of an unmaterialized chunk enqueues and
+  blocks bounded; the served bytes are verified content; a second
+  read is local.
+- **Serve surface**: a requested path (not a `StorageId`) is not
+  servable; the router answers object lookups only.
+- **Loopback iroh end-to-end**: two daemons, announcement + serve +
+  demand + blocking open + read, over the loopback transport the
+  bulk-source tests already use.

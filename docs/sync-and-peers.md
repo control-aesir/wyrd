@@ -54,10 +54,14 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
 ## What is exchanged
 
 - **Snapshot announcements** (small, gossip-propagated): "my head set now
-  includes snapshot S, and here is my current `NodeAddr` for retrieval" —
+  includes snapshot S, and here is my current `node_addr` for retrieval" —
   signed, verified against known member identity keys (`trust.md`). The
-  endpoint is authenticated routing metadata inside the same sealed
+  address is authenticated routing metadata inside the same sealed
   plaintext, never identity and never snapshot content (`fetch-on-open.md`).
+  Freshness is operational, not validity: newer announcements do not
+  cryptographically invalidate older ones — announcement history is
+  append-only, and address selection/fallback is an operational layer
+  decision.
 - **Encrypted manifests** (hierarchical, per-subtree — see
   `object-model.md`): trees plus the content→storage mapping for every
   object the snapshot references, sealed to the drive. Drive members

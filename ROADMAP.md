@@ -99,7 +99,12 @@ next, roughly in order:
   mailbox`)
 - external relay interoperability coverage (`test(daemon): cover external
   relay interoperability`)
-- write support behind the FUSE mount, then automatic peer repair
+- write support behind the FUSE mount: designed in `docs/write-path.md`
+  (`docs(write-path): design the mounted write path`), then
+  `feat(format): mkdir, rmdir, and rename mutations` and
+  `feat(fuse): mounted write operations`, on the composition seam from
+  `refactor(daemon): make runtime ownership and projection publication
+  explicit`; automatic peer repair follows
 - NIP-46 signer-session client wiring
 
 ## Post-v1

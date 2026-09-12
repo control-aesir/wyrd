@@ -16,7 +16,7 @@
 //! membership, a non-member author, an unavailable root tree, or a
 //! signature that will not verify commits nothing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
     ChildManifest, ContentId, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot, Tree,
@@ -119,154 +119,182 @@ where
     // The manifest hierarchy is authored, not reconstructed: every
     // mapping names a sealed envelope this device holds the bytes for
     // (fresh seals below) or a recorded representation it holds the
-    // epoch capability for (recorded_mapping). The snapshot body rides
+    // epoch capability and the vault copy for. The snapshot body rides
     // the same vault: peers fetch it by the announcement's body root.
     let secret = rebuilt
         .keyring
         .secret(known.epoch)
         .ok_or(EngineError::MissingEpochKey(known.epoch))?;
     engine.vault.import(&authorized.snapshot().encode())?;
-    let mut children: Vec<ManifestRecord> = Vec::new();
-    let root = walk_tree(
+    let mut authoring = ManifestAuthor {
         engine,
         objects,
-        &rebuilt.runtime,
-        &rebuilt.keyring,
+        runtime: &rebuilt.runtime,
+        keyring: &rebuilt.keyring,
         secret,
-        known.epoch,
-        authorized.snapshot().snapshot_id(),
-        tree,
-        &mut children,
-    )?;
-
+        epoch: known.epoch,
+        snapshot: authorized.snapshot().snapshot_id(),
+        children: Vec::new(),
+        sealed: BTreeMap::new(),
+    };
+    let root = authoring.walk(tree)?;
     let mut facts = vec![Fact::SnapshotBody(authorized.clone())];
-    facts.extend(children.into_iter().map(Fact::Manifest));
+    facts.extend(
+        std::mem::take(&mut authoring.children)
+            .into_iter()
+            .map(Fact::Manifest),
+    );
     facts.push(Fact::Manifest(root));
     engine.commit_facts(&facts)?;
     Ok(authorized)
 }
 
-/// Map one subtree tree into its manifest: local chunks seal fresh, dirs
-/// recurse into child manifests, symlinks map to nothing. Child records
-/// append post-order (leaves first), so durable replay installs children
-/// before the parent that claims them. The authored envelopes land in
-/// the engine's durable vault — the producer's own representations,
-/// keyed by the transport root the mappings name.
-#[allow(clippy::too_many_arguments)]
-fn walk_tree<S: ObjectStore>(
-    engine: &mut Engine,
-    objects: &S,
-    runtime: &super::RuntimeState,
-    keyring: &crate::keys::DriveKeyring,
-    secret: &crate::keys::EpochSecret,
+/// The per-authoring context for the manifest walk: everything the
+/// recursive build needs, held once. Freshly sealed mappings cache here,
+/// so one logical chunk seals exactly once per authoring session even
+/// when several subtrees reference it.
+struct ManifestAuthor<'a, S: ObjectStore>
+where
+    S::Error: std::fmt::Debug,
+{
+    engine: &'a mut Engine,
+    objects: &'a S,
+    runtime: &'a super::RuntimeState,
+    keyring: &'a crate::keys::DriveKeyring,
+    secret: &'a crate::keys::EpochSecret,
     epoch: u64,
     snapshot: wyrd_format::SnapshotId,
-    tree_id: ContentId,
-    children: &mut Vec<ManifestRecord>,
-) -> Result<ManifestRecord, EngineError>
-where
-    S::Error: std::fmt::Debug,
-{
-    let bytes = objects
-        .get(&tree_id)
-        .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
-        .ok_or(EngineError::TreeUnavailable(tree_id))?;
-    if ContentId::derive(ObjectKind::Tree, &bytes) != tree_id {
-        return Err(EngineError::TreeMismatch(tree_id));
-    }
-    let tree = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree_id))?;
-    check_tree(&Limits::V0, &tree).map_err(EngineError::Ingest)?;
-
-    let mut entries: Vec<ManifestEntry> = Vec::new();
-    let mut links: Vec<ChildManifest> = Vec::new();
-    for entry in tree.entries() {
-        match &entry.content {
-            wyrd_format::EntryContent::File { chunks, .. } => {
-                for chunk in chunks {
-                    entries.push(mapping_for(
-                        engine, runtime, keyring, objects, secret, epoch, *chunk,
-                    )?);
-                }
-            }
-            wyrd_format::EntryContent::Dir { subtree } => {
-                let child = walk_tree(
-                    engine, objects, runtime, keyring, secret, epoch, snapshot, *subtree, children,
-                )?;
-                let storage = child
-                    .storage_ids
-                    .iter()
-                    .next()
-                    .copied()
-                    .ok_or(EngineError::RepresentationMissing(child.manifest_id))?;
-                links.push(ChildManifest {
-                    tree: *subtree,
-                    manifest: child.manifest_id,
-                    storage,
-                    transport: child.transport,
-                });
-                children.push(ManifestRecord {
-                    is_root: false,
-                    ..child
-                });
-            }
-            wyrd_format::EntryContent::Symlink { .. } => {}
-        }
-    }
-
-    let manifest = Manifest {
-        snapshot,
-        entries,
-        children: links,
-    };
-    check_manifest(&Limits::V0, &manifest).map_err(EngineError::Ingest)?;
-    let manifest_key = secret.manifest_key(&engine.drive, epoch, &snapshot);
-    let (manifest_id, obj) = seal_manifest(&manifest_key, &manifest)?;
-    engine.vault.import(&obj.encode())?;
-    Ok(ManifestRecord {
-        is_root: true,
-        manifest_id,
-        storage_ids: BTreeSet::from([obj.storage_id()]),
-        transport: crate::seal::transport_root(&obj),
-        manifest,
-    })
+    /// Child records accumulate post-order (leaves first), so durable
+    /// replay installs children before the parent that claims them.
+    children: Vec<ManifestRecord>,
+    /// Fresh seals this authoring session already produced, by content.
+    sealed: BTreeMap<ContentId, ManifestEntry>,
 }
 
-/// The mapping for one chunk: a recorded representation the device holds
-/// the epoch capability for, else a fresh seal under the canonical epoch
-/// (needs the local plaintext), else fail closed. First match in
-/// manifest-id order wins — deterministic under replay.
-fn mapping_for<S: ObjectStore>(
-    engine: &mut Engine,
-    runtime: &super::RuntimeState,
-    keyring: &crate::keys::DriveKeyring,
-    objects: &S,
-    secret: &crate::keys::EpochSecret,
-    epoch: u64,
-    chunk: ContentId,
-) -> Result<ManifestEntry, EngineError>
+impl<S: ObjectStore> ManifestAuthor<'_, S>
 where
     S::Error: std::fmt::Debug,
 {
-    if let Some(entry) = runtime.recorded_mapping(&chunk) {
-        if keyring.secret(entry.encryption_epoch).is_some() {
-            return Ok(entry);
+    /// Map one subtree tree into its manifest: local chunks seal fresh
+    /// or resolve through the session cache, dirs recurse into child
+    /// manifests, symlinks map to nothing. Entries and child links are
+    /// deduplicated by their logical identity — the canonical manifest
+    /// encoding admits exactly one entry per `(content, kind, version)`
+    /// and one link per subtree, and repeated references (identical
+    /// chunks, identical subtrees) are the norm, not an error. The
+    /// authored envelope lands in the engine's durable vault under the
+    /// transport root the record carries.
+    fn walk(&mut self, tree_id: ContentId) -> Result<ManifestRecord, EngineError> {
+        let bytes = self
+            .objects
+            .get(&tree_id)
+            .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
+            .ok_or(EngineError::TreeUnavailable(tree_id))?;
+        if ContentId::derive(ObjectKind::Tree, &bytes) != tree_id {
+            return Err(EngineError::TreeMismatch(tree_id));
         }
+        let tree = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree_id))?;
+        check_tree(&Limits::V0, &tree).map_err(EngineError::Ingest)?;
+
+        let mut entries: BTreeMap<ContentId, ManifestEntry> = BTreeMap::new();
+        let mut links: BTreeMap<ContentId, ChildManifest> = BTreeMap::new();
+        for entry in tree.entries() {
+            match &entry.content {
+                wyrd_format::EntryContent::File { chunks, .. } => {
+                    for chunk in chunks {
+                        let mapping = self.resolve(*chunk)?;
+                        entries.insert(*chunk, mapping);
+                    }
+                }
+                wyrd_format::EntryContent::Dir { subtree } => {
+                    let child = self.walk(*subtree)?;
+                    let storage = child
+                        .storage_ids
+                        .iter()
+                        .next()
+                        .copied()
+                        .ok_or(EngineError::RepresentationMissing(child.manifest_id))?;
+                    links.insert(
+                        *subtree,
+                        ChildManifest {
+                            tree: *subtree,
+                            manifest: child.manifest_id,
+                            storage,
+                            transport: child.transport,
+                        },
+                    );
+                    self.children.push(ManifestRecord {
+                        is_root: false,
+                        ..child
+                    });
+                }
+                wyrd_format::EntryContent::Symlink { .. } => {}
+            }
+        }
+
+        let manifest = Manifest {
+            snapshot: self.snapshot,
+            entries: entries.into_values().collect(),
+            children: links.into_values().collect(),
+        };
+        check_manifest(&Limits::V0, &manifest).map_err(EngineError::Ingest)?;
+        let manifest_key = self
+            .secret
+            .manifest_key(&self.engine.drive, self.epoch, &self.snapshot);
+        let (manifest_id, obj) = seal_manifest(&manifest_key, &manifest)?;
+        self.engine.vault.import(&obj.encode())?;
+        Ok(ManifestRecord {
+            is_root: true,
+            manifest_id,
+            storage_ids: BTreeSet::from([obj.storage_id()]),
+            transport: crate::seal::transport_root(&obj),
+            manifest,
+        })
     }
-    let plaintext = objects
-        .get(&chunk)
-        .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
-        .ok_or(EngineError::ChunkUnavailable(chunk))?;
-    let object_key = secret.object_key(
-        &engine.drive,
-        epoch,
-        &chunk,
-        ObjectKind::Chunk,
-        SEAL_VERSION,
-    );
-    let obj = seal_content(&object_key, ObjectKind::Chunk, &chunk, &plaintext)?;
-    let entry = entry_for(ObjectKind::Chunk, epoch, &obj, &chunk, &plaintext)?;
-    engine.vault.import(&obj.encode())?;
-    Ok(entry)
+
+    /// The mapping for one chunk, deduplicated across the session: a
+    /// freshly sealed mapping from earlier in this authoring, else a
+    /// recorded representation the device both holds the epoch
+    /// capability for and holds the vault copy of — advertising a
+    /// mapping it cannot serve is the failure mode this order forbids —
+    /// else a fresh seal under the canonical epoch (needs the local
+    /// plaintext), else fail closed. First match in manifest-id order
+    /// wins; deterministic under replay.
+    fn resolve(&mut self, chunk: ContentId) -> Result<ManifestEntry, EngineError> {
+        if let Some(entry) = self.sealed.get(&chunk) {
+            return Ok(entry.clone());
+        }
+        for entry in self.runtime.recorded_mappings(&chunk) {
+            let held = self.keyring.secret(entry.encryption_epoch).is_some();
+            let served = self
+                .engine
+                .vault
+                .sealed(&entry.transport)
+                .map_err(EngineError::from)?
+                .is_some();
+            if held && served {
+                self.sealed.insert(chunk, entry.clone());
+                return Ok(entry);
+            }
+        }
+        let plaintext = self
+            .objects
+            .get(&chunk)
+            .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
+            .ok_or(EngineError::ChunkUnavailable(chunk))?;
+        let object_key = self.secret.object_key(
+            &self.engine.drive,
+            self.epoch,
+            &chunk,
+            ObjectKind::Chunk,
+            SEAL_VERSION,
+        );
+        let obj = seal_content(&object_key, ObjectKind::Chunk, &chunk, &plaintext)?;
+        let entry = entry_for(ObjectKind::Chunk, self.epoch, &obj, &chunk, &plaintext)?;
+        self.engine.vault.import(&obj.encode())?;
+        self.sealed.insert(chunk, entry.clone());
+        Ok(entry)
+    }
 }
 
 /// Announce an authored snapshot to every other member over the control

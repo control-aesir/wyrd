@@ -308,16 +308,19 @@ impl RuntimeState {
         self.manifests.get(&manifest_id)
     }
 
-    /// The first recorded mapping for one plaintext content, in
-    /// manifest-id order (deterministic under replay). The untrusted-hint
-    /// lookup: acting on a mapping additionally requires holding its
-    /// epoch capability, which is the caller's (authoring path's) check.
-    pub fn recorded_mapping(&self, content: &ContentId) -> Option<ManifestEntry> {
+    /// Every recorded mapping for one plaintext content, in manifest-id
+    /// order (deterministic under replay). The untrusted-hint lookup:
+    /// acting on a mapping additionally requires holding its epoch
+    /// capability and holding the representation itself (the vault),
+    /// which are the caller's (authoring path's) checks — cross-epoch
+    /// reuse picks among these, never blind first-match.
+    pub fn recorded_mappings(&self, content: &ContentId) -> Vec<ManifestEntry> {
         self.manifests
             .values()
             .flat_map(|record| &record.manifest.entries)
-            .find(|entry| &entry.content_id == content)
+            .filter(|entry| &entry.content_id == content)
             .cloned()
+            .collect()
     }
 
     /// Record a signature-verified snapshot body. The body must agree

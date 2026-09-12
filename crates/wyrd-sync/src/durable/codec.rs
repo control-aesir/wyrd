@@ -2,6 +2,14 @@
 //! decoding, and the capability/manifest record codecs. The commit
 //! format and CURRENT protocol are byte-for-byte stable; unknown record
 //! tags are skipped for forward compatibility.
+//!
+//! v0 development note: fact *payloads* are not yet migration-stable —
+//! the manifest record gained its transport column (object-model.md
+//! decision 26) by changing the layout in place. A store whose manifest
+//! facts predate the change fails its rebuild loudly (an unparsable
+//! record poisons the commit file, so `open`/`resync` refuse it), which
+//! is the deliberate pre-alpha contract: fail closed on old formats,
+//! no silent interpretation, no migration until v1 freezes the format.
 
 use wyrd_format::{
     BaoRoot, ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot, StorageId,

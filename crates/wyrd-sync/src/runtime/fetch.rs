@@ -12,6 +12,7 @@ use crate::bulk::{BulkError, BulkSource, SealedManifest};
 use crate::ingest::{check_manifest, Limits};
 use crate::keys::capability::DriveKeyring;
 use crate::seal::{open_manifest, verify, EncryptedObject};
+use crate::serving::Vault;
 
 /// One fetch attempt's structured result. Every non-fulfilled variant is
 /// fail-closed: nothing commits and the item stays pending for the next
@@ -54,6 +55,7 @@ pub(super) fn root(
     bulk: &mut impl BulkSource,
     keyring: &DriveKeyring,
     runtime: &RuntimeState,
+    vault: &Vault,
     snapshot: &SnapshotId,
 ) -> FetchOutcome<ManifestRecord> {
     let Some(announcement) = runtime.announcement(snapshot) else {
@@ -88,9 +90,16 @@ pub(super) fn root(
     let Some(served) = served else {
         return FetchOutcome::Missing;
     };
-    match open_record(&served.sealed, &key, &served.content_id, *snapshot, true) {
-        Some(record) => FetchOutcome::Fulfilled(record),
-        None => FetchOutcome::Invalid,
+    let Some(record) = open_record(&served.sealed, &key, &served.content_id, *snapshot, true)
+    else {
+        return FetchOutcome::Invalid;
+    };
+    // Ciphertext residency precedes the durable record: a committed
+    // mapping must name a representation this drive can serve, so an
+    // import failure is a local refusal, never a committed advertisement.
+    match vault.import(&served.sealed) {
+        Ok(_) => FetchOutcome::Fulfilled(record),
+        Err(_) => FetchOutcome::Local,
     }
 }
 
@@ -148,6 +157,7 @@ pub(super) fn child(
     bulk: &mut impl BulkSource,
     keyring: &DriveKeyring,
     runtime: &RuntimeState,
+    vault: &Vault,
     id: &ContentId,
     link: &ChildManifest,
 ) -> FetchOutcome<ManifestRecord> {
@@ -172,21 +182,38 @@ pub(super) fn child(
     let Some(sealed) = sealed else {
         return FetchOutcome::Missing;
     };
-    match open_record(&sealed, &key, &link.manifest, snapshot, false) {
-        Some(record) => FetchOutcome::Fulfilled(record),
-        None => FetchOutcome::Invalid,
+    let Some(record) = open_record(&sealed, &key, &link.manifest, snapshot, false) else {
+        return FetchOutcome::Invalid;
+    };
+    // Residency precedes the record, as in root().
+    match vault.import(&sealed) {
+        Ok(_) => FetchOutcome::Fulfilled(record),
+        Err(_) => FetchOutcome::Local,
     }
 }
 
 /// Fetch one representation over its two routes, which name the same
-/// bytes (decision 26): the transport root first, the vault-visible
-/// storage address second. Absence and a dead or stale transport route
-/// both fall back — the transport root is author-attested routing
-/// metadata, never an availability guarantee (`docs/fetch-on-open.md`).
-/// Oversize is representation-terminal: both routes carry the same
-/// bytes, so no route can succeed after it, and the classification
-/// propagates. Errors from the fallback propagate unchanged, so the
-/// boundary's classification stays authoritative.
+/// bytes in an honest mapping (decision 26): the transport root first,
+/// the vault-visible storage address second. The routes carry different
+/// guarantees, and the distinction is the security model:
+///
+/// - signature: proves the author named `transport` as the route for
+///   the entry's identity — routing evidence, never availability;
+/// - transport route: serves exactly the bytes whose raw BLAKE3 is the
+///   requested root (the memory map derives its keys from content; the
+///   iroh path Bao-verifies; the vault verifies on read);
+/// - storage route: serves the representation `storage_id` addresses;
+///   admission is the AEAD/identity checks in `verify`, which bind the
+///   received bytes to the entry regardless of what its transport
+///   field claimed.
+///
+/// Absence and a dead or stale transport route both fall back — the
+/// transport root is author-attested routing metadata, never an
+/// availability guarantee (`docs/fetch-on-open.md`). Oversize is
+/// representation-terminal: both routes carry the same bytes, so no
+/// route can succeed after it, and the classification propagates.
+/// Errors from the fallback propagate unchanged, so the boundary's
+/// classification stays authoritative.
 fn fetch_representation(
     bulk: &mut impl BulkSource,
     transport: &BaoRoot,
@@ -247,6 +274,7 @@ pub(super) fn object(
     bulk: &mut impl BulkSource,
     keyring: &DriveKeyring,
     objects: &mut impl ObjectStore,
+    vault: &Vault,
     content: &ContentId,
     candidates: &[PendingObjectFetch],
 ) -> ObjectAttempt {
@@ -294,6 +322,13 @@ pub(super) fn object(
             invalid.push(candidate.storage_id);
             continue;
         };
+        // Residency precedes the record (as in root and child): the
+        // verified ciphertext lands in the serving vault before the
+        // plaintext consequence, and a refusal is a local failure.
+        if vault.import(&sealed).is_err() {
+            aggregate = worse(aggregate, FetchOutcome::Local);
+            continue;
+        }
         if objects
             .insert_verified(candidate.kind, content, &plaintext)
             .is_ok()
@@ -408,6 +443,26 @@ mod tests {
             fetch_representation(&mut peer, &BaoRoot::from_bytes([0xEE; 32]), &storage).unwrap(),
             Some(sealed),
             "the forged root names nothing; the storage address serves"
+        );
+    }
+
+    #[test]
+    fn a_stale_transport_field_degrades_to_the_storage_route() {
+        // Decision 26's untrusted-hint semantics, pinned: a mapping whose
+        // transport field names bytes the map does not hold (a stale or
+        // lying root) still yields the entry's representation through the
+        // storage route. Admission is `verify`'s AEAD/identity binding —
+        // the route disagreement is a degradation, never a bypass.
+        let mut peer = MemoryBulkSource::default();
+        let storage = StorageId::from_bytes([0x5B; 32]);
+        let sealed = vec![0x7C; 48];
+        peer.publish_sealed(storage, sealed.clone());
+        let claimed = crate::seal::blob_root(b"bytes that are not the representation");
+        assert_ne!(claimed, crate::seal::blob_root(&sealed));
+        assert_eq!(
+            fetch_representation(&mut peer, &claimed, &storage).unwrap(),
+            Some(sealed),
+            "the signed-but-stale route names absence; the storage route serves the entry's representation"
         );
     }
 

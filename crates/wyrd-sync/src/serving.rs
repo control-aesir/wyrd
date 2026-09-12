@@ -27,13 +27,16 @@ use crate::seal::blob_root;
 /// The vault directory inside a drive directory.
 const VAULT_DIR: &str = "vault";
 
+/// A raw byte CAS with no authorization semantics: it stores and serves
+/// bytes under their own hash, for whoever is allowed to reach the
+/// drive's ciphertext at all. Authorization lives one layer up —
+/// [`VaultSource`] offers only representations durably recorded by the
+/// runtime machines, and every fetch still passes the AEAD/identity
+/// admission checks before plaintext is trusted.
 #[derive(Debug, Error)]
 pub enum VaultError {
     #[error("vault I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("vault is not this drive's directory")]
-    #[allow(dead_code)]
-    Root,
 }
 
 /// The drive's sealed representation store: one file per transport root,
@@ -53,7 +56,10 @@ impl Vault {
     /// Import sealed bytes: the file name is the bytes' own transport
     /// root, so the address handed out is exactly what the transfer
     /// verifies against. Importing an already-held root is a no-op —
-    /// objects are immutable and the store is append-only.
+    /// objects are immutable and the store is append-only. The temp file
+    /// is scoped to the root (distinct roots never collide on the temp
+    /// path), and the rename is the publication point: a torn write
+    /// leaves a temp file, never a servable root.
     pub fn import(&self, sealed: &[u8]) -> Result<BaoRoot, VaultError> {
         let root = blob_root(sealed);
         let path = self.path(&root);
@@ -72,10 +78,21 @@ impl Vault {
         Ok(root)
     }
 
-    /// The sealed bytes at a transport root, if held.
+    /// The sealed bytes at a transport root, if held — and the read is
+    /// verified: filenames are mutable filesystem state, so a file whose
+    /// contents no longer hash to its name is not the requested
+    /// representation. A mismatch is absence (`None`), never bytes under
+    /// the wrong root; the corrupt file is left in place for an explicit
+    /// scrub path (reads never mutate append-only state).
     pub fn sealed(&self, root: &BaoRoot) -> Result<Option<Vec<u8>>, VaultError> {
         match std::fs::read(self.path(root)) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                if blob_root(&bytes) == *root {
+                    Ok(Some(bytes))
+                } else {
+                    Ok(None)
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -123,6 +140,13 @@ fn hex_to_32(name: &str) -> Result<[u8; 32], ()> {
 /// knows how to name is servable. The maps are derived — never stored —
 /// so a restart rebuilds them by replaying durable state, and vault
 /// bytes outlive every process.
+///
+/// The verification chain stays three-staged (trust.md): the author's
+/// signature proves the author named `R` as the route for identity `X`;
+/// the transport (Bao/vault) proves received bytes hash to `R`; the
+/// AEAD/content admission proves the received representation decrypts to
+/// the claimed plaintext. This view participates in the first two — it
+/// never substitutes for the third.
 pub struct VaultSource {
     vault: Vault,
     /// Root manifests by snapshot: the eager exchange address.
@@ -145,17 +169,12 @@ impl VaultSource {
         let mut bodies = BTreeMap::new();
         let mut sealed = BTreeMap::new();
         for snapshot in state.recorded_snapshots() {
+            // The root manifest serves by snapshot id and by the transport
+            // root the record carries; a record with no sealed envelope
+            // (recordable via the durable codec) still serves those two
+            // routes, and contributes nothing to the storage map.
             if let Some(record) = state.root_manifest_record(&snapshot) {
                 roots.insert(snapshot, (record.manifest_id, record.transport));
-                sealed.insert(
-                    record
-                        .storage_ids
-                        .iter()
-                        .next()
-                        .copied()
-                        .expect("recorded records hold their envelope"),
-                    record.transport,
-                );
             }
             if let Some(body) = state.snapshot_body(&snapshot) {
                 bodies.insert(snapshot, body.encode());
@@ -311,6 +330,87 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_file_contents_serve_nothing_under_their_name() {
+        // Filenames are mutable filesystem state: a file whose contents
+        // no longer hash to its name is not the requested representation.
+        // The read refuses (absence) and never mutates the append-only
+        // store.
+        let vault = vault();
+        let sealed = vec![0x42u8; 40];
+        let root = vault.import(&sealed).unwrap();
+        std::fs::write(vault.dir.join(root.to_string()), b"tampered bytes").unwrap();
+        assert_eq!(
+            vault.sealed(&root).unwrap(),
+            None,
+            "bytes that do not hash to the requested root are absence"
+        );
+        assert_eq!(
+            vault.roots().unwrap(),
+            vec![root],
+            "reads never mutate vault state; scrub is explicit"
+        );
+    }
+
+    #[test]
+    fn distinct_roots_never_collide_on_the_temp_path() {
+        // The temp file is scoped to the root, so concurrent imports of
+        // different roots through one vault cannot overwrite each other.
+        let vault = vault();
+        let a = vault.import(b"first representation").unwrap();
+        let b = vault.import(b"second representation").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(
+            vault.sealed(&a).unwrap(),
+            Some(b"first representation".to_vec())
+        );
+        assert_eq!(
+            vault.sealed(&b).unwrap(),
+            Some(b"second representation".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_representationless_root_record_is_not_a_panic() {
+        // Durable state can carry a root manifest with no sealed
+        // representation at all (the codec accepts a zero storage count):
+        // the serving view fails closed to "nothing to serve", never
+        // panics at reconstruction.
+        let vault = vault();
+        let snapshot = SnapshotId::from_bytes([0x01; 32]);
+        let secret = EpochSecret::from_bytes([0x07; 32]);
+        let manifest = Manifest {
+            snapshot,
+            entries: Vec::new(),
+            children: Vec::new(),
+        };
+        let key = secret.manifest_key(&drive(), 1, &snapshot);
+        let (manifest_id, obj) = seal_manifest(&key, &manifest).unwrap();
+        vault.import(&obj.encode()).unwrap();
+        let mut runtime = RuntimeState::new(drive());
+        runtime
+            .record_manifest(crate::runtime::ManifestRecord {
+                is_root: true,
+                manifest_id,
+                storage_ids: std::collections::BTreeSet::new(),
+                transport: crate::seal::transport_root(&obj),
+                manifest,
+            })
+            .unwrap();
+        let mut source = VaultSource::from_state(&runtime, &vault).unwrap();
+        let served = source
+            .fetch_root_manifest(&snapshot, usize::MAX)
+            .unwrap()
+            .expect("the root manifest still serves by id and root");
+        assert_eq!(served.content_id, manifest_id);
+        assert_eq!(
+            source
+                .fetch_sealed(&StorageId::from_bytes([0x02; 32]), usize::MAX)
+                .unwrap(),
+            None,
+            "no storage representations were recorded, so none serve"
+        );
+    }
+    #[test]
     fn the_source_serves_recorded_state_only() {
         // from_state layers the durable records over the vault: a
         // snapshot with neither a recorded root manifest nor a recorded
@@ -337,12 +437,39 @@ mod tests {
             None
         );
 
-        // Record a root manifest, import the envelope, and the same
-        // source serves the root-manifest route by snapshot id, by
-        // transport root, and by storage id.
+        // Record a root manifest whose mapping names a sealed chunk, import
+        // both envelopes, and the source serves the root-manifest routes
+        // (by snapshot id and transport root) plus the mapped chunk by
+        // its storage address.
+        let secret = EpochSecret::from_bytes([0x07; 32]);
+        let plaintext = b"vault served chunk".to_vec();
+        let content = wyrd_format::ContentId::derive(wyrd_format::ObjectKind::Chunk, &plaintext);
+        let chunk_key = secret.object_key(
+            &drive(),
+            1,
+            &content,
+            wyrd_format::ObjectKind::Chunk,
+            crate::seal::SEAL_VERSION,
+        );
+        let sealed_chunk = crate::seal::seal(
+            &chunk_key,
+            wyrd_format::ObjectKind::Chunk,
+            &content,
+            &plaintext,
+        )
+        .unwrap();
+        let entry = crate::seal::entry_for(
+            wyrd_format::ObjectKind::Chunk,
+            1,
+            &sealed_chunk,
+            &content,
+            &plaintext,
+        )
+        .unwrap();
+        vault.import(&sealed_chunk.encode()).unwrap();
         let manifest = Manifest {
             snapshot,
-            entries: Vec::new(),
+            entries: vec![entry],
             children: Vec::new(),
         };
         let secret = EpochSecret::from_bytes([0x07; 32]);
@@ -373,8 +500,10 @@ mod tests {
             Some(obj.encode())
         );
         assert_eq!(
-            source.fetch_sealed(&obj.storage_id(), usize::MAX).unwrap(),
-            Some(obj.encode())
+            source
+                .fetch_sealed(&sealed_chunk.storage_id(), usize::MAX)
+                .unwrap(),
+            Some(sealed_chunk.encode())
         );
     }
 }

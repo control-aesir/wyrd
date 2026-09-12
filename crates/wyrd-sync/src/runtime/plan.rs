@@ -55,14 +55,25 @@ pub(super) fn execute(
                         engine.note_fetch_invalid(&body_key);
                         continue;
                     }
-                    // The commit-time gate: only signature-verified
-                    // bodies become durable facts.
                     match crate::durable::AuthorizedSnapshot::authorize(body, &engine.drive) {
                         Ok(authorized) => {
-                            runtime.record_snapshot_body(authorized.snapshot().clone())?;
-                            facts.push(crate::durable::Fact::SnapshotBody(authorized));
-                            report.snapshot_bodies += 1;
-                            engine.note_fetch_fulfilled(&body_key);
+                            // Residency precedes the durable record: the
+                            // verified body lands in the serving vault
+                            // before the fact commits, so the recorded
+                            // snapshot never names a missing body.
+                            match engine.vault.import(&authorized.snapshot().encode()) {
+                                Ok(_) => {
+                                    runtime.record_snapshot_body(authorized.snapshot().clone())?;
+                                    facts.push(crate::durable::Fact::SnapshotBody(authorized));
+                                    report.snapshot_bodies += 1;
+                                    engine.note_fetch_fulfilled(&body_key);
+                                }
+                                Err(_) => {
+                                    report.local_failures += 1;
+                                    // Locally refused imports never strike:
+                                    // the retry is a local I/O condition.
+                                }
+                            }
                         }
                         Err(_) => {
                             report.invalid += 1;
@@ -88,7 +99,14 @@ pub(super) fn execute(
             if !engine.fetch_eligible(&root_key) {
                 continue;
             }
-            match super::fetch::root(&engine.drive, bulk, &keyring, &runtime, snapshot) {
+            match super::fetch::root(
+                &engine.drive,
+                bulk,
+                &keyring,
+                &runtime,
+                &engine.vault,
+                snapshot,
+            ) {
                 FetchOutcome::Fulfilled(record) => {
                     runtime.record_manifest(record.clone())?;
                     facts.push(crate::durable::Fact::Manifest(record));
@@ -112,7 +130,15 @@ pub(super) fn execute(
             if !engine.fetch_eligible(&child_key) {
                 continue;
             }
-            match super::fetch::child(&engine.drive, bulk, &keyring, &runtime, id, link) {
+            match super::fetch::child(
+                &engine.drive,
+                bulk,
+                &keyring,
+                &runtime,
+                &engine.vault,
+                id,
+                link,
+            ) {
                 FetchOutcome::Fulfilled(record) => {
                     runtime.record_manifest(record.clone())?;
                     facts.push(crate::durable::Fact::Manifest(record));
@@ -141,8 +167,15 @@ pub(super) fn execute(
             if eligible.is_empty() {
                 continue;
             }
-            let attempt =
-                super::fetch::object(&engine.drive, bulk, &keyring, objects, content, &eligible);
+            let attempt = super::fetch::object(
+                &engine.drive,
+                bulk,
+                &keyring,
+                objects,
+                &engine.vault,
+                content,
+                &eligible,
+            );
             // Strike representations whose bytes arrived and failed
             // validation regardless of the aggregate verdict: a corrupt
             // candidate keeps earning strikes even when a later

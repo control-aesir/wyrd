@@ -473,6 +473,35 @@ mod tests {
             verify_announcement(&drive, &bad_author),
             Err(ControlError::InvalidAuthorKey)
         );
+        // Every covered field, one at a time: snapshot, author, epoch,
+        // membership, and the routing metadata. The covered region is
+        // structural, so each mutation alone invalidates the signature.
+        for mutate in [
+            |a: &mut SnapshotAnnouncement| {
+                a.snapshot = wyrd_format::SnapshotId::from_bytes([0x90; 32])
+            },
+            |a: &mut SnapshotAnnouncement| {
+                // A different but valid key: the signature is attributed
+                // authorship, so a swapped author fails the challenge,
+                // not lift_x.
+                let other = crate::keys::DeviceIdentitySecret::from_bytes([0x91; 32]).unwrap();
+                let kp = Keypair::from_secret_key(SECP256K1, &other.secret_key());
+                a.author = DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&kp).0.serialize());
+            },
+            |a: &mut SnapshotAnnouncement| a.epoch = 9,
+            |a: &mut SnapshotAnnouncement| {
+                a.membership = wyrd_format::TransitionId::from_bytes([0x92; 32])
+            },
+            |a: &mut SnapshotAnnouncement| a.node_addr = Some(vec![0x93]),
+        ] {
+            let mut tampered = a.clone();
+            mutate(&mut tampered);
+            assert_eq!(
+                verify_announcement(&drive, &tampered),
+                Err(ControlError::BadSignature),
+                "every covered field binds the signature"
+            );
+        }
     }
 
     fn inbox() -> ControlInbox {

@@ -130,7 +130,11 @@ fn manifest_record() -> ManifestRecord {
     ManifestRecord {
         is_root: true,
         manifest_id,
-        storage_ids: [StorageId::from_bytes([0xA0; 32])].into(),
+        representations: [(
+            StorageId::from_bytes([0xA0; 32]),
+            BaoRoot::from_bytes([0xC0; 32]),
+        )]
+        .into(),
         transport: BaoRoot::from_bytes([0xC0; 32]),
         manifest,
     }

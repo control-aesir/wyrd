@@ -125,6 +125,14 @@ impl IrohBlobRef {
     }
 }
 
+/// Append a provider unless the exact ref is already held, preserving
+/// publication order and keeping periodic route passes idempotent.
+fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
+    if !candidates.contains(&blob) {
+        candidates.push(blob);
+    }
+}
+
 /// A synchronous [`BulkSource`] backed by iroh-blobs' verified streaming API.
 ///
 /// The address maps are populated by the control/runtime layer. Root manifests
@@ -137,8 +145,18 @@ pub struct IrohBulkSource {
     runtime: Arc<Runtime>,
     roots: BTreeMap<SnapshotId, (ContentId, IrohBlobRef)>,
     snapshots: BTreeMap<SnapshotId, IrohBlobRef>,
-    sealed: BTreeMap<StorageId, IrohBlobRef>,
-    transport: BTreeMap<BaoRoot, IrohBlobRef>,
+    /// Sealed representations by storage address. A representation is
+    /// immutable and may be advertised by several members, so each
+    /// address keeps every provider in publication order rather than a
+    /// single overwritten one: a dead route must not displace a live
+    /// alternate.
+    sealed: BTreeMap<StorageId, Vec<IrohBlobRef>>,
+    /// Representations by Bao root, same multi-provider rule. Snapshot
+    /// and root-manifest addresses are different: the author-signed
+    /// announcement names exactly one route per snapshot, and a route
+    /// update replaces it (last accepted wins), so those maps stay
+    /// single-valued by policy.
+    transport: BTreeMap<BaoRoot, Vec<IrohBlobRef>>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -177,6 +195,23 @@ impl IrohBulkSource {
         Ok(Self::with_runtime(endpoint, Arc::new(runtime)))
     }
 
+    /// Create a source bound to a default iroh endpoint (N0 relays for
+    /// peer reachability) on a dedicated runtime: the binary's fetch
+    /// side, with no endpoint plumbing in the composer.
+    pub fn connect_default() -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let endpoint = runtime
+            .block_on(async {
+                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    .bind()
+                    .await
+            })
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Self::with_runtime(endpoint, Arc::new(runtime)))
+    }
+
     /// Publish the transport address for a snapshot's root manifest.
     pub fn publish_root(&mut self, snapshot: SnapshotId, content_id: ContentId, blob: IrohBlobRef) {
         self.roots.insert(snapshot, (content_id, blob));
@@ -188,8 +223,11 @@ impl IrohBulkSource {
     }
 
     /// Publish the transport address for a sealed manifest or object.
+    /// Repeated publication of the same provider is a no-op, so a
+    /// periodic route pass neither reorders nor grows the candidate
+    /// list.
     pub fn publish_sealed(&mut self, storage: StorageId, blob: IrohBlobRef) {
-        self.sealed.insert(storage, blob);
+        push_unique(self.sealed.entry(storage).or_default(), blob);
     }
 
     /// Publish the transport address for a representation by its Bao
@@ -198,12 +236,78 @@ impl IrohBulkSource {
     /// address are the same value by construction, so a mapping cannot
     /// name unrelated bytes.
     pub fn publish_transport(&mut self, blob: IrohBlobRef) {
-        self.transport.insert(BaoRoot::from_bytes(blob.hash), blob);
+        push_unique(
+            self.transport
+                .entry(BaoRoot::from_bytes(blob.hash))
+                .or_default(),
+            blob,
+        );
+    }
+
+    /// Drop every route this source holds. Route maps are derived from
+    /// durable state, so a publication pass clears before republishing:
+    /// without it, providers for superseded routes accumulate across
+    /// passes and a stale provider could outlive its announcement.
+    pub(crate) fn clear_routes(&mut self) {
+        self.roots.clear();
+        self.snapshots.clear();
+        self.sealed.clear();
+        self.transport.clear();
+    }
+
+    /// The recorded provider candidates for a sealed representation, in
+    /// publication order: diagnostics and tests.
+    #[cfg(test)]
+    pub(crate) fn sealed_route(&self, storage: &StorageId) -> Option<&[IrohBlobRef]> {
+        self.sealed.get(storage).map(Vec::as_slice)
     }
 
     /// Close the owned endpoint after all in-flight transfers have finished.
     pub fn shutdown(&self) {
         self.runtime.block_on(self.endpoint.close());
+    }
+
+    /// Fetch a representation by trying each recorded provider in
+    /// publication order. Absence and transport failure fall through to
+    /// the next candidate; oversize is terminal because every provider
+    /// serves the same immutable bytes, so the size is a property of the
+    /// representation, not of the route. With no provider serving it,
+    /// the last transport error is returned (or absence when there were
+    /// no candidates).
+    fn fetch_candidates(
+        &self,
+        candidates: &[IrohBlobRef],
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        Self::fetch_candidates_with(candidates, max, |blob, max| self.fetch(blob, max))
+    }
+
+    /// The provider-fallthrough loop, extracted so tests can drive it
+    /// without a network. Candidates are tried in publication order;
+    /// absence and transport failure fall through to the next; oversize
+    /// is terminal because every provider serves the same immutable
+    /// bytes. With none serving, the last transport error returns (or
+    /// absence when there were no candidates).
+    fn fetch_candidates_with<F>(
+        candidates: &[IrohBlobRef],
+        max: usize,
+        mut fetch: F,
+    ) -> Result<Option<Vec<u8>>, BulkError>
+    where
+        F: FnMut(&IrohBlobRef, usize) -> Result<Vec<u8>, BulkError>,
+    {
+        let mut last_error = None;
+        for blob in candidates {
+            match fetch(blob, max) {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(oversize @ BulkError::Oversize { .. }) => return Err(oversize),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     fn fetch(&self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
@@ -232,6 +336,17 @@ impl IrohBulkSource {
             }
             bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
         })
+    }
+}
+
+impl crate::runtime::RoutePublishing for MemoryBulkSource {
+    /// The in-memory fake never carries live routes: its tests publish
+    /// addresses by hand.
+    fn publish_routes(
+        &mut self,
+        _state: &crate::runtime::RuntimeState,
+    ) -> Result<crate::runtime::RouteReport, crate::runtime::EngineError> {
+        Ok(crate::runtime::RouteReport::default())
     }
 }
 
@@ -309,10 +424,10 @@ impl BulkSource for IrohBulkSource {
         storage: &StorageId,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(blob) = self.sealed.get(storage) else {
+        let Some(candidates) = self.sealed.get(storage) else {
             return Ok(None);
         };
-        self.fetch(blob, max).map(Some)
+        self.fetch_candidates(candidates, max)
     }
 
     fn fetch_transport(
@@ -320,10 +435,10 @@ impl BulkSource for IrohBulkSource {
         root: &BaoRoot,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(blob) = self.transport.get(root) else {
+        let Some(candidates) = self.transport.get(root) else {
             return Ok(None);
         };
-        self.fetch(blob, max).map(Some)
+        self.fetch_candidates(candidates, max)
     }
 }
 
@@ -674,6 +789,144 @@ mod tests {
         runtime.block_on(async {
             router.shutdown().await.unwrap();
             server.close().await;
+        });
+        source.shutdown();
+    }
+
+    #[test]
+    fn fetch_candidates_tries_providers_in_order_and_falls_through() {
+        let key = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        let a = IrohBlobRef {
+            provider: EndpointAddr::new(key(0x11)),
+            hash: [0xAA; 32],
+        };
+        let b = IrohBlobRef {
+            provider: EndpointAddr::new(key(0x22)),
+            hash: [0xAA; 32],
+        };
+        let mut tried = Vec::new();
+        let served =
+            IrohBulkSource::fetch_candidates_with(&[a.clone(), b.clone()], 64, |blob, _max| {
+                tried.push(blob.provider.id);
+                if blob == &a {
+                    Err(BulkError::Transport("down".into()))
+                } else {
+                    Ok(vec![1, 2, 3])
+                }
+            })
+            .unwrap();
+        assert_eq!(served, Some(vec![1, 2, 3]));
+        assert_eq!(
+            tried,
+            vec![a.provider.id, b.provider.id],
+            "publication order, then fallthrough"
+        );
+
+        // Oversize is terminal: the representation's size does not
+        // depend on which provider serves it.
+        let oversize =
+            IrohBulkSource::fetch_candidates_with(&[a.clone(), b.clone()], 1, |blob, _| {
+                if blob == &a {
+                    Err(BulkError::Oversize { bytes: 5, max: 1 })
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+        assert!(matches!(oversize, Err(BulkError::Oversize { .. })));
+
+        // No candidates is absence, not an error.
+        assert_eq!(
+            IrohBulkSource::fetch_candidates_with(&[], 1, |_, _| unreachable!()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn iroh_source_falls_back_across_providers_for_one_root() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let content = b"shared immutable representation";
+        let (server_a, server_b, client, router_a, router_b, hash) = runtime.block_on(async {
+            let bind = || async {
+                Endpoint::builder(presets::N0DisableRelay)
+                    .clear_address_lookup()
+                    .bind()
+                    .await
+                    .unwrap()
+            };
+            let server_a = bind().await;
+            let server_b = bind().await;
+            let store_a = MemStore::new();
+            let store_b = MemStore::new();
+            let router_a = Router::builder(server_a.clone())
+                .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store_a, None))
+                .spawn();
+            let router_b = Router::builder(server_b.clone())
+                .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store_b, None))
+                .spawn();
+            let tag = store_a.add_slice(content).await.unwrap();
+            store_b.add_slice(content).await.unwrap();
+            let client = bind().await;
+            (server_a, server_b, client, router_a, router_b, tag.hash)
+        });
+
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+        let root = BaoRoot::from_bytes(*hash.as_bytes());
+        // Two members advertise the same representation; the dead
+        // provider is published LAST, the order that used to win.
+        for server in [&server_a, &server_b] {
+            source.publish_transport(IrohBlobRef {
+                provider: direct_addr(server),
+                hash: *hash.as_bytes(),
+            });
+        }
+        assert_eq!(
+            source.transport.get(&root).map(Vec::len),
+            Some(2),
+            "alternate providers are retained, not overwritten"
+        );
+        source.publish_transport(IrohBlobRef {
+            provider: direct_addr(&server_a),
+            hash: *hash.as_bytes(),
+        });
+        assert_eq!(
+            source.transport.get(&root).map(Vec::len),
+            Some(2),
+            "republication is idempotent"
+        );
+        // The storage-addressed fallback path keeps alternates too.
+        let storage = StorageId::from_bytes([0x66; 32]);
+        for server in [&server_a, &server_b] {
+            source.publish_sealed(
+                storage,
+                IrohBlobRef {
+                    provider: direct_addr(server),
+                    hash: *hash.as_bytes(),
+                },
+            );
+        }
+        assert_eq!(source.sealed.get(&storage).map(Vec::len), Some(2));
+
+        // The later-published endpoint dies; the fetch still succeeds
+        // through the earlier alternate.
+        runtime.block_on(async {
+            router_b.shutdown().await.unwrap();
+            server_b.close().await;
+        });
+        assert_eq!(
+            source.fetch_transport(&root, usize::MAX).unwrap(),
+            Some(content.to_vec())
+        );
+
+        runtime.block_on(async {
+            router_a.shutdown().await.unwrap();
+            server_a.close().await;
         });
         source.shutdown();
     }

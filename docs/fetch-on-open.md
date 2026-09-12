@@ -100,8 +100,18 @@ filesystem-oriented**:
   outside the content-addressed object space. An arbitrary file in
   the drive directory is not servable.
 
-The daemon (composition layer) owns the iroh-blobs serving `Router`;
-the engine never learns iroh exists.
+The iroh-blobs serving `Router` lives in `wyrd-sync`'s transport layer
+(`serving::ServingEndpoint`), beside its client half
+(`bulk::IrohBulkSource`): both halves are the same iroh transport seam,
+and co-locating them keeps a single implementation of endpoint, store,
+and address handling that the contract suite exercises. The composition
+layer (`wyrd-daemon`) owns that endpoint's lifecycle — `Daemon::open_serving`
+creates it and the live loop drives it — so a different composer can
+choose lifecycle without reimplementing transport. The engine itself
+never learns iroh exists: route interpretation consumes the engine's
+plain-data `RuntimeState` in the transport layer
+(`transport::publish_recorded_routes`), and no engine API names an iroh
+type.
 
 ## The WantRegistry: demand is state, the channel is just a wakeup
 
@@ -277,5 +287,5 @@ Test matrix (each locks a decided invariant):
   servable; the router answers object lookups only.
 - **Loopback iroh end-to-end**: two daemons, announcement + serve +
   demand + blocking open + read, over the loopback transport the
-  bulk-source tests already use. *(Lands with the transport-identity
-  fan-out, which owns the serving router.)*
+  bulk-source tests already use. *(Landed as contract 13; the serving
+  router lives in the transport layer with its client half.)*

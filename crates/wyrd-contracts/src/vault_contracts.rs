@@ -84,7 +84,7 @@ fn content_ids_never_appear_in_vault_transport_records() {
 fn malformed_manifests_never_become_materialized_content() {
     let mut loaded = Loaded::new("guarded.txt", b"guarded body");
     let snapshot_id = loaded.snapshot.snapshot_id();
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     let report = loaded.drain();
     assert_eq!(report.accepted, 2, "capability and announcement");
 

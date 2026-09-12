@@ -1244,14 +1244,14 @@ mod tests {
         assert_eq!(report.manifests, 2);
         assert_eq!(report.objects, 1);
         let current = fixture.engine.current();
-        let before: Vec<(ContentId, BTreeSet<StorageId>)> = fixture
+        let before: Vec<(ContentId, BTreeMap<StorageId, BaoRoot>)> = fixture
             .engine
             .store
             .load()
             .expect("loads")
             .manifests
             .iter()
-            .map(|m| (m.manifest_id, m.storage_ids.clone()))
+            .map(|m| (m.manifest_id, m.representations.clone()))
             .collect();
 
         // The peer re-seals the same manifests and objects (fresh
@@ -1279,14 +1279,14 @@ mod tests {
         assert_eq!(report.objects, 0);
         assert_eq!(report.unfulfilled, 0);
         assert_eq!(fixture.engine.current(), current, "no new commits");
-        let after: Vec<(ContentId, BTreeSet<StorageId>)> = fixture
+        let after: Vec<(ContentId, BTreeMap<StorageId, BaoRoot>)> = fixture
             .engine
             .store
             .load()
             .expect("loads")
             .manifests
             .iter()
-            .map(|m| (m.manifest_id, m.storage_ids.clone()))
+            .map(|m| (m.manifest_id, m.representations.clone()))
             .collect();
         assert_eq!(before, after, "records keep original storage ids");
     }

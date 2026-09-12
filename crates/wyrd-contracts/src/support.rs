@@ -459,13 +459,16 @@ impl Rig {
 
     /// Enqueue a snapshot announcement bound to `membership` at
     /// `epoch`. Every call seals fresh, so every envelope carries a
-    /// distinct message id.
+    /// distinct message id. `node_addr` rides the announcement opaquely
+    /// (the route codec interprets it); `Some` makes it fetchable
+    /// against the naming peer.
     pub(crate) fn enqueue_announcement(
         &mut self,
         snapshot: SnapshotId,
         membership: TransitionId,
         epoch: u64,
         roots: AnnouncedRoots,
+        node_addr: Option<Vec<u8>>,
     ) {
         let mut announcement = SnapshotAnnouncement {
             snapshot,
@@ -477,7 +480,7 @@ impl Rig {
             body_root: roots.body_root,
             root_manifest: roots.root_manifest,
             root_manifest_transport: roots.root_transport,
-            node_addr: None,
+            node_addr,
             signature: [0; 64],
         };
         sign_announcement(&mut announcement, &self.owner.identity, &drive());
@@ -701,7 +704,7 @@ impl Loaded {
     /// real transport identities (decision 26), leaving the manifest
     /// and objects unpublished: for tests that stage the manifest
     /// deliberately.
-    pub(crate) fn publish_body_and_announcement(&mut self) {
+    pub(crate) fn publish_body_and_announcement(&mut self, node_addr: Option<Vec<u8>>) {
         let snapshot_id = self.snapshot.snapshot_id();
         let body_bytes = self.snapshot.encode();
         self.bulk.publish_snapshot(snapshot_id, body_bytes.clone());
@@ -717,6 +720,7 @@ impl Loaded {
                     *blake3::hash(&self.content.root.sealed).as_bytes(),
                 ),
             },
+            node_addr,
         );
     }
 

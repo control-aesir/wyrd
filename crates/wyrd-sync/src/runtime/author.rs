@@ -16,7 +16,7 @@
 //! membership, a non-member author, an unavailable root tree, or a
 //! signature that will not verify commits nothing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use wyrd_format::{
     ChildManifest, ContentId, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot, Tree,
@@ -209,8 +209,8 @@ where
                 wyrd_format::EntryContent::Dir { subtree } => {
                     let child = self.walk(*subtree)?;
                     let storage = child
-                        .storage_ids
-                        .iter()
+                        .representations
+                        .keys()
                         .next()
                         .copied()
                         .ok_or(EngineError::RepresentationMissing(child.manifest_id))?;
@@ -243,11 +243,12 @@ where
             .manifest_key(&self.engine.drive, self.epoch, &self.snapshot);
         let (manifest_id, obj) = seal_manifest(&manifest_key, &manifest)?;
         self.engine.vault.import(&obj.encode())?;
+        let transport = crate::seal::transport_root(&obj);
         Ok(ManifestRecord {
             is_root: true,
             manifest_id,
-            storage_ids: BTreeSet::from([obj.storage_id()]),
-            transport: crate::seal::transport_root(&obj),
+            representations: BTreeMap::from([(obj.storage_id(), transport)]),
+            transport,
             manifest,
         })
     }

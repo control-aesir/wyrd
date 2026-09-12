@@ -128,14 +128,19 @@ provides local init/mount. The demand machinery for fetch-on-open has
 landed (`docs/fetch-on-open.md`): a want registry on its own lock,
 blocking `open`/`read` with a bounded deadline (`EIO` on expiry), and
 read-side chunk demand — proven against the bulk-source contract. The
-transport-identity distribution that makes fetch real against peers is
-in review: announcement Bao roots, author-signed announcements, the
-durable serving vault, and an Engine-owned announcement projection that
-gates every announcement at intake (route updates replace — last
-accepted route wins; immutable forks are rejected before the fact
-commits, so replay never meets a conflict intake could have detected). Still open: the NIP-46 signer-session client
-wiring, and the
-live fetch-on-open transport; garbage collection does
+transport identity distribution that makes fetch real against peers has
+landed: announcement Bao roots, author-signed announcements, the durable
+serving vault, an Engine-owned announcement projection that gates every
+announcement at intake (route updates replace — last accepted route wins;
+immutable forks are rejected before the fact commits, so replay never
+meets a conflict intake could have detected), and the real-iroh serving
+router: a serving endpoint over the vault answers peer fetches by
+transport root, announcement `node_addr` routes publish into the fetch
+plane on every sync pass, and a serving restart's route update rewires
+serving (contract 13). Still open: the NIP-46 signer-session client
+wiring, multi-relay mailbox supervision and relay interop coverage, and
+the
+live write path behind the FUSE mount; garbage collection does
 not exist. `wyrd-fuse` is a
 mount-free view behind the daemon's FUSE backend. All crypto and sync
 work follows `trust.md` and `epochs.md` as normative contracts; the

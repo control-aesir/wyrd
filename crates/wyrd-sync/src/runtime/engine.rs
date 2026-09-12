@@ -84,6 +84,12 @@ pub enum EngineError {
     NotAMember,
     #[error("no held control key for epoch {0}")]
     MissingEpochKey(u64),
+    #[error("capability authorization failed: {0}")]
+    Capability(#[from] crate::keys::CapabilityError),
+    #[error("ingest limits rejected authored content: {0:?}")]
+    Ingest(#[from] crate::ingest::IngestError),
+    #[error("chunk {0} is neither locally sealed nor covered by a held recorded mapping")]
+    ChunkUnavailable(ContentId),
     #[error("no root manifest record for snapshot {0}: author the manifest before announcing")]
     RootManifestUnavailable(SnapshotId),
     #[error("control sealing failed: {0}")]
@@ -206,6 +212,14 @@ pub struct Engine {
     /// drops key material the device still holds. Zeroizing values:
     /// revoked epochs must not linger in process memory.
     pub(super) epoch_keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
+    /// Authored sealed envelopes from local writes: manifests (root and
+    /// children) plus fresh chunk seals, keyed by their vault-visible
+    /// address. The producer's own representations — the serving surface
+    /// drains these into the network backend. In-memory: a restart drops
+    /// the bytes while the mappings survive durably as recorded
+    /// representations (the untrusted-hint pattern), so a restarted
+    /// device re-seals what it can and serves what it holds.
+    pub(super) authored: BTreeMap<StorageId, std::sync::Arc<Vec<u8>>>,
     pub(super) log: MembershipLog,
     pub(super) pending: HashMap<ControlMessageId, Message>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
@@ -259,6 +273,7 @@ impl Engine {
             store,
             inbox: ControlInbox::new(drive),
             epoch_keys: BTreeMap::new(),
+            authored: BTreeMap::new(),
             log: MembershipLog::new(drive),
             pending: HashMap::new(),
             fetch_run: 0,
@@ -377,6 +392,12 @@ impl Engine {
     /// state is a snapshot; fetch execution remains owned by the engine.
     pub fn runtime_state(&self) -> Result<super::RuntimeState, EngineError> {
         Ok(self.store.rebuild(self.device)?.runtime)
+    }
+
+    /// The sealed envelopes this device authored and holds: the serving
+    /// surface's producer side (see the `authored` field doc).
+    pub fn authored_envelopes(&self) -> &BTreeMap<StorageId, std::sync::Arc<Vec<u8>>> {
+        &self.authored
     }
 
     /// The classified live-head projection: the verified snapshot bodies
@@ -553,6 +574,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::authorization::test_util::sign_snapshot;
+    use crate::durable::AuthorizedCapability;
+    use crate::keys::capability::Capability;
+    use crate::seal::{EncryptedObject, SEAL_VERSION};
     use wyrd_format::membership::Admission;
     use wyrd_format::{
         Change, ContentId, Entry, MemoryObjectStore, ObjectKind, Snapshot, TransitionId, Tree,
@@ -565,8 +589,8 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
         announcement_msg, capability_message_for, deliver, drain, encryption_key, fixture,
-        identity, publish_into, queue, record_root_manifest, transition_message, MemoryMailbox,
-        MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
+        identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
+        PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::transport::mailbox::{
         seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
@@ -1080,6 +1104,90 @@ mod tests {
         );
     }
 
+    /// Decision 26's correspondence, end to end: every mapping the local
+    /// write path authors names a sealed envelope this device holds, the
+    /// AEAD tag verifies over the bound AAD, the plaintext hashes back to
+    /// the ContentId, and the mapping's transport root is exactly the raw
+    /// BLAKE3 of the envelope bytes it names. Fresh nonces make the bytes
+    /// unreproducible across seals, so this is per-representation, not
+    /// per-seal.
+    #[test]
+    fn authored_manifests_name_envelopes_the_device_actually_seals() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+        let mut objects = MemoryObjectStore::default();
+        let root_chunk = objects.insert(ObjectKind::Chunk, b"root payload").unwrap();
+        let nested_chunk = objects
+            .insert(ObjectKind::Chunk, b"nested payload")
+            .unwrap();
+        let leaf = Tree::from_entries(vec![
+            Entry::file("leaf.txt", 14, false, vec![nested_chunk]).unwrap()
+        ])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+        let root = Tree::from_entries(vec![
+            Entry::file("file.txt", 12, false, vec![root_chunk]).unwrap(),
+            Entry::dir("nested", leaf).unwrap(),
+        ])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+
+        let authored = pair.a.engine.author_snapshot(&objects, root).unwrap();
+        let snapshot_id = authored.snapshot().snapshot_id();
+        let epoch = authored.snapshot().epoch;
+        assert_eq!(epoch, 3, "bound to the canonical tip");
+
+        let state = pair.a.engine.runtime_state().unwrap();
+        let root_record = state
+            .root_manifest_record(&snapshot_id)
+            .expect("the authored root manifest records with the head");
+        assert_eq!(root_record.manifest.snapshot, snapshot_id);
+        assert_eq!(root_record.manifest.entries.len(), 1);
+        let link = &root_record.manifest.children[0];
+        assert_eq!(link.tree, leaf, "the child link names the subtree tree");
+        let child = state
+            .manifest_record(&link.manifest)
+            .expect("the authored child manifest records before the parent");
+        assert_eq!(child.manifest.snapshot, snapshot_id);
+        assert_eq!(child.manifest.entries.len(), 1);
+        assert!(
+            child.manifest.children.is_empty(),
+            "leaf manifests map flat"
+        );
+
+        let epoch_secret = secret(0x07 + epoch as u8);
+        let envelopes = pair.a.engine.authored_envelopes().clone();
+        for (entry, expected) in [
+            (&root_record.manifest.entries[0], &b"root payload"[..]),
+            (&child.manifest.entries[0], &b"nested payload"[..]),
+        ] {
+            let envelope = envelopes.get(&entry.storage_id).expect("held envelope");
+            let obj = EncryptedObject::decode(envelope).unwrap();
+            assert_eq!(obj.storage_id(), entry.storage_id, "vault address");
+            assert_eq!(
+                crate::seal::transport_root(&obj),
+                entry.transport,
+                "the transport root is exactly the envelope bytes"
+            );
+            let opened = crate::seal::verify(
+                entry,
+                &epoch_secret.object_key(
+                    &member_drive(),
+                    epoch,
+                    &entry.content_id,
+                    ObjectKind::Chunk,
+                    SEAL_VERSION,
+                ),
+                envelope,
+            )
+            .unwrap();
+            assert_eq!(opened.as_slice(), expected);
+        }
+    }
+
     #[test]
     fn authoring_rejects_an_unavailable_noncanonical_or_misaddressed_root() {
         let (mut pair, _, _) = scenario();
@@ -1202,12 +1310,6 @@ mod tests {
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
         let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
-        record_root_manifest(
-            &mut pair.a.engine,
-            &member_drive(),
-            &secret(0x07 + authored.snapshot().epoch as u8),
-            authored.snapshot(),
-        );
         let sent = {
             let mut mailbox = MemoryMailbox {
                 relay: &mut pair.relay,
@@ -1237,15 +1339,34 @@ mod tests {
         queue(&mut f, vec![envelope]);
         assert_eq!(drain(&mut f).accepted, 1);
 
+        // The authoring device holds its epoch material through a
+        // self-capability fact (the production custody path mints it at
+        // bootstrap): the keyring rebuilt from facts then covers epoch 1.
+        let state = f.engine.log.state_of(&genesis.transition_id()).unwrap();
+        let registered = state.encryption_key_of(&f.recipient).copied().unwrap();
+        let cap = Capability::new(
+            member_drive(),
+            f.recipient,
+            registered,
+            genesis.transition_id(),
+            1,
+            vec![EpochSecret::from_bytes([0x07; 32])],
+        )
+        .unwrap();
+        let authorized = AuthorizedCapability::authorize(
+            cap,
+            member_drive(),
+            &f.engine.log,
+            &genesis.transition_id(),
+        )
+        .unwrap();
+        f.engine
+            .commit_facts(&[Fact::Capability(authorized)])
+            .unwrap();
+
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
         let authored = f.engine.author_snapshot(&objects, tree).unwrap();
-        record_root_manifest(
-            &mut f.engine,
-            &member_drive(),
-            &EpochSecret::from_bytes([0x07; 32]),
-            authored.snapshot(),
-        );
         let mut mailbox = MemoryMailbox {
             relay: &mut f.relay,
             owner: f.recipient,
@@ -1323,12 +1444,6 @@ mod tests {
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
         let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
-        record_root_manifest(
-            &mut pair.a.engine,
-            &member_drive(),
-            &secret(0x07 + authored.snapshot().epoch as u8),
-            authored.snapshot(),
-        );
 
         let mut mailbox = FailingMailbox {
             sent: 0,
@@ -1362,6 +1477,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![id],
             "the authored head reclassifies from durable facts"
+        );
+        // The authored manifest hierarchy rehydrates with the head: the
+        // announcement path needs it after every restart.
+        assert!(
+            pair.a
+                .engine
+                .runtime_state()
+                .unwrap()
+                .root_manifest_record(&id)
+                .is_some(),
+            "the authored root manifest survives the restart"
         );
     }
 

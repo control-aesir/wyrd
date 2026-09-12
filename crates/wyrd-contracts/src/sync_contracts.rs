@@ -272,7 +272,6 @@ fn failed_projection_leaves_installed_heads_untouched() {
 #[test]
 fn authored_snapshots_mount_through_the_daemon_view() {
     let mut rig = Rig::new();
-    let mut engine = rig.take_engine();
 
     let mut store = MemoryObjectStore::default();
     let chunk = store.insert(ObjectKind::Chunk, b"alpha").unwrap();
@@ -282,6 +281,16 @@ fn authored_snapshots_mount_through_the_daemon_view() {
     .unwrap()
     .insert_into(&mut store)
     .unwrap();
+
+    // Authorship seals the mapped content, so the engine holds its epoch
+    // material through the same capability facts any member does: the rig
+    // delivers the self-capability for the canonical tip before the write.
+    let admit = rig.admit.clone();
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability(&admit, &secrets);
+    let report = rig.drain();
+    assert_eq!(report.accepted, 1, "the self-capability lands");
+    let mut engine = rig.take_engine();
 
     let authored = engine.author_snapshot(&store, tree).unwrap();
     assert_eq!(authored.snapshot().author, rig.recipient.id);

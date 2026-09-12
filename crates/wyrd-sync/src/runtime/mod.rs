@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wyrd_format::{
-    BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, Snapshot,
-    SnapshotId, StorageId,
+    BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ManifestEntry, ObjectKind,
+    Snapshot, SnapshotId, StorageId,
 };
 
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
@@ -264,6 +264,11 @@ impl RuntimeState {
         self.announcements.get(snapshot)
     }
 
+    /// The record for one manifest id, if recorded.
+    pub fn manifest_record(&self, manifest: &ContentId) -> Option<&ManifestRecord> {
+        self.manifests.get(manifest)
+    }
+
     /// The root-manifest record for one snapshot, if recorded. More than
     /// one root manifest can be recorded for a snapshot only through
     /// hostile or buggy records; the deterministic smallest manifest id
@@ -274,6 +279,18 @@ impl RuntimeState {
         let roots = self.root_manifests_by_snapshot.get(snapshot)?;
         let manifest_id = roots.iter().next()?;
         self.manifests.get(manifest_id)
+    }
+
+    /// The first recorded mapping for one plaintext content, in
+    /// manifest-id order (deterministic under replay). The untrusted-hint
+    /// lookup: acting on a mapping additionally requires holding its
+    /// epoch capability, which is the caller's (authoring path's) check.
+    pub fn recorded_mapping(&self, content: &ContentId) -> Option<ManifestEntry> {
+        self.manifests
+            .values()
+            .flat_map(|record| &record.manifest.entries)
+            .find(|entry| &entry.content_id == content)
+            .cloned()
     }
 
     /// Record a signature-verified snapshot body. The body must agree

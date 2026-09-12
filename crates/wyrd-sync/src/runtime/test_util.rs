@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use wyrd_format::membership::Admission;
 use wyrd_format::{
-    BaoRoot, Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Manifest,
+    BaoRoot, Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, Manifest,
     MembershipTransition, ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
@@ -234,36 +234,6 @@ pub(crate) fn announcement_msg(
 /// (e.g. a membership Builder's owner).
 pub(crate) fn identity_secret(sk: &SecretKey) -> DeviceIdentitySecret {
     DeviceIdentitySecret::from_bytes(sk.secret_bytes()).unwrap()
-}
-
-/// Record the root manifest an authored snapshot needs before its
-/// announcement can name transport identities: an empty manifest sealed
-/// under the snapshot's manifest key, committed as a durable fact. The
-/// production write path authors its manifest itself; scenarios use
-/// this stand-in until that slice lands.
-pub(crate) fn record_root_manifest(
-    engine: &mut Engine,
-    drive: &DriveId,
-    epoch_secret: &EpochSecret,
-    body: &Snapshot,
-) {
-    let manifest = Manifest {
-        snapshot: body.snapshot_id(),
-        entries: Vec::new(),
-        children: Vec::new(),
-    };
-    let key = epoch_secret.manifest_key(drive, body.epoch, &body.snapshot_id());
-    let (manifest_id, obj) = crate::seal::seal_manifest(&key, &manifest).unwrap();
-    let record = super::ManifestRecord {
-        is_root: true,
-        manifest_id,
-        storage_ids: BTreeSet::from([obj.storage_id()]),
-        transport: crate::seal::transport_root(&obj),
-        manifest,
-    };
-    engine
-        .commit_facts(&[crate::durable::Fact::Manifest(record)])
-        .unwrap();
 }
 
 pub(crate) fn transition_message(t: &MembershipTransition) -> Message {

@@ -18,4 +18,4 @@ pub mod live_mailbox;
 #[cfg(test)]
 pub(crate) mod mini_relay;
 
-pub use core::{Daemon, DaemonError};
+pub use core::{Daemon, DaemonError, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};

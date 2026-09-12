@@ -192,11 +192,13 @@ mod tests {
     use super::*;
 
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, Snapshot,
-        SnapshotId, StorageId,
+        ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, SharedStore,
+        Snapshot, SnapshotId, StorageId,
     };
 
     use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -1602,5 +1604,121 @@ mod tests {
             Some(&1),
             "duplicate entries across manifests fetch once"
         );
+    }
+
+    /// A bulk peer that stalls inside fetches until released: models a
+    /// slow peer without sleeping a fixed duration.
+    struct BlockingBulk {
+        inner: MemoryBulkSource,
+        entered: std::sync::Arc<AtomicBool>,
+        release: std::sync::Arc<AtomicBool>,
+    }
+
+    impl BlockingBulk {
+        fn stall(&mut self) {
+            self.entered.store(true, Ordering::Relaxed);
+            while !self.release.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl BulkSource for BlockingBulk {
+        fn fetch_root_manifest(
+            &mut self,
+            snapshot: &SnapshotId,
+            max: usize,
+        ) -> Result<Option<SealedManifest>, BulkError> {
+            self.stall();
+            self.inner.fetch_root_manifest(snapshot, max)
+        }
+
+        fn fetch_snapshot(
+            &mut self,
+            snapshot: &SnapshotId,
+            max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
+            self.stall();
+            self.inner.fetch_snapshot(snapshot, max)
+        }
+
+        fn fetch_sealed(
+            &mut self,
+            storage: &StorageId,
+            max: usize,
+        ) -> Result<Option<Vec<u8>>, BulkError> {
+            self.stall();
+            self.inner.fetch_sealed(storage, max)
+        }
+    }
+
+    /// Serving reads proceed while a fetch waits on a slow peer: the
+    /// fetch plan must not hold the store lock across bulk I/O. The
+    /// fetch thread stalls inside the bulk read; the main thread
+    /// performs fifty serving reads through the same shared handle,
+    /// which would deadlock (or fail the try-lock) if any
+    /// serving-blocking lock were held across the fetch.
+    #[test]
+    fn serving_reads_proceed_while_fetch_waits_on_bulk() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let mut inner = MemoryBulkSource::default();
+        intake_snapshot(
+            &mut fixture,
+            &mut inner,
+            &builder,
+            &genesis,
+            &admission,
+            vec![
+                EpochSecret::from_bytes([0x08; 32]),
+                EpochSecret::from_bytes([0x09; 32]),
+            ],
+        );
+
+        let shared = SharedStore::new(MemoryObjectStore::default());
+        let raw = shared.handle();
+        let reader = SharedStore::from(std::sync::Arc::clone(&raw));
+        let entered = std::sync::Arc::new(AtomicBool::new(false));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let mut blocking = BlockingBulk {
+            inner,
+            entered: std::sync::Arc::clone(&entered),
+            release: std::sync::Arc::clone(&release),
+        };
+        let probe = ContentId::from_bytes([0xAB; 32]);
+        std::thread::scope(|scope| {
+            let fetch = scope.spawn(|| {
+                let mut shared = shared;
+                fixture.engine.execute_plan(&mut blocking, &mut shared)
+            });
+            // Bounded wait: if the plan never consults bulk there is
+            // no pending work and the fixture (not the locking) is
+            // wrong — fail loudly instead of hanging.
+            let start = Instant::now();
+            while !entered.load(Ordering::Relaxed) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(15),
+                    "fetch plan never reached the bulk peer"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            for _ in 0..50 {
+                // Scoped so the probe guard releases before the fetch
+                // thread needs the write lock on release.
+                {
+                    let _guard = raw
+                        .try_read()
+                        .expect("no serving-blocking lock held across bulk fetch");
+                    reader
+                        .has(&probe)
+                        .expect("concurrent serving read succeeds");
+                }
+            }
+            release.store(true, Ordering::Relaxed);
+            let report = fetch.join().expect("fetch thread").unwrap();
+            assert_eq!(report.snapshot_bodies, 1);
+        });
     }
 }

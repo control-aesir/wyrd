@@ -13,6 +13,9 @@ use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::{Engine, EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
+use wyrd_sync::transport::mailbox::{
+    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+};
 
 use crate::support::{
     mount_heads, scratch_dir, signed_transition, Loaded, RemoteOnlyMaterialization, Rig,
@@ -133,6 +136,87 @@ fn only_engine_classification_mounts_the_daemon_view() {
     assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"hello");
 
     drop(daemon);
+    loaded.rig.teardown();
+}
+
+/// A mailbox that fails its first settlement, modeling a lost
+/// acknowledgement: the envelope stays queued (retain-on-failure),
+/// durable commits stand, and the pass aborts before republication.
+struct FailFirstSettle<'a, M: Mailbox> {
+    inner: &'a mut M,
+    armed: bool,
+}
+
+impl<'a, M: Mailbox> FailFirstSettle<'a, M> {
+    fn new(inner: &'a mut M) -> Self {
+        FailFirstSettle { inner, armed: true }
+    }
+}
+
+impl<M: Mailbox> Mailbox for FailFirstSettle<'_, M> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        self.inner.send(envelope)
+    }
+
+    fn recv(&mut self) -> Option<Delivery> {
+        self.inner.recv()
+    }
+
+    fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+        if self.armed {
+            self.armed = false;
+            return Err(MailboxError::Transport("lost acknowledgement".into()));
+        }
+        self.inner.settle(id, disposition)
+    }
+}
+
+/// A failed pass must not strand a durable commit behind a stale
+/// projection. Intake commits the capability, settlement fails, and
+/// the pass aborts before republication — the backend stays empty.
+/// The next pass redelivers (duplicate), commits the announcement,
+/// fetches through the preloaded peer, and serves: recovery never
+/// waits for anything beyond the already-durable state.
+#[test]
+fn failed_pass_recovers_serving_on_retry() {
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    loaded.publish_body_and_announcement();
+    loaded.publish_all();
+
+    let engine = loaded.rig.take_engine();
+    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let (mut live, backend) = daemon.into_live();
+    for id in &loaded.content.content_ids {
+        live.want(*id).unwrap();
+    }
+
+    // Pass 1: the capability commits, then its acknowledgement is
+    // lost. The announcement is never offered, the pass aborts, and
+    // the serving projection stays empty — no premature publication.
+    {
+        let mut flaky = FailFirstSettle::new(&mut loaded.rig.relay);
+        let pass1 = live.sync_once(&mut flaky, None::<&mut MemoryBulkSource>);
+        assert!(pass1.is_err(), "settle failure aborts the pass");
+    }
+    assert!(
+        backend.open_at("keeper.txt").is_err(),
+        "a failed pass publishes nothing"
+    );
+
+    // Pass 2: the announcement commits, the preloaded peer serves
+    // body, manifest, and objects, and republication mounts the
+    // drive. The capability needs no redelivery: it committed
+    // durably in pass 1 despite the lost acknowledgement (this fake
+    // offers each envelope once per lifetime; live relays re-offer
+    // until acked, which collapses to a duplicate no-op).
+    let report = live
+        .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+        .unwrap();
+    assert_eq!(report.drained.duplicates, 0);
+    assert_eq!(report.drained.accepted, 1, "the announcement commits");
+    assert_eq!(report.fetched.snapshot_bodies, 1);
+    let handle = backend.open_at("keeper.txt").expect("recovered serving");
+    assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"keeper");
     loaded.rig.teardown();
 }
 

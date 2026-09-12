@@ -889,6 +889,48 @@ mod tests {
         assert_quiet(&mut mailbox);
     }
 
+    /// Backlog pressure: more wraps than the notification channel
+    /// holds still all arrive exactly once. Overflow backpressures
+    /// into the relay (which retains everything); the seen log
+    /// dedupes replays, so flooding costs latency, never loss or
+    /// duplicates.
+    #[test]
+    fn flood_beyond_channel_capacity_delivers_all_once() {
+        const FLOOD: usize = 1500;
+        // Compile-time proof the flood exceeds the channel bound.
+        const _: () = assert!(FLOOD > INCOMING_CAPACITY);
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+
+        let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-flood"));
+        for index in 0..FLOOD {
+            let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), format!("payload-{index}"))
+                .tag(Tag::public_key(receiver.public_key()))
+                .finalize_unsigned(sender.public_key());
+            relay.inject(
+                GiftWrapBuilder::new(receiver.public_key(), rumor)
+                    .finalize(&sender)
+                    .unwrap(),
+            );
+        }
+
+        let mut payloads = std::collections::HashSet::new();
+        for _ in 0..FLOOD {
+            let delivery =
+                wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("each wrap arrives");
+            assert!(
+                payloads.insert(delivery.envelope().ciphertext.clone()),
+                "no duplicate deliveries"
+            );
+            mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
+        }
+        assert_eq!(payloads.len(), FLOOD);
+        assert_quiet(&mut mailbox);
+    }
+
     #[test]
     fn signer_owner_mismatch_rejected() {
         // A NIP-46 session pointed at the wrong identity must fail at

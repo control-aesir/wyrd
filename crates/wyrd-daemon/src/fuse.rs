@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use fuser::{FileHandle, INodeNo, LockOwner, OpenFlags};
 use std::ffi::OsStr;
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wyrd_format::ObjectStore;
@@ -106,12 +106,14 @@ impl InodeTable {
 /// The read-only FUSE backend over one drive's view. The view sits
 /// behind a lock so the engine can advance heads in place; open file
 /// descriptors never notice, because they serve their open-time
-/// capture.
+/// capture. The lock is reference-counted so a live daemon loop can
+/// hold the same view the session serves: both sides take the lock,
+/// swap or read, and drop — never held across a kernel callback.
 pub struct FuseBackend<S: ObjectStore, M: Materialization>
 where
     S::Error: std::fmt::Debug,
 {
-    view: RwLock<DriveView<S, M>>,
+    view: Arc<RwLock<DriveView<S, M>>>,
     inodes: RwLock<InodeTable>,
     directories: RwLock<DirectoryState>,
     files: Mutex<OpenFiles>,
@@ -168,7 +170,26 @@ where
 {
     pub fn new(view: DriveView<S, M>) -> Self {
         FuseBackend {
-            view: RwLock::new(view),
+            view: Arc::new(RwLock::new(view)),
+            inodes: RwLock::new(InodeTable::new()),
+            directories: RwLock::new(DirectoryState {
+                entries: HashMap::new(),
+                next_handle: 1,
+            }),
+            files: Mutex::new(OpenFiles {
+                by_handle: HashMap::new(),
+                next: 1,
+            }),
+        }
+    }
+
+    /// Serve a view owned elsewhere (the live daemon loop's half): the
+    /// backend shares the lock rather than copying the view, so head and
+    /// materialization updates land without remounting. Each backend keeps
+    /// its own inode tables; construct once per session.
+    pub fn shared(view: Arc<RwLock<DriveView<S, M>>>) -> Self {
+        FuseBackend {
+            view,
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),

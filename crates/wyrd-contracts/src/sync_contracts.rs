@@ -29,7 +29,7 @@ use crate::support::{
 #[test]
 fn unverified_snapshots_never_become_live_fuse_heads() {
     let mut loaded = Loaded::new("keeper.txt", b"keeper");
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     loaded.publish_all();
 
     // A second snapshot announced exactly as honestly, but its body
@@ -53,6 +53,7 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
         loaded.rig.admit_id,
         2,
         crate::support::AnnouncedRoots::placeholders(),
+        None,
     );
 
     let report = loaded.drain();
@@ -107,7 +108,7 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
 #[test]
 fn only_engine_classification_mounts_the_daemon_view() {
     let mut loaded = Loaded::new("hello.txt", b"hello");
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     loaded.publish_all();
 
     let mut engine = loaded.rig.take_engine();
@@ -183,7 +184,7 @@ impl<M: Mailbox> Mailbox for FailFirstSettle<'_, M> {
 #[test]
 fn failed_pass_recovers_serving_on_retry() {
     let mut loaded = Loaded::new("keeper.txt", b"keeper");
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     loaded.publish_all();
 
     let engine = loaded.rig.take_engine();
@@ -233,7 +234,7 @@ fn failed_pass_recovers_serving_on_retry() {
 #[test]
 fn failed_projection_leaves_installed_heads_untouched() {
     let mut loaded = Loaded::new("hello.txt", b"hello");
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     loaded.publish_all();
 
     let mut engine = loaded.rig.take_engine();
@@ -366,6 +367,7 @@ fn deferred_messages_survive_queue_pressure() {
             child_id,
             3,
             crate::support::AnnouncedRoots::placeholders(),
+            None,
         );
     }
     let report = rig.drain();
@@ -438,7 +440,7 @@ fn bulk_ceilings_stay_bounded_and_oversize_fails_closed() {
     let mut loaded = Loaded::new("bounded.txt", b"bounded body");
     // The snapshot body is served; only the root manifest is hostile.
     let snapshot_id = loaded.snapshot.snapshot_id();
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     let report = loaded.drain();
     assert_eq!(report.accepted, 2, "capability and announcement");
 

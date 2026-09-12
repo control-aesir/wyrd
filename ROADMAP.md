@@ -88,11 +88,12 @@ state transitions, and fuzzing for the envelope and decoder surfaces.
 
 ## Current Focus: The Live Network and the Write Path
 
-What comes next, roughly in order:
+The serving router loopback has landed: a real-iroh endpoint over the
+durable vault serves peer fetches by transport root, announcement
+`node_addr` routes publish into the fetch plane on every sync pass, and a
+serving restart's route update rewires serving (contract 13). What comes
+next, roughly in order:
 
-- serving router loopback: one real-iroh daemon serving a peer end to end
-  (announcements, manifest, and object fetch against `wyrd-sync`'s durable
-  vault), turning the bulk-source contract into live transport
 - multi-relay mailbox: cancel-aware recovery supervision for a relay pool
   (`refactor(daemon): cancel-aware recovery supervision for a multi-relay
   mailbox`)

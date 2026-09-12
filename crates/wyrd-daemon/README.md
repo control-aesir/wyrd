@@ -36,7 +36,8 @@ filesystem semantics belong in `wyrd-fuse`.
 ## Status
 
 Read-only FUSE mount, fetch-on-open, authored writes through the daemon
-API, and the durable serving vault (`Daemon::serve`) are in place and
-under test. Pending: the real-iroh serving router loopback (peers dialing
-`wyrd mount` over live transport), the multi-relay mailbox, NIP-46 signer
-wiring, and write support behind the mount.
+API, the durable serving vault (`Daemon::serve`), and the real-iroh
+serving endpoint (`Daemon::open_serving`: peers dial the drive over live
+transport; the sync pass publishes announcement routes into the fetch
+plane) are in place and under test. Pending: the multi-relay mailbox,
+NIP-46 signer wiring, and write support behind the mount.

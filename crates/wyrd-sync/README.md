@@ -30,7 +30,7 @@ encrypted manifests, roles × materialization.
 - Nostr identity verification: snapshot signatures against member pubkeys,
   encrypted control plane for membership/rotation (never public relays)
 - Scrub detection downstream of the store and repair from other peers
-  (pending: needs the serving router)
+  (pending: needs the repair loop)
 
 ## What does not belong here
 
@@ -42,10 +42,11 @@ store is append-only for now), and any filesystem presentation (that is
 
 The protocol/core and runtime sync layers are in place and under test:
 control-plane intake with ingest limits, transport identity distribution,
-fetch-on-open demand machinery, the vault serving path, and recovery.
-Pending: the real-iroh serving router peers dial into (`IrohBulkSource` is
-the client side), multi-relay supervision, NIP-46 remote signing, and
-scrub/repair wiring.
+fetch-on-open demand machinery, the vault serving path, the real-iroh
+serving router (`ServingEndpoint` over the vault; `IrohBulkSource` is the
+client side and routes publish from announcement `node_addr` bytes on
+every pass), and recovery. Pending: multi-relay supervision, NIP-46
+remote signing, and scrub/repair wiring.
 
 ## Version policy
 

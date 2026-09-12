@@ -47,9 +47,17 @@
 //! 12. `a_bootstrapped_drive_serves_its_first_authored_snapshot` — a
 //!     drive created by the production bootstrap (identity, root,
 //!     genesis) serves its first authored snapshot (`docs/epochs.md`).
+//! 13. `a_serving_daemon_serves_a_peer_over_live_iroh` — the serving
+//!     router loopback: a real-iroh endpoint over the durable vault
+//!     serves a peer's fetch from announcement routes alone, and a
+//!     serving restart's route update rewires subsequent fetches
+//!     (`sync-and-peers.md` exchange; tracking issue: real-iroh
+//!     serving router loopback).
 
 #[cfg(test)]
 mod fuse_contracts;
+#[cfg(test)]
+mod serving_contracts;
 #[cfg(test)]
 mod support;
 #[cfg(test)]

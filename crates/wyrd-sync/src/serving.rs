@@ -16,13 +16,17 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr};
+use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
 use thiserror::Error;
 use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
 use crate::bulk::{BulkError, BulkSource, SealedManifest};
 use crate::runtime::RuntimeState;
 use crate::seal::blob_root;
+use crate::transport::encode_node_addr;
 
 /// The vault directory inside a drive directory.
 const VAULT_DIR: &str = "vault";
@@ -43,6 +47,23 @@ pub enum VaultError {
 /// named by the root's hex, written atomically and never rewritten.
 pub struct Vault {
     dir: PathBuf,
+    /// The live serving mirror's write-through channel, attached by
+    /// [`ServingEndpoint::open`] and replaced (never co-held) on reopen.
+    /// Imports enqueue after the durable rename, so the vault stays the
+    /// source of truth and the mirror is a derived, self-healing cache:
+    /// a dropped channel or a failed mirror import only delays serving
+    /// until the next boot rebuild.
+    mirror: Mutex<Option<tokio::sync::mpsc::UnboundedSender<MirrorItem>>>,
+}
+
+/// One write-through item for the serving mirror.
+pub(crate) enum MirrorItem {
+    /// Newly durable sealed bytes to import into the serving store.
+    Import(Vec<u8>),
+    /// A drain barrier: the sender unblocks once every earlier import
+    /// has landed, so callers can order serving readiness against
+    /// announcement (flush before announcing an address).
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 impl Vault {
@@ -50,7 +71,10 @@ impl Vault {
     pub fn open(drive_dir: &Path) -> Result<Self, VaultError> {
         let dir = drive_dir.join(VAULT_DIR);
         std::fs::create_dir_all(&dir)?;
-        Ok(Vault { dir })
+        Ok(Vault {
+            dir,
+            mirror: Mutex::new(None),
+        })
     }
 
     /// Import sealed bytes: the file name is the bytes' own transport
@@ -75,7 +99,20 @@ impl Vault {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &path)?;
+        // Write-through to the serving mirror, after the rename: a
+        // dead channel only delays serving until the next boot
+        // rebuild, never the publication.
+        if let Some(sender) = self.mirror.lock().expect("vault mirror lock").as_ref() {
+            let _ = sender.send(MirrorItem::Import(sealed.to_vec()));
+        }
         Ok(root)
+    }
+
+    /// Attach the write-through channel of a serving mirror. Replacing
+    /// an already-attached channel strands the old one (its sends fail
+    /// and are ignored); a serving restart is the normal replacement.
+    pub(crate) fn attach_mirror(&self, sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>) {
+        *self.mirror.lock().expect("vault mirror lock") = Some(sender);
     }
 
     /// The sealed bytes at a transport root, if held — and the read is
@@ -119,6 +156,159 @@ impl Vault {
 
     fn path(&self, root: &BaoRoot) -> PathBuf {
         self.dir.join(root.to_string())
+    }
+}
+
+/// The vault directory inside a drive directory holding the serving
+/// mirror's own bao-encoded copy of held representations. The vault is
+/// the durable source of truth; this directory is derived state,
+/// rebuilt from it on every [`ServingEndpoint::open`]. The copy is the
+/// cost of riding iroh-blobs' supported serving path instead of a
+/// version-coupled custom store backend; unifying the two stores is a
+/// post-v1 storage question (GC does not exist in v0).
+const SERVE_DIR: &str = "serve";
+
+/// A real-iroh serving surface over the durable vault.
+///
+/// One iroh endpoint accepting iroh-blobs fetches from an [`FsStore`]
+/// mirror beside the vault: every sealed representation the vault holds
+/// is servable by its transport root, which is exactly the address the
+/// verified transfer checks. The mirror is derived state — rebuilt from
+/// the vault at [`open`](Self::open), fed write-through through the
+/// vault's attached channel, and healed by the next restart when either
+/// side drifts.
+///
+/// The endpoint owns its own multi-thread runtime (the router and the
+/// write-through drain are spawned tasks on it), so composition stays
+/// sync: [`open`](Self::open) returns with serving fully live, and
+/// [`flush`](Self::flush) orders serving readiness against announcement
+/// (flush before announcing the address, so a peer that acts on the
+/// announcement finds every byte importable).
+pub struct ServingEndpoint {
+    runtime: tokio::runtime::Runtime,
+    router: Router,
+    endpoint: Endpoint,
+    /// Clone of the write-through channel, for [`flush`](Self::flush).
+    sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+}
+
+impl ServingEndpoint {
+    /// Serve the vault over a default iroh endpoint: N0 relays for
+    /// reachability, standard address discovery.
+    pub fn open(vault: &Vault, drive_dir: &Path) -> std::io::Result<Self> {
+        Self::open_with(vault, drive_dir, Endpoint::builder(presets::N0))
+    }
+
+    /// Serve the vault over a relay-disabled loopback endpoint with
+    /// address discovery cleared: hermetic serving for two daemons on
+    /// one host, the shape the contract suite composes.
+    pub fn open_loopback(vault: &Vault, drive_dir: &Path) -> std::io::Result<Self> {
+        Self::open_with(
+            vault,
+            drive_dir,
+            Endpoint::builder(presets::N0DisableRelay).clear_address_lookup(),
+        )
+    }
+
+    fn open_with(
+        vault: &Vault,
+        drive_dir: &Path,
+        builder: iroh::endpoint::Builder,
+    ) -> std::io::Result<Self> {
+        let serve_dir = drive_dir.join(SERVE_DIR);
+        std::fs::create_dir_all(&serve_dir)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let endpoint = runtime
+            .block_on(builder.bind())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let store = runtime
+            .block_on(FsStore::load(&serve_dir))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        // Boot rebuild: every root the vault holds becomes servable.
+        // A sealed() read that fails verification names a corrupt
+        // vault file and is skipped (absence, not bytes under the
+        // wrong root); the vault is the truth and the next scrub or
+        // refetch repairs serving.
+        for root in vault.roots().map_err(std::io::Error::other)? {
+            let Some(sealed) = vault.sealed(&root).map_err(std::io::Error::other)? else {
+                continue;
+            };
+            runtime
+                .block_on(async { store.blobs().add_bytes(sealed).await })
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<MirrorItem>();
+        let blobs = store.blobs().clone();
+        let router = runtime.block_on(async {
+            tokio::spawn(async move {
+                let mut receiver = receiver;
+                while let Some(item) = receiver.recv().await {
+                    match item {
+                        MirrorItem::Import(bytes) => {
+                            // A failed mirror import only delays serving
+                            // until the next boot rebuild; the vault is
+                            // the source of truth.
+                            let _ = blobs.add_bytes(bytes::Bytes::from(bytes)).await;
+                        }
+                        MirrorItem::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            });
+            Router::builder(endpoint.clone())
+                .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+                .spawn()
+        });
+        vault.attach_mirror(sender.clone());
+        Ok(ServingEndpoint {
+            runtime,
+            router,
+            endpoint,
+            sender,
+        })
+    }
+
+    /// The endpoint's current connectable address: node id, direct ip
+    /// addresses, and relay url. This is what an announcement's
+    /// `node_addr` encodes; call [`flush`](Self::flush) first.
+    pub fn addr(&self) -> EndpointAddr {
+        self.endpoint.addr()
+    }
+
+    /// The endpoint's route as canonical announcement bytes.
+    pub fn node_addr_bytes(&self) -> Vec<u8> {
+        encode_node_addr(&self.addr())
+    }
+
+    /// Wait until every import enqueued so far has landed in the
+    /// serving mirror. Publication paths flush before announcing, so a
+    /// peer acting on the announcement never races the write-through.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        self.send(MirrorItem::Flush(ack))?;
+        self.runtime
+            .block_on(wait)
+            .map_err(|_| std::io::Error::other("serving mirror drain stopped"))
+    }
+
+    fn send(&self, item: MirrorItem) -> std::io::Result<()> {
+        self.sender
+            .send(item)
+            .map_err(|_| std::io::Error::other("serving mirror closed"))
+    }
+
+    /// Stop serving and drop the runtime. The vault's write-through
+    /// slot keeps the old (now dead) channel; reopening replaces it.
+    pub fn shutdown(self) -> std::io::Result<()> {
+        self.runtime
+            .block_on(async { self.router.shutdown().await })
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.runtime.block_on(self.endpoint.close());
+        Ok(())
     }
 }
 
@@ -191,6 +381,7 @@ impl VaultSource {
         Ok(VaultSource {
             vault: Vault {
                 dir: vault.dir.clone(),
+                mirror: Mutex::new(None),
             },
             roots,
             bodies,
@@ -277,6 +468,17 @@ impl BulkSource for VaultSource {
     }
 }
 
+impl crate::runtime::RoutePublishing for VaultSource {
+    /// The serving view holds bytes, not peer addresses: its tests and
+    /// callers populate routes directly when it doubles as a bulk peer.
+    fn publish_routes(
+        &mut self,
+        _engine: &crate::runtime::Engine,
+    ) -> Result<usize, crate::runtime::EngineError> {
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +496,106 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wyrd-vault-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Vault::open(&dir).unwrap()
+    }
+
+    #[test]
+    fn serving_endpoint_serves_vault_roots_over_iroh() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let sealed = b"verified through the serving endpoint".to_vec();
+        let root = vault.import(&sealed).unwrap();
+        // The write-through is async; flush orders serving readiness
+        // against the announcement a peer would act on.
+        serving.flush().unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut source =
+            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        source.publish_transport(crate::bulk::IrohBlobRef {
+            provider: serving.addr(),
+            hash: *root.as_bytes(),
+        });
+        assert_eq!(
+            source.fetch_transport(&root, usize::MAX).unwrap(),
+            Some(sealed)
+        );
+        // A root the vault never held is absence, not error.
+        assert_eq!(
+            source
+                .fetch_transport(&BaoRoot::from_bytes([0x33; 32]), usize::MAX)
+                .unwrap(),
+            None
+        );
+        source.shutdown();
+        serving.shutdown().unwrap();
+    }
+
+    #[test]
+    fn serving_reopen_rebuilds_the_mirror_from_the_vault() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let sealed = b"the mirror is derived state".to_vec();
+        let root = vault.import(&sealed).unwrap();
+        let first = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        first.flush().unwrap();
+        first.shutdown().unwrap();
+
+        // Reopen: the boot rebuild re-imports the vault's roots, so the
+        // representation serves again under its transport root.
+        let reopened = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut source =
+            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        source.publish_transport(crate::bulk::IrohBlobRef {
+            provider: reopened.addr(),
+            hash: *root.as_bytes(),
+        });
+        assert_eq!(
+            source.fetch_transport(&root, usize::MAX).unwrap(),
+            Some(sealed)
+        );
+        source.shutdown();
+        reopened.shutdown().unwrap();
+    }
+
+    #[test]
+    fn node_addr_bytes_round_trip_through_the_route_codec() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let decoded = crate::transport::decode_node_addr(&serving.node_addr_bytes()).unwrap();
+        assert_eq!(decoded.id, serving.addr().id);
+        serving.shutdown().unwrap();
+    }
+
+    fn serve_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("wyrd-serving-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]

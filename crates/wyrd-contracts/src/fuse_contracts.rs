@@ -79,7 +79,7 @@ fn changed_descendants_never_create_directory_path_conflicts() {
 #[test]
 fn open_fds_remain_stable_across_head_advancement() {
     let mut loaded = Loaded::new("stable.txt", b"version one");
-    loaded.publish_body_and_announcement();
+    loaded.publish_body_and_announcement(None);
     loaded.publish_all();
     let report = loaded.drain();
     assert_eq!(report.accepted, 2, "capability and announcement");

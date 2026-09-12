@@ -177,6 +177,23 @@ impl IrohBulkSource {
         Ok(Self::with_runtime(endpoint, Arc::new(runtime)))
     }
 
+    /// Create a source bound to a default iroh endpoint (N0 relays for
+    /// peer reachability) on a dedicated runtime: the binary's fetch
+    /// side, with no endpoint plumbing in the composer.
+    pub fn connect_default() -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let endpoint = runtime
+            .block_on(async {
+                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    .bind()
+                    .await
+            })
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Self::with_runtime(endpoint, Arc::new(runtime)))
+    }
+
     /// Publish the transport address for a snapshot's root manifest.
     pub fn publish_root(&mut self, snapshot: SnapshotId, content_id: ContentId, blob: IrohBlobRef) {
         self.roots.insert(snapshot, (content_id, blob));
@@ -232,6 +249,27 @@ impl IrohBulkSource {
             }
             bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
         })
+    }
+}
+
+impl crate::runtime::RoutePublishing for IrohBulkSource {
+    /// Push the engine's recorded routes into the address maps.
+    fn publish_routes(
+        &mut self,
+        engine: &crate::runtime::Engine,
+    ) -> Result<usize, crate::runtime::EngineError> {
+        engine.publish_bulk_routes(self)
+    }
+}
+
+impl crate::runtime::RoutePublishing for MemoryBulkSource {
+    /// The in-memory fake never carries live routes: its tests publish
+    /// addresses by hand.
+    fn publish_routes(
+        &mut self,
+        _engine: &crate::runtime::Engine,
+    ) -> Result<usize, crate::runtime::EngineError> {
+        Ok(0)
     }
 }
 

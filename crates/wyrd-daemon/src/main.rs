@@ -290,6 +290,20 @@ fn mount(
             .map_err(|error| CliError::Store(error.to_string()))?,
     )?;
     daemon.refresh_live_heads()?;
+
+    // Serving: a real-iroh endpoint over the drive's durable vault, so
+    // peers holding an announcement route can fetch what this drive
+    // holds. The fetch side is the matching real bulk source; routes
+    // publish from recorded announcements on every sync pass.
+    let serving = daemon
+        .open_serving(&drive_dir, false)
+        .map_err(CliError::Mount)?;
+    let mut bulk = bind_bulk_source()?;
+    eprintln!(
+        "serving over iroh: {}",
+        hex::encode(serving.addr().id.as_bytes())
+    );
+
     let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
     // The mailbox signs with the local identity key: open and signer
@@ -316,18 +330,17 @@ fn mount(
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
     let server = std::thread::spawn(move || session.run());
-    // No peer addressing exists yet, so the loop drains and publishes
-    // heads without fetching: `IrohBulkSource` names the source type
-    // the loop will take once peers land.
     let result = live.run_loop(
         &mut mailbox,
-        None::<&mut wyrd_sync::bulk::IrohBulkSource>,
+        Some(&mut bulk),
         &SHUTDOWN,
         &LiveConfig::default(),
         &mut |error, consecutive| {
             eprintln!("live sync pass failed ({consecutive} consecutive): {error}");
         },
     );
+    bulk.shutdown();
+    let _ = serving.shutdown();
 
     // Clean shutdown either way: unmount first so the kernel releases
     // the mountpoint, then reap the session thread, then report the
@@ -341,6 +354,12 @@ fn mount(
         Err(_) => Err(std::io::Error::other("FUSE session thread panicked")),
     };
     combine_status(result, session_result)
+}
+
+/// Bind the fetch side's iroh endpoint (N0 relays for peer
+/// reachability) and wrap it in the real bulk source.
+fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
+    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Mount)
 }
 
 /// Fold the loop and session outcomes into the process exit status: a

@@ -23,8 +23,10 @@
 //! ephemeral routing keys) is adopted for v0; revisit only if a concrete
 //! threat model demands it.
 
+pub mod addr;
 pub mod mailbox;
 pub mod signer;
 
+pub use addr::{decode_node_addr, encode_node_addr};
 pub use mailbox::{Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError};
 pub use signer::{SignerError, SignerSession};

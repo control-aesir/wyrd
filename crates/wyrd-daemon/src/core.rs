@@ -14,8 +14,9 @@ use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore
 use wyrd_fuse::{DriveView, Materialization, VerifiedSnapshot, ViewHead};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
-    bulk::BulkSource,
-    runtime::{DrainReport, Engine, EngineError, ExecuteReport, MaterializationState},
+    runtime::{
+        DrainReport, Engine, EngineError, ExecuteReport, MaterializationState, RoutePublishing,
+    },
     transport::mailbox::Mailbox,
 };
 
@@ -172,7 +173,7 @@ where
     /// Fetch verified manifests and objects, then refresh the view's local
     /// residency facts. Heads advance separately via
     /// [`Daemon::refresh_live_heads`].
-    pub fn execute_plan<B: BulkSource>(
+    pub fn execute_plan<B: RoutePublishing>(
         &mut self,
         bulk: &mut B,
     ) -> Result<wyrd_sync::runtime::ExecuteReport, wyrd_sync::runtime::EngineError> {
@@ -207,6 +208,25 @@ where
         let state = self.engine.runtime_state()?;
         wyrd_sync::serving::VaultSource::from_state(&state, self.engine.vault())
             .map_err(wyrd_sync::runtime::EngineError::from)
+    }
+
+    /// Open a real-iroh serving surface over the drive's durable vault:
+    /// every held representation serves by its transport root. The
+    /// composer owns the endpoint lifecycle; the vault receives the
+    /// write-through channel so published content serves live (flush
+    /// the endpoint before announcing its address). `loopback` binds a
+    /// relay-disabled endpoint with address discovery cleared for
+    /// hermetic two-daemon contracts.
+    pub fn open_serving(
+        &self,
+        drive_dir: &std::path::Path,
+        loopback: bool,
+    ) -> std::io::Result<wyrd_sync::serving::ServingEndpoint> {
+        if loopback {
+            wyrd_sync::serving::ServingEndpoint::open_loopback(self.engine.vault(), drive_dir)
+        } else {
+            wyrd_sync::serving::ServingEndpoint::open(self.engine.vault(), drive_dir)
+        }
     }
 
     /// Announce an authored local snapshot through the control plane. The
@@ -432,7 +452,7 @@ where
     /// re-doing them). Any failure marks the daemon dirty, forcing
     /// republication on the next pass even if that pass reports zero
     /// new changes.
-    pub fn sync_once<M: Mailbox, B: BulkSource>(
+    pub fn sync_once<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
         bulk: Option<&mut B>,
@@ -447,7 +467,7 @@ where
     /// One pass body: intake, fetch, then conditional republication.
     /// Republication clears the dirty backlog; every failure path
     /// leaves it set (via the [`LiveDaemon::sync_once`] wrapper).
-    fn sync_pass<M: Mailbox, B: BulkSource>(
+    fn sync_pass<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
         bulk: Option<&mut B>,
@@ -465,6 +485,17 @@ where
         let wants_admitted = !committed.is_empty();
         let fetched = match bulk {
             Some(bulk) => {
+                // Route publication precedes every pass: routes come
+                // from durable announcements and manifest records, so
+                // each pass refreshes the address maps before fetching
+                // (a route update from this pass's intake lands next
+                // pass; the plan's own convergence passes cover the
+                // cascade body -> manifest -> objects). The count is
+                // informational for now; surfacing it in the report is
+                // observability work, separately tracked.
+                let _routes = bulk
+                    .publish_routes(&self.engine)
+                    .map_err(LiveError::Engine)?;
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
                 self.engine.execute_plan(bulk, &mut shared)?
             }
@@ -508,7 +539,7 @@ where
     /// which retains everything; replayed history collapses through
     /// the durable seen log. Relay reconnect supervision itself is a
     /// separately tracked issue.
-    pub fn run_loop<M: Mailbox, B: BulkSource>(
+    pub fn run_loop<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
         mut bulk: Option<&mut B>,
@@ -609,8 +640,10 @@ fn sleep_checked(stop: &AtomicBool, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use wyrd_format::{DeviceId, DriveId, FsObjectStore, MemoryObjectStore, SnapshotId};
     use wyrd_fuse::{Node, ViewError};
+    use wyrd_sync::bulk::BulkSource;
     use wyrd_sync::bulk::MemoryBulkSource;
     use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
     use wyrd_sync::transport::mailbox::{

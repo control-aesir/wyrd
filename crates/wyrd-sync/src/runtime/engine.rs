@@ -446,6 +446,86 @@ impl Engine {
         &self.vault
     }
 
+    /// Publish every recorded route into a real-iroh bulk source: the
+    /// interpretation of announcement `node_addr` bytes the control
+    /// plane carries opaquely. Content serves from the announcing peer
+    /// (v0 has no replication serving), so one address per snapshot
+    /// feeds the announcement's own routes plus every manifest record
+    /// that snapshot introduced. Undecodable or absent addresses skip
+    /// silently — nothing publishes, the plan reports absence, and a
+    /// later route update rewrites the maps. Returns the number of
+    /// routes published.
+    pub fn publish_bulk_routes(
+        &self,
+        bulk: &mut crate::bulk::IrohBulkSource,
+    ) -> Result<usize, EngineError> {
+        let runtime = self.runtime_state()?;
+        let mut published = 0usize;
+        let mut providers = BTreeMap::new();
+        for (snapshot, announcement) in &self.announcements {
+            let Some(bytes) = &announcement.node_addr else {
+                continue;
+            };
+            let Ok(provider) = crate::transport::decode_node_addr(bytes) else {
+                continue;
+            };
+            bulk.publish_root(
+                *snapshot,
+                announcement.root_manifest,
+                crate::bulk::IrohBlobRef {
+                    provider: provider.clone(),
+                    hash: *announcement.root_manifest_transport.as_bytes(),
+                },
+            );
+            bulk.publish_snapshot(
+                *snapshot,
+                crate::bulk::IrohBlobRef {
+                    provider: provider.clone(),
+                    hash: *announcement.body_root.as_bytes(),
+                },
+            );
+            // The transport routes the fetch plane prefers: the author
+            // signed root manifest (fetch::root's primary route) and the
+            // body root (fetch::snapshot_body's only route).
+            bulk.publish_transport(crate::bulk::IrohBlobRef {
+                provider: provider.clone(),
+                hash: *announcement.root_manifest_transport.as_bytes(),
+            });
+            bulk.publish_transport(crate::bulk::IrohBlobRef {
+                provider: provider.clone(),
+                hash: *announcement.body_root.as_bytes(),
+            });
+            providers.insert(*snapshot, provider);
+            published += 4;
+        }
+        for record in runtime.manifest_records() {
+            let Some(address) = providers.get(&record.manifest.snapshot) else {
+                continue;
+            };
+            let reference = |hash: &wyrd_format::BaoRoot| crate::bulk::IrohBlobRef {
+                provider: address.clone(),
+                hash: *hash.as_bytes(),
+            };
+            bulk.publish_transport(reference(&record.transport));
+            published += 1;
+            for storage in &record.storage_ids {
+                bulk.publish_sealed(*storage, reference(&record.transport));
+                published += 1;
+            }
+            for entry in &record.manifest.entries {
+                bulk.publish_transport(reference(&entry.transport));
+                bulk.publish_sealed(entry.storage_id, reference(&entry.transport));
+                published += 2;
+            }
+            for link in &record.manifest.children {
+                bulk.publish_transport(reference(&link.transport));
+                bulk.publish_sealed(link.storage, reference(&link.transport));
+                published += 2;
+            }
+        }
+        Ok(published)
+    }
+
     /// The classified live-head projection: the verified snapshot bodies
     /// the authorization engine currently marks `Eligible` — live-lineage
     /// DAG heads at the current epoch (`docs/epochs.md`). Built from
@@ -634,9 +714,9 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, capability_message_for, deliver, drain, encryption_key, fixture, identity,
-        publish_into, queue, transition_message, MemoryMailbox, MemoryRelay, PublishedSnapshot,
-        TestDir, WithoutObjects,
+        admit_engine, capability_message, capability_message_for, deliver, drain, encryption_key,
+        fixture, identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
+        PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::transport::mailbox::{
         seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
@@ -2098,5 +2178,143 @@ mod tests {
         ));
 
         let _ = std::fs::write(&keystore, &good);
+    }
+
+    /// The serving router loopback at engine level: the announcement's
+    /// opaque `node_addr` route publishes into a real-iroh bulk source,
+    /// and the plan fetches body, root manifest, and object over live
+    /// transport from a vault-backed serving endpoint. This is the
+    /// T17 interpretation seam end to end: routes exist only because
+    /// the announcement carried them.
+    #[test]
+    fn routes_publish_from_announcements_and_fetch_over_live_iroh() {
+        use crate::bulk::IrohBulkSource;
+        use crate::runtime::test_util::{announcement_msg_routed, body_root, intake_body};
+        use crate::serving::{ServingEndpoint, Vault};
+        use wyrd_format::Manifest;
+
+        let dir = TestDir::new("serve-routes");
+        let vault = Vault::open(&dir.path).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir.path).unwrap();
+
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x21; 32]);
+        let epoch = admission.epoch;
+
+        let body = intake_body(&builder, &admission);
+        let snapshot = body.snapshot_id();
+        let plaintext = b"loopback hello";
+        let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+        let object_key = epoch_secret.object_key(
+            &member_drive(),
+            epoch,
+            &content,
+            ObjectKind::Chunk,
+            SEAL_VERSION,
+        );
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let entry = crate::seal::entry_for(
+            ObjectKind::Chunk,
+            epoch,
+            &sealed_object,
+            &content,
+            plaintext,
+        )
+        .unwrap();
+        let manifest = Manifest {
+            snapshot,
+            entries: vec![entry],
+            children: Vec::new(),
+        };
+        let manifest_key = epoch_secret.manifest_key(&member_drive(), epoch, &snapshot);
+        let (manifest_id, manifest_obj) =
+            crate::seal::seal_manifest(&manifest_key, &manifest).unwrap();
+        // Every representation the announcement names serves from the
+        // vault: body by its root, manifest and object by their
+        // transport roots.
+        vault.import(&body.encode()).unwrap();
+        vault.import(&manifest_obj.encode()).unwrap();
+        vault.import(&sealed_object.encode()).unwrap();
+        serving.flush().unwrap();
+
+        let cap = capability_message(
+            fixture.recipient,
+            admission.transition_id(),
+            admission.epoch,
+            vec![EpochSecret::from_bytes([0x20; 32]), epoch_secret.clone()],
+        );
+        let bound = announcement_msg_routed(
+            &crate::runtime::test_util::identity_secret(&builder.sk),
+            snapshot,
+            admission.epoch,
+            admission.transition_id(),
+            body_root(&body),
+            manifest_id,
+            crate::seal::transport_root(&manifest_obj),
+            Some(serving.node_addr_bytes()),
+        );
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&admission)),
+            deliver(&fixture, admission.epoch, &cap),
+            deliver(&fixture, admission.epoch, &bound),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 4);
+
+        fixture
+            .engine
+            .set_materialization(content, MaterializationState::Pinned)
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = runtime.block_on(async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut bulk = IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        let routes = fixture.engine.publish_bulk_routes(&mut bulk).unwrap();
+        assert_eq!(
+            routes, 4,
+            "root-manifest transport, body, eager root, eager body"
+        );
+        let mut objects = MemoryObjectStore::default();
+        // Pass one: the announcement routes fetch the body and the root
+        // manifest; the manifest's object routes do not exist yet — the
+        // record commits during this pass.
+        let first = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(first.snapshot_bodies, 1);
+        assert_eq!(first.manifests, 1, "the root manifest over live transport");
+        assert_eq!(first.objects, 0);
+        assert_eq!(first.unfulfilled, 1, "the object waits for its route");
+        // Pass two: the recorded manifest now publishes its object's
+        // routes, and the fetch completes over live transport.
+        let second_routes = fixture.engine.publish_bulk_routes(&mut bulk).unwrap();
+        assert!(second_routes > routes, "the manifest record adds routes");
+        let second = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(second.objects, 1);
+        assert_eq!(second.unfulfilled, 0);
+        assert_eq!(
+            objects.get(&content).unwrap().as_deref(),
+            Some(plaintext.as_slice())
+        );
+        bulk.shutdown();
+        serving.shutdown().unwrap();
     }
 }

@@ -30,6 +30,17 @@ pub(crate) mod test_util;
 
 pub use engine::{DrainReport, Engine, EngineError, ExecuteReport, MAX_PENDING_MESSAGES};
 
+/// Sources the engine pushes recorded routes into before a fetch pass:
+/// the interpretation of the announcement's opaque `node_addr` bytes.
+/// The engine owns the recorded state; the source owns its address
+/// maps. No-op defaults keep in-memory fakes honest about not carrying
+/// live routes.
+pub trait RoutePublishing: crate::bulk::BulkSource {
+    /// Push every route the engine's durable state records. Returns the
+    /// number of routes published.
+    fn publish_routes(&mut self, engine: &Engine) -> Result<usize, EngineError>;
+}
+
 /// Local residency policy for one content object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializationState {

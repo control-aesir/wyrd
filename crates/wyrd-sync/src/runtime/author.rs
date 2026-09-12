@@ -17,7 +17,6 @@
 //! signature that will not verify commits nothing.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use wyrd_format::{
     ChildManifest, ContentId, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot, Tree,
@@ -120,11 +119,13 @@ where
     // The manifest hierarchy is authored, not reconstructed: every
     // mapping names a sealed envelope this device holds the bytes for
     // (fresh seals below) or a recorded representation it holds the
-    // epoch capability for (recorded_mapping).
+    // epoch capability for (recorded_mapping). The snapshot body rides
+    // the same vault: peers fetch it by the announcement's body root.
     let secret = rebuilt
         .keyring
         .secret(known.epoch)
         .ok_or(EngineError::MissingEpochKey(known.epoch))?;
+    engine.vault.import(&authorized.snapshot().encode())?;
     let mut children: Vec<ManifestRecord> = Vec::new();
     let root = walk_tree(
         engine,
@@ -149,8 +150,8 @@ where
 /// recurse into child manifests, symlinks map to nothing. Child records
 /// append post-order (leaves first), so durable replay installs children
 /// before the parent that claims them. The authored envelopes land in
-/// `engine.authored` — the producer's own representations, keyed by
-/// their vault-visible address.
+/// the engine's durable vault — the producer's own representations,
+/// keyed by the transport root the mappings name.
 #[allow(clippy::too_many_arguments)]
 fn walk_tree<S: ObjectStore>(
     engine: &mut Engine,
@@ -220,9 +221,7 @@ where
     check_manifest(&Limits::V0, &manifest).map_err(EngineError::Ingest)?;
     let manifest_key = secret.manifest_key(&engine.drive, epoch, &snapshot);
     let (manifest_id, obj) = seal_manifest(&manifest_key, &manifest)?;
-    engine
-        .authored
-        .insert(obj.storage_id(), Arc::new(obj.encode()));
+    engine.vault.import(&obj.encode())?;
     Ok(ManifestRecord {
         is_root: true,
         manifest_id,
@@ -266,9 +265,7 @@ where
     );
     let obj = seal_content(&object_key, ObjectKind::Chunk, &chunk, &plaintext)?;
     let entry = entry_for(ObjectKind::Chunk, epoch, &obj, &chunk, &plaintext)?;
-    engine
-        .authored
-        .insert(obj.storage_id(), Arc::new(obj.encode()));
+    engine.vault.import(&obj.encode())?;
     Ok(entry)
 }
 

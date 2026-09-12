@@ -90,6 +90,8 @@ pub enum EngineError {
     Capability(#[from] crate::keys::CapabilityError),
     #[error("ingest limits rejected authored content: {0:?}")]
     Ingest(#[from] crate::ingest::IngestError),
+    #[error("vault write failed: {0}")]
+    Vault(#[from] crate::serving::VaultError),
     #[error("chunk {0} is neither locally sealed nor covered by a held recorded mapping")]
     ChunkUnavailable(ContentId),
     #[error("authored manifest {0} holds no sealed representation to link")]
@@ -216,14 +218,11 @@ pub struct Engine {
     /// drops key material the device still holds. Zeroizing values:
     /// revoked epochs must not linger in process memory.
     pub(super) epoch_keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
-    /// Authored sealed envelopes from local writes: manifests (root and
-    /// children) plus fresh chunk seals, keyed by their vault-visible
-    /// address. The producer's own representations — the serving surface
-    /// drains these into the network backend. In-memory: a restart drops
-    /// the bytes while the mappings survive durably as recorded
-    /// representations (the untrusted-hint pattern), so a restarted
-    /// device re-seals what it can and serves what it holds.
-    pub(super) authored: BTreeMap<StorageId, std::sync::Arc<Vec<u8>>>,
+    /// The drive's durable sealed-representation vault: authored
+    /// envelopes (manifests, chunk seals, snapshot bodies) are imported
+    /// here at write time and served from it after every restart. See
+    /// `serving.rs`.
+    pub(super) vault: crate::serving::Vault,
     pub(super) log: MembershipLog,
     pub(super) pending: HashMap<ControlMessageId, Message>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
@@ -269,15 +268,16 @@ impl Engine {
         identity_secret: DeviceIdentitySecret,
         encryption_secret: DeviceEncryptionSecret,
     ) -> Result<Self, EngineError> {
+        let vault = crate::serving::Vault::open(store.dir())?;
         let mut engine = Engine {
             drive,
             device,
             identity_secret,
             encryption_secret,
             store,
+            vault,
             inbox: ControlInbox::new(drive),
             epoch_keys: BTreeMap::new(),
-            authored: BTreeMap::new(),
             log: MembershipLog::new(drive),
             pending: HashMap::new(),
             fetch_run: 0,
@@ -398,10 +398,11 @@ impl Engine {
         Ok(self.store.rebuild(self.device)?.runtime)
     }
 
-    /// The sealed envelopes this device authored and holds: the serving
-    /// surface's producer side (see the `authored` field doc).
-    pub fn authored_envelopes(&self) -> &BTreeMap<StorageId, std::sync::Arc<Vec<u8>>> {
-        &self.authored
+    /// The drive's durable sealed-representation vault: the composer
+    /// layers durable runtime state over it (`serving::VaultSource`) to
+    /// serve what peers fetch.
+    pub fn vault(&self) -> &crate::serving::Vault {
+        &self.vault
     }
 
     /// The classified live-head projection: the verified snapshot bodies
@@ -1164,13 +1165,20 @@ mod tests {
         );
 
         let epoch_secret = secret(0x07 + epoch as u8);
-        let envelopes = pair.a.engine.authored_envelopes().clone();
         for (entry, expected) in [
             (&root_record.manifest.entries[0], &b"root payload"[..]),
             (&child.manifest.entries[0], &b"nested payload"[..]),
         ] {
-            let envelope = envelopes.get(&entry.storage_id).expect("held envelope");
-            let obj = EncryptedObject::decode(envelope).unwrap();
+            // The mapping's bytes live in the durable vault under exactly
+            // the transport root the mapping names.
+            let envelope = pair
+                .a
+                .engine
+                .vault()
+                .sealed(&entry.transport)
+                .unwrap()
+                .expect("held envelope");
+            let obj = EncryptedObject::decode(&envelope).unwrap();
             assert_eq!(obj.storage_id(), entry.storage_id, "vault address");
             assert_eq!(
                 crate::seal::transport_root(&obj),
@@ -1186,7 +1194,7 @@ mod tests {
                     ObjectKind::Chunk,
                     SEAL_VERSION,
                 ),
-                envelope,
+                &envelope,
             )
             .unwrap();
             assert_eq!(opened.as_slice(), expected);
@@ -1526,14 +1534,109 @@ mod tests {
         );
         // The authored manifest hierarchy rehydrates with the head: the
         // announcement path needs it after every restart.
-        assert!(
+        let state = pair.a.engine.runtime_state().unwrap();
+        let root_record = state
+            .root_manifest_record(&id)
+            .expect("the authored root manifest survives the restart");
+        // And the durable vault serves every representation the record
+        // names: the restart drops nothing the durable state advertises.
+        let source = crate::serving::VaultSource::from_state(
+            &pair.a.engine.runtime_state().unwrap(),
+            pair.a.engine.vault(),
+        )
+        .unwrap();
+        let mut source = source;
+        let served_root = source
+            .fetch_root_manifest(&id, usize::MAX)
+            .unwrap()
+            .expect("the root manifest serves after restart");
+        assert_eq!(served_root.content_id, root_record.manifest_id);
+        for entry in &root_record.manifest.entries {
+            let bytes = source
+                .fetch_sealed(&entry.storage_id, usize::MAX)
+                .unwrap()
+                .expect("mapped chunks serve after restart");
+            assert_eq!(
+                crate::seal::EncryptedObject::decode(&bytes)
+                    .unwrap()
+                    .storage_id(),
+                entry.storage_id
+            );
+        }
+        let served_body = source
+            .fetch_snapshot(&id, usize::MAX)
+            .unwrap()
+            .expect("the snapshot body serves after restart");
+        assert_eq!(
+            SnapshotId::from_bytes(
+                *ContentId::derive(ObjectKind::Snapshot, &served_body).as_bytes()
+            ),
+            id
+        );
+    }
+
+    #[test]
+    fn a_peer_materializes_authored_content_from_the_vault_alone() {
+        // The full loop: A authors (real manifests, vault-backed), B
+        // accepts the announcement, and B's plan converges entirely over
+        // A's serving view — the durable vault plus A's durable runtime
+        // state. Nothing else is shared.
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+
+        let mut objects = MemoryObjectStore::default();
+        let chunk = objects
+            .insert(ObjectKind::Chunk, b"vault served payload")
+            .unwrap();
+        let tree = Tree::from_entries(vec![
+            Entry::file("file.txt", 20, false, vec![chunk]).unwrap()
+        ])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+
+        let sent = {
+            let mut mailbox = MemoryMailbox {
+                relay: &mut pair.relay,
+                owner: pair.a.device,
+            };
             pair.a
                 .engine
-                .runtime_state()
+                .announce_snapshot(&authored, &mut mailbox, None)
                 .unwrap()
-                .root_manifest_record(&id)
-                .is_some(),
-            "the authored root manifest survives the restart"
+        };
+        assert_eq!(sent, 2, "owner and B; the author is skipped");
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
+
+        let serving = crate::serving::VaultSource::from_state(
+            &pair.a.engine.runtime_state().unwrap(),
+            pair.a.engine.vault(),
+        )
+        .unwrap();
+        let mut serving = serving;
+        let mut peer_objects = MemoryObjectStore::default();
+        pair.b
+            .engine
+            .set_materialization(chunk, MaterializationState::Cached)
+            .unwrap();
+        let report = pair
+            .b
+            .engine
+            .execute_plan(&mut serving, &mut peer_objects)
+            .unwrap();
+        // The authored snapshot's items all land; the scenario's unrelated
+        // published snapshots stay unfulfilled against this vault (they
+        // are not this test's subject).
+        assert_eq!(report.snapshot_bodies, 1, "the body rides the signed root");
+        assert_eq!(report.manifests, 1, "a flat tree maps one root manifest");
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.manifests, 1, "a flat tree maps one root manifest");
+        assert_eq!(report.objects, 1);
+        assert_eq!(
+            peer_objects.get(&chunk).unwrap().as_deref(),
+            Some(b"vault served payload".as_slice())
         );
     }
 

@@ -273,6 +273,24 @@ impl RuntimeState {
         self.manifests.get(manifest)
     }
 
+    /// Every recorded snapshot id (announcement-bearing and
+    /// body-bearing alike), in snapshot-id order.
+    pub fn recorded_snapshots(&self) -> impl Iterator<Item = SnapshotId> + '_ {
+        let announced = self.announcements.keys().copied();
+        let bodies = self.snapshot_bodies.keys().copied();
+        let roots = self.root_manifests_by_snapshot.keys().copied();
+        announced
+            .chain(bodies)
+            .chain(roots)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
+    /// Every recorded manifest record, in manifest-id order.
+    pub fn manifest_records(&self) -> impl Iterator<Item = &ManifestRecord> {
+        self.manifests.values()
+    }
+
     /// The root-manifest record for one snapshot, if recorded. The
     /// announcement names exactly one root manifest identity (decision
     /// 26); when one is recorded, that identity is the record this state

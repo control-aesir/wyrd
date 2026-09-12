@@ -196,6 +196,19 @@ where
         Ok(())
     }
 
+    /// The drive's serving view: the durable sealed-representation vault
+    /// layered with the durable runtime state. Peers fetch authored and
+    /// fetched content through this; the maps are rebuilt from durable
+    /// state on every call, so a restart rehydrates serving by replay,
+    /// never by re-deriving bytes.
+    pub fn serve(
+        &self,
+    ) -> Result<wyrd_sync::serving::VaultSource, wyrd_sync::runtime::EngineError> {
+        let state = self.engine.runtime_state()?;
+        wyrd_sync::serving::VaultSource::from_state(&state, self.engine.vault())
+            .map_err(wyrd_sync::runtime::EngineError::from)
+    }
+
     /// Announce an authored local snapshot through the control plane. The
     /// snapshot returned by [`Daemon::put_file`] or [`Daemon::remove`] is
     /// already durable; announcement failure therefore leaves it available
@@ -596,7 +609,7 @@ fn sleep_checked(stop: &AtomicBool, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_format::{DeviceId, DriveId, FsObjectStore, MemoryObjectStore};
+    use wyrd_format::{DeviceId, DriveId, FsObjectStore, MemoryObjectStore, SnapshotId};
     use wyrd_fuse::{Node, ViewError};
     use wyrd_sync::bulk::MemoryBulkSource;
     use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
@@ -778,6 +791,76 @@ mod tests {
             .announce_snapshot(&snapshot, &mut NoopMailbox, None)
             .unwrap();
         assert_eq!(sent, 0, "a single-member drive has no peer recipients");
+
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A local write serves from the durable vault, across restarts: the
+    /// authored snapshot's body, root manifest, and every mapped chunk
+    /// remain servable through the serving view after the original
+    /// engine is dropped and the drive reopens from custody.
+    #[test]
+    fn authored_writes_serve_from_the_durable_vault_across_restarts() {
+        let (engine, dir, identity) = scratch_drive();
+        let snapshot = {
+            let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+            let snapshot = daemon.put_file("published.txt", b"publish me").unwrap();
+            let mut serving = daemon.serve().unwrap();
+            let snapshot_id = snapshot.snapshot().snapshot_id();
+            let state = daemon.engine.runtime_state().unwrap();
+
+            // The body serves by snapshot id, the root manifest by the
+            // snapshot id and by the transport root the announcement
+            // names, and every mapped chunk by its storage address.
+            let body = serving
+                .fetch_snapshot(&snapshot_id, usize::MAX)
+                .unwrap()
+                .expect("the authored body serves");
+            assert_eq!(
+                SnapshotId::from_bytes(
+                    *wyrd_format::ContentId::derive(wyrd_format::ObjectKind::Snapshot, &body)
+                        .as_bytes()
+                ),
+                snapshot_id
+            );
+            let record = state
+                .root_manifest_record(&snapshot_id)
+                .expect("the authored root manifest records");
+            let manifest = serving
+                .fetch_root_manifest(&snapshot_id, usize::MAX)
+                .unwrap()
+                .expect("the root manifest serves");
+            assert_eq!(manifest.content_id, record.manifest_id);
+            for entry in &record.manifest.entries {
+                let bytes = serving
+                    .fetch_sealed(&entry.storage_id, usize::MAX)
+                    .unwrap()
+                    .expect("mapped chunks serve");
+                assert_eq!(
+                    wyrd_sync::seal::EncryptedObject::decode(&bytes)
+                        .unwrap()
+                        .storage_id(),
+                    entry.storage_id
+                );
+            }
+            snapshot_id
+        };
+
+        // Restart: the drive reopens from custody, the serving view
+        // rehydrates from durable state, and the same routes serve.
+        let reopened =
+            wyrd_sync::runtime::Engine::open_keystore(dir.clone(), "daemon-test-pass", identity)
+                .unwrap();
+        let daemon = Daemon::new(reopened, MemoryObjectStore::default()).unwrap();
+        let mut serving = daemon.serve().unwrap();
+        assert!(
+            serving
+                .fetch_root_manifest(&snapshot, usize::MAX)
+                .unwrap()
+                .is_some(),
+            "the root manifest serves after the restart"
+        );
 
         drop(daemon);
         std::fs::remove_dir_all(dir).unwrap();

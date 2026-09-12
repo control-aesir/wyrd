@@ -20,4 +20,5 @@ pub mod keys;
 pub mod membership;
 pub mod runtime;
 pub mod seal;
+pub mod serving;
 pub mod transport;

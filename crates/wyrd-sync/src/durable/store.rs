@@ -87,6 +87,11 @@ pub(crate) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Res
 }
 
 impl DurableStore {
+    /// The drive directory the store lives in.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn commits_dir(&self) -> PathBuf {
         self.dir.join("commits")
     }

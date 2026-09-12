@@ -185,7 +185,7 @@ fn failed_pass_recovers_serving_on_retry() {
 
     let engine = loaded.rig.take_engine();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live();
+    let (mut live, backend) = daemon.into_live(std::time::Duration::from_secs(30));
     for id in &loaded.content.content_ids {
         live.want(*id).unwrap();
     }

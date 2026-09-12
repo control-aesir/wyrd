@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
@@ -289,7 +290,7 @@ fn mount(
             .map_err(|error| CliError::Store(error.to_string()))?,
     )?;
     daemon.refresh_live_heads()?;
-    let (mut live, backend) = daemon.into_live();
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity

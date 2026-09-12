@@ -26,6 +26,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::fuse::FuseBackend;
+use crate::want::WantRegistry;
 
 /// The daemon's bridge from `wyrd-sync`'s verified snapshots to the
 /// view's heads: the one in-tree implementation of [`VerifiedSnapshot`],
@@ -274,15 +275,21 @@ where
     /// held, and each pass publishes heads and facts under one short
     /// write lock — serving never observes a half-published
     /// projection and never stalls on bulk I/O.
-    pub fn into_live(self) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
+    pub fn into_live(
+        self,
+        open_timeout: Duration,
+    ) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
         let store = self.view.store_handle();
         let view = Arc::new(RwLock::new(self.view));
-        let backend = FuseBackend::shared(Arc::clone(&view));
+        let wants = Arc::new(WantRegistry::default());
+        let backend =
+            FuseBackend::shared_with_wants(Arc::clone(&view), Arc::clone(&wants), open_timeout);
         (
             LiveDaemon {
                 engine: self.engine,
                 store,
                 view,
+                wants,
                 dirty: false,
             },
             backend,
@@ -367,6 +374,11 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// writes bytes through this without taking the view lock.
     store: Arc<RwLock<S>>,
     view: Arc<RwLock<DriveView<S, DaemonMaterialization>>>,
+    /// FUSE demand: the backend registers wants, the loop admits them
+    /// into the engine each pass and lets completion surface through
+    /// the view. The registry's lock is its own (never the view's or
+    /// the store's).
+    wants: Arc<WantRegistry>,
     /// Durable state may have changed without a republication (a pass
     /// failed after committing): the next pass republishes regardless
     /// of its own counters, so recovery never waits for new changes.
@@ -429,6 +441,14 @@ where
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
+        // Admit outstanding FUSE demand ahead of fetching: each pending
+        // want becomes Cached materialization, which the plan then
+        // fetches. Admission is durable (`set_materialization` commits
+        // a fact), so a failed pass never loses a registered demand.
+        for want in self.wants.drain_pending() {
+            self.engine
+                .set_materialization(want, MaterializationState::Cached)?;
+        }
         let fetched = match bulk {
             Some(bulk) => {
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
@@ -862,7 +882,7 @@ mod tests {
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("live.txt", b"shared").unwrap();
 
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         let mut mailbox = NoopMailbox;
         let report = live
             .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -887,7 +907,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("steady.txt", b"steady").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let mut mailbox = QueueMailbox::new();
         mailbox.push(MailboxEnvelope {
@@ -919,7 +939,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("fetched.txt", b"local").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let mut mailbox = NoopMailbox;
         let mut bulk = MemoryBulkSource::default();
@@ -947,7 +967,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("stable.txt", b"v1").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let old = backend.open_at("stable.txt").expect("opens");
         // Idle and poison passes republish (or skip) the projection
@@ -991,7 +1011,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("steady.txt", b"steady").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         live.dirty = true;
         let mut mailbox = NoopMailbox;
         live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -1011,7 +1031,7 @@ mod tests {
     fn run_loop_stops_immediately() {
         let (engine, dir, _) = scratch_drive();
         let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let stop = std::sync::atomic::AtomicBool::new(true);
         let mut mailbox = NoopMailbox;
@@ -1039,7 +1059,7 @@ mod tests {
     fn run_loop_runs_until_stopped() {
         let (engine, dir, _) = scratch_drive();
         let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         drop(backend);
 
         let stop = std::sync::atomic::AtomicBool::new(false);
@@ -1076,7 +1096,7 @@ mod tests {
     fn run_loop_aborts_after_error_cap() {
         let (engine, dir, _) = scratch_drive();
         let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         drop(backend);
 
         let stop = std::sync::atomic::AtomicBool::new(false);

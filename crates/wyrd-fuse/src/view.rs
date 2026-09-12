@@ -141,7 +141,10 @@ pub enum ViewError {
     )]
     Conflict,
     #[error("content is remote-only; the daemon would block and fetch")]
-    NotMaterialized,
+    /// Content the serving policy wants but this device does not hold.
+    /// The missing identity rides the error so a demand-driven backend
+    /// can register exactly that want and retry.
+    NotMaterialized { content: ContentId },
     #[error("content unavailable: no peer reachable and nothing cached")]
     Unavailable,
     #[error("content failed verification; scrub and repair before surfacing")]
@@ -612,7 +615,9 @@ where
     /// looping on a fetch that already "succeeded".
     fn absent(&self, id: &ContentId) -> ViewError {
         match self.materialization.status(id) {
-            FetchStatus::RemoteOnly | FetchStatus::Fetching => ViewError::NotMaterialized,
+            FetchStatus::RemoteOnly | FetchStatus::Fetching => {
+                ViewError::NotMaterialized { content: *id }
+            }
             FetchStatus::Unavailable | FetchStatus::Available => ViewError::Unavailable,
             FetchStatus::Corrupt => ViewError::Corrupt,
         }
@@ -1005,7 +1010,10 @@ mod tests {
         assert_eq!(view.read(&bad, 0, 7), Err(ViewError::Corrupt));
         // No status entry means remote-only: the daemon would fetch.
         let remote = view.open(&view.lookup("remote.txt").unwrap()).unwrap();
-        assert_eq!(view.read(&remote, 0, 6), Err(ViewError::NotMaterialized));
+        assert!(matches!(
+            view.read(&remote, 0, 6),
+            Err(ViewError::NotMaterialized { .. })
+        ));
     }
 
     #[test]
@@ -1025,7 +1033,10 @@ mod tests {
             FakeMaterialization::empty(),
             heads(vec![snapshot(absent)]),
         );
-        assert_eq!(view.lookup("anything"), Err(ViewError::NotMaterialized));
+        assert!(matches!(
+            view.lookup("anything"),
+            Err(ViewError::NotMaterialized { .. })
+        ));
     }
 
     #[test]
@@ -1454,7 +1465,10 @@ mod tests {
             heads(vec![snapshot(root)]),
         );
         let file = view.open(&view.lookup("tail.txt").unwrap()).unwrap();
-        assert_eq!(view.read(&file, 0, 5), Err(ViewError::NotMaterialized));
+        assert!(matches!(
+            view.read(&file, 0, 5),
+            Err(ViewError::NotMaterialized { .. })
+        ));
     }
 
     #[test]

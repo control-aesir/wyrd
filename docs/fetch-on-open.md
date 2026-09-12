@@ -241,15 +241,19 @@ stays in-repo and is untouched by clap.
 
 ## PR boundary
 
-One vertical feature, one PR: announcement `node_addr` + serving
-router + want registry + blocking open + CLI composition.
-Intermediate states cannot demonstrate the feature, and none of it
-redesigns the sync protocol — the announcement schema gains a field;
-everything else is new plumbing around decided invariants.
+This PR lands the demand machinery: announcement `node_addr` + want
+registry + blocking open + read-side demand + CLI composition, proven
+against the existing `BulkSource` contract. The transport-identity
+distribution that makes maps real (announcement Bao roots, author
+signature over the announcement, sealed-manifest-envelope routing
+table, serving router) is fanned out to
+`feat(sync): distribute transport identities (BaoRoot) and author-sign
+announcements` — it is protocol work the demand path consumes, and the
+serving-router storage strategy needs its own measured decision
+(iroh-blobs 0.103 has no `Store` trait to implement).
 
 Commit plan: this design doc → clap migration → announcement
-`node_addr` + serving router → want registry + blocking open → docs
-status.
+`node_addr` → want registry + blocking open → docs status.
 
 Test matrix (each locks a decided invariant):
 
@@ -273,4 +277,5 @@ Test matrix (each locks a decided invariant):
   servable; the router answers object lookups only.
 - **Loopback iroh end-to-end**: two daemons, announcement + serve +
   demand + blocking open + read, over the loopback transport the
-  bulk-source tests already use.
+  bulk-source tests already use. *(Lands with the transport-identity
+  fan-out, which owns the serving router.)*

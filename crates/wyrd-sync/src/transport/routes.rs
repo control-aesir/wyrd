@@ -71,8 +71,8 @@ pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) 
         };
         bulk.publish_transport(reference(&record.transport));
         report.published += 1;
-        for storage in &record.storage_ids {
-            bulk.publish_sealed(*storage, reference(&record.transport));
+        for (storage, transport) in &record.representations {
+            bulk.publish_sealed(*storage, reference(transport));
             report.published += 1;
         }
         for entry in &record.manifest.entries {
@@ -92,5 +92,103 @@ pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) 
 impl RoutePublishing for IrohBulkSource {
     fn publish_routes(&mut self, state: &RuntimeState) -> Result<RouteReport, EngineError> {
         Ok(publish_recorded_routes(state, self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use iroh::{endpoint::presets, Endpoint, EndpointAddr};
+    use wyrd_format::{DeviceId, DriveId, Manifest, SnapshotId, TransitionId};
+
+    use super::*;
+    use crate::control::SnapshotAnnouncement;
+    use crate::keys::EpochSecret;
+    use crate::runtime::ManifestRecord;
+    use crate::seal::{seal_manifest, transport_root};
+
+    /// One logical manifest recorded in two sealed representations (fresh
+    /// nonces) republishes each StorageId under its OWN transport root.
+    /// The first-representation-wins bug published the second StorageId
+    /// with the first root, so a storage-addressed fetch would retrieve
+    /// the wrong bytes and fail identity checks.
+    #[test]
+    fn each_manifest_representation_publishes_its_own_root() {
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let key = EpochSecret::from_bytes([0x51; 32]).manifest_key(&drive, 1, &snapshot);
+        let manifest = Manifest {
+            snapshot,
+            entries: Vec::new(),
+            children: Vec::new(),
+        };
+        let (id_a, obj_a) = seal_manifest(&key, &manifest).unwrap();
+        let (id_b, obj_b) = seal_manifest(&key, &manifest).unwrap();
+        assert_eq!(id_a, id_b, "same plaintext, same logical identity");
+        assert_ne!(
+            obj_a.storage_id(),
+            obj_b.storage_id(),
+            "fresh nonces mean fresh storage addresses"
+        );
+
+        let mut state = RuntimeState::new(drive);
+        // A recorded announcement names the serving provider; manifest
+        // records publish routes only under a snapshot that has one.
+        let provider = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x22; 32]).public());
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot,
+                author: DeviceId::from_bytes([0x33; 32]),
+                epoch: 1,
+                membership: TransitionId::from_bytes([0x44; 32]),
+                body_root: BaoRoot::from_bytes([0x55; 32]),
+                root_manifest: id_a,
+                root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
+                node_addr: Some(crate::transport::encode_node_addr(&provider)),
+                signature: [0; 64],
+            })
+            .unwrap();
+        for obj in [&obj_a, &obj_b] {
+            state
+                .record_manifest(ManifestRecord {
+                    is_root: true,
+                    manifest_id: id_a,
+                    representations: BTreeMap::from([(obj.storage_id(), transport_root(obj))]),
+                    transport: transport_root(obj),
+                    manifest: manifest.clone(),
+                })
+                .unwrap();
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut bulk = IrohBulkSource::with_runtime(endpoint, Arc::new(runtime));
+        let report = publish_recorded_routes(&state, &mut bulk);
+        assert_eq!(
+            report.published, 7,
+            "four announcement routes plus one transport and two representations"
+        );
+
+        for obj in [&obj_a, &obj_b] {
+            let expected = transport_root(obj);
+            let route = bulk.sealed_route(&obj.storage_id()).unwrap();
+            assert_eq!(
+                route[0].hash,
+                *expected.as_bytes(),
+                "each storage id addresses its own representation's bytes"
+            );
+        }
+        bulk.shutdown();
     }
 }

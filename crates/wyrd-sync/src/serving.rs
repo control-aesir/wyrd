@@ -811,7 +811,7 @@ mod tests {
             .record_manifest(crate::runtime::ManifestRecord {
                 is_root: true,
                 manifest_id,
-                storage_ids: std::collections::BTreeSet::new(),
+                representations: std::collections::BTreeMap::new(),
                 transport: crate::seal::transport_root(&obj),
                 manifest,
             })
@@ -901,7 +901,10 @@ mod tests {
             .record_manifest(crate::runtime::ManifestRecord {
                 is_root: true,
                 manifest_id,
-                storage_ids: std::collections::BTreeSet::from([obj.storage_id()]),
+                representations: std::collections::BTreeMap::from([(
+                    obj.storage_id(),
+                    crate::seal::transport_root(&obj),
+                )]),
                 transport: crate::seal::transport_root(&obj),
                 manifest,
             })

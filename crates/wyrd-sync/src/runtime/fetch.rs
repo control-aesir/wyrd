@@ -1,6 +1,6 @@
 //! Manifest and object fetching for the runtime engine.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use wyrd_format::{
     BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectKind,
@@ -249,11 +249,12 @@ fn open_record(
     if check_manifest(&Limits::V0, &manifest).is_err() || manifest.snapshot != snapshot {
         return None;
     }
+    let transport = crate::seal::transport_root(&obj);
     Some(ManifestRecord {
         is_root,
         manifest_id: *expected,
-        storage_ids: BTreeSet::from([obj.storage_id()]),
-        transport: crate::seal::transport_root(&obj),
+        representations: BTreeMap::from([(obj.storage_id(), transport)]),
+        transport,
         manifest,
     })
 }
@@ -479,6 +480,8 @@ mod tests {
     // from the epoch secret the capability delivers; the engine side
     // ingests the control plane, pins the content, and executes the
     // plan against the in-memory bulk peer.
+
+    use std::collections::BTreeSet;
 
     use crate::bulk::{MemoryBulkSource, SealedManifest};
     use crate::keys::EpochSecret;

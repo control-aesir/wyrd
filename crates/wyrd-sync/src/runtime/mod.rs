@@ -68,14 +68,19 @@ pub struct ManifestRecord {
     /// record establishes the snapshot head.
     pub is_root: bool,
     pub manifest_id: ContentId,
-    pub storage_ids: BTreeSet<StorageId>,
-    /// The transport root (Bao root) over the recorded representation's
-    /// sealed bytes — the verified-fetch address distributed with the
-    /// mapping (object-model.md decision 26). Sealed representations are
-    /// re-sealable (fresh nonces), so a manifest can legitimately have
-    /// several; v0 records the first one seen and keeps its root, which
-    /// is the representation the holder serves and, for an author, the
-    /// one its announcement names.
+    /// Sealed representations of this manifest envelope: each recorded
+    /// `StorageId` maps to that representation's own transport root.
+    /// Re-sealing uses a fresh nonce, so a re-sealed representation has
+    /// a distinct `StorageId` and a distinct Bao root; keeping the pair
+    /// lets the fetch plane address each representation independently
+    /// rather than serving one representation's bytes under another's
+    /// address (a shared manifest may be re-sealed by several holders).
+    pub representations: BTreeMap<StorageId, BaoRoot>,
+    /// The first representation this holder recorded (an entry of
+    /// [`representations`](Self::representations)): the one the holder
+    /// serves on the eager exchange route and, for an author, the one
+    /// its announcement names. Deterministic under replay, which walks
+    /// the same commit order.
     pub transport: BaoRoot,
     pub manifest: Manifest,
 }
@@ -260,20 +265,26 @@ impl RuntimeState {
             });
         }
         if let Some(existing) = self.manifests.get_mut(&manifest_id) {
-            return if existing.manifest == record.manifest && existing.is_root == record.is_root {
-                // Same logical manifest: merge the representation set and
-                // keep the first transport root. A different sealed
-                // representation is a legitimate alternate address, but
-                // the record's transport stays the representation this
-                // holder first held (deterministic under replay, which
-                // walks the same commit order).
-                existing.storage_ids.extend(record.storage_ids);
-                Ok(false)
-            } else {
-                Err(RuntimeError::ConflictingManifest {
+            if existing.manifest != record.manifest || existing.is_root != record.is_root {
+                return Err(RuntimeError::ConflictingManifest {
                     manifest: manifest_id,
-                })
-            };
+                });
+            }
+            // Same logical manifest: merge the representation set. A
+            // StorageId names exactly one ciphertext, so it names
+            // exactly one transport root; two records disagreeing on
+            // the root behind one StorageId is corruption, not an
+            // alternate representation, and fails closed.
+            for (storage, transport) in record.representations {
+                if let Some(held) = existing.representations.insert(storage, transport) {
+                    if held != transport {
+                        return Err(RuntimeError::ConflictingManifest {
+                            manifest: manifest_id,
+                        });
+                    }
+                }
+            }
+            return Ok(false);
         }
 
         for child in &record.manifest.children {
@@ -537,7 +548,7 @@ mod tests {
         ManifestRecord {
             is_root,
             manifest_id: content_id,
-            storage_ids: BTreeSet::from([storage_id]),
+            representations: BTreeMap::from([(storage_id, BaoRoot::from_bytes([0xC0; 32]))]),
             transport: BaoRoot::from_bytes([0xC0; 32]),
             manifest: Manifest {
                 snapshot: SnapshotId::from_bytes([snapshot; 32]),
@@ -630,7 +641,10 @@ mod tests {
         assert_eq!(plan.pending_manifests.len(), 1);
 
         let mut root = root_manifest(1, 9, 4, 5);
-        root.storage_ids.insert(StorageId::from_bytes([0xB0; 32]));
+        root.representations.insert(
+            StorageId::from_bytes([0xB0; 32]),
+            BaoRoot::from_bytes([0xD0; 32]),
+        );
         assert!(state.record_manifest(root).unwrap());
         assert!(state.reconcile().pending_snapshots.is_empty());
     }
@@ -687,17 +701,28 @@ mod tests {
     }
 
     #[test]
-    fn alternate_manifest_storage_ids_merge_by_plaintext_identity() {
+    fn alternate_manifest_representations_merge_by_plaintext_identity() {
         let mut state = RuntimeState::new(drive());
         let mut a = root_manifest(1, 9, 4, 5);
         assert!(state.record_manifest(a.clone()).unwrap());
-        a.storage_ids = BTreeSet::from([StorageId::from_bytes([0xB0; 32])]);
+        // A re-sealed representation: a fresh StorageId and, with it,
+        // the transport root of ITS bytes — not the first root.
+        a.representations = BTreeMap::from([(
+            StorageId::from_bytes([0xB0; 32]),
+            BaoRoot::from_bytes([0xD0; 32]),
+        )]);
+        a.transport = BaoRoot::from_bytes([0xD0; 32]);
         assert!(!state.record_manifest(a).unwrap());
         let stored = state
             .manifests
             .get(&manifest_id_for(&root_manifest(1, 9, 4, 5)))
             .unwrap();
-        assert_eq!(stored.storage_ids.len(), 2);
+        assert_eq!(stored.representations.len(), 2);
+        assert_eq!(
+            stored.representations[&StorageId::from_bytes([0xB0; 32])],
+            BaoRoot::from_bytes([0xD0; 32]),
+            "each storage id keeps its own root"
+        );
     }
 
     #[test]

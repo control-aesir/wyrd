@@ -255,6 +255,13 @@ impl IrohBulkSource {
         self.transport.clear();
     }
 
+    /// The recorded provider candidates for a sealed representation, in
+    /// publication order: diagnostics and tests.
+    #[cfg(test)]
+    pub(crate) fn sealed_route(&self, storage: &StorageId) -> Option<&[IrohBlobRef]> {
+        self.sealed.get(storage).map(Vec::as_slice)
+    }
+
     /// Close the owned endpoint after all in-flight transfers have finished.
     pub fn shutdown(&self) {
         self.runtime.block_on(self.endpoint.close());

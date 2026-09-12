@@ -167,9 +167,10 @@ pub(super) fn encode_fact(
             bytes.extend_from_slice(record.manifest_id.as_bytes());
             bytes.push(u8::from(record.is_root));
             bytes.extend_from_slice(record.transport.as_bytes());
-            bytes.extend_from_slice(&(record.storage_ids.len() as u32).to_le_bytes());
-            for id in &record.storage_ids {
+            bytes.extend_from_slice(&(record.representations.len() as u32).to_le_bytes());
+            for (id, transport) in &record.representations {
                 bytes.extend_from_slice(id.as_bytes());
+                bytes.extend_from_slice(transport.as_bytes());
             }
             bytes.extend_from_slice(&record.manifest.canonical_bytes());
             Ok((TAG_MANIFEST, bytes))
@@ -346,13 +347,15 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
     let transport = BaoRoot::from_bytes(record[33..65].try_into().ok()?);
     let storage_count = u32::from_le_bytes(record[65..69].try_into().ok()?) as usize;
     let mut pos: usize = 69;
-    let mut storage_ids = std::collections::BTreeSet::new();
+    let mut representations = std::collections::BTreeMap::new();
     for _ in 0..storage_count {
-        let end = pos.checked_add(32)?;
+        let end = pos.checked_add(64)?;
         if end > record.len() {
             return None;
         }
-        storage_ids.insert(StorageId::from_bytes(record[pos..end].try_into().ok()?));
+        let storage = StorageId::from_bytes(record[pos..pos + 32].try_into().ok()?);
+        let transport = BaoRoot::from_bytes(record[pos + 32..end].try_into().ok()?);
+        representations.insert(storage, transport);
         pos = end;
     }
     let manifest = Manifest::from_canonical_bytes(&record[pos..]).ok()?;
@@ -363,7 +366,7 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
     Some(ManifestRecord {
         is_root,
         manifest_id,
-        storage_ids,
+        representations,
         transport,
         manifest,
     })

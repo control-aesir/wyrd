@@ -110,13 +110,20 @@ fn seal_aad(version: u8, kind: ObjectKind, content_id: &ContentId) -> [u8; 34] {
     aad
 }
 
-/// The transport root of a sealed representation: the raw BLAKE3 (Bao
-/// root) over the sealed bytes — the address verified streaming
-/// requests. Routing metadata (object-model.md decision 26): computed
-/// at sealing time, distributed with the manifest mapping, and verified
-/// by the transfer itself; never an identity.
-fn transport_root(obj: &EncryptedObject) -> BaoRoot {
-    BaoRoot::from_bytes(*blake3::hash(&obj.encode()).as_bytes())
+/// The transport root of a byte run: the raw BLAKE3 (Bao root) the
+/// transfer verifies — routing metadata, never an identity
+/// (object-model.md decision 26).
+pub(crate) fn blob_root(bytes: &[u8]) -> BaoRoot {
+    BaoRoot::from_bytes(*blake3::hash(bytes).as_bytes())
+}
+
+/// The transport root of a sealed representation: [`blob_root`] over the
+/// sealed bytes — the address verified streaming requests. Routing
+/// metadata (object-model.md decision 26): computed at sealing time,
+/// distributed with the manifest mapping, and verified by the transfer
+/// itself; never an identity.
+pub(crate) fn transport_root(obj: &EncryptedObject) -> BaoRoot {
+    blob_root(&obj.encode())
 }
 
 /// Seal plaintext under a per-epoch key. Fails closed when the named

@@ -228,7 +228,7 @@ mod tests {
     use crate::keys::EpochSecret;
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
     use std::collections::VecDeque;
-    use wyrd_format::{DriveId, SnapshotId, TransitionId};
+    use wyrd_format::{BaoRoot, ContentId, DriveId, SnapshotId, TransitionId};
     use zeroize::Zeroizing;
 
     /// An in-memory relay: every sent envelope lands in a shared queue;
@@ -328,7 +328,11 @@ mod tests {
                 author: sender,
                 epoch: 3,
                 membership: TransitionId::from_bytes([0x33; 32]),
+                body_root: BaoRoot::from_bytes([0x44; 32]),
+                root_manifest: ContentId::from_bytes([0x55; 32]),
+                root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
                 node_addr: None,
+                signature: [0x77; 64],
             }),
         )
         .unwrap();
@@ -383,7 +387,11 @@ mod tests {
                 author: sender,
                 epoch: 5,
                 membership: TransitionId::from_bytes([0x33; 32]),
+                body_root: BaoRoot::from_bytes([0x44; 32]),
+                root_manifest: ContentId::from_bytes([0x55; 32]),
+                root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
                 node_addr: None,
+                signature: [0x77; 64],
             }),
         )
         .unwrap();

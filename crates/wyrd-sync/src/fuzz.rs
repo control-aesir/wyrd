@@ -255,7 +255,11 @@ fn message_seeds() -> Vec<(ControlKind, Vec<u8>)> {
                 author: DeviceId::from_bytes([7; 32]),
                 epoch: 9,
                 membership: TransitionId::from_bytes([8; 32]),
+                body_root: BaoRoot::from_bytes([9; 32]),
+                root_manifest: ContentId::from_bytes([10; 32]),
+                root_manifest_transport: BaoRoot::from_bytes([11; 32]),
                 node_addr: None,
+                signature: [12; 64],
             })
             .encode_payload(),
         ),

@@ -10,13 +10,13 @@ use std::path::PathBuf;
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey};
 use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{
-    Change, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Entry, Manifest,
+    BaoRoot, Change, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Entry, Manifest,
     MembershipTransition, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId,
     StorageId, TransitionId, Tree,
 };
 use wyrd_sync::bulk::{MemoryBulkSource, SealedManifest};
 use wyrd_sync::control::{
-    self, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
+    self, sign_announcement, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
 };
 use wyrd_sync::keys::capability::Capability;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
@@ -444,13 +444,21 @@ impl Rig {
         membership: TransitionId,
         epoch: u64,
     ) {
-        let message = Message::SnapshotAnnouncement(SnapshotAnnouncement {
+        let mut announcement = SnapshotAnnouncement {
             snapshot,
             author: self.owner.id,
             epoch,
             membership,
+            // Placeholder transport identities: map population wires the
+            // real roots when announcements start seeding fetch plans.
+            body_root: BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: ContentId::from_bytes([0x55; 32]),
+            root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
             node_addr: None,
-        });
+            signature: [0; 64],
+        };
+        sign_announcement(&mut announcement, &self.owner.identity, &drive());
+        let message = Message::SnapshotAnnouncement(announcement);
         let envelope = sealed_envelope(
             &self.owner.identity,
             self.recipient.id,

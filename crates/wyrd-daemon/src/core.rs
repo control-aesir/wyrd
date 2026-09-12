@@ -770,14 +770,19 @@ mod tests {
     }
 
     #[test]
-    fn authored_writes_can_be_announced_through_the_daemon() {
+    fn authored_writes_cannot_be_announced_before_their_manifest() {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         let snapshot = daemon.put_file("published.txt", b"publish me").unwrap();
-        let sent = daemon
-            .announce_snapshot(&snapshot, &mut NoopMailbox, None)
-            .unwrap();
-        assert_eq!(sent, 0, "a single-member drive has no peer recipients");
+        // The announcement carries the transport identities peers fetch
+        // by (object-model.md decision 26), and a local write does not
+        // author its root manifest yet: announcing fails closed until
+        // the write path records the manifest. The snapshot itself is
+        // durable and untouched by the failed announcement.
+        assert!(matches!(
+            daemon.announce_snapshot(&snapshot, &mut NoopMailbox, None),
+            Err(wyrd_sync::runtime::EngineError::RootManifestUnavailable(_))
+        ));
 
         drop(daemon);
         std::fs::remove_dir_all(dir).unwrap();

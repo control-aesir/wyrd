@@ -197,8 +197,8 @@ mod tests {
 
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        BaoRoot, ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind,
-        SharedStore, Snapshot, SnapshotId, StorageId,
+        BaoRoot, ContentId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, SharedStore,
+        Snapshot, SnapshotId, StorageId,
     };
 
     use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -206,8 +206,8 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, deliver, drain, fixture, intake_snapshot, publish_into,
-        queue, reopen, transition_message, WithoutObjects,
+        admit_engine, announcement_msg, deliver, drain, fixture, identity_secret, intake_snapshot,
+        publish_into, queue, reopen, transition_message, WithoutObjects,
     };
     use crate::runtime::MaterializationState;
     use crate::seal::{entry_for, seal_manifest, EncryptedObject, SEAL_VERSION};
@@ -924,7 +924,12 @@ mod tests {
                 },
             );
         }
-        let bound = announcement_msg(snapshot_b, owner, 2, admission.transition_id());
+        let bound = announcement_msg(
+            &identity_secret(&builder.sk),
+            snapshot_b,
+            2,
+            admission.transition_id(),
+        );
         let envelope = deliver(&fixture, 2, &bound);
         queue(&mut fixture, vec![envelope]);
         assert_eq!(drain(&mut fixture).accepted, 1);
@@ -1215,8 +1220,8 @@ mod tests {
             queue(&mut fixture, mail);
             assert_eq!(drain(&mut fixture).accepted, 2);
             let lying = announcement_msg(
+                &identity_secret(&crate::membership::test_util::key(0x22).0),
                 body.snapshot_id(),
-                DeviceId::from_bytes([0x22; 32]),
                 admission.epoch,
                 admission.transition_id(),
             );
@@ -1259,8 +1264,8 @@ mod tests {
             queue(&mut fixture, mail);
             assert_eq!(drain(&mut fixture).accepted, 2);
             let lying = announcement_msg(
+                &identity_secret(&builder.sk),
                 stale.snapshot_id(),
-                owner,
                 admission.epoch,
                 admission.transition_id(),
             );
@@ -1383,8 +1388,8 @@ mod tests {
             },
         );
         let bound = announcement_msg(
+            &identity_secret(&builder.sk),
             child.snapshot_id(),
-            owner,
             admission.epoch,
             admission.transition_id(),
         );
@@ -1577,7 +1582,12 @@ mod tests {
                     sealed: sealed.encode(),
                 },
             );
-            let bound = announcement_msg(snapshot, owner, 2, admission.transition_id());
+            let bound = announcement_msg(
+                &identity_secret(&builder.sk),
+                snapshot,
+                2,
+                admission.transition_id(),
+            );
             let envelope = deliver(&fixture, 2, &bound);
             queue(&mut fixture, vec![envelope]);
         }

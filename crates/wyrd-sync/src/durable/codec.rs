@@ -4,7 +4,7 @@
 //! tags are skipped for forward compatibility.
 
 use wyrd_format::{
-    ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot, StorageId,
+    BaoRoot, ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot, StorageId,
 };
 
 use super::{DurableError, Fact};
@@ -158,6 +158,7 @@ pub(super) fn encode_fact(
             let mut bytes = Vec::new();
             bytes.extend_from_slice(record.manifest_id.as_bytes());
             bytes.push(u8::from(record.is_root));
+            bytes.extend_from_slice(record.transport.as_bytes());
             bytes.extend_from_slice(&(record.storage_ids.len() as u32).to_le_bytes());
             for id in &record.storage_ids {
                 bytes.extend_from_slice(id.as_bytes());
@@ -325,7 +326,7 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
 }
 
 fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
-    if record.len() < 32 + 1 + 4 {
+    if record.len() < 32 + 1 + 32 + 4 {
         return None;
     }
     let manifest_id = ContentId::from_bytes(record[0..32].try_into().ok()?);
@@ -334,8 +335,9 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
         1 => true,
         _ => return None,
     };
-    let storage_count = u32::from_le_bytes(record[33..37].try_into().ok()?) as usize;
-    let mut pos: usize = 37;
+    let transport = BaoRoot::from_bytes(record[33..65].try_into().ok()?);
+    let storage_count = u32::from_le_bytes(record[65..69].try_into().ok()?) as usize;
+    let mut pos: usize = 69;
     let mut storage_ids = std::collections::BTreeSet::new();
     for _ in 0..storage_count {
         let end = pos.checked_add(32)?;
@@ -354,6 +356,7 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
         is_root,
         manifest_id,
         storage_ids,
+        transport,
         manifest,
     })
 }

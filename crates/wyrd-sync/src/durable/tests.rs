@@ -104,7 +104,11 @@ fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
         author: owner(),
         epoch: 2,
         membership: child.transition_id(),
+        body_root: BaoRoot::from_bytes([0x44; 32]),
+        root_manifest: ContentId::from_bytes([0x55; 32]),
+        root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
         node_addr: None,
+        signature: [0x77; 64],
     }
 }
 
@@ -127,6 +131,7 @@ fn manifest_record() -> ManifestRecord {
         is_root: true,
         manifest_id,
         storage_ids: [StorageId::from_bytes([0xA0; 32])].into(),
+        transport: BaoRoot::from_bytes([0xC0; 32]),
         manifest,
     }
 }
@@ -468,9 +473,7 @@ fn rebuild_rejects_a_body_that_precedes_a_disagreeing_announcement() {
     let lying = SnapshotAnnouncement {
         snapshot: body.snapshot().snapshot_id(),
         author: DeviceId::from_bytes([0x22; 32]),
-        epoch: 2,
-        membership: chain().1.transition_id(),
-        node_addr: None,
+        ..announcement(&chain().1)
     };
     store
         .commit(&[Fact::SnapshotBody(body), Fact::Announcement(lying)])

@@ -104,7 +104,13 @@ where
 /// plane: seal one epoch-keyed announcement and address it to each
 /// member's identity. Returns the number of envelopes sent (the author
 /// is skipped: it already holds the body). The epoch must be one this
-/// engine holds a control key for.
+/// engine holds a control key for, and the snapshot's root manifest must
+/// be recorded — the announcement carries the transport identities the
+/// peers will fetch by (object-model.md decision 26): the body's Bao
+/// root, the root manifest's ContentId, and the transport root of the
+/// author's own sealed representation. The author signs the payload
+/// before sealing, so peers can verify authorship and the identities at
+/// intake.
 pub(super) fn announce(
     engine: &Engine,
     snapshot: &AuthorizedSnapshot,
@@ -116,18 +122,36 @@ pub(super) fn announce(
         .epoch_keys
         .get(&body.epoch)
         .ok_or(EngineError::MissingEpochKey(body.epoch))?;
-    let message = Message::SnapshotAnnouncement(SnapshotAnnouncement {
+
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let root_record = rebuilt
+        .runtime
+        .root_manifest_record(&body.snapshot_id())
+        .ok_or_else(|| EngineError::RootManifestUnavailable(body.snapshot_id()))?;
+
+    let mut announcement = SnapshotAnnouncement {
         snapshot: body.snapshot_id(),
         author: body.author,
         epoch: body.epoch,
         membership: body.membership,
+        // The body's transport root: raw BLAKE3 over the canonical
+        // bytes, the verified-fetch address for the bulk body.
+        body_root: crate::seal::blob_root(&body.encode()),
+        root_manifest: root_record.manifest_id,
+        root_manifest_transport: root_record.transport,
         // The composer's current retrieval route, sealed with the rest
         // (T17): authenticated routing metadata, opaque to control.
         node_addr: node_addr.map(<[u8]>::to_vec),
-    });
-    let sealed = seal(key, &engine.drive, body.epoch, &message)?;
+        signature: [0; 64],
+    };
+    crate::control::sign_announcement(&mut announcement, &engine.identity_secret, &engine.drive);
+    let sealed = seal(
+        key,
+        &engine.drive,
+        body.epoch,
+        &Message::SnapshotAnnouncement(announcement),
+    )?;
 
-    let rebuilt = engine.store.rebuild(engine.device)?;
     let members = rebuilt
         .log
         .members_of(&body.membership)

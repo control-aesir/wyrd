@@ -18,15 +18,15 @@
 //!
 //! Addressing mirrors what each party may know. Sealed objects are
 //! vault-visible, so they fetch by [`StorageId`]. The root manifest of
-//! a snapshot has no vault-visible pointer (the announcement carries
-//! only the snapshot id), so roots fetch by [`SnapshotId`] from a member
-//! peer holding that snapshot's metadata — this is the eager manifest
-//! exchange of sync-and-peers.md, not a vault read. Snapshot bodies
-//! fetch the same way: they are plaintext CAS objects whose content id
-//! equals the snapshot id (`ObjectKind::Snapshot`). The returned
-//! [`ContentId`] of a root fetch is an untrusted hint:
-//! `seal::open_manifest` still enforces it as AAD before the record is
-//! trusted.
+//! a snapshot is fetched by [`SnapshotId`] from a member peer holding
+//! that snapshot's metadata — this is the eager manifest exchange of
+//! sync-and-peers.md, not a vault read; the transport root the
+//! announcement now carries seeds the fetch-by-root path when map
+//! population lands. Snapshot bodies fetch the same way: they are
+//! plaintext CAS objects whose content id equals the snapshot id
+//! (`ObjectKind::Snapshot`). The returned [`ContentId`] of a root fetch
+//! is an untrusted hint: `seal::open_manifest` still enforces it as AAD
+//! before the record is trusted.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

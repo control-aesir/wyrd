@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use wyrd_format::MembershipTransition;
 
 use super::engine::{DrainReport, Engine, EngineError};
-use crate::control::{ControlError, ControlMessageId, IngestReport, Message, SealedControl};
+use crate::control::{
+    verify_announcement, ControlError, ControlMessageId, IngestReport, Message, SealedControl,
+};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::{CapabilityError, WrappedCapability};
@@ -182,6 +184,14 @@ fn message_action(engine: &mut Engine, id: &ControlMessageId, message: &Message)
             ])
         }
         Message::SnapshotAnnouncement(announcement) => {
+            // Authorship first: an announcement is evidence only when
+            // the author's signature verifies against the drive-bound
+            // challenge. A bad signature is malformed evidence like an
+            // unparsable transition — suppress without a durable fact,
+            // never defer.
+            if verify_announcement(&engine.drive(), announcement).is_err() {
+                return Action::Commit(vec![Fact::ControlMessage(*id)]);
+            }
             match engine.log.transition(&announcement.membership) {
                 None => Action::Defer,
                 Some(t) if t.epoch != announcement.epoch => {

@@ -160,6 +160,7 @@ fn open_record(
         is_root,
         manifest_id: *expected,
         storage_ids: BTreeSet::from([obj.storage_id()]),
+        transport: crate::seal::transport_root(&obj),
         manifest,
     })
 }
@@ -346,11 +347,11 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::engine::{FETCH_COOLDOWN_PASSES, FETCH_MAX_STRIKES};
     use crate::runtime::test_util::{
-        admit_engine, announcement_msg, deliver, drain, fixture, intake_snapshot, publish_into,
-        queue, Fixture,
+        admit_engine, announcement_msg, deliver, drain, fixture, identity_secret, intake_snapshot,
+        publish_into, queue, Fixture,
     };
     use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
-    use wyrd_format::{DeviceId, Manifest, MemoryObjectStore, ObjectKind};
+    use wyrd_format::{Manifest, MemoryObjectStore, ObjectKind};
 
     use crate::runtime::MaterializationState;
     /// One logical object under two representations across two snapshots
@@ -426,7 +427,12 @@ mod tests {
                 },
             );
         }
-        let bound = announcement_msg(snapshot_b, owner, 2, admission.transition_id());
+        let bound = announcement_msg(
+            &identity_secret(&builder.sk),
+            snapshot_b,
+            2,
+            admission.transition_id(),
+        );
         let envelope = deliver(fixture, 2, &bound);
         queue(fixture, vec![envelope]);
         assert_eq!(drain(fixture).accepted, 1);
@@ -716,8 +722,8 @@ mod tests {
         );
         // Both roots must be announced to become pending.
         let bound = announcement_msg(
+            &identity_secret(&crate::membership::test_util::key(0x22).0),
             bad_snapshot,
-            DeviceId::from_bytes([0x22; 32]),
             2,
             admission.transition_id(),
         );

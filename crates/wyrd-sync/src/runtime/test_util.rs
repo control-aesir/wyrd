@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use wyrd_format::membership::Admission;
 use wyrd_format::{
-    BaoRoot, Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, Manifest,
+    BaoRoot, Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Manifest,
     MembershipTransition, ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
@@ -198,27 +198,72 @@ pub(crate) fn drain(fixture: &mut Fixture) -> DrainReport {
 }
 
 pub(crate) fn announcement_for(epoch: u64, membership: TransitionId) -> Message {
-    announcement_msg(
-        SnapshotId::from_bytes([0x11; 32]),
-        DeviceId::from_bytes([0x22; 32]),
-        epoch,
-        membership,
-    )
+    let (sk, _) = identity(0x22);
+    announcement_msg(&sk, SnapshotId::from_bytes([0x11; 32]), epoch, membership)
 }
 
+/// A signed announcement: the author derives from the signing key (so
+/// intake verification accepts it), the transport identities are
+/// placeholders (map population wires the real ones), and the
+/// signature binds the member drive.
 pub(crate) fn announcement_msg(
+    author_sk: &DeviceIdentitySecret,
     snapshot: SnapshotId,
-    author: DeviceId,
     epoch: u64,
     membership: TransitionId,
 ) -> Message {
-    Message::SnapshotAnnouncement(SnapshotAnnouncement {
+    let kp = Keypair::from_secret_key(SECP256K1, &author_sk.secret_key());
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
+    let mut announcement = SnapshotAnnouncement {
         snapshot,
-        author,
+        author: DeviceId::from_bytes(xonly.serialize()),
         epoch,
         membership,
+        body_root: BaoRoot::from_bytes([0x44; 32]),
+        root_manifest: ContentId::from_bytes([0x55; 32]),
+        root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
         node_addr: None,
-    })
+        signature: [0; 64],
+    };
+    crate::control::sign_announcement(&mut announcement, author_sk, &member_drive());
+    Message::SnapshotAnnouncement(announcement)
+}
+
+/// The identity-secret wrapper for a test scalar: same key, typed for
+/// announcement signing at call sites that only hold the curve key
+/// (e.g. a membership Builder's owner).
+pub(crate) fn identity_secret(sk: &SecretKey) -> DeviceIdentitySecret {
+    DeviceIdentitySecret::from_bytes(sk.secret_bytes()).unwrap()
+}
+
+/// Record the root manifest an authored snapshot needs before its
+/// announcement can name transport identities: an empty manifest sealed
+/// under the snapshot's manifest key, committed as a durable fact. The
+/// production write path authors its manifest itself; scenarios use
+/// this stand-in until that slice lands.
+pub(crate) fn record_root_manifest(
+    engine: &mut Engine,
+    drive: &DriveId,
+    epoch_secret: &EpochSecret,
+    body: &Snapshot,
+) {
+    let manifest = Manifest {
+        snapshot: body.snapshot_id(),
+        entries: Vec::new(),
+        children: Vec::new(),
+    };
+    let key = epoch_secret.manifest_key(drive, body.epoch, &body.snapshot_id());
+    let (manifest_id, obj) = crate::seal::seal_manifest(&key, &manifest).unwrap();
+    let record = super::ManifestRecord {
+        is_root: true,
+        manifest_id,
+        storage_ids: BTreeSet::from([obj.storage_id()]),
+        transport: crate::seal::transport_root(&obj),
+        manifest,
+    };
+    engine
+        .commit_facts(&[crate::durable::Fact::Manifest(record)])
+        .unwrap();
 }
 
 pub(crate) fn transition_message(t: &MembershipTransition) -> Message {
@@ -342,8 +387,8 @@ pub(crate) fn intake_snapshot(
         secrets,
     );
     let bound = announcement_msg(
+        &identity_secret(&builder.sk),
         body.snapshot_id(),
-        owner,
         admission.epoch,
         admission.transition_id(),
     );

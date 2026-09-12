@@ -84,6 +84,8 @@ pub enum EngineError {
     NotAMember,
     #[error("no held control key for epoch {0}")]
     MissingEpochKey(u64),
+    #[error("no root manifest record for snapshot {0}: author the manifest before announcing")]
+    RootManifestUnavailable(SnapshotId),
     #[error("control sealing failed: {0}")]
     Crypto(#[from] crate::keys::CryptoError),
     #[error("root tree {0} is not present in the local object store")]
@@ -178,9 +180,9 @@ pub const FETCH_COOLDOWN_PASSES: u64 = 8;
 
 /// The backoff identity for one fetchable unit: child-manifest and
 /// object fetches strike by vault-visible representation address; root
-/// manifests and snapshot bodies have no such address before fetching
-/// (the announcement carries only the snapshot id), so they strike by
-/// snapshot.
+/// manifests and snapshot bodies are not yet fetched through the
+/// manifest mappings (map population wires their transport roots), so
+/// they strike by snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum FetchKey {
     Storage(StorageId),
@@ -563,8 +565,8 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
         announcement_msg, capability_message_for, deliver, drain, encryption_key, fixture,
-        identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
-        PublishedSnapshot, TestDir, WithoutObjects,
+        identity, publish_into, queue, record_root_manifest, transition_message, MemoryMailbox,
+        MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::transport::mailbox::{
         seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
@@ -838,8 +840,8 @@ mod tests {
         send_to(&mut pair, &owner_sk, a_dev, 2, &key(2), &cap_a2);
         send_to(&mut pair, &owner_sk, a_dev, 3, &key(3), &cap_a3);
         send_to(&mut pair, &owner_sk, b_dev, 3, &key(3), &cap_b);
-        let ann_a = announcement_msg(snapshot_a, a_dev, 2, admit_a.transition_id());
-        let ann_b = announcement_msg(snapshot_b, b_dev, 3, admit_b.transition_id());
+        let ann_a = announcement_msg(&pair.a.identity_sk, snapshot_a, 2, admit_a.transition_id());
+        let ann_b = announcement_msg(&pair.b.identity_sk, snapshot_b, 3, admit_b.transition_id());
         for target in [a_dev, b_dev] {
             send_to(&mut pair, &a_sk, target, 2, &key(2), &ann_a);
             send_to(&mut pair, &b_sk, target, 3, &key(3), &ann_b);
@@ -1200,6 +1202,12 @@ mod tests {
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
         let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        record_root_manifest(
+            &mut pair.a.engine,
+            &member_drive(),
+            &secret(0x07 + authored.snapshot().epoch as u8),
+            authored.snapshot(),
+        );
         let sent = {
             let mut mailbox = MemoryMailbox {
                 relay: &mut pair.relay,
@@ -1232,6 +1240,12 @@ mod tests {
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
         let authored = f.engine.author_snapshot(&objects, tree).unwrap();
+        record_root_manifest(
+            &mut f.engine,
+            &member_drive(),
+            &EpochSecret::from_bytes([0x07; 32]),
+            authored.snapshot(),
+        );
         let mut mailbox = MemoryMailbox {
             relay: &mut f.relay,
             owner: f.recipient,
@@ -1309,6 +1323,12 @@ mod tests {
         let mut objects = MemoryObjectStore::default();
         let tree = local_tree(&mut objects);
         let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        record_root_manifest(
+            &mut pair.a.engine,
+            &member_drive(),
+            &secret(0x07 + authored.snapshot().epoch as u8),
+            authored.snapshot(),
+        );
 
         let mut mailbox = FailingMailbox {
             sent: 0,

@@ -4,6 +4,7 @@
 
 use crate::identity::{ContentId, ObjectKind};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Storage for immutable plaintext objects, addressed by `ContentId`.
@@ -134,6 +135,96 @@ impl ObjectStore for MemoryObjectStore {
     }
 }
 
+/// An [`ObjectStore`] over a shared handle: each trait call locks only
+/// for its own operation, so a `&mut` borrow held across a fetch plan
+/// guards nothing and bulk I/O never stalls concurrent serving reads.
+/// This is the adapter a live sync loop passes to `execute_plan`
+/// while a presentation backend serves from the same handle.
+///
+/// A poisoned lock surfaces as the store error. Fetch planners treat
+/// store failures as transient local failures (retry next pass) and
+/// readers fail closed — poisoning degrades to retried fetches and
+/// serving errors, never silent corruption.
+#[derive(Debug, Clone)]
+pub struct SharedStore<S> {
+    store: Arc<RwLock<S>>,
+}
+
+/// What a [`SharedStore`] operation can fail with: the backing store's
+/// own error, or a poisoned lock (a holder panicked mid-operation).
+#[derive(Debug, Error)]
+pub enum SharedStoreError<E> {
+    #[error("backing store failed: {0:?}")]
+    Store(E),
+    #[error("store lock poisoned")]
+    Lock,
+}
+
+impl<S> SharedStore<S> {
+    /// Wrap an owned store; the handle starts unshared.
+    pub fn new(store: S) -> Self {
+        SharedStore {
+            store: Arc::new(RwLock::new(store)),
+        }
+    }
+
+    /// Clone the shared handle: serving reads, fetch writes, and
+    /// further wrappers all address the same backing store.
+    pub fn handle(&self) -> Arc<RwLock<S>> {
+        Arc::clone(&self.store)
+    }
+}
+
+impl<S> From<Arc<RwLock<S>>> for SharedStore<S> {
+    fn from(store: Arc<RwLock<S>>) -> Self {
+        SharedStore { store }
+    }
+}
+
+impl<S: ObjectStore> ObjectStore for SharedStore<S>
+where
+    S::Error: std::fmt::Debug,
+{
+    type Error = SharedStoreError<S::Error>;
+
+    fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
+        self.store
+            .write()
+            .map_err(|_| SharedStoreError::Lock)?
+            .insert(kind, data)
+            .map_err(SharedStoreError::Store)
+    }
+
+    fn insert_verified(
+        &mut self,
+        kind: ObjectKind,
+        expected: &ContentId,
+        data: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.store
+            .write()
+            .map_err(|_| SharedStoreError::Lock)?
+            .insert_verified(kind, expected, data)
+            .map_err(SharedStoreError::Store)
+    }
+
+    fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.store
+            .read()
+            .map_err(|_| SharedStoreError::Lock)?
+            .get(id)
+            .map_err(SharedStoreError::Store)
+    }
+
+    fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
+        self.store
+            .read()
+            .map_err(|_| SharedStoreError::Lock)?
+            .has(id)
+            .map_err(SharedStoreError::Store)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +318,71 @@ mod tests {
         let store = MemoryObjectStore::default();
         assert_eq!(store.get(&chunk_id(b"absent")).unwrap(), None);
         assert!(!store.has(&chunk_id(b"absent")).unwrap());
+    }
+
+    #[test]
+    fn shared_store_round_trips_and_shares_handles() {
+        let mut shared = SharedStore::new(MemoryObjectStore::default());
+        let expected = chunk_id(b"shared bytes");
+        shared
+            .insert_verified(ObjectKind::Chunk, &expected, b"shared bytes")
+            .unwrap();
+        assert!(shared.has(&expected).unwrap());
+        assert_eq!(
+            shared.get(&expected).unwrap().as_deref(),
+            Some(b"shared bytes".as_slice())
+        );
+        // A second wrapper over the cloned handle addresses the same
+        // backing store.
+        let mut twin = SharedStore::from(shared.handle());
+        assert!(twin.has(&expected).unwrap());
+        assert!(matches!(
+            twin.insert_verified(ObjectKind::Chunk, &expected, b"wrong bytes"),
+            Err(SharedStoreError::Store(_))
+        ));
+    }
+
+    #[test]
+    fn shared_store_maps_poison_to_lock_error() {
+        let shared = SharedStore::new(MemoryObjectStore::default());
+        let handle = shared.handle();
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = handle.write().unwrap();
+                    panic!("holder panics mid-write");
+                })
+                .join()
+        });
+        assert!(matches!(
+            shared.has(&chunk_id(b"x")),
+            Err(SharedStoreError::Lock)
+        ));
+    }
+
+    #[test]
+    fn shared_store_reads_proceed_concurrently() {
+        use std::sync::Barrier;
+        let mut shared = SharedStore::new(MemoryObjectStore::default());
+        let id = shared.insert(ObjectKind::Chunk, b"concurrent").unwrap();
+        let reader = SharedStore::from(shared.handle());
+        // Two readers at once: per-operation locking never serializes
+        // reads behind each other.
+        let barrier = Barrier::new(3);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..50 {
+                        assert_eq!(
+                            reader.get(&id).unwrap().as_deref(),
+                            Some(b"concurrent".as_slice())
+                        );
+                    }
+                });
+            }
+            barrier.wait();
+        });
+        assert!(shared.has(&id).unwrap());
     }
 }

@@ -10,12 +10,12 @@
 //! mobile file surfaces later) consume the view and map errors at their
 //! own boundary.
 
-use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, Snapshot, Tree};
+use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, Snapshot, Tree};
 use wyrd_fuse::{DriveView, Materialization, VerifiedSnapshot, ViewHead};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     bulk::BulkSource,
-    runtime::{DrainReport, Engine, EngineError, ExecuteReport},
+    runtime::{DrainReport, Engine, EngineError, ExecuteReport, MaterializationState},
     transport::mailbox::Mailbox,
 };
 
@@ -282,6 +282,7 @@ where
                 engine: self.engine,
                 store,
                 view,
+                dirty: false,
             },
             backend,
         )
@@ -365,29 +366,63 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// writes bytes through this without taking the view lock.
     store: Arc<RwLock<S>>,
     view: Arc<RwLock<DriveView<S, DaemonMaterialization>>>,
+    /// Durable state may have changed without a republication (a pass
+    /// failed after committing): the next pass republishes regardless
+    /// of its own counters, so recovery never waits for new changes.
+    dirty: bool,
 }
 
 impl<S: ObjectStore> LiveDaemon<S>
 where
     S::Error: std::fmt::Debug,
 {
+    /// Mark content wanted locally (`Cached`) so fetch plans retrieve
+    /// it: the daemon's fetch-policy surface. `RemoteOnly` content is
+    /// never fetched; the composer decides what to want. (The CLI does
+    /// not call this yet — fetch triggers land with peer addressing
+    /// on the parent tracker.)
+    pub fn want(&mut self, content: ContentId) -> Result<(), LiveError> {
+        self.engine
+            .set_materialization(content, MaterializationState::Cached)?;
+        Ok(())
+    }
+
     /// One supervised pass: drain the mailbox into the engine, run a
     /// bounded fetch plan when a bulk source is present, then publish
     /// refreshed materialization facts and live heads into the shared
-    /// view. The fetch runs against the shared store handle with no
-    /// view lock held, so bulk I/O never stalls serving; only the
-    /// final publication swaps heads and facts under a short write
-    /// lock. A pass with no durable change (nothing accepted,
-    /// committed, or fetched) skips republication: the projection
-    /// derives solely from durable state, so an unchanged store means
-    /// an unchanged projection and the idle loop stays cheap.
+    /// view. Fetch runs through a [`SharedStore`](wyrd_format::SharedStore)
+    /// over the same handle the backend serves from: each verified
+    /// import locks only for its own write, so bulk reads and
+    /// verification never stall serving. Only the final publication
+    /// swaps heads and facts under a short view write lock. A pass
+    /// with no durable change and no backlog from a failed pass skips
+    /// republication: the projection derives solely from durable
+    /// state, so an unchanged store means an unchanged projection and
+    /// the idle loop stays cheap.
     ///
     /// Publication is atomic; the pass is not: a failed pass leaves
     /// the serving projection untouched, but durable commits made
     /// before the failure stand (fetch and intake are designed
     /// restart-safe, so the next pass reconciles rather than
-    /// re-doing them).
+    /// re-doing them). Any failure marks the daemon dirty, forcing
+    /// republication on the next pass even if that pass reports zero
+    /// new changes.
     pub fn sync_once<M: Mailbox, B: BulkSource>(
+        &mut self,
+        mailbox: &mut M,
+        bulk: Option<&mut B>,
+    ) -> Result<SyncReport, LiveError> {
+        let report = self.sync_pass(mailbox, bulk);
+        if report.is_err() {
+            self.dirty = true;
+        }
+        report
+    }
+
+    /// One pass body: intake, fetch, then conditional republication.
+    /// Republication clears the dirty backlog; every failure path
+    /// leaves it set (via the [`LiveDaemon::sync_once`] wrapper).
+    fn sync_pass<M: Mailbox, B: BulkSource>(
         &mut self,
         mailbox: &mut M,
         bulk: Option<&mut B>,
@@ -395,12 +430,12 @@ where
         let drained = self.engine.drain(mailbox)?;
         let fetched = match bulk {
             Some(bulk) => {
-                let mut store = self.store.write().map_err(|_| LiveError::Lock)?;
-                self.engine.execute_plan(bulk, &mut *store)?
+                let mut shared = SharedStore::from(Arc::clone(&self.store));
+                self.engine.execute_plan(bulk, &mut shared)?
             }
             None => ExecuteReport::default(),
         };
-        if !sync_changed(&drained, &fetched) {
+        if !self.dirty && !sync_changed(&drained, &fetched) {
             return Ok(SyncReport { drained, fetched });
         }
         let runtime = self.engine.runtime_state()?;
@@ -410,6 +445,7 @@ where
             view.set_materialization(DaemonMaterialization { runtime });
             view.set_heads(heads);
         }
+        self.dirty = false;
         Ok(SyncReport { drained, fetched })
     }
 
@@ -421,6 +457,13 @@ where
     /// consecutive-failure cap trips. `stop` is a pure cancellation
     /// flag — it publishes no data, so `Relaxed` ordering is the honest
     /// level and must stay that way.
+    ///
+    /// Backlog behavior under sustained traffic: each pass drains what
+    /// the mailbox currently holds, so a flood costs latency (poll
+    /// intervals), never loss. Overflow backpressures into the relay,
+    /// which retains everything; replayed history collapses through
+    /// the durable seen log. Relay reconnect supervision itself is a
+    /// separately tracked issue.
     pub fn run_loop<M: Mailbox, B: BulkSource>(
         &mut self,
         mailbox: &mut M,
@@ -466,6 +509,11 @@ where
 /// nothing. With no durable change the serving projection is provably
 /// identical, so republication is skipped and the idle loop stays
 /// cheap (no durable rebuild, no re-verification, no view churn).
+///
+/// Report-to-durability contract: if a future report field ever
+/// records a durable commit, it must be added to this predicate —
+/// otherwise a real change skips publication and the view goes stale.
+/// (The dirty backlog only covers failures, never silent successes.)
 fn sync_changed(drained: &DrainReport, fetched: &ExecuteReport) -> bool {
     drained.accepted > 0
         || drained.duplicates > 0
@@ -925,6 +973,32 @@ mod tests {
                 .expect("fresh handle reads"),
             b"v1"
         );
+
+        drop(live);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A backlog from a failed pass forces republication on the next
+    /// clean pass even when it reports zero new changes, then clears.
+    /// Whether republication becomes visible depends on durable state
+    /// (heads need bodies); the flag transition itself is the
+    /// mechanism under test here, with end-to-end recovery covered by
+    /// the contracts suite.
+    #[test]
+    fn dirty_backlog_clears_on_clean_pass() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("steady.txt", b"steady").unwrap();
+        let (mut live, backend) = daemon.into_live();
+        live.dirty = true;
+        let mut mailbox = NoopMailbox;
+        live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+        assert!(!live.dirty, "republication clears the backlog");
+        let handle = backend.open_at("steady.txt").expect("still serves");
+        let bytes = backend.read_handle(handle, 0, 1024).expect("still reads");
+        assert_eq!(bytes, b"steady");
 
         drop(live);
         drop(backend);

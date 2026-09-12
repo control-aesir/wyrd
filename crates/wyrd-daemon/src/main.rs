@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fuser::{Config, MountOption};
-use wyrd_daemon::{Daemon, LiveConfig, LiveError};
+use wyrd_daemon::{Daemon, LiveConfig, LiveError, LiveSummary};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
@@ -201,6 +201,12 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
 /// platform cannot install the handler, termination falls back to the
 /// default disposition (same as dying in `fuser::mount` today).
+///
+/// Portability scope: validated on Linux, where the libc-crate union
+/// convention (`sa_sigaction as usize`) addresses the handler union.
+/// Other Unix targets keep the gate but are untested — the handler
+/// touches only a lock-free flag, so the worst case is the
+/// pre-existing default-disposition behavior, never memory unsafety.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn install_shutdown_handler() -> Result<(), CliError> {
@@ -301,9 +307,12 @@ fn mount(
         eprintln!("warning: no --relay given; control-plane intake stays idle");
     }
 
+    // Arm shutdown before mounting: every post-mount failure path
+    // below returns through the unmount-and-join sequence, never
+    // leaking a detached session.
+    install_shutdown_handler()?;
     let mut session = fuser::Session::new(backend, &args.mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
-    install_shutdown_handler()?;
     let server = std::thread::spawn(move || session.run());
     // No peer addressing exists yet, so the loop drains and publishes
     // heads without fetching: `IrohBulkSource` names the source type
@@ -320,17 +329,31 @@ fn mount(
 
     // Clean shutdown either way: unmount first so the kernel releases
     // the mountpoint, then reap the session thread, then report the
-    // loop's own result without masking it.
+    // combined outcome — a dead serving thread fails the mount even
+    // when the loop stopped cleanly.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
     }
-    match server.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("warning: FUSE session failed: {error}"),
-        Err(_) => eprintln!("warning: FUSE session thread panicked"),
+    let session_result = match server.join() {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::other("FUSE session thread panicked")),
+    };
+    combine_status(result, session_result)
+}
+
+/// Fold the loop and session outcomes into the process exit status: a
+/// loop failure dominates (it names the operational cause), but a
+/// session failure alone still fails the mount — success requires a
+/// clean stop AND a cleanly reaped server.
+fn combine_status(
+    loop_result: Result<LiveSummary, LiveError>,
+    session_result: Result<(), std::io::Error>,
+) -> Result<(), CliError> {
+    match (loop_result, session_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(error), _) => Err(CliError::Live(error)),
+        (Ok(_), Err(error)) => Err(CliError::Mount(error)),
     }
-    result?;
-    Ok(())
 }
 
 fn session_config() -> Config {
@@ -489,6 +512,40 @@ mod tests {
         let mut args = vec!["/drive".into(), "--relay".into()];
         let error = collect_options(&mut args, "--relay").unwrap_err();
         assert!(matches!(error, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn combine_status_fails_dead_sessions() {
+        let clean = LiveSummary {
+            passes: 1,
+            errors_retried: 0,
+        };
+        assert!(
+            combine_status(Ok(clean), Ok(())).is_ok(),
+            "clean stop and clean server exit zero"
+        );
+        let clean = LiveSummary {
+            passes: 1,
+            errors_retried: 0,
+        };
+        assert!(
+            matches!(
+                combine_status(Ok(clean), Err(std::io::Error::other("dead"))),
+                Err(CliError::Mount(_))
+            ),
+            "a dead serving thread fails the mount"
+        );
+        assert!(
+            matches!(
+                combine_status(Err(LiveError::Lock), Ok(())),
+                Err(CliError::Live(_))
+            ),
+            "a loop failure dominates"
+        );
+        assert!(
+            combine_status(Err(LiveError::Lock), Err(std::io::Error::other("dead"))).is_err(),
+            "both failing still fails"
+        );
     }
 
     #[test]

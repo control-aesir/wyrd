@@ -45,7 +45,7 @@
 //! [`MembershipLog`]: crate::membership::MembershipLog
 //! [`DurableStore`]: crate::durable::DurableStore
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -234,7 +234,12 @@ pub struct Engine {
     /// forks never become facts — so replay never encounters a conflict
     /// intake could have detected.
     pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
-    pub(super) pending: HashMap<ControlMessageId, Message>,
+    /// Held (deferred) control messages, in arrival order: a flush
+    /// batch emits them in the order they were deferred, so staged
+    /// announcement compatibility and durable fact order are
+    /// deterministic. In-memory fast path only — the relay retains
+    /// unacked envelopes, so a crash loses nothing but latency.
+    pub(super) pending: Vec<(ControlMessageId, Message)>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
     /// happened, per-representation strike counts with the run they were
     /// last struck (one strike per run — a call's convergence passes
@@ -290,7 +295,7 @@ impl Engine {
             epoch_keys: BTreeMap::new(),
             log: MembershipLog::new(drive),
             announcements: BTreeMap::new(),
-            pending: HashMap::new(),
+            pending: Vec::new(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
             fetch_cool_until: BTreeMap::new(),
@@ -377,6 +382,22 @@ impl Engine {
     /// Capabilities held for a future transition.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Hold a deferred message pending, in arrival order. An id already
+    /// held is replaced in place (it keeps its arrival slot; there is
+    /// only ever one copy of a message id).
+    pub(super) fn hold_pending(&mut self, id: ControlMessageId, message: Message) {
+        match self.pending.iter_mut().find(|(held, _)| held == &id) {
+            Some(slot) => slot.1 = message,
+            None => self.pending.push((id, message)),
+        }
+    }
+
+    /// Take a held message by id (a duplicate delivery resolving it).
+    pub(super) fn take_pending(&mut self, id: &ControlMessageId) -> Option<Message> {
+        let pos = self.pending.iter().position(|(held, _)| held == id)?;
+        Some(self.pending.remove(pos).1)
     }
 
     /// Rebuild the inbox dedupe set and membership log from committed

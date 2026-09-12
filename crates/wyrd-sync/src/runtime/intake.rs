@@ -108,7 +108,7 @@ fn accept_envelope(
         // in the relay.
         Err(_) => Ok(Outcome::Discarded),
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
-            Some(id) => match engine.pending.remove(&id) {
+            Some(id) => match engine.take_pending(&id) {
                 Some(message) => commit_action(engine, &id, &message, false),
                 None => Ok(Outcome::Duplicate),
             },
@@ -142,7 +142,7 @@ fn commit_action(
             return Ok(Outcome::RelayHeld);
         }
         Action::Defer => {
-            engine.pending.insert(*id, message.clone());
+            engine.hold_pending(*id, message.clone());
             return Ok(Outcome::Deferred);
         }
     };
@@ -151,11 +151,14 @@ fn commit_action(
         staged.clear();
     }
     if matches!(message, Message::MembershipTransition(_)) {
+        // The flush walks the pending queue in arrival order (see
+        // `Engine::hold_pending`): staged announcement compatibility
+        // and the durable fact order are deterministic.
         for (pending_id, pending_message) in std::mem::take(&mut engine.pending) {
             match message_action(engine, &pending_id, &pending_message, &mut staged) {
                 Action::Commit(more) => facts.extend(more),
                 Action::Defer => {
-                    engine.pending.insert(pending_id, pending_message);
+                    engine.hold_pending(pending_id, pending_message);
                 }
             }
         }
@@ -498,6 +501,122 @@ mod tests {
         assert_eq!(
             engine.announcements[&snapshot].node_addr,
             Some(vec![0x05, 0x06])
+        );
+    }
+
+    #[test]
+    fn deferred_route_updates_flush_in_arrival_order() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let (sk, _) = identity(0x22);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        // Both route updates arrive before their membership transition:
+        // each defers, then flushes in arrival order when it lands.
+        let first = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x01, 0x02]),
+        );
+        let second = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x03, 0x04]),
+        );
+        let mail = vec![deliver(&fixture, 2, &first), deliver(&fixture, 2, &second)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.deferred, 2);
+
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 2);
+
+        // The durable fact order is arrival order, and the projection
+        // carries the last accepted route.
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 2);
+        assert_eq!(facts.announcements[0].node_addr, Some(vec![0x01, 0x02]));
+        assert_eq!(facts.announcements[1].node_addr, Some(vec![0x03, 0x04]));
+        assert_eq!(
+            fixture.engine.announcements[&snapshot].node_addr,
+            Some(vec![0x03, 0x04])
+        );
+
+        // Replay walks the same order: the same winner after reopen.
+        let engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].node_addr,
+            Some(vec![0x03, 0x04])
+        );
+    }
+
+    #[test]
+    fn deferred_fork_never_commits_when_the_batch_flushes() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let (sk, _) = identity(0x22);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        // An honest statement and an immutable fork of it, both
+        // deferred behind the unknown transition. The flush walks
+        // arrival order, so the gate compares the fork against the
+        // staged first statement and refuses it; the reverse order
+        // would refuse the honest one with equal determinism.
+        let first = announcement_msg_with(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+        );
+        let fork = announcement_msg_with(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x99; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+        );
+        let mail = vec![deliver(&fixture, 2, &first), deliver(&fixture, 2, &fork)];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).deferred, 2);
+
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 2);
+
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1, "the fork never commits");
+        assert_eq!(
+            fixture.engine.announcements[&snapshot].root_manifest,
+            ContentId::from_bytes([0x55; 32])
+        );
+        // Replay stays healthy.
+        let engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].root_manifest,
+            ContentId::from_bytes([0x55; 32])
         );
     }
 

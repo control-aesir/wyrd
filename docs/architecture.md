@@ -14,6 +14,9 @@ One page. Read this, then the focused docs:
   authorization, classification, recovery
 - `fetch-on-open.md` — **normative** demand-driven fetch design:
   announcement endpoints, daemon serving, want channel, blocking open
+- `write-path.md` — **normative** mounted write design: write session,
+  mutation queue, commit pipeline and durability ordering, namespace
+  operations, conflicted-drive policy
 
 ## The system in one sentence
 
@@ -139,13 +142,13 @@ transport root, announcement `node_addr` routes publish into the fetch
 plane on every sync pass, and a serving restart's route update rewires
 serving (contract 13). Still open: the NIP-46 signer-session client
 wiring, multi-relay mailbox supervision and relay interop coverage, and
-the
-live write path behind the FUSE mount; garbage collection does
-not exist. `wyrd-fuse` is a
+the live write path behind the FUSE mount — designed in `docs/write-path.md`,
+with the mount still read-only until the mutation queue, format
+mkdir/rename primitives, and FUSE write operations land. Garbage
+collection does not exist. `wyrd-fuse` is a
 mount-free view behind the daemon's FUSE backend. All crypto and sync
 work follows `trust.md` and `epochs.md` as normative contracts; the
-open tracking issues name what comes next (durable snapshot-body
-consumers, runtime sync, recovery completion).
+open tracking issues name what comes next.
 
 The local `wyrd` CLI mounts a live read-only projection: a supervised
 loop drains the NIP-59 control-plane mailbox, admits FUSE demand into
@@ -153,10 +156,11 @@ durable `Cached` materialization each pass, refreshes materialization
 facts and live heads into the serving view without remounting, and
 shuts down cleanly on SIGINT/SIGTERM. `open`/`read` on non-local
 content registers a want and blocks bounded (`docs/fetch-on-open.md`);
-fetch from peers is not yet wired (no transport-identity distribution,
-so the loop runs without a bulk source) and demand therefore surfaces
-`EIO` on deadline. Relays arrive as repeatable `--relay` flags;
-parsing is clap-derive. Credential
+the loop runs with a real iroh bulk source and publishes recorded routes
+each pass, and the mount opens the drive's serving endpoint, so a peer
+with a live announcement fetches over transport, while unavailable
+demand still surfaces `EIO` on its deadline. Relays arrive as repeatable
+`--relay` flags; parsing is clap-derive. Credential
 files are supported on Unix, must be regular files owned by the current
 user with private permissions, and are bounded and zeroized at the CLI
 boundary.

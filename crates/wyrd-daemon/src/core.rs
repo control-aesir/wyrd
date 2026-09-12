@@ -26,6 +26,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::fuse::FuseBackend;
+use crate::want::WantRegistry;
 
 /// The daemon's bridge from `wyrd-sync`'s verified snapshots to the
 /// view's heads: the one in-tree implementation of [`VerifiedSnapshot`],
@@ -203,8 +204,9 @@ where
         &self,
         snapshot: &AuthorizedSnapshot,
         mailbox: &mut impl Mailbox,
+        node_addr: Option<&[u8]>,
     ) -> Result<usize, wyrd_sync::runtime::EngineError> {
-        self.engine.announce_snapshot(snapshot, mailbox)
+        self.engine.announce_snapshot(snapshot, mailbox, node_addr)
     }
 
     /// The tree a write builds from when the drive has exactly one live
@@ -273,15 +275,21 @@ where
     /// held, and each pass publishes heads and facts under one short
     /// write lock — serving never observes a half-published
     /// projection and never stalls on bulk I/O.
-    pub fn into_live(self) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
+    pub fn into_live(
+        self,
+        open_timeout: Duration,
+    ) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
         let store = self.view.store_handle();
         let view = Arc::new(RwLock::new(self.view));
-        let backend = FuseBackend::shared(Arc::clone(&view));
+        let wants = Arc::new(WantRegistry::default());
+        let backend =
+            FuseBackend::shared_with_wants(Arc::clone(&view), Arc::clone(&wants), open_timeout);
         (
             LiveDaemon {
                 engine: self.engine,
                 store,
                 view,
+                wants,
                 dirty: false,
             },
             backend,
@@ -366,6 +374,11 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// writes bytes through this without taking the view lock.
     store: Arc<RwLock<S>>,
     view: Arc<RwLock<DriveView<S, DaemonMaterialization>>>,
+    /// FUSE demand: the backend registers wants, the loop admits them
+    /// into the engine each pass and lets completion surface through
+    /// the view. The registry's lock is its own (never the view's or
+    /// the store's).
+    wants: Arc<WantRegistry>,
     /// Durable state may have changed without a republication (a pass
     /// failed after committing): the next pass republishes regardless
     /// of its own counters, so recovery never waits for new changes.
@@ -377,10 +390,9 @@ where
     S::Error: std::fmt::Debug,
 {
     /// Mark content wanted locally (`Cached`) so fetch plans retrieve
-    /// it: the daemon's fetch-policy surface. `RemoteOnly` content is
-    /// never fetched; the composer decides what to want. (The CLI does
-    /// not call this yet — fetch triggers land with peer addressing
-    /// on the parent tracker.)
+    /// it: the composer's manual fetch-policy lever on top of the
+    /// want registry (FUSE registers demand; the loop admits it).
+    /// `RemoteOnly` content is never fetched without either path.
     pub fn want(&mut self, content: ContentId) -> Result<(), LiveError> {
         self.engine
             .set_materialization(content, MaterializationState::Cached)?;
@@ -428,6 +440,16 @@ where
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
+        // Admit outstanding FUSE demand ahead of fetching, atomically
+        // from the registry's perspective: only durably committed
+        // identities are marked admitted, so a failing commit leaves
+        // the rest pending for the next pass and no waiter ever
+        // coalesces onto an unadmitted fetch.
+        let committed = admit_wants(&self.wants, &mut |want| {
+            self.engine
+                .set_materialization(want, MaterializationState::Cached)
+        })?;
+        let wants_admitted = !committed.is_empty();
         let fetched = match bulk {
             Some(bulk) => {
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
@@ -435,14 +457,23 @@ where
             }
             None => ExecuteReport::default(),
         };
-        if !self.dirty && !sync_changed(&drained, &fetched) {
+        // Settle admitted wants: retire a landed fetch, and retire a fetch
+        // whose demand died — the engine's durable `Cached` policy keeps
+        // retrying independently of the registry, so a permanently
+        // unavailable identity never permanently consumes capacity.
+        let completed_runtime = self.engine.runtime_state()?;
+        self.wants.retire_where(|content, waiters| {
+            completed_runtime.status(content) == FetchStatus::Available || waiters == 0
+        });
+        if !self.dirty && !wants_admitted && !sync_changed(&drained, &fetched) {
             return Ok(SyncReport { drained, fetched });
         }
-        let runtime = self.engine.runtime_state()?;
         let heads = view_heads(self.engine.live_heads()?);
         {
             let mut view = self.view.write().map_err(|_| LiveError::Lock)?;
-            view.set_materialization(DaemonMaterialization { runtime });
+            view.set_materialization(DaemonMaterialization {
+                runtime: completed_runtime,
+            });
             view.set_heads(heads);
         }
         self.dirty = false;
@@ -520,6 +551,33 @@ fn sync_changed(drained: &DrainReport, fetched: &ExecuteReport) -> bool {
         || fetched.manifests > 0
         || fetched.snapshot_bodies > 0
         || fetched.objects > 0
+}
+
+/// Persist pending wants into durable `Cached` materialization,
+/// atomically from the registry's perspective: each identity's fact is
+/// written first, and only the committed prefix is marked admitted. A
+/// failing commit leaves the failing identity and everything after it
+/// pending — the next pass retries them, and no waiter ever coalesces
+/// onto a fetch that was never admitted. Returns the committed
+/// identities (which feed the publication gate: a committed fact
+/// changes the serving projection even when nothing else did).
+fn admit_wants<E>(
+    registry: &WantRegistry,
+    commit: &mut dyn FnMut(ContentId) -> Result<(), E>,
+) -> Result<Vec<ContentId>, E> {
+    let pending = registry.peek_pending();
+    let mut committed = Vec::with_capacity(pending.len());
+    for want in pending {
+        match commit(want) {
+            Ok(()) => committed.push(want),
+            Err(error) => {
+                registry.mark_admitted(&committed);
+                return Err(error);
+            }
+        }
+    }
+    registry.mark_admitted(&committed);
+    Ok(committed)
 }
 
 /// Sleep in short slices so a set `stop` flag is noticed promptly even
@@ -717,7 +775,7 @@ mod tests {
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         let snapshot = daemon.put_file("published.txt", b"publish me").unwrap();
         let sent = daemon
-            .announce_snapshot(&snapshot, &mut NoopMailbox)
+            .announce_snapshot(&snapshot, &mut NoopMailbox, None)
             .unwrap();
         assert_eq!(sent, 0, "a single-member drive has no peer recipients");
 
@@ -861,7 +919,7 @@ mod tests {
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("live.txt", b"shared").unwrap();
 
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         let mut mailbox = NoopMailbox;
         let report = live
             .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -878,6 +936,73 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The reviewer's publication-gate regression: admitting a pending
+    /// want is a durable commit (`Cached` fact) even when nothing else
+    /// changed — the serving projection must republish so the view stops
+    /// reporting `RemoteOnly` for content the engine has admitted.
+    #[test]
+    fn want_admission_publishes_without_other_changes() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("anchor.txt", b"anchor").unwrap();
+        let (mut live, _backend) = daemon.into_live(Duration::from_secs(30));
+
+        // Demand content nobody holds yet; no mailbox traffic, no bulk.
+        let missing = ContentId::from_bytes([0xEE; 32]);
+        live.wants.register(missing).unwrap();
+        live.sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+        let status = live.view.read().unwrap().status(&missing);
+        assert_eq!(
+            status,
+            FetchStatus::Fetching,
+            "want admission must publish even with no other pass changes"
+        );
+        // The sweep left the still-unfulfilled want in flight.
+        assert!(live.wants.is_admitted(&missing));
+
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reviewer's admission-atomicity regression: a durable
+    /// admission failure must leave the uncommitted wants pending — never
+    /// stranded as admitted — so the next pass retries them and no waiter
+    /// ever coalesces onto a fetch that was never admitted. The commit
+    /// step fails mid-batch: the committed prefix is marked, the failing
+    /// suffix stays pending, and the retry admits the rest.
+    #[test]
+    fn failed_want_admission_stays_pending_and_retries() {
+        let registry = WantRegistry::default();
+        let first = ContentId::from_bytes([0xE1; 32]);
+        let second = ContentId::from_bytes([0xE2; 32]);
+        registry.register(first).unwrap();
+        registry.register(second).unwrap();
+
+        let committed = admit_wants(&registry, &mut |want| {
+            if want == second {
+                Err("durable store failed")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            committed,
+            Err("durable store failed"),
+            "the failing commit surfaces"
+        );
+        assert!(registry.is_admitted(&first), "the prefix is admitted");
+        assert!(
+            !registry.is_admitted(&second),
+            "a failed admission never strands the identity as admitted"
+        );
+        assert_eq!(registry.peek_pending(), vec![second]);
+
+        // The next pass retries the pending suffix and finishes the batch.
+        let retry = admit_wants(&registry, &mut |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(retry, vec![second]);
+        assert!(registry.peek_pending().is_empty());
+    }
     /// Poison arriving through the mailbox is consumed (acked) rather
     /// than retained: an unopenable envelope is terminal, and the
     /// serving projection is untouched by the pass.
@@ -886,7 +1011,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("steady.txt", b"steady").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let mut mailbox = QueueMailbox::new();
         mailbox.push(MailboxEnvelope {
@@ -918,7 +1043,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("fetched.txt", b"local").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let mut mailbox = NoopMailbox;
         let mut bulk = MemoryBulkSource::default();
@@ -946,7 +1071,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("stable.txt", b"v1").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let old = backend.open_at("stable.txt").expect("opens");
         // Idle and poison passes republish (or skip) the projection
@@ -990,7 +1115,7 @@ mod tests {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("steady.txt", b"steady").unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         live.dirty = true;
         let mut mailbox = NoopMailbox;
         live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -1010,7 +1135,7 @@ mod tests {
     fn run_loop_stops_immediately() {
         let (engine, dir, _) = scratch_drive();
         let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
         let stop = std::sync::atomic::AtomicBool::new(true);
         let mut mailbox = NoopMailbox;
@@ -1038,7 +1163,7 @@ mod tests {
     fn run_loop_runs_until_stopped() {
         let (engine, dir, _) = scratch_drive();
         let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         drop(backend);
 
         let stop = std::sync::atomic::AtomicBool::new(false);
@@ -1075,7 +1200,7 @@ mod tests {
     fn run_loop_aborts_after_error_cap() {
         let (engine, dir, _) = scratch_drive();
         let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-        let (mut live, backend) = daemon.into_live();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
         drop(backend);
 
         let stop = std::sync::atomic::AtomicBool::new(false);

@@ -395,6 +395,7 @@ mod tests {
             author: wyrd_format::DeviceId::from_bytes([author; 32]),
             epoch,
             membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            node_addr: None,
         }
     }
 
@@ -708,6 +709,7 @@ mod tests {
                 author: wyrd_format::DeviceId::from_bytes([2; 32]),
                 epoch: 3,
                 membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+                node_addr: None,
             })
             .unwrap();
 
@@ -755,18 +757,21 @@ mod tests {
                 author: other_author,
                 epoch: 3,
                 membership,
+                node_addr: None,
             },
             SnapshotAnnouncement {
                 snapshot: id,
                 author,
                 epoch: 4,
                 membership,
+                node_addr: None,
             },
             SnapshotAnnouncement {
                 snapshot: id,
                 author,
                 epoch: 3,
                 membership: other_membership,
+                node_addr: None,
             },
         ] {
             let mut state = RuntimeState::new(drive());
@@ -789,6 +794,7 @@ mod tests {
                 author,
                 epoch: 3,
                 membership,
+                node_addr: None,
             })
             .unwrap();
         assert!(state.record_snapshot_body(body).unwrap());
@@ -823,6 +829,7 @@ mod tests {
                     author: other_author,
                     epoch: 3,
                     membership,
+                    node_addr: None,
                 }),
                 Err(RuntimeError::AnnouncementBodyMismatch { .. })
             ),
@@ -838,6 +845,7 @@ mod tests {
                 author,
                 epoch: 3,
                 membership,
+                node_addr: None,
             })
             .unwrap();
         assert!(state.announcement(&id).is_some());

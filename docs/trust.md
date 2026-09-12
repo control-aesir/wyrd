@@ -643,6 +643,13 @@ Note the deliberate asymmetry: **Content IDs are an equality oracle to
 members.** That is what makes dedup and history work, and it is why the
 member/vault boundary is a security boundary, not an implementation detail.
 
+A serving consequence follows from T17: a member who can name a
+`StorageId` can request that ciphertext from any serving member.
+Authorization = membership, object admission = content verification;
+there are no per-object ACLs in v0. This is an availability and
+enumeration property, not a confidentiality break: a member already
+holds the epoch material that makes the ciphertext meaningful.
+
 ## Decision record
 
 | # | Decision | Rationale |
@@ -663,6 +670,7 @@ member/vault boundary is a security boundary, not an implementation detail.
 | T14 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
 | T15 | Control-plane message set (`Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, duplicate-delivery-idempotent sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); bootstrap invitations under their own ECDH-plus-owner-signature framing; epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; the seal proves possession, never authorship; NIP-46 `sign_message` is `request { domain, drive, digest } → response { signature }` with a closed domain enum | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
 | T16 | Mailbox transport: the control envelope travels inside an outer NIP-44 seal addressed directly to the recipient `DeviceId`, and the relay-visible wire format is NIP-59 gift wrap — Wyrd rumor kind 9501 (`p` tag = recipient) inside a kind 13 seal signed by the sender's identity key, inside a kind 1059 wrap signed by a discarded ephemeral key; consumption is a durable append-only seen-wrap-event-id log (fsynced per ack), never a timestamp cursor; no NIP-09 deletion of wraps is issued; `Mailbox` and `SignerSession` are trait boundaries a concrete relay pool / `nostr-connect` client implements, exercised in this crate only against in-memory fakes | recipient addressing is the same traffic-analysis exposure already accepted as best-effort; the ephemeral wrap key hides sender identity from relays at the cost of never being able to delete (accepted: relay retention is the redelivery backstop and the state machines are set-based); the relay pool and signer session are network/UI wiring outside `wyrd-sync`'s scope (`wyrd-format` must never grow a network dependency; the same discipline applies one layer up) |
+| T17 | Peer addressing and serving authorization: snapshot announcements carry the sender's current iroh `NodeAddr` (`node_addr`) inside the same authenticated sealed plaintext — authenticated routing metadata, never identity, never snapshot content, never durable snapshot fields; announcement history is append-only with no cryptographic invalidation between announcements (freshness is operational, not validity); the serving member answers object-oriented `StorageId` lookups from its local store with ciphertext only, never paths, keys, or plaintext; authorization = membership, object admission = content verification, no per-object ACLs in v0, so a member who can name a `StorageId` can request its ciphertext from any serving member | a dead address is a stale advertisement, not an invalid snapshot; an unauthenticated address would be a redirection surface even against unforgeable announcements; content-addressed verification is the only admission a transfer needs; the availability/enumeration consequence is accepted because a member already holds the epoch material that makes the ciphertext meaningful |
 
 ## Open questions
 

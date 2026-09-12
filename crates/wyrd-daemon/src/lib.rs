@@ -13,9 +13,11 @@
 pub mod core;
 pub mod fuse;
 pub mod live_mailbox;
+pub mod want;
 
 /// Test-only minimal relay for live-mailbox integration tests.
 #[cfg(test)]
 pub(crate) mod mini_relay;
 
 pub use core::{Daemon, DaemonError, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};
+pub use want::{WantError, WantRegistry};

@@ -328,6 +328,7 @@ mod tests {
                 author: sender,
                 epoch: 3,
                 membership: TransitionId::from_bytes([0x33; 32]),
+                node_addr: None,
             }),
         )
         .unwrap();
@@ -382,6 +383,7 @@ mod tests {
                 author: sender,
                 epoch: 5,
                 membership: TransitionId::from_bytes([0x33; 32]),
+                node_addr: None,
             }),
         )
         .unwrap();

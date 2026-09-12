@@ -358,6 +358,18 @@ mod tests {
             author: DeviceId::from_bytes([0x22; 32]),
             epoch: 5,
             membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            node_addr: None,
+        })
+    }
+
+    fn announcement_with_addr() -> Message {
+        Message::SnapshotAnnouncement(message::SnapshotAnnouncement {
+            snapshot: wyrd_format::SnapshotId::from_bytes([0x11; 32]),
+            author: DeviceId::from_bytes([0x22; 32]),
+            epoch: 5,
+            membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            // Opaque composer bytes; control never interprets them.
+            node_addr: Some(vec![0xAA, 0xBB, 0xCC]),
         })
     }
 
@@ -374,6 +386,22 @@ mod tests {
         assert_eq!(d, drive());
         assert_eq!(epoch, 5);
         assert_eq!(message, announcement());
+    }
+
+    #[test]
+    fn node_addr_is_sealed_with_the_announcement() {
+        // T17: the retrieval address is routing metadata inside the
+        // authenticated plaintext — the same seal that proves the
+        // snapshot identity proves the peer→address association.
+        let sealed = seal(&control_key(5), &drive(), 5, &announcement_with_addr()).unwrap();
+        let (d, epoch, message) = open(&control_key(5), &sealed).unwrap();
+        assert_eq!(d, drive());
+        assert_eq!(epoch, 5);
+        assert_eq!(message, announcement_with_addr());
+        let Message::SnapshotAnnouncement(a) = &message else {
+            panic!("announcement kind");
+        };
+        assert_eq!(a.node_addr.as_deref(), Some(&[0xAA, 0xBB, 0xCC][..]));
     }
 
     #[test]

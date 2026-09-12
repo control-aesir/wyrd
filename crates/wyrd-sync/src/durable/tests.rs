@@ -104,6 +104,7 @@ fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
         author: owner(),
         epoch: 2,
         membership: child.transition_id(),
+        node_addr: None,
     }
 }
 
@@ -468,6 +469,7 @@ fn rebuild_rejects_a_body_that_precedes_a_disagreeing_announcement() {
         author: DeviceId::from_bytes([0x22; 32]),
         epoch: 2,
         membership: chain().1.transition_id(),
+        node_addr: None,
     };
     store
         .commit(&[Fact::SnapshotBody(body), Fact::Announcement(lying)])

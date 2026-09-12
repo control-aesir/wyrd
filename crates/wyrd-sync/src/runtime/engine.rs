@@ -434,8 +434,9 @@ impl Engine {
         &self,
         snapshot: &AuthorizedSnapshot,
         mailbox: &mut impl Mailbox,
+        node_addr: Option<&[u8]>,
     ) -> Result<usize, EngineError> {
-        super::author::announce(self, snapshot, mailbox)
+        super::author::announce(self, snapshot, mailbox, node_addr)
     }
 
     /// Drain every envelope currently in the mailbox, committing facts
@@ -1206,7 +1207,7 @@ mod tests {
             };
             pair.a
                 .engine
-                .announce_snapshot(&authored, &mut mailbox)
+                .announce_snapshot(&authored, &mut mailbox, None)
                 .unwrap()
         };
         assert_eq!(sent, 2, "owner and B; the author is skipped");
@@ -1236,7 +1237,9 @@ mod tests {
             owner: f.recipient,
         };
         assert_eq!(
-            f.engine.announce_snapshot(&authored, &mut mailbox).unwrap(),
+            f.engine
+                .announce_snapshot(&authored, &mut mailbox, None)
+                .unwrap(),
             0
         );
     }
@@ -1264,7 +1267,9 @@ mod tests {
             owner: pair.a.device,
         };
         assert!(matches!(
-            pair.a.engine.announce_snapshot(&authorized, &mut mailbox),
+            pair.a
+                .engine
+                .announce_snapshot(&authorized, &mut mailbox, None),
             Err(EngineError::MissingEpochKey(9))
         ));
     }
@@ -1310,7 +1315,9 @@ mod tests {
             fail_after: 1,
         };
         assert!(matches!(
-            pair.a.engine.announce_snapshot(&authored, &mut mailbox),
+            pair.a
+                .engine
+                .announce_snapshot(&authored, &mut mailbox, None),
             Err(EngineError::Mailbox(_))
         ));
         assert_eq!(mailbox.sent, 1, "the first recipient was reached");

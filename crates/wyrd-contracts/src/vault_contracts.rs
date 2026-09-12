@@ -128,9 +128,11 @@ fn malformed_manifests_never_become_materialized_content() {
         RemoteOnlyMaterialization,
         mount_heads(heads),
     );
-    assert_eq!(
-        view.lookup("guarded.txt"),
-        Err(ViewError::NotMaterialized),
+    assert!(
+        matches!(
+            view.lookup("guarded.txt"),
+            Err(ViewError::NotMaterialized { .. })
+        ),
         "nothing behind the rejected manifest is served"
     );
 

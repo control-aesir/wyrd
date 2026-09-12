@@ -16,6 +16,7 @@ fuser = "0.18"
 futures-util.workspace = true
 hex.workspace = true
 libc.workspace = true
+clap.workspace = true
 nostr.workspace = true
 nostr-connect.workspace = true
 nostr-sdk.workspace = true

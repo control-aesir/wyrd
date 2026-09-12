@@ -253,6 +253,7 @@ fn message_seeds() -> Vec<(ControlKind, Vec<u8>)> {
                 author: DeviceId::from_bytes([7; 32]),
                 epoch: 9,
                 membership: TransitionId::from_bytes([8; 32]),
+                node_addr: None,
             })
             .encode_payload(),
         ),

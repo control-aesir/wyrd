@@ -33,6 +33,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError, ViewHead};
 
+use crate::want::{wait_for_materialization, WantRegistry};
+
 /// The attribute time-to-limit served to the kernel: short, since
 /// heads (and thus names and sizes) can advance at any drain.
 const TTL: Duration = Duration::from_secs(1);
@@ -117,6 +119,12 @@ where
     inodes: RwLock<InodeTable>,
     directories: RwLock<DirectoryState>,
     files: Mutex<OpenFiles>,
+    /// FUSE demand: registration + bounded blocking on `open`/`read`
+    /// when a live daemon owns the same view. `None` keeps the
+    /// instant-EIO behavior for standalone backends.
+    wants: Option<Arc<WantRegistry>>,
+    /// How long `open`/`read` may block on demand before `EIO`.
+    open_timeout: Duration,
 }
 
 fn inode_error(error: InodeError) -> fuser::Errno {
@@ -157,7 +165,7 @@ fn errno_of(error: &ViewError) -> fuser::Errno {
         ViewError::NotADirectory => fuser::Errno::ENOTDIR,
         ViewError::NotAFile => fuser::Errno::EISDIR,
         ViewError::Conflict
-        | ViewError::NotMaterialized
+        | ViewError::NotMaterialized { .. }
         | ViewError::Unavailable
         | ViewError::Corrupt
         | ViewError::Store(_) => fuser::Errno::EIO,
@@ -180,6 +188,8 @@ where
                 by_handle: HashMap::new(),
                 next: 1,
             }),
+            wants: None,
+            open_timeout: Duration::ZERO,
         }
     }
 
@@ -199,6 +209,32 @@ where
                 by_handle: HashMap::new(),
                 next: 1,
             }),
+            wants: None,
+            open_timeout: Duration::ZERO,
+        }
+    }
+
+    /// The live daemon's half: the same view plus the demand registry,
+    /// so `open`/`read` on non-local content registers a want and
+    /// blocks bounded before failing.
+    pub fn shared_with_wants(
+        view: Arc<RwLock<DriveView<S, M>>>,
+        wants: Arc<WantRegistry>,
+        open_timeout: Duration,
+    ) -> Self {
+        FuseBackend {
+            view,
+            inodes: RwLock::new(InodeTable::new()),
+            directories: RwLock::new(DirectoryState {
+                entries: HashMap::new(),
+                next_handle: 1,
+            }),
+            files: Mutex::new(OpenFiles {
+                by_handle: HashMap::new(),
+                next: 1,
+            }),
+            wants: Some(wants),
+            open_timeout,
         }
     }
 
@@ -226,11 +262,25 @@ where
     /// serve the opened version even after heads advance. The
     /// non-callback form of the kernel `open` op — the contract
     /// surface the descriptor-stability tests ride.
+    ///
+    /// Demand-driven: on a not-materialized tree in the resolution
+    /// path, the missing identity is registered as a want and the open
+    /// blocks bounded (the same deadline for the whole chain), then
+    /// retries. A deadline expiry is `EIO`, never a partial file.
     pub fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
-        let view = self.view_guard()?;
-        let node = view.lookup(path).map_err(|error| errno_of(&error))?;
-        let file = view.open(&node).map_err(|error| errno_of(&error))?;
-        drop(view);
+        let attempt = |this: &Self| {
+            Result::<_, (ViewError, fuser::Errno)>::Ok({
+                let view = this
+                    .view_guard()
+                    .map_err(|error| (ViewError::Store("view lock".into()), error))?;
+                let node = view
+                    .lookup(path)
+                    .map_err(|error| (error.clone(), errno_of(&error)))?;
+                view.open(&node)
+                    .map_err(|error| (error.clone(), errno_of(&error)))?
+            })
+        };
+        let file = self.with_demand(|| attempt(self), |attempted| attempted.map_err(|e| e.1))?;
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
@@ -246,6 +296,10 @@ where
     /// cloned out before the view is touched, keeping the lock order
     /// view-before-files everywhere. The non-callback form of the
     /// kernel `read` op.
+    ///
+    /// First touch of an unmaterialized chunk registers a want and
+    /// blocks bounded; the FD pins content identity, so the retried
+    /// read serves the same pinned bytes once they arrive.
     pub fn read_handle(
         &self,
         fh: FileHandle,
@@ -260,9 +314,47 @@ where
                 .cloned()
                 .ok_or(fuser::Errno::EBADF)?
         };
-        let view = self.view_guard()?;
-        view.read(&file, offset, size as usize)
-            .map_err(|error| errno_of(&error))
+        let attempt = |this: &Self| {
+            Result::<Vec<u8>, (ViewError, fuser::Errno)>::Ok({
+                let view = this
+                    .view_guard()
+                    .map_err(|error| (ViewError::Store("view lock".into()), error))?;
+                view.read(&file, offset, size as usize)
+                    .map_err(|error| (error.clone(), errno_of(&error)))?
+            })
+        };
+        self.with_demand(|| attempt(self), |attempted| attempted.map_err(|e| e.1))
+    }
+
+    /// Run `attempt`; when it fails on a not-materialized identity and
+    /// demand is wired, register the want and block bounded on it, then
+    /// retry once. Anything else (or no demand wiring) keeps the
+    /// instant-errno behavior. This is the only place FUSE expresses
+    /// demand — the engine stays the single synchronization authority.
+    fn with_demand<T>(
+        &self,
+        attempt: impl Fn() -> Result<T, (ViewError, fuser::Errno)>,
+        map: impl Fn(Result<T, (ViewError, fuser::Errno)>) -> Result<T, fuser::Errno>,
+    ) -> Result<T, fuser::Errno> {
+        let first = attempt();
+        if let (Some(registry), Err((ViewError::NotMaterialized { content }, _errno))) =
+            (&self.wants, &first)
+        {
+            let wants = Arc::clone(registry);
+            let retry = || attempt().is_ok();
+            match wait_for_materialization(&wants, *content, self.open_timeout, retry) {
+                Ok(()) => {
+                    return map(attempt());
+                }
+                Err(_) => {
+                    // Deadline expired or registry refused: the
+                    // POSIX surface is EIO either way. The fetch, if
+                    // admitted, continues and caches for next time.
+                    return Err(fuser::Errno::EIO);
+                }
+            }
+        }
+        map(first)
     }
 
     /// Drop an open handle. Unknown handles release quietly: the
@@ -628,7 +720,7 @@ mod tests {
     use super::*;
     use fuser::Filesystem as _;
     use wyrd_format::{
-        ContentId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, Snapshot, Tree,
+        ContentId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, SharedStore, Snapshot, Tree,
     };
     use wyrd_fuse::ViewError;
 
@@ -700,7 +792,9 @@ mod tests {
         assert_eq!(errno_of(&ViewError::NotAFile), fuser::Errno::EISDIR);
         for corruption in [
             ViewError::Conflict,
-            ViewError::NotMaterialized,
+            ViewError::NotMaterialized {
+                content: ContentId::from_bytes([0; 32]),
+            },
             ViewError::Unavailable,
             ViewError::Corrupt,
         ] {
@@ -848,6 +942,123 @@ mod tests {
         let handle = backend.open_at("f.txt").unwrap();
         backend.destroy();
         assert_eq!(backend.read_handle(handle, 0, 4), Err(fuser::Errno::EBADF));
+    }
+
+    type WithheldFixture = (
+        FuseBackend<SharedStore<MemoryObjectStore>, NoMaterialization>,
+        Arc<RwLock<MemoryObjectStore>>,
+        Arc<WantRegistry>,
+        ContentId,
+    );
+
+    /// A drive whose file tree is held but whose chunk object is
+    /// withheld, plus the shared want registry. `handle` gives the
+    /// test access to the store so a background thread can stand in
+    /// for a fetch landing.
+    fn withheld_backend(open_timeout: Duration) -> WithheldFixture {
+        let mut scratch = MemoryObjectStore::default();
+        let chunk = scratch.insert(ObjectKind::Chunk, b"streamed").unwrap();
+        let mut store = MemoryObjectStore::default();
+        let root = Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let store = Arc::new(RwLock::new(store));
+        let view = DriveView::new(
+            SharedStore::from(Arc::clone(&store)),
+            NoMaterialization,
+            heads(vec![snapshot_of(root)]),
+        );
+        let registry = Arc::new(WantRegistry::default());
+        let backend = FuseBackend::shared_with_wants(
+            Arc::new(RwLock::new(view)),
+            Arc::clone(&registry),
+            open_timeout,
+        );
+        (backend, store, registry, chunk)
+    }
+
+    /// First touch of an unmaterialized chunk registers a want and
+    /// blocks bounded; when the bytes arrive the retried read serves
+    /// them and the demand entry is released. The FD pins identity, so
+    /// the served bytes are the pinned capture's.
+    #[test]
+    fn read_blocks_on_want_until_content_arrives() {
+        use wyrd_format::ObjectKind;
+        let (backend, store, registry, _chunk) = withheld_backend(Duration::from_secs(5));
+        let handle = backend
+            .open_at("f.txt")
+            .expect("the tree is held, so open serves");
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            store
+                .write()
+                .unwrap()
+                .insert(ObjectKind::Chunk, b"streamed")
+                .unwrap();
+        });
+        assert_eq!(
+            backend.read_handle(handle, 0, 8).unwrap(),
+            b"streamed",
+            "the retried read serves the arrived bytes"
+        );
+        worker.join().unwrap();
+        assert!(
+            registry.peek_pending().is_empty(),
+            "success released the demand"
+        );
+    }
+
+    /// The deadline is EIO, never a partial file, and the demand entry
+    /// is retired on expiry: a want whose fetch was never admitted
+    /// dies with the last waiter (the engine, once admitted, is not
+    /// cancelled — the registry tests cover that side).
+    #[test]
+    fn read_deadline_is_eio_and_releases_the_want() {
+        let (backend, _store, registry, _chunk) = withheld_backend(Duration::from_millis(150));
+        let handle = backend.open_at("f.txt").unwrap();
+        assert_eq!(
+            backend.read_handle(handle, 0, 8),
+            Err(fuser::Errno::EIO),
+            "deadline expiry is EIO, never a partial read"
+        );
+        assert!(
+            registry.peek_pending().is_empty(),
+            "expiry released the demand"
+        );
+    }
+
+    /// Identical outstanding wants coalesce: two concurrent readers of
+    /// the same missing chunk produce one demand entry, and both wake
+    /// when the bytes arrive (delivery, dedup, and completion are
+    /// distinct properties per `fetch-on-open.md`).
+    #[test]
+    fn concurrent_reads_coalesce_into_one_want() {
+        use wyrd_format::ObjectKind;
+        let (backend, store, registry, _chunk) = withheld_backend(Duration::from_secs(5));
+        let backend = Arc::new(backend);
+        let handle = backend.open_at("f.txt").unwrap();
+        let reader_a = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || backend.read_handle(handle, 0, 8).unwrap())
+        };
+        let reader_b = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || backend.read_handle(handle, 0, 8).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            registry.peek_pending().len(),
+            1,
+            "two waiters, one demand entry"
+        );
+        store
+            .write()
+            .unwrap()
+            .insert(ObjectKind::Chunk, b"streamed")
+            .unwrap();
+        assert_eq!(reader_a.join().unwrap(), b"streamed");
+        assert_eq!(reader_b.join().unwrap(), b"streamed");
     }
 
     /// The open table is a lock like any other: poison fails the

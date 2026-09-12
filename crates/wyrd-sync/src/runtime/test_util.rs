@@ -217,6 +217,7 @@ pub(crate) fn announcement_msg(
         author,
         epoch,
         membership,
+        node_addr: None,
     })
 }
 

@@ -92,13 +92,21 @@ pub struct KeyRotation {
 }
 
 /// A snapshot announcement: enough to fetch and classify (the snapshot
-/// and transition bodies travel bulk, not here).
+/// and transition bodies travel bulk, not here), plus the sender's
+/// current peer address (`node_addr`, opaque canonical bytes — control
+/// frames and seals it, never interprets it; the address is routing
+/// metadata, not identity, and `trust.md` T17 holds its rules).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAnnouncement {
     pub snapshot: SnapshotId,
     pub author: DeviceId,
     pub epoch: u64,
     pub membership: TransitionId,
+    /// The sender's current retrieval address, as opaque canonical
+    /// bytes supplied by the composing daemon. `None` means the sender
+    /// advertises no retrieval route this time — the announcement
+    /// stays valid and the content identity unaffected.
+    pub node_addr: Option<Vec<u8>>,
 }
 
 /// One control-plane message: the kind plus its payload.
@@ -138,11 +146,18 @@ impl Message {
             }
             Message::KeyRotation(m) => m.transition.as_bytes().to_vec(),
             Message::SnapshotAnnouncement(m) => {
-                let mut out = Vec::with_capacity(104);
+                let mut out = Vec::with_capacity(105);
                 out.extend_from_slice(m.snapshot.as_bytes());
                 out.extend_from_slice(m.author.as_bytes());
                 out.extend_from_slice(&m.epoch.to_le_bytes());
                 out.extend_from_slice(m.membership.as_bytes());
+                match &m.node_addr {
+                    None => out.push(0x00),
+                    Some(addr) => {
+                        out.push(0x01);
+                        push_blob(&mut out, addr);
+                    }
+                }
                 out
             }
         }
@@ -207,14 +222,31 @@ impl Message {
             }
             ControlKind::SnapshotAnnouncement => {
                 need(pos, 104)?;
-                let message = Message::SnapshotAnnouncement(SnapshotAnnouncement {
-                    snapshot: SnapshotId::from_bytes(id32(pos)),
-                    author: DeviceId::from_bytes(id32(pos + 32)),
-                    epoch: u64le(pos + 64),
-                    membership: TransitionId::from_bytes(id32(pos + 72)),
-                });
+                let snapshot = SnapshotId::from_bytes(id32(pos));
+                let author = DeviceId::from_bytes(id32(pos + 32));
+                let epoch = u64le(pos + 64);
+                let membership = TransitionId::from_bytes(id32(pos + 72));
                 pos += 104;
-                message
+                // Address presence is one byte; `Some` carries a counted
+                // blob. Absence is a valid routing state, not truncation.
+                let node_addr = match bytes.get(pos) {
+                    Some(0x00) => {
+                        pos += 1;
+                        None
+                    }
+                    Some(0x01) => {
+                        pos += 1;
+                        Some(blob(&mut pos)?)
+                    }
+                    _ => return Err(ControlError::Truncated),
+                };
+                Message::SnapshotAnnouncement(SnapshotAnnouncement {
+                    snapshot,
+                    author,
+                    epoch,
+                    membership,
+                    node_addr,
+                })
             }
         };
         if pos != len {
@@ -259,6 +291,17 @@ mod tests {
             author: DeviceId::from_bytes([0x22; 32]),
             epoch: 5,
             membership: TransitionId::from_bytes([0x33; 32]),
+            node_addr: None,
+        })
+    }
+
+    fn announcement_with_addr() -> Message {
+        Message::SnapshotAnnouncement(SnapshotAnnouncement {
+            snapshot: SnapshotId::from_bytes([0x11; 32]),
+            author: DeviceId::from_bytes([0x22; 32]),
+            epoch: 5,
+            membership: TransitionId::from_bytes([0x33; 32]),
+            node_addr: Some(vec![0xAA, 0xBB, 0xCC]),
         })
     }
 
@@ -288,14 +331,54 @@ mod tests {
     }
 
     #[test]
-    fn announcement_encoding_is_fixed_104_bytes() {
+    fn announcement_with_addr_round_trips() {
+        // Presence byte + counted blob; absence stays the same shape
+        // minus the address. Opaque bytes ride verbatim — control never
+        // interprets a `node_addr` (T17).
+        let m = announcement_with_addr();
+        let bytes = m.encode_payload();
+        assert_eq!(bytes[104], 0x01);
+        assert_eq!(&bytes[105..109], &3u32.to_le_bytes(), "counted blob");
+        assert_eq!(&bytes[109..], &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            Message::decode_payload(ControlKind::SnapshotAnnouncement, &bytes).unwrap(),
+            m
+        );
+        let absent = announcement().encode_payload();
+        assert_eq!(absent.len(), 105);
+        assert_eq!(absent[104], 0x00, "absence marker");
+    }
+
+    #[test]
+    fn announcement_address_garbage_is_rejected() {
+        // A presence byte of anything but 0x00/0x01 is truncation, not
+        // an address; a declared blob longer than the buffer likewise.
+        let mut bytes = announcement_with_addr().encode_payload();
+        bytes[104] = 0x02;
+        assert_eq!(
+            Message::decode_payload(ControlKind::SnapshotAnnouncement, &bytes),
+            Err(ControlError::Truncated)
+        );
+        let mut bytes = announcement_with_addr().encode_payload();
+        bytes[105..109].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(
+            Message::decode_payload(ControlKind::SnapshotAnnouncement, &bytes),
+            Err(ControlError::Truncated)
+        );
+    }
+
+    #[test]
+    fn announcement_encoding_starts_fixed_then_routes() {
+        // snapshot(32) + author(32) + epoch(8) + membership(32) fixed;
+        // the routing byte follows (absence here).
         let bytes = announcement().encode_payload();
-        assert_eq!(bytes.len(), 104);
+        assert_eq!(bytes.len(), 105);
         assert_eq!(
             &bytes[64..72],
             &5u64.to_le_bytes(),
             "epoch rides the payload too"
         );
+        assert_eq!(bytes[104], 0x00, "no retrieval route advertised");
     }
 
     #[test]

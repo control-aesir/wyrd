@@ -1,31 +1,31 @@
 # wyrd-fuse
 
-Wyrd's presentation layer: mount a Wyrd drive as a standard filesystem.
+Wyrd's presentation layer: the drive as a standard filesystem, mounted by
+the daemon over `fuser`.
 
-## What belongs here (planned; only the read-only view exists so far)
+## What belongs here
 
-- The **live view**: the drive's current state as an ordinary read/write folder
-  (today: read-only, mount-free)
-- **Time travel**: browsing previous snapshot heads and restoring them, using
-  ordinary file tools (planned)
-- **Materialization**: remote-only paths are visible and open on demand
-  (block-and-fetch, `EIO` when offline); cached content evicts by policy;
-  pinned content stays local (today: absent bytes report status instead of
-  fetching; the daemon will block-and-fetch)
+- The **live view** (`src/view.rs`): the drive's current state as an
+  ordinary read-only folder — lookup, readdir, open, read, stat
+- **Time travel**: browsing previous snapshot heads with ordinary file
+  tools (restoration workflows live in `wyrd-sync` recovery)
+- **Materialization**: remote-only paths are visible and open on demand.
+  Absent bytes map to `FetchStatus` at the view boundary; the daemon's
+  want registry blocks open/read with a bounded deadline (`EIO` on
+  expiry) and fetches
 - **Conflict surfacing in the filesystem**: conflicted paths appear as
-  directories holding both versions (today: conflict nodes with union
-  listings, read-only)
+  conflict nodes with union listings of both versions, read-only
 
 ## What does not belong here
 
 Storage, format, and networking logic. This crate translates filesystem
-operations into format-layer calls and renders format-layer state as files.
+operations into format-layer calls and renders format-layer state as
+files. It never mounts (mounting is the daemon's composition) and never
+fetches (fetching is the engine's plan).
 
 ## Status
 
-Read-only drive view implemented mount-free (`src/view.rs`: lookup,
-readdir, open, read, stat over the format layer, remote-only content
-mapped through `FetchStatus`, conflicts surfaced per the policy in
-`docs/sync-and-peers.md`). Kernel mounting still pending: it requires
-macFUSE on macOS and FUSE 3 on Linux, and a daemon composing this view
-with `wyrd-sync`.
+The mount-free view and the daemon's read-only FUSE backend (`wyrd mount`)
+are in place and under test, including open-fd stability across head
+advancement. Write support behind the mount is pending; the write path
+exists through the daemon API (`Daemon::put_file`/`Daemon::remove`).

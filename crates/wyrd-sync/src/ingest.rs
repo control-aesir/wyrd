@@ -83,7 +83,10 @@ impl Limits {
         max_membership_changes: 64,
         max_resolves: 64,
         max_set_owners: 16,
-        max_manifest_entries: 750_000,
+        // Calibrated so max entries stay encodable within the 64 MiB
+        // object ceiling at the 114-byte entry (decision 26's transport
+        // column): 580k × 114 + 40 header bytes fits with headroom.
+        max_manifest_entries: 580_000,
         max_manifest_children: 1_000_000,
     };
 }
@@ -425,7 +428,7 @@ mod tests {
 
     #[test]
     fn manifest_counts_are_bounded() {
-        use wyrd_format::{Manifest, ManifestEntry, ObjectKind, SnapshotId, StorageId};
+        use wyrd_format::{BaoRoot, Manifest, ManifestEntry, ObjectKind, SnapshotId, StorageId};
         let entry = ManifestEntry {
             content_id: ContentId::from_bytes([0x01; 32]),
             kind: ObjectKind::Chunk,
@@ -433,6 +436,7 @@ mod tests {
             storage_id: StorageId::from_bytes([0x02; 32]),
             encryption_epoch: 1,
             size: 10,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         let valid = Manifest {
             snapshot: SnapshotId::from_bytes([0x77; 32]),
@@ -457,15 +461,17 @@ mod tests {
     #[test]
     fn v0_table_is_internally_consistent() {
         use wyrd_format::{CHILD_LEN, ENTRY_LEN};
-        // A manifest entry is fixed 82 bytes: the entry ceiling must fit
-        // inside the byte ceiling, or it could never trigger on the wire.
-        // Snapshot header overhead (id plus two counts) is 40 bytes.
+        // A manifest entry is fixed 114 bytes (decision 26 added the
+        // transport column): the entry ceiling must fit inside the byte
+        // ceiling, or it could never trigger on the wire. Snapshot
+        // header overhead (id plus two counts) is 40 bytes.
         assert!(
             Limits::V0.max_manifest_entries * ENTRY_LEN + 40 < Limits::V0.max_object_bytes,
             "entry ceiling must be encodable within the byte ceiling"
         );
-        // Child references are fixed 96 bytes per object-model decision 21
-        // (tree id, child-manifest id, sealed child-manifest storage id).
+        // Child references are fixed 128 bytes per object-model decision
+        // 26 (tree id, child-manifest id, sealed child-manifest storage
+        // id, child transport root).
         // The current count ceiling deliberately exceeds what the byte
         // ceiling can carry — the byte gate fires first on the wire, and
         // the count check is a backstop for any in-budget case that

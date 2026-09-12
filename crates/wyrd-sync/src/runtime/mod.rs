@@ -13,11 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wyrd_format::{
-    ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ObjectKind, Snapshot, SnapshotId,
-    StorageId,
+    BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ManifestEntry, ObjectKind,
+    Snapshot, SnapshotId, StorageId,
 };
 
-use crate::control::{ControlMessageId, SnapshotAnnouncement};
+use crate::control::{AnnouncementUpdate, ControlMessageId, SnapshotAnnouncement};
 
 mod author;
 mod bootstrap;
@@ -47,6 +47,14 @@ pub struct ManifestRecord {
     pub is_root: bool,
     pub manifest_id: ContentId,
     pub storage_ids: BTreeSet<StorageId>,
+    /// The transport root (Bao root) over the recorded representation's
+    /// sealed bytes — the verified-fetch address distributed with the
+    /// mapping (object-model.md decision 26). Sealed representations are
+    /// re-sealable (fresh nonces), so a manifest can legitimately have
+    /// several; v0 records the first one seen and keeps its root, which
+    /// is the representation the holder serves and, for an author, the
+    /// one its announcement names.
+    pub transport: BaoRoot,
     pub manifest: Manifest,
 }
 
@@ -56,6 +64,10 @@ pub struct PendingObjectFetch {
     pub content_id: ContentId,
     /// The sealed representation address from the manifest entry.
     pub storage_id: StorageId,
+    /// The representation's transport root — the author-attested fetch
+    /// address (object-model.md decision 26), preferred over the storage
+    /// address when the transport map holds it.
+    pub transport: BaoRoot,
     pub kind: ObjectKind,
     pub version: u8,
     pub encryption_epoch: u64,
@@ -168,7 +180,14 @@ impl RuntimeState {
     }
 
     /// Record a snapshot announcement. Replaying the same announcement is a
-    /// no-op; a different announcement for the same snapshot is rejected.
+    /// no-op; a reannouncement that differs only in `node_addr` is a route
+    /// update — the last accepted route wins, deterministically under
+    /// replay (which walks the same commit order). A difference in any
+    /// immutable identity field is a fork of the author's statement and is
+    /// rejected. Intake gates forks before `Fact::Announcement` commits
+    /// (the engine's announcement projection), so replay only reaches the
+    /// fork error for facts hand-crafted into the store.
+    ///
     /// A body recorded for the snapshot must agree with the announcement's
     /// `author`, `epoch`, and `membership` (`record_snapshot_body`
     /// enforces the pairing symmetrically), so replay can never represent
@@ -191,8 +210,16 @@ impl RuntimeState {
                 self.announcements.insert(id, announcement);
                 Ok(true)
             }
-            Some(existing) if existing == &announcement => Ok(false),
-            Some(_) => Err(RuntimeError::ConflictingAnnouncement { snapshot: id }),
+            Some(existing) => match existing.check_update(&announcement) {
+                AnnouncementUpdate::Same => Ok(false),
+                AnnouncementUpdate::RouteUpdate => {
+                    self.announcements.insert(id, announcement);
+                    Ok(true)
+                }
+                AnnouncementUpdate::Fork => {
+                    Err(RuntimeError::ConflictingAnnouncement { snapshot: id })
+                }
+            },
         }
     }
 
@@ -212,6 +239,12 @@ impl RuntimeState {
         }
         if let Some(existing) = self.manifests.get_mut(&manifest_id) {
             return if existing.manifest == record.manifest && existing.is_root == record.is_root {
+                // Same logical manifest: merge the representation set and
+                // keep the first transport root. A different sealed
+                // representation is a legitimate alternate address, but
+                // the record's transport stays the representation this
+                // holder first held (deterministic under replay, which
+                // walks the same commit order).
                 existing.storage_ids.extend(record.storage_ids);
                 Ok(false)
             } else {
@@ -248,6 +281,61 @@ impl RuntimeState {
     /// The announcement for one snapshot, if recorded.
     pub fn announcement(&self, snapshot: &SnapshotId) -> Option<&SnapshotAnnouncement> {
         self.announcements.get(snapshot)
+    }
+
+    /// The record for one manifest id, if recorded.
+    pub fn manifest_record(&self, manifest: &ContentId) -> Option<&ManifestRecord> {
+        self.manifests.get(manifest)
+    }
+
+    /// Every recorded snapshot id (announcement-bearing and
+    /// body-bearing alike), in snapshot-id order.
+    pub fn recorded_snapshots(&self) -> impl Iterator<Item = SnapshotId> + '_ {
+        let announced = self.announcements.keys().copied();
+        let bodies = self.snapshot_bodies.keys().copied();
+        let roots = self.root_manifests_by_snapshot.keys().copied();
+        announced
+            .chain(bodies)
+            .chain(roots)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
+    /// Every recorded manifest record, in manifest-id order.
+    pub fn manifest_records(&self) -> impl Iterator<Item = &ManifestRecord> {
+        self.manifests.values()
+    }
+
+    /// The root-manifest record for one snapshot, if recorded. The
+    /// announcement names exactly one root manifest identity (decision
+    /// 26); when one is recorded, that identity is the record this state
+    /// serves — a hostile or stale extra root for the same snapshot can
+    /// never outvote the author-signed claim. Without an announcement
+    /// (the authoring side), the deterministic smallest manifest id wins.
+    pub fn root_manifest_record(&self, snapshot: &SnapshotId) -> Option<&ManifestRecord> {
+        let roots = self.root_manifests_by_snapshot.get(snapshot)?;
+        let manifest_id = match self.announcements.get(snapshot) {
+            Some(announcement) if roots.contains(&announcement.root_manifest) => {
+                announcement.root_manifest
+            }
+            _ => *roots.iter().next()?,
+        };
+        self.manifests.get(&manifest_id)
+    }
+
+    /// Every recorded mapping for one plaintext content, in manifest-id
+    /// order (deterministic under replay). The untrusted-hint lookup:
+    /// acting on a mapping additionally requires holding its epoch
+    /// capability and holding the representation itself (the vault),
+    /// which are the caller's (authoring path's) checks — cross-epoch
+    /// reuse picks among these, never blind first-match.
+    pub fn recorded_mappings(&self, content: &ContentId) -> Vec<ManifestEntry> {
+        self.manifests
+            .values()
+            .flat_map(|record| &record.manifest.entries)
+            .filter(|entry| &entry.content_id == content)
+            .cloned()
+            .collect()
     }
 
     /// Record a signature-verified snapshot body. The body must agree
@@ -319,7 +407,8 @@ impl RuntimeState {
 
         for snapshot in self.announcements.keys() {
             // Root manifests are the snapshot anchors; child manifests share
-            // the snapshot id but do not resolve the announcement on their own.
+            // the snapshot id but do not resolve the announcement on their
+            // own.
             if !self.root_manifests_by_snapshot.contains_key(snapshot) {
                 pending_snapshots.insert(*snapshot);
             }
@@ -359,6 +448,7 @@ impl RuntimeState {
                 let candidate = PendingObjectFetch {
                     content_id: entry.content_id,
                     storage_id: entry.storage_id,
+                    transport: entry.transport,
                     kind: entry.kind,
                     version: entry.version,
                     encryption_epoch: entry.encryption_epoch,
@@ -384,6 +474,7 @@ impl RuntimeState {
 mod tests {
     use super::*;
     use crate::control::SnapshotAnnouncement;
+    use wyrd_format::BaoRoot;
 
     fn drive() -> DriveId {
         DriveId::from_bytes([0xEE; 32])
@@ -395,7 +486,11 @@ mod tests {
             author: wyrd_format::DeviceId::from_bytes([author; 32]),
             epoch,
             membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            body_root: BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: ContentId::from_bytes([0x55; 32]),
+            root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
             node_addr: None,
+            signature: [0x77; 64],
         }
     }
 
@@ -415,11 +510,13 @@ mod tests {
             storage_id,
             encryption_epoch: 1,
             size: 123,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         ManifestRecord {
             is_root,
             manifest_id: content_id,
             storage_ids: BTreeSet::from([storage_id]),
+            transport: BaoRoot::from_bytes([0xC0; 32]),
             manifest: Manifest {
                 snapshot: SnapshotId::from_bytes([snapshot; 32]),
                 entries: vec![entry],
@@ -427,6 +524,7 @@ mod tests {
                     tree: ContentId::from_bytes([child; 32]),
                     manifest: ContentId::from_bytes([child + 1; 32]),
                     storage: StorageId::from_bytes([child + 2; 32]),
+                    transport: BaoRoot::from_bytes([0xB1; 32]),
                 }],
             },
         }
@@ -434,6 +532,28 @@ mod tests {
 
     fn manifest_id_for(record: &ManifestRecord) -> ContentId {
         ContentId::derive(ObjectKind::Manifest, &record.manifest.canonical_bytes())
+    }
+
+    /// An announcement with placeholder transport identities and an
+    /// unsigned signature: record-level tests exercise bookkeeping, and
+    /// signature verification belongs to intake, not to this state.
+    fn announced(
+        snapshot: SnapshotId,
+        author: wyrd_format::DeviceId,
+        epoch: u64,
+        membership: wyrd_format::TransitionId,
+    ) -> SnapshotAnnouncement {
+        SnapshotAnnouncement {
+            snapshot,
+            author,
+            epoch,
+            membership,
+            body_root: BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: ContentId::from_bytes([0x55; 32]),
+            root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
+            node_addr: None,
+            signature: [0x77; 64],
+        }
     }
 
     fn root_manifest(snapshot: u8, manifest_id: u8, object: u8, child: u8) -> ManifestRecord {
@@ -578,6 +698,47 @@ mod tests {
     }
 
     #[test]
+    fn reannouncements_update_routes_and_reject_forks() {
+        let mut state = RuntimeState::new(drive());
+        let mut first = announcement(1, 2, 3);
+        first.node_addr = Some(vec![0x01, 0x02]);
+        assert!(state.record_announcement(first.clone()).unwrap());
+
+        // Same announcement: no-op. Same immutable statement with a new
+        // route: a route update — the last accepted route wins, so
+        // replay (the same commit order) is deterministic.
+        assert!(!state.record_announcement(first).unwrap());
+        let mut rerouted = announcement(1, 2, 3);
+        rerouted.node_addr = Some(vec![0x03, 0x04]);
+        assert!(state.record_announcement(rerouted.clone()).unwrap());
+        assert_eq!(
+            state.announcements[&SnapshotId::from_bytes([1; 32])].node_addr,
+            rerouted.node_addr
+        );
+        // A route update that drops the address is still only routing.
+        let mut unrouted = announcement(1, 2, 3);
+        unrouted.node_addr = None;
+        assert!(state.record_announcement(unrouted).unwrap());
+        assert!(state.announcements[&SnapshotId::from_bytes([1; 32])]
+            .node_addr
+            .is_none());
+
+        // Any immutable difference is a fork, never a replacement.
+        let mut forked_root = announcement(1, 2, 3);
+        forked_root.root_manifest = ContentId::from_bytes([0x99; 32]);
+        assert!(matches!(
+            state.record_announcement(forked_root),
+            Err(RuntimeError::ConflictingAnnouncement { .. })
+        ));
+        let mut forked_body = announcement(1, 2, 3);
+        forked_body.body_root = BaoRoot::from_bytes([0x98; 32]);
+        assert!(matches!(
+            state.record_announcement(forked_body),
+            Err(RuntimeError::ConflictingAnnouncement { .. })
+        ));
+    }
+
+    #[test]
     fn control_messages_dedupe_by_id() {
         let mut state = RuntimeState::new(drive());
         let id = ControlMessageId::from_bytes([0xAB; 32]);
@@ -704,13 +865,12 @@ mod tests {
         );
         let id = body.snapshot_id();
         state
-            .record_announcement(SnapshotAnnouncement {
-                snapshot: id,
-                author: wyrd_format::DeviceId::from_bytes([2; 32]),
-                epoch: 3,
-                membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
-                node_addr: None,
-            })
+            .record_announcement(announced(
+                id,
+                wyrd_format::DeviceId::from_bytes([2; 32]),
+                3,
+                wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            ))
             .unwrap();
 
         let plan = state.reconcile();
@@ -752,27 +912,9 @@ mod tests {
         let id = body.snapshot_id();
 
         for announcement in [
-            SnapshotAnnouncement {
-                snapshot: id,
-                author: other_author,
-                epoch: 3,
-                membership,
-                node_addr: None,
-            },
-            SnapshotAnnouncement {
-                snapshot: id,
-                author,
-                epoch: 4,
-                membership,
-                node_addr: None,
-            },
-            SnapshotAnnouncement {
-                snapshot: id,
-                author,
-                epoch: 3,
-                membership: other_membership,
-                node_addr: None,
-            },
+            announced(id, other_author, 3, membership),
+            announced(id, author, 4, membership),
+            announced(id, author, 3, other_membership),
         ] {
             let mut state = RuntimeState::new(drive());
             state.record_announcement(announcement).unwrap();
@@ -789,13 +931,7 @@ mod tests {
         // With agreeing metadata the same body records fine.
         let mut state = RuntimeState::new(drive());
         state
-            .record_announcement(SnapshotAnnouncement {
-                snapshot: id,
-                author,
-                epoch: 3,
-                membership,
-                node_addr: None,
-            })
+            .record_announcement(announced(id, author, 3, membership))
             .unwrap();
         assert!(state.record_snapshot_body(body).unwrap());
     }
@@ -824,13 +960,7 @@ mod tests {
         assert!(state.record_snapshot_body(body.clone()).unwrap());
         assert!(
             matches!(
-                state.record_announcement(SnapshotAnnouncement {
-                    snapshot: id,
-                    author: other_author,
-                    epoch: 3,
-                    membership,
-                    node_addr: None,
-                }),
+                state.record_announcement(announced(id, other_author, 3, membership)),
                 Err(RuntimeError::AnnouncementBodyMismatch { .. })
             ),
             "a disagreeing announcement must never join a recorded body"
@@ -840,13 +970,7 @@ mod tests {
 
         // The agreeing announcement joins the recorded body.
         state
-            .record_announcement(SnapshotAnnouncement {
-                snapshot: id,
-                author,
-                epoch: 3,
-                membership,
-                node_addr: None,
-            })
+            .record_announcement(announced(id, author, 3, membership))
             .unwrap();
         assert!(state.announcement(&id).is_some());
     }

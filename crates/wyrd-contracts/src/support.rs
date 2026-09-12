@@ -10,13 +10,13 @@ use std::path::PathBuf;
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey};
 use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{
-    Change, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Entry, Manifest,
+    BaoRoot, Change, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Entry, Manifest,
     MembershipTransition, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId,
     StorageId, TransitionId, Tree,
 };
 use wyrd_sync::bulk::{MemoryBulkSource, SealedManifest};
 use wyrd_sync::control::{
-    self, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
+    self, sign_announcement, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
 };
 use wyrd_sync::keys::capability::Capability;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
@@ -317,6 +317,28 @@ pub(crate) struct Rig {
     pub dir: PathBuf,
 }
 
+/// The transport identities an announcement carries (decision 26): the
+/// author-signed body root and root-manifest identity the fetch planner
+/// consumes as verified-fetch addresses. Real roots make an
+/// announcement fetchable; `placeholders` keeps the legacy shape for
+/// announcements that are never fetched (forged evidence, queue
+/// pressure).
+pub(crate) struct AnnouncedRoots {
+    pub body_root: BaoRoot,
+    pub root_manifest: ContentId,
+    pub root_transport: BaoRoot,
+}
+
+impl AnnouncedRoots {
+    pub(crate) fn placeholders() -> Self {
+        Self {
+            body_root: BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: ContentId::from_bytes([0x55; 32]),
+            root_transport: BaoRoot::from_bytes([0x66; 32]),
+        }
+    }
+}
+
 impl Rig {
     pub(crate) fn new() -> Self {
         let owner = device(0x10);
@@ -443,14 +465,23 @@ impl Rig {
         snapshot: SnapshotId,
         membership: TransitionId,
         epoch: u64,
+        roots: AnnouncedRoots,
     ) {
-        let message = Message::SnapshotAnnouncement(SnapshotAnnouncement {
+        let mut announcement = SnapshotAnnouncement {
             snapshot,
             author: self.owner.id,
             epoch,
             membership,
+            // The author-signed routing columns: real roots make the
+            // announcement fetchable against the publishing peer.
+            body_root: roots.body_root,
+            root_manifest: roots.root_manifest,
+            root_manifest_transport: roots.root_transport,
             node_addr: None,
-        });
+            signature: [0; 64],
+        };
+        sign_announcement(&mut announcement, &self.owner.identity, &drive());
+        let message = Message::SnapshotAnnouncement(announcement);
         let envelope = sealed_envelope(
             &self.owner.identity,
             self.recipient.id,
@@ -666,15 +697,27 @@ impl Loaded {
         }
     }
 
-    /// Publish the snapshot body and enqueue its announcement,
-    /// leaving the manifest and objects unpublished: for tests that
-    /// stage the manifest deliberately.
+    /// Publish the snapshot body and enqueue its announcement naming the
+    /// real transport identities (decision 26), leaving the manifest
+    /// and objects unpublished: for tests that stage the manifest
+    /// deliberately.
     pub(crate) fn publish_body_and_announcement(&mut self) {
         let snapshot_id = self.snapshot.snapshot_id();
-        self.bulk
-            .publish_snapshot(snapshot_id, self.snapshot.encode());
-        self.rig
-            .enqueue_announcement(snapshot_id, self.rig.admit_id, 2);
+        let body_bytes = self.snapshot.encode();
+        self.bulk.publish_snapshot(snapshot_id, body_bytes.clone());
+        self.bulk.publish_transport(body_bytes.clone());
+        self.rig.enqueue_announcement(
+            snapshot_id,
+            self.rig.admit_id,
+            2,
+            AnnouncedRoots {
+                body_root: BaoRoot::from_bytes(*blake3::hash(&body_bytes).as_bytes()),
+                root_manifest: self.content.manifest_id,
+                root_transport: BaoRoot::from_bytes(
+                    *blake3::hash(&self.content.root.sealed).as_bytes(),
+                ),
+            },
+        );
     }
 
     /// Drain the control plane: the capability and the announcement

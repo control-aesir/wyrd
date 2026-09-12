@@ -18,7 +18,7 @@
 use proptest::prelude::*;
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use wyrd_format::{
-    ContentId, DeviceEncryptionKey, DeviceId, Envelope, Manifest, ManifestEntry,
+    BaoRoot, ContentId, DeviceEncryptionKey, DeviceId, Envelope, Manifest, ManifestEntry,
     MembershipTransition, ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId, Tree,
 };
 
@@ -97,6 +97,7 @@ fn manifest_seed() -> Vec<u8> {
             storage_id: StorageId::from_bytes([2; 32]),
             encryption_epoch: 1,
             size: 11,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         }],
         children: vec![],
     }
@@ -111,6 +112,7 @@ fn manifest_entry_seed() -> Vec<u8> {
         storage_id: StorageId::from_bytes([2; 32]),
         encryption_epoch: 1,
         size: 11,
+        transport: BaoRoot::from_bytes([0xB0; 32]),
     }
     .encode()
     .to_vec()
@@ -253,7 +255,11 @@ fn message_seeds() -> Vec<(ControlKind, Vec<u8>)> {
                 author: DeviceId::from_bytes([7; 32]),
                 epoch: 9,
                 membership: TransitionId::from_bytes([8; 32]),
+                body_root: BaoRoot::from_bytes([9; 32]),
+                root_manifest: ContentId::from_bytes([10; 32]),
+                root_manifest_transport: BaoRoot::from_bytes([11; 32]),
                 node_addr: None,
+                signature: [12; 64],
             })
             .encode_payload(),
         ),

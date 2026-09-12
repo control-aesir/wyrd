@@ -151,6 +151,14 @@ that admits the device; owned as a secret only in the device's own
 keystore. Distinct from DeviceId by type: the identity key signs, the
 encryption key receives."
 );
+define_id!(
+    BaoRoot,
+    "The raw BLAKE3/Bao root of one stored representation — the address
+verified streaming requests by. Routing metadata, never an identity: no
+derivation connects it to ContentId or StorageId, and a wrong root only
+fails a transfer, because identity is the AEAD tag plus content check on
+arrival (object-model.md decision 26)."
+);
 
 impl ContentId {
     /// Derive the Content ID for plaintext of the given kind. The identity

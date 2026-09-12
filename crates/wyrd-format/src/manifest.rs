@@ -14,13 +14,15 @@
 //! unsorted documents so every manifest has one byte-exact form):
 //!
 //! ```text
-//! ManifestEntry (fixed 82 bytes):
+//! ManifestEntry (fixed 114 bytes):
 //!     content_id:       32 bytes (the logical object)
 //!     kind:             u8 (ObjectKind byte of the referenced object)
 //!     version:          u8 (envelope version of the referenced representation)
 //!     storage_id:       32 bytes (the sealed representation to fetch)
 //!     encryption_epoch: u64 LE (the capability epoch that decrypts it)
 //!     size:             u64 LE (plaintext byte length; allocation hint)
+//!     transport:        32 bytes (Bao root of the sealed bytes; verified
+//!                       streaming address — routing hint, decision 26)
 //!
 //! Manifest:
 //!     snapshot:         SnapshotId (32 bytes; the snapshot described)
@@ -28,7 +30,8 @@
 //!                       (content_id, kind, version) order
 //!     children:         u32 LE count + (child tree ContentId (32) +
 //!                       child manifest ContentId (32) + sealed child
-//!                       manifest StorageId (32)) in ascending tree-id order
+//!                       manifest StorageId (32) + child transport root
+//!                       (32)) in ascending tree-id order
 //! ```
 //!
 //! Names live in trees, never in manifests: a child reference carries no
@@ -36,9 +39,11 @@
 //! observing StorageId fetches learns neither names nor structure.
 //! Mappings are untrusted hints (object-model.md decision 15): acting on
 //! one requires the sync-layer two-check verification, never blind trust.
-//! Entries may span epochs: cross-epoch reuse is how dedup survives
-//! rotation, while the manifest itself seals under the current epoch's
-//! snapshot manifest key.
+//! The `transport` roots are the same class of hint one column over
+//! (decision 26): a wrong root fails a transfer, never substitutes
+//! content. Entries may span epochs: cross-epoch reuse is how dedup
+//! survives rotation, while the manifest itself seals under the current
+//! epoch's snapshot manifest key.
 //!
 //! One representation per `(content_id, kind, version)`: a manifest
 //! selects exactly one physical representation for a logical object.
@@ -48,18 +53,22 @@
 //! `1..=N` by capability construction, so coexisting variants would serve
 //! no reader.
 
-use crate::identity::{ContentId, ObjectKind, SnapshotId, StorageId};
+use crate::identity::{BaoRoot, ContentId, ObjectKind, SnapshotId, StorageId};
 use thiserror::Error;
 
-/// Canonical length of one encoded entry: 32 + 1 + 1 + 32 + 8 + 8.
-pub const ENTRY_LEN: usize = 82;
+/// Canonical length of one encoded entry: 32 + 1 + 1 + 32 + 8 + 8 + 32.
+pub const ENTRY_LEN: usize = 114;
 
 /// Canonical length of one encoded child reference: tree (32) +
-/// child manifest ContentId (32) + sealed child StorageId (32).
-pub const CHILD_LEN: usize = 96;
+/// child manifest ContentId (32) + sealed child StorageId (32) +
+/// child transport root (32).
+pub const CHILD_LEN: usize = 128;
 
 /// One content→storage mapping: the logical object, the sealed
-/// representation to fetch, and the epoch whose capability decrypts it.
+/// representation to fetch, the epoch whose capability decrypts it, and
+/// the representation's transport root (decision 26: the verified-
+/// streaming address the fetcher requests; a routing hint verified on
+/// arrival, never an identity).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestEntry {
     pub content_id: ContentId,
@@ -68,19 +77,22 @@ pub struct ManifestEntry {
     pub storage_id: StorageId,
     pub encryption_epoch: u64,
     pub size: u64,
+    pub transport: BaoRoot,
 }
 
 /// A reference to a child subtree's sealed manifest: the complete
 /// identity pair. `tree` names the child subtree's tree object, `manifest`
 /// names the child manifest's logical identity (the ContentId its seal
 /// opens under; without it the fetched bytes are unauthenticatable),
-/// and `storage` is the sealed representation to fetch. No names: the
-/// vault sees only an unlinkable StorageId fetch.
+/// and `storage` is the sealed representation to fetch. `transport` is
+/// the child envelope's Bao root (decision 26). No names: the vault sees
+/// only an unlinkable StorageId fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildManifest {
     pub tree: ContentId,
     pub manifest: ContentId,
     pub storage: StorageId,
+    pub transport: BaoRoot,
 }
 
 /// One subtree's manifest: its file entries plus child references.
@@ -117,7 +129,7 @@ impl ManifestEntry {
         )
     }
 
-    /// The fixed 82-byte canonical encoding.
+    /// The fixed 114-byte canonical encoding.
     pub fn encode(&self) -> [u8; ENTRY_LEN] {
         let mut out = [0u8; ENTRY_LEN];
         out[0..32].copy_from_slice(self.content_id.as_bytes());
@@ -126,6 +138,7 @@ impl ManifestEntry {
         out[34..66].copy_from_slice(self.storage_id.as_bytes());
         out[66..74].copy_from_slice(&self.encryption_epoch.to_le_bytes());
         out[74..82].copy_from_slice(&self.size.to_le_bytes());
+        out[82..114].copy_from_slice(self.transport.as_bytes());
         out
     }
 
@@ -141,6 +154,7 @@ impl ManifestEntry {
         let encryption_epoch =
             u64::from_le_bytes(bytes[66..74].try_into().expect("bounds checked"));
         let size = u64::from_le_bytes(bytes[74..82].try_into().expect("bounds checked"));
+        let transport = BaoRoot::from_bytes(bytes[82..114].try_into().expect("bounds checked"));
         Ok(ManifestEntry {
             content_id,
             kind,
@@ -148,6 +162,7 @@ impl ManifestEntry {
             storage_id,
             encryption_epoch,
             size,
+            transport,
         })
     }
 }
@@ -184,6 +199,7 @@ impl Manifest {
             out.extend_from_slice(child.tree.as_bytes());
             out.extend_from_slice(child.manifest.as_bytes());
             out.extend_from_slice(child.storage.as_bytes());
+            out.extend_from_slice(child.transport.as_bytes());
         }
         out
     }
@@ -235,6 +251,7 @@ impl Manifest {
                 tree: ContentId::from_bytes(chunk[0..32].try_into().expect("chunks_exact")),
                 manifest: ContentId::from_bytes(chunk[32..64].try_into().expect("chunks_exact")),
                 storage: StorageId::from_bytes(chunk[64..96].try_into().expect("chunks_exact")),
+                transport: BaoRoot::from_bytes(chunk[96..128].try_into().expect("chunks_exact")),
             });
         }
         pos += child_bytes;
@@ -268,6 +285,7 @@ mod tests {
             storage_id: StorageId::from_bytes([pattern ^ 0xFF; 32]),
             encryption_epoch: epoch,
             size: 1024,
+            transport: BaoRoot::from_bytes([pattern | 0x80; 32]),
         }
     }
 
@@ -279,12 +297,13 @@ mod tests {
                 tree: ContentId::from_bytes([0x10; 32]),
                 manifest: ContentId::from_bytes([0x20; 32]),
                 storage: StorageId::from_bytes([0x30; 32]),
+                transport: BaoRoot::from_bytes([0x81; 32]),
             }],
         }
     }
 
     #[test]
-    fn entry_encoding_is_fixed_82_bytes() {
+    fn entry_encoding_is_fixed_114_bytes() {
         let bytes = entry(0x01, 7).encode();
         assert_eq!(bytes.len(), ENTRY_LEN);
         assert_eq!(&bytes[0..32], &[0x01; 32], "content id");
@@ -293,6 +312,7 @@ mod tests {
         assert_eq!(&bytes[34..66], &[0xFE; 32], "storage id");
         assert_eq!(&bytes[66..74], &7u64.to_le_bytes(), "epoch");
         assert_eq!(&bytes[74..82], &1024u64.to_le_bytes(), "size");
+        assert_eq!(&bytes[82..114], &[0x81; 32], "transport root");
     }
 
     #[test]
@@ -341,7 +361,7 @@ mod tests {
     fn decode_rejects_unsorted_and_duplicate_entries() {
         // Forge the non-canonical bytes by hand: no conforming encoder
         // emits them (canonical_bytes debug-asserts sortedness), so the
-        // decoder is the backstop. Entries live at 36..200 (two 82-byte
+        // decoder is the backstop. Entries live at 36..264 (two 114-byte
         // blocks after snapshot(32) + count(4)).
         let mut swapped = manifest().canonical_bytes();
         let first = swapped[36..36 + ENTRY_LEN].to_vec();
@@ -368,13 +388,16 @@ mod tests {
 
     #[test]
     fn decode_rejects_unsorted_children() {
-        // Children follow entries: count at 200..204, then 96-byte
-        // records. Append a smaller tree id after the 0x10 child.
+        // Children follow entries: count at 264..268 (snapshot(32) +
+        // count(4) + two 114-byte entries), then 128-byte records.
+        // Append a smaller tree id after the 0x10 child.
         let mut bytes = manifest().canonical_bytes();
-        bytes[200..204].copy_from_slice(&2u32.to_le_bytes());
+        let child_count_at = 36 + 2 * ENTRY_LEN;
+        bytes[child_count_at..child_count_at + 4].copy_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&[0x05; 32]);
         bytes.extend_from_slice(&[0x06; 32]);
         bytes.extend_from_slice(&[0x07; 32]);
+        bytes.extend_from_slice(&[0x08; 32]);
         assert_eq!(
             Manifest::from_canonical_bytes(&bytes),
             Err(ManifestError::UnsortedChildren)
@@ -383,13 +406,15 @@ mod tests {
 
     #[test]
     fn child_reference_carries_both_identities() {
-        // The triple: tree identity, manifest logical identity for the
-        // AAD, and sealed storage address for the fetch.
+        // The quadruple: tree identity, manifest logical identity for the
+        // AAD, sealed storage address for the fetch, and the transport
+        // root for verified streaming (decision 26).
         let child = &manifest().children[0];
         assert_eq!(child.tree, ContentId::from_bytes([0x10; 32]));
         assert_eq!(child.manifest, ContentId::from_bytes([0x20; 32]));
         assert_eq!(child.storage, StorageId::from_bytes([0x30; 32]));
-        assert_eq!(CHILD_LEN, 96);
+        assert_eq!(child.transport, BaoRoot::from_bytes([0x81; 32]));
+        assert_eq!(CHILD_LEN, 128);
     }
 
     #[test]

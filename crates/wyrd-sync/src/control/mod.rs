@@ -36,6 +36,8 @@ pub mod bootstrap;
 pub mod message;
 pub mod nip46;
 
+use secp256k1::schnorr::Signature;
+use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
 use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 use wyrd_format::DriveId;
@@ -47,7 +49,8 @@ pub use bootstrap::{
     BootstrapInvitation, SealedBootstrap, BOOTSTRAP_HEADER_LEN, BOOTSTRAP_VERSION,
 };
 pub use message::{
-    CapabilityPayload, ControlKind, KeyRotation, Message, SnapshotAnnouncement, TransitionPayload,
+    AnnouncementUpdate, CapabilityPayload, ControlKind, KeyRotation, Message, SnapshotAnnouncement,
+    TransitionPayload,
 };
 pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
 
@@ -74,6 +77,8 @@ pub enum ControlError {
     WrongDrive,
     #[error("owner signature does not verify")]
     BadSignature,
+    #[error("author bytes are not a valid BIP-340 public key")]
+    InvalidAuthorKey,
     #[error("no control key held for epoch {0}")]
     UnknownEpoch(u64),
     #[error("control crypto failed")]
@@ -226,7 +231,47 @@ pub fn open(
     Ok((sealed.drive, sealed.epoch, message))
 }
 
-/// What an ingest did: first sight delivers, replay is a no-op.
+/// BIP-340 challenge context for announcements (trust.md, "Exact
+/// signing construction"; mirrored from snapshots).
+pub const ANNOUNCEMENT_CHALLENGE_CONTEXT: &str = "wyrd announcement challenge v1";
+
+/// The 32-byte BIP-340 challenge for an announcement's signing message.
+pub fn announcement_challenge(a: &SnapshotAnnouncement, drive: &DriveId) -> [u8; 32] {
+    blake3::derive_key(ANNOUNCEMENT_CHALLENGE_CONTEXT, &a.signing_message(drive))
+}
+
+/// Sign an announcement in place with canonical BIP-340 nonces. The
+/// authoring path is the only production caller: an announcement is
+/// author-signed evidence of the transport identities it carries, so it
+/// is signed exactly once, at construction. The typed wrapper (not a
+/// bare curve key) keeps the identity secret's purpose boundary intact.
+pub fn sign_announcement(
+    a: &mut SnapshotAnnouncement,
+    identity: &crate::keys::DeviceIdentitySecret,
+    drive: &DriveId,
+) {
+    let keypair = Keypair::from_secret_key(SECP256K1, &identity.secret_key());
+    let sig = SECP256K1.sign_schnorr_no_aux_rand(&announcement_challenge(a, drive), &keypair);
+    a.signature = sig.to_byte_array();
+}
+
+/// Whether the announcement's signature verifies against its author.
+/// Full key validation (lift_x, exactly 64-byte signatures) is delegated
+/// to the audited secp256k1 implementation; lift_x failure is reported
+/// distinctly so malformed author keys are flagged as malformed
+/// evidence, not failed challenges.
+pub fn verify_announcement(drive: &DriveId, a: &SnapshotAnnouncement) -> Result<(), ControlError> {
+    let pk = XOnlyPublicKey::from_slice(a.author.as_bytes())
+        .map_err(|_| ControlError::InvalidAuthorKey)?;
+    let sig = Signature::from_slice(&a.signature).map_err(|_| ControlError::BadSignature)?;
+    SECP256K1
+        .verify_schnorr(&sig, &announcement_challenge(a, drive), &pk)
+        .map_err(|_| ControlError::BadSignature)
+}
+
+/// What an ingest did: first sight delivers, replay is a no-op. The
+/// size spread rides [`Message`]'s fixed protocol shapes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestReport {
     /// Already seen: harmless replay, no-op.
@@ -358,7 +403,11 @@ mod tests {
             author: DeviceId::from_bytes([0x22; 32]),
             epoch: 5,
             membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            body_root: wyrd_format::BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: wyrd_format::ContentId::from_bytes([0x55; 32]),
+            root_manifest_transport: wyrd_format::BaoRoot::from_bytes([0x66; 32]),
             node_addr: None,
+            signature: [0x77; 64],
         })
     }
 
@@ -368,9 +417,92 @@ mod tests {
             author: DeviceId::from_bytes([0x22; 32]),
             epoch: 5,
             membership: wyrd_format::TransitionId::from_bytes([0x33; 32]),
+            body_root: wyrd_format::BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: wyrd_format::ContentId::from_bytes([0x55; 32]),
+            root_manifest_transport: wyrd_format::BaoRoot::from_bytes([0x66; 32]),
             // Opaque composer bytes; control never interprets them.
             node_addr: Some(vec![0xAA, 0xBB, 0xCC]),
+            signature: [0x77; 64],
         })
+    }
+
+    #[test]
+    fn announcement_signatures_round_trip_through_the_envelope() {
+        // Sign, verify: authorship binds the drive and every payload
+        // byte, and the distinct error paths stay distinct.
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let identity = crate::keys::DeviceIdentitySecret::from_bytes([0x42; 32]).unwrap();
+        let sk = identity.secret_key();
+        let (xonly, _) = XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(SECP256K1, &sk));
+        let mut a = match announcement() {
+            Message::SnapshotAnnouncement(a) => a,
+            _ => unreachable!(),
+        };
+        a.author = wyrd_format::DeviceId::from_bytes(xonly.serialize());
+        sign_announcement(&mut a, &identity, &drive);
+        verify_announcement(&drive, &a).unwrap();
+        // Another drive's challenge rejects the same signature.
+        assert_eq!(
+            verify_announcement(&DriveId::from_bytes([0x0D; 32]), &a),
+            Err(ControlError::BadSignature)
+        );
+        // Any payload mutation breaks the signature: the covered region
+        // includes the transport identities.
+        let mut tampered = a.clone();
+        tampered.body_root = wyrd_format::BaoRoot::from_bytes([0x99; 32]);
+        assert_eq!(
+            verify_announcement(&drive, &tampered),
+            Err(ControlError::BadSignature)
+        );
+        let mut tampered = a.clone();
+        tampered.root_manifest = wyrd_format::ContentId::from_bytes([0x98; 32]);
+        assert_eq!(
+            verify_announcement(&drive, &tampered),
+            Err(ControlError::BadSignature)
+        );
+        let mut tampered = a.clone();
+        tampered.root_manifest_transport = wyrd_format::BaoRoot::from_bytes([0x98; 32]);
+        assert_eq!(
+            verify_announcement(&drive, &tampered),
+            Err(ControlError::BadSignature)
+        );
+        // An author field that is not a valid x-only key is malformed
+        // evidence, reported distinctly from a failed challenge.
+        let mut bad_author = a.clone();
+        bad_author.author = DeviceId::from_bytes([0xFF; 32]);
+        assert_eq!(
+            verify_announcement(&drive, &bad_author),
+            Err(ControlError::InvalidAuthorKey)
+        );
+        // Every covered field, one at a time: snapshot, author, epoch,
+        // membership, and the routing metadata. The covered region is
+        // structural, so each mutation alone invalidates the signature.
+        for mutate in [
+            |a: &mut SnapshotAnnouncement| {
+                a.snapshot = wyrd_format::SnapshotId::from_bytes([0x90; 32])
+            },
+            |a: &mut SnapshotAnnouncement| {
+                // A different but valid key: the signature is attributed
+                // authorship, so a swapped author fails the challenge,
+                // not lift_x.
+                let other = crate::keys::DeviceIdentitySecret::from_bytes([0x91; 32]).unwrap();
+                let kp = Keypair::from_secret_key(SECP256K1, &other.secret_key());
+                a.author = DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&kp).0.serialize());
+            },
+            |a: &mut SnapshotAnnouncement| a.epoch = 9,
+            |a: &mut SnapshotAnnouncement| {
+                a.membership = wyrd_format::TransitionId::from_bytes([0x92; 32])
+            },
+            |a: &mut SnapshotAnnouncement| a.node_addr = Some(vec![0x93]),
+        ] {
+            let mut tampered = a.clone();
+            mutate(&mut tampered);
+            assert_eq!(
+                verify_announcement(&drive, &tampered),
+                Err(ControlError::BadSignature),
+                "every covered field binds the signature"
+            );
+        }
     }
 
     fn inbox() -> ControlInbox {

@@ -27,7 +27,9 @@
 //! [`EpochSecret::manifest_key`]: crate::keys::EpochSecret::manifest_key
 
 use thiserror::Error;
-use wyrd_format::{ContentId, Manifest, ManifestEntry, ManifestError, ObjectKind, StorageId};
+use wyrd_format::{
+    BaoRoot, ContentId, Manifest, ManifestEntry, ManifestError, ObjectKind, StorageId,
+};
 
 use crate::keys::{random_bytes, CryptoError};
 use zeroize::Zeroizing;
@@ -106,6 +108,22 @@ fn seal_aad(version: u8, kind: ObjectKind, content_id: &ContentId) -> [u8; 34] {
     aad[1] = kind.byte();
     aad[2..34].copy_from_slice(content_id.as_bytes());
     aad
+}
+
+/// The transport root of a byte run: the raw BLAKE3 (Bao root) the
+/// transfer verifies — routing metadata, never an identity
+/// (object-model.md decision 26).
+pub(crate) fn blob_root(bytes: &[u8]) -> BaoRoot {
+    BaoRoot::from_bytes(*blake3::hash(bytes).as_bytes())
+}
+
+/// The transport root of a sealed representation: [`blob_root`] over the
+/// sealed bytes — the address verified streaming requests. Routing
+/// metadata (object-model.md decision 26): computed at sealing time,
+/// distributed with the manifest mapping, and verified by the transfer
+/// itself; never an identity.
+pub(crate) fn transport_root(obj: &EncryptedObject) -> BaoRoot {
+    blob_root(&obj.encode())
 }
 
 /// Seal plaintext under a per-epoch key. Fails closed when the named
@@ -233,6 +251,7 @@ pub fn entry_for(
         storage_id: obj.storage_id(),
         encryption_epoch: epoch,
         size,
+        transport: transport_root(obj),
     })
 }
 

@@ -98,6 +98,13 @@ Hard-won operational rules:
   re-publishes what the peer just wrote.
 - Version ordering uses the deterministic `(timestamp, author)` tiebreak —
   for display only, never content.
+- Announcement compatibility is checked at intake against the engine's
+  hydrated announcement projection before `Fact::Announcement` is
+  durably committed. Route fields (`node_addr`) may be updated for an
+  existing snapshot — the last accepted route wins, deterministically
+  under replay; immutable announcement fields constitute a fork and are
+  rejected before commit. Replay therefore never encounters an
+  announcement conflict that intake could have detected.
 
 ## Current status
 
@@ -120,10 +127,13 @@ health polling and capped-backoff drainer recovery) and the `wyrd` binary
 provides local init/mount. The demand machinery for fetch-on-open has
 landed (`docs/fetch-on-open.md`): a want registry on its own lock,
 blocking `open`/`read` with a bounded deadline (`EIO` on expiry), and
-read-side chunk demand — proven against the bulk-source contract; the
-transport-identity distribution that makes fetch real against peers
-(announcement Bao roots, author-signed announcements, serving router)
-is a tracked follow-up. Still open: the NIP-46 signer-session client
+read-side chunk demand — proven against the bulk-source contract. The
+transport-identity distribution that makes fetch real against peers is
+in review: announcement Bao roots, author-signed announcements, the
+durable serving vault, and an Engine-owned announcement projection that
+gates every announcement at intake (route updates replace — last
+accepted route wins; immutable forks are rejected before the fact
+commits, so replay never meets a conflict intake could have detected). Still open: the NIP-46 signer-session client
 wiring, and the
 live fetch-on-open transport; garbage collection does
 not exist. `wyrd-fuse` is a

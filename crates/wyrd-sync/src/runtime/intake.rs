@@ -1,11 +1,14 @@
 //! Control-plane intake and message classification for the runtime engine.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-use wyrd_format::MembershipTransition;
+use wyrd_format::{MembershipTransition, SnapshotId};
 
 use super::engine::{DrainReport, Engine, EngineError};
-use crate::control::{ControlError, ControlMessageId, IngestReport, Message, SealedControl};
+use crate::control::{
+    verify_announcement, AnnouncementUpdate, ControlError, ControlMessageId, IngestReport, Message,
+    SealedControl, SnapshotAnnouncement,
+};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::{CapabilityError, WrappedCapability};
@@ -105,7 +108,7 @@ fn accept_envelope(
         // in the relay.
         Err(_) => Ok(Outcome::Discarded),
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
-            Some(id) => match engine.pending.remove(&id) {
+            Some(id) => match engine.take_pending(&id) {
                 Some(message) => commit_action(engine, &id, &message, false),
                 None => Ok(Outcome::Duplicate),
             },
@@ -121,7 +124,12 @@ fn commit_action(
     message: &Message,
     is_new: bool,
 ) -> Result<Outcome, EngineError> {
-    let mut facts = match message_action(engine, id, message) {
+    // Announcements this pass would commit, validated against each other
+    // as well as the hydrated projection: a transition landing may flush
+    // several pending messages into one commit, and a fork must never
+    // reach the fact log merely because two deferrals resolved together.
+    let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
+    let mut facts = match message_action(engine, id, message, &mut staged) {
         Action::Commit(facts) => facts,
         Action::Defer if engine.pending.len() >= MAX_PENDING_MESSAGES => {
             // Shed without consuming: the bound protects memory, but a
@@ -134,19 +142,23 @@ fn commit_action(
             return Ok(Outcome::RelayHeld);
         }
         Action::Defer => {
-            engine.pending.insert(*id, message.clone());
+            engine.hold_pending(*id, message.clone());
             return Ok(Outcome::Deferred);
         }
     };
     if !is_new {
         facts.clear();
+        staged.clear();
     }
     if matches!(message, Message::MembershipTransition(_)) {
+        // The flush walks the pending queue in arrival order (see
+        // `Engine::hold_pending`): staged announcement compatibility
+        // and the durable fact order are deterministic.
         for (pending_id, pending_message) in std::mem::take(&mut engine.pending) {
-            match message_action(engine, &pending_id, &pending_message) {
+            match message_action(engine, &pending_id, &pending_message, &mut staged) {
                 Action::Commit(more) => facts.extend(more),
                 Action::Defer => {
-                    engine.pending.insert(pending_id, pending_message);
+                    engine.hold_pending(pending_id, pending_message);
                 }
             }
         }
@@ -158,10 +170,20 @@ fn commit_action(
         let _ = engine.resync();
         return Err(error.into());
     }
+    // The projection follows the durable state, never leads it: staged
+    // announcements merge only after the fact batch committed.
+    for (snapshot, announcement) in std::mem::take(&mut staged) {
+        engine.announcements.insert(snapshot, announcement);
+    }
     Ok(Outcome::Accepted)
 }
 
-fn message_action(engine: &mut Engine, id: &ControlMessageId, message: &Message) -> Action {
+fn message_action(
+    engine: &mut Engine,
+    id: &ControlMessageId,
+    message: &Message,
+    staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
+) -> Action {
     match message {
         Message::MembershipTransition(payload) => {
             let seen = || vec![Fact::ControlMessage(*id)];
@@ -182,6 +204,14 @@ fn message_action(engine: &mut Engine, id: &ControlMessageId, message: &Message)
             ])
         }
         Message::SnapshotAnnouncement(announcement) => {
+            // Authorship first: an announcement is evidence only when
+            // the author's signature verifies against the drive-bound
+            // challenge. A bad signature is malformed evidence like an
+            // unparsable transition — suppress without a durable fact,
+            // never defer.
+            if verify_announcement(&engine.drive(), announcement).is_err() {
+                return Action::Commit(vec![Fact::ControlMessage(*id)]);
+            }
             match engine.log.transition(&announcement.membership) {
                 None => Action::Defer,
                 Some(t) if t.epoch != announcement.epoch => {
@@ -192,10 +222,39 @@ fn message_action(engine: &mut Engine, id: &ControlMessageId, message: &Message)
                     .status(&announcement.membership)
                     .expect("membership observed")
                 {
-                    TransitionStatus::Canonical => Action::Commit(vec![
-                        Fact::Announcement(announcement.clone()),
-                        Fact::ControlMessage(*id),
-                    ]),
+                    TransitionStatus::Canonical => {
+                        // The compatibility gate: an announcement becomes a
+                        // durable fact only when it is compatible with the
+                        // announcement already known for the snapshot — the
+                        // hydrated projection, or an announcement staged
+                        // earlier in this commit batch. Route updates
+                        // (mutable `node_addr` only) commit a fresh fact;
+                        // the last accepted route wins. An immutable fork is
+                        // the sender's invalid data: the seen-id commits
+                        // (verdicts are final) and no announcement fact is
+                        // written, so replay never meets a conflict intake
+                        // could have detected.
+                        let known = engine
+                            .announcements
+                            .get(&announcement.snapshot)
+                            .or_else(|| staged.get(&announcement.snapshot));
+                        let committable = match known {
+                            None => true,
+                            Some(existing) => !matches!(
+                                existing.check_update(announcement),
+                                AnnouncementUpdate::Fork
+                            ),
+                        };
+                        if committable {
+                            staged.insert(announcement.snapshot, announcement.clone());
+                            Action::Commit(vec![
+                                Fact::Announcement(announcement.clone()),
+                                Fact::ControlMessage(*id),
+                            ])
+                        } else {
+                            Action::Commit(vec![Fact::ControlMessage(*id)])
+                        }
+                    }
                     TransitionStatus::Invalid(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
                     TransitionStatus::Contested
                     | TransitionStatus::Voided
@@ -257,7 +316,7 @@ mod tests {
 
     use secp256k1::SecretKey;
     use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-    use wyrd_format::{Change, DeviceId, DriveId, TransitionId};
+    use wyrd_format::{BaoRoot, Change, ContentId, DeviceId, DriveId, SnapshotId, TransitionId};
     use zeroize::Zeroizing;
 
     use crate::control::{CapabilityPayload, Message, TransitionPayload};
@@ -266,8 +325,9 @@ mod tests {
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
     use crate::membership::MembershipLog;
     use crate::runtime::test_util::{
-        admit_engine, announcement_for, capability_message, control_key, deliver, drain,
-        encryption_key, fixture, owner, queue, reopen, transition_message, MemoryMailbox,
+        admit_engine, announcement_for, announcement_msg_routed, announcement_msg_with,
+        capability_message, control_key, deliver, drain, encryption_key, fixture, identity, owner,
+        queue, reopen, transition_message, MemoryMailbox,
     };
     /// Hand-sign one transition against the fixture drive (mirrors
     /// the conformance helper): for siblings the builder cannot
@@ -321,6 +381,243 @@ mod tests {
             }
         );
         assert_eq!(fixture.engine.current(), 3);
+    }
+
+    #[test]
+    fn announcement_forks_commit_seen_id_but_never_a_fact() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let first = announcement_for(2, child.transition_id());
+        // A fork of the first: the same snapshot, author, epoch, and
+        // membership, but a different root manifest identity.
+        let (sk, _) = identity(0x22);
+        let fork = announcement_msg_with(
+            &sk,
+            SnapshotId::from_bytes([0x11; 32]),
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x99; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+        );
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+            deliver(&fixture, 2, &first),
+            deliver(&fixture, 2, &fork),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 4);
+        // The fork is the sender's invalid data: its seen-id committed
+        // (verdicts are final) and no announcement fact was written.
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        assert_eq!(
+            fixture.engine.announcements[&snapshot].root_manifest,
+            ContentId::from_bytes([0x55; 32]),
+            "the projection keeps the first statement, never the fork"
+        );
+        // Replay stays healthy: the invalid fact never reached the log.
+        let engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].root_manifest,
+            ContentId::from_bytes([0x55; 32])
+        );
+    }
+
+    #[test]
+    fn announcement_route_updates_replace_the_recorded_route() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let (sk, _) = identity(0x22);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        let first = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x01, 0x02]),
+        );
+        let rerouted = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x03, 0x04]),
+        );
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+            deliver(&fixture, 2, &first),
+            deliver(&fixture, 2, &rerouted),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 4);
+        // Both author-signed statements committed; the projection
+        // carries the last accepted route.
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 2);
+        assert_eq!(
+            fixture.engine.announcements[&snapshot].node_addr,
+            Some(vec![0x03, 0x04])
+        );
+        // Replay walks the same commit order, so the projection is the
+        // same after a restart.
+        let mut engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].node_addr,
+            Some(vec![0x03, 0x04])
+        );
+
+        // Post-restart, the gate compares against the hydrated latest:
+        // a further route update is accepted and wins.
+        let third = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x05, 0x06]),
+        );
+        let envelope = deliver(&fixture, 2, &third);
+        queue(&mut fixture, vec![envelope]);
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        assert_eq!(engine.drain(&mut mailbox).unwrap().accepted, 1);
+        assert_eq!(
+            engine.announcements[&snapshot].node_addr,
+            Some(vec![0x05, 0x06])
+        );
+    }
+
+    #[test]
+    fn deferred_route_updates_flush_in_arrival_order() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let (sk, _) = identity(0x22);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        // Both route updates arrive before their membership transition:
+        // each defers, then flushes in arrival order when it lands.
+        let first = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x01, 0x02]),
+        );
+        let second = announcement_msg_routed(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+            Some(vec![0x03, 0x04]),
+        );
+        let mail = vec![deliver(&fixture, 2, &first), deliver(&fixture, 2, &second)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.deferred, 2);
+
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 2);
+
+        // The durable fact order is arrival order, and the projection
+        // carries the last accepted route.
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 2);
+        assert_eq!(facts.announcements[0].node_addr, Some(vec![0x01, 0x02]));
+        assert_eq!(facts.announcements[1].node_addr, Some(vec![0x03, 0x04]));
+        assert_eq!(
+            fixture.engine.announcements[&snapshot].node_addr,
+            Some(vec![0x03, 0x04])
+        );
+
+        // Replay walks the same order: the same winner after reopen.
+        let engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].node_addr,
+            Some(vec![0x03, 0x04])
+        );
+    }
+
+    #[test]
+    fn deferred_fork_never_commits_when_the_batch_flushes() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let (sk, _) = identity(0x22);
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        // An honest statement and an immutable fork of it, both
+        // deferred behind the unknown transition. The flush walks
+        // arrival order, so the gate compares the fork against the
+        // staged first statement and refuses it; the reverse order
+        // would refuse the honest one with equal determinism.
+        let first = announcement_msg_with(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x55; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+        );
+        let fork = announcement_msg_with(
+            &sk,
+            snapshot,
+            2,
+            child.transition_id(),
+            BaoRoot::from_bytes([0x44; 32]),
+            ContentId::from_bytes([0x99; 32]),
+            BaoRoot::from_bytes([0x66; 32]),
+        );
+        let mail = vec![deliver(&fixture, 2, &first), deliver(&fixture, 2, &fork)];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).deferred, 2);
+
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).accepted, 2);
+
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1, "the fork never commits");
+        assert_eq!(
+            fixture.engine.announcements[&snapshot].root_manifest,
+            ContentId::from_bytes([0x55; 32])
+        );
+        // Replay stays healthy.
+        let engine = reopen(&mut fixture);
+        assert_eq!(
+            engine.announcements[&snapshot].root_manifest,
+            ContentId::from_bytes([0x55; 32])
+        );
     }
 
     #[test]

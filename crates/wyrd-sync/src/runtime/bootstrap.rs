@@ -37,7 +37,8 @@ use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition};
 
 use super::engine::{Engine, EngineError};
-use crate::durable::{atomic_write, DurableStore, Fact};
+use crate::durable::{atomic_write, AuthorizedCapability, DurableStore, Fact};
+use crate::keys::capability::Capability;
 use crate::keys::keystore::{
     unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, WrappedSecret,
 };
@@ -104,9 +105,10 @@ pub(super) fn create(
     let result = (|| -> Result<Engine, EngineError> {
         let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
         atomic_write(&dir, KEYSTORE_FILE, &custody)?;
-        engine.commit_facts(&[Fact::Transition(genesis)])?;
+        engine.commit_facts(&[Fact::Transition(genesis.clone())])?;
         engine.resync()?;
         engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
+        install_self_capability(&mut engine, &genesis, &epoch)?;
         Ok(engine)
     })();
 
@@ -152,10 +154,51 @@ pub(super) fn open_keystore(
     // and the supplied identity was checked against the recorded owner, so
     // completing it is safe and idempotent.
     if engine.log.known_state().is_none() {
-        engine.commit_facts(&[Fact::Transition(genesis)])?;
+        engine.commit_facts(&[Fact::Transition(genesis.clone())])?;
         engine.resync()?;
     }
+    // Complete an interrupted self-capability install the same way (a
+    // crash between the genesis commit and the capability commit would
+    // otherwise leave a drive that can unlock mail but never seal
+    // content): the escrow record covers exactly this epoch, and the
+    // install is a no-op when the durable capability already exists.
+    install_self_capability(&mut engine, &genesis, &epoch)?;
     Ok(engine)
+}
+
+/// Install the local owner's epoch material as a durable self-capability,
+/// so the keyring rebuilt from facts holds the content/manifest sealing
+/// secrets for exactly the epochs the custody escrow covers. The mailbox
+/// control key stays in `epoch_keys` (per-process, never durable). A
+/// keyring that already holds the epoch skips the commit: replay-safe by
+/// the same idempotence the capability facts themselves carry.
+fn install_self_capability(
+    engine: &mut Engine,
+    genesis: &MembershipTransition,
+    epoch: &EpochSecret,
+) -> Result<(), EngineError> {
+    if engine
+        .store
+        .rebuild(engine.device)?
+        .keyring
+        .secret(genesis.epoch)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let cap = Capability::new(
+        engine.drive,
+        engine.device,
+        encryption_key(&engine.encryption_secret),
+        genesis.transition_id(),
+        genesis.epoch,
+        vec![epoch.clone()],
+    )?;
+    let authorized =
+        AuthorizedCapability::authorize(cap, engine.drive, &engine.log, &genesis.transition_id())
+            .map_err(EngineError::Capability)?;
+    engine.commit_facts(&[Fact::Capability(authorized)])?;
+    Ok(())
 }
 
 /// The genesis membership transition (epochs.md): the owner admits itself

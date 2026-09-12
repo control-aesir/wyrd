@@ -48,14 +48,44 @@
 //! One `LiveMailbox` owns one Tokio runtime and one relay client: the
 //! daemon composes exactly one mailbox per process (see the review note on
 //! runtime-per-mailbox cost before ever changing that).
+//!
+//! # Supervision
+//!
+//! The SDK owns TCP reconnects and resubscribes automatically after one,
+//! but it never reports relay status on the client notification stream —
+//! only events, raw messages, and shutdown. A background supervisor task
+//! therefore polls each relay's connection status into shared health
+//! (read via [`LiveMailbox::health`]), so a relay outage reads as an
+//! unhealthy mailbox instead of an idle one. If the notification stream
+//! itself ever dies (client-level failure), the supervisor re-drives the
+//! client — reconnect plus a fresh subscription with capped exponential
+//! backoff — and respawns the drainer on a new channel. The replacement
+//! drainer is always established before the resubscribe whose replay it
+//! must catch (`establish_drainer` awaits the drainer's readiness, so the
+//! order is a handshake, not timing): `notifications()` only delivers
+//! events broadcast after it is called, and reversing the order drops
+//! relay history into the broadcast void. A sustained
+//! zero-connected state (relay outage) is re-driven the same way minus the
+//! drainer respawn: `connect` attempts paced by the capped backoff, one
+//! fresh subscription on success, and never a proactive disconnect (which
+//! strands the SDK's connection task). The backoff delay
+//! is bounded (1s doubling to a 30s cap); the attempts are not, because an
+//! unattended mailbox must never give up on its own — the daemon composer
+//! owns lifecycle and reads health to decide. Reconnect state never
+//! touches the durable dedupe log: already-acked wraps stay collapsed
+//! across outages, and relay replay after a resubscribe converges to
+//! nothing new.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use nostr::event::{AsyncSignEvent, FinalizeEventAsync, FinalizeUnsignedEvent};
+use nostr::message::RelayMessage;
 use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
 use nostr::prelude::{AsyncGetPublicKey, AsyncNip44};
 use nostr::prelude::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, UnsignedEvent};
@@ -77,6 +107,63 @@ const RUMOR_KIND: u16 = 9_501;
 /// client's notification stream (redelivery comes from relay history), so
 /// an event flood cannot grow daemon memory without limit.
 const INCOMING_CAPACITY: usize = 1024;
+
+/// Supervisor tick: how often relay connection statuses are polled into
+/// shared health. Fast enough to surface an outage within a couple of
+/// seconds; slow enough to stay background noise.
+const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Drainer-recovery backoff bounds: first retry after one second, doubling
+/// per attempt, capped at thirty. See the module supervision notes for why
+/// the delay is bounded but the attempts are not.
+const RECOVERY_BASE_DELAY: Duration = Duration::from_secs(1);
+const RECOVERY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Per-attempt connection wait inside a recovery episode: long enough
+/// for a live relay handshake, short enough to keep the backoff pacing
+/// supervisor-driven rather than SDK-driven.
+const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Capped exponential backoff for drainer recovery: 1s, 2s, 4s, 8s, 16s,
+/// then 30s indefinitely. Pure for testability.
+fn recovery_delay(attempt: u32) -> Duration {
+    RECOVERY_BASE_DELAY
+        .checked_mul(2u32.saturating_pow(attempt.min(5)))
+        .unwrap_or(RECOVERY_MAX_DELAY)
+        .min(RECOVERY_MAX_DELAY)
+}
+
+/// What the supervisor currently believes about the relay attachment.
+/// A dead mailbox is diagnosable through this instead of idling silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxHealth {
+    /// The notification drainer is alive: relay events can reach `recv`.
+    /// Only a client-level stream death clears this; relay outages keep
+    /// the stream open and show up as zero connected relays instead.
+    pub stream_alive: bool,
+    /// Relays currently connected.
+    pub connected_relays: usize,
+    /// Relays registered at construction. Zero means the mailbox was built
+    /// for offline boundary use, where "live" is stream-alive alone.
+    pub total_relays: usize,
+}
+
+impl MailboxHealth {
+    /// True when deliveries can flow: the drainer is alive and, if relays
+    /// are configured, at least one is connected.
+    pub fn is_live(&self) -> bool {
+        self.stream_alive && (self.total_relays == 0 || self.connected_relays > 0)
+    }
+}
+
+/// Health flags shared between the drainer task, the supervisor task, and
+/// the synchronous [`LiveMailbox`] handle. Plain atomics — updated on the
+/// supervisor tick, read lock-free from `health`, never held across await.
+#[derive(Debug, Default)]
+struct SupervisorState {
+    stream_alive: AtomicBool,
+    connected_relays: AtomicUsize,
+}
 
 /// Durable record of consumed gift wraps: one hex event id per line,
 /// appended (and fsynced) at every `Ack`; rebuilt as an in-memory set on
@@ -186,7 +273,15 @@ pub struct LiveMailbox<S> {
     sender_pk: PublicKey,
     open_keys: Keys,
     owner: DeviceId,
-    incoming: tokio_mpsc::Receiver<Event>,
+    /// The drainer's receive end, behind a mutex so the supervisor can swap
+    /// in a fresh channel when it respawns a dead drainer. `recv` only ever
+    /// needs it for a non-blocking `try_recv`; the guard is never held
+    /// across an await.
+    incoming: Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
+    health: Arc<SupervisorState>,
+    /// Relay count registered at construction, for [`MailboxHealth`]. The
+    /// set never changes after `connect`, so this needs no synchronization.
+    total_relays: usize,
     /// Handovers taken from the relay and not yet acked, in pull order.
     /// `recv` prefers new mail and otherwise rotates this deque
     /// front-to-back, re-offering each delivery under its stable id.
@@ -241,13 +336,29 @@ where
             .into_iter()
             .map(|relay| relay.as_ref().to_owned())
             .collect::<Vec<_>>();
+        let total_relays = relay_urls.len();
         let owner_tag = owner_pk.to_string();
+        let filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_P, owner_tag);
         let client_for_setup = Arc::clone(&client);
+        let health = Arc::new(SupervisorState {
+            stream_alive: AtomicBool::new(true),
+            connected_relays: AtomicUsize::new(0),
+        });
+        // Listen before subscribing: the drainer must be polled past its
+        // broadcast subscription before the REQ whose replay it has to
+        // catch is sent (establish awaits the drainer's readiness), or
+        // relay history racing the subscription is lost to the void.
+        let incoming = Arc::new(std::sync::Mutex::new(
+            runtime.block_on(establish_drainer(&client, &health)),
+        ));
         // Registration is local (no I/O per relay); `connect` dials every
         // registered relay concurrently, and nostr-sdk re-establishes
         // subscriptions on reconnects. With no relays there is nothing to
         // dial (nostr-sdk refuses an empty `connect`), and the mailbox
         // stays constructible for offline boundary use.
+        let setup_filter = filter.clone();
         runtime.block_on(async move {
             for relay in relay_urls {
                 client_for_setup
@@ -260,11 +371,7 @@ where
             }
             client_for_setup.connect().await;
             client_for_setup
-                .subscribe(
-                    Filter::new()
-                        .kind(Kind::GiftWrap)
-                        .custom_tag(nostr::filter::SingleLetterTag::LOWERCASE_P, owner_tag),
-                )
+                .subscribe(setup_filter)
                 .await
                 .map_err(|error| MailboxError::Transport(error.to_string()))?;
             Ok::<(), MailboxError>(())
@@ -272,18 +379,13 @@ where
 
         let seen = SeenStore::open(&seen_path)?;
 
-        let (sender, incoming) = tokio_mpsc::channel(INCOMING_CAPACITY);
-        let client_for_events = Arc::clone(&client);
-        runtime.spawn(async move {
-            let mut notifications = client_for_events.notifications();
-            while let Some(notification) = notifications.next().await {
-                if let ClientNotification::Event { event, .. } = notification {
-                    if sender.send(*event).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
+        runtime.spawn(supervise(
+            Arc::clone(&client),
+            filter,
+            Arc::clone(&incoming),
+            Arc::clone(&health),
+            total_relays,
+        ));
 
         Ok(Self {
             runtime,
@@ -293,6 +395,8 @@ where
             open_keys,
             owner,
             incoming,
+            health,
+            total_relays,
             unacked: VecDeque::new(),
             settled: HashSet::new(),
             next_delivery: 1,
@@ -300,10 +404,24 @@ where
         })
     }
 
+    /// Current relay attachment health for the daemon composer: a dead
+    /// mailbox reads `is_live() == false` instead of idling silently.
+    /// Lock-free; the supervisor refreshes it every tick, so it is
+    /// eventually consistent — right after construction or an outage it
+    /// can read stale for up to a tick, never a construction guarantee.
+    pub fn health(&self) -> MailboxHealth {
+        MailboxHealth {
+            stream_alive: self.health.stream_alive.load(Ordering::Relaxed),
+            connected_relays: self.health.connected_relays.load(Ordering::Relaxed),
+            total_relays: self.total_relays,
+        }
+    }
+
     /// Pull the next gift-wrap candidate event from the relay stream.
     fn next_wrap(&mut self) -> Option<Event> {
+        let mut incoming = self.incoming.lock().expect("mailbox channel lock");
         loop {
-            match self.incoming.try_recv() {
+            match incoming.try_recv() {
                 Ok(event) if event.kind == Kind::GiftWrap => return Some(event),
                 Ok(_) => continue,
                 Err(tokio_mpsc::error::TryRecvError::Empty) => return None,
@@ -347,6 +465,207 @@ where
 
     fn held_by_wrap(&self, wrap_id: &EventId) -> bool {
         self.unacked.iter().any(|held| &held.wrap_id == wrap_id)
+    }
+
+    /// Test-only drainer kill: abandon the incoming channel so the live
+    /// drainer's next forward fails and it exits through the production
+    /// stream-death path (flag set, supervisor observation, recovery).
+    /// Models a dead notification stream without shutting down the client,
+    /// which is terminal and unrecoverable by design. The caller must
+    /// publish after killing: a drainer parked on an idle stream has
+    /// nothing to fail on until the next event arrives.
+    #[cfg(test)]
+    fn kill_drainer(&mut self) {
+        let (_, fresh) = tokio_mpsc::channel(INCOMING_CAPACITY);
+        let mut incoming = self.incoming.lock().expect("mailbox channel lock");
+        let _abandoned = std::mem::replace(&mut *incoming, fresh);
+    }
+}
+
+/// Forward relay events into the mailbox channel. Signals readiness once
+/// subscribed to the broadcast, before forwarding anything: callers must
+/// await that signal before any subscribe whose replay this drainer has to
+/// catch. A dead stream (client shutdown) or a dropped mailbox ends the
+/// loop; stream death is recorded so the supervisor can rebuild the
+/// attachment.
+async fn drain_notifications(
+    client: Arc<Client>,
+    sender: tokio_mpsc::Sender<Event>,
+    health: Arc<SupervisorState>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut notifications = client.notifications();
+    // The broadcast subscription exists from this point: everything
+    // emitted afterwards is caught, so readiness is exact, not timed.
+    let _ = ready.send(());
+    while let Some(notification) = notifications.next().await {
+        // Both arms: `Event` fires only the first time the pool sees an
+        // event, while `Message` fires for every EVENT frame — including
+        // relay replay of already-seen history after a resubscribe on the
+        // same client. The mailbox needs the replay (abandoned-channel and
+        // never-pulled mail converge through it), so it listens to both;
+        // double forwarding collapses downstream in held/seen dedupe.
+        let event = match notification {
+            ClientNotification::Event { event, .. } => Some(event),
+            ClientNotification::Message { message, .. } => match *message {
+                RelayMessage::Event { event, .. } => Some(Box::new(event.into_owned())),
+                _ => None,
+            },
+            ClientNotification::Shutdown => None,
+        };
+        if let Some(event) = event {
+            if sender.send(*event).await.is_err() {
+                break;
+            }
+        }
+    }
+    health.stream_alive.store(false, Ordering::Relaxed);
+}
+
+/// Spawn a notification drainer over a fresh channel and wait until it is
+/// listening. `notifications()` only delivers events broadcast after it is
+/// called, so "spawned" is not a sufficient precondition for subscribing —
+/// the spawn has to be polled past the subscription, and this handshake
+/// makes that ordering airtight instead of timing-dependent. The expect
+/// cannot fire while the runtime is alive: the task sends readiness before
+/// its first fallible operation.
+async fn establish_drainer(
+    client: &Arc<Client>,
+    health: &Arc<SupervisorState>,
+) -> tokio_mpsc::Receiver<Event> {
+    let (sender, receiver) = tokio_mpsc::channel(INCOMING_CAPACITY);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(drain_notifications(
+        Arc::clone(client),
+        sender,
+        Arc::clone(health),
+        ready_tx,
+    ));
+    ready_rx.await.expect("drainer task outlived its spawn");
+    receiver
+}
+
+/// Count currently connected relays. The client notification stream never
+/// carries relay status, so health has to poll it.
+async fn connected_count(client: &Client) -> usize {
+    client
+        .relays()
+        .await
+        .values()
+        .filter(|relay| relay.status().is_connected())
+        .count()
+}
+
+/// Consecutive zero-connected ticks before the supervisor treats it as an
+/// outage and starts a recovery episode. A normal handshake completes in
+/// milliseconds, so this grace period keeps startup (and single-tick
+/// flaps) out of recovery without delaying real-outage response
+/// meaningfully.
+const OUTAGE_GRACE_TICKS: u32 = 3;
+
+/// Supervisor: poll relay statuses into shared health, and rebuild the
+/// attachment when it degrades. Two recovery paths: a dead notification
+/// stream (client-level failure) is re-driven with reconnect plus a fresh
+/// subscription and a respawned drainer; a sustained zero-connected state
+/// (relay outage) is re-driven with connect attempts paced by capped
+/// backoff, plus one fresh subscription on success. The supervisor never
+/// disconnects proactively: in nostr-sdk 0.45.3, disconnecting a relay
+/// with a connection attempt in flight strands its connection task (the
+/// spawn guard never clears), so re-driving always goes through `connect`,
+/// which is a no-op for relays whose task is already driving or retrying.
+/// Both paths never give up — the composer owns lifecycle. Relay replay
+/// after any resubscribe converges through the durable dedupe log, so
+/// extra subscriptions are idempotent.
+async fn supervise(
+    client: Arc<Client>,
+    filter: Filter,
+    incoming: Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
+    health: Arc<SupervisorState>,
+    total_relays: usize,
+) {
+    let mut tick = tokio::time::interval(SUPERVISOR_INTERVAL);
+    let mut down_ticks: u32 = 0;
+    loop {
+        tick.tick().await;
+        refresh(&client, &health).await;
+        // Offline mailbox: nothing to re-drive; health is stream-alive
+        // alone, and an empty client refuses connect/subscribe.
+        if total_relays == 0 {
+            continue;
+        }
+        if !health.stream_alive.load(Ordering::Relaxed) {
+            recover_stream(&client, &filter, &incoming, &health).await;
+            refresh(&client, &health).await;
+            down_ticks = 0;
+        }
+        if health.connected_relays.load(Ordering::Relaxed) == 0 {
+            down_ticks = down_ticks.saturating_add(1);
+        } else {
+            down_ticks = 0;
+        }
+        if down_ticks >= OUTAGE_GRACE_TICKS {
+            recover_relays(&client, &filter, &health).await;
+            refresh(&client, &health).await;
+            down_ticks = 0;
+        }
+    }
+}
+
+async fn refresh(client: &Client, health: &SupervisorState) {
+    health
+        .connected_relays
+        .store(connected_count(client).await, Ordering::Relaxed);
+}
+
+/// Client-level recovery: the notification stream died, so re-drive the
+/// client and hand the mailbox a fresh channel with a respawned drainer.
+/// The replacement drainer is established (listening) before the
+/// resubscribe whose replay it has to catch — reversing that order drops
+/// relay history into the broadcast void between REQ and listen.
+async fn recover_stream(
+    client: &Arc<Client>,
+    filter: &Filter,
+    incoming: &Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
+    health: &Arc<SupervisorState>,
+) {
+    let receiver = establish_drainer(client, health).await;
+    let mut attempt: u32 = 0;
+    loop {
+        client.connect().await;
+        match client.subscribe(filter.clone()).await {
+            Ok(_) => break,
+            Err(_) => {
+                tokio::time::sleep(recovery_delay(attempt)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+    // Swap without holding the lock across an await (`recv` only needs
+    // it for a non-blocking `try_recv`); undelivered events in the old
+    // channel are relay history and come back through the resubscribe.
+    *incoming.lock().expect("mailbox channel lock") = receiver;
+    health.stream_alive.store(true, Ordering::Relaxed);
+}
+
+/// Relay-level recovery: no relay has been connected for a sustained
+/// stretch, so ensure a connection task exists (`connect` is a no-op for
+/// relays whose task is already driving or retrying — the supervisor never
+/// disconnects, see above) and wait briefly for progress, backing off with
+/// a capped delay between attempts. On success, subscribe once to refresh
+/// relay-side subscription state; relay replay plus the durable dedupe log
+/// make the extra subscription idempotent.
+async fn recover_relays(client: &Arc<Client>, filter: &Filter, health: &Arc<SupervisorState>) {
+    let mut attempt: u32 = 0;
+    loop {
+        client.connect().and_wait(RECOVERY_ATTEMPT_TIMEOUT).await;
+        let connected = connected_count(client).await;
+        let recovered = connected > 0 && client.subscribe(filter.clone()).await.is_ok();
+        health.connected_relays.store(connected, Ordering::Relaxed);
+        if recovered {
+            return;
+        }
+        tokio::time::sleep(recovery_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -448,6 +767,11 @@ mod tests {
 
     const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
     const QUIET_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Disconnect detection is fast (TCP close); the wait is all margin.
+    const OUTAGE_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Recovery can ride the SDK's auto-reconnect retry (10s default), so
+    /// the wait is generous; supervisor-driven episodes converge faster.
+    const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn keys() -> Keys {
         Keys::generate()
@@ -501,6 +825,73 @@ mod tests {
 
     fn assert_quiet(mailbox: &mut LiveMailbox<Keys>) {
         assert!(wait_for_delivery(mailbox, QUIET_TIMEOUT).is_none());
+    }
+
+    /// Poll `health` until it reads the expected liveness (or time out):
+    /// relay attach and SDK reconnects are asynchronous, so tests observe
+    /// rather than assume.
+    fn wait_for_health(
+        mailbox: &LiveMailbox<Keys>,
+        live: bool,
+        timeout: Duration,
+    ) -> MailboxHealth {
+        let start = Instant::now();
+        loop {
+            let health = mailbox.health();
+            if health.is_live() == live {
+                return health;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "mailbox stayed {} (stream_alive={}, connected={}/{})",
+                if live { "down" } else { "live" },
+                health.stream_alive,
+                health.connected_relays,
+                health.total_relays,
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn recovery_backoff_doubles_to_a_thirty_second_cap() {
+        let delays = [
+            recovery_delay(0),
+            recovery_delay(1),
+            recovery_delay(2),
+            recovery_delay(3),
+            recovery_delay(4),
+            recovery_delay(5),
+            recovery_delay(6),
+            recovery_delay(u32::MAX),
+        ];
+        assert_eq!(
+            delays,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_mailbox_reports_live_without_relays() {
+        // No relays means offline boundary use: liveness is stream-alive
+        // alone, and a relay outage is not a state an offline mailbox can
+        // be in.
+        let open = keys();
+        let mailbox = offline_mailbox(&open);
+        let health = mailbox.health();
+        assert!(health.stream_alive);
+        assert_eq!(health.connected_relays, 0);
+        assert_eq!(health.total_relays, 0);
+        assert!(health.is_live());
     }
 
     #[test]
@@ -873,6 +1264,181 @@ mod tests {
             .settle(delivery.id(), Disposition::Ack)
             .expect("ack");
         // Both the garbage and the duplicate collapse: nothing further.
+        assert_quiet(&mut mailbox);
+    }
+
+    /// Relay outage and reboot: killing the relay surfaces as an unhealthy
+    /// mailbox (not a silently idle one), and restarting on the same URL
+    /// resumes delivery — the relay replays history on resubscribe, and the
+    /// durable dedupe log collapses the replay to nothing new.
+    ///
+    /// Recovery pacing belongs to the SDK's auto-reconnect (10s default
+    /// retry), so the recovery leg waits generously.
+    #[test]
+    fn relay_outage_marks_down_and_recovery_redelivers() {
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+        let seen = temp_path("seen-outage");
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen);
+        // One delivery settled before the outage: its wrap id is durable.
+        {
+            let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-outage-sender"));
+            outbox
+                .send(envelope(device_id(&sender), device_id(&receiver), "before"))
+                .expect("send before");
+        }
+        let before = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("before arrives");
+        mailbox.settle(before.id(), Disposition::Ack).expect("ack");
+        wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+
+        // Kill the relay: the SDK connection dies and health goes down.
+        relay.shutdown();
+        let down = wait_for_health(&mailbox, false, OUTAGE_TIMEOUT);
+        assert_eq!(down.connected_relays, 0, "outage leaves no relay up");
+
+        // Restart on the same URL: the SDK reconnects and resubscribes,
+        // the relay replays the acked wrap, and dedupe collapses it.
+        relay.restart();
+        wait_for_health(&mailbox, true, RECOVERY_TIMEOUT);
+        assert_quiet(&mut mailbox);
+
+        // New mail flows again after the outage.
+        {
+            let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-outage-sender-2"));
+            outbox
+                .send(envelope(device_id(&sender), device_id(&receiver), "after"))
+                .expect("send after");
+        }
+        let after = wait_for_delivery(&mut mailbox, RECOVERY_TIMEOUT).expect("delivery resumes");
+        assert_eq!(after.envelope().ciphertext, "after");
+        mailbox.settle(after.id(), Disposition::Ack).expect("ack");
+        assert_quiet(&mut mailbox);
+    }
+
+    /// Stream-death recovery without losing unacked or in-flight mail.
+    /// The drainer is killed for real (its channel abandoned, so its next
+    /// forward fails and it exits through the production death path) and
+    /// the supervisor runs the genuine recovery: the replacement drainer
+    /// listens before the resubscribe whose replay it has to catch, so
+    /// relay history converges into the new channel instead of the
+    /// broadcast void. One held (unacked) delivery keeps its stable id, a
+    /// backlog abandoned in the old channel is recovered through replay,
+    /// and mail published after the kill arrives exactly once. The relay
+    /// stays up throughout, so this runs without SDK-retry pacing.
+    #[test]
+    fn unacked_and_mid_recovery_mail_survive_stream_recovery() {
+        const BACKLOG: usize = 20;
+
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+
+        let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-stream-recovery"));
+        let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-stream-recovery-sender"));
+
+        // One delivery taken and held (unacked): its id must survive.
+        outbox
+            .send(envelope(device_id(&sender), device_id(&receiver), "held"))
+            .expect("send held");
+        let held = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("held arrives");
+        let held_id = held.id();
+
+        // A backlog that sits queued behind it, never recvd.
+        for index in 0..BACKLOG {
+            outbox
+                .send(envelope(
+                    device_id(&sender),
+                    device_id(&receiver),
+                    &format!("queued-{index}"),
+                ))
+                .expect("send queued");
+        }
+
+        // Kill the drainer for real: abandoning its channel makes its next
+        // forward fail, so it exits through the production stream-death
+        // path (flag set by its own code, observed by the supervisor on
+        // the next tick). The kill needs a subsequent event to trip on,
+        // so the mid-recovery mail doubles as the tripwire: published
+        // after the death, before recovery can complete, it must arrive
+        // exactly once.
+        mailbox.kill_drainer();
+        outbox
+            .send(envelope(device_id(&sender), device_id(&receiver), "during"))
+            .expect("send during");
+
+        // `recv` prefers new mail, so the replayed backlog drains before
+        // the held delivery rotates back; every payload arrives exactly
+        // once (held/seen collapse any live-plus-replay double delivery).
+        let mut payloads = std::collections::HashSet::new();
+        let mut held_found = false;
+        while payloads.len() < BACKLOG + 1 || !held_found {
+            let delivery =
+                wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("recovery delivers");
+            if delivery.id() == held_id {
+                assert_eq!(delivery.envelope().ciphertext, "held");
+                held_found = true;
+            } else {
+                assert!(
+                    payloads.insert(delivery.envelope().ciphertext.clone()),
+                    "no duplicate deliveries across recovery"
+                );
+            }
+            mailbox
+                .settle(delivery.id(), Disposition::Ack)
+                .expect("ack");
+        }
+        assert!(held_found, "held delivery re-offered under its id");
+        assert_eq!(payloads.len(), BACKLOG + 1);
+        assert!(payloads.contains("during"), "mid-recovery mail arrives");
+        assert_quiet(&mut mailbox);
+    }
+
+    /// Degraded, not down: with two relays and one killed, the mailbox
+    /// stays live on the survivor and delivery flows — no recovery episode
+    /// fires while at least one relay is connected.
+    #[test]
+    fn single_relay_outage_leaves_mailbox_live_on_survivor() {
+        let relay_a = MiniRelay::spawn();
+        let relay_b = MiniRelay::spawn();
+        let relays = vec![relay_a.url().to_string(), relay_b.url().to_string()];
+        let sender = sender_keys();
+        let receiver = keys();
+
+        let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-degraded"));
+        wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+
+        relay_b.shutdown();
+        let start = Instant::now();
+        loop {
+            let health = mailbox.health();
+            if health.connected_relays == 1 && health.total_relays == 2 {
+                break;
+            }
+            assert!(start.elapsed() < OUTAGE_TIMEOUT, "survivor reported");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(mailbox.health().is_live(), "one survivor is live");
+
+        let mut outbox = live_mailbox(&sender, &relays[..1], temp_path("seen-degraded-sender"));
+        outbox
+            .send(envelope(
+                device_id(&sender),
+                device_id(&receiver),
+                "via-survivor",
+            ))
+            .expect("send via survivor");
+        let delivery =
+            wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("delivers via survivor");
+        assert_eq!(delivery.envelope().ciphertext, "via-survivor");
+        mailbox
+            .settle(delivery.id(), Disposition::Ack)
+            .expect("ack");
         assert_quiet(&mut mailbox);
     }
 

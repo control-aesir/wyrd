@@ -16,6 +16,7 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 /// Publisher/injector requests routed to the relay core task.
@@ -43,14 +44,52 @@ type Frames = mpsc::UnboundedSender<Message>;
 type Subs = Arc<Mutex<HashMap<(u64, String), (Frames, Filter)>>>;
 type Store = Arc<Mutex<Vec<Event>>>;
 
+/// Task handles for one serving episode. Aborting them kills the listener
+/// loop, the core loop, and every open connection; the bound socket and
+/// the event store live outside, so a later restart serves the same URL
+/// with the same history — a faithful relay outage and reboot.
+struct Serving {
+    commands: mpsc::UnboundedSender<Command>,
+    accept: JoinHandle<()>,
+    core: JoinHandle<()>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+fn abort_serving(serving: Serving) {
+    serving.accept.abort();
+    serving.core.abort();
+    if let Ok(mut connections) = serving.connections.lock() {
+        for conn in connections.drain(..) {
+            conn.abort();
+        }
+    }
+}
+
 /// A tiny websocket relay bound to a random localhost port. Dropping it
-/// tears down the listener and all sessions.
+/// tears down the listener and all sessions; [`shutdown`](Self::shutdown)
+/// stops serving while keeping the socket bound (and the history stored)
+/// so [`restart`](Self::restart) resumes on the same URL.
 pub(crate) struct MiniRelay {
     url: String,
-    commands: mpsc::UnboundedSender<Command>,
-    /// Declared last so the runtime (and with it the accept and core
-    /// tasks) drops last.
-    _runtime: Runtime,
+    listener: Arc<TcpListener>,
+    store: Store,
+    subs: Subs,
+    serving: Mutex<Option<Serving>>,
+    /// Declared last so the runtime (and with it any serving tasks)
+    /// drops last.
+    runtime: Runtime,
+}
+
+impl Drop for MiniRelay {
+    fn drop(&mut self) {
+        // Best-effort: the runtime drop would abort these anyway, but an
+        // explicit abort keeps a mid-flight shutdown deterministic.
+        if let Ok(mut serving) = self.serving.lock() {
+            if let Some(episode) = serving.take() {
+                abort_serving(episode);
+            }
+        }
+    }
 }
 
 impl MiniRelay {
@@ -67,19 +106,57 @@ impl MiniRelay {
         });
         let url = format!("ws://{}", listener.local_addr().expect("local addr"));
 
-        let (commands, core) = mpsc::unbounded_channel::<Command>();
         let store: Store = Arc::new(Mutex::new(Vec::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
 
-        let listener = Arc::new(listener);
-        runtime.spawn(accept_loop(listener, commands.clone()));
-        runtime.spawn(core_loop(core, Arc::clone(&store), Arc::clone(&subs)));
-
-        Self {
+        let relay = Self {
             url,
-            commands,
-            _runtime: runtime,
+            listener: Arc::new(listener),
+            store,
+            subs,
+            serving: Mutex::new(None),
+            runtime,
+        };
+        relay.restart();
+        relay
+    }
+
+    /// Stop serving: abort the accept loop, the core loop, and every open
+    /// connection. Connected clients observe a hard disconnect; the bound
+    /// socket and the stored history survive for a later [`restart`](Self::restart).
+    pub(crate) fn shutdown(&self) {
+        if let Ok(mut serving) = self.serving.lock() {
+            if let Some(episode) = serving.take() {
+                abort_serving(episode);
+            }
         }
+    }
+
+    /// Serve again on the same URL with the same history. Pre-outage
+    /// subscriptions reference dead connections, so they are cleared —
+    /// clients must re-REQ exactly as after a real relay reboot, and the
+    /// replay they get exercises the consumer's dedupe.
+    pub(crate) fn restart(&self) {
+        self.shutdown();
+        self.subs.lock().expect("subs lock").clear();
+        let (commands, core) = mpsc::unbounded_channel::<Command>();
+        let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let accept = self.runtime.spawn(accept_loop(
+            Arc::clone(&self.listener),
+            commands.clone(),
+            Arc::clone(&connections),
+        ));
+        let core = self.runtime.spawn(core_loop(
+            core,
+            Arc::clone(&self.store),
+            Arc::clone(&self.subs),
+        ));
+        *self.serving.lock().expect("relay lock") = Some(Serving {
+            commands,
+            accept,
+            core,
+            connections,
+        });
     }
 
     /// The relay's websocket URL.
@@ -88,9 +165,15 @@ impl MiniRelay {
     }
 
     /// Store and broadcast an event without a publishing client; no
-    /// signature checks, so tests can inject garbage frames.
+    /// signature checks, so tests can inject garbage frames. Panics while
+    /// the relay is shut down — tests only ever inject into a serving relay.
     pub(crate) fn inject(&self, event: Event) {
-        self.commands
+        self.serving
+            .lock()
+            .expect("relay lock")
+            .as_ref()
+            .expect("relay serving")
+            .commands
             .send(Command::Inject(event))
             .expect("relay core alive");
     }
@@ -99,6 +182,7 @@ impl MiniRelay {
 async fn accept_loop(
     listener: std::sync::Arc<TcpListener>,
     commands: mpsc::UnboundedSender<Command>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) {
     let mut next_conn: u64 = 0;
     loop {
@@ -108,7 +192,11 @@ async fn accept_loop(
         next_conn += 1;
         let conn = next_conn;
         let commands = commands.clone();
-        tokio::spawn(handle_connection(stream, commands, conn));
+        let handle = tokio::spawn(handle_connection(stream, commands, conn));
+        if let Ok(mut connections) = connections.lock() {
+            connections.retain(|handle| !handle.is_finished());
+            connections.push(handle);
+        }
     }
 }
 
@@ -119,65 +207,89 @@ async fn handle_connection(stream: TcpStream, commands: mpsc::UnboundedSender<Co
     };
     let (mut sink, mut source) = websocket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if sink.send(frame).await.is_err() {
-                return;
-            }
-        }
-    });
-
-    while let Some(Ok(message)) = source.next().await {
-        let Message::Text(text) = message else {
-            // Answer protocol-level pings; ignore everything else.
-            if let Message::Ping(payload) = message {
-                let _ = tx.send(Message::Pong(payload));
-            }
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let Some(frame) = value.as_array() else {
-            continue;
-        };
-        match frame.first().and_then(|tag| tag.as_str()) {
-            Some("EVENT") if frame.len() == 2 => {
-                let Ok(event) = serde_json::from_value::<Event>(frame[1].clone()) else {
-                    let _ = tx.send(Message::text(json!(["NOTICE", "bad event"]).to_string()));
-                    continue;
+    // One task drives the socket and the outbound queue together, so
+    // aborting the connection task always closes the socket: a split-off
+    // writer task would survive the abort and hold the connection
+    // half-open, hiding the outage from the client.
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                let Some(frame) = frame else {
+                    return;
                 };
-                let _ = commands.send(Command::Publish {
-                    event,
-                    reply: tx.clone(),
-                });
-            }
-            Some("REQ") if frame.len() == 3 => {
-                let (Some(sub_id), Ok(filter)) = (
-                    frame[1].as_str().map(str::to_owned),
-                    serde_json::from_value::<Filter>(frame[2].clone()),
-                ) else {
-                    continue;
-                };
-                let _ = commands.send(Command::Req {
-                    conn,
-                    sub_id,
-                    filter,
-                    tx: tx.clone(),
-                });
-            }
-            Some("CLOSE") if frame.len() == 2 => {
-                if let Some(sub_id) = frame[1].as_str() {
-                    let _ = commands.send(Command::Close {
-                        conn,
-                        sub_id: sub_id.to_string(),
-                    });
+                if sink.send(frame).await.is_err() {
+                    return;
                 }
             }
-            _ => {}
+            message = source.next() => {
+                if !handle_message(message, &commands, &tx, conn) {
+                    return;
+                }
+            }
         }
     }
-    writer.abort();
+}
+
+/// Handle one inbound websocket frame. Returns false when the connection
+/// is over and the task should exit (closing the socket).
+fn handle_message(
+    message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    commands: &mpsc::UnboundedSender<Command>,
+    tx: &mpsc::UnboundedSender<Message>,
+    conn: u64,
+) -> bool {
+    let Some(Ok(message)) = message else {
+        return false;
+    };
+    let Message::Text(text) = message else {
+        // Answer protocol-level pings; ignore everything else.
+        if let Message::Ping(payload) = message {
+            let _ = tx.send(Message::Pong(payload));
+        }
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return true;
+    };
+    let Some(frame) = value.as_array() else {
+        return true;
+    };
+    match frame.first().and_then(|tag| tag.as_str()) {
+        Some("EVENT") if frame.len() == 2 => {
+            let Ok(event) = serde_json::from_value::<Event>(frame[1].clone()) else {
+                let _ = tx.send(Message::text(json!(["NOTICE", "bad event"]).to_string()));
+                return true;
+            };
+            let _ = commands.send(Command::Publish {
+                event,
+                reply: tx.clone(),
+            });
+        }
+        Some("REQ") if frame.len() == 3 => {
+            let (Some(sub_id), Ok(filter)) = (
+                frame[1].as_str().map(str::to_owned),
+                serde_json::from_value::<Filter>(frame[2].clone()),
+            ) else {
+                return true;
+            };
+            let _ = commands.send(Command::Req {
+                conn,
+                sub_id,
+                filter,
+                tx: tx.clone(),
+            });
+        }
+        Some("CLOSE") if frame.len() == 2 => {
+            if let Some(sub_id) = frame[1].as_str() {
+                let _ = commands.send(Command::Close {
+                    conn,
+                    sub_id: sub_id.to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 async fn core_loop(mut core: mpsc::UnboundedReceiver<Command>, store: Store, subs: Subs) {

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use wyrd_format::membership::Admission;
 use wyrd_format::{
-    Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, Manifest,
+    BaoRoot, Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, Manifest,
     MembershipTransition, ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
@@ -408,6 +408,9 @@ pub(crate) fn publish_into(
         tree: ContentId::from_bytes([0xC1; 32]),
         manifest: child_id,
         storage: sealed_child.storage_id(),
+        // The child envelope's transport root, computed from its bytes
+        // (decision 26) — recomputed exactly as the authoring path does.
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_child.encode()).as_bytes()),
     };
     let root = Manifest {
         snapshot,

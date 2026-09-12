@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::PathBuf};
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{
-    Change, ContentId, DeviceId, DriveId, Manifest, ManifestEntry, MembershipTransition,
+    BaoRoot, Change, ContentId, DeviceId, DriveId, Manifest, ManifestEntry, MembershipTransition,
     ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
@@ -118,6 +118,7 @@ fn manifest_record() -> ManifestRecord {
             storage_id: StorageId::from_bytes([0xA0; 32]),
             encryption_epoch: 1,
             size: 123,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         }],
         children: vec![],
     };

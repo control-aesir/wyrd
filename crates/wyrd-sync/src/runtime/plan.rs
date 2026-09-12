@@ -197,8 +197,8 @@ mod tests {
 
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, SharedStore,
-        Snapshot, SnapshotId, StorageId,
+        BaoRoot, ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind,
+        SharedStore, Snapshot, SnapshotId, StorageId,
     };
 
     use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -889,6 +889,7 @@ mod tests {
             storage_id: bad_storage,
             encryption_epoch: 2,
             size: plaintext.len() as u64,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         let snapshot_a = body.snapshot_id();
         // A second authored snapshot carrying the healthy representation:

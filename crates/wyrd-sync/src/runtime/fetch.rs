@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use wyrd_format::{
-    ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectKind, ObjectStore,
-    Snapshot, SnapshotId, StorageId,
+    BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectKind,
+    ObjectStore, Snapshot, SnapshotId, StorageId,
 };
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
@@ -211,6 +211,7 @@ pub(super) fn object(
             storage_id: candidate.storage_id,
             encryption_epoch: candidate.encryption_epoch,
             size: candidate.size,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         let sealed = match bulk.fetch_sealed(&candidate.storage_id, Limits::V0.max_object_bytes) {
             Ok(Some(sealed)) => sealed,
@@ -390,6 +391,7 @@ mod tests {
             storage_id: bad_storage,
             encryption_epoch: 2,
             size: plaintext.len() as u64,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         let snapshot_a = body_a.snapshot_id();
         // A second authored snapshot carrying the healthy representation:
@@ -664,6 +666,7 @@ mod tests {
             storage_id: bad_storage,
             encryption_epoch: 2,
             size: plaintext.len() as u64,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         let good_snapshot = body.snapshot_id();
         let good_key = epoch_secret.manifest_key(&drive, 2, &good_snapshot);

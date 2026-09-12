@@ -384,6 +384,7 @@ impl RuntimeState {
 mod tests {
     use super::*;
     use crate::control::SnapshotAnnouncement;
+    use wyrd_format::BaoRoot;
 
     fn drive() -> DriveId {
         DriveId::from_bytes([0xEE; 32])
@@ -415,6 +416,7 @@ mod tests {
             storage_id,
             encryption_epoch: 1,
             size: 123,
+            transport: BaoRoot::from_bytes([0xB0; 32]),
         };
         ManifestRecord {
             is_root,
@@ -427,6 +429,7 @@ mod tests {
                     tree: ContentId::from_bytes([child; 32]),
                     manifest: ContentId::from_bytes([child + 1; 32]),
                     storage: StorageId::from_bytes([child + 2; 32]),
+                    transport: BaoRoot::from_bytes([0xB1; 32]),
                 }],
             },
         }

@@ -196,7 +196,7 @@ where
                     .iter()
                     .next()
                     .copied()
-                    .ok_or_else(|| EngineError::RepresentationMissing(child.manifest_id))?;
+                    .ok_or(EngineError::RepresentationMissing(child.manifest_id))?;
                 links.push(ChildManifest {
                     tree: *subtree,
                     manifest: child.manifest_id,

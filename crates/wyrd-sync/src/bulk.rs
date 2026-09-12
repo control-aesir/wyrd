@@ -193,12 +193,12 @@ impl IrohBulkSource {
     }
 
     /// Publish the transport address for a representation by its Bao
-    /// root (object-model.md decision 26): the fetch address the
-    /// announcement and manifest mappings name. The caller derives
-    /// `root` from the representation's own bytes at wiring time — the
-    /// map never asserts the pairing, the verified transfer does.
-    pub fn publish_transport(&mut self, root: BaoRoot, blob: IrohBlobRef) {
-        self.transport.insert(root, blob);
+    /// root (object-model.md decision 26): the root is derived from the
+    /// blob's own hash — the verified-transfer identity and the fetch
+    /// address are the same value by construction, so a mapping cannot
+    /// name unrelated bytes.
+    pub fn publish_transport(&mut self, blob: IrohBlobRef) {
+        self.transport.insert(BaoRoot::from_bytes(blob.hash), blob);
     }
 
     /// Close the owned endpoint after all in-flight transfers have finished.
@@ -669,6 +669,65 @@ mod tests {
         assert_eq!(
             source.fetch_sealed(&storage, usize::MAX).unwrap(),
             Some(b"verified over iroh".to_vec())
+        );
+
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
+        source.shutdown();
+    }
+
+    #[test]
+    fn iroh_source_serves_transport_roots() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(b"verified over transport").await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+
+        let provider = direct_addr(&server);
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+        // The map key derives from the blob's own hash: the address the
+        // publisher hands out is exactly what the transfer verifies
+        // against, so a root/blob mismatch cannot be registered.
+        source.publish_transport(IrohBlobRef {
+            provider,
+            hash: *hash.as_bytes(),
+        });
+        let root = BaoRoot::from_bytes(*hash.as_bytes());
+        assert_eq!(
+            source.fetch_transport(&root, usize::MAX).unwrap(),
+            Some(b"verified over transport".to_vec())
+        );
+        assert_eq!(
+            source
+                .fetch_transport(&BaoRoot::from_bytes([0x99; 32]), usize::MAX)
+                .unwrap(),
+            None,
+            "a root no blob was published under names nothing"
         );
 
         runtime.block_on(async {

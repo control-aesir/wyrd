@@ -73,15 +73,17 @@ pub(super) fn root(
             content_id: announcement.root_manifest,
             sealed: bytes,
         }),
-        Ok(None) => match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
-            Ok(served) => served,
-            // Oversize representations are invalid remote data, not
-            // transport trouble: the boundary classified them already.
-            Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-            Err(_) => return FetchOutcome::Transport,
-        },
+        // Absence and a dead transport route both fall back to the eager
+        // exchange; oversize is representation-terminal (see
+        // fetch_representation).
+        Ok(None) | Err(BulkError::Transport(_)) => {
+            match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
+                Ok(served) => served,
+                Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+                Err(_) => return FetchOutcome::Transport,
+            }
+        }
         Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-        Err(_) => return FetchOutcome::Transport,
     };
     let Some(served) = served else {
         return FetchOutcome::Missing;
@@ -109,9 +111,10 @@ pub(super) fn snapshot_body(
         Some(announcement) => {
             match bulk.fetch_transport(&announcement.body_root, Limits::V0.max_object_bytes) {
                 Ok(Some(bytes)) => Some(bytes),
-                Ok(None) => None,
+                // Absence and a dead transport route both fall back to the
+                // snapshot address; oversize is representation-terminal.
+                Ok(None) | Err(BulkError::Transport(_)) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-                Err(_) => return FetchOutcome::Transport,
             }
         }
         None => None,
@@ -175,21 +178,26 @@ pub(super) fn child(
     }
 }
 
-/// Fetch one representation preferring its transport root and falling
-/// back to the vault-visible storage address. The two are the same bytes
-/// under two addresses (decision 26); the transport root wins when the
-/// transport map holds it because it is the author-signed routing
-/// column. Errors propagate from whichever fetch ran — the boundary's
-/// classification is authoritative, and the storage fallback only
-/// covers absence.
+/// Fetch one representation over its two routes, which name the same
+/// bytes (decision 26): the transport root first, the vault-visible
+/// storage address second. Absence and a dead or stale transport route
+/// both fall back — the transport root is author-attested routing
+/// metadata, never an availability guarantee (`docs/fetch-on-open.md`).
+/// Oversize is representation-terminal: both routes carry the same
+/// bytes, so no route can succeed after it, and the classification
+/// propagates. Errors from the fallback propagate unchanged, so the
+/// boundary's classification stays authoritative.
 fn fetch_representation(
     bulk: &mut impl BulkSource,
     transport: &BaoRoot,
     storage: &StorageId,
 ) -> Result<Option<Vec<u8>>, BulkError> {
-    match bulk.fetch_transport(transport, Limits::V0.max_object_bytes)? {
-        Some(bytes) => Ok(Some(bytes)),
-        None => bulk.fetch_sealed(storage, Limits::V0.max_object_bytes),
+    match bulk.fetch_transport(transport, Limits::V0.max_object_bytes) {
+        Ok(Some(bytes)) => Ok(Some(bytes)),
+        Ok(None) | Err(BulkError::Transport(_)) => {
+            bulk.fetch_sealed(storage, Limits::V0.max_object_bytes)
+        }
+        Err(oversize @ BulkError::Oversize { .. }) => Err(oversize),
     }
 }
 
@@ -417,7 +425,7 @@ mod tests {
     use crate::runtime::test_util::{
         admit_engine, announcement_msg, announcement_msg_with, body_root, capability_message,
         deliver, drain, fixture, identity_secret, intake_snapshot, publish_into, queue,
-        transition_message, Fixture, TransportOnly, WithoutObjects,
+        transition_message, Fixture, TransportFault, TransportOnly, WithoutObjects,
     };
 
     /// A hostile peer on the storage route only: the transport map stays
@@ -431,6 +439,79 @@ mod tests {
             hidden_transport: BTreeSet::from([transport]),
         }
     }
+
+    #[test]
+    fn dead_transport_route_falls_back_to_the_storage_route() {
+        // The transport root is author-attested routing metadata, not an
+        // availability guarantee: every transport fetch fails here, and
+        // the plan still converges over the vault-visible routes (root
+        // manifest by eager exchange, body by snapshot address, child
+        // manifest and object by their storage addresses).
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = admit_engine(&mut builder, device);
+        let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+        let mut inner = MemoryBulkSource::default();
+        let body = intake_snapshot(
+            &mut fixture,
+            &mut inner,
+            &builder,
+            &genesis,
+            &admission,
+            vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        );
+        let published = publish_into(
+            &mut inner,
+            &epoch_secret,
+            admission.epoch,
+            &epoch_secret,
+            admission.epoch,
+            body.snapshot_id(),
+            b"fallback hello",
+        );
+        let mut bulk = TransportFault {
+            inner,
+            error: BulkError::Transport("injected dead route".to_string()),
+        };
+        let mut objects = MemoryObjectStore::default();
+        fixture
+            .engine
+            .set_materialization(published.content, MaterializationState::Pinned)
+            .unwrap();
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        assert_eq!(report.snapshot_bodies, 1);
+        assert_eq!(report.manifests, 2, "root plus child, over the fallback");
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.unfulfilled, 0);
+        assert_eq!(
+            objects.get(&published.content).unwrap().as_deref(),
+            Some(b"fallback hello".as_slice())
+        );
+    }
+
+    #[test]
+    fn oversize_transport_response_is_representation_terminal() {
+        // Oversize is a property of the representation's bytes, not the
+        // route: both routes name the same envelope, so an oversize
+        // transport response classifies the representation invalid
+        // without a storage fallback that could only fail the same way.
+        let mut peer = TransportFault {
+            inner: MemoryBulkSource::default(),
+            error: BulkError::Oversize { bytes: 65, max: 64 },
+        };
+        let storage = StorageId::from_bytes([0x7C; 32]);
+        peer.inner.publish_sealed(storage, vec![0x42; 40]);
+        assert_eq!(
+            fetch_representation(&mut peer, &BaoRoot::from_bytes([0xEE; 32]), &storage),
+            Err(BulkError::Oversize { bytes: 65, max: 64 }),
+            "the healthy storage route is not tried after an oversize transport response"
+        );
+    }
+
     use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
     use wyrd_format::{Manifest, MemoryObjectStore, ObjectKind};
 

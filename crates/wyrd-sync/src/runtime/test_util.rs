@@ -500,6 +500,48 @@ pub(crate) fn body_root(body: &Snapshot) -> BaoRoot {
 /// the planner consumed the author-signed roots.
 pub(crate) struct TransportOnly(pub(crate) MemoryBulkSource);
 
+/// A bulk peer whose transport route fails with an injected error: the
+/// eager routes delegate untouched, so a successful fetch proves the
+/// documented storage fallback operates on transport failure.
+pub(crate) struct TransportFault {
+    pub(crate) inner: MemoryBulkSource,
+    pub(crate) error: BulkError,
+}
+
+impl BulkSource for TransportFault {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        _root: &BaoRoot,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        Err(self.error.clone())
+    }
+}
+
 impl BulkSource for TransportOnly {
     fn fetch_root_manifest(
         &mut self,

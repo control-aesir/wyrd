@@ -2389,6 +2389,106 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The stale-handle matrix over namespace changes: rename, unlink,
+    /// and a kind change each make an open writable handle's next commit
+    /// fail `EIO` with no snapshot, and the failure is terminal.
+    #[test]
+    fn stale_writable_handle_after_namespace_change() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        // Rename under an open handle.
+        let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"AAAA").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+        let renamed = backend.open_write("a.txt", libc::O_RDWR).unwrap();
+        backend.rename_at(1, "a.txt", 1, "b.txt", false).unwrap();
+        backend.write_handle(renamed, 0, b"BB").unwrap();
+        assert_eq!(backend.commit_handle(renamed), Err(fuser::Errno::EIO));
+        // Terminal: a later operation is EIO too.
+        assert_eq!(
+            backend.write_handle(renamed, 0, b"C"),
+            Err(fuser::Errno::EIO)
+        );
+        backend.release_handle(renamed).unwrap();
+
+        // Unlink under an open handle.
+        let unlinked = backend.open_write("b.txt", libc::O_RDWR).unwrap();
+        backend.unlink_at(1, "b.txt").unwrap();
+        backend.write_handle(unlinked, 0, b"X").unwrap();
+        assert_eq!(backend.commit_handle(unlinked), Err(fuser::Errno::EIO));
+        backend.release_handle(unlinked).unwrap();
+
+        // Kind change under an open handle.
+        let (fh, _ino, _) = backend.create_at(1, "c.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"data").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+        let kind = backend.open_write("c.txt", libc::O_RDWR).unwrap();
+        backend.unlink_at(1, "c.txt").unwrap();
+        backend.mkdir_at(1, "c.txt").unwrap();
+        backend.write_handle(kind, 0, b"X").unwrap();
+        assert_eq!(backend.commit_handle(kind), Err(fuser::Errno::EIO));
+        backend.release_handle(kind).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The dirty-handle budget bounds the mounted surface: the 65th
+    /// dirty handle's write is `ENOSPC`, and releasing one frees a slot.
+    #[test]
+    fn dirty_handle_budget_refuses_through_the_mount() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, _ino, _) = backend.create_at(1, "d.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"x").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..crate::session::MAX_DIRTY_HANDLES {
+            let handle = backend.open_write("d.txt", libc::O_RDWR).unwrap();
+            backend.write_handle(handle, 1, b"y").unwrap();
+            handles.push(handle);
+        }
+        let overflow = backend.open_write("d.txt", libc::O_RDWR).unwrap();
+        assert_eq!(
+            backend.write_handle(overflow, 1, b"z"),
+            Err(fuser::Errno::ENOSPC),
+            "one dirty handle past the bound is refused"
+        );
+        backend.release_handle(overflow).unwrap();
+
+        let freed = handles.pop().unwrap();
+        backend.release_handle(freed).unwrap();
+        let reused = backend.open_write("d.txt", libc::O_RDWR).unwrap();
+        assert!(backend.write_handle(reused, 1, b"w").is_ok());
+        for handle in handles {
+            backend.release_handle(handle).unwrap();
+        }
+        backend.release_handle(reused).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Concurrent readers never observe a half-published projection:
     /// every cloned generation serves its own complete snapshot while
     /// the loop publishes around them. Readers pin whatever generation

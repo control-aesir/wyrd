@@ -142,6 +142,13 @@ where
 /// into its own descendant is `InvalidRename`; identical paths are a
 /// no-op returning the input root unchanged. Destination parents resolve
 /// strictly (no intermediate creation).
+///
+/// A single trailing slash is significant on either operand (anything else
+/// non-canonical still fails in `parse_path`): a trailing-slash source
+/// names a directory, so it is `InvalidRename` on a file or symlink; a
+/// trailing-slash destination must resolve to an existing directory, so it
+/// is `NotFound` when absent and `NotADirectory` on a file or symlink.
+/// The FUSE adapter relies on this rather than pre-stripping slashes.
 pub fn rename<S: ObjectStore>(
     store: &mut S,
     root: ContentId,
@@ -151,8 +158,18 @@ pub fn rename<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
+    let (from, from_slash) = split_trailing_slash(from);
+    let (to, to_slash) = split_trailing_slash(to);
     let from_components = parse_path(from)?;
     let to_components = parse_path(to)?;
+    let tree = load_tree(store, &root)?;
+    let source = resolve_entry(store, &tree, &from_components)?;
+    let source_is_dir = matches!(source.content, EntryContent::Dir { .. });
+    if from_slash && !source_is_dir {
+        return Err(MutationError::InvalidRename(format!(
+            "{from:?} has a trailing slash but is not a directory"
+        )));
+    }
     if from_components == to_components {
         return Ok(root);
     }
@@ -163,8 +180,23 @@ where
             "{to:?} is inside {from:?}"
         )));
     }
-    let tree = load_tree(store, &root)?;
-    let source = resolve_entry(store, &tree, &from_components)?;
+    if to_slash {
+        match resolve_entry(store, &tree, &to_components)? {
+            Entry {
+                content: EntryContent::Dir { .. },
+                ..
+            } => {}
+            _ => {
+                return Err(MutationError::NotADirectory(
+                    to_components
+                        .last()
+                        .expect("path components are non-empty")
+                        .as_str()
+                        .to_string(),
+                ));
+            }
+        }
+    }
     let moved = Entry {
         name: to_components
             .last()
@@ -172,10 +204,20 @@ where
             .clone(),
         content: source.content.clone(),
     };
-    let source_is_dir = matches!(source.content, EntryContent::Dir { .. });
     let without_source = remove_node(store, tree, &from_components)?;
     let dest_tree = load_tree(store, &without_source)?;
     rename_insert(store, dest_tree, &to_components, moved, source_is_dir)
+}
+
+/// Split one trailing `/` off a rename operand, preserving the intent
+/// `parse_path` would otherwise reject as an empty component. Only a
+/// single trailing slash is special: doubled separators anywhere
+/// (including the tail, like `a//`) still fail in `parse_path`.
+fn split_trailing_slash(path: &str) -> (&str, bool) {
+    match path.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() && !stripped.ends_with('/') => (stripped, true),
+        _ => (path, false),
+    }
 }
 
 fn parse_path(path: &str) -> Result<Vec<Component>, PathError> {
@@ -963,6 +1005,201 @@ mod tests {
             resolve(&store, root, "s"),
             Err(MutationError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn rename_trailing_slash_source_requires_a_directory() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = mkdir(&mut store, root, "d").unwrap();
+        let root = put(&mut store, root, "f", file("f", b"x")).unwrap();
+        let root = put(
+            &mut store,
+            root,
+            "s",
+            Entry::symlink("s", "target").unwrap(),
+        )
+        .unwrap();
+
+        // A directory source moves identically with or without the slash.
+        let moved = rename(&mut store, root, "d/", "e").unwrap();
+        assert!(matches!(
+            resolve(&store, moved, "e"),
+            Ok(EntryContent::Dir { .. })
+        ));
+
+        // A trailing slash on a file or symlink is refused, not resolved.
+        assert!(matches!(
+            rename(&mut store, root, "f/", "g"),
+            Err(MutationError::InvalidRename(_))
+        ));
+        assert!(matches!(
+            rename(&mut store, root, "s/", "g"),
+            Err(MutationError::InvalidRename(_))
+        ));
+        // Even a self-rename with a slash validates the source kind.
+        assert!(matches!(
+            rename(&mut store, root, "f/", "f"),
+            Err(MutationError::InvalidRename(_))
+        ));
+    }
+
+    #[test]
+    fn rename_trailing_slash_destination_requires_a_directory() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = mkdir(&mut store, root, "d").unwrap();
+        let root = mkdir(&mut store, root, "e").unwrap();
+        let root = put(&mut store, root, "f", file("f", b"x")).unwrap();
+
+        // Directory onto an empty directory with a slash replaces.
+        let root = rename(&mut store, root, "d", "e/").unwrap();
+        assert!(matches!(
+            resolve(&store, root, "e"),
+            Ok(EntryContent::Dir { .. })
+        ));
+
+        // A slashed destination that is absent or not a directory fails.
+        assert!(matches!(
+            rename(&mut store, root, "e", "absent/"),
+            Err(MutationError::NotFound(_))
+        ));
+        assert!(matches!(
+            rename(&mut store, root, "e", "f/"),
+            Err(MutationError::NotADirectory(_))
+        ));
+        // A file source onto a slashed directory is still a directory clash.
+        assert!(matches!(
+            rename(&mut store, root, "f", "e/"),
+            Err(MutationError::IsDirectory(_))
+        ));
+        // Doubled separators are not a trailing slash; they stay invalid.
+        assert!(matches!(
+            rename(&mut store, root, "e", "e//"),
+            Err(MutationError::Path(_))
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_non_canonical_paths_on_either_operand() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(&mut store, root, "a", file("a", b"x")).unwrap();
+        for (from, to) in [
+            ("", "b"),
+            ("a", ""),
+            ("/a", "b"),
+            ("a", "/b"),
+            ("a//b", "c"),
+            ("a", "b//c"),
+            ("a/./b", "c"),
+            ("a", "."),
+            ("a/../b", "c"),
+            ("a", ".."),
+        ] {
+            assert!(
+                matches!(
+                    rename(&mut store, root, from, to),
+                    Err(MutationError::Path(_))
+                ),
+                "{from:?} -> {to:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_through_a_file_parent_is_not_a_directory() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(&mut store, root, "f", file("f", b"x")).unwrap();
+        let root = put(&mut store, root, "g", file("g", b"y")).unwrap();
+        assert!(matches!(
+            rename(&mut store, root, "g", "f/deep"),
+            Err(MutationError::NotADirectory(_))
+        ));
+        assert!(matches!(
+            rename(&mut store, root, "f/deep", "g"),
+            Err(MutationError::NotADirectory(_))
+        ));
+    }
+
+    #[test]
+    fn rename_replaces_symlinks_in_both_directions() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(&mut store, root, "f", file("f", b"x")).unwrap();
+        let root = put(
+            &mut store,
+            root,
+            "s",
+            Entry::symlink("s", "target").unwrap(),
+        )
+        .unwrap();
+        let root = mkdir(&mut store, root, "d").unwrap();
+
+        // File onto symlink and symlink onto file both replace.
+        let root = rename(&mut store, root, "f", "s").unwrap();
+        assert!(matches!(
+            resolve(&store, root, "s"),
+            Ok(EntryContent::File { .. })
+        ));
+        let root = put(&mut store, root, "t", Entry::symlink("t", "other").unwrap()).unwrap();
+        let root = rename(&mut store, root, "t", "s").unwrap();
+        match resolve(&store, root, "s").unwrap() {
+            EntryContent::Symlink { target } => assert_eq!(target, "other"),
+            other => panic!("expected symlink, got {other:?}"),
+        }
+
+        // Symlink onto a directory is a directory clash either way.
+        let root = put(
+            &mut store,
+            root,
+            "u",
+            Entry::symlink("u", "target").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            rename(&mut store, root, "u", "d"),
+            Err(MutationError::IsDirectory(_))
+        ));
+        assert!(matches!(
+            rename(&mut store, root, "d", "u"),
+            Err(MutationError::NotADirectory(_))
+        ));
+    }
+
+    #[test]
+    fn failed_renames_leave_the_root_untouched() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        let root = put(&mut store, root, "f", file("f", b"x")).unwrap();
+        let root = mkdir(&mut store, root, "d").unwrap();
+        let root = put(&mut store, root, "d/k", file("k", b"k")).unwrap();
+
+        // Every failure returns no root; the input root keeps resolving.
+        for (from, to) in [
+            ("absent", "f"),
+            ("f", "d"),
+            ("d", "f"),
+            ("d", "d/sub"),
+            ("f/", "g"),
+            ("f", "absent/deep"),
+        ] {
+            assert!(
+                rename(&mut store, root, from, to).is_err(),
+                "{from:?} -> {to:?} must fail"
+            );
+        }
+        assert!(matches!(
+            resolve(&store, root, "f"),
+            Ok(EntryContent::File { .. })
+        ));
+        assert!(matches!(
+            resolve(&store, root, "d/k"),
+            Ok(EntryContent::File { .. })
+        ));
+        let bytes = store.get(&root).unwrap().unwrap();
+        assert_eq!(Tree::decode(&bytes).unwrap().content_id(), root);
     }
 
     #[test]

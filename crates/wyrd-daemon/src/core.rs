@@ -2407,7 +2407,13 @@ mod tests {
         let renamed = backend.open_write("a.txt", libc::O_RDWR).unwrap();
         backend.rename_at(1, "a.txt", 1, "b.txt", false).unwrap();
         backend.write_handle(renamed, 0, b"BB").unwrap();
+        let before = backend.generation().unwrap();
         assert_eq!(backend.commit_handle(renamed), Err(fuser::Errno::EIO));
+        assert_eq!(
+            backend.generation().unwrap(),
+            before,
+            "a stale commit authors no snapshot"
+        );
         // Terminal: a later operation is EIO too.
         assert_eq!(
             backend.write_handle(renamed, 0, b"C"),

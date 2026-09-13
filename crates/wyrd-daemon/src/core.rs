@@ -27,6 +27,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::fuse::FuseBackend;
+use crate::projection::Projection;
 use crate::want::WantRegistry;
 
 /// The daemon's bridge from `wyrd-sync`'s verified snapshots to the
@@ -301,28 +302,36 @@ where
     }
 
     /// Split the composed daemon for live serving: the engine and the
-    /// view stay with the sync loop while the backend half moves into
-    /// the FUSE session thread. Both halves share one view lock for
-    /// heads and facts, plus one store handle for bytes: intake and
-    /// fetch mutate durable state and the store with no view lock
-    /// held, and each pass publishes heads and facts under one short
-    /// write lock — serving never observes a half-published
-    /// projection and never stalls on bulk I/O.
+    /// store stay with the sync loop while the backend half moves into
+    /// the FUSE session thread. Both halves share one projection slot
+    /// plus one store handle for bytes: intake and fetch mutate durable
+    /// state and the store with no publication lock held, and each pass
+    /// publishes a whole new generation under one short write lock —
+    /// serving never observes a half-published projection and never
+    /// stalls on bulk I/O. The composer's synchronously refreshed view
+    /// is adopted as the baseline generation, so the backend never
+    /// serves an empty view while the engine already has heads.
     pub fn into_live(
         self,
         open_timeout: Duration,
     ) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
+        let revision = self.engine.current();
         let store = self.view.store_handle();
-        let view = Arc::new(RwLock::new(self.view));
+        let baseline = Projection::initial(self.view, revision);
+        let projection = Arc::new(RwLock::new(Arc::new(baseline)));
         let wants = Arc::new(WantRegistry::default());
-        let backend =
-            FuseBackend::shared_with_wants(Arc::clone(&view), Arc::clone(&wants), open_timeout);
+        let backend = FuseBackend::shared_with_wants(
+            Arc::clone(&projection),
+            Arc::clone(&wants),
+            open_timeout,
+        );
         (
             LiveDaemon {
                 engine: self.engine,
                 store,
-                view,
+                projection,
                 wants,
+                published_revision: revision,
                 dirty: false,
             },
             backend,
@@ -345,7 +354,8 @@ pub enum LiveError {
 
 /// What one [`LiveDaemon::sync_once`] pass did: the intake report plus
 /// the fetch report (`Default` — all zeros — when no bulk source was
-/// provided and nothing could be fetched).
+/// provided and nothing could be fetched), plus whether the pass
+/// published a new serving generation.
 pub struct SyncReport {
     /// Control-plane intake: accepted, duplicates, deferred, skipped,
     /// discarded.
@@ -353,6 +363,11 @@ pub struct SyncReport {
     /// Fetch execution: manifests, snapshot bodies, objects committed,
     /// and items still unfulfilled for the next pass.
     pub fetched: ExecuteReport,
+    /// Whether the pass published a new projection generation.
+    pub published: bool,
+    /// The served generation after the pass (bumped exactly when
+    /// `published`).
+    pub generation: u64,
 }
 
 /// How far a [`LiveDaemon::run_loop`] run got before stopping or
@@ -394,27 +409,52 @@ impl Default for LiveConfig {
     }
 }
 
-/// A live-mounted drive: the engine plus the view shared with the
-/// serving backend. The sync loop owns this value; the FUSE session
-/// thread owns the backend half from [`Daemon::into_live`]. Intake and
-/// fetch touch only the engine, the durable store, and the shared
-/// store handle — never the view lock — so bulk I/O never stalls
-/// serving; the final publication swaps heads and facts under one
-/// short write lock that serving threads only ever take for reading.
+/// A live-mounted drive: the engine plus the published projection the
+/// serving backend reads. The sync loop owns this value; the FUSE
+/// session thread owns the backend half from [`Daemon::into_live`].
+/// Intake and fetch touch only the engine, the durable store, and the
+/// shared store handle — never the publication lock — so bulk I/O
+/// never stalls serving; publication swaps in a whole new immutable
+/// generation under a short write lock that serving threads only ever
+/// take to clone the current [`Arc`](std::sync::Arc).
+///
+/// Concurrency: the loop is the single writer (it owns `&mut self`),
+/// backend threads are readers. Readers hold cloned generations, so a
+/// slow reader pins its own complete snapshot without blocking the
+/// next publication — staleness is bounded by the poll interval, and
+/// each generation is internally consistent by construction.
+///
+/// Crash ordering: durable commits stand independently of publication
+/// (fetch and intake are restart-safe; the store's CURRENT marker is
+/// the source of truth, read back on reopen). A pass that fails after
+/// committing leaves serving on the previous generation and marks the
+/// daemon dirty, so the next pass republishes even with zero new
+/// changes. A panic during publication poisons the slot and serving
+/// fails closed (EIO), exactly like the old view-lock discipline.
 pub struct LiveDaemon<S: ObjectStore> {
     engine: Engine,
     /// The object store handle shared with the serving view: fetch
-    /// writes bytes through this without taking the view lock.
+    /// writes bytes through this without taking the publication lock.
     store: Arc<RwLock<S>>,
-    view: Arc<RwLock<DriveView<S, DaemonMaterialization>>>,
+    /// The published serving generations, shared with the backend.
+    /// The loop replaces the whole [`Arc`](std::sync::Arc) on every
+    /// publish; it never mutates a published value.
+    projection: Arc<RwLock<Arc<Projection<S, DaemonMaterialization>>>>,
     /// FUSE demand: the backend registers wants, the loop admits them
     /// into the engine each pass and lets completion surface through
-    /// the view. The registry's lock is its own (never the view's or
-    /// the store's).
+    /// the view. The registry's lock is its own (never the
+    /// publication's or the store's).
     wants: Arc<WantRegistry>,
+    /// The durable revision the served generation was built from. The
+    /// loop publishes exactly when the engine's sequence has advanced
+    /// past this — every fact commit advances the sequence and empty
+    /// passes do not, so the gate is complete by construction: no
+    /// report-counter predicate to keep in sync with future commit
+    /// paths.
+    published_revision: u64,
     /// Durable state may have changed without a republication (a pass
     /// failed after committing): the next pass republishes regardless
-    /// of its own counters, so recovery never waits for new changes.
+    /// of the revision gate, so recovery never waits for new changes.
     dirty: bool,
 }
 
@@ -434,24 +474,25 @@ where
 
     /// One supervised pass: drain the mailbox into the engine, run a
     /// bounded fetch plan when a bulk source is present, then publish
-    /// refreshed materialization facts and live heads into the shared
-    /// view. Fetch runs through a [`SharedStore`](wyrd_format::SharedStore)
-    /// over the same handle the backend serves from: each verified
-    /// import locks only for its own write, so bulk reads and
-    /// verification never stall serving. Only the final publication
-    /// swaps heads and facts under a short view write lock. A pass
-    /// with no durable change and no backlog from a failed pass skips
-    /// republication: the projection derives solely from durable
-    /// state, so an unchanged store means an unchanged projection and
-    /// the idle loop stays cheap.
+    /// a new serving generation when durable state advanced. Fetch
+    /// runs through a [`SharedStore`](wyrd_format::SharedStore) over
+    /// the same handle the backend serves from: each verified import
+    /// locks only for its own write, so bulk reads and verification
+    /// never stall serving. Only the final publication takes the
+    /// publication lock, and only to swap in a whole new generation.
+    /// A pass with no durable change and no backlog from a failed pass
+    /// publishes nothing: the projection derives solely from durable
+    /// state keyed by its commit sequence, so an unchanged revision
+    /// means a provably identical projection and the idle loop stays
+    /// cheap (no head re-derivation, no re-verification).
     ///
     /// Publication is atomic; the pass is not: a failed pass leaves
-    /// the serving projection untouched, but durable commits made
+    /// the serving generation untouched, but durable commits made
     /// before the failure stand (fetch and intake are designed
     /// restart-safe, so the next pass reconciles rather than
     /// re-doing them). Any failure marks the daemon dirty, forcing
-    /// republication on the next pass even if that pass reports zero
-    /// new changes.
+    /// republication on the next pass even if the durable revision has
+    /// not advanced since.
     pub fn sync_once<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
@@ -478,11 +519,10 @@ where
         // identities are marked admitted, so a failing commit leaves
         // the rest pending for the next pass and no waiter ever
         // coalesces onto an unadmitted fetch.
-        let committed = admit_wants(&self.wants, &mut |want| {
+        admit_wants(&self.wants, &mut |want| {
             self.engine
                 .set_materialization(want, MaterializationState::Cached)
         })?;
-        let wants_admitted = !committed.is_empty();
         let fetched = match bulk {
             Some(bulk) => {
                 // Route publication precedes every pass: routes come
@@ -508,19 +548,63 @@ where
         self.wants.retire_where(|content, waiters| {
             completed_runtime.status(content) == FetchStatus::Available || waiters == 0
         });
-        if !self.dirty && !wants_admitted && !sync_changed(&drained, &fetched) {
-            return Ok(SyncReport { drained, fetched });
-        }
-        let heads = view_heads(self.engine.live_heads()?);
-        {
-            let mut view = self.view.write().map_err(|_| LiveError::Lock)?;
-            view.set_materialization(DaemonMaterialization {
-                runtime: completed_runtime,
+        // The publication gate is the durable commit sequence, not the
+        // pass reports: every fact commit this pass (intake, want
+        // admission, fetch) advanced it, and empty passes leave it
+        // untouched. The dirty backlog covers the one case the sequence
+        // cannot see — a failed pass that committed before failing.
+        let revision = self.engine.current();
+        let generation = self.generation();
+        if !self.dirty && revision == self.published_revision {
+            return Ok(SyncReport {
+                drained,
+                fetched,
+                published: false,
+                generation,
             });
-            view.set_heads(heads);
         }
+        let next = Projection::new(
+            Arc::clone(&self.store),
+            DaemonMaterialization {
+                runtime: completed_runtime,
+            },
+            view_heads(self.engine.live_heads()?),
+            generation + 1,
+            revision,
+        );
+        {
+            let mut slot = self.projection.write().map_err(|_| LiveError::Lock)?;
+            *slot = Arc::new(next);
+        }
+        self.published_revision = revision;
         self.dirty = false;
-        Ok(SyncReport { drained, fetched })
+        Ok(SyncReport {
+            drained,
+            fetched,
+            published: true,
+            generation: generation + 1,
+        })
+    }
+
+    /// The served generation count. Bumps exactly when a pass
+    /// publishes; lets supervisors and tests observe publication
+    /// without touching the serving path.
+    pub fn generation(&self) -> u64 {
+        self.projection
+            .read()
+            .map(|slot| slot.generation())
+            .unwrap_or(0)
+    }
+
+    /// A shared borrow of the current published generation: the
+    /// read-side handle for supervisors and tests. Serving backends
+    /// hold the same slot through the FUSE adapter. Poison fails
+    /// closed like every other lock failure on this path.
+    pub fn projection(&self) -> Result<Arc<Projection<S, DaemonMaterialization>>, LiveError> {
+        self.projection
+            .read()
+            .map(|slot| Arc::clone(&slot))
+            .map_err(|_| LiveError::Lock)
     }
 
     /// Drive sync passes until `stop` is set: poll on `interval`,
@@ -577,33 +661,15 @@ where
     }
 }
 
-/// Whether a pass changed durable state: an accepted or duplicate
-/// ingest can commit (duplicates resolve held engine messages), as can
-/// any fetch commit. Skipped, discarded, and unfulfilled items commit
-/// nothing. With no durable change the serving projection is provably
-/// identical, so republication is skipped and the idle loop stays
-/// cheap (no durable rebuild, no re-verification, no view churn).
-///
-/// Report-to-durability contract: if a future report field ever
-/// records a durable commit, it must be added to this predicate —
-/// otherwise a real change skips publication and the view goes stale.
-/// (The dirty backlog only covers failures, never silent successes.)
-fn sync_changed(drained: &DrainReport, fetched: &ExecuteReport) -> bool {
-    drained.accepted > 0
-        || drained.duplicates > 0
-        || fetched.manifests > 0
-        || fetched.snapshot_bodies > 0
-        || fetched.objects > 0
-}
-
 /// Persist pending wants into durable `Cached` materialization,
 /// atomically from the registry's perspective: each identity's fact is
 /// written first, and only the committed prefix is marked admitted. A
 /// failing commit leaves the failing identity and everything after it
 /// pending — the next pass retries them, and no waiter ever coalesces
-/// onto a fetch that was never admitted. Returns the committed
-/// identities (which feed the publication gate: a committed fact
-/// changes the serving projection even when nothing else did).
+/// onto a fetch that was never admitted. Admission commits advance the
+/// engine's durable sequence, which is what the publication gate
+/// observes — the returned identities are for callers that need the
+/// admitted set itself.
 fn admit_wants<E>(
     registry: &WantRegistry,
     commit: &mut dyn FnMut(ContentId) -> Result<(), E>,
@@ -1022,12 +1088,15 @@ mod tests {
         }
     }
 
-    /// The live handoff shares one view: a file projected before the
-    /// split is served by the backend after it, and an idle sync pass
-    /// disturbs nothing. This is the structural half of "announced
-    /// after mount becomes visible": the engine's intake and
-    /// classification are covered by the sync and contract suites; here
-    /// the composition (shared lock, undisturbed serving) is pinned.
+    /// The live handoff publishes a baseline generation: a file
+    /// projected before the split is served by the backend after it —
+    /// before any sync pass runs — and an idle sync pass publishes
+    /// nothing (same durable revision, so the projection is provably
+    /// identical and the idle loop stays cheap). This is the structural
+    /// half of "announced after mount becomes visible": the engine's
+    /// intake and classification are covered by the sync and contract
+    /// suites; here the composition (shared slot, undisturbed serving)
+    /// is pinned.
     #[test]
     fn into_live_shares_view_with_backend() {
         let (engine, dir, _) = scratch_drive();
@@ -1035,12 +1104,20 @@ mod tests {
         daemon.put_file("live.txt", b"shared").unwrap();
 
         let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+        assert_eq!(live.generation(), 0, "the split publishes baseline zero");
+        // The baseline serves before any pass runs: no empty window.
+        let early = backend.open_at("live.txt").expect("baseline serves");
+        assert_eq!(backend.read_handle(early, 0, 1024).unwrap(), b"shared");
+
         let mut mailbox = NoopMailbox;
         let report = live
             .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
             .unwrap();
         assert_eq!(report.drained.accepted, 0, "idle drain commits nothing");
         assert_eq!(report.fetched.unfulfilled, 0, "nothing pending to fetch");
+        assert!(!report.published, "an unchanged revision publishes nothing");
+        assert_eq!(report.generation, 0, "idle passes disturb nothing");
+        assert_eq!(backend.generation().unwrap(), 0);
 
         let handle = backend.open_at("live.txt").expect("backend serves");
         let bytes = backend.read_handle(handle, 0, 1024).expect("backend reads");
@@ -1051,23 +1128,103 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The dirty backlog is the one case the revision gate cannot see:
+    /// a pass that failed after committing leaves serving behind, so
+    /// the next pass republishes even with zero new changes. Forced
+    /// directly here (the `sync_once` wrapper sets it on any pass
+    /// error); the recovery path, not the failure injection, is what
+    /// this pins.
+    #[test]
+    fn dirty_backlog_republishes_without_new_changes() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("dirty.txt", b"pending").unwrap();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+        live.dirty = true;
+
+        let report = live
+            .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+        assert!(report.published, "the backlog forces republication");
+        assert_eq!(report.generation, 1);
+        assert!(!live.dirty, "republication clears the backlog");
+
+        // A further idle pass is quiet again.
+        let quiet = live
+            .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+        assert!(!quiet.published);
+        assert_eq!(quiet.generation, 1);
+
+        let handle = backend.open_at("dirty.txt").expect("backend serves");
+        assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"pending");
+
+        drop(live);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Concurrent readers never observe a half-published projection:
+    /// every cloned generation serves its own complete snapshot while
+    /// the loop publishes around them. Readers pin whatever generation
+    /// is current when they clone; each pinned version keeps serving
+    /// its own bytes after newer generations land.
+    #[test]
+    fn concurrent_readers_see_atomic_generations() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("race.txt", b"v1").unwrap();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+
+        let pinned = live.projection().unwrap();
+        assert_eq!(pinned.generation(), 0);
+        let node = pinned.view().lookup("race.txt").unwrap();
+        let file = pinned.view().open(&node).unwrap();
+        assert_eq!(pinned.view().read(&file, 0, 64).unwrap(), b"v1");
+
+        // Publish around the pinned reader: the old generation stays
+        // complete and self-consistent throughout.
+        live.dirty = true;
+        let report = live
+            .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+        assert!(report.published);
+        assert_eq!(pinned.view().read(&file, 0, 64).unwrap(), b"v1");
+        assert_eq!(live.projection().unwrap().generation(), 1);
+
+        // The backend serves the new generation; the pin is unaffected.
+        let handle = backend.open_at("race.txt").expect("backend serves");
+        assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"v1");
+        assert_eq!(pinned.generation(), 0, "pins keep their version");
+
+        drop(live);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The reviewer's publication-gate regression: admitting a pending
     /// want is a durable commit (`Cached` fact) even when nothing else
     /// changed — the serving projection must republish so the view stops
-    /// reporting `RemoteOnly` for content the engine has admitted.
+    /// reporting `RemoteOnly` for content the engine has admitted. The
+    /// gate observes the durable commit sequence, not the pass reports,
+    /// so the admission's sequence advance is what forces publication.
     #[test]
     fn want_admission_publishes_without_other_changes() {
         let (engine, dir, _) = scratch_drive();
         let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
         daemon.put_file("anchor.txt", b"anchor").unwrap();
         let (mut live, _backend) = daemon.into_live(Duration::from_secs(30));
+        let baseline = live.generation();
 
         // Demand content nobody holds yet; no mailbox traffic, no bulk.
         let missing = ContentId::from_bytes([0xEE; 32]);
         live.wants.register(missing).unwrap();
-        live.sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+        let report = live
+            .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
             .unwrap();
-        let status = live.view.read().unwrap().status(&missing);
+        assert!(report.published, "the admission commit must publish");
+        assert_eq!(report.generation, baseline + 1);
+        let status = live.projection().unwrap().view().status(&missing);
         assert_eq!(
             status,
             FetchStatus::Fetching,

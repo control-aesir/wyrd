@@ -32,12 +32,13 @@ use std::collections::HashMap;
 
 use fuser::{FileHandle, INodeNo, LockOwner, OpenFlags};
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wyrd_format::ObjectStore;
-use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError, ViewHead};
+use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
+use crate::projection::Projection;
 use crate::want::{wait_for_materialization, WantRegistry};
 
 /// The attribute time-to-limit served to the kernel: short, since
@@ -110,17 +111,21 @@ impl InodeTable {
     }
 }
 
-/// The read-only FUSE backend over one drive's view. The view sits
-/// behind a lock so the engine can advance heads in place; open file
-/// descriptors never notice, because they serve their open-time
-/// capture. The lock is reference-counted so a live daemon loop can
-/// hold the same view the session serves: both sides take the lock,
-/// swap or read, and drop — never held across a kernel callback.
+/// The read-only FUSE backend over one drive's published projection. The
+/// projection sits behind a lock only as a publication mechanism: the
+/// loop swaps whole immutable generations, and each backend call clones
+/// the current [`Arc`](std::sync::Arc) and serves lock-free from it, so
+/// readers never observe a half-published projection and never block
+/// each other on view content. Open file descriptors never notice
+/// publication at all, because they serve their open-time capture. The
+/// lock is reference-counted so a live daemon loop can publish the same
+/// projection the session serves: both sides take the lock, swap or
+/// clone, and drop — never held across a kernel callback.
 pub struct FuseBackend<S: ObjectStore, M: Materialization>
 where
     S::Error: std::fmt::Debug,
 {
-    view: Arc<RwLock<DriveView<S, M>>>,
+    projection: Arc<RwLock<Arc<Projection<S, M>>>>,
     inodes: RwLock<InodeTable>,
     directories: RwLock<DirectoryState>,
     files: Mutex<OpenFiles>,
@@ -183,7 +188,7 @@ where
 {
     pub fn new(view: DriveView<S, M>) -> Self {
         FuseBackend {
-            view: Arc::new(RwLock::new(view)),
+            projection: Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),
@@ -198,13 +203,14 @@ where
         }
     }
 
-    /// Serve a view owned elsewhere (the live daemon loop's half): the
-    /// backend shares the lock rather than copying the view, so head and
-    /// materialization updates land without remounting. Each backend keeps
-    /// its own inode tables; construct once per session.
-    pub fn shared(view: Arc<RwLock<DriveView<S, M>>>) -> Self {
+    /// Serve a projection owned elsewhere (the live daemon loop's
+    /// published generation): the backend shares the publication lock
+    /// rather than copying the view, so new generations land without
+    /// remounting. Each backend keeps its own inode tables; construct
+    /// once per session.
+    pub fn shared(projection: Arc<RwLock<Arc<Projection<S, M>>>>) -> Self {
         FuseBackend {
-            view,
+            projection,
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),
@@ -219,16 +225,16 @@ where
         }
     }
 
-    /// The live daemon's half: the same view plus the demand registry,
-    /// so `open`/`read` on non-local content registers a want and
-    /// blocks bounded before failing.
+    /// The live daemon's half: the same published projection plus the
+    /// demand registry, so `open`/`read` on non-local content registers
+    /// a want and blocks bounded before failing.
     pub fn shared_with_wants(
-        view: Arc<RwLock<DriveView<S, M>>>,
+        projection: Arc<RwLock<Arc<Projection<S, M>>>>,
         wants: Arc<WantRegistry>,
         open_timeout: Duration,
     ) -> Self {
         FuseBackend {
-            view,
+            projection,
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),
@@ -243,23 +249,43 @@ where
         }
     }
 
-    /// Advance the head set in place. Open file descriptors keep
-    /// serving their open-time capture: they never consult heads
-    /// again. Only verified snapshots cross here — the composition
-    /// layer builds [`ViewHead`]s through the daemon's
-    /// `AuthorizedSnapshot` path.
-    pub fn set_heads(&self, heads: Vec<ViewHead>) -> Result<(), fuser::Errno> {
-        self.view
-            .write()
-            .map_err(|_| fuser::Errno::EIO)?
-            .set_heads(heads);
+    /// Publish a new generation over the given view: the caller's view
+    /// becomes the served generation (bumped by one, same durable
+    /// revision). Open file descriptors keep serving their open-time
+    /// capture: they never consult heads again. This is the
+    /// test/simulation publication path — the production loop
+    /// publishes through [`LiveDaemon`](crate::core::LiveDaemon), which
+    /// also advances the durable revision.
+    pub fn publish(&self, view: DriveView<S, M>) -> Result<(), fuser::Errno> {
+        let mut slot = self.projection.write().map_err(|_| fuser::Errno::EIO)?;
+        let next = Projection::successor(&slot, view);
+        *slot = Arc::new(next);
         Ok(())
     }
 
-    /// A shared borrow of the view. Poison maps to EIO like every
-    /// other lock failure.
-    fn view_guard(&self) -> Result<RwLockReadGuard<'_, DriveView<S, M>>, fuser::Errno> {
-        self.view.read().map_err(|_| fuser::Errno::EIO)
+    /// The shared store handle the served generations address: lets
+    /// callers build the next view to [`publish`](Self::publish).
+    pub fn store_handle(&self) -> Result<Arc<RwLock<S>>, fuser::Errno> {
+        let projection = self.projection()?;
+        Ok(projection.view().store_handle())
+    }
+
+    /// The served generation count. Bumps on every publication; lets
+    /// tests pin that idle passes disturb nothing.
+    pub fn generation(&self) -> Result<u64, fuser::Errno> {
+        Ok(self.projection()?.generation())
+    }
+
+    /// A shared borrow of the current published generation: the
+    /// [`Arc`](std::sync::Arc) is cloned under a short read lock and
+    /// served lock-free after the guard drops, so callers hold an
+    /// immutable snapshot, never the publication slot. Poison maps to
+    /// EIO like every other lock failure.
+    fn projection(&self) -> Result<Arc<Projection<S, M>>, fuser::Errno> {
+        self.projection
+            .read()
+            .map_err(|_| fuser::Errno::EIO)
+            .map(|guard| Arc::clone(&guard))
     }
 
     /// Open the file at `path`: the view's immutable file identity is
@@ -275,9 +301,10 @@ where
     pub fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
         let attempt = |this: &Self| {
             Result::<_, (ViewError, fuser::Errno)>::Ok({
-                let view = this
-                    .view_guard()
-                    .map_err(|error| (ViewError::Store("view lock".into()), error))?;
+                let projection = this
+                    .projection()
+                    .map_err(|error| (ViewError::Store("projection lock".into()), error))?;
+                let view = projection.view();
                 let node = view
                     .lookup(path)
                     .map_err(|error| (error.clone(), errno_of(&error)))?;
@@ -321,10 +348,12 @@ where
         };
         let attempt = |this: &Self| {
             Result::<Vec<u8>, (ViewError, fuser::Errno)>::Ok({
-                let view = this
-                    .view_guard()
-                    .map_err(|error| (ViewError::Store("view lock".into()), error))?;
-                view.read(&file, offset, size as usize)
+                let projection = this
+                    .projection()
+                    .map_err(|error| (ViewError::Store("projection lock".into()), error))?;
+                projection
+                    .view()
+                    .read(&file, offset, size as usize)
                     .map_err(|error| (error.clone(), errno_of(&error)))?
             })
         };
@@ -455,11 +484,11 @@ where
             }
         };
         let child_path = join(&parent_path, name);
-        let Ok(view) = self.view_guard() else {
+        let Ok(projection) = self.projection() else {
             reply.error(fuser::Errno::EIO);
             return;
         };
-        match view.lookup(&child_path) {
+        match projection.view().lookup(&child_path) {
             Ok(node) => {
                 let Ok(mut inodes) = self.inodes.write() else {
                     reply.error(fuser::Errno::EIO);
@@ -493,11 +522,11 @@ where
                 return;
             }
         };
-        let Ok(view) = self.view_guard() else {
+        let Ok(projection) = self.projection() else {
             reply.error(fuser::Errno::EIO);
             return;
         };
-        match view.lookup(&path) {
+        match projection.view().lookup(&path) {
             Ok(node) => {
                 let attr = self.attr(ino.0, &node);
                 reply.attr(&TTL, &attr);
@@ -548,18 +577,18 @@ where
                 return;
             }
         };
-        let Ok(view) = self.view_guard() else {
+        let Ok(projection) = self.projection() else {
             reply.error(fuser::Errno::EIO);
             return;
         };
-        let node = match view.lookup(&path) {
+        let node = match projection.view().lookup(&path) {
             Ok(node) => node,
             Err(error) => {
                 reply.error(errno_of(&error));
                 return;
             }
         };
-        let entries = match view.readdir(&node) {
+        let entries = match projection.view().readdir(&node) {
             Ok(entries) => entries,
             Err(error) => {
                 reply.error(errno_of(&error));
@@ -646,11 +675,11 @@ where
                 return;
             }
         };
-        let Ok(view) = self.view_guard() else {
+        let Ok(projection) = self.projection() else {
             reply.error(fuser::Errno::EIO);
             return;
         };
-        match symlink_target(&view, &path) {
+        match symlink_target(projection.view(), &path) {
             Ok(target) => reply.data(target.as_bytes()),
             Err(error) => reply.error(error),
         }
@@ -736,7 +765,7 @@ mod tests {
     use wyrd_format::{
         ContentId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, SharedStore, Snapshot, Tree,
     };
-    use wyrd_fuse::ViewError;
+    use wyrd_fuse::{ViewError, ViewHead};
 
     /// Test materialization: everything is remote-only. Local reads
     /// never consult it — the store answers from memory.
@@ -963,8 +992,15 @@ mod tests {
         let handle = backend.open_at("f.txt").unwrap();
         assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
 
-        // Heads advance underneath the open descriptor.
-        backend.set_heads(heads(vec![next])).unwrap();
+        // Heads advance underneath the open descriptor: publication
+        // installs a whole new generation.
+        backend
+            .publish(DriveView::shared(
+                backend.store_handle().unwrap(),
+                NoMaterialization,
+                heads(vec![next]),
+            ))
+            .unwrap();
         assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
         assert_eq!(backend.read_handle(handle, 1, 2).unwrap(), b"ir");
 
@@ -1026,7 +1062,7 @@ mod tests {
         );
         let registry = Arc::new(WantRegistry::default());
         let backend = FuseBackend::shared_with_wants(
-            Arc::new(RwLock::new(view)),
+            Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
             Arc::clone(&registry),
             open_timeout,
         );

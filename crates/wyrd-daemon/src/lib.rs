@@ -13,6 +13,7 @@
 pub mod core;
 pub mod fuse;
 pub mod live_mailbox;
+pub mod projection;
 pub mod want;
 
 /// Test-only minimal relay for live-mailbox integration tests.
@@ -20,4 +21,5 @@ pub mod want;
 pub(crate) mod mini_relay;
 
 pub use core::{Daemon, DaemonError, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};
+pub use projection::Projection;
 pub use want::{WantError, WantRegistry};

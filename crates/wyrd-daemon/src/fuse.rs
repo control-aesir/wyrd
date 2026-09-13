@@ -1342,6 +1342,24 @@ where
         if write.executable == executable && !write.dirty {
             return Ok(());
         }
+        // The commit path submits the buffered image; a clean handle has
+        // none, so materialize the captured content first or a
+        // metadata-only change would commit an empty file.
+        if write.image.is_none() {
+            let projected = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+            if self.budget.reserve(write.id, projected).is_err() {
+                return Err(fuser::Errno::ENOSPC);
+            }
+            let capture = write.capture.clone();
+            let len = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+            match self.read_via_capture(&capture, 0, u32::try_from(len).unwrap_or(u32::MAX)) {
+                Ok(image) => write.image = Some(image),
+                Err(error) => {
+                    self.budget.release(write.id);
+                    return Err(error);
+                }
+            }
+        }
         write.executable = executable;
         write.dirty = true;
         if write.sync {

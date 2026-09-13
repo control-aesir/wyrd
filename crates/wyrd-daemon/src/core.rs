@@ -2051,6 +2051,47 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A mode change through a clean writable handle must not lose the
+    /// file: the commit submits the buffered image, so the handle
+    /// materializes the captured content before going dirty.
+    #[test]
+    fn handle_mode_change_preserves_content() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, ino, _) = backend.create_at(1, "m.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"content").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+
+        // Clean handle: no writes, only an exec change.
+        let clean = backend.open_write("m.txt", libc::O_RDWR).unwrap();
+        backend
+            .setattr_attrs(ino, Some(clean), None, Some(0o755))
+            .unwrap();
+        backend.commit_handle(clean).unwrap();
+        backend.release_handle(clean).unwrap();
+
+        let read = backend.open_at("m.txt").unwrap();
+        assert_eq!(
+            backend.read_handle(read, 0, 64).unwrap(),
+            b"content",
+            "a mode-only change preserves file content"
+        );
+        backend.release_handle(read).unwrap();
+        assert_eq!(backend.attr_at("m.txt").unwrap().perm, 0o755);
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Concurrent readers never observe a half-published projection:
     /// every cloned generation serves its own complete snapshot while
     /// the loop publishes around them. Readers pin whatever generation

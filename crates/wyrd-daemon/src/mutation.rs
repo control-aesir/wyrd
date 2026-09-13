@@ -146,6 +146,10 @@ pub enum MutationError {
     /// commit performs no merge and authors no snapshot. POSIX `EIO`.
     #[error("stale handle for {0:?}: the path changed since it opened")]
     Stale(String),
+    /// The operation exceeds a representable or budgeted size. POSIX
+    /// `EFBIG`.
+    #[error("resulting size {0} exceeds the supported bound")]
+    TooLarge(u64),
     /// Object-store or tree access failed. POSIX `EIO`.
     #[error("object store failed")]
     Store,
@@ -187,11 +191,32 @@ pub enum MutationKind {
     /// op's namespace half). `EEXIST` when the name is taken.
     CreateFile { path: String },
     /// Commit a writable handle's full logical image onto the current
-    /// head, accepted only if the path still carries `base`.
+    /// head, accepted only if the path still carries `base`. `executable`
+    /// is the handle's buffered exec bit for the committed entry.
     CommitFile {
         path: String,
         base: FileIdentity,
+        executable: bool,
         content: Vec<u8>,
+    },
+    /// Remove the file or symlink at `path`; a directory is `EISDIR`.
+    Unlink { path: String },
+    /// Remove the empty directory at `path`.
+    Rmdir { path: String },
+    /// Move `from` to `to`. `no_replace` is `RENAME_NOREPLACE`.
+    Rename {
+        from: String,
+        to: String,
+        no_replace: bool,
+    },
+    /// One `setattr`: apply the requested size and/or exec change as a
+    /// single namespace mutation, publishing exactly one root or none.
+    /// `size` on a non-file is `EISDIR`; an exec change on a non-file is
+    /// a no-op. At least one field is set.
+    SetAttrs {
+        path: String,
+        size: Option<u64>,
+        executable: Option<bool>,
     },
 }
 

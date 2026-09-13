@@ -2,9 +2,10 @@
 //! [`DriveView`] over an inode table. Reads are served directly; writes
 //! are buffered in per-handle sessions and committed as snapshots
 //! through the daemon's mutation channel (see `docs/write-path.md`).
-//! Namespace operations not yet implemented — `unlink`, `rmdir`,
-//! `rename`, and `setattr` — fall through to `ENOSYS`; deliberately
-//! unsupported flags (`O_APPEND`, `O_DIRECT`, `O_PATH`) are
+//! Namespace operations (`mkdir`, `create`, `unlink`, `rmdir`,
+//! `rename`, `setattr`) are served; unsupported node types (`mknod`,
+//! `symlink`, `link`) fall through to `ENOSYS`, and deliberately
+//! unsupported open flags (`O_APPEND`, `O_DIRECT`, `O_PATH`) are
 //! `EOPNOTSUPP`.
 //!
 //! Error mapping happens only here, per `docs/sync-and-peers.md`:
@@ -128,6 +129,8 @@ struct WriteHandle {
     capture: OpenFile,
     /// The identity a commit must still find at `path`.
     base: FileIdentity,
+    /// The target exec bit for the next commit (buffered like content).
+    executable: bool,
     /// The dense logical image; `None` while clean.
     image: Option<Vec<u8>>,
     /// The image differs from `base` (or `O_TRUNC` started it empty), so
@@ -313,6 +316,7 @@ fn mutation_errno(error: &MutationError) -> fuser::Errno {
         MutationError::IsDirectory(_) => fuser::Errno::EISDIR,
         MutationError::AlreadyExists(_) => fuser::Errno::EEXIST,
         MutationError::DirectoryNotEmpty(_) => fuser::Errno::ENOTEMPTY,
+        MutationError::TooLarge(_) => fuser::Errno::EFBIG,
         MutationError::Conflicted { .. }
         | MutationError::Stale(_)
         | MutationError::Lock
@@ -764,10 +768,12 @@ where
         } else {
             (None, false)
         };
+        let executable = base.executable();
         let handle = WriteHandle {
             path: path.to_string(),
             capture,
             base,
+            executable,
             image,
             dirty,
             failed: false,
@@ -804,10 +810,12 @@ where
         };
         let capture = self.capture_for(&child_path)?;
         let id = self.budget.next_handle();
+        let executable = identity.executable();
         let handle = WriteHandle {
             path: child_path.clone(),
             capture,
             base: identity,
+            executable,
             image: None,
             dirty: false,
             failed: false,
@@ -955,10 +963,12 @@ where
         let outcome = mutations.submit(MutationKind::CommitFile {
             path,
             base,
+            executable: write.executable,
             content,
         });
         match outcome {
             Ok(MutationOutcome::Committed(identity)) => {
+                write.executable = identity.executable();
                 write.base = identity;
                 match self.capture_for(&write.path) {
                     Ok(capture) => {
@@ -1170,15 +1180,260 @@ where
     ) -> Result<(u64, fuser::FileAttr), fuser::Errno> {
         let parent_path = self.inode_path(parent_ino)?;
         let child_path = join(&parent_path, name);
-        let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
-        mutations
-            .submit(MutationKind::Mkdir {
-                path: child_path.clone(),
-            })
-            .map_err(|error| mutation_errno(&error))?;
+        self.submit(MutationKind::Mkdir {
+            path: child_path.clone(),
+        })?;
         let (ino, node, _) = self.resolve_inode(&child_path)?;
         let attr = self.attr(ino, &node);
         Ok((ino, attr))
+    }
+
+    /// Submit one mutation to the loop, mapping both channel and
+    /// application failures to the POSIX boundary.
+    fn submit(&self, kind: MutationKind) -> Result<MutationOutcome, fuser::Errno> {
+        self.mutations
+            .as_ref()
+            .ok_or(fuser::Errno::EROFS)?
+            .submit(kind)
+            .map_err(|error| mutation_errno(&error))
+    }
+
+    /// Remove the file or symlink `name` under `parent_ino`.
+    pub fn unlink_at(&self, parent_ino: u64, name: &str) -> Result<(), fuser::Errno> {
+        let path = join(&self.inode_path(parent_ino)?, name);
+        self.submit(MutationKind::Unlink { path })?;
+        Ok(())
+    }
+
+    /// Remove the empty directory `name` under `parent_ino`.
+    pub fn rmdir_at(&self, parent_ino: u64, name: &str) -> Result<(), fuser::Errno> {
+        let path = join(&self.inode_path(parent_ino)?, name);
+        self.submit(MutationKind::Rmdir { path })?;
+        Ok(())
+    }
+
+    /// Move `name` under `parent_ino` to `new_name` under `new_parent`.
+    pub fn rename_at(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        new_parent_ino: u64,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<(), fuser::Errno> {
+        let from = join(&self.inode_path(parent_ino)?, name);
+        let to = join(&self.inode_path(new_parent_ino)?, new_name);
+        self.submit(MutationKind::Rename {
+            from,
+            to,
+            no_replace,
+        })?;
+        Ok(())
+    }
+
+    /// Truncate/extend the file at `ino` to `size` (path-addressed
+    /// `setattr(size)`).
+    pub fn set_size_at(&self, ino: u64, size: u64) -> Result<(), fuser::Errno> {
+        let path = self.inode_path(ino)?;
+        self.submit(MutationKind::SetAttrs {
+            path,
+            size: Some(size),
+            executable: None,
+        })?;
+        Ok(())
+    }
+
+    /// Toggle the exec bit of the file at `ino` (path-addressed
+    /// `setattr(mode)`).
+    pub fn set_exec_at(&self, ino: u64, executable: bool) -> Result<(), fuser::Errno> {
+        let path = self.inode_path(ino)?;
+        self.submit(MutationKind::SetAttrs {
+            path,
+            size: None,
+            executable: Some(executable),
+        })?;
+        Ok(())
+    }
+
+    /// Apply one `setattr` carrying an optional size and/or exec change.
+    /// With no writable handle, both fields go in a single `SetAttrs`
+    /// mutation, so the syscall publishes exactly one snapshot. A size
+    /// through a writable handle truncates that handle's buffered image;
+    /// a size through a read-only handle is `EBADF`; a mode change is
+    /// always path-addressed. Combining size and mode through a writable
+    /// handle is refused (`EOPNOTSUPP`): the buffered image and a
+    /// path-addressed exec change cannot be one snapshot.
+    pub fn setattr_attrs(
+        &self,
+        ino: u64,
+        fh: Option<FileHandle>,
+        size: Option<u64>,
+        mode: Option<u32>,
+    ) -> Result<(), fuser::Errno> {
+        let path = self.inode_path(ino)?;
+        let executable = mode.map(|mode| mode & 0o111 != 0);
+        let handle = match fh {
+            Some(fh) => Some(self.handle_of(fh).map_err(|_| fuser::Errno::EBADF)?),
+            None => None,
+        };
+        match handle {
+            Some(Handle::Write(handle)) => {
+                if size.is_some() && executable.is_some() {
+                    return Err(fuser::Errno::EOPNOTSUPP);
+                }
+                if let Some(size) = size {
+                    self.truncate_handle_locked(&handle, &path, size)?;
+                }
+                if let Some(executable) = executable {
+                    self.set_exec_handle(&handle, &path, executable)?;
+                }
+                Ok(())
+            }
+            Some(Handle::Read(_)) => {
+                if size.is_some() {
+                    return Err(fuser::Errno::EBADF);
+                }
+                match executable {
+                    Some(executable) => self.submit(MutationKind::SetAttrs {
+                        path,
+                        size: None,
+                        executable: Some(executable),
+                    })?,
+                    None => return Ok(()),
+                };
+                Ok(())
+            }
+            None => {
+                if size.is_none() && executable.is_none() {
+                    return Ok(());
+                }
+                self.submit(MutationKind::SetAttrs {
+                    path,
+                    size,
+                    executable,
+                })?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve `path` and return its presentation attributes: the
+    /// read-side surface for tests and the `setattr` reply.
+    pub fn attr_at(&self, path: &str) -> Result<fuser::FileAttr, fuser::Errno> {
+        let (ino, node, _) = self.resolve_inode(path)?;
+        Ok(self.attr(ino, &node))
+    }
+
+    /// Toggle a writable handle's exec bit (buffered, committed with the
+    /// next boundary like content). The handle must name `path`.
+    fn set_exec_handle(
+        &self,
+        handle: &Arc<Mutex<WriteHandle>>,
+        path: &str,
+        executable: bool,
+    ) -> Result<(), fuser::Errno> {
+        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        if write.path != path {
+            return Err(fuser::Errno::EBADF);
+        }
+        if write.failed {
+            return Err(fuser::Errno::EIO);
+        }
+        if write.executable == executable && !write.dirty {
+            return Ok(());
+        }
+        // The commit path submits the buffered image; a clean handle has
+        // none, so materialize the captured content first or a
+        // metadata-only change would commit an empty file.
+        if write.image.is_none() {
+            let projected = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+            if self.budget.reserve(write.id, projected).is_err() {
+                return Err(fuser::Errno::ENOSPC);
+            }
+            let capture = write.capture.clone();
+            let len = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+            match self.read_via_capture(&capture, 0, u32::try_from(len).unwrap_or(u32::MAX)) {
+                Ok(image) => write.image = Some(image),
+                Err(error) => {
+                    self.budget.release(write.id);
+                    return Err(error);
+                }
+            }
+        }
+        write.executable = executable;
+        write.dirty = true;
+        if write.sync {
+            self.commit_locked(&mut write)?;
+        }
+        Ok(())
+    }
+
+    /// Truncate a writable handle's buffered image (handle-derived
+    /// `setattr(size)`): grow zero-fills, shrink discards the tail. The
+    /// change is buffered and committed at the next boundary, exactly
+    /// like a write. The handle must name `path`.
+    fn truncate_handle_locked(
+        &self,
+        handle: &Arc<Mutex<WriteHandle>>,
+        path: &str,
+        size: u64,
+    ) -> Result<(), fuser::Errno> {
+        let target = usize::try_from(size).map_err(|_| fuser::Errno::EFBIG)?;
+        if target > crate::session::MAX_WRITE_BUFFER_BYTES {
+            return Err(fuser::Errno::EFBIG);
+        }
+        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        if write.path != path {
+            return Err(fuser::Errno::EBADF);
+        }
+        if write.failed {
+            return Err(fuser::Errno::EIO);
+        }
+        let current_len = match &write.image {
+            Some(image) => image.len(),
+            None => usize::try_from(write.base.size()).unwrap_or(usize::MAX),
+        };
+        if current_len == target && !write.dirty {
+            return Ok(());
+        }
+        let was_clean = write.image.is_none();
+        let mut image = if was_clean {
+            // Reserve the larger of the base and the target before
+            // materializing, so an over-cap base is refused without
+            // reading or allocating it.
+            let projected = usize::try_from(write.base.size())
+                .unwrap_or(usize::MAX)
+                .max(target);
+            if self.budget.reserve(write.id, projected).is_err() {
+                return Err(fuser::Errno::ENOSPC);
+            }
+            let capture = write.capture.clone();
+            let len = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+            match self.read_via_capture(&capture, 0, u32::try_from(len).unwrap_or(u32::MAX)) {
+                Ok(image) => image,
+                Err(error) => {
+                    self.budget.release(write.id);
+                    return Err(error);
+                }
+            }
+        } else {
+            write.image.take().unwrap_or_default()
+        };
+        if self.budget.reserve(write.id, target).is_err() {
+            if was_clean {
+                self.budget.release(write.id);
+            } else {
+                write.image = Some(image);
+            }
+            return Err(fuser::Errno::ENOSPC);
+        }
+        image.resize(target, 0);
+        write.image = Some(image);
+        write.dirty = true;
+        if write.sync {
+            self.commit_locked(&mut write)?;
+        }
+        Ok(())
     }
 }
 
@@ -1547,6 +1802,109 @@ where
                 fh,
                 fuser::FopenFlags::FOPEN_DIRECT_IO,
             ),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn unlink(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(fuser::Errno::EINVAL);
+            return;
+        };
+        match self.unlink_at(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn rmdir(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(fuser::Errno::EINVAL);
+            return;
+        };
+        match self.rmdir_at(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: fuser::ReplyEmpty,
+    ) {
+        // Atomic exchange and whiteout are not representable; only
+        // plain rename and RENAME_NOREPLACE are served.
+        if flags
+            .intersects(fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT)
+        {
+            reply.error(fuser::Errno::EOPNOTSUPP);
+            return;
+        }
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(fuser::Errno::EINVAL);
+            return;
+        };
+        let no_replace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
+        match self.rename_at(parent.0, name, newparent.0, newname, no_replace) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    /// Path- and handle-addressed attribute changes: `size` (truncate)
+    /// and `mode` (the exec bit). uid/gid, ownership, and timestamps are
+    /// accepted and ignored — the format does not represent them.
+    fn setattr(
+        &self,
+        _req: &fuser::Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: fuser::ReplyAttr,
+    ) {
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
+        if size.is_some() || mode.is_some() {
+            if let Err(error) = self.setattr_attrs(ino.0, fh, size, mode) {
+                reply.error(error);
+                return;
+            }
+        }
+        match self.resolve_inode(&path) {
+            Ok((ino, node, _)) => reply.attr(&TTL, &self.attr(ino, &node)),
             Err(error) => reply.error(error),
         }
     }

@@ -2093,8 +2093,9 @@ mod tests {
     }
 
     /// The mounted-drive roundtrip plus write coherence: create, write,
-    /// fsync, read back, and directory listings that observe each commit
-    /// while a directory handle opened earlier keeps its pinned listing.
+    /// commit (the `fsync` durability boundary), read back, and directory
+    /// listings that observe each commit while a directory handle opened
+    /// earlier keeps its pinned listing.
     #[test]
     fn mount_roundtrip_and_write_coherence() {
         let (engine, dir, _) = scratch_drive();
@@ -2132,10 +2133,9 @@ mod tests {
         assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"hello");
         backend.release_handle(read).unwrap();
         assert_eq!(backend.attr_at("d/f.txt").unwrap().size, 5);
-        assert_eq!(
-            names(&backend, backend.open_dir(1, "").unwrap()),
-            ["d", "e"].map(String::from)
-        );
+        let root_dir = backend.open_dir(1, "").unwrap();
+        assert_eq!(names(&backend, root_dir), ["d", "e"].map(String::from));
+        backend.release_dir(root_dir).unwrap();
 
         // Pin a directory handle, then rename within and across
         // directories: the pinned listing never changes, fresh streams
@@ -2150,14 +2150,13 @@ mod tests {
             ["f.txt"].map(String::from),
             "a pinned directory stream keeps its enumeration"
         );
-        assert_eq!(
-            names(&backend, backend.open_dir(d_ino, "d").unwrap()),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            names(&backend, backend.open_dir(e_ino, "e").unwrap()),
-            ["g.txt"].map(String::from)
-        );
+        backend.release_dir(pinned).unwrap();
+        let d_now = backend.open_dir(d_ino, "d").unwrap();
+        assert_eq!(names(&backend, d_now), Vec::<String>::new());
+        backend.release_dir(d_now).unwrap();
+        let e_now = backend.open_dir(e_ino, "e").unwrap();
+        assert_eq!(names(&backend, e_now), ["g.txt"].map(String::from));
+        backend.release_dir(e_now).unwrap();
         assert_eq!(backend.attr_at("d/f.txt"), Err(fuser::Errno::ENOENT));
 
         backend.unlink_at(e_ino, "g.txt").unwrap();

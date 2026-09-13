@@ -825,6 +825,11 @@ where
         offset: u64,
         data: &[u8],
     ) -> Result<u32, fuser::Errno> {
+        if data.is_empty() {
+            // POSIX no-op: a zero-length write changes nothing and must
+            // not materialize, mark the handle dirty, or commit.
+            return Ok(0);
+        }
         let Handle::Write(handle) = self.handle_of(fh)? else {
             // A read-only descriptor has no write access.
             return Err(fuser::Errno::EBADF);
@@ -838,37 +843,63 @@ where
             .ok_or(fuser::Errno::EFBIG)?;
         let end = usize::try_from(end).map_err(|_| fuser::Errno::EFBIG)?;
 
-        let was_clean = write.image.is_none();
-        let mut image = match write.image.take() {
-            Some(image) => image,
-            None => {
-                let capture = write.capture.clone();
-                let len = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
-                self.read_via_capture(&capture, 0, u32::try_from(len).unwrap_or(u32::MAX))?
-            }
-        };
-        let new_len = image.len().max(end);
-        if self.budget.reserve(write.id, new_len).is_err() {
-            // Refuse without disturbing the handle: a clean handle that
-            // only materialized its base goes back to clean (and
-            // unbudgeted), a dirty one keeps its prior image.
-            if !was_clean {
+        match write.image.take() {
+            Some(mut image) => {
+                // Dirty handle: the image is already materialized and
+                // budgeted, so account the extension before mutating.
+                let new_len = image.len().max(end);
+                if self.budget.reserve(write.id, new_len).is_err() {
+                    write.image = Some(image);
+                    return Err(fuser::Errno::ENOSPC);
+                }
+                if end > image.len() {
+                    image.resize(end, 0);
+                }
+                image[offset as usize..end].copy_from_slice(data);
                 write.image = Some(image);
             }
-            return Err(fuser::Errno::ENOSPC);
+            None => {
+                // Clean handle: reserve the projected logical length
+                // *before* materializing, so a base larger than the
+                // per-handle cap fails closed without allocating or
+                // reading it.
+                let projected = usize::try_from(write.base.size())
+                    .unwrap_or(usize::MAX)
+                    .max(end);
+                if self.budget.reserve(write.id, projected).is_err() {
+                    return Err(fuser::Errno::ENOSPC);
+                }
+                let capture = write.capture.clone();
+                let len = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+                let mut image = match self.read_via_capture(
+                    &capture,
+                    0,
+                    u32::try_from(len).unwrap_or(u32::MAX),
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        // Nothing changed on the handle; drop the
+                        // reservation it never used.
+                        self.budget.release(write.id);
+                        return Err(error);
+                    }
+                };
+                if end > image.len() {
+                    image.resize(end, 0);
+                }
+                image[offset as usize..end].copy_from_slice(data);
+                write.image = Some(image);
+            }
         }
-        if end > image.len() {
-            image.resize(end, 0);
-        }
-        image[offset as usize..end].copy_from_slice(data);
-        write.image = Some(image);
         write.dirty = true;
         let sync = write.sync;
-        drop(write);
-
         if sync {
-            self.commit_handle(fh)?;
+            // Commit under the same guard: the write-plus-commit is
+            // one atomic step, so no concurrent write can join this
+            // snapshot and each accepted O_SYNC write is its own.
+            self.commit_locked(&mut write)?;
         }
+        drop(write);
         Ok(data.len() as u32)
     }
 
@@ -888,6 +919,14 @@ where
     /// already removed it from the table).
     fn commit_write_handle(&self, handle: &Arc<Mutex<WriteHandle>>) -> Result<(), fuser::Errno> {
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        self.commit_locked(&mut write)
+    }
+
+    /// The commit transition under an already-held handle guard. Keeping
+    /// it separate from the locking wrapper lets `O_SYNC` writes commit
+    /// without releasing and re-acquiring the lock (which would let a
+    /// concurrent write join the snapshot).
+    fn commit_locked(&self, write: &mut WriteHandle) -> Result<(), fuser::Errno> {
         if write.failed {
             return Err(fuser::Errno::EIO);
         }
@@ -1698,6 +1737,43 @@ mod tests {
         assert_eq!(kind, fuser::FileType::Symlink);
         let (kind, _, _) = attr_of(&Node::Conflict { versions: vec![] });
         assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
+    }
+
+    /// A first write whose resulting logical length exceeds the
+    /// per-handle budget fails closed with `ENOSPC` *before*
+    /// materializing the base, so an oversized file never allocates
+    /// past the advertised bound.
+    #[test]
+    fn first_write_over_the_handle_budget_does_not_materialize() {
+        let mut store = MemoryObjectStore::default();
+        let root = Tree::from_entries(vec![Entry::file(
+            "big",
+            100,
+            false,
+            vec![ContentId::from_bytes([0x01; 32])],
+        )
+        .unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+        // A tiny budget and a channel so `open_write` is permitted; the
+        // write itself must be refused before any base read.
+        let mut backend = FuseBackend::new(view);
+        backend.budget = Arc::new(WriteBudget::with_limits(4, 100, 8));
+        backend.mutations = Some(Arc::new(MutationQueue::default()));
+
+        let fh = backend.open_write("big", libc::O_RDWR).unwrap();
+        assert_eq!(
+            backend.write_handle(fh, 0, b"x"),
+            Err(fuser::Errno::ENOSPC),
+            "a base over the per-handle cap is refused"
+        );
+        assert_eq!(
+            backend.budget.total(),
+            0,
+            "the refused write reserves nothing"
+        );
     }
 
     #[test]

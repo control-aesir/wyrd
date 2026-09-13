@@ -1561,7 +1561,13 @@ mod tests {
         let (fh, _ino, _) = backend
             .create_at(1, "s.txt", libc::O_RDWR | libc::O_SYNC)
             .expect("create commits");
+        let after_create = backend.generation().unwrap();
         backend.write_handle(fh, 0, b"a").unwrap();
+        assert_eq!(
+            backend.generation().unwrap(),
+            after_create + 1,
+            "each accepted O_SYNC write authors exactly one snapshot"
+        );
         let seen = backend.open_at("s.txt").unwrap();
         assert_eq!(
             backend.read_handle(seen, 0, 64).unwrap(),
@@ -1571,10 +1577,53 @@ mod tests {
         backend.release_handle(seen).unwrap();
 
         backend.write_handle(fh, 1, b"b").unwrap();
+        assert_eq!(
+            backend.generation().unwrap(),
+            after_create + 2,
+            "the second accepted O_SYNC write authors its own snapshot"
+        );
         let seen = backend.open_at("s.txt").unwrap();
         assert_eq!(backend.read_handle(seen, 0, 64).unwrap(), b"ab");
         backend.release_handle(seen).unwrap();
         backend.release_handle(fh).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A zero-length write is a POSIX no-op: no materialization, no
+    /// dirty mark, no snapshot — even on an `O_SYNC` handle.
+    #[test]
+    fn zero_length_write_is_a_noop() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("z.txt", b"data").unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let before = backend.generation().unwrap();
+        let fh = backend
+            .open_write("z.txt", libc::O_RDWR | libc::O_SYNC)
+            .unwrap();
+        assert_eq!(backend.write_handle(fh, 0, b""), Ok(0));
+        assert_eq!(
+            backend.generation().unwrap(),
+            before,
+            "a zero-length write authors no snapshot"
+        );
+        backend.commit_handle(fh).unwrap();
+        assert_eq!(
+            backend.generation().unwrap(),
+            before,
+            "a flush on the untouched handle still authors nothing"
+        );
+        backend.release_handle(fh).unwrap();
+        assert_eq!(backend.generation().unwrap(), before);
 
         stop.store(true, Ordering::Relaxed);
         loop_handle

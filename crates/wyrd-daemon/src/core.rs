@@ -730,7 +730,187 @@ where
                     chunks,
                 )))
             }
+            MutationKind::Unlink { path } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                let tree = self.single_tree(&heads, path)?;
+                match self.current_node(&heads, path)? {
+                    Some(Node::Dir { .. } | Node::MergedDir { .. }) => {
+                        return Err(MutationError::IsDirectory(path.clone()));
+                    }
+                    Some(_) => {}
+                    None => return Err(MutationError::NotFound(path.clone())),
+                }
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let root = wyrd_format::mutation::remove(&mut *store, tree, path)
+                    .map_err(MutationError::from_format)?;
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Done)
+            }
+            MutationKind::Rmdir { path } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                let tree = self.single_tree(&heads, path)?;
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
+                    .map_err(MutationError::from_format)?;
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Done)
+            }
+            MutationKind::Rename {
+                from,
+                to,
+                no_replace,
+            } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                let tree = self.single_tree(&heads, from)?;
+                if *no_replace && self.current_node(&heads, to)?.is_some() {
+                    return Err(MutationError::AlreadyExists(to.clone()));
+                }
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let root = wyrd_format::mutation::rename(&mut *store, tree, from, to)
+                    .map_err(MutationError::from_format)?;
+                if root == tree {
+                    // Same-path rename is a no-op: no snapshot.
+                    return Ok(MutationOutcome::Done);
+                }
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Done)
+            }
+            MutationKind::SetExec { path, executable } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                let (base, size, current_exec, chunks) = match self.current_node(&heads, path)? {
+                    Some(Node::File {
+                        size,
+                        executable,
+                        chunks,
+                    }) => (self.single_tree(&heads, path)?, size, executable, chunks),
+                    // Non-files accept a mode change as a no-op: only the
+                    // exec bit of a regular file is represented.
+                    Some(_) => return Ok(MutationOutcome::Done),
+                    None => return Err(MutationError::NotFound(path.clone())),
+                };
+                if current_exec == *executable {
+                    return Ok(MutationOutcome::Done);
+                }
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let entry = Entry::file(name, size, *executable, chunks)
+                    .map_err(|error| MutationError::Invalid(error.to_string()))?;
+                let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
+                    .map_err(MutationError::from_format)?;
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Done)
+            }
+            MutationKind::SetSize { path, size } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                let tree = self.single_tree(&heads, path)?;
+                let (node, bytes) = self.read_current_file(&heads, path)?;
+                let executable = match node {
+                    Node::File { executable, .. } => executable,
+                    _ => return Err(MutationError::IsDirectory(path.clone())),
+                };
+                let target = usize::try_from(*size).map_err(|_| MutationError::TooLarge(*size))?;
+                if target > crate::session::MAX_WRITE_BUFFER_BYTES {
+                    return Err(MutationError::TooLarge(*size));
+                }
+                let mut image = bytes;
+                image.resize(target, 0);
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let chunks =
+                    chunk::insert_chunks(&mut *store, &image).map_err(|_| MutationError::Store)?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let entry = Entry::file(name, *size, executable, chunks)
+                    .map_err(|error| MutationError::Invalid(error.to_string()))?;
+                let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
+                    .map_err(MutationError::from_format)?;
+                if root == tree {
+                    return Ok(MutationOutcome::Done);
+                }
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Done)
+            }
         }
+    }
+
+    /// The single live head's tree, or a conflict. A headless drive has
+    /// no tree to mutate: the caller's path cannot exist, so this is
+    /// `NotFound(path)`.
+    fn single_tree(
+        &self,
+        heads: &[AuthorizedSnapshot],
+        path: &str,
+    ) -> Result<ContentId, MutationError> {
+        match heads {
+            [] => Err(MutationError::NotFound(path.to_string())),
+            [head] => Ok(head.snapshot().tree),
+            _ => Err(MutationError::Conflicted { heads: heads.len() }),
+        }
+    }
+
+    /// A transient view over the current heads, for kind/stale checks and
+    /// reading a file's bytes to rebuild it (truncate).
+    fn view_for(
+        &self,
+        heads: &[AuthorizedSnapshot],
+    ) -> Result<DriveView<S, DaemonMaterialization>, MutationError> {
+        let runtime = self
+            .engine
+            .runtime_state()
+            .map_err(|_| MutationError::Engine)?;
+        Ok(DriveView::shared(
+            Arc::clone(&self.store),
+            DaemonMaterialization { runtime },
+            view_heads(heads.iter().cloned()),
+        ))
+    }
+
+    /// Read a regular file's full plaintext from the current heads. A
+    /// not-materialized file is `EIO`: the loop has no demand path to
+    /// block on.
+    fn read_current_file(
+        &self,
+        heads: &[AuthorizedSnapshot],
+        path: &str,
+    ) -> Result<(Node, Vec<u8>), MutationError> {
+        let view = self.view_for(heads)?;
+        let node = view
+            .lookup(path)
+            .map_err(|_| MutationError::NotFound(path.to_string()))?;
+        let file = view
+            .open(&node)
+            .map_err(|_| MutationError::IsDirectory(path.to_string()))?;
+        let size = match node {
+            Node::File { size, .. } => size,
+            _ => return Err(MutationError::IsDirectory(path.to_string())),
+        };
+        let bytes = view
+            .read(&file, 0, usize::try_from(size).unwrap_or(usize::MAX))
+            .map_err(|_| MutationError::Store)?;
+        Ok((node, bytes))
     }
 
     /// Resolve `path` against the current heads' merged view, for the
@@ -1641,6 +1821,144 @@ mod tests {
         );
         backend.release_handle(fh).unwrap();
         assert_eq!(backend.generation().unwrap(), before);
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Namespace operations commit through the channel and serve: create,
+    /// rename, unlink, and rmdir, with the kind errors the contract
+    /// names.
+    #[test]
+    fn namespace_operations_commit_and_serve() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"data").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+        backend.mkdir_at(1, "dir").unwrap();
+
+        // Rename the file; the old path stops resolving.
+        backend.rename_at(1, "a.txt", 1, "b.txt", false).unwrap();
+        assert_eq!(backend.attr_at("a.txt"), Err(fuser::Errno::ENOENT));
+        assert_eq!(
+            backend.attr_at("b.txt").unwrap().kind,
+            fuser::FileType::RegularFile
+        );
+        // unlink refuses a directory; rmdir removes it.
+        assert_eq!(backend.unlink_at(1, "dir"), Err(fuser::Errno::EISDIR));
+        backend.rmdir_at(1, "dir").unwrap();
+        assert_eq!(backend.attr_at("dir"), Err(fuser::Errno::ENOENT));
+        // unlink removes the file.
+        backend.unlink_at(1, "b.txt").unwrap();
+        assert_eq!(backend.attr_at("b.txt"), Err(fuser::Errno::ENOENT));
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The rename/rmdir rejection matrix: non-empty rmdir, file→dir and
+    /// dir→file renames, and RENAME_NOREPLACE.
+    #[test]
+    fn namespace_operations_reject_invalid_targets() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (d1, _) = backend.mkdir_at(1, "d1").unwrap();
+        backend.mkdir_at(d1, "sub").unwrap();
+        let (d2, _) = backend.mkdir_at(1, "d2").unwrap();
+        let (created, _, _) = backend.create_at(1, "f.txt", libc::O_RDWR).unwrap();
+        backend.release_handle(created).unwrap();
+
+        assert_eq!(
+            backend.rmdir_at(1, "d1"),
+            Err(fuser::Errno::ENOTEMPTY),
+            "a non-empty directory is not removed"
+        );
+        assert_eq!(
+            backend.rename_at(1, "f.txt", 1, "d2", false),
+            Err(fuser::Errno::EISDIR),
+            "a file cannot replace a directory"
+        );
+        assert_eq!(
+            backend.rename_at(1, "d2", 1, "f.txt", false),
+            Err(fuser::Errno::ENOTDIR),
+            "a directory cannot replace a file"
+        );
+        // RENAME_NOREPLACE refuses an existing destination.
+        assert_eq!(
+            backend.rename_at(1, "f.txt", 1, "f.txt", true),
+            Err(fuser::Errno::EEXIST),
+            "no-replace refuses a taken name"
+        );
+        // Plain rename onto the same path is a no-op success.
+        backend.rename_at(1, "f.txt", 1, "f.txt", false).unwrap();
+        assert_eq!(d2, backend.attr_at("d2").unwrap().ino.0);
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `setattr`: path truncate (shrink and grow), the exec bit, and a
+    /// handle-derived truncate that buffers until commit.
+    #[test]
+    fn setattr_truncates_and_toggles_exec() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, ino, _) = backend.create_at(1, "t.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"hello world").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+
+        backend.set_size_at(ino, 5).unwrap();
+        let read = backend.open_at("t.txt").unwrap();
+        assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"hello");
+        backend.release_handle(read).unwrap();
+
+        backend.set_size_at(ino, 8).unwrap();
+        let read = backend.open_at("t.txt").unwrap();
+        assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"hello\0\0\0");
+        backend.release_handle(read).unwrap();
+
+        backend.set_exec_at(ino, true).unwrap();
+        assert_eq!(backend.attr_at("t.txt").unwrap().perm, 0o755);
+        backend.set_exec_at(ino, false).unwrap();
+        assert_eq!(backend.attr_at("t.txt").unwrap().perm, 0o644);
+
+        // A handle-derived truncate buffers: the image shrinks, commits
+        // at the boundary, and other readers see it only after.
+        let writable = backend.open_write("t.txt", libc::O_RDWR).unwrap();
+        backend.setattr_size(ino, Some(writable), 2).unwrap();
+        assert_eq!(backend.read_handle(writable, 0, 64).unwrap(), b"he");
+        backend.commit_handle(writable).unwrap();
+        backend.release_handle(writable).unwrap();
+        let read = backend.open_at("t.txt").unwrap();
+        assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"he");
+        backend.release_handle(read).unwrap();
 
         stop.store(true, Ordering::Relaxed);
         loop_handle

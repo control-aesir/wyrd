@@ -146,6 +146,10 @@ pub enum MutationError {
     /// commit performs no merge and authors no snapshot. POSIX `EIO`.
     #[error("stale handle for {0:?}: the path changed since it opened")]
     Stale(String),
+    /// The operation exceeds a representable or budgeted size. POSIX
+    /// `EFBIG`.
+    #[error("resulting size {0} exceeds the supported bound")]
+    TooLarge(u64),
     /// Object-store or tree access failed. POSIX `EIO`.
     #[error("object store failed")]
     Store,
@@ -193,6 +197,22 @@ pub enum MutationKind {
         base: FileIdentity,
         content: Vec<u8>,
     },
+    /// Remove the file or symlink at `path`; a directory is `EISDIR`.
+    Unlink { path: String },
+    /// Remove the empty directory at `path`.
+    Rmdir { path: String },
+    /// Move `from` to `to`. `no_replace` is `RENAME_NOREPLACE`.
+    Rename {
+        from: String,
+        to: String,
+        no_replace: bool,
+    },
+    /// Construct the file at `path` at `size`: grow zero-fills, shrink
+    /// keeps the prefix. A directory is `EISDIR`.
+    SetSize { path: String, size: u64 },
+    /// Toggle the exec bit of the file at `path`. Directories and
+    /// symlinks accept the request as a no-op.
+    SetExec { path: String, executable: bool },
 }
 
 /// A submitted operation, opaque to callers: the id is diagnostic, the

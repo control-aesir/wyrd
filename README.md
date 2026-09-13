@@ -145,6 +145,17 @@ cargo check
 cargo nextest run
 ```
 
+On macOS, the `wyrd-daemon` and `wyrd-contracts` test binaries link the
+system FUSE library at load, and `wyrd mount` needs the kernel extension,
+so running them requires system macFUSE: `brew install --cask macfuse`,
+then approve the "Benjamin Fleischer" system software under System
+Settings, Privacy & Security (kernel-extension user consent must be
+enabled; on Apple Silicon that needs Reduced Security, set once in
+Recovery via Startup Security Utility), and reboot. The `devenv`
+environment only provides build-time stubs for fuser's probe; it cannot
+supply the runtime library or the kernel extension. `cargo check` and the
+`wyrd-format`, `wyrd-sync`, and `wyrd-fuse` suites need no FUSE at all.
+
 `crates/wyrd-format` carries the format contract and `crates/wyrd-sync`
 the cryptography and state machines (both under test); the read-only FUSE
 backend is implemented in `crates/wyrd-daemon` (`wyrd init`, `wyrd

@@ -704,6 +704,12 @@ fn conflicted_drive_rejects_mounted_writes() {
         Err(fuser::Errno::EIO),
         "a conflicted drive has no single tree to mutate"
     );
+    // Representative non-mkdir entry points fail the same way.
+    assert_eq!(backend.unlink_at(1, "a.txt"), Err(fuser::Errno::EIO));
+    assert_eq!(
+        backend.rename_at(1, "a.txt", 1, "z.txt", false),
+        Err(fuser::Errno::EIO)
+    );
     assert_eq!(
         backend.generation().unwrap(),
         before,

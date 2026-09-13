@@ -47,12 +47,15 @@ pub const KDF_OUT_LEN: usize = 32;
 // plumbing (salts, lengths, zeroization, tags), never memory-hardness
 // itself — that assurance comes from the argon2 crate plus the pinning
 // test below. These constants are test-only and must never reach
-// production paths; `kdf_key` selects them only under `cfg(test)`.
-#[cfg(test)]
+// production paths; `kdf_key` selects them under `cfg(test)` or the
+// `insecure-fast-kdf` feature (which downstream integration tests enable
+// so a real `Engine` per test stays affordable; see the feature's
+// security note in Cargo.toml).
+#[cfg(any(test, feature = "insecure-fast-kdf"))]
 const TEST_KDF_M_COST_KIB: u32 = 8;
-#[cfg(test)]
+#[cfg(any(test, feature = "insecure-fast-kdf"))]
 const TEST_KDF_T_COST: u32 = 1;
-#[cfg(test)]
+#[cfg(any(test, feature = "insecure-fast-kdf"))]
 const TEST_KDF_P_COST: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -72,8 +75,9 @@ pub enum KeystoreError {
 /// surface.
 ///
 /// Tests run the fast `TEST_KDF_*` profile instead (same plumbing,
-/// negligible cost); the pinning test below guards the production
-/// table and the prod smoke test proves it end to end.
+/// negligible cost), selected under `cfg(test)` or the
+/// `insecure-fast-kdf` feature; the pinning test below guards the
+/// production table and the prod smoke test proves it end to end.
 ///
 /// The return is a `Zeroizing<[u8; 32]>` so the derived key is wiped when
 /// the wrapper is dropped (and on panic unwind). Callers that need to
@@ -84,9 +88,9 @@ pub fn kdf_key(
     passphrase: &str,
     salt: &[u8],
 ) -> Result<Zeroizing<[u8; KDF_OUT_LEN]>, KeystoreError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "insecure-fast-kdf"))]
     let (m_cost, t_cost, p_cost) = (TEST_KDF_M_COST_KIB, TEST_KDF_T_COST, TEST_KDF_P_COST);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "insecure-fast-kdf")))]
     let (m_cost, t_cost, p_cost) = (KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST);
     kdf_key_with_params(passphrase, salt, m_cost, t_cost, p_cost)
 }

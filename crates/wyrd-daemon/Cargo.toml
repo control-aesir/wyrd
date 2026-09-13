@@ -25,6 +25,9 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Downstream tests build a real `Engine` per test; enabling the fast KDF
+# profile here keeps that affordable without touching production builds.
+wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
 serde_json = "1"
 # In-process websocket relay for live mailbox integration tests (test-only:
 # a minimal NIP-01 server; never a runtime dependency).

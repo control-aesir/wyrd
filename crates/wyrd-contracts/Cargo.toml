@@ -11,6 +11,9 @@ wyrd-fuse.workspace = true
 wyrd-daemon = { path = "../wyrd-daemon" }
 
 [dev-dependencies]
+# The contract suite builds real drives; enable the fast KDF profile so the
+# composition tests do not pay the production Argon2id cost.
+wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
 fuser = "0.18"
 secp256k1.workspace = true
 blake3.workspace = true

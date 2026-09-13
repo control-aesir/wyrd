@@ -30,6 +30,17 @@ thiserror.workspace = true
 # wrappers; `Zeroizing<T>` covers the buffer-shaped temporaries.
 zeroize = { version = "1.9", features = ["derive"] }
 
+[features]
+# SECURITY: deliberately weakens the keystore KDF (Argon2id to minimum
+# memory, one pass). It exists only so downstream integration tests
+# (wyrd-daemon, wyrd-contracts) that build a real `Engine` per test do not
+# pay the production 64 MiB / t=3 cost. NEVER enable it in a production,
+# release, or published artifact, and never treat an `--all-features`
+# build as production. The production table stays pinned and covered by
+# `kdf_parameters_are_pinned` and `prod_kdf_params_round_trip` in
+# `keys::keystore`.
+insecure-fast-kdf = []
+
 [dev-dependencies]
 proptest.workspace = true
 

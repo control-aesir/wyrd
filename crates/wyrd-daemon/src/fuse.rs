@@ -785,6 +785,19 @@ where
         if self.mutations.is_none() {
             return Err(fuser::Errno::EROFS);
         }
+        // Flag-level refusals come before path resolution: an
+        // unsupported combination is not a path problem.
+        if unsupported_open_flags(flags) {
+            return Err(fuser::Errno::EOPNOTSUPP);
+        }
+        let append = flags & libc::O_APPEND != 0;
+        let truncate = flags & libc::O_TRUNC != 0;
+        if append && truncate {
+            // Truncate-then-append would need a committed empty base
+            // before the first append; not representable in the v0
+            // append model, so refuse rather than silently ignore one.
+            return Err(fuser::Errno::EOPNOTSUPP);
+        }
         let projection = self.projection()?;
         let node = projection
             .view()
@@ -805,8 +818,6 @@ where
             _ => return Err(fuser::Errno::EISDIR),
         };
         let id = self.budget.next_handle();
-        let append = flags & libc::O_APPEND != 0;
-        let truncate = flags & libc::O_TRUNC != 0;
         let (image, dirty) = if truncate {
             self.budget
                 .reserve(id, 0)
@@ -914,7 +925,10 @@ where
             // Append is position-independent: the offset is ignored and
             // the sequence grows in submission order.
             let mut image = write.image.take().unwrap_or_default();
-            let new_len = image.len() + data.len();
+            let new_len = image
+                .len()
+                .checked_add(data.len())
+                .ok_or(fuser::Errno::EFBIG)?;
             if self.budget.reserve(write.id, new_len).is_err() {
                 write.image = Some(image);
                 return Err(fuser::Errno::ENOSPC);
@@ -1057,22 +1071,6 @@ where
                     }
                 }
             }
-            // Append reports `Done` (it hands back no identity), but the
-            // commit still succeeded durably: re-pin the capture.
-            Ok(MutationOutcome::Done) if write.append => match self.capture_for(&write.path) {
-                Ok(capture) => {
-                    write.capture = capture;
-                    write.dirty = false;
-                    self.budget.release(write.id);
-                    Ok(())
-                }
-                Err(error) => {
-                    write.failed = true;
-                    write.dirty = false;
-                    self.budget.release(write.id);
-                    Err(error)
-                }
-            },
             Ok(_) => {
                 write.failed = true;
                 write.dirty = false;

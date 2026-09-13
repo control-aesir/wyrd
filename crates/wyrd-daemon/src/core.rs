@@ -772,7 +772,11 @@ where
                 self.engine
                     .author_snapshot(&*store, root)
                     .map_err(|_| MutationError::Engine)?;
-                Ok(MutationOutcome::Done)
+                Ok(MutationOutcome::Committed(FileIdentity::new(
+                    image.len() as u64,
+                    executable,
+                    chunks,
+                )))
             }
             MutationKind::Unlink { path } => {
                 let heads = self
@@ -2230,6 +2234,13 @@ mod tests {
         let (live, backend) = daemon.into_live(Duration::from_secs(30));
         let (stop, loop_handle) = spawn_live_loop(live);
 
+        // Truncate-then-append is not representable in the v0 model and
+        // is refused rather than silently ignoring one flag.
+        assert_eq!(
+            backend.open_write("a.txt", libc::O_WRONLY | libc::O_APPEND | libc::O_TRUNC),
+            Err(fuser::Errno::EOPNOTSUPP)
+        );
+
         let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
         backend.write_handle(fh, 0, b"AAAA").unwrap();
         backend.commit_handle(fh).unwrap();
@@ -2273,6 +2284,55 @@ mod tests {
         // the append lands at the current end.
         assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"BBBB12X");
         backend.release_handle(read).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An append handle's reads stay coherent after its own commit: the
+    /// handle's base advances to the committed identity, so a same-
+    /// descriptor read does not trip over the old base boundary.
+    #[test]
+    fn append_handle_reads_stay_coherent_after_commit() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"AAA").unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+
+        // O_SYNC commits each append; a same-handle read after commit
+        // spans the old and new content.
+        let sync = backend
+            .open_write("a.txt", libc::O_WRONLY | libc::O_APPEND | libc::O_SYNC)
+            .unwrap();
+        backend.write_handle(sync, 0, b"X").unwrap();
+        assert_eq!(backend.read_handle(sync, 0, 64).unwrap(), b"AAAX");
+        backend.write_handle(sync, 0, b"Y").unwrap();
+        assert_eq!(backend.read_handle(sync, 0, 64).unwrap(), b"AAAXY");
+        assert_eq!(backend.read_handle(sync, 2, 64).unwrap(), b"AXY");
+        backend.release_handle(sync).unwrap();
+
+        // Non-sync: several buffered appends, one commit, then reads
+        // from the same handle.
+        let buffered = backend
+            .open_write("a.txt", libc::O_WRONLY | libc::O_APPEND)
+            .unwrap();
+        backend.write_handle(buffered, 0, b"12").unwrap();
+        backend.write_handle(buffered, 0, b"34").unwrap();
+        assert_eq!(backend.read_handle(buffered, 0, 64).unwrap(), b"AAAXY1234");
+        backend.commit_handle(buffered).unwrap();
+        assert_eq!(backend.read_handle(buffered, 0, 64).unwrap(), b"AAAXY1234");
+        assert_eq!(backend.read_handle(buffered, 3, 64).unwrap(), b"XY1234");
+        backend.release_handle(buffered).unwrap();
 
         stop.store(true, Ordering::Relaxed);
         loop_handle

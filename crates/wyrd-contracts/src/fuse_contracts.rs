@@ -131,7 +131,13 @@ fn open_fds_remain_stable_across_head_advancement() {
     let advanced =
         wyrd_sync::durable::AuthorizedSnapshot::authorize(advanced, &crate::support::drive())
             .unwrap();
-    backend.set_heads(mount_heads(vec![advanced])).unwrap();
+    backend
+        .publish_without_revision(DriveView::shared(
+            backend.store_handle().unwrap(),
+            RemoteOnlyMaterialization,
+            mount_heads(vec![advanced]),
+        ))
+        .unwrap();
 
     // The open descriptor never noticed.
     assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"version one");

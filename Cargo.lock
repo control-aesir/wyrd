@@ -5169,6 +5169,7 @@ name = "wyrd-contracts"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fuser",
  "iroh",
  "secp256k1",
  "tokio",

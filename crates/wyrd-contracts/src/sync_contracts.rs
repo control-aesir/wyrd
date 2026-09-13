@@ -18,7 +18,8 @@ use wyrd_sync::transport::mailbox::{
 };
 
 use crate::support::{
-    mount_heads, scratch_dir, signed_transition, Loaded, RemoteOnlyMaterialization, Rig,
+    drive, mount_heads, scratch_dir, seal_flat_drive, signed_snapshot, signed_transition,
+    AnnouncedRoots, Loaded, RemoteOnlyMaterialization, Rig,
 };
 
 /// One head per verified body; a broken signature never becomes
@@ -573,4 +574,149 @@ fn epoch3_child(rig: &Rig) -> wyrd_format::MembershipTransition {
         &[rig.owner.id],
         &rig.owner,
     )
+}
+
+/// A conflicted drive rejects mounted writes: with more than one
+/// eligible live head there is no single tree to mutate, so every
+/// mutation fails `EIO` and authors no snapshot (`docs/write-path.md`,
+/// Conflicted drives). Two independent root snapshots at the same
+/// epoch and membership produce the conflict.
+#[test]
+fn conflicted_drive_rejects_mounted_writes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use wyrd_daemon::core::LiveConfig;
+    use wyrd_sync::runtime::MaterializationState;
+
+    struct NoopMailbox;
+    impl Mailbox for NoopMailbox {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            Ok(())
+        }
+        fn recv(&mut self) -> Option<Delivery> {
+            None
+        }
+        fn settle(&mut self, _id: DeliveryId, _d: Disposition) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
+    let mut loaded = Loaded::new("a.txt", b"a");
+    loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+
+    // A second, independent sibling snapshot: both are roots at the
+    // same epoch and membership, so both classify as eligible heads.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"b").unwrap();
+    let tree =
+        Tree::from_entries(vec![Entry::file("b.txt", 1, false, vec![chunk]).unwrap()]).unwrap();
+    let tree_id = tree.insert_into(&mut scratch).unwrap();
+    let second = signed_snapshot(
+        Vec::new(),
+        tree_id,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        1_001,
+    );
+    let second_content = seal_flat_drive(
+        &drive(),
+        &loaded.rig.epoch2,
+        2,
+        &second.snapshot_id(),
+        &[("b.txt", b"b")],
+    );
+    let body = second.encode();
+    loaded
+        .bulk
+        .publish_snapshot(second.snapshot_id(), body.clone());
+    loaded
+        .bulk
+        .publish_root(second.snapshot_id(), second_content.root.clone());
+    for (storage, sealed) in &second_content.objects {
+        loaded.bulk.publish_sealed(*storage, sealed.clone());
+    }
+    loaded.rig.enqueue_announcement(
+        second.snapshot_id(),
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: wyrd_format::BaoRoot::from_bytes(*blake3::hash(&body).as_bytes()),
+            root_manifest: second_content.manifest_id,
+            root_transport: wyrd_format::BaoRoot::from_bytes(
+                *blake3::hash(&second_content.root.sealed).as_bytes(),
+            ),
+        },
+        None,
+    );
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    for id in &second_content.content_ids {
+        engine
+            .set_materialization(*id, MaterializationState::Cached)
+            .unwrap();
+    }
+    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+
+    // Both roots contribute children to the merged root directory,
+    // proving the drive has two eligible heads.
+    let root = daemon.view().lookup("").unwrap();
+    let names: Vec<String> = daemon
+        .view()
+        .readdir(&root)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert!(names.contains(&"a.txt".to_string()), "{names:?}");
+    assert!(names.contains(&"b.txt".to_string()), "{names:?}");
+
+    let (live, backend) = daemon.into_live(Duration::from_secs(5));
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        let mut live = live;
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &LiveConfig {
+                interval: Duration::from_millis(10),
+                error_base_delay: Duration::from_millis(5),
+                error_max_delay: Duration::from_millis(20),
+                max_consecutive_errors: 10,
+            },
+            &mut |_, _| {},
+        )
+    });
+
+    let before = backend.generation().unwrap();
+    assert_eq!(
+        backend.mkdir_at(1, "dir"),
+        Err(fuser::Errno::EIO),
+        "a conflicted drive has no single tree to mutate"
+    );
+    // Representative non-mkdir entry points fail the same way.
+    assert_eq!(backend.unlink_at(1, "a.txt"), Err(fuser::Errno::EIO));
+    assert_eq!(
+        backend.rename_at(1, "a.txt", 1, "z.txt", false),
+        Err(fuser::Errno::EIO)
+    );
+    assert_eq!(
+        backend.generation().unwrap(),
+        before,
+        "a conflicted mutation authors no snapshot"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+    loaded.rig.teardown();
 }

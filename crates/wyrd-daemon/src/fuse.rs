@@ -1,15 +1,21 @@
 //! The FUSE presentation backend: kernel ops mapped onto the daemon's
-//! [`DriveView`] over an inode table. Read-only: every mutating kernel
-//! op is refused at the boundary (writes, rename/delete/mkdir, and
-//! conflict UX are out of scope for the slice).
+//! [`DriveView`] over an inode table. Reads are served directly; writes
+//! are buffered in per-handle sessions and committed as snapshots
+//! through the daemon's mutation channel (see `docs/write-path.md`).
+//! Namespace operations not yet implemented — `unlink`, `rmdir`,
+//! `rename`, and `setattr` — fall through to `ENOSYS`; deliberately
+//! unsupported flags (`O_APPEND`, `O_DIRECT`, `O_PATH`) are
+//! `EOPNOTSUPP`.
 //!
 //! Error mapping happens only here, per `docs/sync-and-peers.md`:
 //! absence maps to `ENOENT`, `Unavailable`/`Corrupt`/`Conflict` to
 //! `EIO` (scrub/repair and fetch-on-open are the daemon's duties before
 //! this boundary is allowed to block or serve).
 //!
-//! Synthetic ownership: v0 preserves no uid/gid or permission metadata, so
-//! this backend presents uid/gid zero and read-only mode bits as policy.
+//! Synthetic ownership: v0 preserves no uid/gid or permission metadata;
+//! apart from the represented exec bit, the backend presents uid/gid
+//! zero and synthesized mode bits (files `0644`/`0755`, directories
+//! `0755`).
 //!
 //! Lock discipline: a poisoned lock is a local data-path failure, so
 //! kernel callbacks answer `EIO` instead of panicking the mount. File
@@ -38,8 +44,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
-use crate::mutation::{MutationError, MutationKind, MutationQueue};
+use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::Projection;
+use crate::session::{HandleId, WriteBudget};
 use crate::want::{wait_for_materialization, WantRegistry};
 
 /// The attribute time-to-limit served to the kernel: short, since
@@ -94,11 +101,49 @@ struct DirectoryState {
     next_handle: u64,
 }
 
-/// Open file captures: the immutable file identity taken at open
-/// time, keyed by the handle the kernel uses. A descriptor serves the
-/// object that was opened, not whatever occupies the path later.
+/// Open file handles: the immutable read capture, or the buffered
+/// writable session. A read descriptor serves the object that was
+/// opened; a writable handle adds one mutable logical image on top.
+enum Handle {
+    Read(OpenFile),
+    Write(Arc<Mutex<WriteHandle>>),
+}
+
+/// One writable open: the path, the identity it opened against, and the
+/// dense logical image its writes build.
+///
+/// State machine (serialized by this handle's own mutex, never held by
+/// the loop): a clean handle has `image == None` and serves its open-time
+/// `capture`. The first write materializes the base into `image` and sets
+/// `dirty`. Every commit-producing operation (`O_SYNC` write, `flush`,
+/// `fsync`, `release`) runs under this mutex, so no write can interleave
+/// with a commit and no two commits can overlap. A successful commit
+/// advances `base` to the committed identity, drops the image, and makes
+/// the handle clean; a failed commit is terminal (`failed`), discarding
+/// the image and mapping every later operation to `EIO`.
+struct WriteHandle {
+    path: String,
+    /// The open-time capture: clean reads serve exactly these bytes, so
+    /// head advancement never changes what an open descriptor returns.
+    capture: OpenFile,
+    /// The identity a commit must still find at `path`.
+    base: FileIdentity,
+    /// The dense logical image; `None` while clean.
+    image: Option<Vec<u8>>,
+    /// The image differs from `base` (or `O_TRUNC` started it empty), so
+    /// the next committing boundary authors a snapshot.
+    dirty: bool,
+    /// A failed commit discarded the overlay; the handle is unusable.
+    failed: bool,
+    /// `O_SYNC`/`O_DSYNC`: each successful write is its own commit.
+    sync: bool,
+    /// Budget key for the buffered image.
+    id: HandleId,
+}
+
+/// Open file captures keyed by the handle the kernel uses.
 struct OpenFiles {
-    by_handle: HashMap<u64, OpenFile>,
+    by_handle: HashMap<u64, Handle>,
     next: u64,
 }
 
@@ -249,6 +294,9 @@ where
     /// makes every mutating callback `EROFS` (a standalone read-only
     /// backend).
     mutations: Option<Arc<MutationQueue>>,
+    /// The session's write budget: bounds the buffered logical images of
+    /// writable handles. Independent of the projection and store locks.
+    budget: Arc<WriteBudget>,
     /// How long `open`/`read` may block on demand before `EIO`.
     open_timeout: Duration,
 }
@@ -266,6 +314,7 @@ fn mutation_errno(error: &MutationError) -> fuser::Errno {
         MutationError::AlreadyExists(_) => fuser::Errno::EEXIST,
         MutationError::DirectoryNotEmpty(_) => fuser::Errno::ENOTEMPTY,
         MutationError::Conflicted { .. }
+        | MutationError::Stale(_)
         | MutationError::Lock
         | MutationError::Store
         | MutationError::Engine => fuser::Errno::EIO,
@@ -292,6 +341,19 @@ fn join(parent: &str, name: &str) -> String {
     }
 }
 
+/// The `[offset, offset+size)` window of a buffered image, clamped to
+/// the image end (never serving past the logical file).
+fn slice_image(image: &[u8], offset: u64, size: u32) -> Vec<u8> {
+    let Ok(start) = usize::try_from(offset) else {
+        return Vec::new();
+    };
+    if start >= image.len() {
+        return Vec::new();
+    }
+    let end = start.saturating_add(size as usize).min(image.len());
+    image[start..end].to_vec()
+}
+
 /// Presentation attributes for one node: kind, size, exec bit. A
 /// conflicted path presents as a directory — the readdir union rules
 /// keep it navigable, and the conflict itself fails on read.
@@ -304,6 +366,15 @@ fn attr_of(node: &Node) -> (fuser::FileType, u64, bool) {
         Node::Symlink { .. } => (fuser::FileType::Symlink, 0, false),
         Node::Conflict { .. } => (fuser::FileType::Directory, 0, false),
     }
+}
+
+/// Open flags this slice deliberately refuses. `O_APPEND` is deferred
+/// (its append-against-current-end semantics are a separate contract);
+/// `O_DIRECT`/`O_PATH` are not representable. All are `EOPNOTSUPP`
+/// ("known and deliberately unsupported"), distinct from the `ENOSYS`
+/// of a handler that does not exist.
+fn unsupported_open_flags(flags: i32) -> bool {
+    flags & (libc::O_APPEND | libc::O_DIRECT | libc::O_PATH) != 0
 }
 
 /// The POSIX error the kernel boundary documents for each view failure.
@@ -339,6 +410,7 @@ where
             }),
             wants: None,
             mutations: None,
+            budget: Arc::new(WriteBudget::default()),
             open_timeout: Duration::ZERO,
         }
     }
@@ -362,6 +434,7 @@ where
             }),
             wants: None,
             mutations: None,
+            budget: Arc::new(WriteBudget::default()),
             open_timeout: Duration::ZERO,
         }
     }
@@ -389,6 +462,7 @@ where
             }),
             wants: Some(wants),
             mutations: Some(mutations),
+            budget: Arc::new(WriteBudget::default()),
             open_timeout,
         }
     }
@@ -535,15 +609,37 @@ where
         };
         let handle = files.next;
         files.next = handle.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
-        files.by_handle.insert(handle, file);
+        files.by_handle.insert(handle, Handle::Read(file));
         Ok(FileHandle(handle))
+    }
+
+    /// Insert a freshly built handle, returning its kernel handle.
+    fn insert_handle(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
+        let Ok(mut files) = self.files.lock() else {
+            return Err(fuser::Errno::EIO);
+        };
+        let fh = files.next;
+        files.next = fh.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
+        files.by_handle.insert(fh, handle);
+        Ok(FileHandle(fh))
+    }
+
+    /// Clone the handle entry out of the table, keeping the table lock
+    /// off the data path.
+    fn handle_of(&self, fh: FileHandle) -> Result<Handle, fuser::Errno> {
+        let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
+        match files.by_handle.get(&fh.0) {
+            Some(Handle::Read(file)) => Ok(Handle::Read(file.clone())),
+            Some(Handle::Write(handle)) => Ok(Handle::Write(Arc::clone(handle))),
+            None => Err(fuser::Errno::EBADF),
+        }
     }
 
     /// Read through an open handle: the open-time capture serves the
     /// bytes, so head advancement cannot change what an open
-    /// descriptor returns. Unknown handles are EBADF. The capture is
-    /// cloned out before the view is touched, keeping the lock order
-    /// view-before-files everywhere. The non-callback form of the
+    /// descriptor returns. A dirty writable handle serves its buffered
+    /// image instead (read-your-writes); a clean one serves its pinned
+    /// capture. Unknown handles are EBADF. The non-callback form of the
     /// kernel `read` op.
     ///
     /// First touch of an unmaterialized chunk registers a want and
@@ -555,14 +651,32 @@ where
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, fuser::Errno> {
-        let file = {
-            let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
-            files
-                .by_handle
-                .get(&fh.0)
-                .cloned()
-                .ok_or(fuser::Errno::EBADF)?
-        };
+        match self.handle_of(fh)? {
+            Handle::Read(file) => self.read_via_capture(&file, offset, size),
+            Handle::Write(handle) => {
+                let (image, capture, failed) = {
+                    let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+                    (write.image.clone(), write.capture.clone(), write.failed)
+                };
+                if failed {
+                    return Err(fuser::Errno::EIO);
+                }
+                match image {
+                    Some(image) => Ok(slice_image(&image, offset, size)),
+                    None => self.read_via_capture(&capture, offset, size),
+                }
+            }
+        }
+    }
+
+    /// Read a pinned capture through the current projection, with the
+    /// demand path for not-yet-local content.
+    fn read_via_capture(
+        &self,
+        file: &OpenFile,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, fuser::Errno> {
         let attempt = |this: &Self| {
             Result::<Vec<u8>, (ViewError, fuser::Errno)>::Ok({
                 let projection = this
@@ -570,7 +684,7 @@ where
                     .map_err(|error| (ViewError::Store("projection lock".into()), error))?;
                 projection
                     .view()
-                    .read(&file, offset, size as usize)
+                    .read(file, offset, size as usize)
                     .map_err(|error| (error.clone(), errno_of(&error)))?
             })
         };
@@ -608,14 +722,304 @@ where
         map(first)
     }
 
-    /// Drop an open handle. Unknown handles release quietly: the
-    /// kernel does not double-close, and a duplicate release must not
-    /// fail the unmount path.
-    fn release_handle(&self, fh: FileHandle) -> Result<(), fuser::Errno> {
-        let Ok(mut files) = self.files.lock() else {
-            return Err(fuser::Errno::EIO);
+    /// Open `path` for writing: capture the open-time identity and
+    /// return a writable handle. `O_TRUNC` starts the image empty and
+    /// immediately dirty (so a close with no writes still commits the
+    /// empty file). `O_SYNC`/`O_DSYNC` make every successful write its
+    /// own commit. `O_APPEND` is deferred to a later slice and refused
+    /// with `EOPNOTSUPP`.
+    pub fn open_write(&self, path: &str, flags: i32) -> Result<FileHandle, fuser::Errno> {
+        if self.mutations.is_none() {
+            return Err(fuser::Errno::EROFS);
+        }
+        if flags & libc::O_APPEND != 0 {
+            return Err(fuser::Errno::EOPNOTSUPP);
+        }
+        let projection = self.projection()?;
+        let node = projection
+            .view()
+            .lookup(path)
+            .map_err(|error| errno_of(&error))?;
+        let capture = projection
+            .view()
+            .open(&node)
+            .map_err(|error| errno_of(&error))?;
+        let base = match &node {
+            Node::File {
+                size,
+                executable,
+                chunks,
+            } => FileIdentity::new(*size, *executable, chunks.clone()),
+            // `view.open` above already rejected non-files; this arm is
+            // unreachable but keeps the identity derivation total.
+            _ => return Err(fuser::Errno::EISDIR),
         };
-        files.by_handle.remove(&fh.0);
+        let id = self.budget.next_handle();
+        let truncate = flags & libc::O_TRUNC != 0;
+        let (image, dirty) = if truncate {
+            self.budget
+                .reserve(id, 0)
+                .map_err(|_| fuser::Errno::ENOSPC)?;
+            (Some(Vec::new()), true)
+        } else {
+            (None, false)
+        };
+        let handle = WriteHandle {
+            path: path.to_string(),
+            capture,
+            base,
+            image,
+            dirty,
+            failed: false,
+            sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
+            id,
+        };
+        self.insert_handle(Handle::Write(Arc::new(Mutex::new(handle))))
+    }
+
+    /// Create the file `name` under `parent_ino` and open it for
+    /// writing. `create` is create-plus-open as one daemon operation:
+    /// the empty file is its own snapshot, then the returned handle is
+    /// an ordinary writable handle (no special commit semantics).
+    pub fn create_at(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        flags: i32,
+    ) -> Result<(FileHandle, u64, fuser::FileAttr), fuser::Errno> {
+        if unsupported_open_flags(flags) {
+            return Err(fuser::Errno::EOPNOTSUPP);
+        }
+        let parent_path = self.inode_path(parent_ino)?;
+        let child_path = join(&parent_path, name);
+        let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
+        let identity = match mutations
+            .submit(MutationKind::CreateFile {
+                path: child_path.clone(),
+            })
+            .map_err(|error| mutation_errno(&error))?
+        {
+            MutationOutcome::Created(identity) => identity,
+            _ => return Err(fuser::Errno::EIO),
+        };
+        let capture = self.capture_for(&child_path)?;
+        let id = self.budget.next_handle();
+        let handle = WriteHandle {
+            path: child_path.clone(),
+            capture,
+            base: identity,
+            image: None,
+            dirty: false,
+            failed: false,
+            sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
+            id,
+        };
+        let fh = self.insert_handle(Handle::Write(Arc::new(Mutex::new(handle))))?;
+        let (ino, node, _) = self.resolve_inode(&child_path)?;
+        let attr = self.attr(ino, &node);
+        Ok((fh, ino, attr))
+    }
+
+    /// Buffer `data` at `offset` on a writable handle: materialize the
+    /// base on first touch, zero-fill any gap, apply last-write-wins,
+    /// and enforce the write budget by the resulting logical length
+    /// (`ENOSPC` on overflow, handle unchanged). Under `O_SYNC` the
+    /// write then commits before returning.
+    pub fn write_handle(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, fuser::Errno> {
+        if data.is_empty() {
+            // POSIX no-op: a zero-length write changes nothing and must
+            // not materialize, mark the handle dirty, or commit. It
+            // still validates the descriptor: an unknown handle or one
+            // without write access is `EBADF` just like any write.
+            let Handle::Write(handle) = self.handle_of(fh)? else {
+                return Err(fuser::Errno::EBADF);
+            };
+            let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+            if write.failed {
+                return Err(fuser::Errno::EIO);
+            }
+            return Ok(0);
+        }
+        let Handle::Write(handle) = self.handle_of(fh)? else {
+            // A read-only descriptor has no write access.
+            return Err(fuser::Errno::EBADF);
+        };
+        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        if write.failed {
+            return Err(fuser::Errno::EIO);
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(fuser::Errno::EFBIG)?;
+        let end = usize::try_from(end).map_err(|_| fuser::Errno::EFBIG)?;
+
+        match write.image.take() {
+            Some(mut image) => {
+                // Dirty handle: the image is already materialized and
+                // budgeted, so account the extension before mutating.
+                let new_len = image.len().max(end);
+                if self.budget.reserve(write.id, new_len).is_err() {
+                    write.image = Some(image);
+                    return Err(fuser::Errno::ENOSPC);
+                }
+                if end > image.len() {
+                    image.resize(end, 0);
+                }
+                image[offset as usize..end].copy_from_slice(data);
+                write.image = Some(image);
+            }
+            None => {
+                // Clean handle: reserve the projected logical length
+                // *before* materializing, so a base larger than the
+                // per-handle cap fails closed without allocating or
+                // reading it.
+                let projected = usize::try_from(write.base.size())
+                    .unwrap_or(usize::MAX)
+                    .max(end);
+                if self.budget.reserve(write.id, projected).is_err() {
+                    return Err(fuser::Errno::ENOSPC);
+                }
+                let capture = write.capture.clone();
+                let len = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
+                let mut image = match self.read_via_capture(
+                    &capture,
+                    0,
+                    u32::try_from(len).unwrap_or(u32::MAX),
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        // Nothing changed on the handle; drop the
+                        // reservation it never used.
+                        self.budget.release(write.id);
+                        return Err(error);
+                    }
+                };
+                if end > image.len() {
+                    image.resize(end, 0);
+                }
+                image[offset as usize..end].copy_from_slice(data);
+                write.image = Some(image);
+            }
+        }
+        write.dirty = true;
+        let sync = write.sync;
+        if sync {
+            // Commit under the same guard: the write-plus-commit is
+            // one atomic step, so no concurrent write can join this
+            // snapshot and each accepted O_SYNC write is its own.
+            self.commit_locked(&mut write)?;
+        }
+        drop(write);
+        Ok(data.len() as u32)
+    }
+
+    /// Commit a dirty writable handle: submit its full image, advance
+    /// the handle's base to the committed identity, drop the image, and
+    /// release its budget. A clean handle commits nothing. A failed
+    /// commit is terminal: the overlay is discarded and every later
+    /// operation returns `EIO`.
+    pub fn commit_handle(&self, fh: FileHandle) -> Result<(), fuser::Errno> {
+        match self.handle_of(fh)? {
+            Handle::Read(_) => Ok(()),
+            Handle::Write(handle) => self.commit_write_handle(&handle),
+        }
+    }
+
+    /// Commit a writable handle held directly (the release path has
+    /// already removed it from the table).
+    fn commit_write_handle(&self, handle: &Arc<Mutex<WriteHandle>>) -> Result<(), fuser::Errno> {
+        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        self.commit_locked(&mut write)
+    }
+
+    /// The commit transition under an already-held handle guard. Keeping
+    /// it separate from the locking wrapper lets `O_SYNC` writes commit
+    /// without releasing and re-acquiring the lock (which would let a
+    /// concurrent write join the snapshot).
+    fn commit_locked(&self, write: &mut WriteHandle) -> Result<(), fuser::Errno> {
+        if write.failed {
+            return Err(fuser::Errno::EIO);
+        }
+        if !write.dirty {
+            return Ok(());
+        }
+        let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
+        let content = write.image.take().unwrap_or_default();
+        let path = write.path.clone();
+        let base = write.base.clone();
+        let outcome = mutations.submit(MutationKind::CommitFile {
+            path,
+            base,
+            content,
+        });
+        match outcome {
+            Ok(MutationOutcome::Committed(identity)) => {
+                write.base = identity;
+                match self.capture_for(&write.path) {
+                    Ok(capture) => {
+                        write.capture = capture;
+                        write.dirty = false;
+                        self.budget.release(write.id);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        write.failed = true;
+                        write.dirty = false;
+                        self.budget.release(write.id);
+                        Err(error)
+                    }
+                }
+            }
+            Ok(_) => {
+                write.failed = true;
+                write.dirty = false;
+                self.budget.release(write.id);
+                Err(fuser::Errno::EIO)
+            }
+            Err(error) => {
+                write.failed = true;
+                write.dirty = false;
+                self.budget.release(write.id);
+                Err(mutation_errno(&error))
+            }
+        }
+    }
+
+    /// Resolve `path` in the current projection and re-open it as a
+    /// fresh capture. Used after a commit to re-pin the handle on the
+    /// newly authored bytes.
+    fn capture_for(&self, path: &str) -> Result<OpenFile, fuser::Errno> {
+        let projection = self.projection()?;
+        let node = projection
+            .view()
+            .lookup(path)
+            .map_err(|error| errno_of(&error))?;
+        projection
+            .view()
+            .open(&node)
+            .map_err(|error| errno_of(&error))
+    }
+
+    /// Drop an open handle. A writable handle commits best-effort
+    /// first (a `release` error is not observable to the application);
+    /// unknown handles release quietly. The handle is removed from the
+    /// table before the commit so a concurrent lookup cannot race the
+    /// drop.
+    pub fn release_handle(&self, fh: FileHandle) -> Result<(), fuser::Errno> {
+        let removed = {
+            let Ok(mut files) = self.files.lock() else {
+                return Err(fuser::Errno::EIO);
+            };
+            files.by_handle.remove(&fh.0)
+        };
+        if let Some(Handle::Write(handle)) = removed {
+            let _ = self.commit_write_handle(&handle);
+        }
         Ok(())
     }
 
@@ -630,13 +1034,15 @@ where
             ctime: MOUNT_TIME,
             crtime: MOUNT_TIME,
             kind,
-            // Read-only presentation: owner-readable, dirs/executable
-            // files traversable, never writable.
+            // The mount is single-user and the format represents only
+            // the exec bit: regular files present owner-writable modes
+            // (0644, or 0755 when executable) since writable sessions
+            // are served, and directories are owner-writable 0755.
             perm: match kind {
-                fuser::FileType::Directory => 0o555,
+                fuser::FileType::Directory => 0o755,
                 fuser::FileType::Symlink => 0o777,
-                _ if executable => 0o555,
-                _ => 0o444,
+                _ if executable => 0o755,
+                _ => 0o644,
             },
             nlink: 1,
             uid: 0,
@@ -922,9 +1328,8 @@ where
     }
 
     fn open(&self, _req: &fuser::Request, ino: INodeNo, flags: OpenFlags, reply: fuser::ReplyOpen) {
-        // Read-only mount: refuse write-intent access modes.
-        if flags.acc_mode() != fuser::OpenAccMode::O_RDONLY {
-            reply.error(fuser::Errno::EROFS);
+        if unsupported_open_flags(flags.0) {
+            reply.error(fuser::Errno::EOPNOTSUPP);
             return;
         }
         let path = match self.inode_path(ino.0) {
@@ -961,7 +1366,13 @@ where
                 return;
             }
         }
-        match self.open_at(&path) {
+        let opened = match flags.acc_mode() {
+            fuser::OpenAccMode::O_RDONLY => self.open_at(&path),
+            fuser::OpenAccMode::O_WRONLY | fuser::OpenAccMode::O_RDWR => {
+                self.open_write(&path, flags.0)
+            }
+        };
+        match opened {
             Ok(handle) => reply.opened(handle, fuser::FopenFlags::FOPEN_DIRECT_IO),
             Err(error) => reply.error(error),
         }
@@ -1056,6 +1467,86 @@ where
     ) {
         match self.release_handle(fh) {
             Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    /// Buffer a write on a writable handle. The callback form of
+    /// [`write_handle`](FuseBackend::write_handle).
+    fn write(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        match self.write_handle(fh, offset, data) {
+            Ok(written) => reply.written(written),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    /// Commit the handle: `flush` and `fsync` establish the same Wyrd
+    /// durability boundary (the commit *is* the boundary; there is no
+    /// cached-but-not-durable state). The callback form of
+    /// [`commit_handle`](FuseBackend::commit_handle).
+    fn flush(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: fuser::ReplyEmpty,
+    ) {
+        match self.commit_handle(fh) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn fsync(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        match self.commit_handle(fh) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    /// Create and open a file: the empty file is committed as its own
+    /// snapshot, then served by an ordinary writable handle.
+    fn create(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(fuser::Errno::EINVAL);
+            return;
+        };
+        match self.create_at(parent.0, name, flags) {
+            Ok((fh, _ino, attr)) => reply.created(
+                &TTL,
+                &attr,
+                fuser::Generation(0),
+                fh,
+                fuser::FopenFlags::FOPEN_DIRECT_IO,
+            ),
             Err(error) => reply.error(error),
         }
     }
@@ -1263,6 +1754,43 @@ mod tests {
         assert_eq!(kind, fuser::FileType::Symlink);
         let (kind, _, _) = attr_of(&Node::Conflict { versions: vec![] });
         assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
+    }
+
+    /// A first write whose resulting logical length exceeds the
+    /// per-handle budget fails closed with `ENOSPC` *before*
+    /// materializing the base, so an oversized file never allocates
+    /// past the advertised bound.
+    #[test]
+    fn first_write_over_the_handle_budget_does_not_materialize() {
+        let mut store = MemoryObjectStore::default();
+        let root = Tree::from_entries(vec![Entry::file(
+            "big",
+            100,
+            false,
+            vec![ContentId::from_bytes([0x01; 32])],
+        )
+        .unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+        // A tiny budget and a channel so `open_write` is permitted; the
+        // write itself must be refused before any base read.
+        let mut backend = FuseBackend::new(view);
+        backend.budget = Arc::new(WriteBudget::with_limits(4, 100, 8));
+        backend.mutations = Some(Arc::new(MutationQueue::default()));
+
+        let fh = backend.open_write("big", libc::O_RDWR).unwrap();
+        assert_eq!(
+            backend.write_handle(fh, 0, b"x"),
+            Err(fuser::Errno::ENOSPC),
+            "a base over the per-handle cap is refused"
+        );
+        assert_eq!(
+            backend.budget.total(),
+            0,
+            "the refused write reserves nothing"
+        );
     }
 
     #[test]

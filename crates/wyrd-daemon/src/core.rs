@@ -195,7 +195,27 @@ where
     /// classified inside `wyrd-sync` (see [`Engine::live_heads`]). This
     /// is the only production projection into the view.
     pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
-        self.view.set_heads(view_heads(self.engine.live_heads()?));
+        let runtime = self.engine.runtime_state()?;
+        let heads = self.engine.live_heads()?;
+        let verified = {
+            let store = self
+                .view
+                .store_read()
+                .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
+            heads
+                .into_iter()
+                .filter(|head| {
+                    wyrd_sync::closure::verify_head_closure(
+                        &runtime,
+                        head.snapshot(),
+                        &*store,
+                        &wyrd_sync::ingest::Limits::V0,
+                    )
+                    .is_ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        self.view.set_heads(view_heads(verified));
         Ok(())
     }
 
@@ -589,12 +609,31 @@ where
                 generation,
             });
         }
+        // Install only heads whose tree/manifest closure is complete and
+        // corresponds: a head whose closure is missing or mismatched is not
+        // materializable and must never be served.
+        let heads = self.engine.live_heads()?;
+        let verified = {
+            let store = self.store.read().map_err(|_| LiveError::Lock)?;
+            heads
+                .into_iter()
+                .filter(|head| {
+                    wyrd_sync::closure::verify_head_closure(
+                        &completed_runtime,
+                        head.snapshot(),
+                        &*store,
+                        &wyrd_sync::ingest::Limits::V0,
+                    )
+                    .is_ok()
+                })
+                .collect::<Vec<_>>()
+        };
         let next = Projection::new(
             Arc::clone(&self.store),
             DaemonMaterialization {
                 runtime: completed_runtime,
             },
-            view_heads(self.engine.live_heads()?),
+            view_heads(verified),
             generation + 1,
             revision,
         );

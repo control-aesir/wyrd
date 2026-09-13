@@ -55,9 +55,13 @@
 //!     serving router loopback).
 //! 14. `snapshot_manifest_closure_correspondence` — a snapshot's manifest
 //!     hierarchy must correspond exactly to its tree closure; a valid
-//!     manifest advertising unreachable objects is rejected. Establishes
-//!     the invariant and verifier; read-side enforcement awaits
-//!     fetchable tree closure (`object-model.md`, decision 27).
+//!     manifest advertising unreachable objects is rejected
+//!     (`object-model.md`, decision 27).
+//! 15. `a_mismatched_snapshot_manifest_never_mounts` — tree nodes are
+//!     fetchable, and the daemon verifies each head's tree/manifest
+//!     closure before installing it: a validly signed body whose manifest
+//!     describes different content never becomes a mounted head
+//!     (`object-model.md`, decision 27).
 
 #[cfg(test)]
 mod fuse_contracts;

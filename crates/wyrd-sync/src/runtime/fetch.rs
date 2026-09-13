@@ -44,14 +44,13 @@ pub(super) enum FetchOutcome<T> {
 /// `root_manifest` (decision 26) over the served claim: the transport
 /// root fetch names exactly the envelope the author signed. Absent that
 /// route, the eager exchange serves its own claim, which `open_record`
-/// then enforces as AAD. What fetch does *not* check is that the
+/// then enforces as AAD. What fetch does *not* check here is that the
 /// manifest's entries describe the snapshot's tree: that correspondence
 /// is established by `crate::closure::verify_snapshot_manifest`, which
-/// runs as an authoring self-check and wherever a reader holds both
-/// closures. It is not enforced here yet because tree nodes are not
-/// independently fetchable, so a receiver cannot assemble the tree
-/// closure; read-side enforcement is deferred to tree-closure
-/// materialization (object-model decision 27).
+/// runs as an authoring self-check and, on the read side, as the
+/// daemon's head gate before any classified head is installed. Fetch
+/// records the bytes; the gate refuses to materialize a closure that is
+/// incomplete or does not correspond (object-model decision 27).
 pub(super) fn root(
     drive: &DriveId,
     bulk: &mut impl BulkSource,

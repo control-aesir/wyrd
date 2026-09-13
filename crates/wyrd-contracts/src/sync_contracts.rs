@@ -4,8 +4,8 @@
 use wyrd_daemon::core::Daemon;
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
-    BaoRoot, Change, ContentId, Entry, FetchStatus, ManifestEntry, MemoryObjectStore, ObjectKind,
-    ObjectStore, Snapshot, SnapshotId, StorageId, Tree,
+    BaoRoot, Change, ContentId, Entry, FetchStatus, Manifest, ManifestEntry, MemoryObjectStore,
+    ObjectKind, ObjectStore, Snapshot, SnapshotId, StorageId, Tree,
 };
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -14,6 +14,7 @@ use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::{Engine, EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
+use wyrd_sync::seal::{self, SEAL_VERSION};
 use wyrd_sync::transport::mailbox::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
@@ -802,4 +803,132 @@ fn conflicted_drive_rejects_mounted_writes() {
     stop.store(true, Ordering::Relaxed);
     handle.join().unwrap().unwrap();
     loaded.rig.teardown();
+}
+
+/// A validly signed body whose manifest describes different, individually
+/// valid content must not become a mounted head. The daemon verifies the
+/// tree/manifest closure before installing; without the gate the head would
+/// mount over its (locally present) tree and serve content the manifest does
+/// not describe.
+#[test]
+fn a_mismatched_snapshot_manifest_never_mounts() {
+    let mut rig = Rig::new();
+    let admit = rig.admit.clone();
+    rig.enqueue_capability(&admit, &[rig.epoch1.clone(), rig.epoch2.clone()]);
+
+    // The body's tree T1 is present locally and would serve `honest.txt`.
+    let mut store = MemoryObjectStore::default();
+    let honest_chunk = store.insert(ObjectKind::Chunk, b"honest").unwrap();
+    let tree1 = Tree::from_entries(vec![Entry::file(
+        "honest.txt",
+        6,
+        false,
+        vec![honest_chunk],
+    )
+    .unwrap()])
+    .unwrap();
+    let tree1_id = tree1.insert_into(&mut store).unwrap();
+    let body = signed_snapshot(Vec::new(), tree1_id, &rig.owner, rig.admit_id, 2, 2_000);
+    let body_id = body.snapshot_id();
+
+    // The manifest is valid, bound to the body, and self-maps a *different*
+    // tree T2 with different content.
+    let epoch = 2;
+    let evil_plain = b"evil";
+    let evil_chunk = ContentId::derive(ObjectKind::Chunk, evil_plain);
+    let evil_tree = Tree::from_entries(vec![
+        Entry::file("evil.txt", 4, false, vec![evil_chunk]).unwrap()
+    ])
+    .unwrap();
+    let evil_tree_bytes = evil_tree.encode();
+    let evil_tree_id = ContentId::derive(ObjectKind::Tree, &evil_tree_bytes);
+    let chunk_key = rig.epoch2.object_key(
+        &drive(),
+        epoch,
+        &evil_chunk,
+        ObjectKind::Chunk,
+        SEAL_VERSION,
+    );
+    let chunk_obj = seal::seal(&chunk_key, ObjectKind::Chunk, &evil_chunk, evil_plain).unwrap();
+    let chunk_entry = seal::entry_for(
+        ObjectKind::Chunk,
+        epoch,
+        &chunk_obj,
+        &evil_chunk,
+        evil_plain,
+    )
+    .unwrap();
+    let tree_key = rig.epoch2.object_key(
+        &drive(),
+        epoch,
+        &evil_tree_id,
+        ObjectKind::Tree,
+        SEAL_VERSION,
+    );
+    let tree_obj =
+        seal::seal(&tree_key, ObjectKind::Tree, &evil_tree_id, &evil_tree_bytes).unwrap();
+    let tree_entry = seal::entry_for(
+        ObjectKind::Tree,
+        epoch,
+        &tree_obj,
+        &evil_tree_id,
+        &evil_tree_bytes,
+    )
+    .unwrap();
+    let mut entries = vec![tree_entry, chunk_entry];
+    entries.sort_by(|a, b| {
+        a.content_id
+            .as_bytes()
+            .cmp(b.content_id.as_bytes())
+            .then(a.kind.byte().cmp(&b.kind.byte()))
+            .then(a.version.cmp(&b.version))
+    });
+    let manifest = Manifest {
+        snapshot: body_id,
+        entries,
+        children: Vec::new(),
+    };
+    let manifest_key = rig.epoch2.manifest_key(&drive(), epoch, &body_id);
+    let (manifest_id, manifest_obj) = seal::seal_manifest(&manifest_key, &manifest).unwrap();
+    let manifest_bytes = manifest_obj.encode();
+
+    // A compliant peer serves the body, the hostile manifest, and T2's
+    // sealed objects.
+    let mut bulk = MemoryBulkSource::default();
+    bulk.publish_snapshot(body_id, body.encode());
+    bulk.publish_transport(body.encode());
+    bulk.publish_root(
+        body_id,
+        SealedManifest {
+            content_id: manifest_id,
+            sealed: manifest_bytes.clone(),
+        },
+    );
+    bulk.publish_transport(manifest_bytes.clone());
+    bulk.publish_sealed(chunk_obj.storage_id(), chunk_obj.encode());
+    bulk.publish_sealed(tree_obj.storage_id(), tree_obj.encode());
+    rig.enqueue_announcement(
+        body_id,
+        rig.admit_id,
+        epoch,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body.encode()).as_bytes()),
+            root_manifest: manifest_id,
+            root_transport: BaoRoot::from_bytes(*blake3::hash(&manifest_bytes).as_bytes()),
+        },
+        None,
+    );
+
+    let engine = rig.take_engine();
+    let mut daemon = Daemon::new(engine, store).unwrap();
+    daemon.drain(&mut rig.relay).unwrap();
+    daemon.execute_plan(&mut bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+
+    assert!(
+        matches!(daemon.view().lookup("honest.txt"), Err(ViewError::NotFound)),
+        "a body whose manifest describes other content must not mount"
+    );
+    drop(daemon);
+    rig.teardown();
 }

@@ -13,10 +13,9 @@ use super::types::{Attr, DirEntry, Kind, Materialization, Node, OpenFile, ViewEr
 /// snapshot's own tree, so the snapshot/tree binding holds by
 /// construction. Manifests are uninvolved: materialized reads address
 /// plaintext by content id, and tree/manifest correspondence is sync's
-/// concern (`wyrd_sync::closure::verify_snapshot_manifest`), enforced
-/// where both closures are available — the authoring path today, the
-/// fetch path once tree nodes are independently fetchable (object-model
-/// decision 27).
+/// concern (`wyrd_sync::closure`): the daemon verifies each head's closure
+/// before installing it, so a head whose tree and manifest disagree never
+/// reaches this view (object-model decision 27).
 ///
 /// The object store sits behind a reference-counted lock, separate
 /// from the view's own (head/materialization) mutation: fetch and

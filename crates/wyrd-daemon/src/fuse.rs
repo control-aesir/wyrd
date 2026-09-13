@@ -249,14 +249,17 @@ where
         }
     }
 
-    /// Publish a new generation over the given view: the caller's view
-    /// becomes the served generation (bumped by one, same durable
-    /// revision). Open file descriptors keep serving their open-time
-    /// capture: they never consult heads again. This is the
-    /// test/simulation publication path — the production loop
-    /// publishes through [`LiveDaemon`](crate::core::LiveDaemon), which
-    /// also advances the durable revision.
-    pub fn publish(&self, view: DriveView<S, M>) -> Result<(), fuser::Errno> {
+    /// Publish a new generation over the given view without a durable
+    /// revision advance: the caller's view becomes the served
+    /// generation (bumped by one, prior revision carried over). Open
+    /// file descriptors keep serving their open-time capture: they
+    /// never consult heads again. This is the test/simulation
+    /// publication path — production publication goes through
+    /// [`LiveDaemon`](crate::core::LiveDaemon), which advances the
+    /// durable revision alongside the generation. The name is the
+    /// warning: a generation published here corresponds to no engine
+    /// commit, so production callers must never use it.
+    pub fn publish_without_revision(&self, view: DriveView<S, M>) -> Result<(), fuser::Errno> {
         let mut slot = self.projection.write().map_err(|_| fuser::Errno::EIO)?;
         let next = Projection::successor(&slot, view);
         *slot = Arc::new(next);
@@ -995,7 +998,7 @@ mod tests {
         // Heads advance underneath the open descriptor: publication
         // installs a whole new generation.
         backend
-            .publish(DriveView::shared(
+            .publish_without_revision(DriveView::shared(
                 backend.store_handle().unwrap(),
                 NoMaterialization,
                 heads(vec![next]),

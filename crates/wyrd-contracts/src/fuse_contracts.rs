@@ -132,7 +132,7 @@ fn open_fds_remain_stable_across_head_advancement() {
         wyrd_sync::durable::AuthorizedSnapshot::authorize(advanced, &crate::support::drive())
             .unwrap();
     backend
-        .publish(DriveView::shared(
+        .publish_without_revision(DriveView::shared(
             backend.store_handle().unwrap(),
             RemoteOnlyMaterialization,
             mount_heads(vec![advanced]),

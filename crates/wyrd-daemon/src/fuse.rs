@@ -84,7 +84,7 @@ struct InodeEntry {
     generation: u64,
 }
 
-type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
+pub(crate) type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
 
 /// One open directory: the listing pinned at opendir plus the
 /// projection generation it was enumerated from. Readdir serves the
@@ -1091,7 +1091,7 @@ where
     /// opendir, a stable snapshot of its enumeration generation.
     /// Poison maps to EIO like every other lock failure; an unknown
     /// handle is EBADF.
-    fn dir_entries(&self, fh: u64) -> Result<DirectoryEntries, fuser::Errno> {
+    pub(crate) fn dir_entries(&self, fh: u64) -> Result<DirectoryEntries, fuser::Errno> {
         let directories = self.directories.read().map_err(|_| fuser::Errno::EIO)?;
         directories
             .entries
@@ -1100,13 +1100,22 @@ where
             .ok_or(fuser::Errno::EBADF)
     }
 
+    /// Drop an open directory handle. Directory handles live in their
+    /// own table (separate from file handles), so they release through
+    /// this path, not [`release_handle`](Self::release_handle).
+    pub(crate) fn release_dir(&self, fh: u64) -> Result<(), fuser::Errno> {
+        let mut directories = self.directories.write().map_err(|_| fuser::Errno::EIO)?;
+        directories.entries.remove(&fh);
+        Ok(())
+    }
+
     /// Enumerate the directory at `path` into a fresh handle: resolve
     /// against the current projection, validate the ino, intern every
     /// child (kind-aware, stamped with the enumeration generation),
     /// and pin the listing with its generation. The non-callback form
     /// of the kernel `opendir` op — the surface the
     /// directory-consistency tests ride.
-    fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
+    pub(crate) fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
         let Ok(projection) = self.projection() else {
             return Err(fuser::Errno::EIO);
         };
@@ -1574,12 +1583,10 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        let Ok(mut directories) = self.directories.write() else {
-            reply.error(fuser::Errno::EIO);
-            return;
-        };
-        directories.entries.remove(&fh.0);
-        reply.ok();
+        match self.release_dir(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 
     fn open(&self, _req: &fuser::Request, ino: INodeNo, flags: OpenFlags, reply: fuser::ReplyOpen) {
@@ -2112,6 +2119,34 @@ mod tests {
         assert_eq!(kind, fuser::FileType::Symlink);
         let (kind, _, _) = attr_of(&Node::Conflict { versions: vec![] });
         assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
+    }
+
+    /// A backend with no mutation channel is the standalone read-only
+    /// mount: every mutating operation is refused with EROFS, never
+    /// silently accepted or half-applied.
+    #[test]
+    fn read_only_backend_refuses_mutations() {
+        let backend = backend();
+        assert_eq!(backend.mkdir_at(1, "x"), Err(fuser::Errno::EROFS));
+        assert_eq!(
+            backend.create_at(1, "x", libc::O_RDWR),
+            Err(fuser::Errno::EROFS)
+        );
+        assert_eq!(backend.unlink_at(1, "x"), Err(fuser::Errno::EROFS));
+        assert_eq!(backend.rmdir_at(1, "x"), Err(fuser::Errno::EROFS));
+        assert_eq!(
+            backend.rename_at(1, "x", 1, "y", false),
+            Err(fuser::Errno::EROFS)
+        );
+        assert_eq!(backend.set_size_at(1, 1), Err(fuser::Errno::EROFS));
+        assert_eq!(backend.set_exec_at(1, true), Err(fuser::Errno::EROFS));
+        assert_eq!(
+            backend.setattr_attrs(1, None, Some(1), None),
+            Err(fuser::Errno::EROFS)
+        );
+        // Read handles still serve; there is just no write handle to
+        // open.
+        assert_eq!(backend.open_write("x", 0), Err(fuser::Errno::EROFS));
     }
 
     /// A first write whose resulting logical length exceeds the

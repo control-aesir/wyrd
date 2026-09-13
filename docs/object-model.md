@@ -215,6 +215,33 @@ Design decisions:
   new mapping (rule in `trust.md`).
 - Manifests are versioned envelopes like every other object; their partition
   encoding is the open detail (below).
+- **Tree/manifest closure correspondence.** A snapshot body names a root
+  tree, and that tree's files reference chunks while its directories
+  reference subtrees. The manifest hierarchy is a second declaration of the
+  same content. Tree nodes are **structural**: the root is `snapshot.tree`
+  and each subtree is the `tree` of a `ChildManifest`; a `ManifestEntry` is
+  not required to represent a tree node (production authoring emits entries
+  only for content-bearing chunks). A `Tree`-kind entry, when present, must
+  name a structurally reachable tree and declare its exact plaintext size.
+  The invariant: every reachable file chunk has a manifest entry of kind
+  `Chunk`, every directory subtree has a child manifest and vice versa, and
+  no manifest entry names an object unreachable from the tree. The tree's
+  declared file size is not compared to its chunk list (size-vs-chunk
+  consistency is the reader's job, below); a chunk representation's size is
+  enforced by `seal`'s two checks when it is fetched. Verified by
+  `wyrd_sync::closure::verify_snapshot_manifest` (decision 27).
+- **Enforcement boundary (deferred).** The correspondence verifier is a
+  receiving-side authenticity boundary only once a receiver can assemble a
+  full tree closure. Tree nodes referenced by `snapshot.tree` and
+  `ChildManifest::tree` are not independently fetchable under the current
+  manifest model, so the receiver cannot yet run the verifier; read-side
+  enforcement is deferred to the tree-closure materialization work
+  (tracking issue: `fix(sync): fetch and enforce tree closure at snapshot
+  materialization`, `nostr:nevent1qqswr8fc4cy6lcl8j3q5ey42nv7g7d3pjj9d5qs3j45angx6j33v75gpz9mhxue69uhkwunpwdczuap49eehg8pgr9x`).
+  Today the verifier runs on locally available closures and as an
+  authoring self-check, which proves our own construction maintains the
+  invariant but does **not** close the hostile-author replica-corruption
+  case.
 
 ## Snapshots and the DAG
 
@@ -353,3 +380,4 @@ writes, stale-temp sweep on open, verify-on-read scrub.
 | 24 | Bootstrap invitations under their own framing, never an epoch control key: `version ‖ drive ‖ ephemeral pk ‖ recipient ‖ encryption key ‖ inviter ‖ nonce ‖ ciphertext` (ECDH to the invitee key, owner signature over the payload inside); sealed control kinds carry no invitation tag | sealing an invitation under the key it delivers is a hard bootstrap cycle; delivery (ECDH) and authorship (owner signature) stay separate checks |
 | 25 | Manifest ownership split: schema and canonical plaintext encoding in `wyrd-format`; manifest encryption, storage addressing, and capability semantics in `wyrd-sync` | the format owns the manifest's byte-level identity (ContentId over canonical plaintext); everything key- or capability-shaped stays in sync — the earlier "manifests live in `wyrd-sync`" wording contradicted the code and invited moving the type the wrong way |
 | 26 | Manifest mappings carry their **transport root** (`BaoRoot`): `ManifestEntry` grows to fixed 114 bytes and `ChildManifest` links to fixed 128 bytes (the raw BLAKE3/Bao root of the referenced sealed representation, appended to decisions 20/21); the type is distinct from `ContentId`/`StorageId` with no conversions; sync-layer announcements carry the snapshot body's root plus the root manifest's `(ContentId, root)`, author-signed end-to-end; the v0 entry ceiling recalibrates 750K→580K so ceilings stay encodable within the 64 MiB object gate | Wyrd ids are keyed, kinded hashes while verified streaming addresses blobs by raw BLAKE3, so the mapping must travel with the data; a wrong root only fails a transfer (AEAD + content check remain the sole authority on arrival), so this is the manifest's untrusted-hint pattern one column over, not a new trust relationship. The envelope cannot carry its own root (self-reference), so each level names its children and its parent names it |
+| 27 | **Tree/manifest closure correspondence** is an explicit invariant: tree nodes are structural (`snapshot.tree`, `ChildManifest::tree`); manifest entries cover exactly the reachable chunks (a `Tree` entry is optional but must match a reachable tree and its size); every directory subtree has a child manifest and vice versa; no unreachable mapping is admitted. The tree's declared file size is not part of the invariant (size-vs-chunk consistency is the reader's job); chunk representation sizes are enforced by `seal`'s checks at fetch. Verifier: `wyrd_sync::closure::verify_snapshot_manifest`, run as an authoring self-check now. **Read-side enforcement is deferred** until tree nodes are independently fetchable (tracking issue: `fix(sync): fetch and enforce tree closure at snapshot materialization`). The verifier is not yet a receiving-side boundary | A valid author can sign a body over tree T1 and publish a valid snapshot-bound manifest describing T2, producing an authenticated but broken replica. Establishing the invariant and its verifier is separable from (and precedes) making the referenced tree closure remotely materializable; conflating them would couple object discovery, transport, and authorization to the semantic check |

@@ -53,6 +53,11 @@
 //!     serving restart's route update rewires subsequent fetches
 //!     (`sync-and-peers.md` exchange; tracking issue: real-iroh
 //!     serving router loopback).
+//! 14. `snapshot_manifest_closure_correspondence` — a snapshot's manifest
+//!     hierarchy must correspond exactly to its tree closure; a valid
+//!     manifest advertising unreachable objects is rejected. Establishes
+//!     the invariant and verifier; read-side enforcement awaits
+//!     fetchable tree closure (`object-model.md`, decision 27).
 
 #[cfg(test)]
 mod fuse_contracts;

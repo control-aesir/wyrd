@@ -45,11 +45,13 @@ pub(super) enum FetchOutcome<T> {
 /// root fetch names exactly the envelope the author signed. Absent that
 /// route, the eager exchange serves its own claim, which `open_record`
 /// then enforces as AAD. What fetch does *not* check is that the
-/// manifest's entries describe the snapshot's tree — that correspondence
-/// is author-attested. No consumer in the tree yet holds both sides at
-/// once (the mount-free FUSE view serves trees without seeing
-/// manifests), so the cross-check lands with the daemon that composes
-/// sync and fuse.
+/// manifest's entries describe the snapshot's tree: that correspondence
+/// is established by `crate::closure::verify_snapshot_manifest`, which
+/// runs as an authoring self-check and wherever a reader holds both
+/// closures. It is not enforced here yet because tree nodes are not
+/// independently fetchable, so a receiver cannot assemble the tree
+/// closure; read-side enforcement is deferred to tree-closure
+/// materialization (object-model decision 27).
 pub(super) fn root(
     drive: &DriveId,
     bulk: &mut impl BulkSource,

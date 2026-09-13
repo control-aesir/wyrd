@@ -17,11 +17,16 @@
 //! identity and `read` serves from the capture, never by re-resolving
 //! the path against advanced heads.
 //!
-//! Symlink confinement: format symlink targets are arbitrary by design;
-//! the adapter serves targets verbatim via `readlink` and never follows
-//! them — resolution is the consumer's job, and the view's component
-//! parser already rejects absolute or escaping walks for anything this
-//! backend resolves itself.
+//! Symlink confinement: format symlink targets are arbitrary by design
+//! and member-authored, so untrusted. The kernel resolves whatever
+//! `readlink` returns in the host mount namespace, so the adapter
+//! serves a target only when [`wyrd_fuse::confine_symlink_target`]
+//! proves it stays inside the mount: absolute targets and `..` walks
+//! above the drive root fail with `EACCES`. The adapter never follows
+//! symlinks itself, and the view's component parser already rejects
+//! absolute or escaping walks for anything this backend resolves
+//! itself — `readlink` gating plus strict resolution is the whole
+//! policy, with no trusted-drive opt-out in v0.
 
 use std::collections::HashMap;
 
@@ -709,7 +714,16 @@ where
     S::Error: std::fmt::Debug,
 {
     match view.lookup(path) {
-        Ok(Node::Symlink { target }) => Ok(target),
+        Ok(Node::Symlink { target }) => {
+            // The kernel follows this target in the host namespace, so
+            // an escaping target must never reach it: fail closed with
+            // EACCES (sandbox convention) rather than serving bytes the
+            // kernel would resolve outside the mount.
+            match wyrd_fuse::confine_symlink_target(path, &target) {
+                Ok(()) => Ok(target),
+                Err(_) => Err(fuser::Errno::EACCES),
+            }
+        }
         Ok(_) => Err(fuser::Errno::EINVAL),
         Err(error) => Err(errno_of(&error)),
     }
@@ -846,17 +860,58 @@ mod tests {
     }
 
     #[test]
-    fn symlink_target_is_served_verbatim() {
+    fn symlink_targets_are_confined_to_the_mount() {
         use wyrd_format::Entry;
 
+        fn view_with(entries: Vec<Entry>) -> DriveView<MemoryObjectStore, NoMaterialization> {
+            let mut store = MemoryObjectStore::default();
+            let root = Tree::from_entries(entries)
+                .unwrap()
+                .insert_into(&mut store)
+                .unwrap();
+            DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]))
+        }
+
+        // Absolute targets resolve in the host namespace: never served.
+        let view = view_with(vec![Entry::symlink("link", "/etc/passwd").unwrap()]);
+        assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
+        // A root-level `..` already escapes the mount.
+        let view = view_with(vec![Entry::symlink("link", "../target").unwrap()]);
+        assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
+
+        // Nested escapes: the walk is lexical from the link's parent.
         let mut store = MemoryObjectStore::default();
-        let root = Tree::from_entries(vec![Entry::symlink("link", "../target").unwrap()])
+        let inner = Tree::from_entries(vec![Entry::symlink("link", "../../evil").unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let root = Tree::from_entries(vec![Entry::dir("sub", inner).unwrap()])
             .unwrap()
             .insert_into(&mut store)
             .unwrap();
         let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-        assert_eq!(symlink_target(&view, "link"), Ok("../target".into()));
+        assert_eq!(symlink_target(&view, "sub/link"), Err(fuser::Errno::EACCES));
+
+        // In-drive targets still serve verbatim: the kernel resolves
+        // them inside the mount.
+        let mut store = MemoryObjectStore::default();
+        let inner = Tree::from_entries(vec![Entry::symlink("link", "../sibling").unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let root = Tree::from_entries(vec![
+            Entry::dir("sub", inner).unwrap(),
+            Entry::file("sibling", 1, false, Vec::new()).unwrap(),
+        ])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+        assert_eq!(symlink_target(&view, "sub/link"), Ok("../sibling".into()));
+
+        // Non-target paths keep their existing mapping.
         assert_eq!(symlink_target(&view, "missing"), Err(fuser::Errno::ENOENT));
+        assert_eq!(symlink_target(&view, "sibling"), Err(fuser::Errno::EINVAL));
     }
 
     /// A one-file drive whose `f.txt` holds `a`, with a second head

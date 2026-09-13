@@ -36,6 +36,13 @@
 //! - POSIX mapping happens only at the FUSE boundary, outside this
 //!   crate: [`ViewError::Unavailable`] becomes `EIO`, and
 //!   [`ViewError::Corrupt`] triggers scrub/repair before surfacing.
+//! - Symlink targets are untrusted member-authored bytes. The view
+//!   never follows a symlink (an intermediate symlink is
+//!   [`ViewError::NotADirectory`); only the kernel follows, via
+//!   `readlink` — so the backend serves a target only when
+//!   [`confine_symlink_target`] proves it cannot escape the mount:
+//!   absolute targets and `..` walks above the drive root fail closed.
+//!   There is no trusted-drive opt-out in v0.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -728,6 +735,56 @@ fn attr(node: &Node) -> Attr {
     }
 }
 
+/// Why a symlink target cannot be served to the kernel. Targets are
+/// member-authored and untrusted; the kernel resolves whatever
+/// `readlink` returns in the host mount namespace, so an absolute or
+/// root-escaping target would break the mount boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ConfinementError {
+    #[error("symlink target is absolute; absolute targets resolve in the host namespace")]
+    Absolute,
+    #[error("symlink target escapes the drive root")]
+    EscapesRoot,
+}
+
+/// Confine a symlink target to the mounted namespace: the v0 policy for
+/// untrusted member-authored targets. `link_path` is the symlink's own
+/// drive path (the `""`-joined components the backend interned);
+/// `target` is the stored target bytes.
+///
+/// Absolute targets are refused outright. Relative targets resolve
+/// lexically against the link's parent directory — `.` and empty
+/// segments are skipped, `..` pops — and a `..` that pops above the
+/// drive root is refused. Anything else passes unchanged: the kernel
+/// resolves it inside the mount, so serving it verbatim is safe.
+///
+/// The view never follows symlinks itself (an intermediate symlink is
+/// [`ViewError::NotADirectory`]), so this check at the `readlink`
+/// boundary plus the view's own strict resolution is the whole policy —
+/// every path the backend resolves passes through one of the two.
+/// There is no trusted-drive opt-out in v0: confinement is always on.
+pub fn confine_symlink_target(link_path: &str, target: &str) -> Result<(), ConfinementError> {
+    if target.starts_with('/') {
+        return Err(ConfinementError::Absolute);
+    }
+    // The parent directory's depth: every component but the link's own
+    // name. `link_path` comes from backend-interned paths the view
+    // itself resolved, so a defensive split suffices.
+    let mut depth = link_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+        .saturating_sub(1);
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => depth = depth.checked_sub(1).ok_or(ConfinementError::EscapesRoot)?,
+            _ => depth += 1,
+        }
+    }
+    Ok(())
+}
+
 /// Split a path into validated components. `""` and `"/"` address the
 /// root; anything else must be non-empty valid components.
 fn parse_path(path: &str) -> Result<Vec<Component>, ViewError> {
@@ -1303,6 +1360,8 @@ mod tests {
         assert_eq!(view.lookup("."), Err(ViewError::InvalidPath));
         // Traversing through a file is not a directory.
         assert_eq!(view.lookup("hello.txt/deep"), Err(ViewError::NotADirectory));
+        // Traversing through a symlink is never followed either.
+        assert_eq!(view.lookup("link/deep"), Err(ViewError::NotADirectory));
 
         let empty = DriveView::new(
             MemoryObjectStore::default(),
@@ -1310,6 +1369,57 @@ mod tests {
             heads(vec![]),
         );
         assert_eq!(empty.lookup("hello.txt"), Err(ViewError::NotFound));
+    }
+
+    #[test]
+    fn symlink_confinement_rejects_absolute_and_escaping_targets() {
+        // Absolute targets resolve in the host namespace: always refused.
+        for target in ["/etc/passwd", "/", "/sub/file"] {
+            assert_eq!(
+                confine_symlink_target("link", target),
+                Err(ConfinementError::Absolute),
+                "{target:?} must be refused"
+            );
+        }
+        // A `..` that pops above the drive root escapes, at any depth.
+        for (link, target) in [
+            ("link", "../target"),
+            ("link", ".."),
+            ("link", "a/../../evil"),
+            ("sub/link", "../../evil"),
+            ("a/b/link", "../../../evil"),
+        ] {
+            assert_eq!(
+                confine_symlink_target(link, target),
+                Err(ConfinementError::EscapesRoot),
+                "{link:?} -> {target:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_confinement_keeps_in_drive_targets() {
+        // The kernel resolves these inside the mount, so they serve verbatim.
+        for (link, target) in [
+            ("link", "hello.txt"),
+            ("link", "sub/file"),
+            ("link", "./file"),
+            ("link", "a/../file"),
+            ("link", "a//b"),
+            ("link", "sub/"),
+            ("link", ""),
+            // `..` up to the root (but not above) stays inside.
+            ("link", "sub/../file"),
+            ("sub/link", "../sibling"),
+            ("sub/link", "../sub2/file"),
+            ("a/b/link", "../../x"),
+        ] {
+            assert_eq!(
+                confine_symlink_target(link, target),
+                Ok(()),
+                "{link:?} -> {target:?} must be served"
+            );
+        }
     }
 
     #[test]

@@ -18,27 +18,27 @@
 //! # Model
 //!
 //! Tree nodes are **structural**: the root is `Snapshot::tree` and each
-//! subtree is a [`ChildManifest::tree`]. A `ManifestEntry` is therefore not
-//! required to represent a tree node; production authoring emits entries only
-//! for content-bearing chunks ([`crate::runtime::author`]). A `Tree`-kind
-//! entry, when present (fixtures and some authors emit one), is an additional
-//! declaration that must agree: the tree must be reachable structurally and
-//! the declared size must match the tree's actual plaintext length.
+//! subtree is a [`ChildManifest::tree`]. Production authoring self-maps every
+//! tree node with a `Tree`-kind [`ManifestEntry`], so the closure is
+//! fetchable; the entry must agree with the structural reference (the tree
+//! must be reachable and the declared size must match its plaintext length).
+//! A `Tree` entry is still optional at this verifier's boundary, so closures
+//! authored before self-mapping, or by other producers, remain checkable.
 //!
 //! [`ChildManifest::tree`]: wyrd_format::ChildManifest
 //!
 //! # Enforcement boundary
 //!
-//! This verifier is usable wherever both closures are available: the local
-//! authoring path (which self-checks before commit) and any reader that holds
-//! the snapshot's tree objects. It is **not yet a receiving-side authenticity
-//! boundary**: a receiver cannot currently assemble a full tree closure,
-//! because tree nodes referenced by `Snapshot::tree` and
-//! [`ChildManifest::tree`](wyrd_format::ChildManifest::tree) are not
-//! independently fetchable under the current manifest model. Read-side
-//! enforcement is deferred until tree closure materialization exists; see the
-//! object-model decision record. Until then, do not treat this verifier as
-//! closing the hostile-author replica-corruption case.
+//! Every manifest self-maps its own tree node with a `Tree` entry, and those
+//! entries are structural: the fetch plan always wants them, so a receiver
+//! can assemble the full tree closure. The verifier runs at two boundaries:
+//!
+//! - authoring self-checks before commit ([`crate::runtime::author`]);
+//! - the daemon verifies each classified head's closure against the local
+//!   store before installing it, and a head whose closure is incomplete or
+//!   does not correspond is never mounted (see `wyrd-daemon`).
+//!
+//! [`verify_head_closure`] is the head-level entry point for the second.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,6 +61,8 @@ pub enum ClosureError {
         expected: SnapshotId,
         found: SnapshotId,
     },
+    #[error("no root manifest is recorded for snapshot {0}")]
+    RootManifestMissing(SnapshotId),
     #[error("root manifest id {found} does not match its canonical bytes ({derived})")]
     RootIdentityMismatch {
         found: ContentId,
@@ -391,6 +393,33 @@ where
         }
     }
     Ok(())
+}
+
+/// Verify one classified head's closure against the local store: resolve the
+/// recorded root manifest for the head's snapshot and run
+/// [`verify_snapshot_manifest`]. `Err` means the head is not materializable —
+/// its closure is incomplete or does not correspond — and callers must not
+/// install or serve it.
+pub fn verify_head_closure<S: ObjectStore>(
+    runtime: &crate::runtime::RuntimeState,
+    snapshot: &Snapshot,
+    objects: &S,
+    limits: &Limits,
+) -> Result<(), ClosureError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let root = runtime
+        .root_manifest_record(&snapshot.snapshot_id())
+        .ok_or(ClosureError::RootManifestMissing(snapshot.snapshot_id()))?;
+    verify_snapshot_manifest(
+        snapshot,
+        objects,
+        &root.manifest_id,
+        &root.manifest,
+        runtime,
+        limits,
+    )
 }
 
 #[cfg(test)]

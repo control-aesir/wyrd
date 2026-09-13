@@ -469,13 +469,20 @@ impl RuntimeState {
                 if self.local_objects.contains(&entry.content_id) {
                     continue;
                 }
-                let desired = self
-                    .materialization
-                    .get(&entry.content_id)
-                    .copied()
-                    .unwrap_or(MaterializationState::RemoteOnly);
-                if matches!(desired, MaterializationState::RemoteOnly) {
-                    continue;
+                // Tree nodes are structural metadata: the closure cannot be
+                // navigated or verified without them, so they are always
+                // wanted. Content-bearing objects follow materialization
+                // policy.
+                let structural = entry.kind == ObjectKind::Tree;
+                if !structural {
+                    let desired = self
+                        .materialization
+                        .get(&entry.content_id)
+                        .copied()
+                        .unwrap_or(MaterializationState::RemoteOnly);
+                    if matches!(desired, MaterializationState::RemoteOnly) {
+                        continue;
+                    }
                 }
                 // The same entry in several manifests yields one
                 // candidate per distinct representation: identical

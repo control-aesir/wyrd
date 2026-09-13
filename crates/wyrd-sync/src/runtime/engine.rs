@@ -1214,53 +1214,69 @@ mod tests {
             .root_manifest_record(&snapshot_id)
             .expect("the authored root manifest records with the head");
         assert_eq!(root_record.manifest.snapshot, snapshot_id);
-        assert_eq!(root_record.manifest.entries.len(), 1);
+        // Every manifest self-maps its tree node plus its content entries.
+        assert_eq!(
+            root_record.manifest.entries.len(),
+            2,
+            "self-mapped tree plus the root file chunk"
+        );
+        assert!(root_record
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.kind == ObjectKind::Tree && entry.content_id == root));
         let link = &root_record.manifest.children[0];
         assert_eq!(link.tree, leaf, "the child link names the subtree tree");
         let child = state
             .manifest_record(&link.manifest)
             .expect("the authored child manifest records before the parent");
         assert_eq!(child.manifest.snapshot, snapshot_id);
-        assert_eq!(child.manifest.entries.len(), 1);
+        assert_eq!(child.manifest.entries.len(), 2);
+        assert!(child
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.kind == ObjectKind::Tree && entry.content_id == leaf));
         assert!(
             child.manifest.children.is_empty(),
             "leaf manifests map flat"
         );
 
+        // Every mapping (tree and chunk alike) names a sealed envelope this
+        // device holds, and the envelope opens to the local plaintext under
+        // the key for its own kind, content, and version.
         let epoch_secret = secret(0x07 + epoch as u8);
-        for (entry, expected) in [
-            (&root_record.manifest.entries[0], &b"root payload"[..]),
-            (&child.manifest.entries[0], &b"nested payload"[..]),
-        ] {
-            // The mapping's bytes live in the durable vault under exactly
-            // the transport root the mapping names.
-            let envelope = pair
-                .a
-                .engine
-                .vault()
-                .sealed(&entry.transport)
-                .unwrap()
-                .expect("held envelope");
-            let obj = EncryptedObject::decode(&envelope).unwrap();
-            assert_eq!(obj.storage_id(), entry.storage_id, "vault address");
-            assert_eq!(
-                crate::seal::transport_root(&obj),
-                entry.transport,
-                "the transport root is exactly the envelope bytes"
-            );
-            let opened = crate::seal::verify(
-                entry,
-                &epoch_secret.object_key(
-                    &member_drive(),
-                    epoch,
-                    &entry.content_id,
-                    ObjectKind::Chunk,
-                    SEAL_VERSION,
-                ),
-                &envelope,
-            )
-            .unwrap();
-            assert_eq!(opened.as_slice(), expected);
+        for record in [root_record, child] {
+            for entry in &record.manifest.entries {
+                let expected = objects.get(&entry.content_id).unwrap().unwrap();
+                let envelope = pair
+                    .a
+                    .engine
+                    .vault()
+                    .sealed(&entry.transport)
+                    .unwrap()
+                    .expect("held envelope");
+                let obj = EncryptedObject::decode(&envelope).unwrap();
+                assert_eq!(obj.storage_id(), entry.storage_id, "vault address");
+                assert_eq!(
+                    crate::seal::transport_root(&obj),
+                    entry.transport,
+                    "the transport root is exactly the envelope bytes"
+                );
+                let opened = crate::seal::verify(
+                    entry,
+                    &epoch_secret.object_key(
+                        &member_drive(),
+                        epoch,
+                        &entry.content_id,
+                        entry.kind,
+                        SEAL_VERSION,
+                    ),
+                    &envelope,
+                )
+                .unwrap();
+                assert_eq!(opened, expected);
+            }
         }
     }
 
@@ -1694,9 +1710,10 @@ mod tests {
         // are not this test's subject).
         assert_eq!(report.snapshot_bodies, 1, "the body rides the signed root");
         assert_eq!(report.manifests, 1, "a flat tree maps one root manifest");
-        assert_eq!(report.objects, 1);
-        assert_eq!(report.manifests, 1, "a flat tree maps one root manifest");
-        assert_eq!(report.objects, 1);
+        assert_eq!(
+            report.objects, 2,
+            "the structural tree plus the requested chunk"
+        );
         assert_eq!(
             peer_objects.get(&chunk).unwrap().as_deref(),
             Some(b"vault served payload".as_slice())
@@ -1746,8 +1763,8 @@ mod tests {
             .expect("the authored root manifest records");
         assert_eq!(
             root_record.manifest.entries.len(),
-            1,
-            "one canonical mapping per logical chunk"
+            2,
+            "self-mapped tree plus one canonical mapping per logical chunk"
         );
         assert_eq!(
             root_record.manifest.children.len(),
@@ -1762,9 +1779,19 @@ mod tests {
         let child = state
             .manifest_record(&root_record.manifest.children[0].manifest)
             .expect("the child manifest records");
-        assert_eq!(child.manifest.entries.len(), 1);
+        assert_eq!(child.manifest.entries.len(), 2);
+        let chunk_transport = |record: &super::super::ManifestRecord| {
+            record
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.kind == ObjectKind::Chunk && entry.content_id == chunk)
+                .expect("maps the shared chunk")
+                .transport
+        };
         assert_eq!(
-            child.manifest.entries[0].transport, root_record.manifest.entries[0].transport,
+            chunk_transport(child),
+            chunk_transport(root_record),
             "one seal serves every reference to the chunk"
         );
 
@@ -1847,7 +1874,10 @@ mod tests {
             .engine
             .execute_plan(&mut serving_a, &mut peer_objects)
             .unwrap();
-        assert_eq!(report.objects, 1);
+        assert_eq!(
+            report.objects, 2,
+            "the structural tree plus the requested chunk"
+        );
 
         // B restarts: durable facts and vault bytes both survive.
         restart(&mut pair.b, &controls);
@@ -1874,14 +1904,24 @@ mod tests {
         let a_record = state_a
             .root_manifest_record(&authored.snapshot().snapshot_id())
             .expect("A's root manifest records");
+        let chunk_entry = |record: &super::super::ManifestRecord| {
+            record
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.kind == ObjectKind::Chunk && entry.content_id == chunk)
+                .cloned()
+                .expect("maps the shared chunk")
+        };
         assert_eq!(
-            record_b.manifest.entries[0].transport, a_record.manifest.entries[0].transport,
+            chunk_entry(record_b).transport,
+            chunk_entry(a_record).transport,
             "B's manifest advertises the fetched representation, not a re-seal"
         );
 
         // And B serves what it advertises: the reused mapping's bytes
         // live in B's durable vault.
-        let entry = &record_b.manifest.entries[0];
+        let entry = chunk_entry(record_b);
         let serving_b = crate::serving::VaultSource::from_state(
             &pair.b.engine.runtime_state().unwrap(),
             pair.b.engine.vault(),

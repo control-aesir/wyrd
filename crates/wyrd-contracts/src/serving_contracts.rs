@@ -52,14 +52,15 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
         .published;
     assert_eq!(routes, 4, "the announcement publishes its four routes");
     let mut objects = loaded.objects.clone();
-    // Round one: body and root manifest over live transport. Objects
-    // stay unpinned (materialization is local policy), so nothing is
-    // pending for them yet.
+    // Round one: body and root manifest over live transport. The root
+    // manifest's structural tree entry is wanted immediately, but its route
+    // is only published once the manifest is recorded, so the tree stays
+    // pending for the pass that refreshes routes.
     let first = engine.execute_plan(&mut bulk, &mut objects).unwrap();
     assert_eq!(first.snapshot_bodies, 1);
     assert_eq!(first.manifests, 1);
     assert_eq!(first.objects, 0);
-    assert_eq!(first.unfulfilled, 0);
+    assert_eq!(first.unfulfilled, 1, "the structural tree awaits its route");
 
     // The serving daemon restarts: a fresh endpoint, the same vault.
     // The reannouncement changes only `node_addr`, so intake

@@ -16,7 +16,7 @@
 //! membership, a non-member author, an unavailable root tree, or a
 //! signature that will not verify commits nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
     ChildManifest, ContentId, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot, Tree,
@@ -136,14 +136,15 @@ where
         snapshot: authorized.snapshot().snapshot_id(),
         children: Vec::new(),
         sealed: BTreeMap::new(),
+        local: BTreeSet::new(),
     };
     let root = authoring.walk(tree)?;
     let children = std::mem::take(&mut authoring.children);
+    let local = std::mem::take(&mut authoring.local);
     drop(authoring);
-    // Fail-closed self-check: the manifests we just built must correspond to
-    // the tree we are signing over. This proves our construction maintains
-    // the closure invariant; it is not a receiving-side boundary (a peer
-    // cannot yet fetch the tree closure).
+    // Self-check: the manifests we just built must correspond to the tree
+    // we are signing over. Authoring reads the tree nodes and seals the
+    // chunks it holds, so everything needed is local.
     let child_index: BTreeMap<ContentId, &Manifest> = children
         .iter()
         .map(|record| (record.manifest_id, &record.manifest))
@@ -160,6 +161,9 @@ where
     let mut facts = vec![Fact::SnapshotBody(authorized.clone())];
     facts.extend(children.into_iter().map(Fact::Manifest));
     facts.push(Fact::Manifest(root));
+    // The tree nodes and freshly sealed chunks are local plaintext now;
+    // recording them keeps the fetch plan from re-requesting held content.
+    facts.extend(local.into_iter().map(Fact::LocalObject));
     engine.commit_facts(&facts)?;
     Ok(authorized)
 }
@@ -184,6 +188,10 @@ where
     children: Vec<ManifestRecord>,
     /// Fresh seals this authoring session already produced, by content.
     sealed: BTreeMap<ContentId, ManifestEntry>,
+    /// Content whose plaintext this device holds after the walk (the tree
+    /// nodes it read, and the chunks it sealed fresh), recorded as local
+    /// facts so the fetch plan never re-requests content already present.
+    local: BTreeSet<ContentId>,
 }
 
 impl<S: ObjectStore> ManifestAuthor<'_, S>
@@ -212,6 +220,11 @@ where
         check_tree(&Limits::V0, &tree).map_err(EngineError::Ingest)?;
 
         let mut entries: BTreeMap<ContentId, ManifestEntry> = BTreeMap::new();
+        // Self-mapping: the tree node's own sealed representation. This is
+        // what makes the structural tree closure fetchable (the fetch plan
+        // queues manifest entries by kind), so a receiver can assemble the
+        // tree closure and verify correspondence.
+        entries.insert(tree_id, self.seal_tree(tree_id, &bytes)?);
         let mut links: BTreeMap<ContentId, ChildManifest> = BTreeMap::new();
         for entry in tree.entries() {
             match &entry.content {
@@ -309,6 +322,33 @@ where
         let entry = entry_for(ObjectKind::Chunk, self.epoch, &obj, &chunk, &plaintext)?;
         self.engine.vault.import(&obj.encode())?;
         self.sealed.insert(chunk, entry.clone());
+        self.local.insert(chunk);
+        Ok(entry)
+    }
+
+    /// The sealed representation mapping one tree node: sealed under this
+    /// snapshot's epoch like any object, cached across the session so a
+    /// tree referenced by several parents is sealed once.
+    fn seal_tree(
+        &mut self,
+        tree_id: ContentId,
+        bytes: &[u8],
+    ) -> Result<ManifestEntry, EngineError> {
+        if let Some(entry) = self.sealed.get(&tree_id) {
+            return Ok(entry.clone());
+        }
+        let object_key = self.secret.object_key(
+            &self.engine.drive,
+            self.epoch,
+            &tree_id,
+            ObjectKind::Tree,
+            SEAL_VERSION,
+        );
+        let obj = seal_content(&object_key, ObjectKind::Tree, &tree_id, bytes)?;
+        let entry = entry_for(ObjectKind::Tree, self.epoch, &obj, &tree_id, bytes)?;
+        self.engine.vault.import(&obj.encode())?;
+        self.sealed.insert(tree_id, entry.clone());
+        self.local.insert(tree_id);
         Ok(entry)
     }
 }

@@ -9,6 +9,6 @@
 pub mod view;
 
 pub use view::{
-    Attr, ConflictVersion, DirEntry, DriveView, Kind, Materialization, Node, OpenFile,
-    VerifiedSnapshot, ViewError, ViewHead,
+    confine_symlink_target, Attr, ConfinementError, ConflictVersion, DirEntry, DriveView, Kind,
+    Materialization, Node, OpenFile, VerifiedSnapshot, ViewError, ViewHead,
 };

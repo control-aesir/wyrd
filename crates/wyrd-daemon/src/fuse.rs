@@ -377,11 +377,22 @@ fn attr_of(node: &Node) -> (fuser::FileType, u64, bool) {
     }
 }
 
-/// Open flags that are not representable. `O_DIRECT`/`O_PATH` are
-/// `EOPNOTSUPP` ("known and deliberately unsupported"), distinct from
-/// the `ENOSYS` of a handler that does not exist.
+/// Open flags that are not representable. On Linux `O_DIRECT`/`O_PATH`
+/// are `EOPNOTSUPP` ("known and deliberately unsupported"), distinct
+/// from the `ENOSYS` of a handler that does not exist. Those bits are
+/// Linux-only: other kernels never send them, so there is nothing to
+/// refuse at this layer there.
+#[cfg(target_os = "linux")]
 fn unsupported_open_flags(flags: i32) -> bool {
     flags & (libc::O_DIRECT | libc::O_PATH) != 0
+}
+
+/// Non-Linux kernels never send the Linux-only `O_DIRECT`/`O_PATH`
+/// bits (they do not exist in `libc` there), so no open is refused
+/// at this layer.
+#[cfg(not(target_os = "linux"))]
+fn unsupported_open_flags(_flags: i32) -> bool {
+    false
 }
 
 /// The POSIX error the kernel boundary documents for each view failure.
@@ -1967,10 +1978,19 @@ where
         reply: fuser::ReplyEmpty,
     ) {
         // Atomic exchange and whiteout are not representable; only
-        // plain rename and RENAME_NOREPLACE are served.
+        // plain rename and RENAME_NOREPLACE are served. The
+        // RENAME_* constants are Linux-only in both `libc` and
+        // `fuser`: on other targets any flag is unknown, so refuse
+        // anything non-empty rather than silently ignoring it.
+        #[cfg(target_os = "linux")]
         if flags
             .intersects(fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT)
         {
+            reply.error(fuser::Errno::EOPNOTSUPP);
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !flags.is_empty() {
             reply.error(fuser::Errno::EOPNOTSUPP);
             return;
         }
@@ -1978,7 +1998,10 @@ where
             reply.error(fuser::Errno::EINVAL);
             return;
         };
+        #[cfg(target_os = "linux")]
         let no_replace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
+        #[cfg(not(target_os = "linux"))]
+        let no_replace = false;
         match self.rename_at(parent.0, name, newparent.0, newname, no_replace) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(error),

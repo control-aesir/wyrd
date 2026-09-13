@@ -2419,7 +2419,13 @@ mod tests {
         let unlinked = backend.open_write("b.txt", libc::O_RDWR).unwrap();
         backend.unlink_at(1, "b.txt").unwrap();
         backend.write_handle(unlinked, 0, b"X").unwrap();
+        let before = backend.generation().unwrap();
         assert_eq!(backend.commit_handle(unlinked), Err(fuser::Errno::EIO));
+        assert_eq!(backend.generation().unwrap(), before);
+        assert_eq!(
+            backend.write_handle(unlinked, 0, b"Y"),
+            Err(fuser::Errno::EIO)
+        );
         backend.release_handle(unlinked).unwrap();
 
         // Kind change under an open handle.
@@ -2431,7 +2437,10 @@ mod tests {
         backend.unlink_at(1, "c.txt").unwrap();
         backend.mkdir_at(1, "c.txt").unwrap();
         backend.write_handle(kind, 0, b"X").unwrap();
+        let before = backend.generation().unwrap();
         assert_eq!(backend.commit_handle(kind), Err(fuser::Errno::EIO));
+        assert_eq!(backend.generation().unwrap(), before);
+        assert_eq!(backend.write_handle(kind, 0, b"Y"), Err(fuser::Errno::EIO));
         backend.release_handle(kind).unwrap();
 
         stop.store(true, Ordering::Relaxed);
@@ -2464,11 +2473,19 @@ mod tests {
             handles.push(handle);
         }
         let overflow = backend.open_write("d.txt", libc::O_RDWR).unwrap();
+        let before = backend.budget_state();
         assert_eq!(
             backend.write_handle(overflow, 1, b"z"),
             Err(fuser::Errno::ENOSPC),
             "one dirty handle past the bound is refused"
         );
+        assert_eq!(
+            backend.budget_state(),
+            before,
+            "a refused write changes no budget accounting"
+        );
+        // The refused handle stayed clean: it still serves the base.
+        assert_eq!(backend.read_handle(overflow, 0, 64).unwrap(), b"x");
         backend.release_handle(overflow).unwrap();
 
         let freed = handles.pop().unwrap();

@@ -504,6 +504,13 @@ where
         Ok(self.projection()?.generation())
     }
 
+    /// Test-only: the aggregate buffered bytes and dirty-handle count,
+    /// so tests can assert a refused write is side-effect free.
+    #[cfg(test)]
+    pub(crate) fn budget_state(&self) -> (usize, usize) {
+        (self.budget.total(), self.budget.dirty_handles())
+    }
+
     /// Resolve `path` against the current projection and
     /// intern-or-revalidate its ino in one step: same kind reuses the
     /// mapping (stamping the current generation), a kind change

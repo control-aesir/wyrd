@@ -138,12 +138,27 @@ where
         sealed: BTreeMap::new(),
     };
     let root = authoring.walk(tree)?;
+    let children = std::mem::take(&mut authoring.children);
+    drop(authoring);
+    // Fail-closed self-check: the manifests we just built must correspond to
+    // the tree we are signing over. This proves our construction maintains
+    // the closure invariant; it is not a receiving-side boundary (a peer
+    // cannot yet fetch the tree closure).
+    let child_index: BTreeMap<ContentId, &Manifest> = children
+        .iter()
+        .map(|record| (record.manifest_id, &record.manifest))
+        .collect();
+    crate::closure::verify_snapshot_manifest(
+        authorized.snapshot(),
+        objects,
+        &root.manifest_id,
+        &root.manifest,
+        &child_index,
+        &Limits::V0,
+    )
+    .map_err(EngineError::Closure)?;
     let mut facts = vec![Fact::SnapshotBody(authorized.clone())];
-    facts.extend(
-        std::mem::take(&mut authoring.children)
-            .into_iter()
-            .map(Fact::Manifest),
-    );
+    facts.extend(children.into_iter().map(Fact::Manifest));
     facts.push(Fact::Manifest(root));
     engine.commit_facts(&facts)?;
     Ok(authorized)

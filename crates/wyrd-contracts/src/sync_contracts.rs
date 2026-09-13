@@ -4,11 +4,12 @@
 use wyrd_daemon::core::Daemon;
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
-    Change, ContentId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot,
-    SnapshotId, StorageId, Tree,
+    BaoRoot, Change, ContentId, Entry, FetchStatus, ManifestEntry, MemoryObjectStore, ObjectKind,
+    ObjectStore, Snapshot, SnapshotId, StorageId, Tree,
 };
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
 use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -308,6 +309,88 @@ fn authored_snapshots_mount_through_the_daemon_view() {
     assert_eq!(daemon.view().read(&file, 0, 5).unwrap(), b"alpha");
 
     drop(daemon);
+    rig.teardown();
+}
+
+/// The snapshot/tree/manifest closure invariant: an authored snapshot's
+/// manifest hierarchy corresponds exactly to its tree closure, and a
+/// mismatched-but-individually-valid manifest for the same snapshot is
+/// rejected. This establishes the invariant and the verifier; read-side
+/// enforcement awaits fetchable tree closure (see the object-model
+/// decision record).
+#[test]
+fn snapshot_manifest_closure_correspondence() {
+    let mut rig = Rig::new();
+    let mut store = MemoryObjectStore::default();
+    let chunk = store.insert(ObjectKind::Chunk, b"closure").unwrap();
+    let tree = Tree::from_entries(vec![
+        Entry::file("closure.txt", 7, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+
+    let admit = rig.admit.clone();
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability(&admit, &secrets);
+    assert_eq!(rig.drain().accepted, 1);
+    let mut engine = rig.take_engine();
+    let authored = engine.author_snapshot(&store, tree).unwrap();
+    let snapshot = authored.snapshot().clone();
+
+    // The authored closure (structural tree references, no `Tree` entry)
+    // corresponds to the tree: verification succeeds.
+    let runtime = engine.runtime_state().unwrap();
+    let root = runtime
+        .root_manifest_record(&snapshot.snapshot_id())
+        .expect("authoring records the root manifest");
+    let root_id = root.manifest_id;
+    let root_manifest = root.manifest.clone();
+    verify_snapshot_manifest(
+        &snapshot,
+        &store,
+        &root_id,
+        &root_manifest,
+        &runtime,
+        &Limits::V0,
+    )
+    .unwrap();
+
+    // A valid manifest for the same snapshot that also advertises an
+    // object unreachable from the tree is rejected.
+    let mut mismatched = root_manifest.clone();
+    mismatched.entries.push(ManifestEntry {
+        content_id: ContentId::derive(ObjectKind::Chunk, b"unrelated"),
+        kind: ObjectKind::Chunk,
+        version: 0,
+        storage_id: StorageId::from_bytes([0xEE; 32]),
+        encryption_epoch: snapshot.epoch,
+        size: 9,
+        transport: BaoRoot::from_bytes([0xEF; 32]),
+    });
+    mismatched.entries.sort_by(|a, b| {
+        a.content_id
+            .as_bytes()
+            .cmp(b.content_id.as_bytes())
+            .then(a.kind.byte().cmp(&b.kind.byte()))
+            .then(a.version.cmp(&b.version))
+    });
+    let mismatched_id = ContentId::derive(ObjectKind::Manifest, &mismatched.canonical_bytes());
+    let err = verify_snapshot_manifest(
+        &snapshot,
+        &store,
+        &mismatched_id,
+        &mismatched,
+        &runtime,
+        &Limits::V0,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ClosureError::UnrelatedEntry { .. }),
+        "unexpected error: {err:?}"
+    );
+
+    drop(engine);
     rig.teardown();
 }
 

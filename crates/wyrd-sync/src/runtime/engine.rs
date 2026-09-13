@@ -92,6 +92,8 @@ pub enum EngineError {
     Capability(#[from] crate::keys::CapabilityError),
     #[error("ingest limits rejected authored content: {0:?}")]
     Ingest(#[from] crate::ingest::IngestError),
+    #[error("snapshot/tree/manifest closure mismatch: {0}")]
+    Closure(#[from] crate::closure::ClosureError),
     #[error("vault write failed: {0}")]
     Vault(#[from] crate::serving::VaultError),
     #[error("chunk {0} is neither locally sealed nor covered by a held recorded mapping")]

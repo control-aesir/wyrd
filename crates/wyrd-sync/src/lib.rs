@@ -16,6 +16,7 @@
 
 pub mod authorization;
 pub mod bulk;
+pub mod closure;
 pub mod control;
 pub mod durable;
 #[cfg(test)]

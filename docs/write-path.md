@@ -234,7 +234,12 @@ creates and never resurrects). Its append sequence is concatenated to the
 - an intervening change to the path's kind or its removal is still stale.
 
 Append is the only content mutation with this privilege, and it exists
-because POSIX defines append against the current end.
+because POSIX defines append against the current end. In v0 the mounted
+write path refuses `O_APPEND | O_TRUNC` together (`EOPNOTSUPP`): the
+append model has no committed empty base to truncate to, and neither flag
+is silently ignored. A path-addressed `truncate` on an open append handle
+is likewise `EOPNOTSUPP`; an exec change through an append handle is a
+path-addressed mutation.
 
 Namespace mutations (`mkdir`, `unlink`, `rmdir`, `rename`, and
 path-addressed `set-exec`) carry no handle base: they read-modify-write

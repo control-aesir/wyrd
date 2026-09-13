@@ -142,15 +142,19 @@ transport root, announcement `node_addr` routes publish into the fetch
 plane on every sync pass, and a serving restart's route update rewires
 serving (contract 13). Still open: the NIP-46 signer-session client
 wiring, multi-relay mailbox supervision and relay interop coverage, and
-the live write path behind the FUSE mount — designed in `docs/write-path.md`,
-with the mount still read-only until the mutation queue, format
-mkdir/rename primitives, and FUSE write operations land. Garbage
+the durable announcement outbox (`feat(sync): durable announcement outbox
+and retry contract`). The live write path behind the FUSE mount has
+landed (`docs/write-path.md`): the daemon-owned mutation queue and the
+mounted write surface, namespace operations, generation-aware
+projection/caches, and append-handle semantics are merged. Remaining v0
+limitations are named in `docs/write-path.md` (whole-file rewrite model,
+`O_APPEND | O_TRUNC` refused, budgets). Garbage
 collection does not exist. `wyrd-fuse` is a
 mount-free view behind the daemon's FUSE backend. All crypto and sync
 work follows `trust.md` and `epochs.md` as normative contracts; the
 open tracking issues name what comes next.
 
-The local `wyrd` CLI mounts a live read-only projection: a supervised
+The local `wyrd` CLI mounts a live projection: a supervised
 loop drains the NIP-59 control-plane mailbox, admits FUSE demand into
 durable `Cached` materialization each pass, refreshes materialization
 facts and live heads into the serving view without remounting, and

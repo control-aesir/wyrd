@@ -199,6 +199,12 @@ pub enum MutationKind {
         executable: bool,
         content: Vec<u8>,
     },
+    /// Append `content` to the current head's file at `path`. Unlike
+    /// [`CommitFile`](MutationKind::CommitFile) there is no content
+    /// comparison: append is position-independent and observes an
+    /// intervening commit, but still requires the path to exist as a
+    /// regular file (never creates, never resurrects).
+    AppendFile { path: String, content: Vec<u8> },
     /// Remove the file or symlink at `path`; a directory is `EISDIR`.
     Unlink { path: String },
     /// Remove the empty directory at `path`.

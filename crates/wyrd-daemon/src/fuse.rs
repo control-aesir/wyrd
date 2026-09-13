@@ -4,9 +4,8 @@
 //! through the daemon's mutation channel (see `docs/write-path.md`).
 //! Namespace operations (`mkdir`, `create`, `unlink`, `rmdir`,
 //! `rename`, `setattr`) are served; unsupported node types (`mknod`,
-//! `symlink`, `link`) fall through to `ENOSYS`, and deliberately
-//! unsupported open flags (`O_APPEND`, `O_DIRECT`, `O_PATH`) are
-//! `EOPNOTSUPP`.
+//! `symlink`, `link`) fall through to `ENOSYS`; `O_DIRECT`/`O_PATH`
+//! are `EOPNOTSUPP`.
 //!
 //! Error mapping happens only here, per `docs/sync-and-peers.md`:
 //! absence maps to `ENOENT`, `Unavailable`/`Corrupt`/`Conflict` to
@@ -127,12 +126,18 @@ struct WriteHandle {
     /// The open-time capture: clean reads serve exactly these bytes, so
     /// head advancement never changes what an open descriptor returns.
     capture: OpenFile,
-    /// The identity a commit must still find at `path`.
+    /// The identity a commit must still find at `path` when the handle
+    /// is not an append handle.
     base: FileIdentity,
     /// The target exec bit for the next commit (buffered like content).
     executable: bool,
-    /// The dense logical image; `None` while clean.
+    /// The dense logical image; `None` while clean. For an append
+    /// handle this is the buffered append sequence (never the base).
     image: Option<Vec<u8>>,
+    /// `O_APPEND`: writes buffer an ordered sequence that commits onto
+    /// the current file end; reads concatenate the capture and the
+    /// sequence.
+    append: bool,
     /// The image differs from `base` (or `O_TRUNC` started it empty), so
     /// the next committing boundary authors a snapshot.
     dirty: bool,
@@ -372,13 +377,11 @@ fn attr_of(node: &Node) -> (fuser::FileType, u64, bool) {
     }
 }
 
-/// Open flags this slice deliberately refuses. `O_APPEND` is deferred
-/// (its append-against-current-end semantics are a separate contract);
-/// `O_DIRECT`/`O_PATH` are not representable. All are `EOPNOTSUPP`
-/// ("known and deliberately unsupported"), distinct from the `ENOSYS`
-/// of a handler that does not exist.
+/// Open flags that are not representable. `O_DIRECT`/`O_PATH` are
+/// `EOPNOTSUPP` ("known and deliberately unsupported"), distinct from
+/// the `ENOSYS` of a handler that does not exist.
 fn unsupported_open_flags(flags: i32) -> bool {
-    flags & (libc::O_APPEND | libc::O_DIRECT | libc::O_PATH) != 0
+    flags & (libc::O_DIRECT | libc::O_PATH) != 0
 }
 
 /// The POSIX error the kernel boundary documents for each view failure.
@@ -658,12 +661,24 @@ where
         match self.handle_of(fh)? {
             Handle::Read(file) => self.read_via_capture(&file, offset, size),
             Handle::Write(handle) => {
-                let (image, capture, failed) = {
+                let (image, capture, failed, append, base_size) = {
                     let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
-                    (write.image.clone(), write.capture.clone(), write.failed)
+                    (
+                        write.image.clone(),
+                        write.capture.clone(),
+                        write.failed,
+                        write.append,
+                        write.base.size(),
+                    )
                 };
                 if failed {
                     return Err(fuser::Errno::EIO);
+                }
+                if append {
+                    // Read-your-writes over the logical file: the pinned
+                    // capture followed by the buffered append sequence.
+                    let buffer = image.unwrap_or_default();
+                    return self.read_append(&capture, base_size, &buffer, offset, size);
                 }
                 match image {
                     Some(image) => Ok(slice_image(&image, offset, size)),
@@ -671,6 +686,41 @@ where
                 }
             }
         }
+    }
+
+    /// Read a window of an append handle's logical file: the base capture
+    /// followed by the buffered append sequence. Only the requested base
+    /// range is read from the store, so a large base is not materialized
+    /// for a small read.
+    fn read_append(
+        &self,
+        capture: &OpenFile,
+        base_size: u64,
+        buffer: &[u8],
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, fuser::Errno> {
+        let total = base_size.saturating_add(buffer.len() as u64);
+        if size == 0 || offset >= total {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(size as u64).min(total);
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        if offset < base_size {
+            let base_end = end.min(base_size);
+            let base = self.read_via_capture(
+                capture,
+                offset,
+                u32::try_from(base_end - offset).unwrap_or(u32::MAX),
+            )?;
+            out.extend_from_slice(&base);
+        }
+        if end > base_size {
+            let start = offset.saturating_sub(base_size) as usize;
+            let stop = (end - base_size) as usize;
+            out.extend_from_slice(&buffer[start..stop]);
+        }
+        Ok(out)
     }
 
     /// Read a pinned capture through the current projection, with the
@@ -730,13 +780,22 @@ where
     /// return a writable handle. `O_TRUNC` starts the image empty and
     /// immediately dirty (so a close with no writes still commits the
     /// empty file). `O_SYNC`/`O_DSYNC` make every successful write its
-    /// own commit. `O_APPEND` is deferred to a later slice and refused
-    /// with `EOPNOTSUPP`.
+    /// own commit. `O_APPEND` buffers an ordered append sequence.
     pub fn open_write(&self, path: &str, flags: i32) -> Result<FileHandle, fuser::Errno> {
         if self.mutations.is_none() {
             return Err(fuser::Errno::EROFS);
         }
-        if flags & libc::O_APPEND != 0 {
+        // Flag-level refusals come before path resolution: an
+        // unsupported combination is not a path problem.
+        if unsupported_open_flags(flags) {
+            return Err(fuser::Errno::EOPNOTSUPP);
+        }
+        let append = flags & libc::O_APPEND != 0;
+        let truncate = flags & libc::O_TRUNC != 0;
+        if append && truncate {
+            // Truncate-then-append would need a committed empty base
+            // before the first append; not representable in the v0
+            // append model, so refuse rather than silently ignore one.
             return Err(fuser::Errno::EOPNOTSUPP);
         }
         let projection = self.projection()?;
@@ -759,7 +818,6 @@ where
             _ => return Err(fuser::Errno::EISDIR),
         };
         let id = self.budget.next_handle();
-        let truncate = flags & libc::O_TRUNC != 0;
         let (image, dirty) = if truncate {
             self.budget
                 .reserve(id, 0)
@@ -775,6 +833,7 @@ where
             base,
             executable,
             image,
+            append,
             dirty,
             failed: false,
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
@@ -817,6 +876,7 @@ where
             base: identity,
             executable,
             image: None,
+            append: flags & libc::O_APPEND != 0,
             dirty: false,
             failed: false,
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
@@ -860,6 +920,26 @@ where
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
         if write.failed {
             return Err(fuser::Errno::EIO);
+        }
+        if write.append {
+            // Append is position-independent: the offset is ignored and
+            // the sequence grows in submission order.
+            let mut image = write.image.take().unwrap_or_default();
+            let new_len = image
+                .len()
+                .checked_add(data.len())
+                .ok_or(fuser::Errno::EFBIG)?;
+            if self.budget.reserve(write.id, new_len).is_err() {
+                write.image = Some(image);
+                return Err(fuser::Errno::ENOSPC);
+            }
+            image.extend_from_slice(data);
+            write.image = Some(image);
+            write.dirty = true;
+            if write.sync {
+                self.commit_locked(&mut write)?;
+            }
+            return Ok(data.len() as u32);
         }
         let end = offset
             .checked_add(data.len() as u64)
@@ -959,13 +1039,19 @@ where
         let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
         let content = write.image.take().unwrap_or_default();
         let path = write.path.clone();
-        let base = write.base.clone();
-        let outcome = mutations.submit(MutationKind::CommitFile {
-            path,
-            base,
-            executable: write.executable,
-            content,
-        });
+        let outcome = if write.append {
+            // Append: the sequence commits onto the current head's end;
+            // there is no base content comparison.
+            mutations.submit(MutationKind::AppendFile { path, content })
+        } else {
+            let base = write.base.clone();
+            mutations.submit(MutationKind::CommitFile {
+                path,
+                base,
+                executable: write.executable,
+                content,
+            })
+        };
         match outcome {
             Ok(MutationOutcome::Committed(identity)) => {
                 write.executable = identity.executable();
@@ -1287,6 +1373,22 @@ where
         };
         match handle {
             Some(Handle::Write(handle)) => {
+                let append = handle.lock().map_err(|_| fuser::Errno::EIO)?.append;
+                if append {
+                    // An append handle has no full image to truncate; a
+                    // metadata change is path-addressed (immediate).
+                    if size.is_some() {
+                        return Err(fuser::Errno::EOPNOTSUPP);
+                    }
+                    if let Some(executable) = executable {
+                        self.submit(MutationKind::SetAttrs {
+                            path,
+                            size: None,
+                            executable: Some(executable),
+                        })?;
+                    }
+                    return Ok(());
+                }
                 if size.is_some() && executable.is_some() {
                     return Err(fuser::Errno::EOPNOTSUPP);
                 }

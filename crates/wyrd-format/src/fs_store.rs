@@ -26,12 +26,13 @@
 //! `has` is the trait's cheap existence check only — readability and
 //! validity are proven by `get`, never by `has`.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
+use crate::durable;
 use crate::identity::{ContentId, ObjectKind};
 use crate::store::ObjectStore;
 
@@ -64,10 +65,6 @@ impl FsStoreError {
 #[derive(Debug, Clone)]
 pub struct FsObjectStore {
     dir: PathBuf,
-}
-
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
 }
 
 /// All envelope kind bytes: `get`/`has` take an id without a kind, so
@@ -146,44 +143,40 @@ impl FsObjectStore {
     }
 
     /// Durably create one file: temp + `fsync` + rename + directory
-    /// `fsync`. Stale temps are overwritten, never read. The temp name is
-    /// unique per attempt; if a concurrent `open()` sweep deletes the temp
-    /// between write and rename, the rename fails with `NotFound`: when
-    /// another writer already won the race the write becomes a no-op,
-    /// otherwise it rewrites to a fresh temp. Only the rename stage
-    /// retries — write-stage errors return at once, so a broken
-    /// filesystem surfaces instead of looping. The loop terminates
-    /// because only `open()` removes temps and `open()` calls are finite.
+    /// `fsync` (see [`crate::durable`]). Stale temps are overwritten,
+    /// never read. The temp name is unique per attempt; if a concurrent
+    /// `open()` sweep deletes the temp between write and rename, the
+    /// rename fails with `NotFound`: when another writer already won the
+    /// race the write becomes a no-op, otherwise it rewrites to a fresh
+    /// temp. Only the rename stage retries — write-stage errors return at
+    /// once, so a broken filesystem surfaces instead of looping. The loop
+    /// terminates because only `open()` removes temps and `open()` calls
+    /// are finite.
     fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
         loop {
-            let tmp = Self::write_tmp(path, bytes).map_err(FsStoreError::io)?;
-            match fs::rename(&tmp, path) {
-                Ok(()) => {
-                    fsync_dir(path.parent().expect("object paths have parents"))
-                        .map_err(FsStoreError::io)?;
-                    return Ok(());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let tmp = Self::temp_path(path);
+            durable::write_temp(&tmp, bytes).map_err(FsStoreError::io)?;
+            match durable::publish_temp(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let _ = fs::remove_file(&tmp);
                     if path.is_file() {
                         return Ok(());
                     }
                 }
-                Err(error) => return Err(FsStoreError::io(error)),
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(FsStoreError::io(error));
+                }
             }
         }
     }
 
-    /// Write the temp file for one attempt: created, fully written, and
-    /// fsynced, but not yet renamed into place.
-    fn write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        fs::create_dir_all(path.parent().expect("object paths have parents"))?;
+    /// The per-attempt scratch sibling for `path`: pid + counter keep
+    /// concurrent writers (threads or processes) off each other's temp.
+    fn temp_path(path: &Path) -> PathBuf {
         let nonce = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
-        let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce));
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        Ok(tmp)
+        path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce))
     }
 }
 

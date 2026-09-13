@@ -14,13 +14,13 @@
 //! rehydration is "rebuild from durable state", never "rehydrate bytes".
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr};
 use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
 use thiserror::Error;
+use wyrd_format::durable;
 use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
 use crate::bulk::{BulkError, BulkSource, SealedManifest};
@@ -98,11 +98,14 @@ impl Vault {
     /// objects are immutable and the store is append-only. The temp file
     /// is scoped to the root (distinct roots never collide on the temp
     /// path), and the rename is the publication point: a torn write
-    /// leaves a temp file, never a servable root.
+    /// leaves a temp file, never a servable root. Publication uses the
+    /// same crash protocol as the object store (temp + `fsync` + rename +
+    /// directory `fsync`, `wyrd_format::durable`), so the new directory
+    /// entry, not just the ciphertext, survives a power failure.
     pub fn import(&self, sealed: &[u8]) -> Result<BaoRoot, VaultError> {
         let root = blob_root(sealed);
         let path = self.path(&root);
-        if path.exists() {
+        if path.is_file() {
             return Ok(root);
         }
         let tmp = self.dir.join(format!(
@@ -111,21 +114,20 @@ impl Vault {
             std::process::id(),
             NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let write = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(sealed)?;
-            file.sync_all()
-        })();
-        if let Err(error) = write {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = durable::write_temp(&tmp, sealed) {
             return Err(error.into());
         }
-        if let Err(error) = std::fs::rename(&tmp, &path) {
+        if let Err(error) = durable::publish_temp(&tmp, &path) {
+            // A failed rename leaves the temp behind; a concurrent
+            // import of the same root may have published first, and
+            // identical bytes hash to the same root, so the existing
+            // file is the winner and this call is a no-op. A directory
+            // `fsync` failure happens only after a successful rename, so
+            // the temp is already gone: that is a real failure and must
+            // surface rather than be mistaken for a concurrent winner.
+            let rename_failed = tmp.is_file();
             let _ = std::fs::remove_file(&tmp);
-            // A concurrent import of the same root may have published
-            // first; identical bytes hash to the same root, so the
-            // existing file is the winner and this call is a no-op.
-            if path.exists() {
+            if rename_failed && path.is_file() {
                 return Ok(root);
             }
             return Err(error.into());
@@ -747,6 +749,25 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_publication_surfaces_an_error_and_leaves_no_temp() {
+        // A directory squatting on the root name blocks the rename: the
+        // failure must surface (never a phantom success), and the
+        // scratch file must be cleaned up.
+        let vault = vault();
+        let sealed = b"blocked representation".to_vec();
+        let root = blob_root(&sealed);
+        std::fs::create_dir_all(vault.dir.join(root.to_string()).join("child")).unwrap();
+        assert!(vault.import(&sealed).is_err());
+        for entry in std::fs::read_dir(&vault.dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".tmp-"),
+                "stale import scratch file"
+            );
+        }
     }
 
     #[test]

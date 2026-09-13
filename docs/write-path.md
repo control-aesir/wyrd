@@ -262,9 +262,10 @@ A commit proceeds in this order, and the order is the contract:
 3. **Commit durability boundary.** The object store, the vault, and the
    fact log become durable **together at this boundary** (steps 1-2 only
    *prepared* state; neither is independently durable). The fact-log
-   commit is already append-only and crash-safe; the vault-directory
-   fsync (`fix(sync): fsync the vault directory after publication`) and
-   the object-store fsync path close the remaining gap. The **announcement
+   commit is already append-only and crash-safe, and the object store and
+   vault share one crash protocol — temp + fsync + rename + directory
+   fsync (`wyrd_format::durable`) — so a published byte range or sealed
+   representation survives a power failure. The **announcement
    obligation is recorded durably here**, atomically with the snapshot
    (see below), so a crash after commit still knows the snapshot must be
    announced.

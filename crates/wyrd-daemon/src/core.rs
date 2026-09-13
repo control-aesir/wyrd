@@ -11,7 +11,7 @@
 //! own boundary.
 
 use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, Snapshot, Tree};
-use wyrd_fuse::{DriveView, Materialization, VerifiedSnapshot, ViewHead};
+use wyrd_fuse::{DriveView, Materialization, Node, VerifiedSnapshot, ViewHead};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{
@@ -27,7 +27,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::fuse::FuseBackend;
-use crate::mutation::{MutationError, MutationKind, MutationQueue};
+use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
@@ -622,7 +622,7 @@ where
     /// same bootstrap `put_file` performs. Returns the boundary-mapped
     /// failure without partial application: the format mutations either
     /// produce a new root or nothing.
-    fn apply_mutation(&mut self, kind: &MutationKind) -> Result<(), MutationError> {
+    fn apply_mutation(&mut self, kind: &MutationKind) -> Result<MutationOutcome, MutationError> {
         match kind {
             MutationKind::Mkdir { path } => {
                 let base = self.live_base()?;
@@ -639,8 +639,121 @@ where
                 self.engine
                     .author_snapshot(&*store, root)
                     .map_err(|_| MutationError::Engine)?;
-                Ok(())
+                Ok(MutationOutcome::Done)
             }
+            MutationKind::CreateFile { path } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                // `create` requires an absent name: anything already there
+                // (file, dir, symlink) is `EEXIST`, never a silent replace.
+                if self.current_node(&heads, path)?.is_some() {
+                    return Err(MutationError::AlreadyExists(path.clone()));
+                }
+                let base = match heads.as_slice() {
+                    [] => None,
+                    [head] => Some(head.snapshot().tree),
+                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+                };
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let base = match base {
+                    Some(tree) => tree,
+                    None => Tree::from_entries(Vec::new())
+                        .map_err(|_| MutationError::Store)?
+                        .insert_into(&mut *store)
+                        .map_err(|_| MutationError::Store)?,
+                };
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let entry = Entry::file(name, 0, false, Vec::new())
+                    .map_err(|error| MutationError::Invalid(error.to_string()))?;
+                let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
+                    .map_err(MutationError::from_format)?;
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Created(FileIdentity::new(
+                    0,
+                    false,
+                    Vec::new(),
+                )))
+            }
+            MutationKind::CommitFile {
+                path,
+                base,
+                content,
+            } => {
+                let heads = self
+                    .engine
+                    .live_heads()
+                    .map_err(|_| MutationError::Engine)?;
+                let tree = match heads.as_slice() {
+                    [] => return Err(MutationError::Stale(path.clone())),
+                    [head] => head.snapshot().tree,
+                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+                };
+                // The stale-handle boundary: commit only if the path still
+                // carries exactly the identity this handle opened against.
+                // A content change, kind change, or removal fails closed
+                // with no merge and no snapshot.
+                match self.current_node(&heads, path)? {
+                    Some(Node::File {
+                        size,
+                        executable,
+                        chunks,
+                    }) => {
+                        if FileIdentity::new(size, executable, chunks) != *base {
+                            return Err(MutationError::Stale(path.clone()));
+                        }
+                    }
+                    _ => return Err(MutationError::Stale(path.clone())),
+                }
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let chunks =
+                    chunk::insert_chunks(&mut *store, content).map_err(|_| MutationError::Store)?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let entry = Entry::file(
+                    name,
+                    content.len() as u64,
+                    base.executable(),
+                    chunks.clone(),
+                )
+                .map_err(|error| MutationError::Invalid(error.to_string()))?;
+                let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
+                    .map_err(MutationError::from_format)?;
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(MutationOutcome::Committed(FileIdentity::new(
+                    content.len() as u64,
+                    base.executable(),
+                    chunks,
+                )))
+            }
+        }
+    }
+
+    /// Resolve `path` against the current heads' merged view, for the
+    /// create/stale checks. `None` means absent; a non-file node is
+    /// returned so the caller can distinguish a kind change from absence.
+    fn current_node(
+        &self,
+        heads: &[AuthorizedSnapshot],
+        path: &str,
+    ) -> Result<Option<Node>, MutationError> {
+        let runtime = self
+            .engine
+            .runtime_state()
+            .map_err(|_| MutationError::Engine)?;
+        let view = DriveView::shared(
+            Arc::clone(&self.store),
+            DaemonMaterialization { runtime },
+            view_heads(heads.iter().cloned()),
+        );
+        match view.lookup(path) {
+            Ok(node) => Ok(Some(node)),
+            Err(wyrd_fuse::ViewError::NotFound) => Ok(None),
+            Err(_) => Err(MutationError::Engine),
         }
     }
 
@@ -1286,6 +1399,182 @@ mod tests {
             Err(fuser::Errno::EINVAL),
             "an invalid name is EINVAL"
         );
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Spawn the live loop on its own thread and return the stop flag
+    /// and join handle. The backend half stays on the test thread, so a
+    /// blocking mutation submit is completed by the loop concurrently.
+    fn spawn_live_loop(
+        live: LiveDaemon<MemoryObjectStore>,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Result<LiveSummary, LiveError>>,
+    ) {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loop_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut live = live;
+            let mut mailbox = NoopMailbox;
+            live.run_loop(
+                &mut mailbox,
+                None::<&mut MemoryBulkSource>,
+                &loop_stop,
+                &LiveConfig {
+                    interval: Duration::from_millis(10),
+                    error_base_delay: Duration::from_millis(5),
+                    error_max_delay: Duration::from_millis(20),
+                    max_consecutive_errors: 10,
+                },
+                &mut |_, _| {},
+            )
+        });
+        (stop, handle)
+    }
+
+    /// The whole basic lifecycle: create, write, read-your-writes,
+    /// commit, release, reopen, read back. The centerpiece slice-3 test.
+    #[test]
+    fn file_write_session_commits_and_reopens() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, _ino, attr) = backend
+            .create_at(1, "foo.txt", libc::O_RDWR)
+            .expect("create commits");
+        assert_eq!(attr.kind, fuser::FileType::RegularFile);
+        assert_eq!(backend.write_handle(fh, 0, b"hello").unwrap(), 5);
+        // Read-your-writes on the dirty handle; a fresh descriptor sees
+        // the committed empty file (the write is not yet durable).
+        assert_eq!(backend.read_handle(fh, 0, 64).unwrap(), b"hello");
+        let fresh = backend.open_at("foo.txt").expect("opens");
+        assert_eq!(backend.read_handle(fresh, 0, 64).unwrap(), b"");
+        backend.release_handle(fresh).unwrap();
+
+        backend.commit_handle(fh).expect("fsync commits");
+        backend.release_handle(fh).unwrap();
+
+        let reopened = backend.open_at("foo.txt").expect("reopens");
+        assert_eq!(backend.read_handle(reopened, 0, 64).unwrap(), b"hello");
+        backend.release_handle(reopened).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Two handles on one path: the first commit wins, the second is
+    /// stale (`EIO`) and authors no snapshot. Reads on the losing
+    /// handle still serve its open-time capture.
+    #[test]
+    fn concurrent_handles_isolate_and_second_commit_is_stale() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("c.txt", b"AAAA").unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let first = backend.open_write("c.txt", libc::O_RDWR).unwrap();
+        let second = backend.open_write("c.txt", libc::O_RDWR).unwrap();
+
+        backend.write_handle(first, 0, b"BBBB").unwrap();
+        backend.commit_handle(first).unwrap();
+        backend.release_handle(first).unwrap();
+
+        // The second handle opened against the old identity: its local
+        // image is its own, but committing fails closed.
+        backend.write_handle(second, 0, b"CCCC").unwrap();
+        assert_eq!(backend.read_handle(second, 0, 64).unwrap(), b"CCCC");
+        assert_eq!(backend.commit_handle(second), Err(fuser::Errno::EIO));
+        // Terminal: a later operation is EIO too.
+        assert_eq!(backend.commit_handle(second), Err(fuser::Errno::EIO));
+
+        let reopened = backend.open_at("c.txt").unwrap();
+        assert_eq!(
+            backend.read_handle(reopened, 0, 64).unwrap(),
+            b"BBBB",
+            "the winning commit survives the stale one"
+        );
+        backend.release_handle(reopened).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `O_TRUNC` is immediately dirty: opening with no later write still
+    /// commits an empty snapshot at the boundary, so closing cannot
+    /// silently leave the old content.
+    #[test]
+    fn o_trunc_without_writes_commits_an_empty_file() {
+        let (engine, dir, _) = scratch_drive();
+        let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        daemon.put_file("t.txt", b"hello").unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let fh = backend
+            .open_write("t.txt", libc::O_WRONLY | libc::O_TRUNC)
+            .unwrap();
+        assert_eq!(backend.read_handle(fh, 0, 64).unwrap(), b"");
+        backend.release_handle(fh).unwrap();
+
+        let reopened = backend.open_at("t.txt").unwrap();
+        assert_eq!(backend.read_handle(reopened, 0, 64).unwrap(), b"");
+        backend.release_handle(reopened).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `O_SYNC` makes each successful write its own durable snapshot: a
+    /// fresh descriptor observes the write without an explicit commit.
+    #[test]
+    fn o_sync_commits_each_write() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, _ino, _) = backend
+            .create_at(1, "s.txt", libc::O_RDWR | libc::O_SYNC)
+            .expect("create commits");
+        backend.write_handle(fh, 0, b"a").unwrap();
+        let seen = backend.open_at("s.txt").unwrap();
+        assert_eq!(
+            backend.read_handle(seen, 0, 64).unwrap(),
+            b"a",
+            "the first write is already durable"
+        );
+        backend.release_handle(seen).unwrap();
+
+        backend.write_handle(fh, 1, b"b").unwrap();
+        let seen = backend.open_at("s.txt").unwrap();
+        assert_eq!(backend.read_handle(seen, 0, 64).unwrap(), b"ab");
+        backend.release_handle(seen).unwrap();
+        backend.release_handle(fh).unwrap();
 
         stop.store(true, Ordering::Relaxed);
         loop_handle

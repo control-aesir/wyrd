@@ -15,6 +15,7 @@ pub mod fuse;
 pub mod live_mailbox;
 pub mod mutation;
 pub mod projection;
+pub mod session;
 pub mod want;
 
 /// Test-only minimal relay for live-mailbox integration tests.
@@ -22,6 +23,10 @@ pub mod want;
 pub(crate) mod mini_relay;
 
 pub use core::{Daemon, DaemonError, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};
-pub use mutation::{MutationError, MutationId, MutationKind, MutationQueue, MutationRequest};
+pub use mutation::{
+    FileIdentity, MutationError, MutationId, MutationKind, MutationOutcome, MutationQueue,
+    MutationRequest,
+};
 pub use projection::Projection;
+pub use session::{BudgetError, HandleId, WriteBudget};
 pub use want::{WantError, WantRegistry};

@@ -29,11 +29,70 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use wyrd_format::ContentId;
+
 /// Total admitted-but-incomplete mutations, including the one executing.
 /// Admission beyond the bound fails with [`MutationError::Saturated`]
 /// (`EAGAIN` at the POSIX boundary); buffered state is memory, so the
 /// bound keeps it bounded.
 pub const MAX_PENDING_MUTATIONS: usize = 4096;
+
+/// The base identity a writable handle opened against, and the identity
+/// the loop compares against the current head at commit. A commit is
+/// accepted only if the path still carries exactly this identity;
+/// anything else — a content change, a kind change, or removal — is
+/// [`MutationError::Stale`], never a silent merge.
+///
+/// The tuple is deliberately the full file identity (size, exec, ordered
+/// chunk ids) rather than a single content id: `docs/write-path.md` names
+/// kind, size, exec, and content as the comparison, and the format layer
+/// does not yet expose a canonical file-node id. A cheaper id is future
+/// work; it must not weaken the comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    size: u64,
+    executable: bool,
+    chunks: Vec<ContentId>,
+}
+
+impl FileIdentity {
+    /// The identity of a regular file as the view presented it.
+    pub fn new(size: u64, executable: bool, chunks: Vec<ContentId>) -> Self {
+        FileIdentity {
+            size,
+            executable,
+            chunks,
+        }
+    }
+
+    /// The declared byte size.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Whether the exec bit is set.
+    pub fn executable(&self) -> bool {
+        self.executable
+    }
+
+    /// The ordered chunk ids.
+    pub fn chunks(&self) -> &[ContentId] {
+        &self.chunks
+    }
+}
+
+/// What an applied mutation produced. Namespace mutations report `Done`;
+/// file mutations return the new identity so the caller can advance its
+/// handle's base without a second resolution pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationOutcome {
+    /// A namespace change with no content to hand back (e.g. `mkdir`).
+    Done,
+    /// A newly created empty file, with its durable identity.
+    Created(FileIdentity),
+    /// A committed file image, with its durable identity.
+    Committed(FileIdentity),
+}
 
 /// Idle-wait slice for the loop while nothing is happening: the wait
 /// wakes immediately on submission, so this only bounds how long a
@@ -82,6 +141,11 @@ pub enum MutationError {
     /// POSIX `EINVAL`.
     #[error("invalid rename: {0}")]
     InvalidRename(String),
+    /// A writable handle's base identity no longer matches the path's
+    /// current identity (content change, kind change, or removal). The
+    /// commit performs no merge and authors no snapshot. POSIX `EIO`.
+    #[error("stale handle for {0:?}: the path changed since it opened")]
+    Stale(String),
     /// Object-store or tree access failed. POSIX `EIO`.
     #[error("object store failed")]
     Store,
@@ -110,14 +174,25 @@ impl MutationError {
     }
 }
 
-/// One queued operation. Slice 2 carries `Mkdir`; later slices add file
-/// commits, create, unlink, rmdir, rename, and setattr. Paths are
-/// canonical components (the format layer re-validates them).
+/// One queued operation. Slice 2 carries `Mkdir`; this slice adds
+/// `CreateFile` and `CommitFile`. Later slices add unlink, rmdir,
+/// rename, and setattr. Paths are canonical components (the format
+/// layer re-validates them).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationKind {
     /// Create an empty directory; no intermediates (`insert_into` is the
     /// format layer's strict-parents rule).
     Mkdir { path: String },
+    /// Create an empty regular file as its own snapshot (the `create`
+    /// op's namespace half). `EEXIST` when the name is taken.
+    CreateFile { path: String },
+    /// Commit a writable handle's full logical image onto the current
+    /// head, accepted only if the path still carries `base`.
+    CommitFile {
+        path: String,
+        base: FileIdentity,
+        content: Vec<u8>,
+    },
 }
 
 /// A submitted operation, opaque to callers: the id is diagnostic, the
@@ -176,12 +251,12 @@ impl std::fmt::Debug for QueuedMutation {
 /// not completed it yet.
 #[derive(Debug, Default)]
 struct Reply {
-    result: Mutex<Option<Result<(), MutationError>>>,
+    result: Mutex<Option<Result<MutationOutcome, MutationError>>>,
     ready: Condvar,
 }
 
 impl Reply {
-    fn complete(&self, result: Result<(), MutationError>) {
+    fn complete(&self, result: Result<MutationOutcome, MutationError>) {
         let Ok(mut slot) = self.result.lock() else {
             // The submitter's thread is gone or panicking; nothing to
             // deliver to. Notify anyway so a waiter never hangs on a
@@ -193,7 +268,7 @@ impl Reply {
         self.ready.notify_all();
     }
 
-    fn wait(&self) -> Result<(), MutationError> {
+    fn wait(&self) -> Result<MutationOutcome, MutationError> {
         let mut slot = self.result.lock().map_err(|_| MutationError::Lock)?;
         loop {
             if let Some(result) = slot.take() {
@@ -246,7 +321,7 @@ impl MutationQueue {
     /// caller returns only after the executing pass completes it, so a
     /// success means the state is served. Saturation (`EAGAIN`) is the
     /// only failure that means the request never executed.
-    pub fn submit(&self, kind: MutationKind) -> Result<(), MutationError> {
+    pub fn submit(&self, kind: MutationKind) -> Result<MutationOutcome, MutationError> {
         let id = MutationId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let reply = Arc::new(Reply::default());
         {
@@ -294,7 +369,7 @@ impl MutationQueue {
     /// Complete one taken request: record the outcome, release its
     /// admission slot, wake the blocked submitter. [`MutationBatch`]
     /// calls this; direct callers should prefer the batch guard.
-    fn complete(&self, queued: QueuedMutation, result: Result<(), MutationError>) {
+    fn complete(&self, queued: QueuedMutation, result: Result<MutationOutcome, MutationError>) {
         let mut state = self.lock_state();
         state.outstanding = state.outstanding.saturating_sub(1);
         drop(state);
@@ -357,7 +432,7 @@ pub struct MutationBatch<'a> {
 
 struct BatchEntry {
     queued: Option<QueuedMutation>,
-    result: Option<Result<(), MutationError>>,
+    result: Option<Result<MutationOutcome, MutationError>>,
 }
 
 impl MutationBatch<'_> {
@@ -381,7 +456,7 @@ impl MutationBatch<'_> {
     }
 
     /// Record the outcome for the request at `index`.
-    pub fn record(&mut self, index: usize, result: Result<(), MutationError>) {
+    pub fn record(&mut self, index: usize, result: Result<MutationOutcome, MutationError>) {
         self.entries[index].result = Some(result);
     }
 
@@ -442,9 +517,9 @@ mod tests {
         assert_eq!(batch.request(0).kind(), &mkdir("docs"));
         assert_eq!(queue.outstanding(), 1, "admitted until completed");
 
-        batch.record(0, Ok(()));
+        batch.record(0, Ok(MutationOutcome::Done));
         batch.finish();
-        assert_eq!(submitter.join().unwrap(), Ok(()));
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
         assert_eq!(queue.outstanding(), 0, "completion releases the slot");
     }
 
@@ -505,18 +580,18 @@ mod tests {
         );
 
         // Finishing the first frees the slot for another.
-        batch.record(0, Ok(()));
+        batch.record(0, Ok(MutationOutcome::Done));
         batch.finish();
-        assert_eq!(submitter.join().unwrap(), Ok(()));
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
         let again = {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || queue.submit(mkdir("third")))
         };
         let mut batch = take_batch_blocking(&queue);
         assert_eq!(batch.request(0).kind(), &mkdir("third"));
-        batch.record(0, Ok(()));
+        batch.record(0, Ok(MutationOutcome::Done));
         batch.finish();
-        assert_eq!(again.join().unwrap(), Ok(()));
+        assert_eq!(again.join().unwrap(), Ok(MutationOutcome::Done));
     }
 
     /// A poisoned queue lock does not wedge callers: the state is plain
@@ -538,8 +613,8 @@ mod tests {
         };
         let mut batch = take_batch_blocking(&queue);
         assert_eq!(batch.len(), 1, "the recovered queue still drains");
-        batch.record(0, Ok(()));
+        batch.record(0, Ok(MutationOutcome::Done));
         batch.finish();
-        assert_eq!(submitter.join().unwrap(), Ok(()));
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
     }
 }

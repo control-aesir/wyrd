@@ -64,7 +64,11 @@ struct InodeTable {
 }
 
 /// One minted mapping: the path, the node kind it resolved to, and
-/// the projection generation that last confirmed both.
+/// the projection generation that last confirmed both. The stamp is
+/// recorded for the mounted write path's invalidation (it tells
+/// whether a mapping predates a commit); validation correctness
+/// itself comes from re-resolving against one cloned immutable
+/// projection, not from comparing this field.
 struct InodeEntry {
     path: String,
     kind: fuser::FileType,
@@ -134,6 +138,17 @@ impl InodeTable {
     fn retire(&mut self, ino: u64) {
         if let Some(entry) = self.by_ino.remove(&ino) {
             self.by_path.remove(&entry.path);
+        }
+    }
+
+    /// Forget whatever mapping names `path`, if any. Failed
+    /// resolution retires by path: the resolving callback holds no
+    /// ino (lookup mints after resolving), but the stale mapping must
+    /// still go — otherwise a same-kind recreation would reuse an
+    /// identity whose content died with the deleted generation.
+    fn retire_path(&mut self, path: &str) {
+        if let Some(ino) = self.by_path.remove(path) {
+            self.by_ino.remove(&ino);
         }
     }
 
@@ -387,10 +402,18 @@ where
     fn resolve_inode(&self, path: &str) -> Result<(u64, Node, u64), fuser::Errno> {
         let projection = self.projection()?;
         let generation = projection.generation();
-        let node = projection
-            .view()
-            .lookup(path)
-            .map_err(|error| errno_of(&error))?;
+        let node = match projection.view().lookup(path) {
+            Ok(node) => node,
+            Err(ViewError::NotFound) => {
+                // The path is gone: retire by path, not by ino —
+                // resolution precedes minting, so no ino is at hand,
+                // but the stale mapping must go or a same-kind
+                // recreation would silently reuse its identity.
+                self.retire_path(path);
+                return Err(fuser::Errno::ENOENT);
+            }
+            Err(error) => return Err(errno_of(&error)),
+        };
         let (kind, _, _) = attr_of(&node);
         let ino = self
             .inodes
@@ -427,6 +450,16 @@ where
     fn retire_inode(&self, ino: u64) {
         if let Ok(mut inodes) = self.inodes.write() {
             inodes.retire(ino);
+        }
+    }
+
+    /// Forget whatever mapping names `path`, if any. Same
+    /// best-effort terms as [`retire_inode`](Self::retire_inode):
+    /// failed resolution holds no ino, but the stale by-path mapping
+    /// must still go.
+    fn retire_path(&self, path: &str) {
+        if let Ok(mut inodes) = self.inodes.write() {
+            inodes.retire_path(path);
         }
     }
 
@@ -1392,6 +1425,38 @@ mod tests {
             backend.validate_inode(dir_ino, "f.txt", &dir_node, 3),
             Err(fuser::Errno::ENOENT),
             "the deleted path's ino stopped validating on recreation"
+        );
+    }
+
+    /// A same-kind delete/recreate cycle mints a fresh ino: the
+    /// failed resolution between the generations retires the mapping
+    /// by path, so the recreated file never inherits the deleted
+    /// file's identity — even with no getattr on the stale ino in
+    /// between.
+    #[test]
+    fn same_kind_recreate_mints_fresh_ino() {
+        let (backend, _, gone, file_again) = kind_changing_backend();
+        // Skip the repurpose generation: file -> deleted -> file.
+        let (first_ino, first_node, _) = backend.resolve_inode("f.txt").unwrap();
+        assert!(matches!(first_node, Node::File { .. }));
+
+        publish(&backend, gone);
+        assert_eq!(
+            backend.resolve_inode("f.txt"),
+            Err(fuser::Errno::ENOENT),
+            "the failed resolution retires the mapping by path"
+        );
+
+        publish(&backend, file_again);
+        let (second_ino, second_node, _) = backend.resolve_inode("f.txt").unwrap();
+        assert!(matches!(second_node, Node::File { .. }));
+        assert_ne!(
+            first_ino, second_ino,
+            "same-kind recreation must not reuse the deleted identity"
+        );
+        assert_eq!(
+            backend.validate_inode(first_ino, "f.txt", &second_node, 2),
+            Err(fuser::Errno::ENOENT)
         );
     }
 

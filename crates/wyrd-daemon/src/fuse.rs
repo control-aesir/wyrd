@@ -827,7 +827,16 @@ where
     ) -> Result<u32, fuser::Errno> {
         if data.is_empty() {
             // POSIX no-op: a zero-length write changes nothing and must
-            // not materialize, mark the handle dirty, or commit.
+            // not materialize, mark the handle dirty, or commit. It
+            // still validates the descriptor: an unknown handle or one
+            // without write access is `EBADF` just like any write.
+            let Handle::Write(handle) = self.handle_of(fh)? else {
+                return Err(fuser::Errno::EBADF);
+            };
+            let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+            if write.failed {
+                return Err(fuser::Errno::EIO);
+            }
             return Ok(0);
         }
         let Handle::Write(handle) = self.handle_of(fh)? else {
@@ -1019,13 +1028,15 @@ where
             ctime: MOUNT_TIME,
             crtime: MOUNT_TIME,
             kind,
-            // Read-only presentation: owner-readable, dirs/executable
-            // files traversable, never writable.
+            // The mount is single-user and the format represents only
+            // the exec bit: regular files present owner-writable modes
+            // (0644, or 0755 when executable) since writable sessions
+            // are served, and directories are owner-writable 0755.
             perm: match kind {
-                fuser::FileType::Directory => 0o555,
+                fuser::FileType::Directory => 0o755,
                 fuser::FileType::Symlink => 0o777,
-                _ if executable => 0o555,
-                _ => 0o444,
+                _ if executable => 0o755,
+                _ => 0o644,
             },
             nlink: 1,
             uid: 0,

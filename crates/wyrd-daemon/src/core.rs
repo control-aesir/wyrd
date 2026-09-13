@@ -1374,6 +1374,7 @@ mod tests {
         let before = backend.generation().unwrap();
         let (docs_ino, attr) = backend.mkdir_at(1, "docs").expect("mkdir commits");
         assert_eq!(attr.kind, fuser::FileType::Directory);
+        assert_eq!(attr.perm, 0o755, "directories present owner-writable bits");
         assert!(
             backend.generation().unwrap() > before,
             "the committing pass publishes a new generation"
@@ -1452,6 +1453,10 @@ mod tests {
             .create_at(1, "foo.txt", libc::O_RDWR)
             .expect("create commits");
         assert_eq!(attr.kind, fuser::FileType::RegularFile);
+        assert_eq!(
+            attr.perm, 0o644,
+            "a writable file presents owner-writable bits"
+        );
         assert_eq!(backend.write_handle(fh, 0, b"hello").unwrap(), 5);
         // Read-your-writes on the dirty handle; a fresh descriptor sees
         // the committed empty file (the write is not yet durable).
@@ -1616,6 +1621,18 @@ mod tests {
             before,
             "a zero-length write authors no snapshot"
         );
+        // The no-op still validates the descriptor: an unknown handle and
+        // a read-only handle are EBADF, like any other write.
+        assert_eq!(
+            backend.write_handle(fuser::FileHandle(9999), 0, b""),
+            Err(fuser::Errno::EBADF)
+        );
+        let read_only = backend.open_at("z.txt").unwrap();
+        assert_eq!(
+            backend.write_handle(read_only, 0, b""),
+            Err(fuser::Errno::EBADF)
+        );
+        backend.release_handle(read_only).unwrap();
         backend.commit_handle(fh).unwrap();
         assert_eq!(
             backend.generation().unwrap(),

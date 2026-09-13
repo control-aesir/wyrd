@@ -48,18 +48,44 @@ const TTL: Duration = Duration::from_secs(1);
 /// snapshot timestamps are display-only (object-model.md).
 const MOUNT_TIME: SystemTime = UNIX_EPOCH;
 
-/// The inode table: kernel ino → the path it was minted for. Inodes are
-/// never reused within a mount; the root is always 1.
+/// The inode table: kernel ino → the path it was minted for, plus
+/// the kind and projection generation that last validated the
+/// mapping. Inodes are never reused within a mount; the root is
+/// always 1. A mapping is only as fresh as its last validation:
+/// every lookup/getattr re-resolves the path against the current
+/// projection, and a kind change or deletion retires the ino instead
+/// of letting it silently attach to new content — the next lookup
+/// mints a fresh ino, and holders of the retired ino fail with
+/// ENOENT rather than serving stale identity.
 struct InodeTable {
-    by_ino: HashMap<u64, String>,
+    by_ino: HashMap<u64, InodeEntry>,
     by_path: HashMap<String, u64>,
     next: u64,
 }
 
+/// One minted mapping: the path, the node kind it resolved to, and
+/// the projection generation that last confirmed both.
+struct InodeEntry {
+    path: String,
+    kind: fuser::FileType,
+    generation: u64,
+}
+
 type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
 
+/// One open directory: the listing pinned at opendir plus the
+/// projection generation it was enumerated from. Readdir serves the
+/// pinned listing — a stable snapshot of its generation — while
+/// lookup/getattr always resolve against the current projection, so
+/// a listing never mixes generations mid-stream; a fresh opendir
+/// picks up the new generation.
+struct OpenDir {
+    generation: u64,
+    entries: DirectoryEntries,
+}
+
 struct DirectoryState {
-    entries: HashMap<u64, DirectoryEntries>,
+    entries: HashMap<u64, OpenDir>,
     next_handle: u64,
 }
 
@@ -74,12 +100,20 @@ struct OpenFiles {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InodeError {
     Exhausted,
+    Stale,
 }
 
 impl InodeTable {
     fn new() -> Self {
         let mut by_ino = HashMap::new();
-        by_ino.insert(1u64, String::new());
+        by_ino.insert(
+            1u64,
+            InodeEntry {
+                path: String::new(),
+                kind: fuser::FileType::Directory,
+                generation: 0,
+            },
+        );
         let mut by_path = HashMap::new();
         by_path.insert(String::new(), 1);
         InodeTable {
@@ -90,24 +124,85 @@ impl InodeTable {
     }
 
     fn path(&self, ino: u64) -> Option<&str> {
-        self.by_ino.get(&ino).map(String::as_str)
+        self.by_ino.get(&ino).map(|entry| entry.path.as_str())
     }
 
-    /// The ino for a path, minting one on first sight. The root path
-    /// (`""`) always maps to ino 1.
-    fn intern(&mut self, path: &str) -> Result<u64, InodeError> {
+    /// Forget a mapping on both indexes. Deletion and kind changes
+    /// retire the ino; a later lookup mints a fresh one, so a retired
+    /// ino never silently reattaches to recreated or repurposed
+    /// content.
+    fn retire(&mut self, ino: u64) {
+        if let Some(entry) = self.by_ino.remove(&ino) {
+            self.by_path.remove(&entry.path);
+        }
+    }
+
+    /// The ino for a freshly resolved path: reuse the mapping when it
+    /// still names the same kind (refreshing its validated
+    /// generation), otherwise retire the stale ino and mint a new one.
+    /// The root path (`""`) always maps to ino 1.
+    fn intern(
+        &mut self,
+        path: &str,
+        kind: fuser::FileType,
+        generation: u64,
+    ) -> Result<u64, InodeError> {
         if path.is_empty() {
             return Ok(1);
         }
         if let Some(ino) = self.by_path.get(path) {
-            return Ok(*ino);
+            let ino = *ino;
+            let matches = self
+                .by_ino
+                .get(&ino)
+                .is_some_and(|entry| entry.kind == kind);
+            if matches {
+                if let Some(entry) = self.by_ino.get_mut(&ino) {
+                    entry.generation = generation;
+                }
+                return Ok(ino);
+            }
+            self.retire(ino);
         }
         let ino = self.next;
         self.next = self.next.checked_add(1).ok_or(InodeError::Exhausted)?;
         let path = path.to_string();
-        self.by_ino.insert(ino, path.clone());
-        self.by_path.insert(path, ino);
+        self.by_path.insert(path.clone(), ino);
+        self.by_ino.insert(
+            ino,
+            InodeEntry {
+                path,
+                kind,
+                generation,
+            },
+        );
         Ok(ino)
+    }
+
+    /// Confirm an ino still names its path at its kind: refresh the
+    /// validated generation on success, retire the mapping and report
+    /// stale on any divergence (kind change, path swap) or unknown
+    /// ino. Holders of a retired ino fail with ENOENT instead of
+    /// serving the path's new occupant.
+    fn validate(
+        &mut self,
+        ino: u64,
+        path: &str,
+        kind: fuser::FileType,
+        generation: u64,
+    ) -> Result<(), InodeError> {
+        let fresh = self
+            .by_ino
+            .get(&ino)
+            .is_some_and(|entry| entry.path.as_str() == path && entry.kind == kind);
+        if !fresh {
+            self.retire(ino);
+            return Err(InodeError::Stale);
+        }
+        if let Some(entry) = self.by_ino.get_mut(&ino) {
+            entry.generation = generation;
+        }
+        Ok(())
     }
 }
 
@@ -140,6 +235,10 @@ where
 fn inode_error(error: InodeError) -> fuser::Errno {
     match error {
         InodeError::Exhausted => fuser::Errno::EOVERFLOW,
+        // A retired mapping: the path was deleted or repurposed since
+        // the ino was minted. The kernel drops the dentry on ENOENT
+        // and re-resolves, which mints the fresh mapping.
+        InodeError::Stale => fuser::Errno::ENOENT,
     }
 }
 
@@ -277,6 +376,58 @@ where
     /// tests pin that idle passes disturb nothing.
     pub fn generation(&self) -> Result<u64, fuser::Errno> {
         Ok(self.projection()?.generation())
+    }
+
+    /// Resolve `path` against the current projection and
+    /// intern-or-revalidate its ino in one step: same kind reuses the
+    /// mapping (stamping the current generation), a kind change
+    /// retires the stale ino and mints a fresh one. The node and the
+    /// generation come from the same projection, so callers serve one
+    /// consistent snapshot per call.
+    fn resolve_inode(&self, path: &str) -> Result<(u64, Node, u64), fuser::Errno> {
+        let projection = self.projection()?;
+        let generation = projection.generation();
+        let node = projection
+            .view()
+            .lookup(path)
+            .map_err(|error| errno_of(&error))?;
+        let (kind, _, _) = attr_of(&node);
+        let ino = self
+            .inodes
+            .write()
+            .map_err(|_| fuser::Errno::EIO)?
+            .intern(path, kind, generation)
+            .map_err(inode_error)?;
+        Ok((ino, node, generation))
+    }
+
+    /// Confirm `ino` still names `path` at `node`'s kind, stamping the
+    /// current generation. A kind change, path swap, or unknown ino
+    /// retires the mapping and reports ENOENT: holders of a retired
+    /// ino re-resolve instead of serving the path's new occupant.
+    fn validate_inode(
+        &self,
+        ino: u64,
+        path: &str,
+        node: &Node,
+        generation: u64,
+    ) -> Result<(), fuser::Errno> {
+        let (kind, _, _) = attr_of(node);
+        self.inodes
+            .write()
+            .map_err(|_| fuser::Errno::EIO)?
+            .validate(ino, path, kind, generation)
+            .map_err(inode_error)
+    }
+
+    /// Forget a mapping on the deletion path. Best-effort: this runs
+    /// where the operation already fails, so poison is ignored — the
+    /// primary locks fail closed on their own, and the next
+    /// validation retires anything this misses.
+    fn retire_inode(&self, ino: u64) {
+        if let Ok(mut inodes) = self.inodes.write() {
+            inodes.retire(ino);
+        }
     }
 
     /// A shared borrow of the current published generation: the
@@ -443,15 +594,95 @@ where
             .ok_or(fuser::Errno::ENOENT)
     }
 
-    /// The cached entries of an open directory. Poison maps to EIO
-    /// like every other lock failure; an unknown handle is EBADF.
+    /// The projection generation an open directory was enumerated
+    /// from: lets callers tell whether a pinned listing predates a
+    /// publication. The mounted write path keys its cache
+    /// invalidation on this. Same failure mapping as
+    /// [`dir_entries`](Self::dir_entries).
+    pub fn dir_generation(&self, fh: u64) -> Result<u64, fuser::Errno> {
+        let directories = self.directories.read().map_err(|_| fuser::Errno::EIO)?;
+        directories
+            .entries
+            .get(&fh)
+            .map(|opened| opened.generation)
+            .ok_or(fuser::Errno::EBADF)
+    }
+
+    /// The cached entries of an open directory: the listing pinned at
+    /// opendir, a stable snapshot of its enumeration generation.
+    /// Poison maps to EIO like every other lock failure; an unknown
+    /// handle is EBADF.
     fn dir_entries(&self, fh: u64) -> Result<DirectoryEntries, fuser::Errno> {
         let directories = self.directories.read().map_err(|_| fuser::Errno::EIO)?;
         directories
             .entries
             .get(&fh)
-            .cloned()
+            .map(|opened| opened.entries.clone())
             .ok_or(fuser::Errno::EBADF)
+    }
+
+    /// Enumerate the directory at `path` into a fresh handle: resolve
+    /// against the current projection, validate the ino, intern every
+    /// child (kind-aware, stamped with the enumeration generation),
+    /// and pin the listing with its generation. The non-callback form
+    /// of the kernel `opendir` op — the surface the
+    /// directory-consistency tests ride.
+    fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
+        let Ok(projection) = self.projection() else {
+            return Err(fuser::Errno::EIO);
+        };
+        let node = match projection.view().lookup(path) {
+            Ok(node) => node,
+            Err(ViewError::NotFound) => {
+                self.retire_inode(ino);
+                return Err(fuser::Errno::ENOENT);
+            }
+            Err(error) => {
+                return Err(errno_of(&error));
+            }
+        };
+        self.validate_inode(ino, path, &node, projection.generation())?;
+        let entries = projection
+            .view()
+            .readdir(&node)
+            .map_err(|error| errno_of(&error))?;
+        let mut all = vec![
+            (ino, fuser::FileType::Directory, ".".into()),
+            (ino, fuser::FileType::Directory, "..".into()),
+        ];
+        let Ok(mut inodes) = self.inodes.write() else {
+            return Err(fuser::Errno::EIO);
+        };
+        for entry in entries {
+            let child_path = join(path, &entry.name);
+            let (kind, _, _) = attr_of(&entry.node);
+            let child_ino = match inodes.intern(&child_path, kind, projection.generation()) {
+                Ok(ino) => ino,
+                Err(error) => {
+                    return Err(inode_error(error));
+                }
+            };
+            all.push((child_ino, kind, entry.name));
+        }
+        drop(inodes);
+        let Ok(mut directories) = self.directories.write() else {
+            return Err(fuser::Errno::EIO);
+        };
+        let handle = directories.next_handle;
+        directories.next_handle = match handle.checked_add(1) {
+            Some(next) => next,
+            None => {
+                return Err(fuser::Errno::EOVERFLOW);
+            }
+        };
+        // The listing is pinned to its enumeration generation: a
+        // stable snapshot, never a mix of generations mid-stream.
+        let opened = OpenDir {
+            generation: projection.generation(),
+            entries: all,
+        };
+        directories.entries.insert(handle, opened);
+        Ok(handle)
     }
 }
 
@@ -487,27 +718,12 @@ where
             }
         };
         let child_path = join(&parent_path, name);
-        let Ok(projection) = self.projection() else {
-            reply.error(fuser::Errno::EIO);
-            return;
-        };
-        match projection.view().lookup(&child_path) {
-            Ok(node) => {
-                let Ok(mut inodes) = self.inodes.write() else {
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                };
-                let ino = match inodes.intern(&child_path) {
-                    Ok(ino) => ino,
-                    Err(error) => {
-                        reply.error(inode_error(error));
-                        return;
-                    }
-                };
+        match self.resolve_inode(&child_path) {
+            Ok((ino, node, _)) => {
                 let attr = self.attr(ino, &node);
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
-            Err(error) => reply.error(errno_of(&error)),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -531,8 +747,21 @@ where
         };
         match projection.view().lookup(&path) {
             Ok(node) => {
+                if let Err(error) =
+                    self.validate_inode(ino.0, &path, &node, projection.generation())
+                {
+                    reply.error(error);
+                    return;
+                }
                 let attr = self.attr(ino.0, &node);
                 reply.attr(&TTL, &attr);
+            }
+            Err(ViewError::NotFound) => {
+                // The path is gone: retire the mapping so a later
+                // recreation mints a fresh ino instead of reattaching
+                // the retired one to new content.
+                self.retire_inode(ino.0);
+                reply.error(fuser::Errno::ENOENT);
             }
             Err(error) => reply.error(errno_of(&error)),
         }
@@ -580,59 +809,10 @@ where
                 return;
             }
         };
-        let Ok(projection) = self.projection() else {
-            reply.error(fuser::Errno::EIO);
-            return;
-        };
-        let node = match projection.view().lookup(&path) {
-            Ok(node) => node,
-            Err(error) => {
-                reply.error(errno_of(&error));
-                return;
-            }
-        };
-        let entries = match projection.view().readdir(&node) {
-            Ok(entries) => entries,
-            Err(error) => {
-                reply.error(errno_of(&error));
-                return;
-            }
-        };
-        let mut all = vec![
-            (ino.0, fuser::FileType::Directory, ".".into()),
-            (ino.0, fuser::FileType::Directory, "..".into()),
-        ];
-        let Ok(mut inodes) = self.inodes.write() else {
-            reply.error(fuser::Errno::EIO);
-            return;
-        };
-        for entry in entries {
-            let child_path = join(&path, &entry.name);
-            let child_ino = match inodes.intern(&child_path) {
-                Ok(ino) => ino,
-                Err(error) => {
-                    reply.error(inode_error(error));
-                    return;
-                }
-            };
-            let (kind, _, _) = attr_of(&entry.node);
-            all.push((child_ino, kind, entry.name));
+        match self.open_dir(ino.0, &path) {
+            Ok(handle) => reply.opened(FileHandle(handle), fuser::FopenFlags::empty()),
+            Err(error) => reply.error(error),
         }
-        drop(inodes);
-        let Ok(mut directories) = self.directories.write() else {
-            reply.error(fuser::Errno::EIO);
-            return;
-        };
-        let handle = directories.next_handle;
-        directories.next_handle = match handle.checked_add(1) {
-            Some(next) => next,
-            None => {
-                reply.error(fuser::Errno::EOVERFLOW);
-                return;
-            }
-        };
-        directories.entries.insert(handle, all);
-        reply.opened(FileHandle(handle), fuser::FopenFlags::empty());
     }
 
     fn releasedir(
@@ -664,6 +844,33 @@ where
                 return;
             }
         };
+        // The ino must still name this path at its kind: a retired
+        // mapping (kind change since the dentry was cached) fails
+        // here so the kernel re-resolves instead of opening the
+        // path's new occupant under stale identity.
+        let Ok(projection) = self.projection() else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
+        match projection.view().lookup(&path) {
+            Ok(node) => {
+                if let Err(error) =
+                    self.validate_inode(ino.0, &path, &node, projection.generation())
+                {
+                    reply.error(error);
+                    return;
+                }
+            }
+            Err(ViewError::NotFound) => {
+                self.retire_inode(ino.0);
+                reply.error(fuser::Errno::ENOENT);
+                return;
+            }
+            Err(error) => {
+                reply.error(errno_of(&error));
+                return;
+            }
+        }
         match self.open_at(&path) {
             Ok(handle) => reply.opened(handle, fuser::FopenFlags::FOPEN_DIRECT_IO),
             Err(error) => reply.error(error),
@@ -682,6 +889,22 @@ where
             reply.error(fuser::Errno::EIO);
             return;
         };
+        let node = match projection.view().lookup(&path) {
+            Ok(node) => node,
+            Err(ViewError::NotFound) => {
+                self.retire_inode(ino.0);
+                reply.error(fuser::Errno::ENOENT);
+                return;
+            }
+            Err(error) => {
+                reply.error(errno_of(&error));
+                return;
+            }
+        };
+        if let Err(error) = self.validate_inode(ino.0, &path, &node, projection.generation()) {
+            reply.error(error);
+            return;
+        }
         match symlink_target(projection.view(), &path) {
             Ok(target) => reply.data(target.as_bytes()),
             Err(error) => reply.error(error),
@@ -827,7 +1050,6 @@ mod tests {
             heads(vec![snapshot_of(root)]),
         ))
     }
-
     /// The errno mapping is the POSIX contract at the mount boundary:
     /// pinned variant by variant.
     #[test]
@@ -854,15 +1076,54 @@ mod tests {
 
     #[test]
     fn inode_table_interns_stably_and_never_reuses() {
+        use fuser::FileType;
         let mut table = InodeTable::new();
         assert_eq!(table.path(1), Some(""), "root is 1");
-        let a = table.intern("hello.txt").unwrap();
-        let b = table.intern("sub").unwrap();
+        let a = table.intern("hello.txt", FileType::RegularFile, 0).unwrap();
+        let b = table.intern("sub", FileType::Directory, 0).unwrap();
         assert_ne!(a, b);
-        assert_eq!(table.intern("hello.txt"), Ok(a), "re-interning is stable");
+        assert_eq!(
+            table.intern("hello.txt", FileType::RegularFile, 1),
+            Ok(a),
+            "re-interning is stable and refreshes the generation"
+        );
         assert_eq!(table.path(a), Some("hello.txt"));
         // The root path interns to the root ino, never a fresh one.
-        assert_eq!(table.intern(""), Ok(1));
+        assert_eq!(table.intern("", FileType::Directory, 1), Ok(1));
+    }
+
+    /// A kind change retires the mapping: the next intern mints a
+    /// fresh ino, and the retired one validates stale instead of
+    /// silently attaching to the repurposed path.
+    #[test]
+    fn inode_table_retires_mappings_on_kind_change() {
+        use fuser::FileType;
+        let mut table = InodeTable::new();
+        let file_ino = table.intern("shape", FileType::RegularFile, 0).unwrap();
+        let dir_ino = table.intern("shape", FileType::Directory, 1).unwrap();
+        assert_ne!(file_ino, dir_ino, "a repurposed path mints a fresh ino");
+        assert_eq!(
+            table.validate(file_ino, "shape", FileType::RegularFile, 1),
+            Err(InodeError::Stale),
+            "the retired ino no longer validates"
+        );
+        assert_eq!(table.path(file_ino), None, "retirement clears both indexes");
+        assert!(table
+            .validate(dir_ino, "shape", FileType::Directory, 1)
+            .is_ok());
+    }
+
+    /// Validating an unknown ino is stale (never a fresh mapping for
+    /// someone else's identity), and retiring an unknown ino is quiet.
+    #[test]
+    fn inode_table_rejects_unknown_inos() {
+        use fuser::FileType;
+        let mut table = InodeTable::new();
+        assert_eq!(
+            table.validate(999, "ghost", FileType::RegularFile, 0),
+            Err(InodeError::Stale)
+        );
+        table.retire(999);
     }
 
     #[test]
@@ -1012,6 +1273,170 @@ mod tests {
         let fresh = backend.open_at("f.txt").unwrap();
         assert_eq!(backend.read_handle(fresh, 0, 64).unwrap(), b"second");
         assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
+    }
+
+    /// Three generations over one store: v0 serves `f.txt` as a file
+    /// beside an empty `sub`, v1 repurposes `f.txt` as a directory and
+    /// adds `new.txt`, v2 deletes `f.txt`. Each step publishes a new
+    /// backend generation without touching the durable revision.
+    fn kind_changing_backend() -> (
+        FuseBackend<MemoryObjectStore, NoMaterialization>,
+        Snapshot,
+        Snapshot,
+        Snapshot,
+    ) {
+        let mut store = MemoryObjectStore::default();
+        let chunk = store.insert(ObjectKind::Chunk, b"data").unwrap();
+        let empty = Tree::from_entries(Vec::new())
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let file_entry = || Entry::file("f.txt", 4, false, vec![chunk]).unwrap();
+        let root_file = Tree::from_entries(vec![file_entry(), Entry::dir("sub", empty).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let root_dir = Tree::from_entries(vec![
+            Entry::dir("f.txt", empty).unwrap(),
+            Entry::dir("sub", empty).unwrap(),
+            Entry::file("new.txt", 4, false, vec![chunk]).unwrap(),
+        ])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+        let root_gone = Tree::from_entries(vec![Entry::dir("sub", empty).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let backend = FuseBackend::new(DriveView::new(
+            store,
+            NoMaterialization,
+            heads(vec![snapshot_of(root_file)]),
+        ));
+        (
+            backend,
+            snapshot_of(root_dir),
+            snapshot_of(root_gone),
+            snapshot_of(root_file),
+        )
+    }
+
+    /// Publish `next` as the backend's new generation.
+    fn publish(backend: &FuseBackend<MemoryObjectStore, NoMaterialization>, next: Snapshot) {
+        backend
+            .publish_without_revision(DriveView::shared(
+                backend.store_handle().unwrap(),
+                NoMaterialization,
+                heads(vec![next]),
+            ))
+            .unwrap();
+    }
+
+    /// A file repurposed as a directory mints a fresh ino: the lookup
+    /// after publication resolves the new kind under a new identity,
+    /// and the retired ino fails instead of serving the new occupant.
+    #[test]
+    fn kind_change_retires_the_ino() {
+        let (backend, as_dir, _, _) = kind_changing_backend();
+        let (file_ino, file_node, _) = backend.resolve_inode("f.txt").unwrap();
+        assert!(matches!(file_node, Node::File { .. }));
+
+        publish(&backend, as_dir);
+        assert_eq!(backend.generation().unwrap(), 1);
+        let (dir_ino, dir_node, _) = backend.resolve_inode("f.txt").unwrap();
+        assert!(matches!(dir_node, Node::Dir { .. }));
+        assert_ne!(
+            file_ino, dir_ino,
+            "a repurposed path must not keep its identity"
+        );
+
+        // The retired ino no longer validates, even against the new
+        // node: holders re-resolve instead of serving stale identity.
+        assert_eq!(
+            backend.validate_inode(file_ino, "f.txt", &dir_node, 1),
+            Err(fuser::Errno::ENOENT)
+        );
+        assert!(backend
+            .validate_inode(dir_ino, "f.txt", &dir_node, 1)
+            .is_ok());
+    }
+
+    /// Deletion retires the mapping: resolution fails, the old ino
+    /// stops validating, and recreating the path mints a fresh ino
+    /// that never reattaches to the deleted content's identity.
+    #[test]
+    fn deletion_retires_and_recreation_mints_fresh() {
+        let (backend, as_dir, gone, file_again) = kind_changing_backend();
+        let (file_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+        publish(&backend, as_dir);
+        let (dir_ino, dir_node, _) = backend.resolve_inode("f.txt").unwrap();
+
+        publish(&backend, gone);
+        assert_eq!(
+            backend.resolve_inode("f.txt"),
+            Err(fuser::Errno::ENOENT),
+            "a deleted path resolves to nothing"
+        );
+        // Retirement is lazy: the deleted mapping lingers until the
+        // path resolves again (a getattr on the stale ino re-resolves,
+        // fails, and retires it — the callback path, not this helper).
+        // Recreation is what observably retires it here: the fresh
+        // resolve finds the kind mismatch, drops the deleted mapping,
+        // and mints a new identity.
+        publish(&backend, file_again);
+        let (fresh_ino, fresh_node, _) = backend.resolve_inode("f.txt").unwrap();
+        assert!(matches!(fresh_node, Node::File { .. }));
+        assert_ne!(fresh_ino, file_ino);
+        assert_ne!(fresh_ino, dir_ino, "recreation never reuses a retired ino");
+        assert_eq!(
+            backend.validate_inode(dir_ino, "f.txt", &dir_node, 3),
+            Err(fuser::Errno::ENOENT),
+            "the deleted path's ino stopped validating on recreation"
+        );
+    }
+
+    /// Directory handles pin their enumeration generation: a listing
+    /// opened before a publication keeps serving its own snapshot
+    /// while a fresh open picks up the new generation. The two never
+    /// mix mid-stream.
+    #[test]
+    fn directory_handles_pin_their_enumeration_generation() {
+        let (backend, as_dir, _, _) = kind_changing_backend();
+        let (root_ino, _, _) = backend.resolve_inode("").unwrap();
+        let old = backend.open_dir(root_ino, "").unwrap();
+        assert_eq!(backend.dir_generation(old).unwrap(), 0);
+        let before: Vec<String> = backend
+            .dir_entries(old)
+            .unwrap()
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect();
+        assert!(before.contains(&"f.txt".to_string()));
+        assert!(!before.contains(&"new.txt".to_string()));
+
+        publish(&backend, as_dir);
+        // The pinned handle is untouched by the publication: same
+        // generation, same listing.
+        assert_eq!(backend.dir_generation(old).unwrap(), 0);
+        let still: Vec<String> = backend
+            .dir_entries(old)
+            .unwrap()
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect();
+        assert_eq!(before, still);
+
+        // A fresh open enumerates the new generation.
+        let (fresh_root, _, _) = backend.resolve_inode("").unwrap();
+        let current = backend.open_dir(fresh_root, "").unwrap();
+        assert_eq!(backend.dir_generation(current).unwrap(), 1);
+        let after: Vec<String> = backend
+            .dir_entries(current)
+            .unwrap()
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect();
+        assert!(after.contains(&"new.txt".to_string()));
     }
 
     /// Unknown handles are EBADF, and a released handle stops

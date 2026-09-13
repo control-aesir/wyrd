@@ -66,6 +66,13 @@ pub enum ClosureError {
         found: ContentId,
         derived: ContentId,
     },
+    #[error("child manifest {expected} does not match its canonical bytes ({derived})")]
+    ChildIdentityMismatch {
+        expected: ContentId,
+        derived: ContentId,
+    },
+    #[error("manifest is not canonical: entries or children are not strictly ascending")]
+    NonCanonicalManifest,
     #[error("tree {0} is not available locally")]
     TreeUnavailable(ContentId),
     #[error("tree {0} does not hash back to its content id")]
@@ -140,6 +147,35 @@ impl ManifestSource for crate::runtime::RuntimeState {
     }
 }
 
+/// Every manifest the verifier accepts must be canonical: entries strictly
+/// ascending by `(content_id, kind, version)` and children strictly ascending
+/// by tree id, exactly as the format decoder enforces. Checking here keeps the
+/// verifier sound for direct in-memory inputs and stops `canonical_bytes`'
+/// debug assertion from firing on non-canonical data.
+fn check_canonical(manifest: &Manifest) -> Result<(), ClosureError> {
+    for pair in manifest.entries.windows(2) {
+        let a = (
+            pair[0].content_id.as_bytes(),
+            pair[0].kind.byte(),
+            pair[0].version,
+        );
+        let b = (
+            pair[1].content_id.as_bytes(),
+            pair[1].kind.byte(),
+            pair[1].version,
+        );
+        if a >= b {
+            return Err(ClosureError::NonCanonicalManifest);
+        }
+    }
+    for pair in manifest.children.windows(2) {
+        if pair[0].tree.as_bytes() >= pair[1].tree.as_bytes() {
+            return Err(ClosureError::NonCanonicalManifest);
+        }
+    }
+    Ok(())
+}
+
 /// Verify that the manifest hierarchy rooted at `root` corresponds to the
 /// tree closure rooted at `snapshot.tree`.
 ///
@@ -148,10 +184,12 @@ impl ManifestSource for crate::runtime::RuntimeState {
 /// `ChildManifest::manifest` identity its parent links. The plaintext tree
 /// objects are read from `objects`; missing trees fail closed.
 ///
-/// Checks: every directory subtree has a corresponding child manifest and
-/// vice versa; every file chunk has a manifest entry of kind `Chunk`; every
-/// manifest entry is reachable from the tree (a chunk or, optionally, a tree
-/// node), with matching kind and, for a `Tree` entry, matching plaintext
+/// Checks: every manifest is canonical (strictly ascending entries and
+/// children) and every child manifest's canonical identity matches the id its
+/// parent named; every directory subtree has a corresponding child manifest
+/// and vice versa; every file chunk has a manifest entry of kind `Chunk`;
+/// every manifest entry is reachable from the tree (a chunk or, optionally, a
+/// tree node), with matching kind and, for a `Tree` entry, matching plaintext
 /// size; no unreachable mapping is admitted. The tree's own declared file
 /// size is deliberately **not** compared to the chunk list: the format
 /// permits them to disagree and makes that inconsistency the reader's job
@@ -180,6 +218,7 @@ where
             found: root.snapshot,
         });
     }
+    check_canonical(root)?;
     let derived = ContentId::derive(ObjectKind::Manifest, &root.canonical_bytes());
     if &derived != root_id {
         return Err(ClosureError::RootIdentityMismatch {
@@ -292,6 +331,18 @@ where
                     manifest: link.manifest,
                 },
             )?;
+            // The source is indexed by the claimed id, but a generic source
+            // may hand back bytes that derive to a different one. Bind the
+            // child's canonical identity to the id its parent named, exactly
+            // as the root identity is bound.
+            check_canonical(child)?;
+            let derived = ContentId::derive(ObjectKind::Manifest, &child.canonical_bytes());
+            if derived != link.manifest {
+                return Err(ClosureError::ChildIdentityMismatch {
+                    expected: link.manifest,
+                    derived,
+                });
+            }
             if child.snapshot != snapshot_id {
                 return Err(ClosureError::ChildSnapshotMismatch {
                     manifest: link.manifest,
@@ -596,6 +647,148 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ClosureError::UnexpectedChildManifest { .. }));
+    }
+
+    #[test]
+    fn child_manifest_identity_mismatch_is_rejected() {
+        // The source is keyed by the claimed id, but returns bytes that
+        // derive to a different id: the child must be rejected before it is
+        // traversed.
+        let mut store = MemoryObjectStore::default();
+        let (c, e) = chunk(b"leaf");
+        let leaf =
+            Tree::from_entries(vec![Entry::file("leaf", 4, false, vec![c]).unwrap()]).unwrap();
+        let leaf_id = store_tree(&mut store, &leaf);
+        let root_tree = Tree::from_entries(vec![Entry::dir("sub", leaf_id).unwrap()]).unwrap();
+        let root_tree_id = store_tree(&mut store, &root_tree);
+        let snapshot = snapshot(root_tree_id);
+
+        let child = manifest(&snapshot, vec![e]);
+        let wrong_id = ContentId::from_bytes([0xAB; 32]);
+        let mut root = manifest(&snapshot, Vec::new());
+        root.children.push(ChildManifest {
+            tree: leaf_id,
+            manifest: wrong_id,
+            storage: StorageId::from_bytes([0xE0; 32]),
+            transport: BaoRoot::from_bytes([0xF0; 32]),
+        });
+        let children = BTreeMap::from([(wrong_id, child)]);
+        let err = verify_snapshot_manifest(
+            &snapshot,
+            &store,
+            &manifest_id(&root),
+            &root,
+            &children,
+            &Limits::V0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ClosureError::ChildIdentityMismatch { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn non_canonical_manifest_is_rejected() {
+        // A duplicated entry is not canonical. The id is not derived from
+        // these bytes here: canonicality must be rejected before the
+        // canonical encoder's sortedness assertion could fire.
+        let (store, snapshot, _tree_id, root) = flat();
+        let mut duplicated = root.clone();
+        duplicated.entries.push(duplicated.entries[0].clone());
+        let err = verify_snapshot_manifest(
+            &snapshot,
+            &store,
+            &ContentId::from_bytes([0x00; 32]),
+            &duplicated,
+            &BTreeMap::<ContentId, Manifest>::new(),
+            &Limits::V0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ClosureError::NonCanonicalManifest),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_subtree_reference_verifies() {
+        // Two directory names resolving to the same subtree share one child
+        // manifest: the walk must dedupe the tree, not reject the repeat.
+        let mut store = MemoryObjectStore::default();
+        let (c, e) = chunk(b"leaf");
+        let leaf =
+            Tree::from_entries(vec![Entry::file("leaf", 4, false, vec![c]).unwrap()]).unwrap();
+        let leaf_id = store_tree(&mut store, &leaf);
+        let root_tree = Tree::from_entries(vec![
+            Entry::dir("a", leaf_id).unwrap(),
+            Entry::dir("b", leaf_id).unwrap(),
+        ])
+        .unwrap();
+        let root_tree_id = store_tree(&mut store, &root_tree);
+        let snapshot = snapshot(root_tree_id);
+
+        let child = manifest(&snapshot, vec![e]);
+        let child_id = manifest_id(&child);
+        let mut root = manifest(&snapshot, Vec::new());
+        root.children.push(ChildManifest {
+            tree: leaf_id,
+            manifest: child_id,
+            storage: StorageId::from_bytes([0xE0; 32]),
+            transport: BaoRoot::from_bytes([0xF0; 32]),
+        });
+        let children = BTreeMap::from([(child_id, child)]);
+        verify_snapshot_manifest(
+            &snapshot,
+            &store,
+            &manifest_id(&root),
+            &root,
+            &children,
+            &Limits::V0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deep_closure_is_bounded_and_iterative() {
+        // A long dir chain walks iteratively: no recursion, no stack
+        // growth, one manifest per tree node.
+        const DEPTH: usize = 512;
+        let mut store = MemoryObjectStore::default();
+        let mut tree_ids = vec![store_tree(&mut store, &Tree::empty())];
+        for _ in 0..DEPTH {
+            let child = *tree_ids.last().expect("chain nonempty");
+            let parent = Tree::from_entries(vec![Entry::dir("d", child).unwrap()]).unwrap();
+            tree_ids.push(store_tree(&mut store, &parent));
+        }
+        let snapshot = snapshot(*tree_ids.last().expect("root"));
+
+        let mut manifests: BTreeMap<ContentId, Manifest> = BTreeMap::new();
+        let mut current = manifest(&snapshot, Vec::new());
+        let mut current_id = manifest_id(&current);
+        for i in 1..=DEPTH {
+            let child_tree = tree_ids[i - 1];
+            let mut parent = manifest(&snapshot, Vec::new());
+            parent.children.push(ChildManifest {
+                tree: child_tree,
+                manifest: current_id,
+                storage: StorageId::from_bytes([0xE0; 32]),
+                transport: BaoRoot::from_bytes([0xF0; 32]),
+            });
+            let parent_id = manifest_id(&parent);
+            manifests.insert(current_id, current);
+            current = parent;
+            current_id = parent_id;
+        }
+        verify_snapshot_manifest(
+            &snapshot,
+            &store,
+            &current_id,
+            &current,
+            &manifests,
+            &Limits::V0,
+        )
+        .unwrap();
     }
 
     #[test]

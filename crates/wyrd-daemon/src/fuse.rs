@@ -1,15 +1,21 @@
 //! The FUSE presentation backend: kernel ops mapped onto the daemon's
-//! [`DriveView`] over an inode table. Read-only: every mutating kernel
-//! op is refused at the boundary (writes, rename/delete/mkdir, and
-//! conflict UX are out of scope for the slice).
+//! [`DriveView`] over an inode table. Reads are served directly; writes
+//! are buffered in per-handle sessions and committed as snapshots
+//! through the daemon's mutation channel (see `docs/write-path.md`).
+//! Namespace operations not yet implemented — `unlink`, `rmdir`,
+//! `rename`, and `setattr` — fall through to `ENOSYS`; deliberately
+//! unsupported flags (`O_APPEND`, `O_DIRECT`, `O_PATH`) are
+//! `EOPNOTSUPP`.
 //!
 //! Error mapping happens only here, per `docs/sync-and-peers.md`:
 //! absence maps to `ENOENT`, `Unavailable`/`Corrupt`/`Conflict` to
 //! `EIO` (scrub/repair and fetch-on-open are the daemon's duties before
 //! this boundary is allowed to block or serve).
 //!
-//! Synthetic ownership: v0 preserves no uid/gid or permission metadata, so
-//! this backend presents uid/gid zero and read-only mode bits as policy.
+//! Synthetic ownership: v0 preserves no uid/gid or permission metadata;
+//! apart from the represented exec bit, the backend presents uid/gid
+//! zero and synthesized mode bits (files `0644`/`0755`, directories
+//! `0755`).
 //!
 //! Lock discipline: a poisoned lock is a local data-path failure, so
 //! kernel callbacks answer `EIO` instead of panicking the mount. File

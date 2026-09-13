@@ -219,6 +219,14 @@ impl ObjectStore for FsObjectStore {
             .is_some_and(|bytes| ContentId::derive(kind, &bytes) == id);
         if !valid {
             self.atomic_write(&path, data)?;
+        } else {
+            // The object exists, but a prior publication (possibly before
+            // a restart) may have installed it without a successful
+            // directory fsync. Confirm the directory is durable before
+            // accepting the insert as a no-op.
+            self.durability
+                .verify_dir(path.parent().expect("object paths have parents"))
+                .map_err(FsStoreError::io)?;
         }
         Ok(id)
     }
@@ -391,6 +399,38 @@ mod tests {
             id
         );
         assert!(SYNC_CALLS.load(Ordering::SeqCst) >= 2);
+        remove_scratch(&dir);
+    }
+
+    /// Directory-sync calls seen by the restart-recovery test.
+    static REOPEN_SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Counts calls, then defers to the real `fsync_dir`.
+    fn count_sync(dir: &Path) -> std::io::Result<()> {
+        REOPEN_SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
+        crate::durable::fsync_dir(dir)
+    }
+
+    #[test]
+    fn reopening_reconciles_an_existing_object_directory() {
+        let dir = scratch_dir();
+        let data = b"restart reconciliation";
+        {
+            let mut store = FsObjectStore::open(dir.clone()).unwrap();
+            store.insert(ObjectKind::Chunk, data).unwrap();
+        }
+        // Reopen: a fresh durability layer has no verified directories,
+        // so the first insert of the held object must re-sync its
+        // directory before treating it as durable.
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        REOPEN_SYNC_CALLS.store(0, Ordering::SeqCst);
+        store.durability = Arc::new(Durability::with_sync(count_sync));
+        let id = ContentId::derive(ObjectKind::Chunk, data);
+        assert_eq!(store.insert(ObjectKind::Chunk, data).unwrap(), id);
+        assert_eq!(REOPEN_SYNC_CALLS.load(Ordering::SeqCst), 1);
+        // Verified now: a second insert is a cheap no-op.
+        assert_eq!(store.insert(ObjectKind::Chunk, data).unwrap(), id);
+        assert_eq!(REOPEN_SYNC_CALLS.load(Ordering::SeqCst), 1);
         remove_scratch(&dir);
     }
 

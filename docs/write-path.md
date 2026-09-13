@@ -271,11 +271,14 @@ A commit proceeds in this order, and the order is the contract:
    installed but not known durable. That failure is reported, never
    swallowed, and a later publication attempt (an `insert` or `import`)
    reconciles the directory before reporting success, while an `import`
-   also re-imports the representation into the serving mirror. A
-   directory created along the way is synced level by level, so a
-   first-write hierarchy is durable too. The **announcement obligation
-   is recorded durably here**, atomically with the snapshot (see below),
-   so a crash after commit still knows the snapshot must be announced.
+   also re-imports the representation into the serving mirror. An
+   existing entry is not treated as durable until its directory has been
+   synced in the current process, so this recovery survives a restart
+   rather than living only in memory. A directory created along the way
+   is synced level by level, so a first-write hierarchy is durable too.
+   The **announcement obligation is recorded durably here**, atomically
+   with the snapshot (see below), so a crash after commit still knows the
+   snapshot must be announced.
 4. **Publication.** Heads and materialization are swapped into the shared
    view under one short write lock. The view sees the old head until this
    step.

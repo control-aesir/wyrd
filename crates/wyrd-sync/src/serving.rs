@@ -158,13 +158,13 @@ impl Vault {
         Ok(root)
     }
 
-    /// Make an already-held root durable and served: retry any pending
-    /// directory `fsync` and re-import into the mirror. Both steps are
-    /// idempotent, so this heals a prior post-rename `fsync` failure, a
-    /// crash before the mirror write-through, or a concurrent winner this
-    /// process never observed.
+    /// Make an already-held root durable and served: confirm the vault
+    /// directory's durability and re-import into the mirror. Both steps
+    /// are idempotent, so this heals a prior post-rename `fsync` failure
+    /// (including across a restart), a crash before the mirror
+    /// write-through, or a concurrent winner this process never observed.
     fn reconcile_held(&self, sealed: &[u8]) -> Result<(), VaultError> {
-        self.durability.reconcile()?;
+        self.durability.verify_dir(&self.dir)?;
         self.notify_mirror(sealed);
         Ok(())
     }
@@ -898,6 +898,42 @@ mod tests {
         serving.flush().unwrap();
         assert_eq!(fetch_from(&serving, &root), Some(sealed));
         serving.shutdown().unwrap();
+    }
+
+    /// Directory-sync calls seen by the restart-recovery test.
+    static REOPEN_SYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn count_dir_sync(dir: &Path) -> std::io::Result<()> {
+        REOPEN_SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        durable::fsync_dir(dir)
+    }
+
+    #[test]
+    fn reopening_reconciles_a_held_vault_directory() {
+        let dir = serve_dir();
+        let sealed = b"restart reconciliation".to_vec();
+        let root = blob_root(&sealed);
+        {
+            let vault = Vault::open(&dir).unwrap();
+            vault.import(&sealed).unwrap();
+        }
+        // Reopen: the fresh durability layer has verified nothing, so
+        // the first import of the held root must fsync the vault
+        // directory before reporting success.
+        let mut vault = Vault::open(&dir).unwrap();
+        REOPEN_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        vault.durability = durable::Durability::with_sync(count_dir_sync);
+        assert_eq!(vault.import(&sealed).unwrap(), root);
+        assert_eq!(
+            REOPEN_SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // Verified now: a second import is a cheap no-op.
+        assert_eq!(vault.import(&sealed).unwrap(), root);
+        assert_eq!(
+            REOPEN_SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]

@@ -11,10 +11,18 @@
 //! [`Durability`] is stateful on purpose. A directory `fsync` can fail
 //! after the rename has already installed the live file, and a
 //! newly-created parent directory can be left present but not durable;
-//! both leave a state that a naive retry would skip. Every failed
-//! directory `fsync` is remembered, and [`Durability::reconcile`] retries
-//! them, so a retry of `insert`/`import` repairs durability instead of
-//! reporting success over an unsynced directory entry.
+//! both leave a state that a naive retry would skip. Two obligations are
+//! tracked:
+//!
+//! - a failed `fsync` is remembered in `pending` and retried by
+//!   [`Durability::reconcile`], so a same-process retry repairs it;
+//! - a directory is only treated as durable after its `fsync` succeeded
+//!   in this process, recorded in `verified`. A fresh store (for example
+//!   after a restart) has nothing verified, so the first use of an
+//!   existing object re-syncs its directory through
+//!   [`Durability::verify_dir`] before accepting it. That is the
+//!   restart-recovery boundary: the obligation cannot live only in
+//!   volatile memory.
 //!
 //! Directory `fsync` and rename-atomicity assume Unix-like filesystem
 //! semantics; other platforms get best-effort durability.
@@ -54,12 +62,19 @@ impl PublishError {
 }
 
 /// A store's durability layer: the directory-sync implementation plus the
-/// set of directories whose last sync failed, so a later call can repair
-/// them before claiming success.
+/// directory bookkeeping that lets a retry (or a reopen) repair a
+/// publication whose directory `fsync` did not complete.
 #[derive(Debug)]
 pub struct Durability {
     sync_dir: fn(&Path) -> io::Result<()>,
+    /// Directories whose last `fsync` failed; retried by [`reconcile`].
+    ///
+    /// [`reconcile`]: Durability::reconcile
     pending: Mutex<HashSet<PathBuf>>,
+    /// Directories whose `fsync` succeeded in this process. A directory
+    /// absent here is not assumed durable, which is what makes recovery
+    /// survive a reopen.
+    verified: Mutex<HashSet<PathBuf>>,
 }
 
 impl Default for Durability {
@@ -74,6 +89,7 @@ impl Durability {
         Self {
             sync_dir: fsync_dir,
             pending: Mutex::new(HashSet::new()),
+            verified: Mutex::new(HashSet::new()),
         }
     }
 
@@ -83,17 +99,23 @@ impl Durability {
         Self {
             sync_dir,
             pending: Mutex::new(HashSet::new()),
+            verified: Mutex::new(HashSet::new()),
         }
     }
 
     /// Retry every directory whose last sync failed. Idempotent: a
-    /// directory is dropped once its sync succeeds, and retained
-    /// otherwise. Returns the first remaining error, if any.
+    /// directory is moved to `verified` once its sync succeeds, and
+    /// retained in `pending` otherwise. Returns the first remaining
+    /// error, if any.
     pub fn reconcile(&self) -> io::Result<()> {
         let mut pending = self.pending.lock().expect("durability pending lock");
+        let mut verified = self.verified.lock().expect("durability verified lock");
         let mut failure = None;
         pending.retain(|dir| match (self.sync_dir)(dir) {
-            Ok(()) => false,
+            Ok(()) => {
+                verified.insert(dir.clone());
+                false
+            }
             Err(error) => {
                 failure.get_or_insert(error);
                 true
@@ -103,6 +125,22 @@ impl Durability {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Confirm that `dir` is durable before an existing entry inside it
+    /// is accepted. A directory already verified in this process is a set
+    /// lookup; otherwise its `fsync` runs now. This is the recovery point
+    /// after a restart, when the in-process `pending` set is gone.
+    pub fn verify_dir(&self, dir: &Path) -> io::Result<()> {
+        if self
+            .verified
+            .lock()
+            .expect("durability verified lock")
+            .contains(dir)
+        {
+            return Ok(());
+        }
+        self.sync_and_verify(dir)
     }
 
     /// Create `temp`, write all `bytes`, and `fsync` it. Missing parent
@@ -134,7 +172,7 @@ impl Durability {
     /// [`reconcile`]: Durability::reconcile
     pub fn publish_temp(&self, temp: &Path, path: &Path) -> Result<(), PublishError> {
         fs::rename(temp, path).map_err(PublishError::Rename)?;
-        self.sync_or_mark(path.parent().unwrap_or_else(|| Path::new(".")))
+        self.sync_and_verify(path.parent().unwrap_or_else(|| Path::new(".")))
             .map_err(PublishError::DirectorySync)
     }
 
@@ -165,7 +203,7 @@ impl Durability {
         }
         match fs::create_dir(dir) {
             Ok(()) => match parent {
-                Some(parent) => self.sync_or_mark(parent),
+                Some(parent) => self.sync_and_verify(parent),
                 None => Ok(()),
             },
             // A concurrent creator won the race; its own call is
@@ -179,10 +217,17 @@ impl Durability {
         }
     }
 
-    /// `fsync` `dir`, remembering it for [`reconcile`] on failure.
-    fn sync_or_mark(&self, dir: &Path) -> io::Result<()> {
+    /// `fsync` `dir`, recording success in `verified` and failure in
+    /// `pending`.
+    fn sync_and_verify(&self, dir: &Path) -> io::Result<()> {
         match (self.sync_dir)(dir) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.verified
+                    .lock()
+                    .expect("durability verified lock")
+                    .insert(dir.to_path_buf());
+                Ok(())
+            }
             Err(error) => {
                 self.pending
                     .lock()
@@ -203,16 +248,7 @@ impl Durability {
         {
             return Ok(());
         }
-        match (self.sync_dir)(dir) {
-            Ok(()) => {
-                self.pending
-                    .lock()
-                    .expect("durability pending lock")
-                    .remove(dir);
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        self.sync_and_verify(dir)
     }
 }
 
@@ -247,6 +283,12 @@ mod tests {
         if SYNC_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(io::Error::other("injected directory fsync failure"));
         }
+        fsync_dir(dir)
+    }
+
+    /// Counts calls and defers to the real `fsync_dir`.
+    fn count_sync(dir: &Path) -> io::Result<()> {
+        SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
         fsync_dir(dir)
     }
 
@@ -353,6 +395,19 @@ mod tests {
             SYNC_CALLS.load(Ordering::SeqCst) >= 2,
             "the retry must re-sync the created directory's parent"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_dir_syncs_once_per_process() {
+        // A fresh durability layer has nothing verified: the first
+        // `verify_dir` syncs, later calls are a set lookup.
+        let dir = scratch_dir();
+        SYNC_CALLS.store(0, Ordering::SeqCst);
+        let durability = Durability::with_sync(count_sync);
+        durability.verify_dir(&dir).unwrap();
+        durability.verify_dir(&dir).unwrap();
+        assert_eq!(SYNC_CALLS.load(Ordering::SeqCst), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

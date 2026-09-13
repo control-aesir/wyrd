@@ -24,6 +24,34 @@ fn genesis_is_valid_and_canonical() {
     assert_eq!(log.frozen_at(), None);
 }
 
+/// A genesis that carries `resolves` violates the pinned shape
+/// (`docs/epochs.md`: genesis is `prev = None` with empty `resolves`):
+/// there is never a conflict at a `prev` that does not exist, so any
+/// entry is invalid, including duplicates, which fail the same intrinsic
+/// check before the resolution-shape checks run.
+#[test]
+fn genesis_with_non_empty_resolves_is_invalid() {
+    let (b, genesis) = Builder::genesis(1);
+    let bogus = genesis.transition_id();
+    for resolves in [vec![bogus], vec![bogus, bogus]] {
+        let mut t = MembershipTransition {
+            resolves,
+            ..genesis.clone()
+        };
+        sign(&mut t, &b.sk, &b.drive);
+        let mut log = MembershipLog::new(drive());
+        log.observe(t.clone());
+        assert_eq!(
+            log.status(&t.transition_id()),
+            Some(TransitionStatus::Invalid(
+                InvalidReason::ResolvesWithoutConflict
+            ))
+        );
+        assert_eq!(log.known_state(), None, "an invalid genesis never roots");
+        assert_eq!(log.frozen_at(), None, "no conflict exists to freeze on");
+    }
+}
+
 #[test]
 fn two_valid_geneses_conflict_at_epoch_one() {
     let (_, g1) = Builder::genesis(1);

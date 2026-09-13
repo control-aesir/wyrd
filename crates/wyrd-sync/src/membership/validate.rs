@@ -51,6 +51,12 @@ pub(crate) fn check_intrinsic(t: &MembershipTransition) -> Result<(), InvalidRea
         (false, false) => return Err(InvalidReason::MissingPrev),
         _ => {}
     }
+    // Genesis pins an empty `resolves` (epochs.md): a conflict can only
+    // exist at a `prev`, and genesis has none. Reject here so a
+    // garbage-carrying genesis is classified Invalid instead of rooting.
+    if t.prev.is_none() && !t.resolves.is_empty() {
+        return Err(InvalidReason::ResolvesWithoutConflict);
+    }
     if t.changes.is_empty() {
         return Err(InvalidReason::EmptyChanges);
     }

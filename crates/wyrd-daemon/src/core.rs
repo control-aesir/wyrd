@@ -24,9 +24,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, RwLock,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::fuse::FuseBackend;
+use crate::mutation::{MutationError, MutationKind, MutationQueue, QueuedMutation};
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
@@ -303,14 +304,15 @@ where
 
     /// Split the composed daemon for live serving: the engine and the
     /// store stay with the sync loop while the backend half moves into
-    /// the FUSE session thread. Both halves share one projection slot
-    /// plus one store handle for bytes: intake and fetch mutate durable
-    /// state and the store with no publication lock held, and each pass
-    /// publishes a whole new generation under one short write lock —
-    /// serving never observes a half-published projection and never
-    /// stalls on bulk I/O. The composer's synchronously refreshed view
-    /// is adopted as the baseline generation, so the backend never
-    /// serves an empty view while the engine already has heads.
+    /// the FUSE session thread. Both halves share one projection slot,
+    /// one mutation channel, and one store handle for bytes: intake,
+    /// fetch, and local mutations mutate durable state and the store
+    /// with no publication lock held, and each pass publishes a whole
+    /// new generation under one short write lock — serving never
+    /// observes a half-published projection and never stalls on bulk
+    /// I/O. The composer's synchronously refreshed view is adopted as
+    /// the baseline generation, so the backend never serves an empty
+    /// view while the engine already has heads.
     pub fn into_live(
         self,
         open_timeout: Duration,
@@ -320,9 +322,11 @@ where
         let baseline = Projection::initial(self.view, revision);
         let projection = Arc::new(RwLock::new(Arc::new(baseline)));
         let wants = Arc::new(WantRegistry::default());
+        let mutations = Arc::new(MutationQueue::default());
         let backend = FuseBackend::shared_with_wants(
             Arc::clone(&projection),
             Arc::clone(&wants),
+            Arc::clone(&mutations),
             open_timeout,
         );
         (
@@ -331,6 +335,7 @@ where
                 store,
                 projection,
                 wants,
+                mutations,
                 published_revision: revision,
                 dirty: false,
             },
@@ -445,6 +450,10 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// the view. The registry's lock is its own (never the
     /// publication's or the store's).
     wants: Arc<WantRegistry>,
+    /// Mounted mutations: the backend submits and blocks, the loop
+    /// drains and applies them serially each pass (the total order).
+    /// Its lock is its own; submitting also wakes the loop's idle wait.
+    mutations: Arc<MutationQueue>,
     /// The durable revision the served generation was built from. The
     /// loop publishes exactly when the engine's sequence has advanced
     /// past this — every fact commit advances the sequence and empty
@@ -540,6 +549,18 @@ where
             }
             None => ExecuteReport::default(),
         };
+        // Apply mounted mutations in admission order (the queue's total
+        // order): each is evaluated against the state its predecessor
+        // committed, never against what the syscall saw. Submitters block
+        // until this pass completes them, and completion is deferred past
+        // publication below so a returned success means the state serves.
+        let pending = self.mutations.take_pending();
+        let mut results = Vec::with_capacity(pending.len());
+        for queued in pending {
+            let kind = queued.request().kind().clone();
+            let result = self.apply_mutation(&kind);
+            results.push((queued, result));
+        }
         // Settle admitted wants: retire a landed fetch, and retire a fetch
         // whose demand died — the engine's durable `Cached` policy keeps
         // retrying independently of the registry, so a permanently
@@ -550,12 +571,13 @@ where
         });
         // The publication gate is the durable commit sequence, not the
         // pass reports: every fact commit this pass (intake, want
-        // admission, fetch) advanced it, and empty passes leave it
-        // untouched. The dirty backlog covers the one case the sequence
+        // admission, fetch, mutation) advanced it, and empty passes leave
+        // it untouched. The dirty backlog covers the one case the sequence
         // cannot see — a failed pass that committed before failing.
         let revision = self.engine.current();
         let generation = self.generation();
         if !self.dirty && revision == self.published_revision {
+            complete_mutations(&self.mutations, results);
             return Ok(SyncReport {
                 drained,
                 fetched,
@@ -578,12 +600,59 @@ where
         }
         self.published_revision = revision;
         self.dirty = false;
+        // Publication is done: a completed mutation's success now means
+        // the new generation serves.
+        complete_mutations(&self.mutations, results);
         Ok(SyncReport {
             drained,
             fetched,
             published: true,
             generation: generation + 1,
         })
+    }
+
+    /// Apply one mutation to the current single live head and author a
+    /// snapshot over the result. The base is read fresh (the previous
+    /// mutation's committed state, under the queue's total order); a
+    /// headless drive authors the initial root from an empty tree, the
+    /// same bootstrap `put_file` performs. Returns the boundary-mapped
+    /// failure without partial application: the format mutations either
+    /// produce a new root or nothing.
+    fn apply_mutation(&mut self, kind: &MutationKind) -> Result<(), MutationError> {
+        match kind {
+            MutationKind::Mkdir { path } => {
+                let base = self.live_base()?;
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let base = match base {
+                    Some(tree) => tree,
+                    None => Tree::from_entries(Vec::new())
+                        .map_err(|_| MutationError::Store)?
+                        .insert_into(&mut *store)
+                        .map_err(|_| MutationError::Store)?,
+                };
+                let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
+                    .map_err(MutationError::from_format)?;
+                self.engine
+                    .author_snapshot(&*store, root)
+                    .map_err(|_| MutationError::Engine)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The tree a local mutation read-modify-writes: a single live head,
+    /// `None` for the headless bootstrap, or a conflict. Mutations fail
+    /// closed on multiple heads: there is no single tree to rebuild.
+    fn live_base(&self) -> Result<Option<ContentId>, MutationError> {
+        let heads = self
+            .engine
+            .live_heads()
+            .map_err(|_| MutationError::Engine)?;
+        match heads.as_slice() {
+            [] => Ok(None),
+            [head] => Ok(Some(head.snapshot().tree)),
+            _ => Err(MutationError::Conflicted { heads: heads.len() }),
+        }
     }
 
     /// The served generation count. Bumps exactly when a pass
@@ -643,7 +712,7 @@ where
                     consecutive = 0;
                     delay = config.error_base_delay;
                     summary.passes += 1;
-                    sleep_checked(stop, config.interval);
+                    self.mutations.wait_for_work(stop, config.interval);
                 }
                 Err(error) => {
                     consecutive += 1;
@@ -652,7 +721,7 @@ where
                     if consecutive > config.max_consecutive_errors {
                         return Err(error);
                     }
-                    sleep_checked(stop, delay);
+                    self.mutations.wait_for_work(stop, delay);
                     delay = delay.saturating_mul(2).min(config.error_max_delay);
                 }
             }
@@ -689,16 +758,15 @@ fn admit_wants<E>(
     Ok(committed)
 }
 
-/// Sleep in short slices so a set `stop` flag is noticed promptly even
-/// with a long poll interval.
-fn sleep_checked(stop: &AtomicBool, duration: Duration) {
-    let deadline = Instant::now() + duration;
-    while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::sleep((deadline - now).min(Duration::from_millis(250)));
+/// Complete every mutation this pass applied, releasing admission slots
+/// and waking the blocked submitters. Always called for the full batch
+/// (success or failure) so no caller hangs and the bound never leaks.
+fn complete_mutations(
+    queue: &MutationQueue,
+    results: Vec<(QueuedMutation, Result<(), MutationError>)>,
+) {
+    for (queued, result) in results {
+        queue.complete(queued, result);
     }
 }
 
@@ -1160,6 +1228,71 @@ mod tests {
         assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"pending");
 
         drop(live);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A directory created through the mounted mutation channel is
+    /// committed by the live loop and served by the next generation:
+    /// the backend's `mkdir` submits and blocks, the loop (running on
+    /// another thread) applies it under the store write path, authors
+    /// the snapshot, and publishes before the submit returns. This is
+    /// the slice-2 end-to-end proof — channel, commit, publication, and
+    /// read-side coherence.
+    #[test]
+    fn mkdir_through_backend_commits_and_serves() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loop_stop = Arc::clone(&stop);
+        let loop_handle = std::thread::spawn(move || {
+            let mut live = live;
+            let mut mailbox = NoopMailbox;
+            live.run_loop(
+                &mut mailbox,
+                None::<&mut MemoryBulkSource>,
+                &loop_stop,
+                &LiveConfig {
+                    interval: Duration::from_millis(10),
+                    error_base_delay: Duration::from_millis(5),
+                    error_max_delay: Duration::from_millis(20),
+                    max_consecutive_errors: 10,
+                },
+                &mut |_, _| {},
+            )
+        });
+
+        // A headless drive bootstraps its initial root on the first
+        // mutation; the submit blocks until the loop has published.
+        let before = backend.generation().unwrap();
+        let (docs_ino, attr) = backend.mkdir_at(1, "docs").expect("mkdir commits");
+        assert_eq!(attr.kind, fuser::FileType::Directory);
+        assert!(
+            backend.generation().unwrap() > before,
+            "the committing pass publishes a new generation"
+        );
+        // The committed directory is a usable parent: a child mkdir
+        // resolves through it, proving the new generation serves.
+        let (_sub_ino, sub_attr) = backend
+            .mkdir_at(docs_ino, "sub")
+            .expect("the committed directory serves as a parent");
+        assert_eq!(sub_attr.kind, fuser::FileType::Directory);
+
+        // A duplicate name surfaces through the channel's format
+        // validation as EEXIST.
+        assert_eq!(
+            backend.mkdir_at(1, "docs"),
+            Err(fuser::Errno::EEXIST),
+            "an existing name is EEXIST"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
         drop(backend);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -38,6 +38,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
+use crate::mutation::{MutationError, MutationKind, MutationQueue};
 use crate::projection::Projection;
 use crate::want::{wait_for_materialization, WantRegistry};
 
@@ -243,8 +244,32 @@ where
     /// when a live daemon owns the same view. `None` keeps the
     /// instant-EIO behavior for standalone backends.
     wants: Option<Arc<WantRegistry>>,
+    /// The live daemon's mutation channel: namespace and handle
+    /// mutations are submitted here and executed by the loop. `None`
+    /// makes every mutating callback `EROFS` (a standalone read-only
+    /// backend).
+    mutations: Option<Arc<MutationQueue>>,
     /// How long `open`/`read` may block on demand before `EIO`.
     open_timeout: Duration,
+}
+
+/// Map a mutation failure to the POSIX errno the write-path contract
+/// names. Everything unclassified is `EIO`: a durability or validation
+/// failure never masquerades as a more benign error.
+fn mutation_errno(error: &MutationError) -> fuser::Errno {
+    match error {
+        MutationError::Saturated => fuser::Errno::EAGAIN,
+        MutationError::Invalid(_) | MutationError::InvalidRename(_) => fuser::Errno::EINVAL,
+        MutationError::NotFound(_) => fuser::Errno::ENOENT,
+        MutationError::NotADirectory(_) => fuser::Errno::ENOTDIR,
+        MutationError::IsDirectory(_) => fuser::Errno::EISDIR,
+        MutationError::AlreadyExists(_) => fuser::Errno::EEXIST,
+        MutationError::DirectoryNotEmpty(_) => fuser::Errno::ENOTEMPTY,
+        MutationError::Conflicted { .. }
+        | MutationError::Lock
+        | MutationError::Store
+        | MutationError::Engine => fuser::Errno::EIO,
+    }
 }
 
 fn inode_error(error: InodeError) -> fuser::Errno {
@@ -313,6 +338,7 @@ where
                 next: 1,
             }),
             wants: None,
+            mutations: None,
             open_timeout: Duration::ZERO,
         }
     }
@@ -335,16 +361,19 @@ where
                 next: 1,
             }),
             wants: None,
+            mutations: None,
             open_timeout: Duration::ZERO,
         }
     }
 
     /// The live daemon's half: the same published projection plus the
-    /// demand registry, so `open`/`read` on non-local content registers
-    /// a want and blocks bounded before failing.
+    /// demand registry and the mutation channel, so `open`/`read` on
+    /// non-local content can block bounded on a want and mutating
+    /// callbacks submit to the loop.
     pub fn shared_with_wants(
         projection: Arc<RwLock<Arc<Projection<S, M>>>>,
         wants: Arc<WantRegistry>,
+        mutations: Arc<MutationQueue>,
         open_timeout: Duration,
     ) -> Self {
         FuseBackend {
@@ -359,6 +388,7 @@ where
                 next: 1,
             }),
             wants: Some(wants),
+            mutations: Some(mutations),
             open_timeout,
         }
     }
@@ -717,6 +747,33 @@ where
         directories.entries.insert(handle, opened);
         Ok(handle)
     }
+
+    /// Create the directory `name` under `parent_ino` and return its
+    /// interned ino and presentation attributes. The mutation runs on
+    /// the loop (the only engine user); the submit blocks until the
+    /// committing pass publishes, so the fresh resolution here observes
+    /// the new generation. The non-callback form of the kernel `mkdir`
+    /// op — the surface the mounted-write tests ride.
+    ///
+    /// A backend with no mutation channel is the standalone read-only
+    /// mount: `EROFS`, like every other mutating op.
+    pub fn mkdir_at(
+        &self,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<(u64, fuser::FileAttr), fuser::Errno> {
+        let parent_path = self.inode_path(parent_ino)?;
+        let child_path = join(&parent_path, name);
+        let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
+        mutations
+            .submit(MutationKind::Mkdir {
+                path: child_path.clone(),
+            })
+            .map_err(|error| mutation_errno(&error))?;
+        let (ino, node, _) = self.resolve_inode(&child_path)?;
+        let attr = self.attr(ino, &node);
+        Ok((ino, attr))
+    }
 }
 
 impl<S: ObjectStore + Send + Sync + 'static, M: Materialization + Send + Sync + 'static>
@@ -940,6 +997,29 @@ where
         }
         match symlink_target(projection.view(), &path) {
             Ok(target) => reply.data(target.as_bytes()),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    /// Create a directory: submit the mutation to the loop and, on
+    /// commit, reply with the entry. The name is validated by the
+    /// format layer (a non-UTF-8 or malformed component is `EINVAL`),
+    /// never by FUSE, so the mount is never an alternate parser.
+    fn mkdir(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(fuser::Errno::EINVAL);
+            return;
+        };
+        match self.mkdir_at(parent.0, name) {
+            Ok((_, attr)) => reply.entry(&TTL, &attr, fuser::Generation(0)),
             Err(error) => reply.error(error),
         }
     }
@@ -1557,6 +1637,7 @@ mod tests {
         let backend = FuseBackend::shared_with_wants(
             Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
             Arc::clone(&registry),
+            Arc::new(MutationQueue::default()),
             open_timeout,
         );
         (backend, store, registry, chunk)

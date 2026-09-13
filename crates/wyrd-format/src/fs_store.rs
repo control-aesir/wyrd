@@ -148,26 +148,31 @@ impl FsObjectStore {
     /// `open()` sweep deletes the temp between write and rename, the
     /// rename fails with `NotFound`: when another writer already won the
     /// race the write becomes a no-op, otherwise it rewrites to a fresh
-    /// temp. Only the rename stage retries — write-stage errors return at
-    /// once, so a broken filesystem surfaces instead of looping. The loop
-    /// terminates because only `open()` removes temps and `open()` calls
-    /// are finite.
+    /// temp. Only a `NotFound` rename retries — every other failure
+    /// returns at once, so a broken filesystem surfaces instead of
+    /// looping. The loop terminates because only `open()` removes temps
+    /// and `open()` calls are finite.
     fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
         loop {
             let tmp = Self::temp_path(path);
             durable::write_temp(&tmp, bytes).map_err(FsStoreError::io)?;
             match durable::publish_temp(&tmp, path) {
                 Ok(()) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(durable::PublishError::Rename(error)) => {
                     let _ = fs::remove_file(&tmp);
                     if path.is_file() {
                         return Ok(());
                     }
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(FsStoreError::io(error));
+                    }
+                    // A concurrent sweep removed the temp before the
+                    // rename; rewrite to a fresh temp.
                 }
-                Err(error) => {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(FsStoreError::io(error));
-                }
+                // The rename installed the live file but the directory
+                // fsync failed: the write is not durable, and retrying
+                // the rename would not repair it, so surface the error.
+                Err(error) => return Err(FsStoreError::io(error.into_io())),
             }
         }
     }

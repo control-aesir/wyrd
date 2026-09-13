@@ -191,10 +191,12 @@ pub enum MutationKind {
     /// op's namespace half). `EEXIST` when the name is taken.
     CreateFile { path: String },
     /// Commit a writable handle's full logical image onto the current
-    /// head, accepted only if the path still carries `base`.
+    /// head, accepted only if the path still carries `base`. `executable`
+    /// is the handle's buffered exec bit for the committed entry.
     CommitFile {
         path: String,
         base: FileIdentity,
+        executable: bool,
         content: Vec<u8>,
     },
     /// Remove the file or symlink at `path`; a directory is `EISDIR`.
@@ -207,12 +209,15 @@ pub enum MutationKind {
         to: String,
         no_replace: bool,
     },
-    /// Construct the file at `path` at `size`: grow zero-fills, shrink
-    /// keeps the prefix. A directory is `EISDIR`.
-    SetSize { path: String, size: u64 },
-    /// Toggle the exec bit of the file at `path`. Directories and
-    /// symlinks accept the request as a no-op.
-    SetExec { path: String, executable: bool },
+    /// One `setattr`: apply the requested size and/or exec change as a
+    /// single namespace mutation, publishing exactly one root or none.
+    /// `size` on a non-file is `EISDIR`; an exec change on a non-file is
+    /// a no-op. At least one field is set.
+    SetAttrs {
+        path: String,
+        size: Option<u64>,
+        executable: Option<bool>,
+    },
 }
 
 /// A submitted operation, opaque to callers: the id is diagnostic, the

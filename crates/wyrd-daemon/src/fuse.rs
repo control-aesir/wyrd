@@ -129,6 +129,8 @@ struct WriteHandle {
     capture: OpenFile,
     /// The identity a commit must still find at `path`.
     base: FileIdentity,
+    /// The target exec bit for the next commit (buffered like content).
+    executable: bool,
     /// The dense logical image; `None` while clean.
     image: Option<Vec<u8>>,
     /// The image differs from `base` (or `O_TRUNC` started it empty), so
@@ -766,10 +768,12 @@ where
         } else {
             (None, false)
         };
+        let executable = base.executable();
         let handle = WriteHandle {
             path: path.to_string(),
             capture,
             base,
+            executable,
             image,
             dirty,
             failed: false,
@@ -806,10 +810,12 @@ where
         };
         let capture = self.capture_for(&child_path)?;
         let id = self.budget.next_handle();
+        let executable = identity.executable();
         let handle = WriteHandle {
             path: child_path.clone(),
             capture,
             base: identity,
+            executable,
             image: None,
             dirty: false,
             failed: false,
@@ -957,10 +963,12 @@ where
         let outcome = mutations.submit(MutationKind::CommitFile {
             path,
             base,
+            executable: write.executable,
             content,
         });
         match outcome {
             Ok(MutationOutcome::Committed(identity)) => {
+                write.executable = identity.executable();
                 write.base = identity;
                 match self.capture_for(&write.path) {
                     Ok(capture) => {
@@ -1227,7 +1235,11 @@ where
     /// `setattr(size)`).
     pub fn set_size_at(&self, ino: u64, size: u64) -> Result<(), fuser::Errno> {
         let path = self.inode_path(ino)?;
-        self.submit(MutationKind::SetSize { path, size })?;
+        self.submit(MutationKind::SetAttrs {
+            path,
+            size: Some(size),
+            executable: None,
+        })?;
         Ok(())
     }
 
@@ -1235,8 +1247,74 @@ where
     /// `setattr(mode)`).
     pub fn set_exec_at(&self, ino: u64, executable: bool) -> Result<(), fuser::Errno> {
         let path = self.inode_path(ino)?;
-        self.submit(MutationKind::SetExec { path, executable })?;
+        self.submit(MutationKind::SetAttrs {
+            path,
+            size: None,
+            executable: Some(executable),
+        })?;
         Ok(())
+    }
+
+    /// Apply one `setattr` carrying an optional size and/or exec change.
+    /// With no writable handle, both fields go in a single `SetAttrs`
+    /// mutation, so the syscall publishes exactly one snapshot. A size
+    /// through a writable handle truncates that handle's buffered image;
+    /// a size through a read-only handle is `EBADF`; a mode change is
+    /// always path-addressed. Combining size and mode through a writable
+    /// handle is refused (`EOPNOTSUPP`): the buffered image and a
+    /// path-addressed exec change cannot be one snapshot.
+    pub fn setattr_attrs(
+        &self,
+        ino: u64,
+        fh: Option<FileHandle>,
+        size: Option<u64>,
+        mode: Option<u32>,
+    ) -> Result<(), fuser::Errno> {
+        let path = self.inode_path(ino)?;
+        let executable = mode.map(|mode| mode & 0o111 != 0);
+        let handle = match fh {
+            Some(fh) => Some(self.handle_of(fh).map_err(|_| fuser::Errno::EBADF)?),
+            None => None,
+        };
+        match handle {
+            Some(Handle::Write(handle)) => {
+                if size.is_some() && executable.is_some() {
+                    return Err(fuser::Errno::EOPNOTSUPP);
+                }
+                if let Some(size) = size {
+                    self.truncate_handle_locked(&handle, &path, size)?;
+                }
+                if let Some(executable) = executable {
+                    self.set_exec_handle(&handle, &path, executable)?;
+                }
+                Ok(())
+            }
+            Some(Handle::Read(_)) => {
+                if size.is_some() {
+                    return Err(fuser::Errno::EBADF);
+                }
+                match executable {
+                    Some(executable) => self.submit(MutationKind::SetAttrs {
+                        path,
+                        size: None,
+                        executable: Some(executable),
+                    })?,
+                    None => return Ok(()),
+                };
+                Ok(())
+            }
+            None => {
+                if size.is_none() && executable.is_none() {
+                    return Ok(());
+                }
+                self.submit(MutationKind::SetAttrs {
+                    path,
+                    size,
+                    executable,
+                })?;
+                Ok(())
+            }
+        }
     }
 
     /// Resolve `path` and return its presentation attributes: the
@@ -1246,34 +1324,50 @@ where
         Ok(self.attr(ino, &node))
     }
 
-    /// Apply `setattr(size)`: a writable `fh` truncates its buffered
-    /// image, otherwise the truncation is a path-addressed mutation.
-    pub fn setattr_size(
+    /// Toggle a writable handle's exec bit (buffered, committed with the
+    /// next boundary like content). The handle must name `path`.
+    fn set_exec_handle(
         &self,
-        ino: u64,
-        fh: Option<FileHandle>,
-        size: u64,
+        handle: &Arc<Mutex<WriteHandle>>,
+        path: &str,
+        executable: bool,
     ) -> Result<(), fuser::Errno> {
-        let buffered = matches!(fh, Some(fh) if matches!(self.handle_of(fh), Ok(Handle::Write(_))));
-        match (buffered, fh) {
-            (true, Some(fh)) => self.truncate_handle(fh, size),
-            _ => self.set_size_at(ino, size),
+        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        if write.path != path {
+            return Err(fuser::Errno::EBADF);
         }
+        if write.failed {
+            return Err(fuser::Errno::EIO);
+        }
+        if write.executable == executable && !write.dirty {
+            return Ok(());
+        }
+        write.executable = executable;
+        write.dirty = true;
+        if write.sync {
+            self.commit_locked(&mut write)?;
+        }
+        Ok(())
     }
 
     /// Truncate a writable handle's buffered image (handle-derived
     /// `setattr(size)`): grow zero-fills, shrink discards the tail. The
     /// change is buffered and committed at the next boundary, exactly
-    /// like a write.
-    fn truncate_handle(&self, fh: FileHandle, size: u64) -> Result<(), fuser::Errno> {
-        let Handle::Write(handle) = self.handle_of(fh)? else {
-            return Err(fuser::Errno::EBADF);
-        };
+    /// like a write. The handle must name `path`.
+    fn truncate_handle_locked(
+        &self,
+        handle: &Arc<Mutex<WriteHandle>>,
+        path: &str,
+        size: u64,
+    ) -> Result<(), fuser::Errno> {
         let target = usize::try_from(size).map_err(|_| fuser::Errno::EFBIG)?;
         if target > crate::session::MAX_WRITE_BUFFER_BYTES {
             return Err(fuser::Errno::EFBIG);
         }
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        if write.path != path {
+            return Err(fuser::Errno::EBADF);
+        }
         if write.failed {
             return Err(fuser::Errno::EIO);
         }
@@ -1785,14 +1879,8 @@ where
                 return;
             }
         };
-        if let Some(size) = size {
-            if let Err(error) = self.setattr_size(ino.0, fh, size) {
-                reply.error(error);
-                return;
-            }
-        }
-        if let Some(mode) = mode {
-            if let Err(error) = self.set_exec_at(ino.0, mode & 0o111 != 0) {
+        if size.is_some() || mode.is_some() {
+            if let Err(error) = self.setattr_attrs(ino.0, fh, size, mode) {
                 reply.error(error);
                 return;
             }

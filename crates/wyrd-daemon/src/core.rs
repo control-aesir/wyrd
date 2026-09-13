@@ -681,6 +681,7 @@ where
             MutationKind::CommitFile {
                 path,
                 base,
+                executable,
                 content,
             } => {
                 let heads = self
@@ -712,13 +713,8 @@ where
                 let chunks =
                     chunk::insert_chunks(&mut *store, content).map_err(|_| MutationError::Store)?;
                 let name = path.rsplit('/').next().unwrap_or(path);
-                let entry = Entry::file(
-                    name,
-                    content.len() as u64,
-                    base.executable(),
-                    chunks.clone(),
-                )
-                .map_err(|error| MutationError::Invalid(error.to_string()))?;
+                let entry = Entry::file(name, content.len() as u64, *executable, chunks.clone())
+                    .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
                 self.engine
@@ -726,7 +722,7 @@ where
                     .map_err(|_| MutationError::Engine)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     content.len() as u64,
-                    base.executable(),
+                    *executable,
                     chunks,
                 )))
             }
@@ -790,58 +786,62 @@ where
                     .map_err(|_| MutationError::Engine)?;
                 Ok(MutationOutcome::Done)
             }
-            MutationKind::SetExec { path, executable } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
-                let (base, size, current_exec, chunks) = match self.current_node(&heads, path)? {
-                    Some(Node::File {
-                        size,
-                        executable,
-                        chunks,
-                    }) => (self.single_tree(&heads, path)?, size, executable, chunks),
-                    // Non-files accept a mode change as a no-op: only the
-                    // exec bit of a regular file is represented.
-                    Some(_) => return Ok(MutationOutcome::Done),
-                    None => return Err(MutationError::NotFound(path.clone())),
-                };
-                if current_exec == *executable {
-                    return Ok(MutationOutcome::Done);
-                }
-                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let name = path.rsplit('/').next().unwrap_or(path);
-                let entry = Entry::file(name, size, *executable, chunks)
-                    .map_err(|error| MutationError::Invalid(error.to_string()))?;
-                let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
-                    .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
-                Ok(MutationOutcome::Done)
-            }
-            MutationKind::SetSize { path, size } => {
+            MutationKind::SetAttrs {
+                path,
+                size,
+                executable,
+            } => {
                 let heads = self
                     .engine
                     .live_heads()
                     .map_err(|_| MutationError::Engine)?;
                 let tree = self.single_tree(&heads, path)?;
-                let (node, bytes) = self.read_current_file(&heads, path)?;
-                let executable = match node {
-                    Node::File { executable, .. } => executable,
-                    _ => return Err(MutationError::IsDirectory(path.clone())),
+                let (current_size, current_exec, chunks) = match self.current_node(&heads, path)? {
+                    Some(Node::File {
+                        size,
+                        executable,
+                        chunks,
+                    }) => (size, executable, chunks),
+                    // A size change on a non-file is EISDIR; an exec
+                    // change is a no-op (only files represent exec).
+                    Some(_) if size.is_some() => {
+                        return Err(MutationError::IsDirectory(path.clone()));
+                    }
+                    Some(_) => return Ok(MutationOutcome::Done),
+                    None => return Err(MutationError::NotFound(path.clone())),
                 };
-                let target = usize::try_from(*size).map_err(|_| MutationError::TooLarge(*size))?;
-                if target > crate::session::MAX_WRITE_BUFFER_BYTES {
-                    return Err(MutationError::TooLarge(*size));
+                let want_exec = executable.unwrap_or(current_exec);
+                // Decide everything before reading: an over-budget target
+                // fails closed without materializing, and a shrink only
+                // reads the prefix it keeps.
+                let new_size = match size {
+                    Some(target) => {
+                        if *target > crate::session::MAX_WRITE_BUFFER_BYTES as u64 {
+                            return Err(MutationError::TooLarge(*target));
+                        }
+                        *target
+                    }
+                    None => current_size,
+                };
+                if size.is_none() && want_exec == current_exec {
+                    return Ok(MutationOutcome::Done);
                 }
-                let mut image = bytes;
-                image.resize(target, 0);
+                let new_chunks = match size {
+                    None => chunks,
+                    Some(target) => {
+                        let read_len = current_size.min(*target);
+                        let mut image = self.read_current_file_prefix(&heads, path, read_len)?;
+                        let target = usize::try_from(*target)
+                            .map_err(|_| MutationError::TooLarge(*target))?;
+                        image.resize(target, 0);
+                        let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                        chunk::insert_chunks(&mut *store, &image)
+                            .map_err(|_| MutationError::Store)?
+                    }
+                };
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let chunks =
-                    chunk::insert_chunks(&mut *store, &image).map_err(|_| MutationError::Store)?;
                 let name = path.rsplit('/').next().unwrap_or(path);
-                let entry = Entry::file(name, *size, executable, chunks)
+                let entry = Entry::file(name, new_size, want_exec, new_chunks)
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
@@ -888,14 +888,20 @@ where
         ))
     }
 
-    /// Read a regular file's full plaintext from the current heads. A
-    /// not-materialized file is `EIO`: the loop has no demand path to
-    /// block on.
-    fn read_current_file(
+    /// Read at most `max_len` bytes of a regular file's plaintext from
+    /// the current heads. A truncate uses this to read only the prefix it
+    /// keeps, and never more than the target, so shrinking an oversized
+    /// file does not materialize it. A not-materialized file is `EIO`:
+    /// the loop has no demand path to block on.
+    fn read_current_file_prefix(
         &self,
         heads: &[AuthorizedSnapshot],
         path: &str,
-    ) -> Result<(Node, Vec<u8>), MutationError> {
+        max_len: u64,
+    ) -> Result<Vec<u8>, MutationError> {
+        if max_len == 0 {
+            return Ok(Vec::new());
+        }
         let view = self.view_for(heads)?;
         let node = view
             .lookup(path)
@@ -907,10 +913,9 @@ where
             Node::File { size, .. } => size,
             _ => return Err(MutationError::IsDirectory(path.to_string())),
         };
-        let bytes = view
-            .read(&file, 0, usize::try_from(size).unwrap_or(usize::MAX))
-            .map_err(|_| MutationError::Store)?;
-        Ok((node, bytes))
+        let len = size.min(max_len);
+        view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
+            .map_err(|_| MutationError::Store)
     }
 
     /// Resolve `path` against the current heads' merged view, for the
@@ -1949,15 +1954,92 @@ mod tests {
         backend.set_exec_at(ino, false).unwrap();
         assert_eq!(backend.attr_at("t.txt").unwrap().perm, 0o644);
 
-        // A handle-derived truncate buffers: the image shrinks, commits
-        // at the boundary, and other readers see it only after.
+        // A combined size+mode setattr is one namespace mutation: one
+        // generation, both effects, no intermediate state.
+        let before = backend.generation().unwrap();
+        backend
+            .setattr_attrs(ino, None, Some(4), Some(0o755))
+            .unwrap();
+        assert_eq!(
+            backend.generation().unwrap(),
+            before + 1,
+            "one snapshot for a combined setattr"
+        );
+        assert_eq!(backend.attr_at("t.txt").unwrap().perm, 0o755);
+        let read = backend.open_at("t.txt").unwrap();
+        assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"hell");
+        backend.release_handle(read).unwrap();
+
+        // A read-only handle cannot truncate.
+        let read_only = backend.open_at("t.txt").unwrap();
+        assert_eq!(
+            backend.setattr_attrs(ino, Some(read_only), Some(1), None),
+            Err(fuser::Errno::EBADF)
+        );
+        backend.release_handle(read_only).unwrap();
+
+        // An over-budget target fails closed before materializing.
+        let too_big = crate::session::MAX_WRITE_BUFFER_BYTES as u64 + 1;
+        assert_eq!(backend.set_size_at(ino, too_big), Err(fuser::Errno::EFBIG));
+
+        // A writable handle cannot combine a buffered truncate with a
+        // path-addressed exec change in one snapshot.
         let writable = backend.open_write("t.txt", libc::O_RDWR).unwrap();
-        backend.setattr_size(ino, Some(writable), 2).unwrap();
+        assert_eq!(
+            backend.setattr_attrs(ino, Some(writable), Some(2), Some(0o755)),
+            Err(fuser::Errno::EOPNOTSUPP)
+        );
+        // A handle-derived truncate alone buffers: the image shrinks,
+        // commits at the boundary, and other readers see it only after.
+        backend
+            .setattr_attrs(ino, Some(writable), Some(2), None)
+            .unwrap();
         assert_eq!(backend.read_handle(writable, 0, 64).unwrap(), b"he");
         backend.commit_handle(writable).unwrap();
         backend.release_handle(writable).unwrap();
         let read = backend.open_at("t.txt").unwrap();
         assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"he");
+        backend.release_handle(read).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Shrinking an over-budget declared file reads only the kept
+    /// prefix: the path truncate never materializes the old whole image.
+    #[test]
+    fn path_truncate_reads_only_the_kept_prefix() {
+        let (mut engine, dir, _) = scratch_drive();
+        let mut store = MemoryObjectStore::default();
+        let chunk = store.insert(wyrd_format::ObjectKind::Chunk, b"x").unwrap();
+        // A file whose declared size far exceeds the write budget, but
+        // whose only chunk holds one byte. A full read would be refused;
+        // a one-byte shrink must succeed.
+        let root = wyrd_format::Tree::from_entries(vec![wyrd_format::Entry::file(
+            "big",
+            crate::session::MAX_WRITE_BUFFER_BYTES as u64 + 1,
+            false,
+            vec![chunk],
+        )
+        .unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.refresh_live_heads().unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let ino = backend.attr_at("big").unwrap().ino.0;
+        backend.set_size_at(ino, 1).unwrap();
+        let read = backend.open_at("big").unwrap();
+        assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"x");
         backend.release_handle(read).unwrap();
 
         stop.store(true, Ordering::Relaxed);

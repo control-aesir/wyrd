@@ -1,7 +1,7 @@
 { pkgs, inputs, ... }:
 let
   inherit (pkgs.lib) optionals;
-  inherit (pkgs.stdenv.hostPlatform) isLinux;
+  inherit (pkgs.stdenv.hostPlatform) isLinux isDarwin;
   unstable = import inputs.nixpkgs-unstable { system = pkgs.stdenv.system; };
 in
 {
@@ -18,10 +18,18 @@ in
     # add .cargo/config.toml with -fuse-ld=mold; falls back to the system
     # linker without it.
     mold
+  ] ++ optionals isDarwin [
+    # Build-time headers/stubs for fuser's libfuse2 probe (fuse.pc).
+    macfuse-stubs
   ];
 
-  # Native FUSE for wyrd-fuse development stays out of nix on darwin:
-  # macFUSE is a system installation with kernel-extension expectations.
+  # FUSE on darwin is a build/runtime split: macfuse-stubs above only
+  # covers compiling and linking (headers + fuse.pc; devenv wires
+  # PKG_CONFIG_PATH to its pkgconfig dir automatically, so the manual
+  # `export PKG_CONFIG_PATH=...` from fuser's README for `nix-env`
+  # installs is not needed here). Mounting at runtime still needs the
+  # real system macFUSE (kernel extension,
+  # /Library/Filesystems/macfuse.fs), which nix cannot provide.
   # Revisit if/when we target FUSE 3 on Linux.
 
   git-hooks.hooks = {

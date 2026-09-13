@@ -59,6 +59,21 @@ jobs:
           set -o pipefail
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
 
+      # `insecure-fast-kdf` deliberately weakens the keystore KDF and is
+      # enabled only from dev-dependencies so integration tests can build a
+      # real Engine affordably. Guard production: the normal dependency graph
+      # (no dev/test edges) must never enable it. Never treat an
+      # `--all-features` artifact as production.
+      - name: Production feature graph excludes insecure-fast-kdf
+        run: |
+          set -euo pipefail
+          cargo tree -e normal,features --workspace > /tmp/features.log
+          if grep -q insecure-fast-kdf /tmp/features.log; then
+            echo "error: the normal dependency graph enables insecure-fast-kdf" >&2
+            grep -n insecure-fast-kdf /tmp/features.log >&2
+            exit 1
+          fi
+
       - name: Tests
         run: |
           set -o pipefail

@@ -27,7 +27,7 @@ pub use identity::{
 };
 pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_LEN, ENTRY_LEN};
 pub use membership::{Change, MembershipError, MembershipTransition};
-pub use mutation::{put, remove, MutationError, PathError, MAX_PATH_DEPTH};
+pub use mutation::{mkdir, put, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH};
 pub use snapshot::Snapshot;
 pub use store::{FetchStatus, MemoryObjectStore, ObjectStore, SharedStore, SharedStoreError};
 pub use tree::{Component, Entry, EntryContent, Tree};

@@ -269,11 +269,13 @@ A commit proceeds in this order, and the order is the contract:
    fsync are distinct outcomes: a rename failure publishes nothing, while
    a post-rename directory-fsync failure leaves the representation
    installed but not known durable. That failure is reported, never
-   swallowed, and a subsequent import reconciles it (re-syncs the
-   directory and re-imports into the serving mirror) before reporting
-   success. The **announcement obligation is recorded durably here**,
-   atomically with the snapshot (see below), so a crash after commit
-   still knows the snapshot must be announced.
+   swallowed, and a later publication attempt (an `insert` or `import`)
+   reconciles the directory before reporting success, while an `import`
+   also re-imports the representation into the serving mirror. A
+   directory created along the way is synced level by level, so a
+   first-write hierarchy is durable too. The **announcement obligation
+   is recorded durably here**, atomically with the snapshot (see below),
+   so a crash after commit still knows the snapshot must be announced.
 4. **Publication.** Heads and materialization are swapped into the shared
    view under one short write lock. The view sees the old head until this
    step.

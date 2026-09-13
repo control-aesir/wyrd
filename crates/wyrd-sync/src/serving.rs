@@ -56,10 +56,10 @@ pub struct Vault {
     /// endpoint can detach it on shutdown: an import after shutdown must
     /// not silently enqueue into a channel nobody will drain.
     mirror: std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MirrorItem>>>>,
-    /// Directory `fsync` implementation. Production uses
-    /// [`durable::fsync_dir`]; tests replace it to inject a post-rename
-    /// durability failure and exercise the recovery path.
-    sync_dir: fn(&Path) -> std::io::Result<()>,
+    /// Publication durability and its pending-directory recovery state.
+    /// Production uses [`durable::fsync_dir`]; tests replace it to inject
+    /// a post-rename durability failure and exercise the recovery path.
+    durability: durable::Durability,
 }
 
 /// One write-through item for the serving mirror.
@@ -85,7 +85,7 @@ impl Vault {
         Ok(Vault {
             dir,
             mirror: std::sync::Arc::new(Mutex::new(None)),
-            sync_dir: durable::fsync_dir,
+            durability: durable::Durability::new(),
         })
     }
 
@@ -117,6 +117,9 @@ impl Vault {
     pub fn import(&self, sealed: &[u8]) -> Result<BaoRoot, VaultError> {
         let root = blob_root(sealed);
         let path = self.path(&root);
+        // Repair any directory whose earlier publication failed its
+        // fsync before deciding the import is a no-op.
+        self.durability.reconcile()?;
         if path.is_file() {
             self.reconcile_held(sealed)?;
             return Ok(root);
@@ -127,8 +130,8 @@ impl Vault {
             std::process::id(),
             NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        durable::write_temp(&tmp, sealed)?;
-        match durable::publish_temp_with(&tmp, &path, self.sync_dir) {
+        self.durability.write_temp(&tmp, sealed)?;
+        match self.durability.publish_temp(&tmp, &path) {
             Ok(()) => {}
             Err(durable::PublishError::Rename(error)) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -155,13 +158,13 @@ impl Vault {
         Ok(root)
     }
 
-    /// Make an already-held root durable and served: re-`fsync` the vault
-    /// directory and re-import into the mirror. Both steps are
+    /// Make an already-held root durable and served: retry any pending
+    /// directory `fsync` and re-import into the mirror. Both steps are
     /// idempotent, so this heals a prior post-rename `fsync` failure, a
     /// crash before the mirror write-through, or a concurrent winner this
     /// process never observed.
     fn reconcile_held(&self, sealed: &[u8]) -> Result<(), VaultError> {
-        (self.sync_dir)(&self.dir)?;
+        self.durability.reconcile()?;
         self.notify_mirror(sealed);
         Ok(())
     }
@@ -487,7 +490,7 @@ impl VaultSource {
             vault: Vault {
                 dir: vault.dir.clone(),
                 mirror: std::sync::Arc::new(Mutex::new(None)),
-                sync_dir: durable::fsync_dir,
+                durability: durable::Durability::new(),
             },
             roots,
             bodies,
@@ -873,7 +876,7 @@ mod tests {
         let mut vault = Vault::open(&dir).unwrap();
         let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
         DIR_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
-        vault.sync_dir = fail_first_dir_sync;
+        vault.durability = durable::Durability::with_sync(fail_first_dir_sync);
 
         let sealed = b"durability failure reconciled".to_vec();
         let root = blob_root(&sealed);

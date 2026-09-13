@@ -8,6 +8,7 @@
 //! normative v0 format contract.
 
 pub mod chunk;
+pub mod durable;
 pub mod envelope;
 pub mod fs_store;
 pub mod identity;

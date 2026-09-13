@@ -14,13 +14,13 @@
 //! rehydration is "rebuild from durable state", never "rehydrate bytes".
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr};
 use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
 use thiserror::Error;
+use wyrd_format::durable;
 use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
 use crate::bulk::{BulkError, BulkSource, SealedManifest};
@@ -56,6 +56,10 @@ pub struct Vault {
     /// endpoint can detach it on shutdown: an import after shutdown must
     /// not silently enqueue into a channel nobody will drain.
     mirror: std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MirrorItem>>>>,
+    /// Publication durability and its pending-directory recovery state.
+    /// Production uses [`durable::fsync_dir`]; tests replace it to inject
+    /// a post-rename durability failure and exercise the recovery path.
+    durability: durable::Durability,
 }
 
 /// One write-through item for the serving mirror.
@@ -81,6 +85,7 @@ impl Vault {
         Ok(Vault {
             dir,
             mirror: std::sync::Arc::new(Mutex::new(None)),
+            durability: durable::Durability::new(),
         })
     }
 
@@ -98,11 +103,25 @@ impl Vault {
     /// objects are immutable and the store is append-only. The temp file
     /// is scoped to the root (distinct roots never collide on the temp
     /// path), and the rename is the publication point: a torn write
-    /// leaves a temp file, never a servable root.
+    /// leaves a temp file, never a servable root. Publication uses the
+    /// same crash protocol as the object store (temp + `fsync` + rename +
+    /// directory `fsync`, `wyrd_format::durable`), so the new directory
+    /// entry, not just the ciphertext, survives a power failure.
+    ///
+    /// The rename and the directory `fsync` are distinct stages. A rename
+    /// failure leaves nothing published, but a directory-`fsync` failure
+    /// leaves the file installed and not known durable; that error is
+    /// surfaced, and a retry takes the held-root path, which re-syncs the
+    /// directory and re-imports into the mirror. Both are idempotent, so a
+    /// crash between the rename and the mirror write-through heals too.
     pub fn import(&self, sealed: &[u8]) -> Result<BaoRoot, VaultError> {
         let root = blob_root(sealed);
         let path = self.path(&root);
-        if path.exists() {
+        // Repair any directory whose earlier publication failed its
+        // fsync before deciding the import is a no-op.
+        self.durability.reconcile()?;
+        if path.is_file() {
+            self.reconcile_held(sealed)?;
             return Ok(root);
         }
         let tmp = self.dir.join(format!(
@@ -111,32 +130,51 @@ impl Vault {
             std::process::id(),
             NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let write = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(sealed)?;
-            file.sync_all()
-        })();
-        if let Err(error) = write {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error.into());
-        }
-        if let Err(error) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
-            // A concurrent import of the same root may have published
-            // first; identical bytes hash to the same root, so the
-            // existing file is the winner and this call is a no-op.
-            if path.exists() {
-                return Ok(root);
+        self.durability.write_temp(&tmp, sealed)?;
+        match self.durability.publish_temp(&tmp, &path) {
+            Ok(()) => {}
+            Err(durable::PublishError::Rename(error)) => {
+                let _ = std::fs::remove_file(&tmp);
+                // A concurrent import of the same root may have published
+                // first; identical bytes hash to the same root, so the
+                // existing file is the winner and this call reconciles
+                // instead of failing.
+                if path.is_file() {
+                    self.reconcile_held(sealed)?;
+                    return Ok(root);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
+            Err(durable::PublishError::DirectorySync(error)) => {
+                // The rename installed the file but its directory entry is
+                // not known durable. Notify the mirror best-effort so the
+                // failure does not also strand serving readiness, then
+                // surface the error; a retry re-syncs the directory.
+                self.notify_mirror(sealed);
+                return Err(error.into());
+            }
         }
-        // Write-through to the serving mirror, after the rename: a
-        // dead channel only delays serving until the next boot
-        // rebuild, never the publication.
+        self.notify_mirror(sealed);
+        Ok(root)
+    }
+
+    /// Make an already-held root durable and served: confirm the vault
+    /// directory's durability and re-import into the mirror. Both steps
+    /// are idempotent, so this heals a prior post-rename `fsync` failure
+    /// (including across a restart), a crash before the mirror
+    /// write-through, or a concurrent winner this process never observed.
+    fn reconcile_held(&self, sealed: &[u8]) -> Result<(), VaultError> {
+        self.durability.verify_dir(&self.dir)?;
+        self.notify_mirror(sealed);
+        Ok(())
+    }
+
+    /// Write-through to the serving mirror. A dead channel only delays
+    /// serving until the next boot rebuild, never the publication.
+    fn notify_mirror(&self, sealed: &[u8]) {
         if let Some(sender) = self.mirror.lock().expect("vault mirror lock").as_ref() {
             let _ = sender.send(MirrorItem::Import(sealed.to_vec()));
         }
-        Ok(root)
     }
 
     /// Attach the write-through channel of a serving mirror. Replacing
@@ -452,6 +490,7 @@ impl VaultSource {
             vault: Vault {
                 dir: vault.dir.clone(),
                 mirror: std::sync::Arc::new(Mutex::new(None)),
+                durability: durable::Durability::new(),
             },
             roots,
             bodies,
@@ -668,6 +707,32 @@ mod tests {
         dir
     }
 
+    /// Fetch a representation from a loopback serving endpoint by
+    /// transport root over a real iroh client: `None` when the mirror
+    /// does not serve it.
+    fn fetch_from(serving: &ServingEndpoint, root: &BaoRoot) -> Option<Vec<u8>> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut source =
+            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        source.publish_transport(crate::bulk::IrohBlobRef {
+            provider: serving.addr(),
+            hash: *root.as_bytes(),
+        });
+        let fetched = source.fetch_transport(root, usize::MAX).ok().flatten();
+        source.shutdown();
+        fetched
+    }
+
     #[test]
     fn concurrent_same_root_imports_publish_once() {
         let vault = vault();
@@ -747,6 +812,128 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_publication_surfaces_an_error_and_leaves_no_temp() {
+        // A directory squatting on the root name blocks the rename: the
+        // failure must surface (never a phantom success), and the
+        // scratch file must be cleaned up.
+        let vault = vault();
+        let sealed = b"blocked representation".to_vec();
+        let root = blob_root(&sealed);
+        std::fs::create_dir_all(vault.dir.join(root.to_string()).join("child")).unwrap();
+        assert!(vault.import(&sealed).is_err());
+        for entry in std::fs::read_dir(&vault.dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".tmp-"),
+                "stale import scratch file"
+            );
+        }
+    }
+
+    /// Directory-sync calls made by the injection test below; the first
+    /// fails, the rest use the real implementation.
+    static DIR_SYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn fail_first_dir_sync(dir: &Path) -> std::io::Result<()> {
+        if DIR_SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        durable::fsync_dir(dir)
+    }
+
+    #[test]
+    fn reimport_reconciles_a_vault_file_the_mirror_never_saw() {
+        // Boot the endpoint against an empty vault so its boot rebuild
+        // cannot import the representation. Then place the file directly,
+        // as a publication that installed ciphertext but never reached
+        // the mirror (a crash before write-through, or a concurrent
+        // winner this process did not observe).
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let sealed = b"stranded representation".to_vec();
+        let root = blob_root(&sealed);
+        std::fs::write(vault.dir.join(root.to_string()), &sealed).unwrap();
+        assert!(
+            fetch_from(&serving, &root).is_none(),
+            "the mirror must not serve it before reconciliation"
+        );
+
+        // Re-importing a held root reconciles instead of no-oping: the
+        // directory is re-synced and the mirror receives the bytes.
+        assert_eq!(vault.import(&sealed).unwrap(), root);
+        serving.flush().unwrap();
+        assert_eq!(fetch_from(&serving, &root), Some(sealed));
+        serving.shutdown().unwrap();
+    }
+
+    #[test]
+    fn post_rename_directory_sync_failure_is_reconciled_on_retry() {
+        let dir = serve_dir();
+        let mut vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        DIR_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        vault.durability = durable::Durability::with_sync(fail_first_dir_sync);
+
+        let sealed = b"durability failure reconciled".to_vec();
+        let root = blob_root(&sealed);
+        // The rename publishes the file, then the injected directory
+        // fsync fails: the durability error must surface.
+        let error = vault.import(&sealed).unwrap_err();
+        assert!(
+            error.to_string().contains("injected"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            vault.dir.join(root.to_string()).is_file(),
+            "the rename installed the live file"
+        );
+
+        // A retry takes the held-root path, re-syncs the directory
+        // (second call succeeds), and reconciles the mirror.
+        assert_eq!(vault.import(&sealed).unwrap(), root);
+        serving.flush().unwrap();
+        assert_eq!(fetch_from(&serving, &root), Some(sealed));
+        serving.shutdown().unwrap();
+    }
+
+    /// Directory-sync calls seen by the restart-recovery test.
+    static REOPEN_SYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn count_dir_sync(dir: &Path) -> std::io::Result<()> {
+        REOPEN_SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        durable::fsync_dir(dir)
+    }
+
+    #[test]
+    fn reopening_reconciles_a_held_vault_directory() {
+        let dir = serve_dir();
+        let sealed = b"restart reconciliation".to_vec();
+        let root = blob_root(&sealed);
+        {
+            let vault = Vault::open(&dir).unwrap();
+            vault.import(&sealed).unwrap();
+        }
+        // Reopen: the fresh durability layer has verified nothing, so
+        // the first import of the held root must fsync the vault
+        // directory before reporting success.
+        let mut vault = Vault::open(&dir).unwrap();
+        REOPEN_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        vault.durability = durable::Durability::with_sync(count_dir_sync);
+        assert_eq!(vault.import(&sealed).unwrap(), root);
+        assert_eq!(
+            REOPEN_SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // Verified now: a second import is a cheap no-op.
+        assert_eq!(vault.import(&sealed).unwrap(), root);
+        assert_eq!(
+            REOPEN_SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]

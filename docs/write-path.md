@@ -262,12 +262,23 @@ A commit proceeds in this order, and the order is the contract:
 3. **Commit durability boundary.** The object store, the vault, and the
    fact log become durable **together at this boundary** (steps 1-2 only
    *prepared* state; neither is independently durable). The fact-log
-   commit is already append-only and crash-safe; the vault-directory
-   fsync (`fix(sync): fsync the vault directory after publication`) and
-   the object-store fsync path close the remaining gap. The **announcement
-   obligation is recorded durably here**, atomically with the snapshot
-   (see below), so a crash after commit still knows the snapshot must be
-   announced.
+   commit is already append-only and crash-safe, and the object store and
+   vault share one crash protocol: temp + fsync + rename + directory
+   fsync (`wyrd_format::durable`), so a published byte range or sealed
+   representation survives a power failure. The rename and the directory
+   fsync are distinct outcomes: a rename failure publishes nothing, while
+   a post-rename directory-fsync failure leaves the representation
+   installed but not known durable. That failure is reported, never
+   swallowed, and a later publication attempt (an `insert` or `import`)
+   reconciles the directory before reporting success, while an `import`
+   also re-imports the representation into the serving mirror. An
+   existing entry is not treated as durable until its directory has been
+   synced in the current process, so this recovery survives a restart
+   rather than living only in memory. A directory created along the way
+   is synced level by level, so a first-write hierarchy is durable too.
+   The **announcement obligation is recorded durably here**, atomically
+   with the snapshot (see below), so a crash after commit still knows the
+   snapshot must be announced.
 4. **Publication.** Heads and materialization are swapped into the shared
    view under one short write lock. The view sees the old head until this
    step.

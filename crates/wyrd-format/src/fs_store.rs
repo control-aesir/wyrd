@@ -26,12 +26,14 @@
 //! `has` is the trait's cheap existence check only — readability and
 //! validity are proven by `get`, never by `has`.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
+use crate::durable::{Durability, PublishError};
 use crate::identity::{ContentId, ObjectKind};
 use crate::store::ObjectStore;
 
@@ -64,10 +66,9 @@ impl FsStoreError {
 #[derive(Debug, Clone)]
 pub struct FsObjectStore {
     dir: PathBuf,
-}
-
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
+    /// Publication durability and its pending-directory recovery state,
+    /// shared across clones of the same store.
+    durability: Arc<Durability>,
 }
 
 /// All envelope kind bytes: `get`/`has` take an id without a kind, so
@@ -92,7 +93,10 @@ impl FsObjectStore {
     /// Open (or create) the store at `dir`, sweeping stale `.tmp` files
     /// from crashed writers.
     pub fn open(dir: PathBuf) -> Result<Self, FsStoreError> {
-        let store = FsObjectStore { dir };
+        let store = FsObjectStore {
+            dir,
+            durability: Arc::new(Durability::new()),
+        };
         fs::create_dir_all(store.objects_dir()).map_err(FsStoreError::io)?;
         store.sweep_temps()?;
         Ok(store)
@@ -146,44 +150,53 @@ impl FsObjectStore {
     }
 
     /// Durably create one file: temp + `fsync` + rename + directory
-    /// `fsync`. Stale temps are overwritten, never read. The temp name is
-    /// unique per attempt; if a concurrent `open()` sweep deletes the temp
-    /// between write and rename, the rename fails with `NotFound`: when
-    /// another writer already won the race the write becomes a no-op,
-    /// otherwise it rewrites to a fresh temp. Only the rename stage
-    /// retries — write-stage errors return at once, so a broken
-    /// filesystem surfaces instead of looping. The loop terminates
-    /// because only `open()` removes temps and `open()` calls are finite.
-    fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
+    /// `fsync` (see [`crate::durable`]). Stale temps are overwritten,
+    /// never read. The temp name is unique per attempt; if a concurrent
+    /// `open()` sweep deletes the temp between write and rename, the
+    /// rename fails with `NotFound`: when another writer already won the
+    /// race the write becomes a no-op, otherwise it rewrites to a fresh
+    /// temp. Only a `NotFound` rename retries — every other failure
+    /// returns at once, so a broken filesystem surfaces instead of
+    /// looping. The loop terminates because only `open()` removes temps
+    /// and `open()` calls are finite.
+    ///
+    /// A directory-`fsync` failure after the rename is surfaced, and the
+    /// directory is remembered by [`Durability`]; a later `insert`
+    /// reconciles it before reporting success.
+    fn atomic_write(&self, path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
         loop {
-            let tmp = Self::write_tmp(path, bytes).map_err(FsStoreError::io)?;
-            match fs::rename(&tmp, path) {
-                Ok(()) => {
-                    fsync_dir(path.parent().expect("object paths have parents"))
-                        .map_err(FsStoreError::io)?;
-                    return Ok(());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let tmp = Self::temp_path(path);
+            self.durability
+                .write_temp(&tmp, bytes)
+                .map_err(FsStoreError::io)?;
+            match self.durability.publish_temp(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(PublishError::Rename(error)) => {
+                    let _ = fs::remove_file(&tmp);
                     if path.is_file() {
                         return Ok(());
                     }
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(FsStoreError::io(error));
+                    }
+                    // A concurrent sweep removed the temp before the
+                    // rename; rewrite to a fresh temp.
                 }
-                Err(error) => return Err(FsStoreError::io(error)),
+                // The rename installed the live file but the directory
+                // fsync failed: the write is not durable, and retrying
+                // the rename would not repair it, so surface the error.
+                // `Durability` remembers the directory for the next
+                // insert to reconcile.
+                Err(error) => return Err(FsStoreError::io(error.into_io())),
             }
         }
     }
 
-    /// Write the temp file for one attempt: created, fully written, and
-    /// fsynced, but not yet renamed into place.
-    fn write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        fs::create_dir_all(path.parent().expect("object paths have parents"))?;
+    /// The per-attempt scratch sibling for `path`: pid + counter keep
+    /// concurrent writers (threads or processes) off each other's temp.
+    fn temp_path(path: &Path) -> PathBuf {
         let nonce = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
-        let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce));
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        Ok(tmp)
+        path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce))
     }
 }
 
@@ -191,6 +204,9 @@ impl ObjectStore for FsObjectStore {
     type Error = FsStoreError;
 
     fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
+        // Repair any directory whose earlier publication failed its
+        // fsync before deciding the write is a no-op.
+        self.durability.reconcile().map_err(FsStoreError::io)?;
         let id = ContentId::derive(kind, data);
         let path = self.path_for(kind, &id);
         // A present file is a no-op only when it still derives to the
@@ -202,7 +218,15 @@ impl ObjectStore for FsObjectStore {
             .and_then(Result::ok)
             .is_some_and(|bytes| ContentId::derive(kind, &bytes) == id);
         if !valid {
-            Self::atomic_write(&path, data)?;
+            self.atomic_write(&path, data)?;
+        } else {
+            // The object exists, but a prior publication (possibly before
+            // a restart) may have installed it without a successful
+            // directory fsync. Confirm the directory is durable before
+            // accepting the insert as a no-op.
+            self.durability
+                .verify_dir(path.parent().expect("object paths have parents"))
+                .map_err(FsStoreError::io)?;
         }
         Ok(id)
     }
@@ -335,6 +359,78 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert!(!store.has(&expected).unwrap());
+        remove_scratch(&dir);
+    }
+
+    /// Directory-sync calls seen by the injection test below.
+    static SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Fails the first call, then defers to the real `fsync_dir`.
+    fn fail_first_sync(dir: &Path) -> std::io::Result<()> {
+        if SYNC_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        crate::durable::fsync_dir(dir)
+    }
+
+    #[test]
+    fn insert_reconciles_a_post_rename_directory_sync_failure() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        SYNC_CALLS.store(0, Ordering::SeqCst);
+        store.durability = Arc::new(Durability::with_sync(fail_first_sync));
+        let id = ContentId::derive(ObjectKind::Chunk, b"needs reconciliation");
+        let path = store.path_for(ObjectKind::Chunk, &id);
+        // Pre-create the fanout directory so the first injected fsync is
+        // the publication's, not a parent-directory creation's.
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The first insert installs the file, then the injected directory
+        // fsync fails: the error surfaces and the object is present.
+        assert!(store
+            .insert(ObjectKind::Chunk, b"needs reconciliation")
+            .is_err());
+        assert!(path.is_file());
+        // A later insert of the same bytes reconciles the directory and
+        // succeeds instead of no-oping over an unsynced directory entry.
+        assert_eq!(
+            store
+                .insert(ObjectKind::Chunk, b"needs reconciliation")
+                .unwrap(),
+            id
+        );
+        assert!(SYNC_CALLS.load(Ordering::SeqCst) >= 2);
+        remove_scratch(&dir);
+    }
+
+    /// Directory-sync calls seen by the restart-recovery test.
+    static REOPEN_SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Counts calls, then defers to the real `fsync_dir`.
+    fn count_sync(dir: &Path) -> std::io::Result<()> {
+        REOPEN_SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
+        crate::durable::fsync_dir(dir)
+    }
+
+    #[test]
+    fn reopening_reconciles_an_existing_object_directory() {
+        let dir = scratch_dir();
+        let data = b"restart reconciliation";
+        {
+            let mut store = FsObjectStore::open(dir.clone()).unwrap();
+            store.insert(ObjectKind::Chunk, data).unwrap();
+        }
+        // Reopen: a fresh durability layer has no verified directories,
+        // so the first insert of the held object must re-sync its
+        // directory before treating it as durable.
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        REOPEN_SYNC_CALLS.store(0, Ordering::SeqCst);
+        store.durability = Arc::new(Durability::with_sync(count_sync));
+        let id = ContentId::derive(ObjectKind::Chunk, data);
+        assert_eq!(store.insert(ObjectKind::Chunk, data).unwrap(), id);
+        assert_eq!(REOPEN_SYNC_CALLS.load(Ordering::SeqCst), 1);
+        // Verified now: a second insert is a cheap no-op.
+        assert_eq!(store.insert(ObjectKind::Chunk, data).unwrap(), id);
+        assert_eq!(REOPEN_SYNC_CALLS.load(Ordering::SeqCst), 1);
         remove_scratch(&dir);
     }
 

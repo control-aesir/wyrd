@@ -27,7 +27,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::fuse::FuseBackend;
-use crate::mutation::{MutationError, MutationKind, MutationQueue, QueuedMutation};
+use crate::mutation::{MutationError, MutationKind, MutationQueue};
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
@@ -552,14 +552,18 @@ where
         // Apply mounted mutations in admission order (the queue's total
         // order): each is evaluated against the state its predecessor
         // committed, never against what the syscall saw. Submitters block
-        // until this pass completes them, and completion is deferred past
-        // publication below so a returned success means the state serves.
-        let pending = self.mutations.take_pending();
-        let mut results = Vec::with_capacity(pending.len());
-        for queued in pending {
-            let kind = queued.request().kind().clone();
+        // until the guard completes them; the batch completes on scope
+        // exit, so no later failure can strand a blocked caller. In the
+        // success path completion is deferred past publication below so a
+        // returned success means the state serves.
+        // Clone the queue handle so the batch borrow does not pin `self`
+        // while mutations apply (the engine borrow is mutable).
+        let mutations = Arc::clone(&self.mutations);
+        let mut batch = mutations.take_batch();
+        for index in 0..batch.len() {
+            let kind = batch.request(index).kind().clone();
             let result = self.apply_mutation(&kind);
-            results.push((queued, result));
+            batch.record(index, result);
         }
         // Settle admitted wants: retire a landed fetch, and retire a fetch
         // whose demand died — the engine's durable `Cached` policy keeps
@@ -577,7 +581,7 @@ where
         let revision = self.engine.current();
         let generation = self.generation();
         if !self.dirty && revision == self.published_revision {
-            complete_mutations(&self.mutations, results);
+            batch.finish();
             return Ok(SyncReport {
                 drained,
                 fetched,
@@ -602,7 +606,7 @@ where
         self.dirty = false;
         // Publication is done: a completed mutation's success now means
         // the new generation serves.
-        complete_mutations(&self.mutations, results);
+        batch.finish();
         Ok(SyncReport {
             drained,
             fetched,
@@ -756,18 +760,6 @@ fn admit_wants<E>(
     }
     registry.mark_admitted(&committed);
     Ok(committed)
-}
-
-/// Complete every mutation this pass applied, releasing admission slots
-/// and waking the blocked submitters. Always called for the full batch
-/// (success or failure) so no caller hangs and the bound never leaks.
-fn complete_mutations(
-    queue: &MutationQueue,
-    results: Vec<(QueuedMutation, Result<(), MutationError>)>,
-) {
-    for (queued, result) in results {
-        queue.complete(queued, result);
-    }
 }
 
 #[cfg(test)]
@@ -1286,6 +1278,13 @@ mod tests {
             backend.mkdir_at(1, "docs"),
             Err(fuser::Errno::EEXIST),
             "an existing name is EEXIST"
+        );
+        // A malformed final component is refused by the format parser,
+        // not by FUSE: an empty name is EINVAL.
+        assert_eq!(
+            backend.mkdir_at(1, ""),
+            Err(fuser::Errno::EINVAL),
+            "an invalid name is EINVAL"
         );
 
         stop.store(true, Ordering::Relaxed);

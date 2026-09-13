@@ -26,7 +26,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Total admitted-but-incomplete mutations, including the one executing.
@@ -250,7 +250,7 @@ impl MutationQueue {
         let id = MutationId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let reply = Arc::new(Reply::default());
         {
-            let mut state = self.state.lock().map_err(|_| MutationError::Lock)?;
+            let mut state = self.lock_state();
             if state.outstanding >= self.limit {
                 return Err(MutationError::Saturated);
             }
@@ -264,27 +264,50 @@ impl MutationQueue {
         reply.wait()
     }
 
-    /// Take every currently queued request, preserving submission order.
-    /// A poisoned lock yields nothing — the loop treats the batch as
-    /// empty and the requests' submitters eventually see `Lock` through
-    /// their own poisoned reply slots (fail closed, bounded by the
-    /// admission bound).
-    pub fn take_pending(&self) -> Vec<QueuedMutation> {
-        let Ok(mut state) = self.state.lock() else {
-            return Vec::new();
-        };
-        state.pending.drain(..).collect()
+    /// Take every currently queued request as a completion guard,
+    /// preserving submission order. The returned [`MutationBatch`]
+    /// completes each request when it is dropped: callers record a
+    /// result per request ([`MutationBatch::record`]) and completion
+    /// happens on scope exit, so no `?` or early return can leave a
+    /// blocked submitter stranded or leak an admission slot.
+    ///
+    /// A poisoned queue lock does not wedge callers: the state is plain
+    /// data, so poisoning is recovered and the batch is drained and
+    /// failed closed (`MutationError::Lock`) by the guard like any
+    /// other unfinished request.
+    pub fn take_batch(&self) -> MutationBatch<'_> {
+        let mut state = self.lock_state();
+        let entries = state
+            .pending
+            .drain(..)
+            .map(|queued| BatchEntry {
+                queued: Some(queued),
+                result: None,
+            })
+            .collect();
+        MutationBatch {
+            queue: self,
+            entries,
+        }
     }
 
     /// Complete one taken request: record the outcome, release its
-    /// admission slot, wake the blocked submitter. The loop must call
-    /// this for every taken request (exactly once), or the caller hangs
-    /// and the bound leaks.
-    pub fn complete(&self, queued: QueuedMutation, result: Result<(), MutationError>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.outstanding = state.outstanding.saturating_sub(1);
-        }
+    /// admission slot, wake the blocked submitter. [`MutationBatch`]
+    /// calls this; direct callers should prefer the batch guard.
+    fn complete(&self, queued: QueuedMutation, result: Result<(), MutationError>) {
+        let mut state = self.lock_state();
+        state.outstanding = state.outstanding.saturating_sub(1);
+        drop(state);
         queued.reply.complete(result);
+    }
+
+    /// Lock the queue state, recovering a poisoned mutex: the state is
+    /// plain data, so a panicked holder leaves it usable, and wedging
+    /// every submitter is strictly worse than continuing.
+    fn lock_state(&self) -> MutexGuard<'_, QueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Wait for work (or the timeout / stop) on the loop's idle path:
@@ -300,10 +323,7 @@ impl MutationQueue {
                 return;
             }
             let slice = (deadline - now).min(WAIT_SLICE);
-            let Ok(state) = self.state.lock() else {
-                std::thread::sleep(slice);
-                continue;
-            };
+            let state = self.lock_state();
             if !state.pending.is_empty() {
                 return;
             }
@@ -318,10 +338,70 @@ impl MutationQueue {
     /// Test-only: the number of admitted-but-incomplete requests.
     #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
-        self.state
-            .lock()
-            .map(|state| state.outstanding)
-            .unwrap_or(0)
+        self.lock_state().outstanding
+    }
+}
+
+/// A drained set of queued mutations that completes every request when
+/// dropped. The loop records a result per request as it applies them;
+/// anything left unrecorded (an early return between the drain and the
+/// record, including any `?`) fails closed with
+/// [`MutationError::Engine`] rather than stranding the submitter. This
+/// is the local enforcement of the no-post-timeout contract: taking a
+/// request and completing it are one lifecycle, not two caller duties.
+#[must_use = "a taken batch must be driven; dropping it completes every request"]
+pub struct MutationBatch<'a> {
+    queue: &'a MutationQueue,
+    entries: Vec<BatchEntry>,
+}
+
+struct BatchEntry {
+    queued: Option<QueuedMutation>,
+    result: Option<Result<(), MutationError>>,
+}
+
+impl MutationBatch<'_> {
+    /// The number of requests in the batch.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The request at `index`, for applying it.
+    pub fn request(&self, index: usize) -> &MutationRequest {
+        &self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .request
+    }
+
+    /// Record the outcome for the request at `index`.
+    pub fn record(&mut self, index: usize, result: Result<(), MutationError>) {
+        self.entries[index].result = Some(result);
+    }
+
+    /// Complete every request with its recorded result; an unrecorded
+    /// request fails closed with `Engine`. Idempotent — [`Drop`] calls
+    /// it, so an explicit call just makes the timing clear.
+    pub fn finish(&mut self) {
+        for entry in &mut self.entries {
+            let Some(queued) = entry.queued.take() else {
+                continue;
+            };
+            let result = entry.result.take().unwrap_or(Err(MutationError::Engine));
+            self.queue.complete(queued, result);
+        }
+    }
+}
+
+impl Drop for MutationBatch<'_> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -335,15 +415,17 @@ mod tests {
         }
     }
 
-    /// Submit one and take it once it lands, without racing the test's
-    /// own polling: the submitter blocks until completed.
-    fn take_one(queue: &MutationQueue) -> QueuedMutation {
-        loop {
-            if let Some(queued) = queue.take_pending().pop() {
-                return queued;
-            }
-            std::thread::yield_now();
-        }
+    /// Block until a request is queued, then take it as a batch. The
+    /// guard completes on drop, so tests must finish it explicitly.
+    fn take_batch_blocking(queue: &MutationQueue) -> MutationBatch<'_> {
+        let stop = AtomicBool::new(false);
+        queue.wait_for_work(&stop, Duration::from_secs(5));
+        let batch = queue.take_batch();
+        assert!(
+            !batch.is_empty(),
+            "wait_for_work returned without a request"
+        );
+        batch
     }
 
     /// `submit` blocks until the loop completes the request, and the id
@@ -355,11 +437,13 @@ mod tests {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || queue.submit(mkdir("docs")))
         };
-        let queued = take_one(&queue);
-        assert_eq!(queued.request().kind(), &mkdir("docs"));
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.request(0).kind(), &mkdir("docs"));
         assert_eq!(queue.outstanding(), 1, "admitted until completed");
 
-        queue.complete(queued, Ok(()));
+        batch.record(0, Ok(()));
+        batch.finish();
         assert_eq!(submitter.join().unwrap(), Ok(()));
         assert_eq!(queue.outstanding(), 0, "completion releases the slot");
     }
@@ -373,13 +457,34 @@ mod tests {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || queue.submit(mkdir("docs")))
         };
-        let queued = take_one(&queue);
-        queue.complete(queued, Err(MutationError::AlreadyExists("docs".into())));
+        let mut batch = take_batch_blocking(&queue);
+        batch.record(0, Err(MutationError::AlreadyExists("docs".into())));
+        batch.finish();
         assert_eq!(
             submitter.join().unwrap(),
             Err(MutationError::AlreadyExists("docs".into()))
         );
         assert_eq!(queue.outstanding(), 0);
+    }
+
+    /// The guard is the contract: a batch dropped without a recorded
+    /// result — the shape of a `?` early return after the drain — still
+    /// completes the request, failing closed with `Engine` rather than
+    /// stranding the blocked submitter or leaking the slot.
+    #[test]
+    fn dropped_batch_fails_unrecorded_requests_closed() {
+        let queue = Arc::new(MutationQueue::default());
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("docs")))
+        };
+        {
+            let _batch = take_batch_blocking(&queue);
+            // Dropped here with no recorded result, as an error exit
+            // between take and apply would.
+        }
+        assert_eq!(submitter.join().unwrap(), Err(MutationError::Engine));
+        assert_eq!(queue.outstanding(), 0, "the slot is released");
     }
 
     /// Admission is bounded including the executing request: past the
@@ -392,7 +497,7 @@ mod tests {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || queue.submit(mkdir("first")))
         };
-        let queued = take_one(&queue);
+        let mut batch = take_batch_blocking(&queue);
         assert_eq!(
             queue.submit(mkdir("second")),
             Err(MutationError::Saturated),
@@ -400,15 +505,41 @@ mod tests {
         );
 
         // Finishing the first frees the slot for another.
-        queue.complete(queued, Ok(()));
+        batch.record(0, Ok(()));
+        batch.finish();
         assert_eq!(submitter.join().unwrap(), Ok(()));
         let again = {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || queue.submit(mkdir("third")))
         };
-        let queued = take_one(&queue);
-        assert_eq!(queued.request().kind(), &mkdir("third"));
-        queue.complete(queued, Ok(()));
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.request(0).kind(), &mkdir("third"));
+        batch.record(0, Ok(()));
+        batch.finish();
         assert_eq!(again.join().unwrap(), Ok(()));
+    }
+
+    /// A poisoned queue lock does not wedge callers: the state is plain
+    /// data, so it is recovered, and the queue keeps admitting and
+    /// draining. A panicked holder must never strand blocked submitters.
+    #[test]
+    fn poisoned_state_lock_is_recovered() {
+        let queue = Arc::new(MutationQueue::default());
+        let poisoner = Arc::clone(&queue);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison the queue state");
+        })
+        .join();
+
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("docs")))
+        };
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.len(), 1, "the recovered queue still drains");
+        batch.record(0, Ok(()));
+        batch.finish();
+        assert_eq!(submitter.join().unwrap(), Ok(()));
     }
 }

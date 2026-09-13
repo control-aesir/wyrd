@@ -1091,7 +1091,7 @@ where
     /// opendir, a stable snapshot of its enumeration generation.
     /// Poison maps to EIO like every other lock failure; an unknown
     /// handle is EBADF.
-    fn dir_entries(&self, fh: u64) -> Result<DirectoryEntries, fuser::Errno> {
+    pub fn dir_entries(&self, fh: u64) -> Result<DirectoryEntries, fuser::Errno> {
         let directories = self.directories.read().map_err(|_| fuser::Errno::EIO)?;
         directories
             .entries
@@ -1106,7 +1106,7 @@ where
     /// and pin the listing with its generation. The non-callback form
     /// of the kernel `opendir` op — the surface the
     /// directory-consistency tests ride.
-    fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
+    pub fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
         let Ok(projection) = self.projection() else {
             return Err(fuser::Errno::EIO);
         };
@@ -2112,6 +2112,34 @@ mod tests {
         assert_eq!(kind, fuser::FileType::Symlink);
         let (kind, _, _) = attr_of(&Node::Conflict { versions: vec![] });
         assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
+    }
+
+    /// A backend with no mutation channel is the standalone read-only
+    /// mount: every mutating operation is refused with EROFS, never
+    /// silently accepted or half-applied.
+    #[test]
+    fn read_only_backend_refuses_mutations() {
+        let backend = backend();
+        assert_eq!(backend.mkdir_at(1, "x"), Err(fuser::Errno::EROFS));
+        assert_eq!(
+            backend.create_at(1, "x", libc::O_RDWR),
+            Err(fuser::Errno::EROFS)
+        );
+        assert_eq!(backend.unlink_at(1, "x"), Err(fuser::Errno::EROFS));
+        assert_eq!(backend.rmdir_at(1, "x"), Err(fuser::Errno::EROFS));
+        assert_eq!(
+            backend.rename_at(1, "x", 1, "y", false),
+            Err(fuser::Errno::EROFS)
+        );
+        assert_eq!(backend.set_size_at(1, 1), Err(fuser::Errno::EROFS));
+        assert_eq!(backend.set_exec_at(1, true), Err(fuser::Errno::EROFS));
+        assert_eq!(
+            backend.setattr_attrs(1, None, Some(1), None),
+            Err(fuser::Errno::EROFS)
+        );
+        // Read handles still serve; there is just no write handle to
+        // open.
+        assert_eq!(backend.open_write("x", 0), Err(fuser::Errno::EROFS));
     }
 
     /// A first write whose resulting logical length exceeds the

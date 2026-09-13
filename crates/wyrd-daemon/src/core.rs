@@ -2092,6 +2092,86 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The mounted-drive roundtrip plus write coherence: create, write,
+    /// fsync, read back, and directory listings that observe each commit
+    /// while a directory handle opened earlier keeps its pinned listing.
+    #[test]
+    fn mount_roundtrip_and_write_coherence() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30));
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let names = |backend: &FuseBackend<MemoryObjectStore, DaemonMaterialization>, fh: u64| {
+            backend
+                .dir_entries(fh)
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, name)| name)
+                .filter(|name| name != "." && name != "..")
+                .collect::<Vec<_>>()
+        };
+
+        // Headless: the first mkdir bootstraps the initial root.
+        let (d_ino, _) = backend.mkdir_at(1, "d").unwrap();
+        let (e_ino, _) = backend.mkdir_at(1, "e").unwrap();
+        let (fh, _f_ino, _) = backend.create_at(d_ino, "f.txt", libc::O_RDWR).unwrap();
+        backend.write_handle(fh, 0, b"hello").unwrap();
+        // Read-your-writes on the handle; a fresh reader sees the file
+        // `create` committed (empty) until the write is flushed.
+        assert_eq!(backend.read_handle(fh, 0, 64).unwrap(), b"hello");
+        let fresh = backend.open_at("d/f.txt").unwrap();
+        assert_eq!(backend.read_handle(fresh, 0, 64).unwrap(), b"");
+        backend.release_handle(fresh).unwrap();
+        backend.commit_handle(fh).unwrap();
+        backend.release_handle(fh).unwrap();
+
+        // The committed state is coherent across lookup, attrs, and a
+        // fresh directory stream.
+        let read = backend.open_at("d/f.txt").unwrap();
+        assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"hello");
+        backend.release_handle(read).unwrap();
+        assert_eq!(backend.attr_at("d/f.txt").unwrap().size, 5);
+        assert_eq!(
+            names(&backend, backend.open_dir(1, "").unwrap()),
+            ["d", "e"].map(String::from)
+        );
+
+        // Pin a directory handle, then rename within and across
+        // directories: the pinned listing never changes, fresh streams
+        // observe the commit.
+        let pinned = backend.open_dir(d_ino, "d").unwrap();
+        assert_eq!(names(&backend, pinned), ["f.txt"].map(String::from));
+        backend
+            .rename_at(d_ino, "f.txt", e_ino, "g.txt", false)
+            .unwrap();
+        assert_eq!(
+            names(&backend, pinned),
+            ["f.txt"].map(String::from),
+            "a pinned directory stream keeps its enumeration"
+        );
+        assert_eq!(
+            names(&backend, backend.open_dir(d_ino, "d").unwrap()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            names(&backend, backend.open_dir(e_ino, "e").unwrap()),
+            ["g.txt"].map(String::from)
+        );
+        assert_eq!(backend.attr_at("d/f.txt"), Err(fuser::Errno::ENOENT));
+
+        backend.unlink_at(e_ino, "g.txt").unwrap();
+        assert_eq!(backend.attr_at("e/g.txt"), Err(fuser::Errno::ENOENT));
+
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Concurrent readers never observe a half-published projection:
     /// every cloned generation serves its own complete snapshot while
     /// the loop publishes around them. Readers pin whatever generation

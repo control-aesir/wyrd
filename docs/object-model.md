@@ -74,7 +74,7 @@ bytes:
 offset  size  field
 0       4     magic      = "wyrd"
 4       1     version    = 0x00 (v0)
-5       1     kind       = 0x00 chunk | 0x01 tree | 0x02 snapshot
+5       1     kind       = 0x00 chunk | 0x01 tree | 0x02 snapshot | 0x03 manifest
 6       ..    payload    (kind-specific, canonical)
 ```
 

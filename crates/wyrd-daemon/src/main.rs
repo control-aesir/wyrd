@@ -790,7 +790,10 @@ mod tests {
 
     /// Owns a spawned mount thread: signals shutdown and rejoins on
     /// every exit path, so a failed assertion cannot orphan the
-    /// mount. The explicit join reports mount errors; dropping stays
+    /// mount. Rejoins are bounded: a wedged FUSE thread fails the
+    /// test instead of hanging it (the mount itself may linger —
+    /// detaching is the only escape a wedged kernel thread leaves).
+    /// The explicit join reports mount errors; dropping stays
     /// best-effort and never panics.
     struct MountGuard {
         server: Option<std::thread::JoinHandle<Result<(), CliError>>>,
@@ -801,10 +804,11 @@ mod tests {
             SHUTDOWN.store(true, Ordering::Relaxed);
             match self.server.take() {
                 None => {}
-                Some(server) => match server.join() {
-                    Err(_) => panic!("the mount thread panicked {context}"),
-                    Ok(Err(error)) => panic!("the mount failed {context}: {error}"),
-                    Ok(Ok(())) => {}
+                Some(server) => match reclaim(server, JOIN_TIMEOUT) {
+                    Some(Err(_)) => panic!("the mount thread panicked {context}"),
+                    Some(Ok(Err(error))) => panic!("the mount failed {context}: {error}"),
+                    Some(Ok(Ok(()))) => {}
+                    None => panic!("the mount thread did not exit within {JOIN_TIMEOUT:?} of shutdown {context}: FUSE may be wedged"),
                 },
             }
         }
@@ -814,8 +818,34 @@ mod tests {
         fn drop(&mut self) {
             if let Some(server) = self.server.take() {
                 SHUTDOWN.store(true, Ordering::Relaxed);
-                let _ = server.join();
+                // Best-effort and bounded: never panic or hang while
+                // unwinding; the explicit join reports errors.
+                let _ = reclaim(server, JOIN_TIMEOUT);
             }
+        }
+    }
+
+    /// How long a shutdown waits for the mount thread before
+    /// detaching: long enough for a healthy unmount-and-join
+    /// sequence, short enough that a wedged FUSE thread fails the
+    /// test instead of hanging CI.
+    const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Wait up to `timeout` for the mount thread, returning its
+    /// outcome; on expiry the handle is dropped (detaching the
+    /// thread) and `None` is returned.
+    fn reclaim(
+        server: std::thread::JoinHandle<Result<(), CliError>>,
+        timeout: std::time::Duration,
+    ) -> Option<std::thread::Result<Result<(), CliError>>> {
+        let deadline = std::time::Instant::now() + timeout;
+        while !server.is_finished() && std::time::Instant::now() <= deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if server.is_finished() {
+            Some(server.join())
+        } else {
+            None
         }
     }
 }

@@ -37,4 +37,5 @@ one through the available project tooling.
 - Work on `pr/<name>` branches; do not commit directly to `master`.
 - Keep `wyrd-format` free of networking, async, and FUSE dependencies.
 - Run the relevant checks locally while the PR is in draft. Marking the PR
-  ready (`ngit pr ready`) moves it to open and triggers CI.
+  ready (`ngit pr ready`) moves it to open and triggers CI for PRs
+  touching the workflow's filtered paths (docs-only PRs trigger none).

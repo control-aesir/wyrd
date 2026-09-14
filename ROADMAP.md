@@ -11,13 +11,18 @@ The protocol/core layers are effectively frozen for v0:
 - format and identity types
 - canonical serialization and decoding
 - membership and snapshot authorization
-- epoch keys, capabilities, bootstrap framing, and escrow records
+ - epoch keys, capabilities, bootstrap framing, and escrow records
+   (local custody wrap/unwrap; the guardian recovery workflow is future
+   work — see Phase 3)
 - control-plane message set and mailbox/signing trait boundaries
 
 Phases 1 to 4 shipped their tracked scope: the runtime sync engine, the
-read-only filesystem slice, root recovery, and the hardening passes are in
-place and under test. The frontier is the live network and the write path
-(see Current Focus below).
+read-only filesystem slice, crash recovery, recovery foundations, and
+the hardening passes are in place and under test. The frontier is the
+live network and the write path (see Current Focus below). "Recovery"
+below always means root-loss recovery per `docs/trust.md` (guardians,
+Shamir reconstruction); crash/restart recovery shipped in Phase 1 and
+the guardian workflow itself is unshipped — see Phase 3.
 
 ## Phase 1: Runtime Sync — shipped
 
@@ -62,16 +67,40 @@ Landed:
 Remaining in this phase: write support (the mount is read-only by design
 until the write path lands).
 
-## Phase 3: Recovery Completion — shipped
+## Phase 3: Recovery Foundations — shipped; workflow pending
 
-Goal: make root recovery and historical restoration operational end to end.
+Goal: land the recovery primitives the trust contract reserves the
+design for (`docs/trust.md`, Recovery). Making root-loss recovery
+operational end to end (guardians reconstructing a lost root) is
+explicitly NOT in this phase.
 
 Tracked by (applied):
 
 - `feat(sync): recovery protocol completion` (`nostr:nevent1qqszq7ctvnagpkzwdcfyjs2u6ezqw2qrvgcqtsnawrugnz2yxarfxhspz9mhxue69uhkwunpwdczuap49eehgql62dp`)
 
-Landed: root reconstruction workflow, escrow record retrieval and replay,
-historical epoch restoration, and recovery snapshot creation.
+Landed (foundations — implemented, tested, wired):
+
+- epoch-secret escrow records (T13): wrap/unwrap implemented and
+  under test, wired into bootstrap custody (epoch-1 un-escrow on
+  reopen) — end to end for local custody, not for guardians
+- bootstrap custody handling: create plus reopen flows
+- recovery-snapshot flag and grafting rules, specified in
+  `docs/epochs.md` (content grafts, never lineage); the creation
+  workflow that mints one is unshipped (see below)
+
+Explicitly NOT landed (unimplemented, untracked — file tracking
+issues before implementing):
+
+- guardian selection and membership-log guardian fields
+- Shamir reconstruction flow (k-of-n share return, root rebuild,
+  fresh capability / new epoch)
+- share rotation (re-split, re-deliver on compromise or loss)
+- historical epoch restoration
+- owner recovery-snapshot creation workflow
+
+Until those land, root loss with all capable devices gone is
+unrecoverable — exactly as `docs/trust.md` states. Nothing here
+should be read as operational root-loss recovery.
 
 ## Phase 4: Hardening — shipped
 

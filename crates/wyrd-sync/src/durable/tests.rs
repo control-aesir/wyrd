@@ -9,6 +9,7 @@ use crate::keys::epoch::EpochSecret;
 use crate::membership::test_util::{admit, drive, key, sign, Builder};
 use crate::membership::{MembershipLog, TransitionStatus};
 use crate::runtime::{ManifestRecord, MaterializationState, RuntimeState};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::PathBuf};
 use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
@@ -410,6 +411,59 @@ fn planted_forged_body_is_rejected_before_eligibility() {
     assert!(
         !eligible.contains(&forged_id),
         "the forged body never enters the eligible set"
+    );
+}
+
+/// Durable replay of individually valid facts preserves the
+/// transport/representation invariant: a representationless record
+/// completed by a later fact adopts the incoming eager root, so the
+/// rebuilt state never serves a root its map does not advertise.
+#[test]
+fn replayed_empty_to_filled_merge_keeps_transport_represented() {
+    let manifest =
+        Manifest::new(SnapshotId::from_bytes([0x11; 32]), Vec::new(), Vec::new()).unwrap();
+    let manifest_id = ContentId::derive(ObjectKind::Manifest, &manifest.canonical_bytes());
+    let dir = TestDir::new("manifest-merge");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store
+        .commit(&[Fact::Manifest(ManifestRecord {
+            is_root: true,
+            manifest_id,
+            representations: BTreeMap::new(),
+            transport: BaoRoot::from_bytes([0xA0; 32]),
+            manifest: manifest.clone(),
+        })])
+        .unwrap();
+    store
+        .commit(&[Fact::Manifest(ManifestRecord {
+            is_root: true,
+            manifest_id,
+            representations: [(
+                StorageId::from_bytes([0xB0; 32]),
+                BaoRoot::from_bytes([0xD0; 32]),
+            )]
+            .into(),
+            transport: BaoRoot::from_bytes([0xD0; 32]),
+            manifest: manifest.clone(),
+        })])
+        .unwrap();
+
+    let rebuilt = store.rebuild(owner()).unwrap();
+    let stored = rebuilt
+        .runtime
+        .manifest_record(&manifest_id)
+        .expect("both facts replay into one record");
+    assert_eq!(
+        stored.transport,
+        BaoRoot::from_bytes([0xD0; 32]),
+        "replay adopts the completing root"
+    );
+    assert!(
+        stored
+            .representations
+            .values()
+            .any(|root| *root == stored.transport),
+        "the rebuilt record serves only advertised roots"
     );
 }
 

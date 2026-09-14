@@ -371,20 +371,22 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
     if manifest_id != derived {
         return None;
     }
-    // Transport/representation consistency (matches
-    // `RuntimeState::record_manifest`): a record naming representations
-    // must name its eager root among them. An empty map is a
-    // representationless root and stays decodable.
-    if !representations.is_empty() && !representations.values().any(|root| *root == transport) {
-        return None;
-    }
-    Some(ManifestRecord {
+    // Transport/representation consistency (same predicate as
+    // `RuntimeState::record_manifest`, so the gates cannot drift): a
+    // record naming representations must name its eager root among
+    // them. An empty map is a representationless root and stays
+    // decodable.
+    let record = ManifestRecord {
         is_root,
         manifest_id,
         representations,
         transport,
         manifest,
-    })
+    };
+    if !crate::runtime::transport_is_represented(&record) {
+        return None;
+    }
+    Some(record)
 }
 
 // --- decoded facts -------------------------------------------------------------

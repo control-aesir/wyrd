@@ -15,6 +15,9 @@ target/
 # assembled into dist/ at release time; see .ngit/release.yaml)
 dist/
 
+# Nix build out-links (`nix build` result symlinks)
+result*
+
 # Repo packers (scratch files for review workflows)
 repomix*
 

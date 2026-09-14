@@ -84,11 +84,21 @@
           platform = ngitPlatforms.${system};
           dirname = "wyrd-${version}-${platform}";
         in
-        pkgs.runCommand "${dirname}.tar.gz" { } ''
-          mkdir -p staging/${dirname}/bin
-          cp ${self.packages.${system}.wyrd}/bin/wyrd staging/${dirname}/bin/
-          tar -czf $out -C staging ${dirname}
-        '';
+        # Explicit store paths, not PATH: sandbox tar/gzip vary by platform
+          # (BSD tar on darwin lacks --sort-name), and the archive format
+          # must not.
+        pkgs.runCommand "${dirname}.tar.gz" { }
+          ''
+            mkdir -p staging/${dirname}/bin
+            cp ${self.packages.${system}.wyrd}/bin/wyrd staging/${dirname}/bin/
+            # Reproducible archive: sorted entries, fixed mtime, zero
+            # owner/group, and no gzip filename/timestamp, so every builder
+            # publishes identical bytes. Re-verify with
+            # `nix build .#wyrd-dist --rebuild` after touching this.
+            ${pkgs.gnutar}/bin/tar --sort=name --mtime=@1 --owner=0 --group=0 \
+              --numeric-owner -I '${pkgs.gzip}/bin/gzip -n' -cf $out \
+              -C staging ${dirname}
+          '';
     in
     {
       packages = forAllSystems (system: {

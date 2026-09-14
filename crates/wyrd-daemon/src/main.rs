@@ -721,18 +721,14 @@ mod tests {
 
     /// The full static mount: init, author, mount in a thread, read
     /// through the mountpoint, prove read-only, shut down, and
-    /// rejoin cleanly. Ignored by default and additionally gated on
-    /// `WYRD_TEST_MOUNT=1`, so ordinary runs report it as skipped,
-    /// never as passed: it needs kernel FUSE plus local networking
-    /// for the serving endpoint. Run it where both hold:
-    /// `WYRD_TEST_MOUNT=1 cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
+    /// rejoin cleanly. Ignored by default — opting in is the test
+    /// runner's job, so an explicit run always attempts the mount
+    /// instead of silently passing. Needs kernel FUSE plus local
+    /// networking for the serving endpoint. Run it where both hold:
+    /// `cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
     #[test]
-    #[ignore = "needs kernel FUSE and local networking; see WYRD_TEST_MOUNT"]
+    #[ignore = "needs kernel FUSE and local networking"]
     fn live_mount_serves_read_only_until_shutdown() {
-        if std::env::var("WYRD_TEST_MOUNT").is_err() {
-            eprintln!("skipping live mount test: set WYRD_TEST_MOUNT=1 where kernel FUSE and local networking are available");
-            return;
-        }
         // The shutdown latch is process-global: start unset so a
         // previous run in this process cannot cut this mount short.
         SHUTDOWN.store(false, Ordering::Relaxed);
@@ -761,40 +757,65 @@ mod tests {
 
         let mountpoint = temp.0.join("mnt");
         fs::create_dir_all(&mountpoint).unwrap();
-        let server =
-            std::thread::spawn(move || mount(drive, mountpoint, Vec::new(), "test-pass", identity));
+        // The guard owns the mount thread: an assertion panic
+        // anywhere below still signals shutdown and rejoins instead
+        // of orphaning the mount. The explicit join reports the
+        // mount outcome; the Drop path stays best-effort (it must
+        // never panic while unwinding).
+        let mut mount = MountGuard {
+            server: Some(std::thread::spawn(move || {
+                mount(drive, mountpoint, Vec::new(), "test-pass", identity)
+            })),
+        };
         let target = temp.0.join("mnt").join("hello.txt");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !target.is_file() && std::time::Instant::now() <= deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if !target.is_file() {
-            // Startup failed or hung: signal and rejoin first — a
-            // hung startup must not orphan the mount thread — and
-            // surface any mount error instead of a bare timeout.
-            SHUTDOWN.store(true, Ordering::Relaxed);
-            match server.join() {
-                Err(_) => panic!("the mount thread panicked during startup"),
-                Ok(Err(error)) => panic!("the mount failed during startup: {error}"),
-                Ok(Ok(())) => panic!("the mount exited cleanly without ever serving"),
-            }
+            mount.shutdown_and_join("during startup");
+            panic!("the mount did not serve in time");
         }
         assert_eq!(fs::read(&target).unwrap(), b"hello mount");
         assert!(
             fs::write(&target, b"nope").is_err(),
             "the static mount is read-only"
         );
-        // Shut down and rejoin, reporting the mount outcome instead
-        // of unwrapping: a failed shutdown must fail the test.
-        SHUTDOWN.store(true, Ordering::Relaxed);
-        match server.join() {
-            Err(_) => panic!("the mount thread panicked during shutdown"),
-            Ok(Err(error)) => panic!("the mount failed during shutdown: {error}"),
-            Ok(Ok(())) => {}
-        }
+        mount.shutdown_and_join("during shutdown");
         assert!(
             fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
             "a clean unmount releases the mountpoint"
         );
+    }
+
+    /// Owns a spawned mount thread: signals shutdown and rejoins on
+    /// every exit path, so a failed assertion cannot orphan the
+    /// mount. The explicit join reports mount errors; dropping stays
+    /// best-effort and never panics.
+    struct MountGuard {
+        server: Option<std::thread::JoinHandle<Result<(), CliError>>>,
+    }
+
+    impl MountGuard {
+        fn shutdown_and_join(&mut self, context: &str) {
+            SHUTDOWN.store(true, Ordering::Relaxed);
+            match self.server.take() {
+                None => {}
+                Some(server) => match server.join() {
+                    Err(_) => panic!("the mount thread panicked {context}"),
+                    Ok(Err(error)) => panic!("the mount failed {context}: {error}"),
+                    Ok(Ok(())) => {}
+                },
+            }
+        }
+    }
+
+    impl Drop for MountGuard {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                let _ = server.join();
+            }
+        }
     }
 }

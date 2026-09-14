@@ -340,9 +340,11 @@ where
                 None => {
                     let frame = stack.pop().expect("walk stack nonempty");
                     in_progress.remove(&frame.tree_id);
-                    // BTreeMap-collected parts: ascending unique keys, so
-                    // the manifest is canonical without re-sorting.
-                    let manifest = Manifest::from_sorted(self.snapshot, frame.entries, frame.links);
+                    // BTreeMap-collected parts: ascending unique keys with
+                    // values sealed under those keys, verified by
+                    // `from_sorted` rather than re-sorted.
+                    let manifest =
+                        Manifest::from_sorted(self.snapshot, frame.entries, frame.links)?;
                     check_manifest(&Limits::V0, &manifest).map_err(EngineError::Ingest)?;
                     let manifest_key =
                         self.secret

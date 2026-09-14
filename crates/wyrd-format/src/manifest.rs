@@ -189,8 +189,8 @@ impl Manifest {
         mut entries: Vec<ManifestEntry>,
         mut children: Vec<ChildManifest>,
     ) -> Result<Self, ManifestError> {
-        entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-        children.sort_by(|a, b| a.tree.as_bytes().cmp(b.tree.as_bytes()));
+        entries.sort_by_key(|entry| entry.sort_key());
+        children.sort_by_key(|child| *child.tree.as_bytes());
         let manifest = Manifest {
             snapshot,
             entries,
@@ -200,22 +200,34 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Build a manifest from pre-sorted maps, infallibly: `BTreeMap`
-    /// iteration is ascending by key with unique keys, and the map keys
-    /// are exactly the canonical sort keys (entry content id, child tree
-    /// id), so the collected vectors are strictly ordered by
-    /// construction. The authoring path uses this; everyone else uses
-    /// [`Manifest::new`].
+    /// Build a manifest from pre-sorted maps, verifying (not trusting)
+    /// that each map key names the value stored under it: entry keys must
+    /// equal the entry content ids, child keys the child tree ids. A
+    /// mismatch fails with the same errors decoding reports, because the
+    /// collected values would not be canonically ordered. The authoring
+    /// path uses this to skip the `new()` re-sort after `BTreeMap`
+    /// accumulation (one linear verification pass instead); everyone
+    /// else uses [`Manifest::new`].
     pub fn from_sorted(
         snapshot: SnapshotId,
         entries: BTreeMap<ContentId, ManifestEntry>,
         children: BTreeMap<ContentId, ChildManifest>,
-    ) -> Self {
-        Manifest {
+    ) -> Result<Self, ManifestError> {
+        for (key, entry) in &entries {
+            if key != &entry.content_id {
+                return Err(ManifestError::UnsortedEntries);
+            }
+        }
+        for (key, link) in &children {
+            if key != &link.tree {
+                return Err(ManifestError::UnsortedChildren);
+            }
+        }
+        Ok(Manifest {
             snapshot,
             entries: entries.into_values().collect(),
             children: children.into_values().collect(),
-        }
+        })
     }
 
     /// The snapshot this manifest describes.
@@ -550,11 +562,42 @@ mod tests {
             (ContentId::from_bytes([0x02; 32]), entry(0x02, 2)),
             (ContentId::from_bytes([0x01; 32]), entry(0x01, 1)),
         ]);
-        let m = Manifest::from_sorted(SnapshotId::from_bytes([0x77; 32]), entries, BTreeMap::new());
+        let m = Manifest::from_sorted(SnapshotId::from_bytes([0x77; 32]), entries, BTreeMap::new())
+            .unwrap();
         assert_eq!(m.entries().len(), 2);
         assert_eq!(
             Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
             m
+        );
+    }
+
+    #[test]
+    fn from_sorted_rejects_mismatched_map_keys() {
+        // The map key must name the value stored under it: a mismatch
+        // would collect values out of canonical order, so it fails with
+        // the same errors decoding reports.
+        use std::collections::BTreeMap;
+        let entries = BTreeMap::from([(ContentId::from_bytes([0x01; 32]), entry(0x02, 2))]);
+        assert_eq!(
+            Manifest::from_sorted(SnapshotId::from_bytes([0x77; 32]), entries, BTreeMap::new(),),
+            Err(ManifestError::UnsortedEntries)
+        );
+        let children = BTreeMap::from([(
+            ContentId::from_bytes([0x01; 32]),
+            ChildManifest {
+                tree: ContentId::from_bytes([0x02; 32]),
+                manifest: ContentId::from_bytes([0x20; 32]),
+                storage: StorageId::from_bytes([0x30; 32]),
+                transport: BaoRoot::from_bytes([0x81; 32]),
+            },
+        )]);
+        assert_eq!(
+            Manifest::from_sorted(
+                SnapshotId::from_bytes([0x77; 32]),
+                BTreeMap::new(),
+                children,
+            ),
+            Err(ManifestError::UnsortedChildren)
         );
     }
 

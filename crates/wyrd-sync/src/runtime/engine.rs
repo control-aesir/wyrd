@@ -122,6 +122,8 @@ pub enum EngineError {
     MalformedKeystore,
     #[error("the supplied identity is not this drive's owner")]
     OwnerMismatch,
+    #[error("authored manifest failed canonical construction: {0}")]
+    InvalidManifest(#[from] wyrd_format::ManifestError),
     #[error("keystore failed: {0}")]
     Keystore(#[from] crate::keys::KeystoreError),
     #[error("keystore I/O failed: {0}")]

@@ -156,13 +156,36 @@ pub enum TreeError {
     InvalidUtf8,
     #[error("duplicate component {0:?}: names within a tree are unique")]
     DuplicateComponent(String),
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
 }
 
 impl Tree {
     /// Build a tree from entries; they are sorted into canonical order.
-    /// Rejects duplicate components — names within a tree are unique.
+    /// Rejects duplicate components — names within a tree are unique —
+    /// and lengths beyond the `u32` wire counts, so the infallible
+    /// [`Tree::encode`] only ever sees encodable values.
     pub fn from_entries(entries: Vec<Entry>) -> Result<Self, TreeError> {
         let mut entries = entries;
+        if entries.len() > u32::MAX as usize {
+            return Err(TreeError::CountOverflow(entries.len()));
+        }
+        for entry in &entries {
+            let name_len = entry.name.as_str().len();
+            if name_len > u32::MAX as usize {
+                return Err(TreeError::CountOverflow(name_len));
+            }
+            if let EntryContent::File { chunks, .. } = &entry.content {
+                if chunks.len() > u32::MAX as usize {
+                    return Err(TreeError::CountOverflow(chunks.len()));
+                }
+            }
+            if let EntryContent::Symlink { target } = &entry.content {
+                if target.len() > u32::MAX as usize {
+                    return Err(TreeError::CountOverflow(target.len()));
+                }
+            }
+        }
         // str Ord is bytewise lexicographic, which is exactly the
         // canonical order (UTF-8, case-sensitive).
         entries.sort_by(|a, b| a.name.cmp(&b.name));

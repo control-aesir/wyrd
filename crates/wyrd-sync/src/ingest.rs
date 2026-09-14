@@ -263,18 +263,18 @@ mod tests {
     };
 
     fn snapshot(parents: usize) -> Snapshot {
-        Snapshot {
-            parents: (0..parents)
+        Snapshot::new(
+            (0..parents)
                 .map(|b| SnapshotId::from_bytes([b as u8; 32]))
                 .collect(),
-            tree: ContentId::from_bytes([0x01; 32]),
-            author: DeviceId::from_bytes([0x02; 32]),
-            membership: TransitionId::from_bytes([0x03; 32]),
-            epoch: 1,
-            flags: 0,
-            timestamp: 0,
-            signature: [0x04; 64],
-        }
+            ContentId::from_bytes([0x01; 32]),
+            DeviceId::from_bytes([0x02; 32]),
+            TransitionId::from_bytes([0x03; 32]),
+            1,
+            0,
+            0,
+        )
+        .unwrap()
     }
 
     #[test]

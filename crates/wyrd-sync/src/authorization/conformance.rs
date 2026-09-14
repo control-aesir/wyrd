@@ -476,7 +476,9 @@ fn recovery_snapshot_by_the_owner_with_eligible_parents_is_eligible() {
     let id_head = observe(&mut dag, &head);
     let recovery = f.owner_snapshot(vec![id_head], tree_id(3));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -545,7 +547,9 @@ fn recovery_parenting_a_stranded_head_is_rejected() {
     // grafts content, never lineage.
     let recovery = f.owner_snapshot(vec![id_stranded], tree_id(3));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -570,7 +574,9 @@ fn descendants_of_a_rejected_recovery_stay_dead() {
     // `head` is no longer a DAG head, so the recovery is rejected.
     let recovery = f.owner_snapshot(vec![id_head], tree_id(4));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -615,7 +621,9 @@ fn recovery_parent_that_dies_in_the_fixed_point_is_rejected() {
     // Recovery onto the doomed parent: rejected, not silently stranded.
     let recovery = f.owner_snapshot(vec![id_p2], tree_id(4));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(

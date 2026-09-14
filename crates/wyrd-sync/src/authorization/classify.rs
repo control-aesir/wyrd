@@ -90,7 +90,7 @@ pub(super) fn classify(
     let mut recovery_rejected = false;
     for id in &ids {
         let s = dag.snapshot(id).expect("observed");
-        if s.flags & RECOVERY_FLAG != 0
+        if s.flags() & RECOVERY_FLAG != 0
             && engine.pre.get(id) == Some(&Pre::Authorized)
             && !engine.recovery_parents_eligible(id)
         {
@@ -173,7 +173,7 @@ fn preverdict(
         Some(members) if members.contains(&s.author) => {}
         _ => return Pre::Rejected(Rejection::AuthorNotMember),
     }
-    if s.flags & RECOVERY_FLAG != 0 {
+    if s.flags() & RECOVERY_FLAG != 0 {
         // The recovery author must be the current canonical owner — not
         // merely a member of the bound epoch.
         let is_owner =

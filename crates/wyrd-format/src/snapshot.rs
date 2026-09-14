@@ -49,9 +49,12 @@ pub struct Snapshot {
     /// Must equal the referenced transition's epoch (checked by the
     /// authorization engine).
     pub epoch: u64,
-    /// Reserved-flag bits; see [`RECOVERY_FLAG`] and
-    /// [`RESERVED_FLAG_MASK`].
-    pub flags: u8,
+    /// Flag bits; see [`RECOVERY_FLAG`] and [`RESERVED_FLAG_MASK`].
+    /// Private: reserved bits are rejected by [`Snapshot::new`] and
+    /// [`Snapshot::set_flags`], so a value with garbage flags cannot be
+    /// built outside this module. Other fields carry no construction
+    /// invariant and stay struct-literal friendly.
+    flags: u8,
     /// Milliseconds. The authoring path keeps a value strictly greater
     /// than every timestamp already observed in the local DAG (monotonic
     /// across local writes, clock rollback, and restarts). Display and
@@ -69,6 +72,8 @@ pub enum SnapshotError {
     TrailingBytes,
     #[error("reserved flag bits must be zero, got {0:#04x}")]
     ReservedFlags(u8),
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
 }
 
 impl Snapshot {
@@ -89,6 +94,9 @@ impl Snapshot {
         if flags & RESERVED_FLAG_MASK != 0 {
             return Err(SnapshotError::ReservedFlags(flags));
         }
+        if parents.len() > u32::MAX as usize {
+            return Err(SnapshotError::CountOverflow(parents.len()));
+        }
         Ok(Snapshot {
             parents,
             tree,
@@ -99,6 +107,21 @@ impl Snapshot {
             timestamp,
             signature: [0; 64],
         })
+    }
+
+    /// The flag bits (only [`RECOVERY_FLAG`] is defined).
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Replace the flag bits, rejecting nonzero reserved bits with the
+    /// same error construction and decoding report.
+    pub fn set_flags(&mut self, flags: u8) -> Result<(), SnapshotError> {
+        if flags & RESERVED_FLAG_MASK != 0 {
+            return Err(SnapshotError::ReservedFlags(flags));
+        }
+        self.flags = flags;
+        Ok(())
     }
 
     /// The BIP-340 message: `ASCII("wyrd snapshot v1") ‖ DriveId ‖ signing
@@ -333,6 +356,21 @@ mod tests {
         let mut recovery = sample();
         recovery.flags = RECOVERY_FLAG;
         assert_eq!(Snapshot::decode(&recovery.encode()).unwrap(), recovery);
+    }
+
+    #[test]
+    fn set_flags_rejects_reserved_bits() {
+        let mut snapshot = sample();
+        assert!(snapshot.set_flags(RECOVERY_FLAG).is_ok());
+        assert_eq!(snapshot.flags(), RECOVERY_FLAG);
+        assert_eq!(
+            snapshot.set_flags(0x02),
+            Err(SnapshotError::ReservedFlags(0x02))
+        );
+        // A rejected set leaves the previous flags in place.
+        assert_eq!(snapshot.flags(), RECOVERY_FLAG);
+        assert!(snapshot.set_flags(0).is_ok());
+        assert_eq!(snapshot.flags(), 0);
     }
 
     #[test]

@@ -88,9 +88,9 @@ fn membership_seed() -> Vec<u8> {
 }
 
 fn manifest_seed() -> Vec<u8> {
-    Manifest {
-        snapshot: SnapshotId::from_bytes([9; 32]),
-        entries: vec![ManifestEntry {
+    Manifest::new(
+        SnapshotId::from_bytes([9; 32]),
+        vec![ManifestEntry {
             content_id: ContentId::from_bytes([1; 32]),
             kind: ObjectKind::Chunk,
             version: 0,
@@ -99,8 +99,9 @@ fn manifest_seed() -> Vec<u8> {
             size: 11,
             transport: BaoRoot::from_bytes([0xB0; 32]),
         }],
-        children: vec![],
-    }
+        Vec::new(),
+    )
+    .unwrap()
     .canonical_bytes()
 }
 

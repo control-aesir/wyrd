@@ -479,10 +479,10 @@ impl VaultSource {
             }
         }
         for record in state.manifest_records() {
-            for entry in &record.manifest.entries {
+            for entry in record.manifest.entries() {
                 sealed.insert(entry.storage_id, entry.transport);
             }
-            for link in &record.manifest.children {
+            for link in record.manifest.children() {
                 sealed.insert(link.storage, link.transport);
             }
         }
@@ -985,11 +985,7 @@ mod tests {
         let vault = vault();
         let snapshot = SnapshotId::from_bytes([0x01; 32]);
         let secret = EpochSecret::from_bytes([0x07; 32]);
-        let manifest = Manifest {
-            snapshot,
-            entries: Vec::new(),
-            children: Vec::new(),
-        };
+        let manifest = Manifest::new(snapshot, Vec::new(), Vec::new()).unwrap();
         let key = secret.manifest_key(&drive(), 1, &snapshot);
         let (manifest_id, obj) = seal_manifest(&key, &manifest).unwrap();
         vault.import(&obj.encode()).unwrap();
@@ -1074,11 +1070,7 @@ mod tests {
         )
         .unwrap();
         vault.import(&sealed_chunk.encode()).unwrap();
-        let manifest = Manifest {
-            snapshot,
-            entries: vec![entry],
-            children: Vec::new(),
-        };
+        let manifest = Manifest::new(snapshot, vec![entry], Vec::new()).unwrap();
         let secret = EpochSecret::from_bytes([0x07; 32]);
         let key = secret.manifest_key(&drive(), 1, &snapshot);
         let (manifest_id, obj) = seal_manifest(&key, &manifest).unwrap();

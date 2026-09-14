@@ -405,11 +405,7 @@ mod tests {
         let secret = EpochSecret::from_bytes([0x03; 32]);
         let snapshot = SnapshotId::from_bytes([0x77; 32]);
         let key = secret.manifest_key(&drive(), 2, &snapshot);
-        let manifest = Manifest {
-            snapshot,
-            entries: Vec::new(),
-            children: Vec::new(),
-        };
+        let manifest = Manifest::new(snapshot, Vec::new(), Vec::new()).unwrap();
         let (content_id, obj) = seal_manifest(&key, &manifest).unwrap();
         assert_eq!(obj.kind, ObjectKind::Manifest);
         assert_eq!(open_manifest(&key, &content_id, &obj).unwrap(), manifest);

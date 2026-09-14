@@ -53,6 +53,8 @@
 //! `1..=N` by capability construction, so coexisting variants would serve
 //! no reader.
 
+use std::collections::BTreeMap;
+
 use crate::identity::{BaoRoot, ContentId, ObjectKind, SnapshotId, StorageId};
 use thiserror::Error;
 
@@ -96,11 +98,19 @@ pub struct ChildManifest {
 }
 
 /// One subtree's manifest: its file entries plus child references.
+///
+/// Canonical by construction: entries sort by `(content_id, kind,
+/// version)`, children by tree id, and the only way to build one outside
+/// this module is [`Manifest::new`] (which sorts) or
+/// [`Manifest::from_sorted`] (which takes pre-sorted maps), so
+/// [`Manifest::canonical_bytes`] cannot emit bytes the decoder rejects.
+/// Duplicate keys have no canonical form and are refused with the same
+/// errors decoding uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    pub snapshot: SnapshotId,
-    pub entries: Vec<ManifestEntry>,
-    pub children: Vec<ChildManifest>,
+    snapshot: SnapshotId,
+    entries: Vec<ManifestEntry>,
+    children: Vec<ChildManifest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -168,24 +178,101 @@ impl ManifestEntry {
 }
 
 impl Manifest {
+    /// Build a manifest from its parts, establishing the canonical
+    /// invariant: entries sort by `(content_id, kind, version)`, children
+    /// by tree id. Sort-on-ingest (not reject-unsorted): callers hand
+    /// over unordered parts and always get canonical output. Duplicate
+    /// keys have no canonical encoding, so they fail with the same
+    /// errors decoding reports for them.
+    pub fn new(
+        snapshot: SnapshotId,
+        mut entries: Vec<ManifestEntry>,
+        mut children: Vec<ChildManifest>,
+    ) -> Result<Self, ManifestError> {
+        entries.sort_by_key(|entry| entry.sort_key());
+        children.sort_by_key(|child| *child.tree.as_bytes());
+        let manifest = Manifest {
+            snapshot,
+            entries,
+            children,
+        };
+        manifest.check_sorted()?;
+        Ok(manifest)
+    }
+
+    /// Build a manifest from pre-sorted maps, verifying (not trusting)
+    /// that each map key names the value stored under it: entry keys must
+    /// equal the entry content ids, child keys the child tree ids. A
+    /// mismatch fails with the same errors decoding reports, because the
+    /// collected values would not be canonically ordered. The authoring
+    /// path uses this to skip the `new()` re-sort after `BTreeMap`
+    /// accumulation (one linear verification pass instead); everyone
+    /// else uses [`Manifest::new`].
+    pub fn from_sorted(
+        snapshot: SnapshotId,
+        entries: BTreeMap<ContentId, ManifestEntry>,
+        children: BTreeMap<ContentId, ChildManifest>,
+    ) -> Result<Self, ManifestError> {
+        for (key, entry) in &entries {
+            if key != &entry.content_id {
+                return Err(ManifestError::UnsortedEntries);
+            }
+        }
+        for (key, link) in &children {
+            if key != &link.tree {
+                return Err(ManifestError::UnsortedChildren);
+            }
+        }
+        Ok(Manifest {
+            snapshot,
+            entries: entries.into_values().collect(),
+            children: children.into_values().collect(),
+        })
+    }
+
+    /// The snapshot this manifest describes.
+    pub fn snapshot(&self) -> SnapshotId {
+        self.snapshot
+    }
+
+    /// Mappings in ascending `(content_id, kind, version)` order.
+    pub fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
+    }
+
+    /// Child references in ascending tree-id order.
+    pub fn children(&self) -> &[ChildManifest] {
+        &self.children
+    }
+
+    /// Strict canonical ordering, as the decoder requires it: duplicates
+    /// (equal adjacent keys) are ambiguity, never canonical.
+    fn check_sorted(&self) -> Result<(), ManifestError> {
+        if self.entries.len() > 1
+            && !self
+                .entries
+                .windows(2)
+                .all(|w| w[0].sort_key() < w[1].sort_key())
+        {
+            return Err(ManifestError::UnsortedEntries);
+        }
+        if self.children.len() > 1
+            && !self
+                .children
+                .windows(2)
+                .all(|w| w[0].tree.as_bytes() < w[1].tree.as_bytes())
+        {
+            return Err(ManifestError::UnsortedChildren);
+        }
+        Ok(())
+    }
+
     /// The canonical byte encoding: snapshot ‖ counted entries ‖ counted
-    /// children. Callers must provide sorted vectors; encoding does not
-    /// sort; byte-exactness must be a choice, never an accident. The
-    /// debug assertions catch unsorted callers where the decoder would
-    /// later refuse the bytes; release builds carry zero cost.
+    /// children. Infallible by construction: only [`Manifest::new`],
+    /// [`Manifest::from_sorted`], and the validating decoder can produce
+    /// a `Manifest`, and all three establish sortedness, so there is no
+    /// unsorted state left to assert on.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        debug_assert!(
-            self.entries
-                .windows(2)
-                .all(|w| w[0].sort_key() < w[1].sort_key()),
-            "manifest entries must be sorted for canonical encoding"
-        );
-        debug_assert!(
-            self.children
-                .windows(2)
-                .all(|w| w[0].tree.as_bytes() < w[1].tree.as_bytes()),
-            "manifest children must be sorted for canonical encoding"
-        );
         let mut out = Vec::with_capacity(
             32 + 4 + ENTRY_LEN * self.entries.len() + 4 + CHILD_LEN * self.children.len(),
         );
@@ -290,16 +377,17 @@ mod tests {
     }
 
     fn manifest() -> Manifest {
-        Manifest {
-            snapshot: SnapshotId::from_bytes([0x77; 32]),
-            entries: vec![entry(0x01, 1), entry(0x02, 2)],
-            children: vec![ChildManifest {
+        Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![entry(0x01, 1), entry(0x02, 2)],
+            vec![ChildManifest {
                 tree: ContentId::from_bytes([0x10; 32]),
                 manifest: ContentId::from_bytes([0x20; 32]),
                 storage: StorageId::from_bytes([0x30; 32]),
                 transport: BaoRoot::from_bytes([0x81; 32]),
             }],
-        }
+        )
+        .unwrap()
     }
 
     #[test]
@@ -346,8 +434,14 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_kind() {
-        let mut m = manifest();
-        m.entries[0].kind = ObjectKind::Tree;
+        let mut first = entry(0x01, 1);
+        first.kind = ObjectKind::Tree;
+        let m = Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![first, entry(0x02, 2)],
+            Vec::new(),
+        )
+        .unwrap();
         let mut bytes = m.canonical_bytes();
         // Offset of the first entry's kind: snapshot(32) + count(4).
         bytes[32 + 4 + 32] = 0x09;
@@ -405,11 +499,115 @@ mod tests {
     }
 
     #[test]
+    fn constructor_sorts_unsorted_input() {
+        // Reverse-order parts come out canonical: byte-exact with the
+        // sorted construction, and decodable.
+        let child = |tree: u8| ChildManifest {
+            tree: ContentId::from_bytes([tree; 32]),
+            manifest: ContentId::from_bytes([tree ^ 0xF0; 32]),
+            storage: StorageId::from_bytes([tree ^ 0x0F; 32]),
+            transport: BaoRoot::from_bytes([tree | 0x80; 32]),
+        };
+        let sorted = Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![entry(0x01, 1), entry(0x02, 2)],
+            vec![child(0x10), child(0x20)],
+        )
+        .unwrap();
+        let shuffled = Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![entry(0x02, 2), entry(0x01, 1)],
+            vec![child(0x20), child(0x10)],
+        )
+        .unwrap();
+        assert_eq!(shuffled, sorted);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&shuffled.canonical_bytes()).unwrap(),
+            sorted
+        );
+    }
+
+    #[test]
+    fn constructor_rejects_duplicate_keys() {
+        // Duplicate keys have no canonical encoding: the constructor
+        // reports the same errors decoding uses.
+        assert_eq!(
+            Manifest::new(
+                SnapshotId::from_bytes([0x77; 32]),
+                vec![entry(0x01, 1), entry(0x01, 1)],
+                Vec::new(),
+            ),
+            Err(ManifestError::UnsortedEntries)
+        );
+        let child = ChildManifest {
+            tree: ContentId::from_bytes([0x10; 32]),
+            manifest: ContentId::from_bytes([0x20; 32]),
+            storage: StorageId::from_bytes([0x30; 32]),
+            transport: BaoRoot::from_bytes([0x81; 32]),
+        };
+        assert_eq!(
+            Manifest::new(
+                SnapshotId::from_bytes([0x77; 32]),
+                Vec::new(),
+                vec![child.clone(), child],
+            ),
+            Err(ManifestError::UnsortedChildren)
+        );
+    }
+
+    #[test]
+    fn from_sorted_collects_maps_in_order() {
+        use std::collections::BTreeMap;
+        let entries = BTreeMap::from([
+            (ContentId::from_bytes([0x02; 32]), entry(0x02, 2)),
+            (ContentId::from_bytes([0x01; 32]), entry(0x01, 1)),
+        ]);
+        let m = Manifest::from_sorted(SnapshotId::from_bytes([0x77; 32]), entries, BTreeMap::new())
+            .unwrap();
+        assert_eq!(m.entries().len(), 2);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
+            m
+        );
+    }
+
+    #[test]
+    fn from_sorted_rejects_mismatched_map_keys() {
+        // The map key must name the value stored under it: a mismatch
+        // would collect values out of canonical order, so it fails with
+        // the same errors decoding reports.
+        use std::collections::BTreeMap;
+        let entries = BTreeMap::from([(ContentId::from_bytes([0x01; 32]), entry(0x02, 2))]);
+        assert_eq!(
+            Manifest::from_sorted(SnapshotId::from_bytes([0x77; 32]), entries, BTreeMap::new(),),
+            Err(ManifestError::UnsortedEntries)
+        );
+        let children = BTreeMap::from([(
+            ContentId::from_bytes([0x01; 32]),
+            ChildManifest {
+                tree: ContentId::from_bytes([0x02; 32]),
+                manifest: ContentId::from_bytes([0x20; 32]),
+                storage: StorageId::from_bytes([0x30; 32]),
+                transport: BaoRoot::from_bytes([0x81; 32]),
+            },
+        )]);
+        assert_eq!(
+            Manifest::from_sorted(
+                SnapshotId::from_bytes([0x77; 32]),
+                BTreeMap::new(),
+                children,
+            ),
+            Err(ManifestError::UnsortedChildren)
+        );
+    }
+
+    #[test]
     fn child_reference_carries_both_identities() {
         // The quadruple: tree identity, manifest logical identity for the
         // AAD, sealed storage address for the fetch, and the transport
         // root for verified streaming (decision 26).
-        let child = &manifest().children[0];
+        let manifest = manifest();
+        let child = &manifest.children()[0];
         assert_eq!(child.tree, ContentId::from_bytes([0x10; 32]));
         assert_eq!(child.manifest, ContentId::from_bytes([0x20; 32]));
         assert_eq!(child.storage, StorageId::from_bytes([0x30; 32]));
@@ -429,11 +627,8 @@ mod tests {
         e2.version = 0x00;
         e2.kind = ObjectKind::Tree;
         e1.kind = ObjectKind::Chunk;
-        let m = Manifest {
-            snapshot: SnapshotId::from_bytes([0x77; 32]),
-            entries: vec![e1, e2],
-            children: Vec::new(),
-        };
+        let m =
+            Manifest::new(SnapshotId::from_bytes([0x77; 32]), vec![e1, e2], Vec::new()).unwrap();
         assert_eq!(
             Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
             m

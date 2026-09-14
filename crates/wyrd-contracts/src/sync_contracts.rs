@@ -359,8 +359,8 @@ fn snapshot_manifest_closure_correspondence() {
 
     // A valid manifest for the same snapshot that also advertises an
     // object unreachable from the tree is rejected.
-    let mut mismatched = root_manifest.clone();
-    mismatched.entries.push(ManifestEntry {
+    let mut entries = root_manifest.entries().to_vec();
+    entries.push(ManifestEntry {
         content_id: ContentId::derive(ObjectKind::Chunk, b"unrelated"),
         kind: ObjectKind::Chunk,
         version: 0,
@@ -369,13 +369,12 @@ fn snapshot_manifest_closure_correspondence() {
         size: 9,
         transport: BaoRoot::from_bytes([0xEF; 32]),
     });
-    mismatched.entries.sort_by(|a, b| {
-        a.content_id
-            .as_bytes()
-            .cmp(b.content_id.as_bytes())
-            .then(a.kind.byte().cmp(&b.kind.byte()))
-            .then(a.version.cmp(&b.version))
-    });
+    let mismatched = Manifest::new(
+        root_manifest.snapshot(),
+        entries,
+        root_manifest.children().to_vec(),
+    )
+    .unwrap();
     let mismatched_id = ContentId::derive(ObjectKind::Manifest, &mismatched.canonical_bytes());
     let err = verify_snapshot_manifest(
         &snapshot,
@@ -883,11 +882,7 @@ fn a_mismatched_snapshot_manifest_never_mounts() {
             .then(a.kind.byte().cmp(&b.kind.byte()))
             .then(a.version.cmp(&b.version))
     });
-    let manifest = Manifest {
-        snapshot: body_id,
-        entries,
-        children: Vec::new(),
-    };
+    let manifest = Manifest::new(body_id, entries, Vec::new()).unwrap();
     let manifest_key = rig.epoch2.manifest_key(&drive(), epoch, &body_id);
     let (manifest_id, manifest_obj) = seal::seal_manifest(&manifest_key, &manifest).unwrap();
     let manifest_bytes = manifest_obj.encode();

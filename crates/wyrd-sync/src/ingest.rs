@@ -232,12 +232,12 @@ pub fn check_manifest(limits: &Limits, manifest: &Manifest) -> Result<(), Ingest
     check_count(
         limits.max_manifest_entries,
         "manifest entries",
-        manifest.entries.len(),
+        manifest.entries().len(),
     )?;
     check_count(
         limits.max_manifest_children,
         "manifest children",
-        manifest.children.len(),
+        manifest.children().len(),
     )
 }
 
@@ -438,14 +438,24 @@ mod tests {
             size: 10,
             transport: BaoRoot::from_bytes([0xB0; 32]),
         };
-        let valid = Manifest {
-            snapshot: SnapshotId::from_bytes([0x77; 32]),
-            entries: vec![entry.clone(), entry.clone()],
-            children: Vec::new(),
+        let entry2 = ManifestEntry {
+            content_id: ContentId::from_bytes([0x02; 32]),
+            ..entry.clone()
         };
+        let entry3 = ManifestEntry {
+            content_id: ContentId::from_bytes([0x03; 32]),
+            ..entry.clone()
+        };
+        let valid = Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![entry.clone(), entry2],
+            Vec::new(),
+        )
+        .unwrap();
         assert!(check_manifest(&SMALL, &valid).is_ok());
-        let mut too_many = valid.clone();
-        too_many.entries.push(entry);
+        let mut entries = valid.entries().to_vec();
+        entries.push(entry3);
+        let too_many = Manifest::new(valid.snapshot(), entries, Vec::new()).unwrap();
         assert!(matches!(
             check_manifest(&SMALL, &too_many),
             Err(IngestError::TooMany {

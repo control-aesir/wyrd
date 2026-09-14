@@ -291,9 +291,9 @@ impl RuntimeState {
             return Ok(false);
         }
 
-        for child in &record.manifest.children {
+        for child in record.manifest.children() {
             if let Some(existing) = self.child_parent_by_manifest.get(&child.manifest) {
-                if existing != &record.manifest.snapshot {
+                if existing != &record.manifest.snapshot() {
                     return Err(RuntimeError::ConflictingChildParent {
                         manifest: child.manifest,
                     });
@@ -304,13 +304,13 @@ impl RuntimeState {
         self.manifests.insert(manifest_id, record.clone());
         if record.is_root {
             self.root_manifests_by_snapshot
-                .entry(record.manifest.snapshot)
+                .entry(record.manifest.snapshot())
                 .or_default()
                 .insert(manifest_id);
         }
-        for child in &record.manifest.children {
+        for child in record.manifest.children() {
             self.child_parent_by_manifest
-                .insert(child.manifest, record.manifest.snapshot);
+                .insert(child.manifest, record.manifest.snapshot());
         }
         Ok(true)
     }
@@ -369,7 +369,7 @@ impl RuntimeState {
     pub fn recorded_mappings(&self, content: &ContentId) -> Vec<ManifestEntry> {
         self.manifests
             .values()
-            .flat_map(|record| &record.manifest.entries)
+            .flat_map(|record| record.manifest.entries())
             .filter(|entry| &entry.content_id == content)
             .cloned()
             .collect()
@@ -457,7 +457,7 @@ impl RuntimeState {
         }
 
         for record in self.manifests.values() {
-            for child in &record.manifest.children {
+            for child in record.manifest.children() {
                 if !self.manifests.contains_key(&child.manifest) {
                     pending_manifests
                         .entry(child.manifest)
@@ -465,7 +465,7 @@ impl RuntimeState {
                 }
             }
 
-            for entry in &record.manifest.entries {
+            for entry in record.manifest.entries() {
                 if self.local_objects.contains(&entry.content_id) {
                     continue;
                 }
@@ -561,16 +561,17 @@ mod tests {
             manifest_id: content_id,
             representations: BTreeMap::from([(storage_id, BaoRoot::from_bytes([0xC0; 32]))]),
             transport: BaoRoot::from_bytes([0xC0; 32]),
-            manifest: Manifest {
-                snapshot: SnapshotId::from_bytes([snapshot; 32]),
-                entries: vec![entry],
-                children: vec![ChildManifest {
+            manifest: Manifest::new(
+                SnapshotId::from_bytes([snapshot; 32]),
+                vec![entry],
+                vec![ChildManifest {
                     tree: ContentId::from_bytes([child; 32]),
                     manifest: ContentId::from_bytes([child + 1; 32]),
                     storage: StorageId::from_bytes([child + 2; 32]),
                     transport: BaoRoot::from_bytes([0xB1; 32]),
                 }],
-            },
+            )
+            .unwrap(),
         }
     }
 
@@ -641,7 +642,12 @@ mod tests {
 
         let mut child = manifest_record(1, 8, 4, 5, false);
         child.is_root = false;
-        child.manifest.entries.clear();
+        child.manifest = Manifest::new(
+            child.manifest.snapshot(),
+            Vec::new(),
+            child.manifest.children().to_vec(),
+        )
+        .unwrap();
         child.manifest_id = manifest_id_for(&child);
         assert!(state.record_manifest(child).unwrap());
 
@@ -790,7 +796,14 @@ mod tests {
 
         state.record_manifest(root_manifest(1, 9, 4, 5)).unwrap();
         let mut conflicting = root_manifest(1, 9, 4, 5);
-        conflicting.manifest.entries[0].size = 999;
+        let mut entries = conflicting.manifest.entries().to_vec();
+        entries[0].size = 999;
+        conflicting.manifest = Manifest::new(
+            conflicting.manifest.snapshot(),
+            entries,
+            conflicting.manifest.children().to_vec(),
+        )
+        .unwrap();
         conflicting.manifest_id = ContentId::from_bytes([0xFE; 32]);
         assert!(matches!(
             state.record_manifest(conflicting),
@@ -879,12 +892,26 @@ mod tests {
         let mut state = RuntimeState::new(drive());
         let content = ContentId::from_bytes([4; 32]);
         let mut old_epoch = root_manifest(1, 9, 4, 5);
-        old_epoch.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
-        old_epoch.manifest.entries[0].encryption_epoch = 1;
+        let mut entries = old_epoch.manifest.entries().to_vec();
+        entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
+        entries[0].encryption_epoch = 1;
+        old_epoch.manifest = Manifest::new(
+            old_epoch.manifest.snapshot(),
+            entries,
+            old_epoch.manifest.children().to_vec(),
+        )
+        .unwrap();
         old_epoch.manifest_id = manifest_id_for(&old_epoch);
         let mut new_epoch = root_manifest(1, 9, 4, 5);
-        new_epoch.manifest.entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
-        new_epoch.manifest.entries[0].encryption_epoch = 2;
+        let mut entries = new_epoch.manifest.entries().to_vec();
+        entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
+        entries[0].encryption_epoch = 2;
+        new_epoch.manifest = Manifest::new(
+            new_epoch.manifest.snapshot(),
+            entries,
+            new_epoch.manifest.children().to_vec(),
+        )
+        .unwrap();
         new_epoch.manifest_id = manifest_id_for(&new_epoch);
         assert!(state.record_manifest(old_epoch).unwrap());
         assert!(state.record_manifest(new_epoch).unwrap());
@@ -913,19 +940,22 @@ mod tests {
         let mut state = RuntimeState::new(drive());
         let content = ContentId::from_bytes([4; 32]);
         let mut first = root_manifest(1, 9, 4, 5);
-        first.manifest.children.clear();
-        first.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
-        first.manifest.entries[0].encryption_epoch = 1;
+        let mut entries = first.manifest.entries().to_vec();
+        entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
+        entries[0].encryption_epoch = 1;
+        first.manifest = Manifest::new(first.manifest.snapshot(), entries, Vec::new()).unwrap();
         first.manifest_id = manifest_id_for(&first);
         let mut second = root_manifest(2, 9, 4, 5);
-        second.manifest.children.clear();
-        second.manifest.entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
-        second.manifest.entries[0].encryption_epoch = 1;
+        let mut entries = second.manifest.entries().to_vec();
+        entries[0].storage_id = StorageId::from_bytes([0xA0; 32]);
+        entries[0].encryption_epoch = 1;
+        second.manifest = Manifest::new(second.manifest.snapshot(), entries, Vec::new()).unwrap();
         second.manifest_id = manifest_id_for(&second);
         let mut third = root_manifest(3, 9, 4, 5);
-        third.manifest.children.clear();
-        third.manifest.entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
-        third.manifest.entries[0].encryption_epoch = 2;
+        let mut entries = third.manifest.entries().to_vec();
+        entries[0].storage_id = StorageId::from_bytes([0xB0; 32]);
+        entries[0].encryption_epoch = 2;
+        third.manifest = Manifest::new(third.manifest.snapshot(), entries, Vec::new()).unwrap();
         third.manifest_id = manifest_id_for(&third);
         assert!(state.record_manifest(first).unwrap());
         assert!(state.record_manifest(second).unwrap());

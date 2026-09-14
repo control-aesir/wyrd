@@ -1820,6 +1820,60 @@ mod tests {
         );
     }
 
+    /// Stack-safety regression for manifest authoring: the walk is an
+    /// explicit heap DFS, so a chain far deeper than the call stack could
+    /// hold still authors to completion. The authoring runs on a thread
+    /// with a deliberately tiny stack (256 KiB): the per-level recursion
+    /// this replaced overflowed such a stack far shallower, while the
+    /// heap walk fits with room to spare. Depth stays modest on purpose:
+    /// every level costs two fsync-backed vault imports, so depth here
+    /// buys proof against the old recursion, not broader coverage.
+    #[test]
+    fn deep_tree_authoring_is_stack_safe() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+        const DEPTH: usize = 300;
+        const STACK: usize = 256 << 10;
+        let mut objects = MemoryObjectStore::default();
+        let mut child = Tree::empty().insert_into(&mut objects).unwrap();
+        for _ in 0..DEPTH {
+            child = Tree::from_entries(vec![Entry::dir("d", child).unwrap()])
+                .unwrap()
+                .insert_into(&mut objects)
+                .unwrap();
+        }
+
+        let mut device = pair.a;
+        std::thread::Builder::new()
+            .name("deep-authoring".into())
+            .stack_size(STACK)
+            .spawn(move || {
+                let authored = device.engine.author_snapshot(&objects, child).unwrap();
+                let snapshot_id = authored.snapshot().snapshot_id();
+                let state = device.engine.runtime_state().unwrap();
+                let root_record = state
+                    .root_manifest_record(&snapshot_id)
+                    .expect("the deep root manifest records");
+                assert_eq!(
+                    root_record.manifest.children.len(),
+                    1,
+                    "each level links exactly its child"
+                );
+                assert_eq!(
+                    state
+                        .manifest_records()
+                        .filter(|record| record.manifest.snapshot == snapshot_id)
+                        .count(),
+                    DEPTH + 1,
+                    "one manifest per tree node in the chain"
+                );
+            })
+            .expect("spawn authoring thread")
+            .join()
+            .expect("authoring completes on a 256 KiB stack");
+    }
+
     /// Critical regression for the serving contract: a fetched
     /// representation lands in the fetcher's durable vault, so a restart
     /// plus re-authoring can reuse the recorded mapping and serve it.

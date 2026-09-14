@@ -19,7 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
-    ChildManifest, ContentId, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot, Tree,
+    ChildManifest, ContentId, Entry, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot,
+    Tree,
 };
 
 use super::engine::{Engine, EngineError};
@@ -169,7 +170,7 @@ where
 }
 
 /// The per-authoring context for the manifest walk: everything the
-/// recursive build needs, held once. Freshly sealed mappings cache here,
+/// iterative build needs, held once. Freshly sealed mappings cache here,
 /// so one logical chunk seals exactly once per authoring session even
 /// when several subtrees reference it.
 struct ManifestAuthor<'a, S: ObjectStore>
@@ -194,20 +195,46 @@ where
     local: BTreeSet<ContentId>,
 }
 
+/// One subtree frame of the iterative manifest walk: the tree's
+/// canonical entries in order, the next entry to process, and the
+/// mappings and child links assembled so far. Frames live on the heap
+/// (`Vec<WalkFrame>`), so a deep member-authored chain costs heap, never
+/// process stack.
+struct WalkFrame {
+    tree_id: ContentId,
+    entries_list: Vec<Entry>,
+    next: usize,
+    entries: BTreeMap<ContentId, ManifestEntry>,
+    links: BTreeMap<ContentId, ChildManifest>,
+}
+
+/// The child link for an assembled subtree manifest: the subtree's first
+/// sealed representation, the one the author serves and announces. A
+/// manifest with no representation to link is an authoring bug, failed
+/// closed.
+fn child_link(subtree: ContentId, child: &ManifestRecord) -> Result<ChildManifest, EngineError> {
+    let storage = child
+        .representations
+        .keys()
+        .next()
+        .copied()
+        .ok_or(EngineError::RepresentationMissing(child.manifest_id))?;
+    Ok(ChildManifest {
+        tree: subtree,
+        manifest: child.manifest_id,
+        storage,
+        transport: child.transport,
+    })
+}
+
 impl<S: ObjectStore> ManifestAuthor<'_, S>
 where
     S::Error: std::fmt::Debug,
 {
-    /// Map one subtree tree into its manifest: local chunks seal fresh
-    /// or resolve through the session cache, dirs recurse into child
-    /// manifests, symlinks map to nothing. Entries and child links are
-    /// deduplicated by their logical identity — the canonical manifest
-    /// encoding admits exactly one entry per `(content, kind, version)`
-    /// and one link per subtree, and repeated references (identical
-    /// chunks, identical subtrees) are the norm, not an error. The
-    /// authored envelope lands in the engine's durable vault under the
-    /// transport root the record carries.
-    fn walk(&mut self, tree_id: ContentId) -> Result<ManifestRecord, EngineError> {
+    /// Load, address-check, decode, and limit-check one tree node: the
+    /// store's scrub invariant, re-checked here so a faulty store cannot
+    /// launder a wrong address at any depth of the walk.
+    fn load_tree(&self, tree_id: ContentId) -> Result<(Vec<u8>, Tree), EngineError> {
         let bytes = self
             .objects
             .get(&tree_id)
@@ -218,67 +245,138 @@ where
         }
         let tree = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree_id))?;
         check_tree(&Limits::V0, &tree).map_err(EngineError::Ingest)?;
+        Ok((bytes, tree))
+    }
 
-        let mut entries: BTreeMap<ContentId, ManifestEntry> = BTreeMap::new();
-        // Self-mapping: the tree node's own sealed representation. This is
-        // what makes the structural tree closure fetchable (the fetch plan
-        // queues manifest entries by kind), so a receiver can assemble the
-        // tree closure and verify correspondence.
-        entries.insert(tree_id, self.seal_tree(tree_id, &bytes)?);
-        let mut links: BTreeMap<ContentId, ChildManifest> = BTreeMap::new();
-        for entry in tree.entries() {
-            match &entry.content {
-                wyrd_format::EntryContent::File { chunks, .. } => {
-                    for chunk in chunks {
-                        let mapping = self.resolve(*chunk)?;
-                        entries.insert(*chunk, mapping);
+    /// Map one subtree tree into its manifest: local chunks seal fresh
+    /// or resolve through the session cache, dirs descend into child
+    /// manifests, symlinks map to nothing. Entries and child links are
+    /// deduplicated by their logical identity — the canonical manifest
+    /// encoding admits exactly one entry per `(content, kind, version)`
+    /// and one link per subtree, and repeated references (identical
+    /// chunks, identical subtrees) are the norm, not an error. A subtree
+    /// shared by several parents assembles once and every parent links
+    /// the same record. The authored envelope lands in the engine's
+    /// durable vault under the transport root the record carries.
+    ///
+    /// Iterative post-order DFS over the tree closure on the heap: a deep
+    /// member-authored chain must not exhaust the process stack (this walk
+    /// previously recursed per directory level). File mappings resolve in
+    /// canonical entry order as each frame is reached, so the session seal
+    /// cache reuses the same first seal the recursive walk produced;
+    /// child manifests assemble before the parent that links them, so
+    /// durable replay still installs children before their parent.
+    fn walk(&mut self, tree_id: ContentId) -> Result<ManifestRecord, EngineError> {
+        let (root_bytes, root_tree) = self.load_tree(tree_id)?;
+        // Self-mapping: each tree node's own sealed representation. This
+        // is what makes the structural tree closure fetchable (the fetch
+        // plan queues manifest entries by kind), so a receiver can
+        // assemble the tree closure and verify correspondence.
+        let mut root_entries: BTreeMap<ContentId, ManifestEntry> = BTreeMap::new();
+        root_entries.insert(tree_id, self.seal_tree(tree_id, &root_bytes)?);
+        let mut stack = vec![WalkFrame {
+            tree_id,
+            entries_list: root_tree.entries().to_vec(),
+            next: 0,
+            entries: root_entries,
+            links: BTreeMap::new(),
+        }];
+        // Subtrees assembled so far, by tree id, and the ids of frames
+        // currently on the stack. Content addressing makes a true
+        // reference cycle infeasible (it would need a hash cycle), so a
+        // re-entered in-progress id means a faulty store, failed closed.
+        let mut completed: BTreeMap<ContentId, ManifestRecord> = BTreeMap::new();
+        let mut in_progress: BTreeSet<ContentId> = BTreeSet::from([tree_id]);
+        while !stack.is_empty() {
+            // Peek at the top frame's next entry without holding the
+            // borrow across the sealing calls below.
+            let next_entry = {
+                let frame = stack.last().expect("walk stack nonempty");
+                frame.entries_list.get(frame.next).cloned()
+            };
+            match next_entry {
+                Some(entry) => match entry.content {
+                    wyrd_format::EntryContent::File { chunks, .. } => {
+                        let mut mappings = Vec::with_capacity(chunks.len());
+                        for chunk in &chunks {
+                            mappings.push((*chunk, self.resolve(*chunk)?));
+                        }
+                        let frame = stack.last_mut().expect("walk stack nonempty");
+                        for (chunk, mapping) in mappings {
+                            frame.entries.insert(chunk, mapping);
+                        }
+                        frame.next += 1;
                     }
-                }
-                wyrd_format::EntryContent::Dir { subtree } => {
-                    let child = self.walk(*subtree)?;
-                    let storage = child
-                        .representations
-                        .keys()
-                        .next()
-                        .copied()
-                        .ok_or(EngineError::RepresentationMissing(child.manifest_id))?;
-                    links.insert(
-                        *subtree,
-                        ChildManifest {
-                            tree: *subtree,
-                            manifest: child.manifest_id,
-                            storage,
-                            transport: child.transport,
-                        },
-                    );
+                    wyrd_format::EntryContent::Dir { subtree } => {
+                        if let Some(done) = completed.get(&subtree) {
+                            let link = child_link(subtree, done)?;
+                            let frame = stack.last_mut().expect("walk stack nonempty");
+                            frame.links.insert(subtree, link);
+                            frame.next += 1;
+                        } else {
+                            if in_progress.contains(&subtree) {
+                                return Err(EngineError::TreeMismatch(subtree));
+                            }
+                            stack.last_mut().expect("walk stack nonempty").next += 1;
+                            let (bytes, tree) = self.load_tree(subtree)?;
+                            let self_mapping = self.seal_tree(subtree, &bytes)?;
+                            let mut entries: BTreeMap<ContentId, ManifestEntry> = BTreeMap::new();
+                            entries.insert(subtree, self_mapping);
+                            in_progress.insert(subtree);
+                            stack.push(WalkFrame {
+                                tree_id: subtree,
+                                entries_list: tree.entries().to_vec(),
+                                next: 0,
+                                entries,
+                                links: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    wyrd_format::EntryContent::Symlink { .. } => {
+                        stack.last_mut().expect("walk stack nonempty").next += 1;
+                    }
+                },
+                None => {
+                    let frame = stack.pop().expect("walk stack nonempty");
+                    in_progress.remove(&frame.tree_id);
+                    let manifest = Manifest {
+                        snapshot: self.snapshot,
+                        entries: frame.entries.into_values().collect(),
+                        children: frame.links.into_values().collect(),
+                    };
+                    check_manifest(&Limits::V0, &manifest).map_err(EngineError::Ingest)?;
+                    let manifest_key =
+                        self.secret
+                            .manifest_key(&self.engine.drive, self.epoch, &self.snapshot);
+                    let (manifest_id, obj) = seal_manifest(&manifest_key, &manifest)?;
+                    self.engine.vault.import(&obj.encode())?;
+                    let transport = crate::seal::transport_root(&obj);
+                    let record = ManifestRecord {
+                        is_root: true,
+                        manifest_id,
+                        representations: BTreeMap::from([(obj.storage_id(), transport)]),
+                        transport,
+                        manifest,
+                    };
+                    let frame_id = frame.tree_id;
+                    if stack.is_empty() {
+                        return Ok(record);
+                    }
+                    let link = child_link(frame_id, &record)?;
+                    completed.insert(frame_id, record.clone());
                     self.children.push(ManifestRecord {
                         is_root: false,
-                        ..child
+                        ..record
                     });
+                    stack
+                        .last_mut()
+                        .expect("walk stack nonempty")
+                        .links
+                        .insert(frame_id, link);
                 }
-                wyrd_format::EntryContent::Symlink { .. } => {}
             }
         }
-
-        let manifest = Manifest {
-            snapshot: self.snapshot,
-            entries: entries.into_values().collect(),
-            children: links.into_values().collect(),
-        };
-        check_manifest(&Limits::V0, &manifest).map_err(EngineError::Ingest)?;
-        let manifest_key = self
-            .secret
-            .manifest_key(&self.engine.drive, self.epoch, &self.snapshot);
-        let (manifest_id, obj) = seal_manifest(&manifest_key, &manifest)?;
-        self.engine.vault.import(&obj.encode())?;
-        let transport = crate::seal::transport_root(&obj);
-        Ok(ManifestRecord {
-            is_root: true,
-            manifest_id,
-            representations: BTreeMap::from([(obj.storage_id(), transport)]),
-            transport,
-            manifest,
-        })
+        unreachable!("the walk returns when the root frame assembles");
     }
 
     /// The mapping for one chunk, deduplicated across the session: a

@@ -444,17 +444,38 @@ impl Rig {
 
     /// Enqueue a signed transition under an epoch the engine holds.
     pub(crate) fn enqueue_transition(&mut self, transition: &MembershipTransition, epoch: u64) {
+        let owner = self.owner.identity.clone();
+        let recipient = self.recipient.id;
+        let envelope = self.transition_envelope(transition, epoch, &owner, recipient);
+        self.relay.queue([envelope]);
+    }
+
+    /// Enqueue a signed transition sealed for another member of the
+    /// drive: the rig's own engine is the recipient, so cross-member
+    /// contracts address their other engines through this.
+    pub(crate) fn enqueue_transition_for(
+        &mut self,
+        transition: &MembershipTransition,
+        epoch: u64,
+        recipient: DeviceId,
+        relay: &mut Relay,
+    ) {
+        let owner = self.owner.identity.clone();
+        let envelope = self.transition_envelope(transition, epoch, &owner, recipient);
+        relay.queue([envelope]);
+    }
+
+    fn transition_envelope(
+        &self,
+        transition: &MembershipTransition,
+        epoch: u64,
+        sender: &DeviceIdentitySecret,
+        recipient: DeviceId,
+    ) -> MailboxEnvelope {
         let message = Message::MembershipTransition(TransitionPayload {
             transition: transition.canonical_bytes(),
         });
-        let envelope = sealed_envelope(
-            &self.owner.identity,
-            self.recipient.id,
-            self.epoch_secret(epoch),
-            epoch,
-            &message,
-        );
-        self.relay.queue([envelope]);
+        sealed_envelope(sender, recipient, self.epoch_secret(epoch), epoch, &message)
     }
 
     /// Enqueue a snapshot announcement bound to `membership` at
@@ -503,6 +524,30 @@ impl Rig {
         transition: &MembershipTransition,
         secrets: &[EpochSecret],
     ) {
+        let recipient = self.recipient.id;
+        let envelope = self.capability_envelope(transition, secrets, recipient);
+        self.relay.queue([envelope]);
+    }
+
+    /// Mint the capability for another member of the drive (the rig's
+    /// own engine is the recipient) and queue it on their relay.
+    pub(crate) fn enqueue_capability_for(
+        &mut self,
+        transition: &MembershipTransition,
+        secrets: &[EpochSecret],
+        recipient: DeviceId,
+        relay: &mut Relay,
+    ) {
+        let envelope = self.capability_envelope(transition, secrets, recipient);
+        relay.queue([envelope]);
+    }
+
+    fn capability_envelope(
+        &self,
+        transition: &MembershipTransition,
+        secrets: &[EpochSecret],
+        recipient: DeviceId,
+    ) -> MailboxEnvelope {
         let drive = drive();
         let mut log = MembershipLog::new(drive);
         log.observe(self.genesis.clone());
@@ -510,29 +555,22 @@ impl Rig {
         let state = log
             .state_of(&transition.transition_id())
             .expect("a canonical transition carries its state");
-        let capability = Capability::mint(
-            drive,
-            self.recipient.id,
-            &state,
-            transition,
-            secrets.to_vec(),
-        )
-        .expect("the rig's membership admits its recipient");
+        let capability = Capability::mint(drive, recipient, &state, transition, secrets.to_vec())
+            .expect("the rig's membership admits its recipient");
         let covered = capability.up_to_epoch();
         let wrapped = capability.wrap().unwrap();
         let message = Message::Capability(CapabilityPayload {
-            device: self.recipient.id,
+            device: recipient,
             epoch: covered,
             wrapped: wrapped.as_bytes().to_vec(),
         });
-        let envelope = sealed_envelope(
+        sealed_envelope(
             &self.owner.identity,
-            self.recipient.id,
+            recipient,
             self.epoch_secret(covered),
             covered,
             &message,
-        );
-        self.relay.queue([envelope]);
+        )
     }
 
     /// Drain the relay into the engine.

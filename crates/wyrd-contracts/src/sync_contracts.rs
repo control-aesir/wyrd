@@ -4,8 +4,8 @@
 use wyrd_daemon::core::Daemon;
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
-    BaoRoot, Change, ContentId, Entry, FetchStatus, Manifest, ManifestEntry, MemoryObjectStore,
-    ObjectKind, ObjectStore, Snapshot, SnapshotId, StorageId, Tree,
+    BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, Manifest, ManifestEntry,
+    MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId, StorageId, Tree,
 };
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -13,16 +13,21 @@ use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
 use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
 use wyrd_sync::keys::DeviceIdentitySecret;
-use wyrd_sync::runtime::{Engine, EngineError, MAX_PENDING_MESSAGES as PENDING_BOUND};
+use wyrd_sync::runtime::{
+    Engine, EngineError, RoutePublishing, RouteReport, RuntimeState,
+    MAX_PENDING_MESSAGES as PENDING_BOUND,
+};
 use wyrd_sync::seal::{self, SEAL_VERSION};
+use wyrd_sync::serving::VaultSource;
 use wyrd_sync::transport::mailbox::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
 
 use crate::support::{
     drive, mount_heads, scratch_dir, seal_flat_drive, signed_snapshot, signed_transition,
-    AnnouncedRoots, Loaded, RemoteOnlyMaterialization, Rig,
+    AnnouncedRoots, Loaded, Relay, RemoteOnlyMaterialization, Rig,
 };
+use zeroize::Zeroizing;
 
 /// One head per verified body; a broken signature never becomes
 /// durable, never classified, and never mounts (architecture.md
@@ -312,6 +317,215 @@ fn authored_snapshots_mount_through_the_daemon_view() {
 
     drop(daemon);
     rig.teardown();
+}
+
+/// Serve one member's durable vault to another member's fetch plane:
+/// every byte the peer fetches comes from the publisher's `serve()`
+/// view, so the contract exercises the real serving maps. Routes are
+/// a no-op: the in-process peer needs no iroh naming (no-op impls
+/// keep the in-memory fakes honest about not carrying live routes).
+struct VaultPeer(VaultSource);
+
+impl BulkSource for VaultPeer {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.0.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.0.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.0.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.0.fetch_transport(root, max)
+    }
+}
+
+impl RoutePublishing for VaultPeer {
+    fn publish_routes(&mut self, _state: &RuntimeState) -> Result<RouteReport, EngineError> {
+        Ok(RouteReport::default())
+    }
+}
+
+/// A mailbox that fails its first send, modeling a lost
+/// announcement: the authored snapshot stays durable on the author
+/// while nothing reaches the peer, and the retry converges.
+struct FailFirstSend<'a, M: Mailbox> {
+    inner: &'a mut M,
+    armed: bool,
+}
+
+impl<'a, M: Mailbox> FailFirstSend<'a, M> {
+    fn new(inner: &'a mut M) -> Self {
+        FailFirstSend { inner, armed: true }
+    }
+}
+
+impl<M: Mailbox> Mailbox for FailFirstSend<'_, M> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        if self.armed {
+            self.armed = false;
+            return Err(MailboxError::Transport("lost announcement".into()));
+        }
+        self.inner.send(envelope)
+    }
+
+    fn recv(&mut self) -> Option<Delivery> {
+        self.inner.recv()
+    }
+
+    fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+        self.inner.settle(id, disposition)
+    }
+}
+
+/// Daemon write publication across members, with retry. Member A
+/// authors through `put_file` and announces through the control-plane
+/// mailbox; member B drains, fetches from A's serving vault, refreshes
+/// live heads, and serves the new file. A failed announcement leaves
+/// the authored snapshot durable on A, and the retry announces the
+/// same snapshot — convergence needs no re-authoring (`docs/epochs.md`,
+/// local write).
+#[test]
+fn daemon_write_publication_and_retry_converges_across_members() {
+    // Member A: the rig's recipient engine composed as a daemon, with
+    // its self-capability committed exactly as the single-member
+    // write contract holds it.
+    let mut rig = Rig::new();
+    let admit = rig.admit.clone();
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability(&admit, &secrets);
+    assert_eq!(rig.drain().accepted, 1, "the self-capability lands");
+    let mut daemon_a = Daemon::new(rig.take_engine(), MemoryObjectStore::default()).unwrap();
+    let authored = daemon_a.put_file("shared.txt", b"shared bytes").unwrap();
+
+    // Member B: the owner's engine over its own scratch dir, with the
+    // same membership and epoch material. Its relay carries the
+    // membership, the owner capability, and — once announced — the
+    // snapshot announcement.
+    let owner = rig.owner.id;
+    let dir_b = scratch_dir("member-b");
+    let mut engine_b = Engine::open(
+        dir_b.clone(),
+        drive(),
+        owner,
+        "contracts",
+        rig.owner.identity.clone(),
+        rig.owner.encryption.clone(),
+    )
+    .unwrap();
+    engine_b.add_epoch_key(1, Zeroizing::new(rig.epoch1.control_key(&drive(), 1)));
+    engine_b.add_epoch_key(2, Zeroizing::new(rig.epoch2.control_key(&drive(), 2)));
+    engine_b.add_epoch_key(3, Zeroizing::new(rig.epoch3.control_key(&drive(), 3)));
+    let mut relay_b = Relay::new();
+    let genesis = rig.genesis.clone();
+    rig.enqueue_transition_for(&genesis, 1, owner, &mut relay_b);
+    let admit = rig.admit.clone();
+    rig.enqueue_transition_for(&admit, 1, owner, &mut relay_b);
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
+    let daemon_b = Daemon::new(engine_b, MemoryObjectStore::default()).unwrap();
+    let (mut live_b, backend_b) = daemon_b.into_live(std::time::Duration::from_secs(30));
+
+    // The first announcement never leaves the author — and the local
+    // write stands: only delivery failed, nothing was rolled back.
+    {
+        let mut flaky = FailFirstSend::new(&mut relay_b);
+        assert!(
+            daemon_a
+                .announce_snapshot(&authored, &mut flaky, None)
+                .is_err(),
+            "a lost announcement fails the handoff"
+        );
+    }
+    let node = daemon_a.view().lookup("shared.txt").unwrap();
+    let file = daemon_a.view().open(&node).unwrap();
+    assert_eq!(daemon_a.view().read(&file, 0, 12).unwrap(), b"shared bytes");
+
+    // Retry announces the same authored snapshot: one envelope for
+    // the one other member, with no re-authoring anywhere in between.
+    let sent = daemon_a
+        .announce_snapshot(&authored, &mut relay_b, None)
+        .unwrap();
+    assert_eq!(sent, 1, "the author announces to its one peer");
+
+    // Member B walks the full receiving path through the live daemon:
+    // pass 1 commits the membership, the owner capability, and the
+    // announcement, and fetches the structural metadata (body,
+    // manifest, tree) from A's serving vault. Content chunks are
+    // RemoteOnly by policy until demanded, so the file is not
+    // servable yet.
+    let mut peer = VaultPeer(daemon_a.serve().unwrap());
+    let report = live_b.sync_once(&mut relay_b, Some(&mut peer)).unwrap();
+    assert_eq!(
+        report.drained.accepted, 4,
+        "genesis, admit, capability, announcement"
+    );
+    assert_eq!(
+        report.fetched.snapshot_bodies, 1,
+        "the authored body commits"
+    );
+
+    // Demand: decode the fetched root tree through the backend's
+    // shared store and want its chunks, exactly as FUSE demand would.
+    // The announced snapshot's root is legitimately known; every
+    // content byte still arrives only through A's serving vault.
+    let tree_id = authored.snapshot().tree;
+    let chunks = {
+        let store = backend_b.store_handle().unwrap();
+        let store = store.read().unwrap();
+        let tree_bytes = store
+            .get(&tree_id)
+            .unwrap()
+            .expect("the root tree fetched structurally");
+        Tree::decode(&tree_bytes)
+            .unwrap()
+            .entries()
+            .iter()
+            .flat_map(|entry| match &entry.content {
+                EntryContent::File { chunks, .. } => chunks.clone(),
+                EntryContent::Dir { .. } | EntryContent::Symlink { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(chunks.len(), 1, "one flat file chunk");
+    for chunk in &chunks {
+        live_b.want(*chunk).unwrap();
+    }
+
+    // Pass 2: the wanted chunk fetches, the projection republishes,
+    // and the backend serves the file.
+    live_b.sync_once(&mut relay_b, Some(&mut peer)).unwrap();
+    let handle = backend_b.open_at("shared.txt").expect("published serving");
+    assert_eq!(
+        backend_b.read_handle(handle, 0, 64).unwrap(),
+        b"shared bytes"
+    );
+
+    drop(daemon_a);
+    drop(live_b);
+    drop(backend_b);
+    rig.teardown();
+    std::fs::remove_dir_all(dir_b).unwrap();
 }
 
 /// The snapshot/tree/manifest closure invariant: an authored snapshot's

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use wyrd_format::store::MemoryStoreError;
 use wyrd_format::{
     ContentId, DeviceId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot,
-    TransitionId, Tree,
+    TransitionId, Tree, MAX_PATH_DEPTH,
 };
 
 /// Test materialization: explicit statuses, everything else
@@ -221,14 +221,14 @@ fn stat_readdir_and_symlink() {
 
 #[test]
 fn deep_lookup_does_not_overflow_the_stack() {
-    // A pathological chain: every level holds one dir entry pointing
-    // deeper. Lookup advances one level per path component, so a
-    // recursive walk overflows the stack here — the walk must stay
-    // iterative no matter how deep the drive goes.
-    const DEPTH: usize = 100_000;
+    // A pathological chain at exactly the depth bound: the walk
+    // advances one level per path component, so a recursive walk
+    // overflows the stack here — the walk must stay iterative no
+    // matter how deep the drive goes. Deeper than this never reaches
+    // the walk: `parse_path` rejects it first.
     let mut store = MemoryObjectStore::default();
     let mut child = tree_of(&mut store, Vec::new());
-    for _ in 0..DEPTH {
+    for _ in 0..MAX_PATH_DEPTH {
         child = tree_of(&mut store, vec![Entry::dir("d", child).unwrap()]);
     }
     let view = DriveView::new(
@@ -236,8 +236,34 @@ fn deep_lookup_does_not_overflow_the_stack() {
         FakeMaterialization::empty(),
         heads(vec![snapshot(child)]),
     );
-    let path = vec!["d"; DEPTH].join("/");
+    let path = vec!["d"; MAX_PATH_DEPTH].join("/");
     assert!(matches!(view.lookup(&path), Ok(Node::Dir { .. })));
+}
+
+#[test]
+fn over_deep_lookup_fails_before_touching_the_store() {
+    // One component past the bound: the lookup fails in `parse_path`
+    // before any store lock or tree decode, so a pathological
+    // kernel-supplied path cannot amplify into store work. The bound
+    // is shared with authoring (`MAX_PATH_DEPTH`), so nothing served
+    // here is deeper than mutation can write.
+    let mut inner = MemoryObjectStore::default();
+    let root = tree_of(&mut inner, Vec::new());
+    let store = CountingStore {
+        inner,
+        gets: std::cell::Cell::new(0),
+    };
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(root)]),
+    );
+    let path = vec!["d"; MAX_PATH_DEPTH + 1].join("/");
+    assert_eq!(view.lookup(&path), Err(ViewError::InvalidPath));
+    assert_eq!(view.store_read().unwrap().gets.get(), 0);
+    // Exactly at the bound still parses: absent names miss normally.
+    let path = vec!["d"; MAX_PATH_DEPTH].join("/");
+    assert_eq!(view.lookup(&path), Err(ViewError::NotFound));
 }
 
 #[test]

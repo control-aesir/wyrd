@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use wyrd_format::{Component, ContentId, EntryContent, FetchStatus, ObjectStore, Snapshot, Tree};
+use wyrd_format::{
+    Component, ContentId, EntryContent, FetchStatus, ObjectStore, Snapshot, Tree, MAX_PATH_DEPTH,
+};
 
 use super::grammar;
 use super::head::ViewHead;
@@ -300,9 +302,11 @@ where
 
     /// Resolve one head's tree walk. Single heads never conflict;
     /// absence is `None`, fetch problems are errors. Iterative: the walk
-    /// advances one level per path component, and kernel-supplied paths
-    /// are unbounded, so recursion here would overflow the stack on a
-    /// pathological drive.
+    /// advances one level per path component, so recursion here would
+    /// overflow the stack on a pathological drive. Depth is bounded at
+    /// parse (`parse_path`), so each lookup costs at most
+    /// `MAX_PATH_DEPTH` store reads; iteration is what keeps even a
+    /// maximal walk off the stack.
     fn resolve_one(
         &self,
         tree_id: &ContentId,
@@ -434,15 +438,29 @@ fn attr(node: &Node) -> Attr {
 }
 
 /// Split a path into validated components. `""` and `"/"` address the
-/// root; anything else must be non-empty valid components.
+/// root; anything else must be non-empty valid components, at most
+/// `MAX_PATH_DEPTH` of them: every level costs a store lock plus a
+/// tree decode in `resolve_one`, so an unbounded kernel-supplied path
+/// would be a CPU/IO amplification input.
+///
+/// This is deliberately a separate grammar from the authoring parser
+/// (`wyrd_format::mutation`): serving takes absolute FUSE paths with a
+/// root address (`""`, `"/"`, leading slash tolerated), while authoring
+/// takes relative paths and is strict about separators. Component
+/// validation (`Component::new`) and the depth bound are shared, so a
+/// path the view serves can never be deeper than mutation can author.
 fn parse_path(path: &str) -> Result<Vec<Component>, ViewError> {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    trimmed
+    let components = trimmed
         .split('/')
         .map(Component::new)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ViewError::InvalidPath)
+        .map_err(|_| ViewError::InvalidPath)?;
+    if components.len() > MAX_PATH_DEPTH {
+        return Err(ViewError::InvalidPath);
+    }
+    Ok(components)
 }

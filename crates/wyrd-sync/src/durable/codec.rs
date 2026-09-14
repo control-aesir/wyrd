@@ -166,6 +166,17 @@ pub(super) fn encode_fact(
                     },
                 ));
             }
+            // Same gate as `RuntimeState::record_manifest` and
+            // `parse_manifest_record`: rejecting here fails the commit
+            // with the store untouched, instead of persisting a fact
+            // replay would later refuse as corruption.
+            if !crate::runtime::transport_is_represented(record) {
+                return Err(DurableError::Runtime(
+                    RuntimeError::TransportNotRepresented {
+                        manifest: record.manifest_id,
+                    },
+                ));
+            }
             let mut bytes = Vec::new();
             bytes.extend_from_slice(record.manifest_id.as_bytes());
             bytes.push(u8::from(record.is_root));

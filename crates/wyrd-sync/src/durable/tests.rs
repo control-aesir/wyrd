@@ -8,7 +8,7 @@ use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::epoch::EpochSecret;
 use crate::membership::test_util::{admit, drive, key, sign, Builder};
 use crate::membership::{MembershipLog, TransitionStatus};
-use crate::runtime::{ManifestRecord, MaterializationState, RuntimeState};
+use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError, RuntimeState};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::PathBuf};
@@ -412,6 +412,29 @@ fn planted_forged_body_is_rejected_before_eligibility() {
         !eligible.contains(&forged_id),
         "the forged body never enters the eligible set"
     );
+}
+
+/// The commit write path enforces the invariant too: persisting an
+/// inconsistent manifest fact is rejected before any file lands, so
+/// replay can never meet a record the encoder wrote but the decoder
+/// refuses.
+#[test]
+fn commit_rejects_unrepresented_transport_before_writing() {
+    let dir = TestDir::new("manifest-commit-gate");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let mut record = manifest_record();
+    record.transport = BaoRoot::from_bytes([0xD0; 32]);
+    assert_eq!(store.current(), 0);
+    assert!(matches!(
+        store.commit(&[Fact::Manifest(record)]),
+        Err(DurableError::Runtime(
+            RuntimeError::TransportNotRepresented { .. }
+        ))
+    ));
+    assert_eq!(store.current(), 0, "the rejected commit advances nothing");
+    // The store stays healthy: a valid fact commits as sequence 1.
+    store.commit(&[Fact::Manifest(manifest_record())]).unwrap();
+    assert_eq!(store.current(), 1);
 }
 
 /// Durable replay of individually valid facts preserves the

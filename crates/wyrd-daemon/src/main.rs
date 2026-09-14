@@ -548,4 +548,339 @@ mod tests {
             "both failing still fails"
         );
     }
+
+    /// Credential files are opened `O_NOFOLLOW`: a symlink is refused
+    /// as a filesystem loop, never followed to its target.
+    #[cfg(unix)]
+    #[test]
+    fn credential_symlinks_are_rejected_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let target = temp.0.join("target");
+        write_secret(&target, [0x11; 32]);
+        let link = temp.0.join("link");
+        symlink(&target, &link).unwrap();
+        let error = read_identity(&link).unwrap_err();
+        assert!(
+            matches!(&error, CliError::Io { source, .. }
+                if source.raw_os_error() == Some(libc::ELOOP)),
+            "a symlinked identity must fail closed: {error:?}"
+        );
+
+        // The passphrase rides the same reader: a symlinked
+        // passphrase fails the wired credential path too.
+        let identity_file = temp.0.join("identity");
+        write_secret(&identity_file, [0x11; 32]);
+        let passphrase_target = temp.0.join("passphrase-target");
+        write_secret(&passphrase_target, b"test-pass\n");
+        let passphrase_link = temp.0.join("passphrase");
+        symlink(&passphrase_target, &passphrase_link).unwrap();
+        let error = read_credentials(&Credentials {
+            identity_file,
+            passphrase_file: passphrase_link,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, CliError::Io { source, .. }
+                if source.raw_os_error() == Some(libc::ELOOP)),
+            "a symlinked passphrase must fail closed: {error:?}"
+        );
+    }
+
+    /// Credential files are bounded: over 4096 bytes is refused, and
+    /// exactly 4096 still reads.
+    #[cfg(unix)]
+    #[test]
+    fn oversized_credential_files_are_rejected() {
+        let temp = TempDir::new();
+        let big = temp.0.join("big");
+        write_secret(&big, vec![b'x'; 4097]);
+        let error = read_secret_file(&big).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CliError::Credential {
+                    reason: "exceeds the 4096-byte size limit",
+                    ..
+                }
+            ),
+            "oversize must name its stage: {error:?}"
+        );
+
+        let edge = temp.0.join("edge");
+        write_secret(&edge, vec![b'x'; 4096]);
+        assert!(
+            read_secret_file(&edge).is_ok(),
+            "exactly the limit still reads"
+        );
+    }
+
+    /// Formatted CLI errors name paths and reasons, never secret
+    /// bytes: neither a rejected passphrase nor a rejected identity
+    /// scalar may appear in its own error text.
+    #[cfg(unix)]
+    #[test]
+    fn credential_contents_never_appear_in_errors() {
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        write_secret(&identity_file, [0x11; 32]);
+
+        // A non-UTF8 passphrase fails after the secret is read: the
+        // marker must not surface in the usage error.
+        let passphrase_file = temp.0.join("passphrase");
+        let mut marker = b"sekrit-marker-".to_vec();
+        marker.extend_from_slice(&[0xff, 0xfe]);
+        write_secret(&passphrase_file, &marker);
+        let error = read_credentials(&Credentials {
+            identity_file: identity_file.clone(),
+            passphrase_file,
+        })
+        .unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            !text.contains("sekrit-marker"),
+            "passphrase bytes leaked: {text}"
+        );
+
+        // A 32-byte scalar outside the curve range fails identity
+        // validation: its hex must not surface either.
+        let bad_scalar = temp.0.join("bad-scalar");
+        write_secret(&bad_scalar, [0xff; 32]);
+        let error = read_identity(&bad_scalar).unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            !text.contains(&hex::encode([0xff; 32])),
+            "identity bytes leaked: {text}"
+        );
+
+        // The oversize stage names the file and the limit, never the
+        // content that overflowed it.
+        let big = temp.0.join("big");
+        write_secret(&big, [b's'; 4097]);
+        let error = read_secret_file(&big).unwrap_err();
+        let text = format!("{error}");
+        assert!(!text.contains("ssss"), "oversized content leaked: {text}");
+    }
+
+    /// The static mount serves a read-only `wyrd` filesystem: the
+    /// kernel must never see a writable mount from this binary.
+    #[test]
+    fn mount_uses_a_read_only_filesystem_name() {
+        let config = session_config();
+        assert!(
+            config
+                .mount_options
+                .iter()
+                .any(|option| matches!(option, MountOption::RO)),
+            "the mount is read-only"
+        );
+        assert!(
+            config
+                .mount_options
+                .iter()
+                .any(|option| matches!(option, MountOption::FSName(name) if name == "wyrd")),
+            "the mount names itself"
+        );
+    }
+
+    /// The mount preamble composes without a kernel: open the
+    /// keystore, build the daemon over the file store, author, and
+    /// the classified projection serves. That is the composition this
+    /// covers; the serving endpoint, bulk source, mailbox, signal
+    /// handler, and FUSE session creation remain live-mount-only
+    /// (see the gated test below).
+    #[test]
+    fn mount_preamble_projects_authorized_heads_without_fuse() {
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        let passphrase_file = temp.0.join("passphrase");
+        let drive = temp.0.join("drive");
+        write_secret(&identity_file, [0x11; 32]);
+        write_secret(&passphrase_file, b"test-pass\n");
+        command(vec![
+            "init".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap();
+
+        let identity = read_identity(&identity_file).unwrap();
+        let engine = Engine::open_keystore(drive.clone(), "test-pass", identity).unwrap();
+        let store = FsObjectStore::open(drive).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.put_file("hello.txt", b"hello mount").unwrap();
+        daemon.refresh_live_heads().unwrap();
+        let node = daemon.view().lookup("hello.txt").unwrap();
+        let file = daemon.view().open(&node).unwrap();
+        assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello mount");
+    }
+
+    /// The full static mount: init, author, mount in a thread, read
+    /// through the mountpoint, prove read-only, shut down, and
+    /// rejoin cleanly. Ignored by default — opting in is the test
+    /// runner's job, so an explicit run always attempts the mount
+    /// instead of silently passing. Needs kernel FUSE plus local
+    /// networking for the serving endpoint. Run it where both hold:
+    /// `cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
+    #[test]
+    #[ignore = "needs kernel FUSE and local networking"]
+    fn live_mount_serves_read_only_until_shutdown() {
+        // The shutdown latch is process-global: start unset so a
+        // previous run in this process cannot cut this mount short.
+        SHUTDOWN.store(false, Ordering::Relaxed);
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        let passphrase_file = temp.0.join("passphrase");
+        let drive = temp.0.join("drive");
+        write_secret(&identity_file, [0x11; 32]);
+        write_secret(&passphrase_file, b"test-pass\n");
+        command(vec![
+            "init".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap();
+
+        let identity = read_identity(&identity_file).unwrap();
+        let engine = Engine::open_keystore(drive.clone(), "test-pass", identity.clone()).unwrap();
+        let store = FsObjectStore::open(drive.clone()).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.put_file("hello.txt", b"hello mount").unwrap();
+        drop(daemon);
+
+        let mountpoint = temp.0.join("mnt");
+        fs::create_dir_all(&mountpoint).unwrap();
+        // The guard owns the mount thread: an assertion panic
+        // anywhere below still signals shutdown and rejoins instead
+        // of orphaning the mount. The explicit join reports the
+        // mount outcome; the Drop path stays best-effort (it must
+        // never panic while unwinding).
+        let mut mount = MountGuard {
+            server: Some(std::thread::spawn(move || {
+                mount(drive, mountpoint, Vec::new(), "test-pass", identity)
+            })),
+        };
+        let target = temp.0.join("mnt").join("hello.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !target.is_file() && std::time::Instant::now() <= deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !target.is_file() {
+            mount.shutdown_and_join("during startup");
+            panic!("the mount did not serve in time");
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"hello mount");
+        assert!(
+            fs::write(&target, b"nope").is_err(),
+            "the static mount is read-only"
+        );
+        mount.shutdown_and_join("during shutdown");
+        assert!(
+            fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
+            "a clean unmount releases the mountpoint"
+        );
+    }
+
+    /// Owns a spawned mount thread: signals shutdown and rejoins on
+    /// every exit path, so a failed assertion cannot orphan the
+    /// mount. Rejoins are bounded: a wedged FUSE thread fails the
+    /// test instead of hanging it. The tradeoff is explicit: on
+    /// expiry the handle detaches, so the thread and possibly the
+    /// mount may outlive the test's tempdir (already-open handles
+    /// keep working against removed paths; nothing new is served).
+    /// The explicit join reports mount errors; dropping stays
+    /// best-effort and never panics.
+    struct MountGuard {
+        server: Option<std::thread::JoinHandle<Result<(), CliError>>>,
+    }
+
+    impl MountGuard {
+        fn shutdown_and_join(&mut self, context: &str) {
+            SHUTDOWN.store(true, Ordering::Relaxed);
+            match self.server.take() {
+                None => {}
+                Some(server) => match reclaim(server, JOIN_TIMEOUT) {
+                    Some(Err(_)) => panic!("the mount thread panicked {context}"),
+                    Some(Ok(Err(error))) => panic!("the mount failed {context}: {error}"),
+                    Some(Ok(Ok(()))) => {}
+                    None => panic!("the mount thread did not exit within {JOIN_TIMEOUT:?} of shutdown {context}: FUSE may be wedged"),
+                },
+            }
+        }
+    }
+
+    impl Drop for MountGuard {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                // Best-effort and bounded: never panic or hang while
+                // unwinding; the explicit join reports errors.
+                let _ = reclaim(server, JOIN_TIMEOUT);
+            }
+        }
+    }
+
+    /// How long a shutdown waits for the mount thread before
+    /// detaching: long enough for a healthy unmount-and-join
+    /// sequence, short enough that a wedged FUSE thread fails the
+    /// test instead of hanging CI.
+    const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Wait up to `timeout` for the mount thread, returning its
+    /// outcome; on expiry the handle is dropped (detaching the
+    /// thread) and `None` is returned.
+    fn reclaim(
+        server: std::thread::JoinHandle<Result<(), CliError>>,
+        timeout: std::time::Duration,
+    ) -> Option<std::thread::Result<Result<(), CliError>>> {
+        let deadline = std::time::Instant::now() + timeout;
+        while !server.is_finished() && std::time::Instant::now() <= deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if server.is_finished() {
+            Some(server.join())
+        } else {
+            None
+        }
+    }
+
+    /// `reclaim` returns a finished thread's outcome, success or
+    /// mount error alike.
+    #[test]
+    fn reclaim_returns_a_finished_threads_outcome() {
+        let ok = std::thread::spawn(|| Ok(()));
+        assert!(matches!(reclaim(ok, JOIN_TIMEOUT), Some(Ok(Ok(())))));
+        let failed = std::thread::spawn(|| Err(CliError::Mount(std::io::Error::other("boom"))));
+        assert!(matches!(reclaim(failed, JOIN_TIMEOUT), Some(Ok(Err(_)))));
+    }
+
+    /// `reclaim` gives up after the bound instead of hanging: a
+    /// blocked thread yields `None` promptly, and dropping the
+    /// sender lets it exit so nothing lingers past the test.
+    #[test]
+    fn reclaim_detaches_past_the_deadline() {
+        let (send, recv) = std::sync::mpsc::channel::<()>();
+        let blocked = std::thread::spawn(move || {
+            let _ = recv.recv();
+            Ok(())
+        });
+        let bound = std::time::Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        assert!(
+            reclaim(blocked, bound).is_none(),
+            "a wedged thread detaches"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the rejoin is bounded"
+        );
+        drop(send);
+    }
 }

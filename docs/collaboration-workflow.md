@@ -44,12 +44,13 @@ git checkout -b pr/<name>
 git push -u origin pr/<name>
 ```
 
-Set the PR to draft immediately after the first push. CI runs on
-`ready_for_review` only, and only for PRs touching the paths listed in the
-workflows under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust
+Set the PR to draft immediately after the first push. CI triggers on
+`ready_for_review` and `synchronize` for PRs touching the paths listed in
+the workflows under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust
 workspace: `crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow
 itself; `nix.yml` for the flake: those plus `flake.*`) — docs-only PRs run
-no CI. Revisions pushed after ready are not rechecked, so the merge gate
+no CI. Jobs skip while the PR is draft, so draft pushes cost nothing; the
+gate runs on ready and re-runs on every push after that. The merge gate
 below is what guarantees the final revision is green.
 Work stays in draft until it is ready:
 
@@ -74,8 +75,8 @@ git push origin pr/<name>
 
 When the work is ready, mark the PR ready. This moves it from draft to
 open and triggers CI for PRs touching the filtered paths
-(`ready_for_review` is the only `pull_request` trigger in the workflows;
-docs-only PRs trigger none):
+(`ready_for_review` and `synchronize` are the `pull_request` triggers;
+jobs skip on drafts, docs-only PRs trigger none):
 
 ```bash
 ngit pr ready <pr> --reason "ready for review" --json

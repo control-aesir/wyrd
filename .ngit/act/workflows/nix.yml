@@ -12,7 +12,7 @@ on:
       - "crates/**"
       - ".ngit/act/workflows/nix.yml"
   pull_request:
-    types: [ready_for_review]
+    types: [ready_for_review, synchronize]
     paths:
       - "flake.nix"
       - "flake.lock"
@@ -25,6 +25,10 @@ on:
 
 jobs:
   check:
+    # Draft pushes trigger but skip: no compute on unfinished revisions.
+    # Negation (not `== false`) keeps push events running, which carry no
+    # pull_request object.
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

@@ -10,7 +10,7 @@ on:
       - "rust-toolchain.toml"
       - ".ngit/act/workflows/rust-ci.yml"
   pull_request:
-    types: [ready_for_review]
+    types: [ready_for_review, synchronize]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -21,6 +21,10 @@ on:
 
 jobs:
   test:
+    # Draft pushes trigger but skip: no compute on unfinished revisions.
+    # Negation (not `== false`) keeps push events running, which carry no
+    # pull_request object.
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

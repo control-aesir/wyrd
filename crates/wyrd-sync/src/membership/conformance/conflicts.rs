@@ -207,8 +207,10 @@ fn contradictory_resolutions_refreeze() {
 fn duplicate_resolves_entries_are_invalid() {
     let (mut b, genesis) = Builder::genesis(1);
     let first = b.child(vec![Change::Rotate]);
-    let mut r = b.child(vec![Change::Rotate]);
-    r.resolves = vec![first.transition_id(), first.transition_id()];
+    let mut r = b
+        .child(vec![Change::Rotate])
+        .with_resolves(vec![first.transition_id(), first.transition_id()])
+        .unwrap();
     sign(&mut r, &b.sk, &b.drive);
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&genesis, &first, &r]);
@@ -298,8 +300,10 @@ fn resolution_naming_the_winner_is_invalid() {
 fn resolves_without_conflict_is_invalid() {
     let (mut b, genesis) = Builder::genesis(1);
     let first = b.child(vec![Change::Rotate]);
-    let mut r = b.child(vec![Change::Rotate]);
-    r.resolves = vec![first.transition_id()];
+    let mut r = b
+        .child(vec![Change::Rotate])
+        .with_resolves(vec![first.transition_id()])
+        .unwrap();
     sign(&mut r, &b.sk, &b.drive);
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&genesis, &first, &r]);

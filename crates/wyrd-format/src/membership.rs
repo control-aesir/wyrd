@@ -29,7 +29,7 @@
 //! non-empty well-formed changes, derive-the-roots, author authority) is
 //! the membership state machine's job.
 
-use crate::identity::{DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
+use crate::identity::{u32_le, DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
 use thiserror::Error;
 
 /// Context for deriving member-set roots. A format constant (epochs.md,
@@ -43,17 +43,21 @@ pub const OWNER_SET_CONTEXT: &str = "wyrd owner set v1";
 /// encoded as `u32` LE count followed by the 32-byte x-only pubkeys in
 /// ascending bytewise order. Order-insensitive by construction. Set roots
 /// are **derived, never authoritative** — verifiers recompute them from
-/// the transition chain (epochs.md rule 2).
-pub fn set_root(context: &'static str, devices: &[DeviceId]) -> [u8; 32] {
+/// the transition chain (epochs.md rule 2). Counts beyond the `u32` wire
+/// format fail instead of truncating.
+pub fn set_root(context: &'static str, devices: &[DeviceId]) -> Result<[u8; 32], MembershipError> {
     let mut sorted: Vec<&DeviceId> = devices.iter().collect();
     sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     sorted.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+    if sorted.len() > u32::MAX as usize {
+        return Err(MembershipError::CountOverflow(sorted.len()));
+    }
     let mut bytes = Vec::with_capacity(4 + 32 * sorted.len());
-    bytes.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&u32_le(sorted.len()));
     for device in sorted {
         bytes.extend_from_slice(device.as_bytes());
     }
-    blake3::derive_key(context, &bytes)
+    Ok(blake3::derive_key(context, &bytes))
 }
 
 /// What `Admit` registers: the device's Nostr identity key (the
@@ -96,10 +100,13 @@ pub struct MembershipTransition {
     pub epoch: u64,
     /// The predecessor transition; `None` only at genesis (epoch 1).
     pub prev: Option<TransitionId>,
-    /// Conflict branches voided by this resolution transition.
-    pub resolves: Vec<TransitionId>,
-    /// The changes applied to the pre-transition state.
-    pub changes: Vec<Change>,
+    /// Conflict branches voided by this resolution transition. Private:
+    /// lengths feed the `u32` wire counts, so replacement goes through
+    /// [`MembershipTransition::with_resolves`].
+    resolves: Vec<TransitionId>,
+    /// The changes applied to the pre-transition state. Private, like
+    /// `resolves`: see [`MembershipTransition::with_changes`].
+    changes: Vec<Change>,
     /// Hash of the member set after the changes (opaque at this layer;
     /// the derivation lives with the state machine).
     pub members_root: [u8; 32],
@@ -121,9 +128,86 @@ pub enum MembershipError {
     InvalidPrevFlag(u8),
     #[error("unknown change tag byte {0:#04x}")]
     UnknownChangeTag(u8),
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
+}
+
+/// Wire-count validation shared by construction and validated mutation:
+/// every vector length the encoders narrow to `u32` must fit, so the
+/// infallible encoders only ever see encodable values.
+fn check_counts(resolves: &[TransitionId], changes: &[Change]) -> Result<(), MembershipError> {
+    if resolves.len() > u32::MAX as usize {
+        return Err(MembershipError::CountOverflow(resolves.len()));
+    }
+    if changes.len() > u32::MAX as usize {
+        return Err(MembershipError::CountOverflow(changes.len()));
+    }
+    for change in changes {
+        if let Change::SetOwners(owners) = change {
+            if owners.len() > u32::MAX as usize {
+                return Err(MembershipError::CountOverflow(owners.len()));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl MembershipTransition {
+    /// A transition with an all-zero signature (unsigned draft). The sync
+    /// layer signs and fills the signature. Counts beyond the `u32` wire
+    /// format are rejected so the infallible encoders only ever see
+    /// encodable values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        epoch: u64,
+        prev: Option<TransitionId>,
+        resolves: Vec<TransitionId>,
+        changes: Vec<Change>,
+        members_root: [u8; 32],
+        owners_root: [u8; 32],
+        author: DeviceId,
+    ) -> Result<Self, MembershipError> {
+        check_counts(&resolves, &changes)?;
+        Ok(MembershipTransition {
+            epoch,
+            prev,
+            resolves,
+            changes,
+            members_root,
+            owners_root,
+            author,
+            signature: [0; 64],
+        })
+    }
+
+    /// The conflict branches this transition voids.
+    pub fn resolves(&self) -> &[TransitionId] {
+        &self.resolves
+    }
+
+    /// The changes this transition applies.
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+
+    /// Replace the voided branches, validating the wire count. The
+    /// validated mutation API for post-construction forgeries and future
+    /// resolution builders: the field itself stays private so an
+    /// oversized vector cannot reach the infallible encoders.
+    pub fn with_resolves(mut self, resolves: Vec<TransitionId>) -> Result<Self, MembershipError> {
+        check_counts(&resolves, &self.changes)?;
+        self.resolves = resolves;
+        Ok(self)
+    }
+
+    /// Replace the applied changes, validating wire counts including
+    /// nested `SetOwners` vectors. See [`MembershipTransition::with_resolves`].
+    pub fn with_changes(mut self, changes: Vec<Change>) -> Result<Self, MembershipError> {
+        check_counts(&self.resolves, &changes)?;
+        self.changes = changes;
+        Ok(self)
+    }
+
     /// The BIP-340 message: `ASCII("wyrd membership v1") ‖ DriveId ‖
     /// signing preimage` (trust.md "Exact signing construction"). The
     /// sync layer signs and verifies exactly these bytes.
@@ -145,11 +229,11 @@ impl MembershipTransition {
             }
             None => out.push(0x00),
         }
-        out.extend_from_slice(&(self.resolves.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32_le(self.resolves.len()));
         for id in &self.resolves {
             out.extend_from_slice(id.as_bytes());
         }
-        out.extend_from_slice(&(self.changes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32_le(self.changes.len()));
         for change in &self.changes {
             out.push(change.tag());
             match change {
@@ -162,7 +246,7 @@ impl MembershipTransition {
                 }
                 Change::Rotate => {}
                 Change::SetOwners(owners) => {
-                    out.extend_from_slice(&(owners.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&u32_le(owners.len()));
                     for device in owners {
                         out.extend_from_slice(device.as_bytes());
                     }
@@ -332,16 +416,18 @@ mod tests {
     }
 
     fn sample() -> MembershipTransition {
-        MembershipTransition {
-            epoch: 2,
-            prev: Some(transition_id(0x10)),
-            resolves: Vec::new(),
-            changes: vec![Change::Rotate],
-            members_root: [0x20; 32],
-            owners_root: [0x21; 32],
-            author: device(0x30),
-            signature: [0x40; 64],
-        }
+        let mut transition = MembershipTransition::new(
+            2,
+            Some(transition_id(0x10)),
+            Vec::new(),
+            vec![Change::Rotate],
+            [0x20; 32],
+            [0x21; 32],
+            device(0x30),
+        )
+        .unwrap();
+        transition.signature = [0x40; 64];
+        transition
     }
 
     #[test]
@@ -488,23 +574,23 @@ mod tests {
         let a = device(0x01);
         let b = device(0x02);
         let c = device(0x03);
-        let members = set_root(MEMBER_SET_CONTEXT, &[a, b, c]);
-        let permuted = set_root(MEMBER_SET_CONTEXT, &[c, a, b]);
+        let members = set_root(MEMBER_SET_CONTEXT, &[a, b, c]).unwrap();
+        let permuted = set_root(MEMBER_SET_CONTEXT, &[c, a, b]).unwrap();
         assert_eq!(members, permuted, "set roots cover sets, not lists");
         assert_eq!(
-            set_root(MEMBER_SET_CONTEXT, &[a]),
-            set_root(MEMBER_SET_CONTEXT, &[a, a]),
+            set_root(MEMBER_SET_CONTEXT, &[a]).unwrap(),
+            set_root(MEMBER_SET_CONTEXT, &[a, a]).unwrap(),
             "duplicate devices must not change the root"
         );
         // Domains are separated: the same set under both contexts differs.
         assert_ne!(
-            set_root(MEMBER_SET_CONTEXT, &[a, b]),
-            set_root(OWNER_SET_CONTEXT, &[a, b])
+            set_root(MEMBER_SET_CONTEXT, &[a, b]).unwrap(),
+            set_root(OWNER_SET_CONTEXT, &[a, b]).unwrap()
         );
         // Subsets differ.
         assert_ne!(
-            set_root(MEMBER_SET_CONTEXT, &[a, b]),
-            set_root(MEMBER_SET_CONTEXT, &[a])
+            set_root(MEMBER_SET_CONTEXT, &[a, b]).unwrap(),
+            set_root(MEMBER_SET_CONTEXT, &[a]).unwrap()
         );
     }
 }

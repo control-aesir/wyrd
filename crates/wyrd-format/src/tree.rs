@@ -21,7 +21,7 @@
 //!   symlink:  u32 LE + bytes        target (UTF-8)
 //! ```
 
-use crate::identity::{ContentId, ObjectKind, ID_LEN};
+use crate::identity::{u32_le, ContentId, ObjectKind, ID_LEN};
 use crate::store::ObjectStore;
 use std::cmp::Ordering;
 use thiserror::Error;
@@ -156,13 +156,36 @@ pub enum TreeError {
     InvalidUtf8,
     #[error("duplicate component {0:?}: names within a tree are unique")]
     DuplicateComponent(String),
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
 }
 
 impl Tree {
     /// Build a tree from entries; they are sorted into canonical order.
-    /// Rejects duplicate components — names within a tree are unique.
+    /// Rejects duplicate components — names within a tree are unique —
+    /// and lengths beyond the `u32` wire counts, so the infallible
+    /// [`Tree::encode`] only ever sees encodable values.
     pub fn from_entries(entries: Vec<Entry>) -> Result<Self, TreeError> {
         let mut entries = entries;
+        if entries.len() > u32::MAX as usize {
+            return Err(TreeError::CountOverflow(entries.len()));
+        }
+        for entry in &entries {
+            let name_len = entry.name.as_str().len();
+            if name_len > u32::MAX as usize {
+                return Err(TreeError::CountOverflow(name_len));
+            }
+            if let EntryContent::File { chunks, .. } = &entry.content {
+                if chunks.len() > u32::MAX as usize {
+                    return Err(TreeError::CountOverflow(chunks.len()));
+                }
+            }
+            if let EntryContent::Symlink { target } = &entry.content {
+                if target.len() > u32::MAX as usize {
+                    return Err(TreeError::CountOverflow(target.len()));
+                }
+            }
+        }
         // str Ord is bytewise lexicographic, which is exactly the
         // canonical order (UTF-8, case-sensitive).
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -188,7 +211,7 @@ impl Tree {
     /// The canonical payload encoding (see the module docs).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32_le(self.entries.len()));
         for entry in &self.entries {
             let kind = match &entry.content {
                 EntryContent::File { .. } => 0x00u8,
@@ -197,7 +220,7 @@ impl Tree {
             };
             out.push(kind);
             let name = entry.name.as_str();
-            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(&u32_le(name.len()));
             out.extend_from_slice(name.as_bytes());
             match &entry.content {
                 EntryContent::File {
@@ -207,7 +230,7 @@ impl Tree {
                 } => {
                     out.extend_from_slice(&size.to_le_bytes());
                     out.push(u8::from(*executable));
-                    out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&u32_le(chunks.len()));
                     for chunk in chunks {
                         out.extend_from_slice(chunk.as_bytes());
                     }
@@ -216,7 +239,7 @@ impl Tree {
                     out.extend_from_slice(subtree.as_bytes());
                 }
                 EntryContent::Symlink { target } => {
-                    out.extend_from_slice(&(target.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&u32_le(target.len()));
                     out.extend_from_slice(target.as_bytes());
                 }
             }

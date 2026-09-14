@@ -989,7 +989,8 @@ mod tests {
             2,
             0,
             1003,
-        );
+        )
+        .unwrap();
         crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
         bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();
@@ -1321,7 +1322,8 @@ mod tests {
                 admission.epoch,
                 0,
                 1005,
-            );
+            )
+            .unwrap();
             crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
             let mut bulk = MemoryBulkSource::default();
             bulk.publish_snapshot(body.snapshot_id(), body.encode());
@@ -1361,7 +1363,8 @@ mod tests {
                 genesis.epoch,
                 0,
                 1006,
-            );
+            )
+            .unwrap();
             crate::authorization::test_util::sign_snapshot(
                 &mut stale,
                 &builder.sk,
@@ -1471,7 +1474,8 @@ mod tests {
             admission.epoch,
             0,
             1004,
-        );
+        )
+        .unwrap();
         crate::authorization::test_util::sign_snapshot(&mut child, &builder.sk, &member_drive());
         bulk.publish_snapshot(child.snapshot_id(), child.encode());
         let child_manifest_key = EpochSecret::from_bytes([0x09; 32]).manifest_key(
@@ -1671,7 +1675,8 @@ mod tests {
             2,
             0,
             1003,
-        );
+        )
+        .unwrap();
         crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
         bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();

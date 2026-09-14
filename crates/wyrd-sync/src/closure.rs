@@ -459,6 +459,7 @@ mod tests {
             0,
             7,
         )
+        .unwrap()
     }
 
     fn manifest(snapshot: &Snapshot, entries: Vec<ManifestEntry>) -> Manifest {
@@ -757,7 +758,8 @@ mod tests {
             1,
             0,
             7,
-        );
+        )
+        .unwrap();
         let root = Manifest::new(
             missing.snapshot_id(),
             root.entries().to_vec(),

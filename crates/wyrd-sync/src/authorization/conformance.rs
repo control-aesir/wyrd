@@ -224,8 +224,8 @@ fn contested_transition_reference_is_pending() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![admit(second)];
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     f.log.observe(a);
     let fork_id = fork.transition_id();
@@ -264,13 +264,13 @@ fn voided_branch_reference_is_voided() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![admit(second)];
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     // Resolution: prev = a (winner), resolves = fork (voided).
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
-    r.resolves = vec![fork.transition_id()];
+    r = r.with_resolves(vec![fork.transition_id()]).unwrap();
     r.epoch = 3;
     crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
     f.log.observe(a);
@@ -328,12 +328,12 @@ fn building_on_dead_ancestry_strands_the_work() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![admit(second)];
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
-    r.resolves = vec![fork.transition_id()];
+    r = r.with_resolves(vec![fork.transition_id()]).unwrap();
     r.epoch = 3;
     crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
     f.observe_raw(a);
@@ -427,12 +427,12 @@ fn merge_including_a_stranded_head_is_stranded() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![admit(second)];
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
-    r.resolves = vec![fork.transition_id()];
+    r = r.with_resolves(vec![fork.transition_id()]).unwrap();
     r.epoch = 3;
     crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
     f.observe_raw(a);
@@ -476,7 +476,9 @@ fn recovery_snapshot_by_the_owner_with_eligible_parents_is_eligible() {
     let id_head = observe(&mut dag, &head);
     let recovery = f.owner_snapshot(vec![id_head], tree_id(3));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -516,12 +518,12 @@ fn recovery_parenting_a_stranded_head_is_rejected() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![admit(second)];
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
-    r.resolves = vec![fork.transition_id()];
+    r = r.with_resolves(vec![fork.transition_id()]).unwrap();
     r.epoch = 3;
     crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
     f.observe_raw(a);
@@ -545,7 +547,9 @@ fn recovery_parenting_a_stranded_head_is_rejected() {
     // grafts content, never lineage.
     let recovery = f.owner_snapshot(vec![id_stranded], tree_id(3));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -570,7 +574,9 @@ fn descendants_of_a_rejected_recovery_stay_dead() {
     // `head` is no longer a DAG head, so the recovery is rejected.
     let recovery = f.owner_snapshot(vec![id_head], tree_id(4));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -615,7 +621,9 @@ fn recovery_parent_that_dies_in_the_fixed_point_is_rejected() {
     // Recovery onto the doomed parent: rejected, not silently stranded.
     let recovery = f.owner_snapshot(vec![id_p2], tree_id(4));
     let mut recovery = recovery;
-    recovery.flags = wyrd_format::snapshot::RECOVERY_FLAG;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
     sign_snapshot(&mut recovery, &f.sk, &f.drive);
     let id_recovery = observe(&mut dag, &recovery);
     assert_eq!(
@@ -639,12 +647,12 @@ fn classification_is_arrival_order_independent() {
     let (_, second) = f.device(2);
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
-    fork.changes = vec![admit(second)];
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
-    r.resolves = vec![fork.transition_id()];
+    r = r.with_resolves(vec![fork.transition_id()]).unwrap();
     r.epoch = 4;
     crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
     f.observe_raw(a);

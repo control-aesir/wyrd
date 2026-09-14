@@ -24,7 +24,7 @@
 //! signature:   64 bytes (BIP-340 over the drive-bound signing message)
 //! ```
 
-use crate::identity::{ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, TransitionId};
+use crate::identity::{u32_le, ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, TransitionId};
 use crate::store::ObjectStore;
 use thiserror::Error;
 
@@ -47,9 +47,12 @@ pub struct Snapshot {
     /// Must equal the referenced transition's epoch (checked by the
     /// authorization engine).
     pub epoch: u64,
-    /// Reserved-flag bits; see [`RECOVERY_FLAG`] and
-    /// [`RESERVED_FLAG_MASK`].
-    pub flags: u8,
+    /// Flag bits; see [`RECOVERY_FLAG`] and [`RESERVED_FLAG_MASK`].
+    /// Private: reserved bits are rejected by [`Snapshot::new`] and
+    /// [`Snapshot::set_flags`], so a value with garbage flags cannot be
+    /// built outside this module. Other fields carry no construction
+    /// invariant and stay struct-literal friendly.
+    flags: u8,
     /// Milliseconds. The authoring path keeps a value strictly greater
     /// than every timestamp already observed in the local DAG (monotonic
     /// across local writes, clock rollback, and restarts). Display and
@@ -67,13 +70,15 @@ pub enum SnapshotError {
     TrailingBytes,
     #[error("reserved flag bits must be zero, got {0:#04x}")]
     ReservedFlags(u8),
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
 }
 
 impl Snapshot {
     /// A snapshot with an all-zero signature (unsigned draft). The sync
     /// layer signs and fills the signature. Flags with nonzero reserved
-    /// bits are rejected by decode; this constructor debug-asserts them so
-    /// drafts never carry garbage into signing.
+    /// bits are rejected in all profiles with the same error decoding
+    /// reports, so garbage can never reach signing.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parents: Vec<SnapshotId>,
@@ -83,12 +88,14 @@ impl Snapshot {
         epoch: u64,
         flags: u8,
         timestamp: u64,
-    ) -> Self {
-        debug_assert!(
-            flags & RESERVED_FLAG_MASK == 0,
-            "reserved flag bits must be zero"
-        );
-        Snapshot {
+    ) -> Result<Self, SnapshotError> {
+        if flags & RESERVED_FLAG_MASK != 0 {
+            return Err(SnapshotError::ReservedFlags(flags));
+        }
+        if parents.len() > u32::MAX as usize {
+            return Err(SnapshotError::CountOverflow(parents.len()));
+        }
+        Ok(Snapshot {
             parents,
             tree,
             author,
@@ -97,7 +104,22 @@ impl Snapshot {
             flags,
             timestamp,
             signature: [0; 64],
+        })
+    }
+
+    /// The flag bits (only [`RECOVERY_FLAG`] is defined).
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Replace the flag bits, rejecting nonzero reserved bits with the
+    /// same error construction and decoding report.
+    pub fn set_flags(&mut self, flags: u8) -> Result<(), SnapshotError> {
+        if flags & RESERVED_FLAG_MASK != 0 {
+            return Err(SnapshotError::ReservedFlags(flags));
         }
+        self.flags = flags;
+        Ok(())
     }
 
     /// The BIP-340 message: `ASCII("wyrd snapshot v1") ‖ DriveId ‖ signing
@@ -114,7 +136,7 @@ impl Snapshot {
     /// flags, timestamp — declared order, self-delimiting vectors.
     fn signing_preimage(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.parents.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32_le(self.parents.len()));
         for parent in &self.parents {
             out.extend_from_slice(parent.as_bytes());
         }
@@ -331,6 +353,21 @@ mod tests {
     }
 
     #[test]
+    fn set_flags_rejects_reserved_bits() {
+        let mut snapshot = sample();
+        assert!(snapshot.set_flags(RECOVERY_FLAG).is_ok());
+        assert_eq!(snapshot.flags(), RECOVERY_FLAG);
+        assert_eq!(
+            snapshot.set_flags(0x02),
+            Err(SnapshotError::ReservedFlags(0x02))
+        );
+        // A rejected set leaves the previous flags in place.
+        assert_eq!(snapshot.flags(), RECOVERY_FLAG);
+        assert!(snapshot.set_flags(0).is_ok());
+        assert_eq!(snapshot.flags(), 0);
+    }
+
+    #[test]
     fn decode_rejects_truncation() {
         let payload = sample().encode();
         assert_eq!(
@@ -393,8 +430,51 @@ mod tests {
             1,
             0,
             100,
-        );
+        )
+        .unwrap();
         assert!(genesis.parents.is_empty());
         assert_eq!(Snapshot::decode(&genesis.encode()).unwrap(), genesis);
+    }
+
+    #[test]
+    fn constructor_rejects_reserved_flags_in_all_profiles() {
+        // Garbage flags fail here, before signing — not just at peer
+        // decode. A debug_assert would be silent in release; this is the
+        // same error decoding reports.
+        assert_eq!(
+            Snapshot::new(
+                Vec::new(),
+                ContentId::from_bytes([0x20; 32]),
+                DeviceId::from_bytes([0x30; 32]),
+                TransitionId::from_bytes([0x40; 32]),
+                1,
+                0x02,
+                100,
+            ),
+            Err(SnapshotError::ReservedFlags(0x02))
+        );
+        assert_eq!(
+            Snapshot::new(
+                Vec::new(),
+                ContentId::from_bytes([0x20; 32]),
+                DeviceId::from_bytes([0x30; 32]),
+                TransitionId::from_bytes([0x40; 32]),
+                1,
+                0xFF,
+                100,
+            ),
+            Err(SnapshotError::ReservedFlags(0xFF))
+        );
+        // The one defined flag still constructs.
+        assert!(Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x20; 32]),
+            DeviceId::from_bytes([0x30; 32]),
+            TransitionId::from_bytes([0x40; 32]),
+            1,
+            RECOVERY_FLAG,
+            100,
+        )
+        .is_ok());
     }
 }

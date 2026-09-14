@@ -49,16 +49,16 @@ fn keyring(device: DeviceId) -> DriveKeyring {
 /// its derived id is a deterministic input, never resolved against a
 /// log (signature validity is the log's job, upstream of install).
 fn stub_transition(epoch: u64, salt: u8) -> MembershipTransition {
-    MembershipTransition {
+    MembershipTransition::new(
         epoch,
-        prev: None,
-        resolves: Vec::new(),
-        changes: Vec::new(),
-        members_root: [salt; 32],
-        owners_root: [0; 32],
-        author: DeviceId::from_bytes([0; 32]),
-        signature: [0; 64],
-    }
+        None,
+        Vec::new(),
+        Vec::new(),
+        [salt; 32],
+        [0; 32],
+        DeviceId::from_bytes([0; 32]),
+    )
+    .unwrap()
 }
 
 /// A logged chain on the shared test drive: genesis, then children up

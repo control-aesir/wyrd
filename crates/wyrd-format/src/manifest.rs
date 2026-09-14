@@ -55,7 +55,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::identity::{BaoRoot, ContentId, ObjectKind, SnapshotId, StorageId};
+use crate::identity::{u32_le, BaoRoot, ContentId, ObjectKind, SnapshotId, StorageId};
 use thiserror::Error;
 
 /// Canonical length of one encoded entry: 32 + 1 + 1 + 32 + 8 + 8 + 32.
@@ -125,6 +125,8 @@ pub enum ManifestError {
     UnsortedEntries,
     #[error("child references are not in ascending tree-id order")]
     UnsortedChildren,
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
 }
 
 impl ManifestEntry {
@@ -183,12 +185,20 @@ impl Manifest {
     /// by tree id. Sort-on-ingest (not reject-unsorted): callers hand
     /// over unordered parts and always get canonical output. Duplicate
     /// keys have no canonical encoding, so they fail with the same
-    /// errors decoding reports for them.
+    /// errors decoding reports for them. Lengths beyond the `u32` wire
+    /// counts are rejected so the infallible [`Manifest::canonical_bytes`]
+    /// only ever sees encodable values.
     pub fn new(
         snapshot: SnapshotId,
         mut entries: Vec<ManifestEntry>,
         mut children: Vec<ChildManifest>,
     ) -> Result<Self, ManifestError> {
+        if entries.len() > u32::MAX as usize {
+            return Err(ManifestError::CountOverflow(entries.len()));
+        }
+        if children.len() > u32::MAX as usize {
+            return Err(ManifestError::CountOverflow(children.len()));
+        }
         entries.sort_by_key(|entry| entry.sort_key());
         children.sort_by_key(|child| *child.tree.as_bytes());
         let manifest = Manifest {
@@ -213,6 +223,12 @@ impl Manifest {
         entries: BTreeMap<ContentId, ManifestEntry>,
         children: BTreeMap<ContentId, ChildManifest>,
     ) -> Result<Self, ManifestError> {
+        if entries.len() > u32::MAX as usize {
+            return Err(ManifestError::CountOverflow(entries.len()));
+        }
+        if children.len() > u32::MAX as usize {
+            return Err(ManifestError::CountOverflow(children.len()));
+        }
         for (key, entry) in &entries {
             if key != &entry.content_id {
                 return Err(ManifestError::UnsortedEntries);
@@ -277,11 +293,11 @@ impl Manifest {
             32 + 4 + ENTRY_LEN * self.entries.len() + 4 + CHILD_LEN * self.children.len(),
         );
         out.extend_from_slice(self.snapshot.as_bytes());
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32_le(self.entries.len()));
         for entry in &self.entries {
             out.extend_from_slice(&entry.encode());
         }
-        out.extend_from_slice(&(self.children.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32_le(self.children.len()));
         for child in &self.children {
             out.extend_from_slice(child.tree.as_bytes());
             out.extend_from_slice(child.manifest.as_bytes());

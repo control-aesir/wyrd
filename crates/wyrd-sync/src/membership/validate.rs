@@ -54,13 +54,13 @@ pub(crate) fn check_intrinsic(t: &MembershipTransition) -> Result<(), InvalidRea
     // Genesis pins an empty `resolves` (epochs.md): a conflict can only
     // exist at a `prev`, and genesis has none. Reject here so a
     // garbage-carrying genesis is classified Invalid instead of rooting.
-    if t.prev.is_none() && !t.resolves.is_empty() {
+    if t.prev.is_none() && !t.resolves().is_empty() {
         return Err(InvalidReason::ResolvesWithoutConflict);
     }
-    if t.changes.is_empty() {
+    if t.changes().is_empty() {
         return Err(InvalidReason::EmptyChanges);
     }
-    for change in &t.changes {
+    for change in t.changes() {
         if let wyrd_format::Change::Admit(admission) = change {
             // The encryption key must be a real curve point: a garbage
             // key would make the device uncapability-able forever.
@@ -104,15 +104,19 @@ pub(crate) fn derive_next(
     prev_state: &MembershipState,
     t: &MembershipTransition,
 ) -> Result<MembershipState, InvalidReason> {
-    let derived = apply(prev_state, &t.changes).map_err(|_| InvalidReason::BadChanges)?;
+    let derived = apply(prev_state, t.changes()).map_err(|_| InvalidReason::BadChanges)?;
+    // A recompute failure is a mismatch: the claimed roots stand
+    // unverified, so the transition is rejected, never accepted.
     let members_match = set_root(
         MEMBER_SET_CONTEXT,
         &derived.members.iter().copied().collect::<Vec<_>>(),
-    ) == t.members_root;
+    )
+    .is_ok_and(|root| root == t.members_root);
     let owners_match = set_root(
         OWNER_SET_CONTEXT,
         &derived.owners.iter().copied().collect::<Vec<_>>(),
-    ) == t.owners_root;
+    )
+    .is_ok_and(|root| root == t.owners_root);
     if !(members_match && owners_match) {
         return Err(InvalidReason::RootMismatch);
     }

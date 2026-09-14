@@ -157,11 +157,11 @@ fn validate_link(
     // epoch − 1. Unknown entries leave this pending (the referenced
     // transition may still arrive); known-but-invalid entries are bad
     // evidence.
-    let distinct: HashSet<&TransitionId> = t.resolves.iter().collect();
-    if distinct.len() != t.resolves.len() {
+    let distinct: HashSet<&TransitionId> = t.resolves().iter().collect();
+    if distinct.len() != t.resolves().len() {
         return Link::Invalid(InvalidReason::DuplicateResolves);
     }
-    for entry in &t.resolves {
+    for entry in t.resolves() {
         let Some(entry_t) = log.transition(entry) else {
             return Link::Pending;
         };
@@ -214,7 +214,7 @@ fn link_for(
                 stack.push(prev);
             }
         }
-        for entry in &cur_t.resolves {
+        for entry in cur_t.resolves() {
             if seen.insert(*entry) {
                 closure.push(*entry);
                 stack.push(*entry);
@@ -287,7 +287,7 @@ fn walk(
         if kids.len() == 1 {
             let child = kids[0];
             let t = log.transition(&child).expect("observed");
-            if !t.resolves.is_empty() {
+            if !t.resolves().is_empty() {
                 // Non-empty resolves where no conflict exists at prev.
                 result.status.insert(
                     child,
@@ -348,10 +348,10 @@ fn handle_conflict(
                 continue;
             }
             let gt = log.transition(grand).expect("observed");
-            if gt.resolves.is_empty() {
+            if gt.resolves().is_empty() {
                 continue;
             }
-            let named: HashSet<TransitionId> = gt.resolves.iter().copied().collect();
+            let named: HashSet<TransitionId> = gt.resolves().iter().copied().collect();
             let others: HashSet<TransitionId> = contender_set
                 .iter()
                 .filter(|c| **c != *contender)
@@ -387,7 +387,7 @@ fn handle_conflict(
             result.canonical.push(r);
             // Named siblings are voided permanently; unnamed ones stay
             // contested (a partial resolution leaves them open).
-            let named: HashSet<TransitionId> = rt.resolves.iter().copied().collect();
+            let named: HashSet<TransitionId> = rt.resolves().iter().copied().collect();
             for c in contenders {
                 if *c == winner {
                     continue;

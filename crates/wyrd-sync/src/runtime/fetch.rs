@@ -730,7 +730,8 @@ mod tests {
             admission.epoch,
             0,
             1000 + admission.epoch,
-        );
+        )
+        .unwrap();
         crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
         let snapshot = body.snapshot_id();
         inner.publish_transport(body.encode());
@@ -834,7 +835,8 @@ mod tests {
             2,
             0,
             1003,
-        );
+        )
+        .unwrap();
         crate::authorization::test_util::sign_snapshot(&mut body_b, &builder.sk, &drive);
         bulk.publish_snapshot(body_b.snapshot_id(), body_b.encode());
         let snapshot_b = body_b.snapshot_id();

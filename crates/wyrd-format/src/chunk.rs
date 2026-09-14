@@ -71,7 +71,7 @@ mod tests {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
-                x as u8
+                u8::try_from(x & 0xFF).unwrap()
             })
             .collect()
     }

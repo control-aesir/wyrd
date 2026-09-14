@@ -213,13 +213,13 @@ pub fn check_transition(
     limits: &Limits,
     transition: &MembershipTransition,
 ) -> Result<(), IngestError> {
-    check_count(limits.max_resolves, "resolves", transition.resolves.len())?;
+    check_count(limits.max_resolves, "resolves", transition.resolves().len())?;
     check_count(
         limits.max_membership_changes,
         "membership changes",
-        transition.changes.len(),
+        transition.changes().len(),
     )?;
-    for change in &transition.changes {
+    for change in transition.changes() {
         if let Change::SetOwners(owners) = change {
             check_count(limits.max_set_owners, "set owners", owners.len())?;
         }
@@ -263,18 +263,18 @@ mod tests {
     };
 
     fn snapshot(parents: usize) -> Snapshot {
-        Snapshot {
-            parents: (0..parents)
+        Snapshot::new(
+            (0..parents)
                 .map(|b| SnapshotId::from_bytes([b as u8; 32]))
                 .collect(),
-            tree: ContentId::from_bytes([0x01; 32]),
-            author: DeviceId::from_bytes([0x02; 32]),
-            membership: TransitionId::from_bytes([0x03; 32]),
-            epoch: 1,
-            flags: 0,
-            timestamp: 0,
-            signature: [0x04; 64],
-        }
+            ContentId::from_bytes([0x01; 32]),
+            DeviceId::from_bytes([0x02; 32]),
+            TransitionId::from_bytes([0x03; 32]),
+            1,
+            0,
+            0,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -381,19 +381,20 @@ mod tests {
                 encryption_key: DeviceEncryptionKey::from_bytes([b ^ 0xA5; 32]),
             })
         };
-        let valid = MembershipTransition {
-            epoch: 2,
-            prev: Some(TransitionId::from_bytes([0x10; 32])),
-            resolves: vec![TransitionId::from_bytes([0x11; 32])],
-            changes: vec![admit(0x20), Change::SetOwners(vec![owner])],
-            members_root: [0x20; 32],
-            owners_root: [0x21; 32],
-            author: owner,
-            signature: [0x40; 64],
-        };
+        let valid = MembershipTransition::new(
+            2,
+            Some(TransitionId::from_bytes([0x10; 32])),
+            vec![TransitionId::from_bytes([0x11; 32])],
+            vec![admit(0x20), Change::SetOwners(vec![owner])],
+            [0x20; 32],
+            [0x21; 32],
+            owner,
+        )
+        .unwrap();
         assert!(check_transition(&SMALL, &valid).is_ok());
-        let mut too_many_changes = valid.clone();
-        too_many_changes.changes.push(Change::Rotate);
+        let mut changes = valid.changes().to_vec();
+        changes.push(Change::Rotate);
+        let too_many_changes = valid.clone().with_changes(changes).unwrap();
         assert!(matches!(
             check_transition(&SMALL, &too_many_changes),
             Err(IngestError::TooMany {
@@ -401,13 +402,14 @@ mod tests {
                 ..
             })
         ));
-        let mut too_many_resolves = valid.clone();
-        too_many_resolves
-            .resolves
-            .push(TransitionId::from_bytes([0x12; 32]));
-        too_many_resolves
-            .resolves
-            .push(TransitionId::from_bytes([0x13; 32]));
+        let too_many_resolves = valid
+            .clone()
+            .with_resolves(vec![
+                TransitionId::from_bytes([0x11; 32]),
+                TransitionId::from_bytes([0x12; 32]),
+                TransitionId::from_bytes([0x13; 32]),
+            ])
+            .unwrap();
         assert!(matches!(
             check_transition(&SMALL, &too_many_resolves),
             Err(IngestError::TooMany {
@@ -415,8 +417,10 @@ mod tests {
                 ..
             })
         ));
-        let mut too_many_owners = valid.clone();
-        too_many_owners.changes = vec![Change::SetOwners(vec![owner, owner, owner])];
+        let too_many_owners = valid
+            .clone()
+            .with_changes(vec![Change::SetOwners(vec![owner, owner, owner])])
+            .unwrap();
         assert!(matches!(
             check_transition(&SMALL, &too_many_owners),
             Err(IngestError::TooMany {

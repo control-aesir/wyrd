@@ -34,10 +34,17 @@ fn genesis_with_non_empty_resolves_is_invalid() {
     let (b, genesis) = Builder::genesis(1);
     let bogus = genesis.transition_id();
     for resolves in [vec![bogus], vec![bogus, bogus]] {
-        let mut t = MembershipTransition {
+        let g = genesis.clone();
+        let mut t = MembershipTransition::new(
+            g.epoch,
+            g.prev,
             resolves,
-            ..genesis.clone()
-        };
+            g.changes().to_vec(),
+            g.members_root,
+            g.owners_root,
+            g.author,
+        )
+        .unwrap();
         sign(&mut t, &b.sk, &b.drive);
         let mut log = MembershipLog::new(drive());
         log.observe(t.clone());
@@ -81,16 +88,16 @@ fn genesis_conflict_is_resolved_like_any_other() {
     let (_b2, g2) = Builder::genesis(2);
     let owner1 = *b1.owners.iter().next().unwrap();
     // R: prev names the winning genesis, resolves names the loser.
-    let mut r = MembershipTransition {
-        epoch: 2,
-        prev: Some(g1.transition_id()),
-        resolves: vec![g2.transition_id()],
-        changes: vec![Change::Rotate],
-        members_root: set_root(MEMBER_SET_CONTEXT, &[owner1]),
-        owners_root: set_root(OWNER_SET_CONTEXT, &[owner1]),
-        author: owner1,
-        signature: [0; 64],
-    };
+    let mut r = MembershipTransition::new(
+        2,
+        Some(g1.transition_id()),
+        vec![g2.transition_id()],
+        vec![Change::Rotate],
+        set_root(MEMBER_SET_CONTEXT, &[owner1]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner1]).unwrap(),
+        owner1,
+    )
+    .unwrap();
     sign(&mut r, &b1.sk, &b1.drive);
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&g1, &g2, &r]);
@@ -133,27 +140,27 @@ fn contradictory_genesis_resolutions_refreeze() {
     let (b2, g2) = Builder::genesis(2);
     let owner1 = *b1.owners.iter().next().unwrap();
     let owner2 = *b2.owners.iter().next().unwrap();
-    let mut r1 = MembershipTransition {
-        epoch: 2,
-        prev: Some(g1.transition_id()),
-        resolves: vec![g2.transition_id()],
-        changes: vec![Change::Rotate],
-        members_root: set_root(MEMBER_SET_CONTEXT, &[owner1]),
-        owners_root: set_root(OWNER_SET_CONTEXT, &[owner1]),
-        author: owner1,
-        signature: [0; 64],
-    };
+    let mut r1 = MembershipTransition::new(
+        2,
+        Some(g1.transition_id()),
+        vec![g2.transition_id()],
+        vec![Change::Rotate],
+        set_root(MEMBER_SET_CONTEXT, &[owner1]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner1]).unwrap(),
+        owner1,
+    )
+    .unwrap();
     sign(&mut r1, &b1.sk, &b1.drive);
-    let mut r2 = MembershipTransition {
-        epoch: 2,
-        prev: Some(g2.transition_id()),
-        resolves: vec![g1.transition_id()],
-        changes: vec![Change::Rotate],
-        members_root: set_root(MEMBER_SET_CONTEXT, &[owner2]),
-        owners_root: set_root(OWNER_SET_CONTEXT, &[owner2]),
-        author: owner2,
-        signature: [0; 64],
-    };
+    let mut r2 = MembershipTransition::new(
+        2,
+        Some(g2.transition_id()),
+        vec![g1.transition_id()],
+        vec![Change::Rotate],
+        set_root(MEMBER_SET_CONTEXT, &[owner2]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner2]).unwrap(),
+        owner2,
+    )
+    .unwrap();
     sign(&mut r2, &b2.sk, &b2.drive);
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&g1, &g2, &r1, &r2]);

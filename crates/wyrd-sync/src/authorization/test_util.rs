@@ -87,7 +87,8 @@ impl Fixture {
             self.tip_epoch,
             flags,
             1000 + self.tip_epoch,
-        );
+        )
+        .unwrap();
         sign_snapshot(&mut s, author_sk, &self.drive);
         s
     }

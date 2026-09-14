@@ -2137,6 +2137,7 @@ mod tests {
             0,
             1,
         )
+        .unwrap()
     }
 
     fn backend() -> FuseBackend<MemoryObjectStore, NoMaterialization> {

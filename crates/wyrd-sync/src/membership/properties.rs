@@ -89,16 +89,16 @@ fn signed(
     author_sk: &secp256k1::SecretKey,
     author: DeviceId,
 ) -> MembershipTransition {
-    let mut t = MembershipTransition {
+    let mut t = MembershipTransition::new(
         epoch,
         prev,
         resolves,
         changes,
-        members_root: set_root(MEMBER_SET_CONTEXT, members),
-        owners_root: set_root(OWNER_SET_CONTEXT, owners),
+        set_root(MEMBER_SET_CONTEXT, members).unwrap(),
+        set_root(OWNER_SET_CONTEXT, owners).unwrap(),
         author,
-        signature: [0; 64],
-    };
+    )
+    .unwrap();
     sign(&mut t, author_sk, &b.drive);
     t
 }
@@ -132,7 +132,7 @@ fn observe_all(log: &mut MembershipLog, transitions: &[MembershipTransition]) {
 fn tip_members(chain: &[MembershipTransition]) -> BTreeSet<DeviceId> {
     let mut members = BTreeSet::from([device(0)]);
     for t in chain.iter().skip(1) {
-        for c in &t.changes {
+        for c in t.changes() {
             match c {
                 Change::Admit(a) => {
                     members.insert(a.device);
@@ -197,7 +197,7 @@ proptest! {
         let mut members: BTreeSet<DeviceId> = BTreeSet::from([device(0)]);
         for t in prefix_chain.iter().skip(1) {
             // The builder mirrors valid prefixes; replay each change set.
-            let changes = t.changes.clone();
+            let changes = t.changes().to_vec();
             for c in &changes {
                 match c {
                     Change::Admit(a) => { members.insert(a.device); }
@@ -239,7 +239,7 @@ proptest! {
         // The winner's own state carries the resolution: an admitting
         // winner keeps its new member.
         if !winner_is_first {
-            resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>());
+            resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>()).unwrap();
             sign(&mut resolution, &sk_owner, &b.drive);
         }
         let mut log = MembershipLog::new(drive());
@@ -265,7 +265,7 @@ proptest! {
         let (mut b, _) = Builder::genesis(10);
         let mut members: BTreeSet<DeviceId> = BTreeSet::from([device(0)]);
         for t in prefix_chain.iter().skip(1) {
-            let changes = t.changes.clone();
+            let changes = t.changes().to_vec();
             for c in &changes {
                 match c {
                     Change::Admit(a) => { members.insert(a.device); }
@@ -395,7 +395,7 @@ proptest! {
                 // An admitting winner keeps its new member, as in the
                 // example-based fork test.
                 if !winner_is_first {
-                    resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>());
+                    resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>()).unwrap();
                     sign(&mut resolution, &sk_owner, &probe.drive);
                 }
                 all.push(resolution);
@@ -536,7 +536,7 @@ sharded_property! {
         for t in &canonical {
             // Generated chains are valid end to end by construction
             // (ill-formed ops degrade to `Rotate`), so the fold cannot fail.
-            folded = apply(&folded, &t.changes).expect("generated chain folds");
+            folded = apply(&folded, t.changes()).expect("generated chain folds");
             prop_assert_eq!(
                 shuffled_log.state_of(&t.transition_id()),
                 Some(folded.clone())

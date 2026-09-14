@@ -88,8 +88,9 @@ first backend, not a property of the core.
 
 ## Transport and operational invariants
 
-The iroh stack (iroh 1.0.3, iroh-blobs 0.103.0 fs-store, iroh-gossip 0.101.0)
-is validated as a set: bump all three together and run the full test suite.
+The iroh stack (iroh 1.1.0, iroh-blobs 0.103.0 fs-store, iroh-gossip 0.101.0)
+is validated as a set: exact-pinned in the workspace `Cargo.toml` so drift
+is a deliberate edit, never silent; bump all three together and run the full test suite.
 Hard-won operational rules:
 
 - Supervised tasks restart with capped exponential backoff.

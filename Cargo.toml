@@ -57,16 +57,18 @@ zeroize = "1.9"
 # tick and backs off drainer recovery; same audited crate, additive feature)
 tokio = { version = "1", features = ["sync", "fs", "io-util", "rt", "macros", "net", "signal", "time"] }
 
-# iroh stack — validated as a set, change all three together and test
-iroh = "1.0.3"
-iroh-blobs = { version = "0.103.0", default-features = false, features = ["fs-store"] }
-iroh-gossip = "0.101.0"
+# iroh stack — validated as a set, change all three together and test.
+# Exact pins (`=`): caret drift once silently invalidated the documented
+# set, so bumps are deliberate edits here plus docs plus the full suite.
+iroh = "=1.1.0"
+iroh-blobs = { version = "=0.103.0", default-features = false, features = ["fs-store"] }
+iroh-gossip = "=0.101.0"
 # streaming primitives for bounded blob intake (versions match what the
 # pinned iroh-blobs 0.103 already depends on; bump with the iroh set)
-bao-tree = "0.16"
+bao-tree = "=0.16.1"
 bytes = "1"
 futures-util = "0.3"
-n0-future = "0.3"
+n0-future = "=0.3.2"
 
 # nostr protocol (control-plane transport only: NIP-44 + NIP-59 gift wrap
 # mailbox framing; object encryption stays Wyrd-owned per T11). Pinned with

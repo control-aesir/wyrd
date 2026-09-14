@@ -791,8 +791,10 @@ mod tests {
     /// Owns a spawned mount thread: signals shutdown and rejoins on
     /// every exit path, so a failed assertion cannot orphan the
     /// mount. Rejoins are bounded: a wedged FUSE thread fails the
-    /// test instead of hanging it (the mount itself may linger —
-    /// detaching is the only escape a wedged kernel thread leaves).
+    /// test instead of hanging it. The tradeoff is explicit: on
+    /// expiry the handle detaches, so the thread and possibly the
+    /// mount may outlive the test's tempdir (already-open handles
+    /// keep working against removed paths; nothing new is served).
     /// The explicit join reports mount errors; dropping stays
     /// best-effort and never panics.
     struct MountGuard {
@@ -847,5 +849,38 @@ mod tests {
         } else {
             None
         }
+    }
+
+    /// `reclaim` returns a finished thread's outcome, success or
+    /// mount error alike.
+    #[test]
+    fn reclaim_returns_a_finished_threads_outcome() {
+        let ok = std::thread::spawn(|| Ok(()));
+        assert!(matches!(reclaim(ok, JOIN_TIMEOUT), Some(Ok(Ok(())))));
+        let failed = std::thread::spawn(|| Err(CliError::Mount(std::io::Error::other("boom"))));
+        assert!(matches!(reclaim(failed, JOIN_TIMEOUT), Some(Ok(Err(_)))));
+    }
+
+    /// `reclaim` gives up after the bound instead of hanging: a
+    /// blocked thread yields `None` promptly, and dropping the
+    /// sender lets it exit so nothing lingers past the test.
+    #[test]
+    fn reclaim_detaches_past_the_deadline() {
+        let (send, recv) = std::sync::mpsc::channel::<()>();
+        let blocked = std::thread::spawn(move || {
+            let _ = recv.recv();
+            Ok(())
+        });
+        let bound = std::time::Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        assert!(
+            reclaim(blocked, bound).is_none(),
+            "a wedged thread detaches"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the rejoin is bounded"
+        );
+        drop(send);
     }
 }

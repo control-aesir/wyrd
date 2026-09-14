@@ -515,8 +515,8 @@ fn signed(
         prev,
         resolves,
         changes,
-        set_root(MEMBER_SET_CONTEXT, members),
-        set_root(OWNER_SET_CONTEXT, owners),
+        set_root(MEMBER_SET_CONTEXT, members).unwrap(),
+        set_root(OWNER_SET_CONTEXT, owners).unwrap(),
         author,
     )
     .unwrap();

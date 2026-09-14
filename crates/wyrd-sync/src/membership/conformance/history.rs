@@ -21,8 +21,8 @@ fn invalid_setowners_cases() {
         Some(genesis.transition_id()),
         Vec::new(),
         vec![Change::SetOwners(vec![stranger])],
-        set_root(MEMBER_SET_CONTEXT, &[owner]),
-        set_root(OWNER_SET_CONTEXT, &[stranger]),
+        set_root(MEMBER_SET_CONTEXT, &[owner]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[stranger]).unwrap(),
         owner,
     )
     .unwrap();
@@ -126,8 +126,8 @@ fn removal_of_unknown_member_is_invalid() {
         Some(genesis.transition_id()),
         Vec::new(),
         vec![Change::Remove(stranger)],
-        set_root(MEMBER_SET_CONTEXT, &[]),
-        set_root(OWNER_SET_CONTEXT, &[]),
+        set_root(MEMBER_SET_CONTEXT, &[]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[]).unwrap(),
         owner,
     )
     .unwrap();

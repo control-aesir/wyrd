@@ -126,6 +126,8 @@ pub enum EngineError {
     InvalidManifest(#[from] wyrd_format::ManifestError),
     #[error("authored snapshot failed construction: {0}")]
     InvalidSnapshot(#[from] wyrd_format::SnapshotError),
+    #[error("authored transition failed construction: {0}")]
+    InvalidTransition(#[from] wyrd_format::MembershipError),
     #[error("keystore failed: {0}")]
     Keystore(#[from] crate::keys::KeystoreError),
     #[error("keystore I/O failed: {0}")]

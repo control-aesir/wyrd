@@ -83,8 +83,8 @@ impl Builder {
             None,
             Vec::new(),
             vec![admit(owner), Change::SetOwners(vec![owner])],
-            set_root(MEMBER_SET_CONTEXT, &[owner]),
-            set_root(OWNER_SET_CONTEXT, &[owner]),
+            set_root(MEMBER_SET_CONTEXT, &[owner]).unwrap(),
+            set_root(OWNER_SET_CONTEXT, &[owner]).unwrap(),
             owner,
         )
         .unwrap();
@@ -117,11 +117,13 @@ impl Builder {
             set_root(
                 MEMBER_SET_CONTEXT,
                 &self.members.iter().copied().collect::<Vec<_>>(),
-            ),
+            )
+            .unwrap(),
             set_root(
                 OWNER_SET_CONTEXT,
                 &self.owners.iter().copied().collect::<Vec<_>>(),
-            ),
+            )
+            .unwrap(),
             author,
         )
         .unwrap();

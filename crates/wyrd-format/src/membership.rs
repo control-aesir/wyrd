@@ -43,17 +43,21 @@ pub const OWNER_SET_CONTEXT: &str = "wyrd owner set v1";
 /// encoded as `u32` LE count followed by the 32-byte x-only pubkeys in
 /// ascending bytewise order. Order-insensitive by construction. Set roots
 /// are **derived, never authoritative** — verifiers recompute them from
-/// the transition chain (epochs.md rule 2).
-pub fn set_root(context: &'static str, devices: &[DeviceId]) -> [u8; 32] {
+/// the transition chain (epochs.md rule 2). Counts beyond the `u32` wire
+/// format fail instead of truncating.
+pub fn set_root(context: &'static str, devices: &[DeviceId]) -> Result<[u8; 32], MembershipError> {
     let mut sorted: Vec<&DeviceId> = devices.iter().collect();
     sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     sorted.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+    if sorted.len() > u32::MAX as usize {
+        return Err(MembershipError::CountOverflow(sorted.len()));
+    }
     let mut bytes = Vec::with_capacity(4 + 32 * sorted.len());
     bytes.extend_from_slice(&u32_le(sorted.len()));
     for device in sorted {
         bytes.extend_from_slice(device.as_bytes());
     }
-    blake3::derive_key(context, &bytes)
+    Ok(blake3::derive_key(context, &bytes))
 }
 
 /// What `Admit` registers: the device's Nostr identity key (the
@@ -570,23 +574,23 @@ mod tests {
         let a = device(0x01);
         let b = device(0x02);
         let c = device(0x03);
-        let members = set_root(MEMBER_SET_CONTEXT, &[a, b, c]);
-        let permuted = set_root(MEMBER_SET_CONTEXT, &[c, a, b]);
+        let members = set_root(MEMBER_SET_CONTEXT, &[a, b, c]).unwrap();
+        let permuted = set_root(MEMBER_SET_CONTEXT, &[c, a, b]).unwrap();
         assert_eq!(members, permuted, "set roots cover sets, not lists");
         assert_eq!(
-            set_root(MEMBER_SET_CONTEXT, &[a]),
-            set_root(MEMBER_SET_CONTEXT, &[a, a]),
+            set_root(MEMBER_SET_CONTEXT, &[a]).unwrap(),
+            set_root(MEMBER_SET_CONTEXT, &[a, a]).unwrap(),
             "duplicate devices must not change the root"
         );
         // Domains are separated: the same set under both contexts differs.
         assert_ne!(
-            set_root(MEMBER_SET_CONTEXT, &[a, b]),
-            set_root(OWNER_SET_CONTEXT, &[a, b])
+            set_root(MEMBER_SET_CONTEXT, &[a, b]).unwrap(),
+            set_root(OWNER_SET_CONTEXT, &[a, b]).unwrap()
         );
         // Subsets differ.
         assert_ne!(
-            set_root(MEMBER_SET_CONTEXT, &[a, b]),
-            set_root(MEMBER_SET_CONTEXT, &[a])
+            set_root(MEMBER_SET_CONTEXT, &[a, b]).unwrap(),
+            set_root(MEMBER_SET_CONTEXT, &[a]).unwrap()
         );
     }
 }

@@ -74,7 +74,7 @@ pub(super) fn create(
     random_bytes(&mut drive_bytes)?;
     let drive = DriveId::from_bytes(drive_bytes);
     let device = device_id(&identity);
-    let genesis = genesis_transition(drive, &identity, &encryption);
+    let genesis = genesis_transition(drive, &identity, &encryption)?;
 
     // Seal the custody record before the drive is usable. A crash before
     // the genesis commit is recoverable: `open_keystore` completes the
@@ -144,7 +144,7 @@ pub(super) fn open_keystore(
 
     // The genesis is a deterministic function of the (drive, owner,
     // encryption) triple, used to complete an interrupted bootstrap below.
-    let genesis = genesis_transition(drive, &identity, &encryption);
+    let genesis = genesis_transition(drive, &identity, &encryption)?;
 
     let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
     engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
@@ -208,7 +208,7 @@ fn genesis_transition(
     drive: DriveId,
     identity: &DeviceIdentitySecret,
     encryption: &DeviceEncryptionSecret,
-) -> MembershipTransition {
+) -> Result<MembershipTransition, EngineError> {
     let owner = device_id(identity);
     let mut transition = MembershipTransition::new(
         1,
@@ -221,13 +221,12 @@ fn genesis_transition(
             }),
             Change::SetOwners(vec![owner]),
         ],
-        set_root(MEMBER_SET_CONTEXT, &[owner]),
-        set_root(OWNER_SET_CONTEXT, &[owner]),
+        set_root(MEMBER_SET_CONTEXT, &[owner])?,
+        set_root(OWNER_SET_CONTEXT, &[owner])?,
         owner,
-    )
-    .expect("genesis transition is two changes and no resolves");
+    )?;
     sign_transition(&mut transition, &identity.secret_key(), &drive);
-    transition
+    Ok(transition)
 }
 
 /// The custody record: `version ‖ owner (32) ‖ len(root) ‖ len(device) ‖

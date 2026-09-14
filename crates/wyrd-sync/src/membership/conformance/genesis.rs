@@ -93,8 +93,8 @@ fn genesis_conflict_is_resolved_like_any_other() {
         Some(g1.transition_id()),
         vec![g2.transition_id()],
         vec![Change::Rotate],
-        set_root(MEMBER_SET_CONTEXT, &[owner1]),
-        set_root(OWNER_SET_CONTEXT, &[owner1]),
+        set_root(MEMBER_SET_CONTEXT, &[owner1]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner1]).unwrap(),
         owner1,
     )
     .unwrap();
@@ -145,8 +145,8 @@ fn contradictory_genesis_resolutions_refreeze() {
         Some(g1.transition_id()),
         vec![g2.transition_id()],
         vec![Change::Rotate],
-        set_root(MEMBER_SET_CONTEXT, &[owner1]),
-        set_root(OWNER_SET_CONTEXT, &[owner1]),
+        set_root(MEMBER_SET_CONTEXT, &[owner1]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner1]).unwrap(),
         owner1,
     )
     .unwrap();
@@ -156,8 +156,8 @@ fn contradictory_genesis_resolutions_refreeze() {
         Some(g2.transition_id()),
         vec![g1.transition_id()],
         vec![Change::Rotate],
-        set_root(MEMBER_SET_CONTEXT, &[owner2]),
-        set_root(OWNER_SET_CONTEXT, &[owner2]),
+        set_root(MEMBER_SET_CONTEXT, &[owner2]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner2]).unwrap(),
         owner2,
     )
     .unwrap();

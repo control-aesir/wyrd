@@ -94,8 +94,8 @@ fn signed(
         prev,
         resolves,
         changes,
-        set_root(MEMBER_SET_CONTEXT, members),
-        set_root(OWNER_SET_CONTEXT, owners),
+        set_root(MEMBER_SET_CONTEXT, members).unwrap(),
+        set_root(OWNER_SET_CONTEXT, owners).unwrap(),
         author,
     )
     .unwrap();
@@ -239,7 +239,7 @@ proptest! {
         // The winner's own state carries the resolution: an admitting
         // winner keeps its new member.
         if !winner_is_first {
-            resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>());
+            resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>()).unwrap();
             sign(&mut resolution, &sk_owner, &b.drive);
         }
         let mut log = MembershipLog::new(drive());
@@ -395,7 +395,7 @@ proptest! {
                 // An admitting winner keeps its new member, as in the
                 // example-based fork test.
                 if !winner_is_first {
-                    resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>());
+                    resolution.members_root = set_root(MEMBER_SET_CONTEXT, &with_new.iter().copied().collect::<Vec<_>>()).unwrap();
                     sign(&mut resolution, &sk_owner, &probe.drive);
                 }
                 all.push(resolution);

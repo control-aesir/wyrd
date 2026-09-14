@@ -225,7 +225,7 @@ fn contested_transition_reference_is_pending() {
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
     fork = fork.with_changes(vec![admit(second)]).unwrap();
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     f.log.observe(a);
     let fork_id = fork.transition_id();
@@ -265,7 +265,7 @@ fn voided_branch_reference_is_voided() {
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
     fork = fork.with_changes(vec![admit(second)]).unwrap();
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     // Resolution: prev = a (winner), resolves = fork (voided).
     let mut r = f.builder.child(vec![Change::Rotate]);
@@ -329,7 +329,7 @@ fn building_on_dead_ancestry_strands_the_work() {
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
     fork = fork.with_changes(vec![admit(second)]).unwrap();
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
@@ -428,7 +428,7 @@ fn merge_including_a_stranded_head_is_stranded() {
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
     fork = fork.with_changes(vec![admit(second)]).unwrap();
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
@@ -519,7 +519,7 @@ fn recovery_parenting_a_stranded_head_is_rejected() {
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
     fork = fork.with_changes(vec![admit(second)]).unwrap();
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());
@@ -648,7 +648,7 @@ fn classification_is_arrival_order_independent() {
     let a = f.builder.child(vec![Change::Rotate]);
     let mut fork = a.clone();
     fork = fork.with_changes(vec![admit(second)]).unwrap();
-    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]);
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
     crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
     let mut r = f.builder.child(vec![Change::Rotate]);
     r.prev = Some(a.transition_id());

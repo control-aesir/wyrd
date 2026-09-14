@@ -105,14 +105,18 @@ pub(crate) fn derive_next(
     t: &MembershipTransition,
 ) -> Result<MembershipState, InvalidReason> {
     let derived = apply(prev_state, t.changes()).map_err(|_| InvalidReason::BadChanges)?;
+    // A recompute failure is a mismatch: the claimed roots stand
+    // unverified, so the transition is rejected, never accepted.
     let members_match = set_root(
         MEMBER_SET_CONTEXT,
         &derived.members.iter().copied().collect::<Vec<_>>(),
-    ) == t.members_root;
+    )
+    .is_ok_and(|root| root == t.members_root);
     let owners_match = set_root(
         OWNER_SET_CONTEXT,
         &derived.owners.iter().copied().collect::<Vec<_>>(),
-    ) == t.owners_root;
+    )
+    .is_ok_and(|root| root == t.owners_root);
     if !(members_match && owners_match) {
         return Err(InvalidReason::RootMismatch);
     }

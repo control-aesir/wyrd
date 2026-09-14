@@ -24,9 +24,7 @@
 //! signature:   64 bytes (BIP-340 over the drive-bound signing message)
 //! ```
 
-use crate::identity::{
-    u32_len, ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, TransitionId,
-};
+use crate::identity::{u32_le, ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, TransitionId};
 use crate::store::ObjectStore;
 use thiserror::Error;
 
@@ -138,11 +136,7 @@ impl Snapshot {
     /// flags, timestamp — declared order, self-delimiting vectors.
     fn signing_preimage(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(
-            &u32_len(self.parents.len())
-                .expect("wire counts fit u32")
-                .to_le_bytes(),
-        );
+        out.extend_from_slice(&u32_le(self.parents.len()));
         for parent in &self.parents {
             out.extend_from_slice(parent.as_bytes());
         }

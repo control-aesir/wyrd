@@ -21,7 +21,7 @@
 //!   symlink:  u32 LE + bytes        target (UTF-8)
 //! ```
 
-use crate::identity::{u32_len, ContentId, ObjectKind, ID_LEN};
+use crate::identity::{u32_le, ContentId, ObjectKind, ID_LEN};
 use crate::store::ObjectStore;
 use std::cmp::Ordering;
 use thiserror::Error;
@@ -211,11 +211,7 @@ impl Tree {
     /// The canonical payload encoding (see the module docs).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(
-            &u32_len(self.entries.len())
-                .expect("wire counts fit u32")
-                .to_le_bytes(),
-        );
+        out.extend_from_slice(&u32_le(self.entries.len()));
         for entry in &self.entries {
             let kind = match &entry.content {
                 EntryContent::File { .. } => 0x00u8,
@@ -224,11 +220,7 @@ impl Tree {
             };
             out.push(kind);
             let name = entry.name.as_str();
-            out.extend_from_slice(
-                &u32_len(name.len())
-                    .expect("wire counts fit u32")
-                    .to_le_bytes(),
-            );
+            out.extend_from_slice(&u32_le(name.len()));
             out.extend_from_slice(name.as_bytes());
             match &entry.content {
                 EntryContent::File {
@@ -238,11 +230,7 @@ impl Tree {
                 } => {
                     out.extend_from_slice(&size.to_le_bytes());
                     out.push(u8::from(*executable));
-                    out.extend_from_slice(
-                        &u32_len(chunks.len())
-                            .expect("wire counts fit u32")
-                            .to_le_bytes(),
-                    );
+                    out.extend_from_slice(&u32_le(chunks.len()));
                     for chunk in chunks {
                         out.extend_from_slice(chunk.as_bytes());
                     }
@@ -251,11 +239,7 @@ impl Tree {
                     out.extend_from_slice(subtree.as_bytes());
                 }
                 EntryContent::Symlink { target } => {
-                    out.extend_from_slice(
-                        &u32_len(target.len())
-                            .expect("wire counts fit u32")
-                            .to_le_bytes(),
-                    );
+                    out.extend_from_slice(&u32_le(target.len()));
                     out.extend_from_slice(target.as_bytes());
                 }
             }

@@ -29,7 +29,7 @@
 //! non-empty well-formed changes, derive-the-roots, author authority) is
 //! the membership state machine's job.
 
-use crate::identity::{u32_len, DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
+use crate::identity::{u32_le, DeviceEncryptionKey, DeviceId, DriveId, TransitionId};
 use thiserror::Error;
 
 /// Context for deriving member-set roots. A format constant (epochs.md,
@@ -49,11 +49,7 @@ pub fn set_root(context: &'static str, devices: &[DeviceId]) -> [u8; 32] {
     sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     sorted.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
     let mut bytes = Vec::with_capacity(4 + 32 * sorted.len());
-    bytes.extend_from_slice(
-        &u32_len(sorted.len())
-            .expect("wire counts fit u32")
-            .to_le_bytes(),
-    );
+    bytes.extend_from_slice(&u32_le(sorted.len()));
     for device in sorted {
         bytes.extend_from_slice(device.as_bytes());
     }
@@ -149,19 +145,11 @@ impl MembershipTransition {
             }
             None => out.push(0x00),
         }
-        out.extend_from_slice(
-            &u32_len(self.resolves.len())
-                .expect("wire counts fit u32")
-                .to_le_bytes(),
-        );
+        out.extend_from_slice(&u32_le(self.resolves.len()));
         for id in &self.resolves {
             out.extend_from_slice(id.as_bytes());
         }
-        out.extend_from_slice(
-            &u32_len(self.changes.len())
-                .expect("wire counts fit u32")
-                .to_le_bytes(),
-        );
+        out.extend_from_slice(&u32_le(self.changes.len()));
         for change in &self.changes {
             out.push(change.tag());
             match change {
@@ -174,11 +162,7 @@ impl MembershipTransition {
                 }
                 Change::Rotate => {}
                 Change::SetOwners(owners) => {
-                    out.extend_from_slice(
-                        &u32_len(owners.len())
-                            .expect("wire counts fit u32")
-                            .to_le_bytes(),
-                    );
+                    out.extend_from_slice(&u32_le(owners.len()));
                     for device in owners {
                         out.extend_from_slice(device.as_bytes());
                     }

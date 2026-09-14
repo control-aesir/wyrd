@@ -193,6 +193,14 @@ pub(crate) fn u32_len(len: usize) -> Result<u32, CountOverflow> {
     u32::try_from(len).map_err(|_| CountOverflow(len))
 }
 
+/// Encode a collection length as a `u32` little-endian wire count.
+/// Centralizes the infallible-encoder policy: lengths are bounded at
+/// construction (see the `CountOverflow` checks there), so this asserts
+/// rather than propagates, keeping `encode` signatures infallible.
+pub(crate) fn u32_le(len: usize) -> [u8; 4] {
+    u32_len(len).expect("wire counts fit u32").to_le_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

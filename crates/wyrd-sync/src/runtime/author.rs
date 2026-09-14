@@ -281,11 +281,13 @@ where
             entries: root_entries,
             links: BTreeMap::new(),
         }];
-        // Subtrees assembled so far, by tree id, and the ids of frames
-        // currently on the stack. Content addressing makes a true
-        // reference cycle infeasible (it would need a hash cycle), so a
-        // re-entered in-progress id means a faulty store, failed closed.
-        let mut completed: BTreeMap<ContentId, ManifestRecord> = BTreeMap::new();
+        // Assembled child links, by subtree tree id: everything the
+        // parent frames need to link a completed subtree, without
+        // retaining a second full manifest graph (the records live only
+        // in `self.children`). Content addressing makes a true reference
+        // cycle infeasible (it would need a hash cycle), so a re-entered
+        // in-progress id means a faulty store, failed closed.
+        let mut completed: BTreeMap<ContentId, ChildManifest> = BTreeMap::new();
         let mut in_progress: BTreeSet<ContentId> = BTreeSet::from([tree_id]);
         while !stack.is_empty() {
             // Peek at the top frame's next entry without holding the
@@ -308,10 +310,9 @@ where
                         frame.next += 1;
                     }
                     wyrd_format::EntryContent::Dir { subtree } => {
-                        if let Some(done) = completed.get(&subtree) {
-                            let link = child_link(subtree, done)?;
+                        if let Some(link) = completed.get(&subtree) {
                             let frame = stack.last_mut().expect("walk stack nonempty");
-                            frame.links.insert(subtree, link);
+                            frame.links.insert(subtree, link.clone());
                             frame.next += 1;
                         } else {
                             if in_progress.contains(&subtree) {
@@ -363,7 +364,7 @@ where
                         return Ok(record);
                     }
                     let link = child_link(frame_id, &record)?;
-                    completed.insert(frame_id, record.clone());
+                    completed.insert(frame_id, link.clone());
                     self.children.push(ManifestRecord {
                         is_root: false,
                         ..record

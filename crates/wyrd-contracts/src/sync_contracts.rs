@@ -240,6 +240,12 @@ fn failed_pass_recovers_serving_on_retry() {
 /// rather than projecting from untrustworthy state. The view keeps
 /// serving exactly what it served before: refresh is all-or-nothing,
 /// never a partial head set, never a clear.
+///
+/// This pins the decided v0 post-corruption policy (`docs/epochs.md`,
+/// Heads: projection failure ⇒ installed heads unchanged ⇒ failure
+/// surfaced to the caller ⇒ no automatic repair, resync, or clear.
+/// The installed projection is the last known-good state, not an
+/// endorsement of the damaged durable bytes.
 #[test]
 fn failed_projection_leaves_installed_heads_untouched() {
     let mut loaded = Loaded::new("hello.txt", b"hello");

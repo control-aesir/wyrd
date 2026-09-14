@@ -402,6 +402,18 @@ single sanctioned remedy.
   lineage.
 - Superseded, stranded, and voided objects are never deleted (append-only);
   GC rules, when they exist someday, may revisit this.
+- **Post-corruption projection behavior (v0, decided):** when replay or
+  classification cannot produce a valid projection from the durable
+  state, Wyrd preserves the last successfully installed heads and
+  surfaces the projection error to the caller. The installed projection
+  is not an endorsement of the newly replayed state — observed is not
+  valid, and a failed projection never replaces a previously installed
+  trustworthy projection with less trustworthy state. Wyrd does not
+  automatically repair, resynchronize, or clear the installed heads in
+  v0, and v0 defines no persistent daemon error-state model: a future
+  presentation layer may expose "operating from the last known-good
+  projection while durable state reports an integrity error" as a
+  degraded state, but the runtime does not invent one.
 
 ## Edge cases
 

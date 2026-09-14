@@ -100,7 +100,12 @@ mod store;
 mod tests;
 
 pub use replay::{LoadedFacts, Rebuilt};
+// Raw-commit test seam (planted-forgery tests): unused outside cfg(test).
+#[allow(unused_imports)]
+pub(crate) use codec::{encode_commit, TAG_SNAPSHOT_BODY};
 pub(crate) use store::atomic_write;
+#[allow(unused_imports)]
+pub(crate) use store::commit_name;
 #[allow(unused_imports)]
 pub(crate) use store::CrashStage;
 pub use store::DurableStore;

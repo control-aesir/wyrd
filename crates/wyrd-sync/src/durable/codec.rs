@@ -34,7 +34,9 @@ const TAG_LOCAL_OBJECT: u8 = 0x05;
 const TAG_MATERIALIZATION: u8 = 0x06;
 const TAG_CONTROL_MESSAGE: u8 = 0x07;
 const TAG_OBJECT_REMOVED: u8 = 0x08;
-const TAG_SNAPSHOT_BODY: u8 = 0x09;
+/// Crate-visible for the raw-commit test seam: the planted-forgery tests
+/// encode records no typed `Fact` can carry.
+pub(crate) const TAG_SNAPSHOT_BODY: u8 = 0x09;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
@@ -89,8 +91,9 @@ fn commit_hash(drive: &DriveId, seq: u64, prev: &[u8; 32], records: &[u8]) -> [u
 }
 
 /// Serialize one commit and hash it: header (version, sequence,
-/// previous hash) + records + trailer hash.
-pub(super) fn encode_commit(
+/// previous hash) + records + trailer hash. Crate-visible for the
+/// raw-commit test seam alongside `TAG_SNAPSHOT_BODY`.
+pub(crate) fn encode_commit(
     drive: &DriveId,
     seq: u64,
     prev: &[u8; 32],

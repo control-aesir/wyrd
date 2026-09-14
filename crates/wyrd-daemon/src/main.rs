@@ -548,4 +548,232 @@ mod tests {
             "both failing still fails"
         );
     }
+
+    /// Credential files are opened `O_NOFOLLOW`: a symlink is refused
+    /// as a filesystem loop, never followed to its target.
+    #[cfg(unix)]
+    #[test]
+    fn credential_symlinks_are_rejected_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let target = temp.0.join("target");
+        write_secret(&target, [0x11; 32]);
+        let link = temp.0.join("link");
+        symlink(&target, &link).unwrap();
+        let error = read_identity(&link).unwrap_err();
+        assert!(
+            matches!(&error, CliError::Io { source, .. }
+                if source.raw_os_error() == Some(libc::ELOOP)),
+            "a symlinked identity must fail closed: {error:?}"
+        );
+
+        // The passphrase rides the same reader: a symlinked
+        // passphrase fails the wired credential path too.
+        let identity_file = temp.0.join("identity");
+        write_secret(&identity_file, [0x11; 32]);
+        let passphrase_target = temp.0.join("passphrase-target");
+        write_secret(&passphrase_target, b"test-pass\n");
+        let passphrase_link = temp.0.join("passphrase");
+        symlink(&passphrase_target, &passphrase_link).unwrap();
+        let error = read_credentials(&Credentials {
+            identity_file,
+            passphrase_file: passphrase_link,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, CliError::Io { source, .. }
+                if source.raw_os_error() == Some(libc::ELOOP)),
+            "a symlinked passphrase must fail closed: {error:?}"
+        );
+    }
+
+    /// Credential files are bounded: over 4096 bytes is refused, and
+    /// exactly 4096 still reads.
+    #[cfg(unix)]
+    #[test]
+    fn oversized_credential_files_are_rejected() {
+        let temp = TempDir::new();
+        let big = temp.0.join("big");
+        write_secret(&big, vec![b'x'; 4097]);
+        let error = read_secret_file(&big).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CliError::Credential {
+                    reason: "exceeds the 4096-byte size limit",
+                    ..
+                }
+            ),
+            "oversize must name its stage: {error:?}"
+        );
+
+        let edge = temp.0.join("edge");
+        write_secret(&edge, vec![b'x'; 4096]);
+        assert!(
+            read_secret_file(&edge).is_ok(),
+            "exactly the limit still reads"
+        );
+    }
+
+    /// Formatted CLI errors name paths and reasons, never secret
+    /// bytes: neither a rejected passphrase nor a rejected identity
+    /// scalar may appear in its own error text.
+    #[cfg(unix)]
+    #[test]
+    fn credential_contents_never_appear_in_errors() {
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        write_secret(&identity_file, [0x11; 32]);
+
+        // A non-UTF8 passphrase fails after the secret is read: the
+        // marker must not surface in the usage error.
+        let passphrase_file = temp.0.join("passphrase");
+        let mut marker = b"sekrit-marker-".to_vec();
+        marker.extend_from_slice(&[0xff, 0xfe]);
+        write_secret(&passphrase_file, &marker);
+        let error = read_credentials(&Credentials {
+            identity_file: identity_file.clone(),
+            passphrase_file,
+        })
+        .unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            !text.contains("sekrit-marker"),
+            "passphrase bytes leaked: {text}"
+        );
+
+        // A 32-byte scalar outside the curve range fails identity
+        // validation: its hex must not surface either.
+        let bad_scalar = temp.0.join("bad-scalar");
+        write_secret(&bad_scalar, [0xff; 32]);
+        let error = read_identity(&bad_scalar).unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            !text.contains(&hex::encode([0xff; 32])),
+            "identity bytes leaked: {text}"
+        );
+
+        // The oversize stage names the file and the limit, never the
+        // content that overflowed it.
+        let big = temp.0.join("big");
+        write_secret(&big, [b's'; 4097]);
+        let error = read_secret_file(&big).unwrap_err();
+        let text = format!("{error}");
+        assert!(!text.contains("ssss"), "oversized content leaked: {text}");
+    }
+
+    /// The static mount serves a read-only `wyrd` filesystem: the
+    /// kernel must never see a writable mount from this binary.
+    #[test]
+    fn mount_uses_a_read_only_filesystem_name() {
+        let config = session_config();
+        assert!(
+            config
+                .mount_options
+                .iter()
+                .any(|option| matches!(option, MountOption::RO)),
+            "the mount is read-only"
+        );
+        assert!(
+            config
+                .mount_options
+                .iter()
+                .any(|option| matches!(option, MountOption::FSName(name) if name == "wyrd")),
+            "the mount names itself"
+        );
+    }
+
+    /// The mount preamble composes without a kernel: open the
+    /// keystore, build the daemon over the file store, author, and
+    /// the classified projection serves — the same steps `mount`
+    /// runs before binding FUSE.
+    #[test]
+    fn mount_preamble_projects_authorized_heads_without_fuse() {
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        let passphrase_file = temp.0.join("passphrase");
+        let drive = temp.0.join("drive");
+        write_secret(&identity_file, [0x11; 32]);
+        write_secret(&passphrase_file, b"test-pass\n");
+        command(vec![
+            "init".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap();
+
+        let identity = read_identity(&identity_file).unwrap();
+        let engine = Engine::open_keystore(drive.clone(), "test-pass", identity).unwrap();
+        let store = FsObjectStore::open(drive).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.put_file("hello.txt", b"hello mount").unwrap();
+        daemon.refresh_live_heads().unwrap();
+        let node = daemon.view().lookup("hello.txt").unwrap();
+        let file = daemon.view().open(&node).unwrap();
+        assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello mount");
+    }
+
+    /// The full static mount, gated on an environment that vouches
+    /// for kernel FUSE and local networking: init, author, mount in
+    /// a thread, read through the mountpoint, prove read-only,
+    /// shut down, and rejoin cleanly. Skips with a clear message
+    /// otherwise — never fails a machine without FUSE.
+    #[test]
+    fn live_mount_serves_read_only_until_shutdown() {
+        if std::env::var("WYRD_TEST_MOUNT").is_err() {
+            eprintln!("skipping live mount test: set WYRD_TEST_MOUNT=1 where kernel FUSE and local networking are available");
+            return;
+        }
+        let temp = TempDir::new();
+        let identity_file = temp.0.join("identity");
+        let passphrase_file = temp.0.join("passphrase");
+        let drive = temp.0.join("drive");
+        write_secret(&identity_file, [0x11; 32]);
+        write_secret(&passphrase_file, b"test-pass\n");
+        command(vec![
+            "init".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap();
+
+        let identity = read_identity(&identity_file).unwrap();
+        let engine = Engine::open_keystore(drive.clone(), "test-pass", identity.clone()).unwrap();
+        let store = FsObjectStore::open(drive.clone()).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.put_file("hello.txt", b"hello mount").unwrap();
+        drop(daemon);
+
+        let mountpoint = temp.0.join("mnt");
+        fs::create_dir_all(&mountpoint).unwrap();
+        let server =
+            std::thread::spawn(move || mount(drive, mountpoint, Vec::new(), "test-pass", identity));
+        let target = temp.0.join("mnt").join("hello.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !target.is_file() {
+            if std::time::Instant::now() > deadline {
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                panic!("the mount did not serve in time");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"hello mount");
+        assert!(
+            fs::write(&target, b"nope").is_err(),
+            "the static mount is read-only"
+        );
+        SHUTDOWN.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+        assert!(
+            fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
+            "a clean unmount releases the mountpoint"
+        );
+    }
 }

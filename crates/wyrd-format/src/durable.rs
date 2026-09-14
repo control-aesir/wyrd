@@ -275,12 +275,31 @@ mod tests {
         dir
     }
 
-    /// Directory-sync calls seen by the tests that inject failures.
-    static SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+    // Directory-sync calls seen by the tests that inject failures.
+    // Thread-local: the suite runs tests concurrently in one binary,
+    // and a shared counter let one test's reset steal another test's
+    // injected failure. A thread runs one test at a time, so
+    // resetting at the test's start is race-free.
+    thread_local! {
+        static SYNC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn reset_sync_calls() {
+        SYNC_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn sync_calls() -> u64 {
+        SYNC_CALLS.with(|calls| calls.get())
+    }
 
     /// Fails the first call, then defers to the real `fsync_dir`.
     fn fail_first_sync(dir: &Path) -> io::Result<()> {
-        if SYNC_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+        let call = SYNC_CALLS.with(|calls| {
+            let call = calls.get();
+            calls.set(call + 1);
+            call
+        });
+        if call == 0 {
             return Err(io::Error::other("injected directory fsync failure"));
         }
         fsync_dir(dir)
@@ -288,7 +307,7 @@ mod tests {
 
     /// Counts calls and defers to the real `fsync_dir`.
     fn count_sync(dir: &Path) -> io::Result<()> {
-        SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
+        SYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
         fsync_dir(dir)
     }
 
@@ -361,7 +380,7 @@ mod tests {
         // directory-sync failure is reported as its own stage and is
         // remembered for reconciliation.
         let dir = scratch_dir();
-        SYNC_CALLS.store(0, Ordering::SeqCst);
+        reset_sync_calls();
         let durability = Durability::with_sync(fail_first_sync);
         let path = dir.join("live");
         let temp = dir.join(".tmp-live");
@@ -374,7 +393,7 @@ mod tests {
         assert!(path.is_file(), "the rename published the file");
         // The failed directory is reconciled on the next attempt.
         durability.reconcile().unwrap();
-        assert_eq!(SYNC_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(sync_calls(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -384,7 +403,7 @@ mod tests {
         // to sync the grandparent; the retry must perform that sync even
         // though the directory now exists.
         let dir = scratch_dir();
-        SYNC_CALLS.store(0, Ordering::SeqCst);
+        reset_sync_calls();
         let durability = Durability::with_sync(fail_first_sync);
         let temp = dir.join("newtop").join("leaf");
         assert!(durability.write_temp(&temp, b"first").is_err());
@@ -392,7 +411,7 @@ mod tests {
         durability.write_temp(&temp, b"second").unwrap();
         assert!(temp.is_file());
         assert!(
-            SYNC_CALLS.load(Ordering::SeqCst) >= 2,
+            sync_calls() >= 2,
             "the retry must re-sync the created directory's parent"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -403,11 +422,11 @@ mod tests {
         // A fresh durability layer has nothing verified: the first
         // `verify_dir` syncs, later calls are a set lookup.
         let dir = scratch_dir();
-        SYNC_CALLS.store(0, Ordering::SeqCst);
+        reset_sync_calls();
         let durability = Durability::with_sync(count_sync);
         durability.verify_dir(&dir).unwrap();
         durability.verify_dir(&dir).unwrap();
-        assert_eq!(SYNC_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(sync_calls(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

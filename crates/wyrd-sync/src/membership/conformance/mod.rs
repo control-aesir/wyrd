@@ -22,16 +22,16 @@ pub(super) fn signed(
     members: &[DeviceId],
     owners: &[DeviceId],
 ) -> MembershipTransition {
-    let mut t = MembershipTransition {
+    let mut t = MembershipTransition::new(
         epoch,
         prev,
         resolves,
         changes,
-        members_root: set_root(MEMBER_SET_CONTEXT, members),
-        owners_root: set_root(OWNER_SET_CONTEXT, owners),
-        author: *owners.first().expect("fixture names an author via owners"),
-        signature: [0; 64],
-    };
+        set_root(MEMBER_SET_CONTEXT, members),
+        set_root(OWNER_SET_CONTEXT, owners),
+        *owners.first().expect("fixture names an author via owners"),
+    )
+    .unwrap();
     sign(&mut t, &b.sk, &b.drive);
     t
 }

@@ -121,9 +121,50 @@ pub enum MembershipError {
     InvalidPrevFlag(u8),
     #[error("unknown change tag byte {0:#04x}")]
     UnknownChangeTag(u8),
+    #[error("length {0} exceeds the u32 wire count")]
+    CountOverflow(usize),
 }
 
 impl MembershipTransition {
+    /// A transition with an all-zero signature (unsigned draft). The sync
+    /// layer signs and fills the signature. Counts beyond the `u32` wire
+    /// format are rejected so the infallible encoders only ever see
+    /// encodable values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        epoch: u64,
+        prev: Option<TransitionId>,
+        resolves: Vec<TransitionId>,
+        changes: Vec<Change>,
+        members_root: [u8; 32],
+        owners_root: [u8; 32],
+        author: DeviceId,
+    ) -> Result<Self, MembershipError> {
+        if resolves.len() > u32::MAX as usize {
+            return Err(MembershipError::CountOverflow(resolves.len()));
+        }
+        if changes.len() > u32::MAX as usize {
+            return Err(MembershipError::CountOverflow(changes.len()));
+        }
+        for change in &changes {
+            if let Change::SetOwners(owners) = change {
+                if owners.len() > u32::MAX as usize {
+                    return Err(MembershipError::CountOverflow(owners.len()));
+                }
+            }
+        }
+        Ok(MembershipTransition {
+            epoch,
+            prev,
+            resolves,
+            changes,
+            members_root,
+            owners_root,
+            author,
+            signature: [0; 64],
+        })
+    }
+
     /// The BIP-340 message: `ASCII("wyrd membership v1") ‖ DriveId ‖
     /// signing preimage` (trust.md "Exact signing construction"). The
     /// sync layer signs and verifies exactly these bytes.
@@ -332,16 +373,18 @@ mod tests {
     }
 
     fn sample() -> MembershipTransition {
-        MembershipTransition {
-            epoch: 2,
-            prev: Some(transition_id(0x10)),
-            resolves: Vec::new(),
-            changes: vec![Change::Rotate],
-            members_root: [0x20; 32],
-            owners_root: [0x21; 32],
-            author: device(0x30),
-            signature: [0x40; 64],
-        }
+        let mut transition = MembershipTransition::new(
+            2,
+            Some(transition_id(0x10)),
+            Vec::new(),
+            vec![Change::Rotate],
+            [0x20; 32],
+            [0x21; 32],
+            device(0x30),
+        )
+        .unwrap();
+        transition.signature = [0x40; 64];
+        transition
     }
 
     #[test]

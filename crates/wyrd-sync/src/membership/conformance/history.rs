@@ -16,16 +16,16 @@ fn invalid_setowners_cases() {
     let (_sk2, member) = key(2);
     // SetOwners of a non-member: the final owners ⊆ members check fails.
     // Hand-built so the author stays the legitimate owner.
-    let mut non_member = MembershipTransition {
-        epoch: 2,
-        prev: Some(genesis.transition_id()),
-        resolves: Vec::new(),
-        changes: vec![Change::SetOwners(vec![stranger])],
-        members_root: set_root(MEMBER_SET_CONTEXT, &[owner]),
-        owners_root: set_root(OWNER_SET_CONTEXT, &[stranger]),
-        author: owner,
-        signature: [0; 64],
-    };
+    let mut non_member = MembershipTransition::new(
+        2,
+        Some(genesis.transition_id()),
+        Vec::new(),
+        vec![Change::SetOwners(vec![stranger])],
+        set_root(MEMBER_SET_CONTEXT, &[owner]),
+        set_root(OWNER_SET_CONTEXT, &[stranger]),
+        owner,
+    )
+    .unwrap();
     sign(&mut non_member, &b.sk, &b.drive);
     // Multiple owners in v0.
     let multi = signed(
@@ -121,16 +121,16 @@ fn removal_of_unknown_member_is_invalid() {
     let (b, genesis) = Builder::genesis(1);
     let owner = *b.owners.iter().next().unwrap();
     let (_sk, stranger) = key(3);
-    let mut t = MembershipTransition {
-        epoch: 2,
-        prev: Some(genesis.transition_id()),
-        resolves: Vec::new(),
-        changes: vec![Change::Remove(stranger)],
-        members_root: set_root(MEMBER_SET_CONTEXT, &[]),
-        owners_root: set_root(OWNER_SET_CONTEXT, &[]),
-        author: owner,
-        signature: [0; 64],
-    };
+    let mut t = MembershipTransition::new(
+        2,
+        Some(genesis.transition_id()),
+        Vec::new(),
+        vec![Change::Remove(stranger)],
+        set_root(MEMBER_SET_CONTEXT, &[]),
+        set_root(OWNER_SET_CONTEXT, &[]),
+        owner,
+    )
+    .unwrap();
     sign(&mut t, &b.sk, &b.drive);
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&genesis, &t]);

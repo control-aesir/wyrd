@@ -510,16 +510,16 @@ fn signed(
     author_sk: &secp256k1::SecretKey,
     author: DeviceId,
 ) -> MembershipTransition {
-    let mut t = MembershipTransition {
+    let mut t = MembershipTransition::new(
         epoch,
         prev,
         resolves,
         changes,
-        members_root: set_root(MEMBER_SET_CONTEXT, members),
-        owners_root: set_root(OWNER_SET_CONTEXT, owners),
+        set_root(MEMBER_SET_CONTEXT, members),
+        set_root(OWNER_SET_CONTEXT, owners),
         author,
-        signature: [0; 64],
-    };
+    )
+    .unwrap();
     sign(&mut t, author_sk, &b.drive);
     t
 }

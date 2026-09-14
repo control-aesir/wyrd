@@ -381,16 +381,16 @@ mod tests {
                 encryption_key: DeviceEncryptionKey::from_bytes([b ^ 0xA5; 32]),
             })
         };
-        let valid = MembershipTransition {
-            epoch: 2,
-            prev: Some(TransitionId::from_bytes([0x10; 32])),
-            resolves: vec![TransitionId::from_bytes([0x11; 32])],
-            changes: vec![admit(0x20), Change::SetOwners(vec![owner])],
-            members_root: [0x20; 32],
-            owners_root: [0x21; 32],
-            author: owner,
-            signature: [0x40; 64],
-        };
+        let valid = MembershipTransition::new(
+            2,
+            Some(TransitionId::from_bytes([0x10; 32])),
+            vec![TransitionId::from_bytes([0x11; 32])],
+            vec![admit(0x20), Change::SetOwners(vec![owner])],
+            [0x20; 32],
+            [0x21; 32],
+            owner,
+        )
+        .unwrap();
         assert!(check_transition(&SMALL, &valid).is_ok());
         let mut too_many_changes = valid.clone();
         too_many_changes.changes.push(Change::Rotate);

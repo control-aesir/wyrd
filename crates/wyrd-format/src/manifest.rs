@@ -223,6 +223,12 @@ impl Manifest {
         entries: BTreeMap<ContentId, ManifestEntry>,
         children: BTreeMap<ContentId, ChildManifest>,
     ) -> Result<Self, ManifestError> {
+        if entries.len() > u32::MAX as usize {
+            return Err(ManifestError::CountOverflow(entries.len()));
+        }
+        if children.len() > u32::MAX as usize {
+            return Err(ManifestError::CountOverflow(children.len()));
+        }
         for (key, entry) in &entries {
             if key != &entry.content_id {
                 return Err(ManifestError::UnsortedEntries);

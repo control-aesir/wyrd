@@ -78,16 +78,16 @@ impl Builder {
     pub fn genesis(sk_byte: u8) -> (Self, MembershipTransition) {
         let (sk, owner) = key(sk_byte);
         let drive = drive();
-        let mut t = MembershipTransition {
-            epoch: 1,
-            prev: None,
-            resolves: Vec::new(),
-            changes: vec![admit(owner), Change::SetOwners(vec![owner])],
-            members_root: set_root(MEMBER_SET_CONTEXT, &[owner]),
-            owners_root: set_root(OWNER_SET_CONTEXT, &[owner]),
-            author: owner,
-            signature: [0; 64],
-        };
+        let mut t = MembershipTransition::new(
+            1,
+            None,
+            Vec::new(),
+            vec![admit(owner), Change::SetOwners(vec![owner])],
+            set_root(MEMBER_SET_CONTEXT, &[owner]),
+            set_root(OWNER_SET_CONTEXT, &[owner]),
+            owner,
+        )
+        .unwrap();
         sign(&mut t, &sk, &drive);
         (
             Builder {
@@ -109,22 +109,22 @@ impl Builder {
     pub fn child(&mut self, changes: Vec<Change>) -> MembershipTransition {
         let author = *self.owners.iter().next().expect("tracked owner");
         self.apply_mirror(&changes);
-        let mut t = MembershipTransition {
-            epoch: self.epoch + 1,
-            prev: self.prev,
-            resolves: Vec::new(),
+        let mut t = MembershipTransition::new(
+            self.epoch + 1,
+            self.prev,
+            Vec::new(),
             changes,
-            members_root: set_root(
+            set_root(
                 MEMBER_SET_CONTEXT,
                 &self.members.iter().copied().collect::<Vec<_>>(),
             ),
-            owners_root: set_root(
+            set_root(
                 OWNER_SET_CONTEXT,
                 &self.owners.iter().copied().collect::<Vec<_>>(),
             ),
             author,
-            signature: [0; 64],
-        };
+        )
+        .unwrap();
         sign(&mut t, &self.sk, &self.drive);
         self.prev = Some(t.transition_id());
         self.epoch = t.epoch;

@@ -113,9 +113,9 @@ fn announcement(child: &MembershipTransition) -> SnapshotAnnouncement {
 }
 
 fn manifest_record() -> ManifestRecord {
-    let manifest = Manifest {
-        snapshot: SnapshotId::from_bytes([1; 32]),
-        entries: vec![ManifestEntry {
+    let manifest = Manifest::new(
+        SnapshotId::from_bytes([1; 32]),
+        vec![ManifestEntry {
             content_id: ContentId::from_bytes([4; 32]),
             kind: ObjectKind::Chunk,
             version: 0,
@@ -124,8 +124,9 @@ fn manifest_record() -> ManifestRecord {
             size: 123,
             transport: BaoRoot::from_bytes([0xB0; 32]),
         }],
-        children: vec![],
-    };
+        Vec::new(),
+    )
+    .unwrap();
     let manifest_id = ContentId::derive(ObjectKind::Manifest, &manifest.canonical_bytes());
     ManifestRecord {
         is_root: true,

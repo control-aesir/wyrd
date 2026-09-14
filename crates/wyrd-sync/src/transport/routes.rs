@@ -62,7 +62,7 @@ pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) 
         report.published += 4;
     }
     for record in state.manifest_records() {
-        let Some(address) = providers.get(&record.manifest.snapshot) else {
+        let Some(address) = providers.get(&record.manifest.snapshot()) else {
             continue;
         };
         let reference = |hash: &BaoRoot| IrohBlobRef {
@@ -75,12 +75,12 @@ pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) 
             bulk.publish_sealed(*storage, reference(transport));
             report.published += 1;
         }
-        for entry in &record.manifest.entries {
+        for entry in record.manifest.entries() {
             bulk.publish_transport(reference(&entry.transport));
             bulk.publish_sealed(entry.storage_id, reference(&entry.transport));
             report.published += 2;
         }
-        for link in &record.manifest.children {
+        for link in record.manifest.children() {
             bulk.publish_transport(reference(&link.transport));
             bulk.publish_sealed(link.storage, reference(&link.transport));
             report.published += 2;
@@ -119,11 +119,7 @@ mod tests {
         let drive = DriveId::from_bytes([0xEE; 32]);
         let snapshot = SnapshotId::from_bytes([0x11; 32]);
         let key = EpochSecret::from_bytes([0x51; 32]).manifest_key(&drive, 1, &snapshot);
-        let manifest = Manifest {
-            snapshot,
-            entries: Vec::new(),
-            children: Vec::new(),
-        };
+        let manifest = Manifest::new(snapshot, Vec::new(), Vec::new()).unwrap();
         let (id_a, obj_a) = seal_manifest(&key, &manifest).unwrap();
         let (id_b, obj_b) = seal_manifest(&key, &manifest).unwrap();
         assert_eq!(id_a, id_b, "same plaintext, same logical identity");

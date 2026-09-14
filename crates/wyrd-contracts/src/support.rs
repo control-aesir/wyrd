@@ -612,11 +612,7 @@ pub(crate) fn seal_flat_drive(
             b.version,
         ))
     });
-    let manifest = Manifest {
-        snapshot: *snapshot_id,
-        entries: manifest_entries,
-        children: Vec::new(),
-    };
+    let manifest = Manifest::new(*snapshot_id, manifest_entries, Vec::new()).unwrap();
     let (manifest_id, manifest_obj) = seal::seal_manifest(
         &epoch_secret.manifest_key(drive, epoch, snapshot_id),
         &manifest,

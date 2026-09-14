@@ -414,11 +414,7 @@ pub(crate) fn empty_roots(
     epoch: u64,
     snapshot: &SnapshotId,
 ) -> AnnouncedRoots {
-    let manifest = Manifest {
-        snapshot: *snapshot,
-        entries: Vec::new(),
-        children: Vec::new(),
-    };
+    let manifest = Manifest::new(*snapshot, Vec::new(), Vec::new()).unwrap();
     let key = epoch_secret.manifest_key(&member_drive(), epoch, snapshot);
     let (manifest_id, obj) = crate::seal::seal_manifest(&key, &manifest).unwrap();
     bulk.publish_root(
@@ -563,11 +559,7 @@ pub(crate) fn publish_into(
     )
     .unwrap();
 
-    let child_manifest = Manifest {
-        snapshot,
-        entries: vec![],
-        children: vec![],
-    };
+    let child_manifest = Manifest::new(snapshot, Vec::new(), Vec::new()).unwrap();
     let manifest_key = manifest_secret.manifest_key(&drive, manifest_epoch, &snapshot);
     let object_transport = entry.transport;
     let (child_id, sealed_child) = seal_manifest(&manifest_key, &child_manifest).unwrap();
@@ -579,11 +571,7 @@ pub(crate) fn publish_into(
         // (decision 26) — recomputed exactly as the authoring path does.
         transport: BaoRoot::from_bytes(*blake3::hash(&sealed_child.encode()).as_bytes()),
     };
-    let root = Manifest {
-        snapshot,
-        entries: vec![entry],
-        children: vec![link],
-    };
+    let root = Manifest::new(snapshot, vec![entry], vec![link]).unwrap();
     let (root_id, sealed_root) = seal_manifest(&manifest_key, &root).unwrap();
 
     bulk.publish_root(

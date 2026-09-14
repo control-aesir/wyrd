@@ -1213,32 +1213,32 @@ mod tests {
         let root_record = state
             .root_manifest_record(&snapshot_id)
             .expect("the authored root manifest records with the head");
-        assert_eq!(root_record.manifest.snapshot, snapshot_id);
+        assert_eq!(root_record.manifest.snapshot(), snapshot_id);
         // Every manifest self-maps its tree node plus its content entries.
         assert_eq!(
-            root_record.manifest.entries.len(),
+            root_record.manifest.entries().len(),
             2,
             "self-mapped tree plus the root file chunk"
         );
         assert!(root_record
             .manifest
-            .entries
+            .entries()
             .iter()
             .any(|entry| entry.kind == ObjectKind::Tree && entry.content_id == root));
-        let link = &root_record.manifest.children[0];
+        let link = &root_record.manifest.children()[0];
         assert_eq!(link.tree, leaf, "the child link names the subtree tree");
         let child = state
             .manifest_record(&link.manifest)
             .expect("the authored child manifest records before the parent");
-        assert_eq!(child.manifest.snapshot, snapshot_id);
-        assert_eq!(child.manifest.entries.len(), 2);
+        assert_eq!(child.manifest.snapshot(), snapshot_id);
+        assert_eq!(child.manifest.entries().len(), 2);
         assert!(child
             .manifest
-            .entries
+            .entries()
             .iter()
             .any(|entry| entry.kind == ObjectKind::Tree && entry.content_id == leaf));
         assert!(
-            child.manifest.children.is_empty(),
+            child.manifest.children().is_empty(),
             "leaf manifests map flat"
         );
 
@@ -1247,7 +1247,7 @@ mod tests {
         // the key for its own kind, content, and version.
         let epoch_secret = secret(0x07 + epoch as u8);
         for record in [root_record, child] {
-            for entry in &record.manifest.entries {
+            for entry in record.manifest.entries() {
                 let expected = objects.get(&entry.content_id).unwrap().unwrap();
                 let envelope = pair
                     .a
@@ -1630,7 +1630,7 @@ mod tests {
             .unwrap()
             .expect("the root manifest serves after restart");
         assert_eq!(served_root.content_id, root_record.manifest_id);
-        for entry in &root_record.manifest.entries {
+        for entry in root_record.manifest.entries() {
             let bytes = source
                 .fetch_sealed(&entry.storage_id, usize::MAX)
                 .unwrap()
@@ -1762,28 +1762,28 @@ mod tests {
             .root_manifest_record(&snapshot_id)
             .expect("the authored root manifest records");
         assert_eq!(
-            root_record.manifest.entries.len(),
+            root_record.manifest.entries().len(),
             2,
             "self-mapped tree plus one canonical mapping per logical chunk"
         );
         assert_eq!(
-            root_record.manifest.children.len(),
+            root_record.manifest.children().len(),
             1,
             "one canonical link per logical subtree"
         );
-        assert_eq!(root_record.manifest.children[0].tree, leaf);
+        assert_eq!(root_record.manifest.children()[0].tree, leaf);
 
         // The child manifest maps the same chunk to the same
         // representation the root maps: the session cache reused one
         // seal, so both mappings name servable bytes identically.
         let child = state
-            .manifest_record(&root_record.manifest.children[0].manifest)
+            .manifest_record(&root_record.manifest.children()[0].manifest)
             .expect("the child manifest records");
-        assert_eq!(child.manifest.entries.len(), 2);
+        assert_eq!(child.manifest.entries().len(), 2);
         let chunk_transport = |record: &super::super::ManifestRecord| {
             record
                 .manifest
-                .entries
+                .entries()
                 .iter()
                 .find(|entry| entry.kind == ObjectKind::Chunk && entry.content_id == chunk)
                 .expect("maps the shared chunk")
@@ -1874,14 +1874,14 @@ mod tests {
                     .root_manifest_record(&snapshot_id)
                     .expect("the deep root manifest records");
                 assert_eq!(
-                    root_record.manifest.children.len(),
+                    root_record.manifest.children().len(),
                     2,
                     "the chain link plus the mid-chain mirror"
                 );
                 assert_eq!(
                     state
                         .manifest_records()
-                        .filter(|record| record.manifest.snapshot == snapshot_id)
+                        .filter(|record| record.manifest.snapshot() == snapshot_id)
                         .count(),
                     DEPTH + 1,
                     "one manifest per tree node in the chain"
@@ -1894,7 +1894,7 @@ mod tests {
                 for i in (0..DEPTH).rev() {
                     let link = current
                         .manifest
-                        .children
+                        .children()
                         .iter()
                         .find(|link| link.tree == chain[i])
                         .expect("chain link present");
@@ -1903,7 +1903,7 @@ mod tests {
                         .expect("child manifest records");
                     let expected_kids = if i == 0 { 0 } else { 1 };
                     assert_eq!(
-                        child.manifest.children.len(),
+                        child.manifest.children().len(),
                         expected_kids,
                         "chain manifest {i} links exactly its child"
                     );
@@ -1912,7 +1912,7 @@ mod tests {
                 }
                 let mirror = root_record
                     .manifest
-                    .children
+                    .children()
                     .iter()
                     .find(|link| link.tree == mid)
                     .expect("mirror link present");
@@ -2014,7 +2014,7 @@ mod tests {
         let chunk_entry = |record: &super::super::ManifestRecord| {
             record
                 .manifest
-                .entries
+                .entries()
                 .iter()
                 .find(|entry| entry.kind == ObjectKind::Chunk && entry.content_id == chunk)
                 .cloned()
@@ -2107,7 +2107,7 @@ mod tests {
                 .is_some(),
             "the re-authored snapshot serves after the crash recovery"
         );
-        for entry in &record.manifest.entries {
+        for entry in record.manifest.entries() {
             assert!(
                 source
                     .fetch_sealed(&entry.storage_id, usize::MAX)
@@ -2295,11 +2295,7 @@ mod tests {
             plaintext,
         )
         .unwrap();
-        let manifest = Manifest {
-            snapshot,
-            entries: vec![entry],
-            children: Vec::new(),
-        };
+        let manifest = Manifest::new(snapshot, vec![entry], Vec::new()).unwrap();
         let manifest_key = epoch_secret.manifest_key(&member_drive(), epoch, &snapshot);
         let (manifest_id, manifest_obj) =
             crate::seal::seal_manifest(&manifest_key, &manifest).unwrap();

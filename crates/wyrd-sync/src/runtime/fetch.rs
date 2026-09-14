@@ -247,7 +247,7 @@ fn open_record(
     // fetch); decode-level ceilings still apply here.
     let obj = EncryptedObject::decode(sealed).ok()?;
     let manifest = open_manifest(key, expected, &obj).ok()?;
-    if check_manifest(&Limits::V0, &manifest).is_err() || manifest.snapshot != snapshot {
+    if check_manifest(&Limits::V0, &manifest).is_err() || manifest.snapshot() != snapshot {
         return None;
     }
     let transport = crate::seal::transport_root(&obj);
@@ -589,11 +589,7 @@ mod tests {
         // serves the fork instead.
         let (root_a, sealed_a) = seal_manifest(
             &manifest_key,
-            &Manifest {
-                snapshot,
-                entries: vec![],
-                children: vec![],
-            },
+            &Manifest::new(snapshot, Vec::new(), Vec::new()).unwrap(),
         )
         .unwrap();
         // Root B: a well-sealed manifest under the same snapshot key
@@ -621,11 +617,7 @@ mod tests {
         .unwrap();
         let (root_b, sealed_b) = seal_manifest(
             &manifest_key,
-            &Manifest {
-                snapshot,
-                entries: vec![probe_entry],
-                children: vec![],
-            },
+            &Manifest::new(snapshot, vec![probe_entry], Vec::new()).unwrap(),
         )
         .unwrap();
         assert_ne!(root_a, root_b, "distinct manifests must yield distinct ids");
@@ -855,11 +847,7 @@ mod tests {
             (snapshot_a, bad, &mut roots_a),
             (snapshot_b, good, &mut roots_b),
         ] {
-            let manifest = Manifest {
-                snapshot,
-                entries: vec![entry],
-                children: vec![],
-            };
+            let manifest = Manifest::new(snapshot, vec![entry], Vec::new()).unwrap();
             let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
             let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
             bulk.publish_root(
@@ -1149,21 +1137,13 @@ mod tests {
         let good_key = epoch_secret.manifest_key(&drive, 2, &good_snapshot);
         let (good_id, good_sealed) = seal_manifest(
             &good_key,
-            &Manifest {
-                snapshot: good_snapshot,
-                entries: vec![good],
-                children: vec![],
-            },
+            &Manifest::new(good_snapshot, vec![good], Vec::new()).unwrap(),
         )
         .unwrap();
         let mut bad_snapshot: Option<(SnapshotId, EncryptedObject, ContentId)> = None;
         for probe in 0x20u8..=0xFF {
             let candidate = SnapshotId::from_bytes([probe; 32]);
-            let manifest = Manifest {
-                snapshot: candidate,
-                entries: vec![bad.clone()],
-                children: vec![],
-            };
+            let manifest = Manifest::new(candidate, vec![bad.clone()], Vec::new()).unwrap();
             let key = epoch_secret.manifest_key(&drive, 2, &candidate);
             let (id, sealed_manifest) = seal_manifest(&key, &manifest).unwrap();
             if id < good_id {
@@ -1298,11 +1278,8 @@ mod tests {
         // snapshot id: structurally valid, wrong binding — invalid.
         let snapshot = body.snapshot_id();
         let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
-        let rogue = Manifest {
-            snapshot: SnapshotId::from_bytes([0x22; 32]),
-            entries: vec![],
-            children: vec![],
-        };
+        let rogue =
+            Manifest::new(SnapshotId::from_bytes([0x22; 32]), Vec::new(), Vec::new()).unwrap();
         let (rogue_id, sealed_rogue) = seal_manifest(&manifest_key, &rogue).unwrap();
         let mut hostile = MemoryBulkSource::default();
         hostile.publish_root(

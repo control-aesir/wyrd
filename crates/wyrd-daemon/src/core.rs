@@ -1379,7 +1379,7 @@ mod tests {
                 .unwrap()
                 .expect("the root manifest serves");
             assert_eq!(manifest.content_id, record.manifest_id);
-            for entry in &record.manifest.entries {
+            for entry in record.manifest.entries() {
                 let bytes = serving
                     .fetch_sealed(&entry.storage_id, usize::MAX)
                     .unwrap()

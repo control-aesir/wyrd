@@ -53,8 +53,8 @@ fn content_ids_never_appear_in_vault_transport_records() {
         &manifest_obj,
     )
     .unwrap();
-    assert_eq!(manifest.snapshot, snapshot_id);
-    for entry in &manifest.entries {
+    assert_eq!(manifest.snapshot(), snapshot_id);
+    for entry in manifest.entries() {
         let (_, sealed_bytes) = content
             .objects
             .iter()

@@ -407,11 +407,8 @@ mod tests {
     fn manifest_decode_rejects_duplicate_storage_ids() {
         let drive = DriveId::from_bytes([0xEE; 32]);
         let key = [0x11u8; 32];
-        let manifest = Manifest {
-            snapshot: SnapshotId::from_bytes([0x11; 32]),
-            entries: Vec::new(),
-            children: Vec::new(),
-        };
+        let manifest =
+            Manifest::new(SnapshotId::from_bytes([0x11; 32]), Vec::new(), Vec::new()).unwrap();
         let manifest_id = ContentId::derive(ObjectKind::Manifest, &manifest.canonical_bytes());
         let record = ManifestRecord {
             is_root: true,

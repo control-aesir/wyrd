@@ -1002,11 +1002,7 @@ mod tests {
         let roots: Vec<(ContentId, BaoRoot)> = [(snapshot_a, bad), (snapshot_b, good)]
             .into_iter()
             .map(|(snapshot, entry)| {
-                let manifest = Manifest {
-                    snapshot,
-                    entries: vec![entry],
-                    children: vec![],
-                };
+                let manifest = Manifest::new(snapshot, vec![entry], Vec::new()).unwrap();
                 let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
                 let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
                 bulk.publish_root(
@@ -1155,11 +1151,8 @@ mod tests {
         // enforced binding, not any-root-for-snapshot.
         let snapshot = body.snapshot_id();
         let manifest_key = epoch_secret.manifest_key(&member_drive(), 2, &snapshot);
-        let rogue = Manifest {
-            snapshot: SnapshotId::from_bytes([0x22; 32]),
-            entries: vec![],
-            children: vec![],
-        };
+        let rogue =
+            Manifest::new(SnapshotId::from_bytes([0x22; 32]), Vec::new(), Vec::new()).unwrap();
         let (rogue_id, sealed_rogue) = seal_manifest(&manifest_key, &rogue).unwrap();
         let mut hostile = MemoryBulkSource::default();
         hostile.publish_root(
@@ -1428,11 +1421,7 @@ mod tests {
         );
         let (manifest_id, sealed_manifest) = seal_manifest(
             &manifest_key,
-            &Manifest {
-                snapshot: genesis_body.snapshot_id(),
-                entries: vec![],
-                children: vec![],
-            },
+            &Manifest::new(genesis_body.snapshot_id(), Vec::new(), Vec::new()).unwrap(),
         )
         .unwrap();
         bulk.publish_root(
@@ -1492,11 +1481,7 @@ mod tests {
         );
         let (child_manifest_id, sealed_child_manifest) = seal_manifest(
             &child_manifest_key,
-            &Manifest {
-                snapshot: child.snapshot_id(),
-                entries: vec![],
-                children: vec![],
-            },
+            &Manifest::new(child.snapshot_id(), Vec::new(), Vec::new()).unwrap(),
         )
         .unwrap();
         bulk.publish_root(
@@ -1696,11 +1681,7 @@ mod tests {
         let roots: Vec<(ContentId, BaoRoot)> = [snapshot_a, snapshot_b]
             .into_iter()
             .map(|snapshot| {
-                let manifest = Manifest {
-                    snapshot,
-                    entries: vec![entry.clone()],
-                    children: vec![],
-                };
+                let manifest = Manifest::new(snapshot, vec![entry.clone()], Vec::new()).unwrap();
                 let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
                 let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
                 bulk.publish_root(

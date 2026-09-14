@@ -169,6 +169,6 @@ nix run .#wyrd -- --help
 ```
 
 Prebuilt `wyrd-{version}-{platform}.tar.gz` archives ship with each ngit
-release. Alpha caveat: the on-disk format, the trust protocol, and the CLI
+release (built reproducibly per platform via `nix build .#wyrd-dist`). Alpha caveat: the on-disk format, the trust protocol, and the CLI
 can all change between alphas — `CHANGELOG.md` leads with the format
 version so you can tell whether two builds interoperate.

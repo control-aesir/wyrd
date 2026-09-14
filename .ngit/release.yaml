@@ -1,9 +1,20 @@
 # Release manifest for `ngit release publish`: with this committed, a release
-# needs nothing but a version. `release_notes` extracts the level-two
-# CHANGELOG section matching the release version, so cutting a release means
-# renaming the `[Unreleased]` section to the version first. Blossom servers
-# and relays are intentionally unset here; the publisher supplies them with
-# `--blossom-server` / `--relay` (or a later manifest edit) at release time.
+# needs nothing but a version. Cutting one:
+#
+#   1. Rename the `[Unreleased]` CHANGELOG section to the version; the notes
+#      below are extracted from that exact section.
+#   2. Tag the release commit `v<version>` (the version derives from the tag
+#      with one leading `v` stripped, so it must equal the Cargo version).
+#   3. On each platform, run `nix build .#wyrd-dist` and copy the resulting
+#      tarball to the `dist/` path named below (`dist/` is gitignored build
+#      output). A main release must ship all three: ngit rejects partial
+#      platform coverage on the main channel.
+#   4. `ngit release publish <version>` with `--blossom-server` (or a
+#      kind-10063 server list from the publisher), plus `--relay` as needed.
+#
+# The first publish also creates the `wyrd` application owned by the
+# publishing maintainer; repository maintainership alone grants no release
+# authority, so decide who that owner is before publishing.
 schema: 1
 application: wyrd
 name: Wyrd
@@ -19,10 +30,13 @@ release_notes: CHANGELOG.md
 assets:
   - file: dist/wyrd-{version}-linux-x86_64.tar.gz
     filename: wyrd-{version}-linux-x86_64.tar.gz
+    mime: application/gzip
     platforms: [linux-x86_64]
   - file: dist/wyrd-{version}-linux-aarch64.tar.gz
     filename: wyrd-{version}-linux-aarch64.tar.gz
+    mime: application/gzip
     platforms: [linux-aarch64]
   - file: dist/wyrd-{version}-macos-aarch64.tar.gz
     filename: wyrd-{version}-macos-aarch64.tar.gz
+    mime: application/gzip
     platforms: [macos-aarch64]

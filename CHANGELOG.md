@@ -25,6 +25,10 @@ version say exactly what changed.
   toolchain pinned in `rust-toolchain.toml`, for `aarch64-darwin`,
   `aarch64-linux`, and `x86_64-linux`. `devenv.nix` stays the development
   environment; the flake is distribution only.
+- Deterministic per-platform release archives: `packages.wyrd-dist`
+  (`nix build .#wyrd-dist`) produces the `wyrd-{version}-{platform}.tar.gz`
+  named in `.ngit/release.yaml`, so a main release always covers every
+  application platform.
 - `nix` CI gate (`.ngit/act/workflows/nix.yml`): `nix flake check` on push to
   `master` and on `ready_for_review` for PRs touching the flake, the Rust
   workspace, or the workflow itself.

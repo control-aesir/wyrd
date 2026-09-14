@@ -45,9 +45,9 @@ git push -u origin pr/<name>
 ```
 
 Set the PR to draft immediately after the first push. CI runs on
-`ready_for_review` only, and only for PRs touching the paths listed in the
-workflows under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust
-workspace: `crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow
+`ready_for_review` and `synchronize`, and only for PRs touching the paths
+listed in the workflows under `.ngit/act/workflows/` (`rust-ci.yml` for the
+Rust workspace: `crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow
 itself; `nix.yml` for the flake: those plus `flake.*`) — docs-only PRs run
 no CI.
 Work stays in draft until it is ready:
@@ -72,8 +72,8 @@ git push origin pr/<name>
 ```
 
 When the work is ready, mark the PR ready. This moves it from draft to
-open and triggers CI for PRs touching the filtered paths
-(`ready_for_review` is the only `pull_request` trigger in the workflows;
+open and triggers CI for PRs touching the filtered paths (triggers are
+`ready_for_review` plus `synchronize`, so every pushed revision is checked;
 docs-only PRs trigger none):
 
 ```bash

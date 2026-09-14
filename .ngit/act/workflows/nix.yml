@@ -12,7 +12,11 @@ on:
       - "crates/**"
       - ".ngit/act/workflows/nix.yml"
   pull_request:
-    types: [ready_for_review]
+    # ready_for_review starts the gate; synchronize re-runs it on every
+    # pushed revision so the final revision is always the checked one.
+    # (If the coordinator only emits ready_for_review, the extra type is
+    # ignored and behavior is unchanged.)
+    types: [ready_for_review, synchronize]
     paths:
       - "flake.nix"
       - "flake.lock"
@@ -35,8 +39,20 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v23
 
-      # Builds packages.wyrd and checks.wyrd for the runner's system
-      # (linux-x86_64). Darwin coverage comes from the maintainer's
-      # machine; see the packaging issue.
+      # Builds packages.wyrd, packages.wyrd-dist, and checks.wyrd* for the
+      # runner's system (linux-x86_64). Darwin coverage comes from the
+      # maintainer's machine; see the packaging issue.
       - name: Flake check
         run: nix flake check --print-build-logs
+
+      # Proves the release archive path end to end: the tarball named in
+      # .ngit/release.yaml unpacks to a working wyrd for this platform.
+      - name: Release archive smoke test
+        run: |
+          set -euo pipefail
+          nix build .#wyrd-dist --print-build-logs
+          rm -rf /tmp/wyrd-dist-smoke && mkdir -p /tmp/wyrd-dist-smoke
+          tar -xzf result -C /tmp/wyrd-dist-smoke
+          bin=$(echo /tmp/wyrd-dist-smoke/*/bin/wyrd)
+          test -x "$bin"
+          "$bin" --version

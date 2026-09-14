@@ -11,6 +11,10 @@ devenv.local.nix
 # Rust build artifacts
 target/
 
+# Release archives (built per platform via `nix build .#wyrd-dist`,
+# assembled into dist/ at release time; see .ngit/release.yaml)
+dist/
+
 # Repo packers (scratch files for review workflows)
 repomix*
 

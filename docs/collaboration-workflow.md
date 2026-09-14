@@ -44,13 +44,24 @@ git checkout -b pr/<name>
 git push -u origin pr/<name>
 ```
 
+Set the PR to draft immediately after the first push. CI runs on
+`ready_for_review` only, and only for PRs touching the paths listed in
+`.ngit/act/workflows/rust-ci.yml` (`crates/**`, `Cargo.*`,
+`rust-toolchain.toml`, the workflow itself) — docs-only PRs run no CI.
+Work stays in draft until it is ready:
+
+```bash
+ngit pr draft <pr> --reason "work in progress" --json
+```
+
 Reference the issue in the PR description with a `nostr:nevent1...` URI. Do
 not rely on an unqualified issue number or raw event ID.
 
 ## 4. Review And Update
 
 Inspect the PR and comments with ngit. Address concrete findings with new
-commits, run the relevant checks locally, and push the branch again.
+commits, run the relevant checks locally, and push the branch again. Keep
+the PR in draft while iterating.
 
 ```bash
 ngit pr view <pr> --comments --json
@@ -58,12 +69,23 @@ ngit pr comment <pr> --body "Addressed in <commit>." --json
 git push origin pr/<name>
 ```
 
+When the work is ready, mark the PR ready. This moves it from draft to
+open and triggers CI for PRs touching the filtered paths
+(`ready_for_review` is the only `pull_request` trigger in
+`.ngit/act/workflows/rust-ci.yml`; docs-only PRs trigger none):
+
+```bash
+ngit pr ready <pr> --reason "ready for review" --json
+```
+
 Do not rewrite published history unless the workflow explicitly requires it.
 Keep unrelated worktree changes out of the PR.
 
 ## 5. Merge
 
-Before merging, verify the final revision and CI state. Use ngit's merge
+Before merging, verify the PR is `open` (not `draft`), the final revision
+is correct, and CI is green where CI runs. Docs-only PRs run no CI:
+merge those on green local hooks plus review. Use ngit's merge
 command, then publish `master`.
 
 ```bash

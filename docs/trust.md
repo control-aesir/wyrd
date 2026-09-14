@@ -520,6 +520,16 @@ Consequences:
 The precise state machine — transition validation, membership conflicts,
 snapshot classification, recovery — is normative in `epochs.md`.
 
+**View-head audit rule.** The live view admits snapshots only through the
+`wyrd_fuse::VerifiedSnapshot` capability, whose `unsafe impl` is the trust
+assertion that the wrapped snapshot was verified by the trust authority.
+Every future `unsafe impl` of that trait is therefore a trust-boundary
+change and needs individual audit: keep implementations few, local to the
+composing crate, and review each like an `unsafe` block. The workspace
+denies `unsafe_code` with explicit, commented `#[allow(unsafe_code)]`
+exceptions (workspace lints in `Cargo.toml`), so a new capability impl
+cannot compile quietly — it arrives as a visible, greppable trust decision.
+
 ## Device admission (decided)
 
 - **Two keys per device (T14).** The Nostr identity key (= `DeviceId`)

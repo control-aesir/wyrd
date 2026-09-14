@@ -213,13 +213,13 @@ pub fn check_transition(
     limits: &Limits,
     transition: &MembershipTransition,
 ) -> Result<(), IngestError> {
-    check_count(limits.max_resolves, "resolves", transition.resolves.len())?;
+    check_count(limits.max_resolves, "resolves", transition.resolves().len())?;
     check_count(
         limits.max_membership_changes,
         "membership changes",
-        transition.changes.len(),
+        transition.changes().len(),
     )?;
-    for change in &transition.changes {
+    for change in transition.changes() {
         if let Change::SetOwners(owners) = change {
             check_count(limits.max_set_owners, "set owners", owners.len())?;
         }
@@ -392,8 +392,9 @@ mod tests {
         )
         .unwrap();
         assert!(check_transition(&SMALL, &valid).is_ok());
-        let mut too_many_changes = valid.clone();
-        too_many_changes.changes.push(Change::Rotate);
+        let mut changes = valid.changes().to_vec();
+        changes.push(Change::Rotate);
+        let too_many_changes = valid.clone().with_changes(changes).unwrap();
         assert!(matches!(
             check_transition(&SMALL, &too_many_changes),
             Err(IngestError::TooMany {
@@ -401,13 +402,14 @@ mod tests {
                 ..
             })
         ));
-        let mut too_many_resolves = valid.clone();
-        too_many_resolves
-            .resolves
-            .push(TransitionId::from_bytes([0x12; 32]));
-        too_many_resolves
-            .resolves
-            .push(TransitionId::from_bytes([0x13; 32]));
+        let too_many_resolves = valid
+            .clone()
+            .with_resolves(vec![
+                TransitionId::from_bytes([0x11; 32]),
+                TransitionId::from_bytes([0x12; 32]),
+                TransitionId::from_bytes([0x13; 32]),
+            ])
+            .unwrap();
         assert!(matches!(
             check_transition(&SMALL, &too_many_resolves),
             Err(IngestError::TooMany {
@@ -415,8 +417,10 @@ mod tests {
                 ..
             })
         ));
-        let mut too_many_owners = valid.clone();
-        too_many_owners.changes = vec![Change::SetOwners(vec![owner, owner, owner])];
+        let too_many_owners = valid
+            .clone()
+            .with_changes(vec![Change::SetOwners(vec![owner, owner, owner])])
+            .unwrap();
         assert!(matches!(
             check_transition(&SMALL, &too_many_owners),
             Err(IngestError::TooMany {

@@ -114,16 +114,16 @@ pub(crate) fn signed_transition(
     owners: &[DeviceId],
     author: &Device,
 ) -> MembershipTransition {
-    let mut t = MembershipTransition {
+    let mut t = MembershipTransition::new(
         epoch,
         prev,
         resolves,
         changes,
-        members_root: set_root(MEMBER_SET_CONTEXT, members),
-        owners_root: set_root(OWNER_SET_CONTEXT, owners),
-        author: author.id,
-        signature: [0; 64],
-    };
+        set_root(MEMBER_SET_CONTEXT, members),
+        set_root(OWNER_SET_CONTEXT, owners),
+        author.id,
+    )
+    .unwrap();
     sign_transition(&mut t, &author.signing, &drive());
     t
 }

@@ -132,7 +132,7 @@ fn observe_all(log: &mut MembershipLog, transitions: &[MembershipTransition]) {
 fn tip_members(chain: &[MembershipTransition]) -> BTreeSet<DeviceId> {
     let mut members = BTreeSet::from([device(0)]);
     for t in chain.iter().skip(1) {
-        for c in &t.changes {
+        for c in t.changes() {
             match c {
                 Change::Admit(a) => {
                     members.insert(a.device);
@@ -197,7 +197,7 @@ proptest! {
         let mut members: BTreeSet<DeviceId> = BTreeSet::from([device(0)]);
         for t in prefix_chain.iter().skip(1) {
             // The builder mirrors valid prefixes; replay each change set.
-            let changes = t.changes.clone();
+            let changes = t.changes().to_vec();
             for c in &changes {
                 match c {
                     Change::Admit(a) => { members.insert(a.device); }
@@ -265,7 +265,7 @@ proptest! {
         let (mut b, _) = Builder::genesis(10);
         let mut members: BTreeSet<DeviceId> = BTreeSet::from([device(0)]);
         for t in prefix_chain.iter().skip(1) {
-            let changes = t.changes.clone();
+            let changes = t.changes().to_vec();
             for c in &changes {
                 match c {
                     Change::Admit(a) => { members.insert(a.device); }
@@ -536,7 +536,7 @@ sharded_property! {
         for t in &canonical {
             // Generated chains are valid end to end by construction
             // (ill-formed ops degrade to `Rotate`), so the fold cannot fail.
-            folded = apply(&folded, &t.changes).expect("generated chain folds");
+            folded = apply(&folded, t.changes()).expect("generated chain folds");
             prop_assert_eq!(
                 shuffled_log.state_of(&t.transition_id()),
                 Some(folded.clone())

@@ -96,10 +96,13 @@ pub struct MembershipTransition {
     pub epoch: u64,
     /// The predecessor transition; `None` only at genesis (epoch 1).
     pub prev: Option<TransitionId>,
-    /// Conflict branches voided by this resolution transition.
-    pub resolves: Vec<TransitionId>,
-    /// The changes applied to the pre-transition state.
-    pub changes: Vec<Change>,
+    /// Conflict branches voided by this resolution transition. Private:
+    /// lengths feed the `u32` wire counts, so replacement goes through
+    /// [`MembershipTransition::with_resolves`].
+    resolves: Vec<TransitionId>,
+    /// The changes applied to the pre-transition state. Private, like
+    /// `resolves`: see [`MembershipTransition::with_changes`].
+    changes: Vec<Change>,
     /// Hash of the member set after the changes (opaque at this layer;
     /// the derivation lives with the state machine).
     pub members_root: [u8; 32],
@@ -125,6 +128,26 @@ pub enum MembershipError {
     CountOverflow(usize),
 }
 
+/// Wire-count validation shared by construction and validated mutation:
+/// every vector length the encoders narrow to `u32` must fit, so the
+/// infallible encoders only ever see encodable values.
+fn check_counts(resolves: &[TransitionId], changes: &[Change]) -> Result<(), MembershipError> {
+    if resolves.len() > u32::MAX as usize {
+        return Err(MembershipError::CountOverflow(resolves.len()));
+    }
+    if changes.len() > u32::MAX as usize {
+        return Err(MembershipError::CountOverflow(changes.len()));
+    }
+    for change in changes {
+        if let Change::SetOwners(owners) = change {
+            if owners.len() > u32::MAX as usize {
+                return Err(MembershipError::CountOverflow(owners.len()));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl MembershipTransition {
     /// A transition with an all-zero signature (unsigned draft). The sync
     /// layer signs and fills the signature. Counts beyond the `u32` wire
@@ -140,19 +163,7 @@ impl MembershipTransition {
         owners_root: [u8; 32],
         author: DeviceId,
     ) -> Result<Self, MembershipError> {
-        if resolves.len() > u32::MAX as usize {
-            return Err(MembershipError::CountOverflow(resolves.len()));
-        }
-        if changes.len() > u32::MAX as usize {
-            return Err(MembershipError::CountOverflow(changes.len()));
-        }
-        for change in &changes {
-            if let Change::SetOwners(owners) = change {
-                if owners.len() > u32::MAX as usize {
-                    return Err(MembershipError::CountOverflow(owners.len()));
-                }
-            }
-        }
+        check_counts(&resolves, &changes)?;
         Ok(MembershipTransition {
             epoch,
             prev,
@@ -163,6 +174,34 @@ impl MembershipTransition {
             author,
             signature: [0; 64],
         })
+    }
+
+    /// The conflict branches this transition voids.
+    pub fn resolves(&self) -> &[TransitionId] {
+        &self.resolves
+    }
+
+    /// The changes this transition applies.
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+
+    /// Replace the voided branches, validating the wire count. The
+    /// validated mutation API for post-construction forgeries and future
+    /// resolution builders: the field itself stays private so an
+    /// oversized vector cannot reach the infallible encoders.
+    pub fn with_resolves(mut self, resolves: Vec<TransitionId>) -> Result<Self, MembershipError> {
+        check_counts(&resolves, &self.changes)?;
+        self.resolves = resolves;
+        Ok(self)
+    }
+
+    /// Replace the applied changes, validating wire counts including
+    /// nested `SetOwners` vectors. See [`MembershipTransition::with_resolves`].
+    pub fn with_changes(mut self, changes: Vec<Change>) -> Result<Self, MembershipError> {
+        check_counts(&self.resolves, &changes)?;
+        self.changes = changes;
+        Ok(self)
     }
 
     /// The BIP-340 message: `ASCII("wyrd membership v1") ‖ DriveId ‖

@@ -39,7 +39,7 @@ fn genesis_with_non_empty_resolves_is_invalid() {
             g.epoch,
             g.prev,
             resolves,
-            g.changes.clone(),
+            g.changes().to_vec(),
             g.members_root,
             g.owners_root,
             g.author,

@@ -210,22 +210,22 @@ fn genesis_transition(
     encryption: &DeviceEncryptionSecret,
 ) -> MembershipTransition {
     let owner = device_id(identity);
-    let mut transition = MembershipTransition {
-        epoch: 1,
-        prev: None,
-        resolves: Vec::new(),
-        changes: vec![
+    let mut transition = MembershipTransition::new(
+        1,
+        None,
+        Vec::new(),
+        vec![
             Change::Admit(Admission {
                 device: owner,
                 encryption_key: encryption_key(encryption),
             }),
             Change::SetOwners(vec![owner]),
         ],
-        members_root: set_root(MEMBER_SET_CONTEXT, &[owner]),
-        owners_root: set_root(OWNER_SET_CONTEXT, &[owner]),
-        author: owner,
-        signature: [0; 64],
-    };
+        set_root(MEMBER_SET_CONTEXT, &[owner]),
+        set_root(OWNER_SET_CONTEXT, &[owner]),
+        owner,
+    )
+    .expect("genesis transition is two changes and no resolves");
     sign_transition(&mut transition, &identity.secret_key(), &drive);
     transition
 }

@@ -1,7 +1,8 @@
-use super::codec::encode_commit;
+use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
 use crate::authorization::test_util::sign_snapshot;
+use crate::authorization::{Classification, Rejection, SnapshotDag};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::epoch::EpochSecret;
@@ -337,6 +338,79 @@ fn committed_corruption_fails() {
 
     // After all damage is repaired, the store loads cleanly.
     assert_eq!(load().unwrap().transitions.len(), 2);
+}
+
+/// A store-key holder plants a forged snapshot body: replay observes the
+/// bytes (decode is not verification), but classification rejects the
+/// forgery before eligibility — so the `live_heads` re-authorization
+/// gate never sees it. The planted forgery must neither enter the
+/// eligible set nor disturb the valid head.
+#[test]
+fn planted_forged_body_is_rejected_before_eligibility() {
+    let (genesis, child) = chain();
+    let dir = TestDir::new("forged-body");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&[Fact::Transition(genesis.clone())]).unwrap();
+    store.commit(&[Fact::Transition(child.clone())]).unwrap();
+    let valid = authorized_snapshot_body();
+    let valid_id = valid.snapshot().snapshot_id();
+    store.commit(&[Fact::SnapshotBody(valid)]).unwrap();
+
+    // Forge: identical fields, flipped signature byte. No `authorize()`
+    // call — the store-key holder writes bytes, not capabilities.
+    let mut forged = authorized_snapshot_body().snapshot().clone();
+    forged.signature[0] ^= 0xFF;
+    let forged_id = forged.snapshot_id();
+    assert_ne!(
+        forged_id, valid_id,
+        "the id covers every byte, so the forgery is a distinct snapshot"
+    );
+
+    // Plant: a raw commit chained after the tip, CURRENT re-anchored —
+    // exactly what a real commit would have written.
+    let tip = store.tip_hash_for_test();
+    let (tagged, hash4) = encode_commit(&drive(), 4, &tip, &[(TAG_SNAPSHOT_BODY, forged.encode())]);
+    fs::write(dir.path.join("commits").join(commit_name(4)), &tagged).unwrap();
+    let mut current = 4u64.to_le_bytes().to_vec();
+    current.extend_from_slice(&hash4);
+    atomic_write(&dir.path, "CURRENT", &current).unwrap();
+
+    // Replay observes the forgery: parsing is not verification.
+    let reloaded = store.load().unwrap();
+    let ids: Vec<_> = reloaded
+        .snapshot_bodies
+        .iter()
+        .map(|s| s.snapshot_id())
+        .collect();
+    assert!(
+        ids.contains(&valid_id) && ids.contains(&forged_id),
+        "both the valid and the forged body replay: {ids:?}"
+    );
+
+    // Classification rejects the forgery before eligibility.
+    let mut log = MembershipLog::new(drive());
+    for t in &reloaded.transitions {
+        log.observe(t.clone());
+    }
+    let mut dag = SnapshotDag::new(drive());
+    for body in &reloaded.snapshot_bodies {
+        dag.observe(body.clone());
+    }
+    let map = dag.classify(&log);
+    assert_eq!(
+        map.get(&forged_id),
+        Some(&Classification::Rejected(Rejection::BadSignature)),
+        "the forged body is rejected, not parked or voided"
+    );
+    let eligible = dag.eligible_heads(&log);
+    assert!(
+        eligible.contains(&valid_id),
+        "the valid head stays projected"
+    );
+    assert!(
+        !eligible.contains(&forged_id),
+        "the forged body never enters the eligible set"
+    );
 }
 
 /// Facts rebuild the live machines bit-identically: same log

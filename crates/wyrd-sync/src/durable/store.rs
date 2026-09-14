@@ -65,7 +65,8 @@ pub struct DurableStore {
     _lock: File,
 }
 
-pub(super) fn commit_name(seq: u64) -> String {
+/// Crate-visible for the raw-commit test seam alongside `atomic_write`.
+pub(crate) fn commit_name(seq: u64) -> String {
     format!("{seq:016x}.commit")
 }
 

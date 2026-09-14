@@ -463,6 +463,14 @@ impl Engine {
     /// the live view. Each head is re-verified on the way out, so the
     /// projection is typed as `AuthorizedSnapshot`: durable bytes that
     /// no longer verify fail the projection instead of reaching a view.
+    ///
+    /// `EngineError::InvalidHead` is a defense-in-depth invariant
+    /// failure, not the primary durable-corruption path: classification
+    /// verifies every observed body before it can become eligible, so
+    /// this re-authorization repeats the same check over the same bytes
+    /// while constructing the typed value. A failure here means an
+    /// internal invariant broke, not that a new corruption flavor was
+    /// detected.
     pub fn live_heads(&self) -> Result<Vec<AuthorizedSnapshot>, EngineError> {
         let rebuilt = self.store.rebuild(self.device)?;
         let mut dag = crate::authorization::SnapshotDag::new(self.drive);
@@ -639,6 +647,7 @@ mod tests {
     use crate::bulk::MemoryBulkSource;
     use crate::control::seal;
     use crate::durable::AuthorizedSnapshot;
+    use crate::durable::{atomic_write, commit_name, encode_commit, TAG_SNAPSHOT_BODY};
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
@@ -2150,6 +2159,67 @@ mod tests {
                 .map(|h| h.snapshot().snapshot_id())
                 .collect::<Vec<_>>(),
             vec![authored.snapshot().snapshot_id()]
+        );
+    }
+
+    /// A planted forgery never reaches the projection: classification
+    /// rejects it before eligibility, so `live_heads` re-authorizes only
+    /// the valid head and the `InvalidHead` arm stays silent. The arm is
+    /// a defense-in-depth typed-construction invariant, not the primary
+    /// corruption path — it repeats the verification classification
+    /// already ran over the same bytes.
+    #[test]
+    fn planted_forged_body_is_rejected_and_heads_survive() {
+        let dir = TestDir::new("forged-head");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+        let mut objects = MemoryObjectStore::default();
+        let tree = local_tree(&mut objects);
+        let authored = engine.author_snapshot(&objects, tree).unwrap();
+        let valid_id = authored.snapshot().snapshot_id();
+        assert_eq!(
+            engine.live_heads().unwrap().len(),
+            1,
+            "the valid head projects before planting"
+        );
+
+        // Forge: identical fields, flipped signature byte. No
+        // `authorize()` call — the store-key holder writes bytes.
+        let mut forged = authored.snapshot().clone();
+        forged.signature[0] ^= 0xFF;
+        assert_ne!(
+            forged.snapshot_id(),
+            valid_id,
+            "the id covers every byte, so the forgery is distinct"
+        );
+
+        // Plant: a raw commit chained after the CURRENT tip, CURRENT
+        // re-anchored — exactly what a real commit would have written.
+        let current = std::fs::read(dir.path.join("CURRENT")).unwrap();
+        let seq = u64::from_le_bytes(current[0..8].try_into().unwrap());
+        let mut tip = [0u8; 32];
+        tip.copy_from_slice(&current[8..40]);
+        let (tagged, hash) = encode_commit(
+            &engine.drive(),
+            seq + 1,
+            &tip,
+            &[(TAG_SNAPSHOT_BODY, forged.encode())],
+        );
+        std::fs::write(dir.path.join("commits").join(commit_name(seq + 1)), &tagged).unwrap();
+        let mut anchored = (seq + 1).to_le_bytes().to_vec();
+        anchored.extend_from_slice(&hash);
+        atomic_write(&dir.path, "CURRENT", &anchored).unwrap();
+
+        // The projection is untouched: the valid head survives, the
+        // forgery never becomes a head, and no `InvalidHead` fires.
+        let heads = engine.live_heads().unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .map(|h| h.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![valid_id],
+            "classification rejected the forgery before eligibility"
         );
     }
 

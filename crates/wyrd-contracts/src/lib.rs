@@ -41,6 +41,8 @@
 //! 10. `failed_projection_leaves_installed_heads_untouched` — a
 //!     damaged durable store fails the projection closed and the view
 //!     keeps serving what it served before; refresh is all-or-nothing.
+//!     Pins the decided v0 policy: failure ⇒ heads unchanged ⇒ error
+//!     surfaced ⇒ no automatic repair, resync, or clear (`docs/epochs.md`).
 //! 11. `authored_snapshots_mount_through_the_daemon_view` — the local
 //!     write path: a member authors a snapshot and the daemon's
 //!     classified projection serves its tree (`docs/epochs.md`).

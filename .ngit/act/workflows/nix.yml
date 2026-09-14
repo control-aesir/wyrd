@@ -35,19 +35,20 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v23
 
-      # Flake evaluation needs a Git repository and the coordinator
-      # worktree may carry no .git metadata; synthesize one so `nix flake
-      # check` resolves the worktree. Respects .gitignore, so build output
-      # and dev state stay out.
+      # Flake evaluation needs an openable Git repository (libgit2
+      # ENOTFOUND otherwise) and the coordinator worktree can carry a stub
+      # or no .git metadata at all. Rebuild it when git itself cannot open
+      # it. Respects .gitignore, so build output and dev state stay out.
       - name: Prepare git metadata for flake evaluation
         run: |
           set -euo pipefail
-          if [ ! -d .git ]; then
+          git config --global --add safe.directory "$PWD"
+          if ! git rev-parse --git-dir >/dev/null 2>&1; then
+            rm -rf .git
             git init -q
             git add -A
             git -c user.email=ci@localhost -c user.name=ci commit -qm ci
           fi
-          git config --global --add safe.directory "$PWD"
 
       # Builds packages.wyrd, packages.wyrd-dist, and checks.wyrd* for the
       # runner's system (linux-x86_64). Darwin coverage comes from the

@@ -1820,6 +1820,113 @@ mod tests {
         );
     }
 
+    /// Stack-safety regression for manifest authoring: the walk is an
+    /// explicit heap DFS, so a chain far deeper than the call stack could
+    /// hold still authors to completion. The authoring runs on a thread
+    /// with a deliberately tiny stack (256 KiB): the per-level recursion
+    /// this replaced overflowed such a stack far shallower, while the
+    /// heap walk fits with room to spare. Depth stays modest on purpose:
+    /// every level costs two fsync-backed vault imports, so depth here
+    /// buys proof against the old recursion, not broader coverage.
+    ///
+    /// The root also mirrors a mid-chain subtree, exercising the
+    /// completed-subtree fast path at depth, and the test walks the full
+    /// link chain from root to leaf, so a malformed link fails here (on
+    /// top of the closure self-check authoring already runs before
+    /// committing).
+    #[test]
+    fn deep_tree_authoring_is_stack_safe() {
+        let (mut pair, _, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+        const DEPTH: usize = 300;
+        const STACK: usize = 256 << 10;
+        let mut objects = MemoryObjectStore::default();
+        let mut chain = vec![Tree::empty().insert_into(&mut objects).unwrap()];
+        for _ in 1..DEPTH {
+            let top = *chain.last().expect("chain nonempty");
+            chain.push(
+                Tree::from_entries(vec![Entry::dir("d", top).unwrap()])
+                    .unwrap()
+                    .insert_into(&mut objects)
+                    .unwrap(),
+            );
+        }
+        let mid = chain[DEPTH / 2];
+        let top = *chain.last().expect("chain nonempty");
+        let root = Tree::from_entries(vec![
+            Entry::dir("d", top).unwrap(),
+            Entry::dir("mirror", mid).unwrap(),
+        ])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+
+        let mut device = pair.a;
+        std::thread::Builder::new()
+            .name("deep-authoring".into())
+            .stack_size(STACK)
+            .spawn(move || {
+                let authored = device.engine.author_snapshot(&objects, root).unwrap();
+                let snapshot_id = authored.snapshot().snapshot_id();
+                let state = device.engine.runtime_state().unwrap();
+                let root_record = state
+                    .root_manifest_record(&snapshot_id)
+                    .expect("the deep root manifest records");
+                assert_eq!(
+                    root_record.manifest.children.len(),
+                    2,
+                    "the chain link plus the mid-chain mirror"
+                );
+                assert_eq!(
+                    state
+                        .manifest_records()
+                        .filter(|record| record.manifest.snapshot == snapshot_id)
+                        .count(),
+                    DEPTH + 1,
+                    "one manifest per tree node in the chain"
+                );
+                // Walk the chain link by link to the leaf: every level
+                // names exactly its child subtree, and the mirror reuses
+                // the mid-chain manifest assembled on the way down.
+                let mut manifest_ids = Vec::with_capacity(DEPTH);
+                let mut current = root_record;
+                for i in (0..DEPTH).rev() {
+                    let link = current
+                        .manifest
+                        .children
+                        .iter()
+                        .find(|link| link.tree == chain[i])
+                        .expect("chain link present");
+                    let child = state
+                        .manifest_record(&link.manifest)
+                        .expect("child manifest records");
+                    let expected_kids = if i == 0 { 0 } else { 1 };
+                    assert_eq!(
+                        child.manifest.children.len(),
+                        expected_kids,
+                        "chain manifest {i} links exactly its child"
+                    );
+                    manifest_ids.push(link.manifest);
+                    current = child;
+                }
+                let mirror = root_record
+                    .manifest
+                    .children
+                    .iter()
+                    .find(|link| link.tree == mid)
+                    .expect("mirror link present");
+                assert_eq!(
+                    mirror.manifest,
+                    manifest_ids[DEPTH - 1 - DEPTH / 2],
+                    "the mirror reuses the completed record, not a re-seal"
+                );
+            })
+            .expect("spawn authoring thread")
+            .join()
+            .expect("authoring completes on a 256 KiB stack");
+    }
+
     /// Critical regression for the serving contract: a fetched
     /// representation lands in the fetcher's durable vault, so a restart
     /// plus re-authoring can reuse the recorded mapping and serve it.

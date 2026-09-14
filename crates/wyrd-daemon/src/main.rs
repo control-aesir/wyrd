@@ -686,8 +686,10 @@ mod tests {
 
     /// The mount preamble composes without a kernel: open the
     /// keystore, build the daemon over the file store, author, and
-    /// the classified projection serves — the same steps `mount`
-    /// runs before binding FUSE.
+    /// the classified projection serves. That is the composition this
+    /// covers; the serving endpoint, bulk source, mailbox, signal
+    /// handler, and FUSE session creation remain live-mount-only
+    /// (see the gated test below).
     #[test]
     fn mount_preamble_projects_authorized_heads_without_fuse() {
         let temp = TempDir::new();
@@ -717,17 +719,23 @@ mod tests {
         assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello mount");
     }
 
-    /// The full static mount, gated on an environment that vouches
-    /// for kernel FUSE and local networking: init, author, mount in
-    /// a thread, read through the mountpoint, prove read-only,
-    /// shut down, and rejoin cleanly. Skips with a clear message
-    /// otherwise — never fails a machine without FUSE.
+    /// The full static mount: init, author, mount in a thread, read
+    /// through the mountpoint, prove read-only, shut down, and
+    /// rejoin cleanly. Ignored by default and additionally gated on
+    /// `WYRD_TEST_MOUNT=1`, so ordinary runs report it as skipped,
+    /// never as passed: it needs kernel FUSE plus local networking
+    /// for the serving endpoint. Run it where both hold:
+    /// `WYRD_TEST_MOUNT=1 cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
     #[test]
+    #[ignore = "needs kernel FUSE and local networking; see WYRD_TEST_MOUNT"]
     fn live_mount_serves_read_only_until_shutdown() {
         if std::env::var("WYRD_TEST_MOUNT").is_err() {
             eprintln!("skipping live mount test: set WYRD_TEST_MOUNT=1 where kernel FUSE and local networking are available");
             return;
         }
+        // The shutdown latch is process-global: start unset so a
+        // previous run in this process cannot cut this mount short.
+        SHUTDOWN.store(false, Ordering::Relaxed);
         let temp = TempDir::new();
         let identity_file = temp.0.join("identity");
         let passphrase_file = temp.0.join("passphrase");
@@ -757,20 +765,33 @@ mod tests {
             std::thread::spawn(move || mount(drive, mountpoint, Vec::new(), "test-pass", identity));
         let target = temp.0.join("mnt").join("hello.txt");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !target.is_file() {
-            if std::time::Instant::now() > deadline {
-                SHUTDOWN.store(true, Ordering::Relaxed);
-                panic!("the mount did not serve in time");
-            }
+        while !target.is_file() && std::time::Instant::now() <= deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !target.is_file() {
+            // Startup failed or hung: signal and rejoin first — a
+            // hung startup must not orphan the mount thread — and
+            // surface any mount error instead of a bare timeout.
+            SHUTDOWN.store(true, Ordering::Relaxed);
+            match server.join() {
+                Err(_) => panic!("the mount thread panicked during startup"),
+                Ok(Err(error)) => panic!("the mount failed during startup: {error}"),
+                Ok(Ok(())) => panic!("the mount exited cleanly without ever serving"),
+            }
         }
         assert_eq!(fs::read(&target).unwrap(), b"hello mount");
         assert!(
             fs::write(&target, b"nope").is_err(),
             "the static mount is read-only"
         );
+        // Shut down and rejoin, reporting the mount outcome instead
+        // of unwrapping: a failed shutdown must fail the test.
         SHUTDOWN.store(true, Ordering::Relaxed);
-        server.join().unwrap().unwrap();
+        match server.join() {
+            Err(_) => panic!("the mount thread panicked during shutdown"),
+            Ok(Err(error)) => panic!("the mount failed during shutdown: {error}"),
+            Ok(Ok(())) => {}
+        }
         assert!(
             fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
             "a clean unmount releases the mountpoint"

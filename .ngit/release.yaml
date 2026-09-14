@@ -1,0 +1,28 @@
+# Release manifest for `ngit release publish`: with this committed, a release
+# needs nothing but a version. `release_notes` extracts the level-two
+# CHANGELOG section matching the release version, so cutting a release means
+# renaming the `[Unreleased]` section to the version first. Blossom servers
+# and relays are intentionally unset here; the publisher supplies them with
+# `--blossom-server` / `--relay` (or a later manifest edit) at release time.
+schema: 1
+application: wyrd
+name: Wyrd
+summary: Decentralized, append-only, content-addressed drive system
+description: |
+  Wyrd treats a storage drive as an append-only, content-addressed store:
+  files split into hash-addressed chunks, drive states as roots into a
+  Merkle tree, deletion as a state change rather than erasure.
+tags: [nostr, cli]
+license: MIT
+channel: main
+release_notes: CHANGELOG.md
+assets:
+  - file: dist/wyrd-{version}-linux-x86_64.tar.gz
+    filename: wyrd-{version}-linux-x86_64.tar.gz
+    platforms: [linux-x86_64]
+  - file: dist/wyrd-{version}-linux-aarch64.tar.gz
+    filename: wyrd-{version}-linux-aarch64.tar.gz
+    platforms: [linux-aarch64]
+  - file: dist/wyrd-{version}-macos-aarch64.tar.gz
+    filename: wyrd-{version}-macos-aarch64.tar.gz
+    platforms: [macos-aarch64]

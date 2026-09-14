@@ -161,3 +161,14 @@ the cryptography and state machines (both under test); the read-only FUSE
 backend is implemented in `crates/wyrd-daemon` (`wyrd init`, `wyrd
 mount`), which also opens the drive's real-iroh serving endpoint; write
 support behind the mount is pending.
+
+To try the alpha without installing Rust:
+
+```bash
+nix run .#wyrd -- --help
+```
+
+Prebuilt `wyrd-{version}-{platform}.tar.gz` archives ship with each ngit
+release. Alpha caveat: the on-disk format, the trust protocol, and the CLI
+can all change between alphas — `CHANGELOG.md` leads with the format
+version so you can tell whether two builds interoperate.

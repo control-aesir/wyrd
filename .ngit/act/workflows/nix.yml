@@ -12,11 +12,7 @@ on:
       - "crates/**"
       - ".ngit/act/workflows/nix.yml"
   pull_request:
-    # ready_for_review starts the gate; synchronize re-runs it on every
-    # pushed revision so the final revision is always the checked one.
-    # (If the coordinator only emits ready_for_review, the extra type is
-    # ignored and behavior is unchanged.)
-    types: [ready_for_review, synchronize]
+    types: [ready_for_review]
     paths:
       - "flake.nix"
       - "flake.lock"
@@ -38,6 +34,20 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v23
+
+      # Flake evaluation needs a Git repository and the coordinator
+      # worktree may carry no .git metadata; synthesize one so `nix flake
+      # check` resolves the worktree. Respects .gitignore, so build output
+      # and dev state stay out.
+      - name: Prepare git metadata for flake evaluation
+        run: |
+          set -euo pipefail
+          if [ ! -d .git ]; then
+            git init -q
+            git add -A
+            git -c user.email=ci@localhost -c user.name=ci commit -qm ci
+          fi
+          git config --global --add safe.directory "$PWD"
 
       # Builds packages.wyrd, packages.wyrd-dist, and checks.wyrd* for the
       # runner's system (linux-x86_64). Darwin coverage comes from the

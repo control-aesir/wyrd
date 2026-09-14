@@ -10,9 +10,7 @@ on:
       - "rust-toolchain.toml"
       - ".ngit/act/workflows/rust-ci.yml"
   pull_request:
-    # ready_for_review starts the gate; synchronize re-runs it on every
-    # pushed revision so the final revision is always the checked one.
-    types: [ready_for_review, synchronize]
+    types: [ready_for_review]
     paths:
       - "crates/**"
       - "Cargo.toml"

@@ -13,6 +13,8 @@
 
 use std::fmt;
 
+use thiserror::Error;
+
 /// Width of every Wyrd identifier: DriveId, ContentId, StorageId,
 /// SnapshotId alike. A format constant: encodings that embed identifiers
 /// use this, never a literal. Kept crate-internal until a public consumer
@@ -177,6 +179,20 @@ impl StorageId {
     }
 }
 
+/// A collection length that does not fit the wire format's `u32` counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("length {0} exceeds the u32 wire count")]
+pub(crate) struct CountOverflow(pub(crate) usize);
+
+/// Narrow a collection length for the wire format. Lengths beyond
+/// `u32::MAX` fail explicitly instead of truncating silently. Unreachable
+/// with real inputs (a 4-billion-element vector is unallocatable), so
+/// encoders assert the invariant loudly at the single place it could
+/// break; the unit test pins the failure on synthetic lengths.
+pub(crate) fn u32_len(len: usize) -> Result<u32, CountOverflow> {
+    u32::try_from(len).map_err(|_| CountOverflow(len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +248,16 @@ mod tests {
     fn unknown_kind_bytes_are_rejected() {
         assert_eq!(ObjectKind::from_byte(0x04), None);
         assert_eq!(ObjectKind::from_byte(0xFF), None);
+    }
+
+    #[test]
+    fn wire_lengths_reject_counts_beyond_u32() {
+        assert_eq!(u32_len(0), Ok(0));
+        assert_eq!(u32_len(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(
+            u32_len(u32::MAX as usize + 1),
+            Err(CountOverflow(u32::MAX as usize + 1))
+        );
+        assert!(u32_len(usize::MAX).is_err());
     }
 }

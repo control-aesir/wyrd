@@ -141,6 +141,7 @@ fn snapshot_seed() -> Vec<u8> {
         0,
         7,
     )
+    .unwrap()
     .encode()
 }
 

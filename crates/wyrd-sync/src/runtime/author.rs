@@ -107,7 +107,7 @@ where
         known.epoch,
         0,
         timestamp,
-    );
+    )?;
     crate::authorization::predicates::sign_snapshot(
         &mut snapshot,
         &engine.identity_secret.secret_key(),

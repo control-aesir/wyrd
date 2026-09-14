@@ -993,7 +993,8 @@ mod tests {
             3,
             0,
             42,
-        );
+        )
+        .unwrap();
         let id = body.snapshot_id();
         state
             .record_announcement(announced(
@@ -1039,7 +1040,8 @@ mod tests {
             3,
             0,
             42,
-        );
+        )
+        .unwrap();
         let id = body.snapshot_id();
 
         for announcement in [
@@ -1084,7 +1086,8 @@ mod tests {
             3,
             0,
             42,
-        );
+        )
+        .unwrap();
         let id = body.snapshot_id();
 
         let mut state = RuntimeState::new(drive());

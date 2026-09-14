@@ -124,6 +124,8 @@ pub enum EngineError {
     OwnerMismatch,
     #[error("authored manifest failed canonical construction: {0}")]
     InvalidManifest(#[from] wyrd_format::ManifestError),
+    #[error("authored snapshot failed construction: {0}")]
+    InvalidSnapshot(#[from] wyrd_format::SnapshotError),
     #[error("keystore failed: {0}")]
     Keystore(#[from] crate::keys::KeystoreError),
     #[error("keystore I/O failed: {0}")]
@@ -837,7 +839,8 @@ mod tests {
             2,
             0,
             1002,
-        );
+        )
+        .unwrap();
         sign_snapshot(&mut body_a, &a_sk.secret_key(), &drive);
         pair.bulk
             .publish_snapshot(body_a.snapshot_id(), body_a.encode());
@@ -850,7 +853,8 @@ mod tests {
             3,
             0,
             1003,
-        );
+        )
+        .unwrap();
         sign_snapshot(&mut body_b, &b_sk.secret_key(), &drive);
         pair.bulk
             .publish_snapshot(body_b.snapshot_id(), body_b.encode());
@@ -1487,7 +1491,8 @@ mod tests {
             9,
             0,
             1,
-        );
+        )
+        .unwrap();
         sign_snapshot(&mut body, &pair.a.identity_sk.secret_key(), &member_drive());
         let authorized = AuthorizedSnapshot::authorize(body, &member_drive()).unwrap();
 
@@ -1526,7 +1531,8 @@ mod tests {
             admission.epoch,
             0,
             1000,
-        );
+        )
+        .unwrap();
         crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
         let authorized = AuthorizedSnapshot::authorize(body, &member_drive()).unwrap();
 

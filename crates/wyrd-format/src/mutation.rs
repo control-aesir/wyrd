@@ -540,7 +540,7 @@ mod tests {
     fn file(name: &str, body: &[u8]) -> Entry {
         Entry::file(
             name,
-            body.len() as u64,
+            u64::try_from(body.len()).unwrap(),
             false,
             vec![ContentId::derive(ObjectKind::Chunk, body)],
         )

@@ -46,7 +46,8 @@ fn unverified_snapshots_never_become_live_fuse_heads() {
         2,
         0,
         1_001,
-    );
+    )
+    .unwrap();
     forged.signature = [0xAB; 64];
     loaded
         .bulk

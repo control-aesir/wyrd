@@ -102,7 +102,7 @@ fn heads(snapshots: Vec<Snapshot>) -> Vec<ViewHead> {
 }
 
 fn snapshot(tree: ContentId) -> Snapshot {
-    Snapshot::new(vec![], tree, device(), transition(), 1, 0, 1)
+    Snapshot::new(vec![], tree, device(), transition(), 1, 0, 1).unwrap()
 }
 
 fn chunk(store: &mut MemoryObjectStore, data: &[u8]) -> ContentId {

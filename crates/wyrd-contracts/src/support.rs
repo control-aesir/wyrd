@@ -138,7 +138,7 @@ pub(crate) fn signed_snapshot(
     epoch: u64,
     timestamp: u64,
 ) -> Snapshot {
-    let mut s = Snapshot::new(parents, tree, author.id, membership, epoch, 0, timestamp);
+    let mut s = Snapshot::new(parents, tree, author.id, membership, epoch, 0, timestamp).unwrap();
     sign_snapshot(&mut s, &author.signing, &drive());
     s
 }

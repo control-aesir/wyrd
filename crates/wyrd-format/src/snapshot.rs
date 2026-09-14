@@ -24,7 +24,9 @@
 //! signature:   64 bytes (BIP-340 over the drive-bound signing message)
 //! ```
 
-use crate::identity::{ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, TransitionId};
+use crate::identity::{
+    u32_len, ContentId, DeviceId, DriveId, ObjectKind, SnapshotId, TransitionId,
+};
 use crate::store::ObjectStore;
 use thiserror::Error;
 
@@ -72,8 +74,8 @@ pub enum SnapshotError {
 impl Snapshot {
     /// A snapshot with an all-zero signature (unsigned draft). The sync
     /// layer signs and fills the signature. Flags with nonzero reserved
-    /// bits are rejected by decode; this constructor debug-asserts them so
-    /// drafts never carry garbage into signing.
+    /// bits are rejected in all profiles with the same error decoding
+    /// reports, so garbage can never reach signing.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parents: Vec<SnapshotId>,
@@ -83,12 +85,11 @@ impl Snapshot {
         epoch: u64,
         flags: u8,
         timestamp: u64,
-    ) -> Self {
-        debug_assert!(
-            flags & RESERVED_FLAG_MASK == 0,
-            "reserved flag bits must be zero"
-        );
-        Snapshot {
+    ) -> Result<Self, SnapshotError> {
+        if flags & RESERVED_FLAG_MASK != 0 {
+            return Err(SnapshotError::ReservedFlags(flags));
+        }
+        Ok(Snapshot {
             parents,
             tree,
             author,
@@ -97,7 +98,7 @@ impl Snapshot {
             flags,
             timestamp,
             signature: [0; 64],
-        }
+        })
     }
 
     /// The BIP-340 message: `ASCII("wyrd snapshot v1") ‖ DriveId ‖ signing
@@ -114,7 +115,11 @@ impl Snapshot {
     /// flags, timestamp — declared order, self-delimiting vectors.
     fn signing_preimage(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.parents.len() as u32).to_le_bytes());
+        out.extend_from_slice(
+            &u32_len(self.parents.len())
+                .expect("wire counts fit u32")
+                .to_le_bytes(),
+        );
         for parent in &self.parents {
             out.extend_from_slice(parent.as_bytes());
         }
@@ -393,8 +398,51 @@ mod tests {
             1,
             0,
             100,
-        );
+        )
+        .unwrap();
         assert!(genesis.parents.is_empty());
         assert_eq!(Snapshot::decode(&genesis.encode()).unwrap(), genesis);
+    }
+
+    #[test]
+    fn constructor_rejects_reserved_flags_in_all_profiles() {
+        // Garbage flags fail here, before signing — not just at peer
+        // decode. A debug_assert would be silent in release; this is the
+        // same error decoding reports.
+        assert_eq!(
+            Snapshot::new(
+                Vec::new(),
+                ContentId::from_bytes([0x20; 32]),
+                DeviceId::from_bytes([0x30; 32]),
+                TransitionId::from_bytes([0x40; 32]),
+                1,
+                0x02,
+                100,
+            ),
+            Err(SnapshotError::ReservedFlags(0x02))
+        );
+        assert_eq!(
+            Snapshot::new(
+                Vec::new(),
+                ContentId::from_bytes([0x20; 32]),
+                DeviceId::from_bytes([0x30; 32]),
+                TransitionId::from_bytes([0x40; 32]),
+                1,
+                0xFF,
+                100,
+            ),
+            Err(SnapshotError::ReservedFlags(0xFF))
+        );
+        // The one defined flag still constructs.
+        assert!(Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x20; 32]),
+            DeviceId::from_bytes([0x30; 32]),
+            TransitionId::from_bytes([0x40; 32]),
+            1,
+            RECOVERY_FLAG,
+            100,
+        )
+        .is_ok());
     }
 }

@@ -55,7 +55,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::identity::{BaoRoot, ContentId, ObjectKind, SnapshotId, StorageId};
+use crate::identity::{u32_len, BaoRoot, ContentId, ObjectKind, SnapshotId, StorageId};
 use thiserror::Error;
 
 /// Canonical length of one encoded entry: 32 + 1 + 1 + 32 + 8 + 8 + 32.
@@ -277,11 +277,19 @@ impl Manifest {
             32 + 4 + ENTRY_LEN * self.entries.len() + 4 + CHILD_LEN * self.children.len(),
         );
         out.extend_from_slice(self.snapshot.as_bytes());
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(
+            &u32_len(self.entries.len())
+                .expect("wire counts fit u32")
+                .to_le_bytes(),
+        );
         for entry in &self.entries {
             out.extend_from_slice(&entry.encode());
         }
-        out.extend_from_slice(&(self.children.len() as u32).to_le_bytes());
+        out.extend_from_slice(
+            &u32_len(self.children.len())
+                .expect("wire counts fit u32")
+                .to_le_bytes(),
+        );
         for child in &self.children {
             out.extend_from_slice(child.tree.as_bytes());
             out.extend_from_slice(child.manifest.as_bytes());

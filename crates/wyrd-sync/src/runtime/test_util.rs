@@ -400,7 +400,8 @@ pub(crate) fn intake_body(builder: &Builder, admission: &MembershipTransition) -
         admission.epoch,
         0,
         1000 + admission.epoch,
-    );
+    )
+    .unwrap();
     crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
     body
 }

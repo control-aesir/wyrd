@@ -153,7 +153,8 @@ fn authorized_snapshot_body() -> AuthorizedSnapshot {
         2,
         0,
         42,
-    );
+    )
+    .unwrap();
     sign_snapshot(&mut body, &key(10).0, &drive());
     AuthorizedSnapshot::authorize(body, &drive()).unwrap()
 }

@@ -81,6 +81,12 @@ pub struct ManifestRecord {
     /// serves on the eager exchange route and, for an author, the one
     /// its announcement names. Deterministic under replay, which walks
     /// the same commit order.
+    ///
+    /// Invariant (enforced by [`RuntimeState::record_manifest`] and the
+    /// durable codec): when `representations` is non-empty, `transport`
+    /// is one of its values. An empty map is a representationless root:
+    /// `transport` names the not-yet-recorded first representation and
+    /// serves nothing until merges fill the map.
     pub transport: BaoRoot,
     pub manifest: Manifest,
 }
@@ -153,6 +159,8 @@ pub enum RuntimeError {
         manifest: ContentId,
         derived: ContentId,
     },
+    #[error("manifest {manifest} names a transport root with no recorded representation")]
+    TransportNotRepresented { manifest: ContentId },
 }
 
 impl RuntimeState {
@@ -289,6 +297,26 @@ impl RuntimeState {
             }
             existing.representations.extend(record.representations);
             return Ok(false);
+        }
+
+        // Transport/representation consistency, new records only: a
+        // record naming representations must serve its eager root from
+        // among them, or the eager route would serve under a root the
+        // record's own map does not advertise. Merges skip this: the
+        // stored transport was validated at insert, merges only extend
+        // the map, and the incoming transport is ignored (first-recorded
+        // wins). An empty map is a representationless root (serves
+        // nothing) and is allowed. Checked before any mutation: `Err`
+        // means no state change.
+        if !record.representations.is_empty()
+            && !record
+                .representations
+                .values()
+                .any(|root| *root == record.transport)
+        {
+            return Err(RuntimeError::TransportNotRepresented {
+                manifest: manifest_id,
+            });
         }
 
         for child in record.manifest.children() {
@@ -783,6 +811,29 @@ mod tests {
         assert!(!stored
             .representations
             .contains_key(&StorageId::from_bytes([0xA0; 32])));
+    }
+
+    #[test]
+    fn unrepresented_transport_is_rejected_before_any_mutation() {
+        let mut state = RuntimeState::new(drive());
+        let id = manifest_id_for(&root_manifest(1, 9, 4, 5));
+        // A transport root with no recorded representation fails closed.
+        let mut bad = root_manifest(1, 9, 4, 5);
+        bad.transport = BaoRoot::from_bytes([0xD0; 32]);
+        assert!(matches!(
+            state.record_manifest(bad),
+            Err(RuntimeError::TransportNotRepresented { .. })
+        ));
+        assert!(
+            state.manifest_record(&id).is_none(),
+            "the rejected record leaves no state behind"
+        );
+        // A representationless root (empty map) is allowed: it serves
+        // nothing until merges fill the map.
+        let mut bare = root_manifest(1, 9, 4, 5);
+        bare.representations.clear();
+        assert!(state.record_manifest(bare).unwrap());
+        assert!(state.manifest_record(&id).is_some());
     }
 
     #[test]

@@ -371,6 +371,13 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
     if manifest_id != derived {
         return None;
     }
+    // Transport/representation consistency (matches
+    // `RuntimeState::record_manifest`): a record naming representations
+    // must name its eager root among them. An empty map is a
+    // representationless root and stays decodable.
+    if !representations.is_empty() && !representations.values().any(|root| *root == transport) {
+        return None;
+    }
     Some(ManifestRecord {
         is_root,
         manifest_id,
@@ -432,5 +439,49 @@ mod tests {
         let entry = good[69..133].to_vec();
         bad.splice(133..133, entry);
         assert!(decode_record(&drive, &key, tag, &bad).is_none());
+    }
+
+    /// Transport/representation consistency: a record naming
+    /// representations must name its eager root among them, or the eager
+    /// route would serve under a root the record's own map does not
+    /// advertise. An empty map is a representationless root and stays
+    /// decodable.
+    #[test]
+    fn manifest_decode_rejects_unrepresented_transport() {
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let key = [0x11u8; 32];
+        let manifest =
+            Manifest::new(SnapshotId::from_bytes([0x11; 32]), Vec::new(), Vec::new()).unwrap();
+        let manifest_id = ContentId::derive(ObjectKind::Manifest, &manifest.canonical_bytes());
+        let record = ManifestRecord {
+            is_root: true,
+            manifest_id,
+            representations: BTreeMap::from([(
+                StorageId::from_bytes([0xA0; 32]),
+                BaoRoot::from_bytes([0xC0; 32]),
+            )]),
+            transport: BaoRoot::from_bytes([0xC0; 32]),
+            manifest: manifest.clone(),
+        };
+        let (tag, good) = encode_fact(&key, &drive, &Fact::Manifest(record)).unwrap();
+        assert!(decode_record(&drive, &key, tag, &good).is_some());
+
+        // Patch the transport root to one the map does not advertise
+        // (record layout: manifest id 0..32, is_root 32, transport
+        // 33..65, storage count 65..69).
+        let mut bad = good.clone();
+        bad[33..65].copy_from_slice(&[0xD0; 32]);
+        assert!(decode_record(&drive, &key, tag, &bad).is_none());
+
+        // A representationless root still decodes: it serves nothing.
+        let bare = ManifestRecord {
+            is_root: true,
+            manifest_id,
+            representations: BTreeMap::new(),
+            transport: BaoRoot::from_bytes([0xC0; 32]),
+            manifest,
+        };
+        let (tag, bytes) = encode_fact(&key, &drive, &Fact::Manifest(bare)).unwrap();
+        assert!(decode_record(&drive, &key, tag, &bytes).is_some());
     }
 }

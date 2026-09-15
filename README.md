@@ -151,7 +151,14 @@ so running them requires system macFUSE: `brew install --cask macfuse`,
 then approve the "Benjamin Fleischer" system software under System
 Settings, Privacy & Security (kernel-extension user consent must be
 enabled; on Apple Silicon that needs Reduced Security, set once in
-Recovery via Startup Security Utility), and reboot. The `devenv`
+Recovery via Startup Security Utility), and reboot. If the mount still
+fails, make sure macFUSE's mount daemon is running
+(`pgrep -af io.macfuse.app.launchservice.daemon`); if it is not,
+`sudo launchctl kickstart -k system/io.macfuse.app.launchservice.daemon`.
+`wyrd mount` fails fast when the kext is unloaded and otherwise names its
+stage (serving, bulk, FUSE session); on macOS a session failure also
+prints a checklist, because macFUSE can fail without setting errno and a
+bare errno may be stale. The `devenv`
 environment only provides build-time stubs for fuser's probe; it cannot
 supply the runtime library or the kernel extension. `cargo check` and the
 `wyrd-format`, `wyrd-sync`, and `wyrd-fuse` suites need no FUSE at all.

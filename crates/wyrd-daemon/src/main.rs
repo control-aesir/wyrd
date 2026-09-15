@@ -93,6 +93,12 @@ enum CliError {
     Mailbox(#[from] wyrd_sync::transport::mailbox::MailboxError),
     #[error("live sync failed: {0}")]
     Live(#[from] LiveError),
+    #[error("serving endpoint failed: {0}")]
+    Serving(std::io::Error),
+    #[error("bulk source failed: {0}")]
+    Bulk(std::io::Error),
+    #[error("macOS FUSE preflight failed: {0}")]
+    Preflight(String),
     #[error("FUSE mount failed: {0}")]
     Mount(#[from] std::io::Error),
 }
@@ -291,13 +297,19 @@ fn mount(
     )?;
     daemon.refresh_live_heads()?;
 
+    // Fail fast on macOS before binding any endpoint: a missing
+    // macFUSE runtime can never mount, and every later stage would
+    // report the same opaque failure.
+    #[cfg(target_os = "macos")]
+    macos_preflight(&mountpoint)?;
+
     // Serving: a real-iroh endpoint over the drive's durable vault, so
     // peers holding an announcement route can fetch what this drive
     // holds. The fetch side is the matching real bulk source; routes
     // publish from recorded announcements on every sync pass.
     let serving = daemon
         .open_serving(&drive_dir, false)
-        .map_err(CliError::Mount)?;
+        .map_err(CliError::Serving)?;
     let mut bulk = bind_bulk_source()?;
     eprintln!(
         "serving over iroh: {}",
@@ -327,6 +339,18 @@ fn mount(
     // below returns through the unmount-and-join sequence, never
     // leaking a detached session.
     install_shutdown_handler()?;
+    // On macOS the reported errno may be stale: macFUSE's libfuse2
+    // mount can fail without setting errno at all, so name the
+    // checklist alongside the raw error instead of trusting it.
+    #[cfg(target_os = "macos")]
+    let mut session = match fuser::Session::new(backend, &mountpoint, &session_config()) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{MACOS_MOUNT_HINT}");
+            return Err(CliError::Mount(error));
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
     let server = std::thread::spawn(move || session.run());
@@ -359,7 +383,74 @@ fn mount(
 /// Bind the fetch side's iroh endpoint (N0 relays for peer
 /// reachability) and wrap it in the real bulk source.
 fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
-    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Mount)
+    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Bulk)
+}
+
+/// macOS mount-failure checklist, printed next to the raw error.
+/// macFUSE's libfuse2 mount can return -1 without setting errno, so
+/// the errno in the error line may be stale (observed: EOPNOTSUPP
+/// left over from an iroh socket op, ENOTTY from elsewhere). The
+/// checklist names the fix; the README carries the full procedure.
+#[cfg(target_os = "macos")]
+const MACOS_MOUNT_HINT: &str = "macOS hint: the errno above may be stale; check \
+    the kext (ls /dev/macfuse0; if missing: load macFUSE, approve it in \
+    Privacy & Security, reboot), the mount daemon (pgrep -af \
+    io.macfuse.app.launchservice.daemon; if missing: sudo launchctl kickstart \
+    -k system/io.macfuse.app.launchservice.daemon), and the README macOS section.";
+
+/// Fail fast when the macOS FUSE runtime cannot mount: macFUSE
+/// missing entirely, or installed with its kext unloaded. Both states
+/// are plain path probes so the logic stays unit-testable; only the
+/// wiring (real /Library and /dev roots) is macOS-gated at the call
+/// site. The mountpoint itself must already be a directory — fuser
+/// would reject anything else with a bare ENOENT.
+#[cfg(target_os = "macos")]
+fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
+    if let Err(reason) = check_mountpoint(mountpoint) {
+        return Err(CliError::Preflight(reason));
+    }
+    if let Err(reason) = check_macfuse_runtime(
+        Path::new("/Library/Filesystems/macfuse.fs"),
+        Path::new("/dev"),
+    ) {
+        return Err(CliError::Preflight(reason));
+    }
+    Ok(())
+}
+
+/// The mountpoint must be an existing directory before fuser sees it.
+fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
+    match std::fs::metadata(mountpoint) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "mountpoint {} is not a directory",
+            mountpoint.display()
+        )),
+        Err(_) => Err(format!(
+            "mountpoint {} does not exist",
+            mountpoint.display()
+        )),
+    }
+}
+
+/// Distinguish macFUSE absent from macFUSE present-but-unloaded: the
+/// bundle probe names the install step, the device probe names the
+/// load/approve/reboot step. `dev_dir` is a parameter (not `/dev`
+/// inline) so tests can point it at a tempdir.
+fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(), String> {
+    if !bundle.exists() {
+        return Err(format!(
+            "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
+            bundle.display()
+        ));
+    }
+    if !dev_dir.join("macfuse0").exists() {
+        return Err(format!(
+            "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
+            dev_dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Fold the loop and session outcomes into the process exit status: a
@@ -882,5 +973,63 @@ mod tests {
             "the rejoin is bounded"
         );
         drop(send);
+    }
+
+    /// Each mount stage names itself: serving, bulk, preflight, and
+    /// the FUSE session render distinct prefixes, so a failure can
+    /// never again report every stage as "FUSE mount failed".
+    #[test]
+    fn mount_stages_name_themselves() {
+        let serving = CliError::Serving(std::io::Error::other("down"));
+        let bulk = CliError::Bulk(std::io::Error::other("down"));
+        let preflight = CliError::Preflight("kext missing".into());
+        let mount = CliError::Mount(std::io::Error::other("down"));
+        for (error, prefix) in [
+            (serving, "serving endpoint failed"),
+            (bulk, "bulk source failed"),
+            (preflight, "macOS FUSE preflight failed"),
+            (mount, "FUSE mount failed"),
+        ] {
+            assert!(
+                format!("{error}").starts_with(prefix),
+                "staged error must name its stage: {error}"
+            );
+        }
+    }
+
+    /// The mountpoint probe accepts a directory and names anything
+    /// else: fuser's bare ENOENT never reaches the user.
+    #[test]
+    fn mountpoint_probe_names_missing_or_file() {
+        let temp = TempDir::new();
+        assert!(check_mountpoint(&temp.0).is_ok());
+        let missing = temp.0.join("nope");
+        assert!(
+            matches!(check_mountpoint(&missing), Err(reason) if reason.contains("does not exist"))
+        );
+        let file = temp.0.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(
+            matches!(check_mountpoint(&file), Err(reason) if reason.contains("not a directory"))
+        );
+    }
+
+    /// The runtime probe distinguishes absent macFUSE from an
+    /// unloaded kext, and passes when both probes hit.
+    #[test]
+    fn runtime_probe_distinguishes_absent_from_unloaded() {
+        let temp = TempDir::new();
+        let bundle = temp.0.join("macfuse.fs");
+        let dev = temp.0.join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        assert!(
+            matches!(check_macfuse_runtime(&bundle, &dev), Err(reason) if reason.contains("not installed"))
+        );
+        fs::create_dir_all(&bundle).unwrap();
+        assert!(
+            matches!(check_macfuse_runtime(&bundle, &dev), Err(reason) if reason.contains("not loaded"))
+        );
+        fs::write(dev.join("macfuse0"), b"").unwrap();
+        assert!(check_macfuse_runtime(&bundle, &dev).is_ok());
     }
 }

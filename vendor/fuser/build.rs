@@ -17,12 +17,16 @@ fn main() {
         if cfg!(feature = "macos-no-mount") {
             println!("cargo::rustc-cfg=fuser_mount_impl=\"macos-no-mount\"");
         } else {
-            pkg_config::Config::new()
-                .atleast_version("2.6.0")
-                .probe("fuse") // for macFUSE 4.x
-                .map_err(|e| eprintln!("{e}"))
-                .unwrap();
-            println!("cargo::rustc-cfg=fuser_mount_impl=\"libfuse2\"");
+            // Wyrd divergence from upstream 0.18.0: mount via libfuse3.
+            // Upstream probes libfuse2 here ("for macFUSE 4.x"), but
+            // macFUSE 5.3 disables that path (fuse_mount_compat25
+            // returns -1 unconditionally; see cberner/fuser#752), while
+            // the libfuse3 path mounts fine. The Rust protocol side is
+            // untouched; only the C mount/unmount calls change.
+            // Re-apply on re-sync, and converge with upstream once
+            // #752 lands (their direction keeps libfuse2 via the public
+            // channel API; ours switches the backend).
+            configure_libfuse3().unwrap();
             println!("cargo::rustc-cfg=feature=\"macfuse-4-compat\"");
         }
     } else if cfg!(feature = "libfuse3") {

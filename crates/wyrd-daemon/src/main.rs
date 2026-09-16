@@ -415,22 +415,125 @@ fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
     }
     // macFUSE 4.x installs macfuse.fs; older osxfuse layouts used
     // fuse.fs. Accept either so the probe does not reject a supported
-    // runtime it was not taught about.
-    const BUNDLES: [&str; 2] = [
-        "/Library/Filesystems/macfuse.fs",
-        "/Library/Filesystems/fuse.fs",
+    // runtime it was not taught about. Bundle discovery runs over all
+    // candidates before the kext probe, so a stale first bundle can
+    // never shadow a valid second one.
+    let bundles = [
+        Path::new("/Library/Filesystems/macfuse.fs"),
+        Path::new("/Library/Filesystems/fuse.fs"),
     ];
-    let mut last_reason = String::new();
-    for bundle in BUNDLES {
-        match check_macfuse_runtime(Path::new(bundle), Path::new("/dev")) {
-            Ok(()) => return Ok(()),
-            Err(reason) if reason.contains("not loaded") => {
-                return Err(CliError::Preflight(reason));
-            }
-            Err(reason) => last_reason = reason,
+    let bundle = find_macfuse_bundle(&bundles).map_err(CliError::Preflight)?;
+    check_kext_loaded(Path::new("/dev")).map_err(CliError::Preflight)?;
+    let _ = bundle;
+    Ok(())
+}
+
+/// Typed outcome of the macFUSE probes, so callers branch on variants
+/// instead of matching rendered error strings. Test scaffolding for the
+/// single-bundle probe; production separates the phases with
+/// [`find_macfuse_bundle`] then [`check_kext_loaded`], which is equally
+/// typed and never matches on message text.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum MacfuseProbe {
+    Ready,
+    BundleMissing,
+    BundleUnusable(String),
+    KextMissing,
+    KextUnusable(String),
+}
+
+/// Probe one bundle directory plus the kext node without rendering: the
+/// caller decides which errors are retryable across candidates.
+#[cfg(test)]
+fn probe_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> MacfuseProbe {
+    match std::fs::metadata(bundle) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return MacfuseProbe::BundleUnusable(format!(
+                "macFUSE bundle {} is not a directory: reinstall it with `brew install --cask macfuse`, then approve and reboot per the README",
+                bundle.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return MacfuseProbe::BundleMissing;
+        }
+        Err(error) => {
+            return MacfuseProbe::BundleUnusable(format!(
+                "macFUSE bundle {} cannot be inspected: {error}",
+                bundle.display()
+            ));
         }
     }
-    Err(CliError::Preflight(last_reason))
+    let node = dev_dir.join("macfuse0");
+    match std::fs::metadata(&node) {
+        Ok(metadata) if metadata.is_dir() => MacfuseProbe::KextUnusable(format!(
+            "macFUSE kext node {}/macfuse0 is a directory (expected a device node): reload macFUSE per the README",
+            dev_dir.display()
+        )),
+        Ok(_) => MacfuseProbe::Ready,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MacfuseProbe::KextMissing,
+        Err(error) => MacfuseProbe::KextUnusable(format!(
+            "macFUSE kext node {}/macfuse0 cannot be inspected: {error}",
+            dev_dir.display()
+        )),
+    }
+}
+
+/// Find the first installed bundle directory among the candidates: every
+/// candidate is probed before giving up, so ordering never shadows a
+/// valid later layout.
+fn find_macfuse_bundle(candidates: &[&Path]) -> Result<PathBuf, String> {
+    let mut last_unusable: Option<String> = None;
+    for bundle in candidates {
+        match std::fs::metadata(bundle) {
+            Ok(metadata) if metadata.is_dir() => return Ok(bundle.to_path_buf()),
+            Ok(_) => {
+                last_unusable = Some(format!(
+                    "macFUSE bundle {} is not a directory: reinstall it with `brew install --cask macfuse`, then approve and reboot per the README",
+                    bundle.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                last_unusable = Some(format!(
+                    "macFUSE bundle {} cannot be inspected: {error}",
+                    bundle.display()
+                ));
+            }
+        }
+    }
+    if let Some(reason) = last_unusable {
+        return Err(reason);
+    }
+    let names = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "macFUSE is not installed (none of {names}): install it with `brew install --cask macfuse`, then approve and reboot per the README"
+    ))
+}
+
+/// Probe the kext device node once the bundle is known to be installed.
+fn check_kext_loaded(dev_dir: &Path) -> Result<(), String> {
+    let node = dev_dir.join("macfuse0");
+    match std::fs::metadata(&node) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "macFUSE kext node {}/macfuse0 is a directory (expected a device node): reload macFUSE per the README",
+            dev_dir.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
+            dev_dir.display()
+        )),
+        Err(error) => Err(format!(
+            "macFUSE kext node {}/macfuse0 cannot be inspected: {error}",
+            dev_dir.display()
+        )),
+    }
 }
 
 /// The mountpoint must be an existing directory before fuser sees it.
@@ -462,41 +565,21 @@ fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
 /// Best-effort: the device probe checks presence, not device type — a
 /// stale regular file at macfuse0 passes here and fails at mount, where
 /// the mount error stays authoritative.
+///
+/// Test-only single-bundle renderer over [`probe_macfuse_runtime`];
+/// production pairs [`find_macfuse_bundle`] with [`check_kext_loaded`].
+#[cfg(test)]
 fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(), String> {
-    match std::fs::metadata(bundle) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return Err(format!(
-                "macFUSE bundle {} is not a directory: reinstall it with `brew install --cask macfuse`, then approve and reboot per the README",
-                bundle.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
-                bundle.display()
-            ));
-        }
-        Err(error) => {
-            return Err(format!(
-                "macFUSE bundle {} cannot be inspected: {error}",
-                bundle.display()
-            ));
-        }
-    }
-    let node = dev_dir.join("macfuse0");
-    match std::fs::metadata(&node) {
-        Ok(metadata) if metadata.is_dir() => Err(format!(
-            "macFUSE kext node {}/macfuse0 is a directory (expected a device node): reload macFUSE per the README",
-            dev_dir.display()
+    match probe_macfuse_runtime(bundle, dev_dir) {
+        MacfuseProbe::Ready => Ok(()),
+        MacfuseProbe::BundleMissing => Err(format!(
+            "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
+            bundle.display()
         )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+        MacfuseProbe::BundleUnusable(reason)
+        | MacfuseProbe::KextUnusable(reason) => Err(reason),
+        MacfuseProbe::KextMissing => Err(format!(
             "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
-            dev_dir.display()
-        )),
-        Err(error) => Err(format!(
-            "macFUSE kext node {}/macfuse0 cannot be inspected: {error}",
             dev_dir.display()
         )),
     }
@@ -1080,5 +1163,43 @@ mod tests {
         );
         fs::write(dev.join("macfuse0"), b"").unwrap();
         assert!(check_macfuse_runtime(&bundle, &dev).is_ok());
+    }
+
+    /// Bundle discovery probes every candidate before giving up: a
+    /// missing first layout never shadows a valid second one, and a
+    /// corrupt (non-directory) first layout falls through as well.
+    #[test]
+    fn bundle_discovery_falls_through_to_later_layouts() {
+        let temp = TempDir::new();
+        let first = temp.0.join("macfuse.fs");
+        let second = temp.0.join("fuse.fs");
+        assert!(
+            matches!(find_macfuse_bundle(&[&first, &second]), Err(reason) if reason.contains("not installed"))
+        );
+        fs::create_dir_all(&second).unwrap();
+        assert_eq!(find_macfuse_bundle(&[&first, &second]).unwrap(), second);
+        fs::write(&first, b"stale").unwrap();
+        assert_eq!(find_macfuse_bundle(&[&first, &second]).unwrap(), second);
+    }
+
+    /// The typed probe names each state without string matching: bundle
+    /// absence, kext absence, and readiness are distinct variants.
+    #[test]
+    fn typed_probe_names_each_state() {
+        let temp = TempDir::new();
+        let bundle = temp.0.join("macfuse.fs");
+        let dev = temp.0.join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        assert_eq!(
+            probe_macfuse_runtime(&bundle, &dev),
+            MacfuseProbe::BundleMissing
+        );
+        fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(
+            probe_macfuse_runtime(&bundle, &dev),
+            MacfuseProbe::KextMissing
+        );
+        fs::write(dev.join("macfuse0"), b"").unwrap();
+        assert_eq!(probe_macfuse_runtime(&bundle, &dev), MacfuseProbe::Ready);
     }
 }

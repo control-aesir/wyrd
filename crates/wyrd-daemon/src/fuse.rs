@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use fuser::{FileHandle, INodeNo, LockOwner, OpenFlags};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
@@ -432,6 +432,50 @@ fn errno_of(error: &ViewError) -> fuser::Errno {
         | ViewError::Unavailable
         | ViewError::Corrupt
         | ViewError::Store(_) => fuser::Errno::EIO,
+    }
+}
+
+/// Request-level debug probe: opcode + latency + reply errno at
+/// `debug` level, enabled by the mount's `--verbose` flag (the
+/// subscriber filter gates it; at the default `info` level each
+/// dispatch costs one enabled-check).
+///
+/// Construct at dispatch entry; wrap each `reply.error(errno)` as
+/// `reply.error(log.fail(errno))`. Success needs no annotation — the
+/// absence of a recorded errno logs the dispatch as clean. The guard
+/// drops at the end of the callback, after the reply is sent, so the
+/// latency covers the dispatch. Interior mutability keeps call sites
+/// to one line with no `mut` binding.
+struct RequestLog {
+    opcode: &'static str,
+    start: Instant,
+    err: std::cell::Cell<Option<i32>>,
+}
+
+impl RequestLog {
+    fn new(opcode: &'static str) -> Self {
+        RequestLog {
+            opcode,
+            start: Instant::now(),
+            err: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Record the reply errno for the drop log; returns it unchanged
+    /// so it reads inline at the reply site.
+    fn fail(&self, err: fuser::Errno) -> fuser::Errno {
+        self.err.set(Some(i32::from(err)));
+        err
+    }
+}
+
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        let latency_us = self.start.elapsed().as_micros() as u64;
+        match self.err.get() {
+            Some(errno) => tracing::debug!(opcode = self.opcode, errno, latency_us),
+            None => tracing::debug!(opcode = self.opcode, latency_us),
+        }
     }
 }
 
@@ -1620,14 +1664,15 @@ where
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        let _log = RequestLog::new("lookup");
         let Some(name) = name.to_str() else {
-            reply.error(fuser::Errno::ENOENT);
+            reply.error(_log.fail(fuser::Errno::ENOENT));
             return;
         };
         let parent_path = match self.inode_path(parent.0) {
             Ok(path) => path,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
@@ -1637,7 +1682,7 @@ where
                 let attr = self.attr(ino, &node);
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1648,15 +1693,16 @@ where
         _fh: Option<FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
+        let _log = RequestLog::new("getattr");
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
         let Ok(projection) = self.projection() else {
-            reply.error(fuser::Errno::EIO);
+            reply.error(_log.fail(fuser::Errno::EIO));
             return;
         };
         match projection.view().lookup(&path) {
@@ -1664,7 +1710,7 @@ where
                 if let Err(error) =
                     self.validate_inode(ino.0, &path, &node, projection.generation())
                 {
-                    reply.error(error);
+                    reply.error(_log.fail(error));
                     return;
                 }
                 let attr = self.attr(ino.0, &node);
@@ -1675,9 +1721,9 @@ where
                 // recreation mints a fresh ino instead of reattaching
                 // the retired one to new content.
                 self.retire_inode(ino.0);
-                reply.error(fuser::Errno::ENOENT);
+                reply.error(_log.fail(fuser::Errno::ENOENT));
             }
-            Err(error) => reply.error(errno_of(&error)),
+            Err(error) => reply.error(_log.fail(errno_of(&error))),
         }
     }
 
@@ -1689,10 +1735,11 @@ where
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
+        let _log = RequestLog::new("readdir");
         let all = match self.dir_entries(fh.0) {
             Ok(all) => all,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
@@ -1716,16 +1763,17 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
+        let _log = RequestLog::new("opendir");
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
         match self.open_dir(ino.0, &path) {
             Ok(handle) => reply.opened(FileHandle(handle), fuser::FopenFlags::empty()),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1737,21 +1785,23 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("releasedir");
         match self.release_dir(fh.0) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
     fn open(&self, _req: &fuser::Request, ino: INodeNo, flags: OpenFlags, reply: fuser::ReplyOpen) {
+        let _log = RequestLog::new("open");
         if unsupported_open_flags(flags.0) {
-            reply.error(fuser::Errno::EOPNOTSUPP);
+            reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
             return;
         }
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
@@ -1760,7 +1810,7 @@ where
         // here so the kernel re-resolves instead of opening the
         // path's new occupant under stale identity.
         let Ok(projection) = self.projection() else {
-            reply.error(fuser::Errno::EIO);
+            reply.error(_log.fail(fuser::Errno::EIO));
             return;
         };
         match projection.view().lookup(&path) {
@@ -1768,17 +1818,17 @@ where
                 if let Err(error) =
                     self.validate_inode(ino.0, &path, &node, projection.generation())
                 {
-                    reply.error(error);
+                    reply.error(_log.fail(error));
                     return;
                 }
             }
             Err(ViewError::NotFound) => {
                 self.retire_inode(ino.0);
-                reply.error(fuser::Errno::ENOENT);
+                reply.error(_log.fail(fuser::Errno::ENOENT));
                 return;
             }
             Err(error) => {
-                reply.error(errno_of(&error));
+                reply.error(_log.fail(errno_of(&error)));
                 return;
             }
         }
@@ -1790,41 +1840,42 @@ where
         };
         match opened {
             Ok(handle) => reply.opened(handle, fuser::FopenFlags::FOPEN_DIRECT_IO),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
     fn readlink(&self, _req: &fuser::Request, ino: INodeNo, reply: fuser::ReplyData) {
+        let _log = RequestLog::new("readlink");
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
         let Ok(projection) = self.projection() else {
-            reply.error(fuser::Errno::EIO);
+            reply.error(_log.fail(fuser::Errno::EIO));
             return;
         };
         let node = match projection.view().lookup(&path) {
             Ok(node) => node,
             Err(ViewError::NotFound) => {
                 self.retire_inode(ino.0);
-                reply.error(fuser::Errno::ENOENT);
+                reply.error(_log.fail(fuser::Errno::ENOENT));
                 return;
             }
             Err(error) => {
-                reply.error(errno_of(&error));
+                reply.error(_log.fail(errno_of(&error)));
                 return;
             }
         };
         if let Err(error) = self.validate_inode(ino.0, &path, &node, projection.generation()) {
-            reply.error(error);
+            reply.error(_log.fail(error));
             return;
         }
         match symlink_target(projection.view(), &path) {
             Ok(target) => reply.data(target.as_bytes()),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1841,13 +1892,14 @@ where
         _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
+        let _log = RequestLog::new("mkdir");
         let Some(name) = name.to_str() else {
-            reply.error(fuser::Errno::EINVAL);
+            reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
         };
         match self.mkdir_at(parent.0, name) {
             Ok((_, attr)) => reply.entry(&TTL, &attr, fuser::Generation(0)),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1862,12 +1914,13 @@ where
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyData,
     ) {
+        let _log = RequestLog::new("read");
         // Reads serve the open-time capture keyed by the handle; the
         // path the descriptor was opened from is never consulted
         // again.
         match self.read_handle(fh, offset, size) {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1881,9 +1934,10 @@ where
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("release");
         match self.release_handle(fh) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1901,9 +1955,10 @@ where
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
+        let _log = RequestLog::new("write");
         match self.write_handle(fh, offset, data) {
             Ok(written) => reply.written(written),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1919,9 +1974,10 @@ where
         _lock_owner: LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("flush");
         match self.commit_handle(fh) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1933,9 +1989,10 @@ where
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("fsync");
         match self.commit_handle(fh) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1951,8 +2008,9 @@ where
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
+        let _log = RequestLog::new("create");
         let Some(name) = name.to_str() else {
-            reply.error(fuser::Errno::EINVAL);
+            reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
         };
         match self.create_at(parent.0, name, flags) {
@@ -1963,7 +2021,7 @@ where
                 fh,
                 fuser::FopenFlags::FOPEN_DIRECT_IO,
             ),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1974,13 +2032,14 @@ where
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("unlink");
         let Some(name) = name.to_str() else {
-            reply.error(fuser::Errno::EINVAL);
+            reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
         };
         match self.unlink_at(parent.0, name) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -1991,13 +2050,14 @@ where
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("rmdir");
         let Some(name) = name.to_str() else {
-            reply.error(fuser::Errno::EINVAL);
+            reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
         };
         match self.rmdir_at(parent.0, name) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -2011,6 +2071,7 @@ where
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
+        let _log = RequestLog::new("rename");
         // Atomic exchange and whiteout are not representable; only
         // plain rename and RENAME_NOREPLACE are served. The
         // RENAME_* constants are Linux-only in both `libc` and
@@ -2020,16 +2081,16 @@ where
         if flags
             .intersects(fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT)
         {
-            reply.error(fuser::Errno::EOPNOTSUPP);
+            reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
             return;
         }
         #[cfg(not(target_os = "linux"))]
         if !flags.is_empty() {
-            reply.error(fuser::Errno::EOPNOTSUPP);
+            reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
             return;
         }
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
-            reply.error(fuser::Errno::EINVAL);
+            reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
         };
         #[cfg(target_os = "linux")]
@@ -2038,7 +2099,7 @@ where
         let no_replace = false;
         match self.rename_at(parent.0, name, newparent.0, newname, no_replace) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
@@ -2063,26 +2124,28 @@ where
         _flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
+        let _log = RequestLog::new("setattr");
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         };
         if size.is_some() || mode.is_some() {
             if let Err(error) = self.setattr_attrs(ino.0, fh, size, mode) {
-                reply.error(error);
+                reply.error(_log.fail(error));
                 return;
             }
         }
         match self.resolve_inode(&path) {
             Ok((ino, node, _)) => reply.attr(&TTL, &self.attr(ino, &node)),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 
     fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        let _log = RequestLog::new("statfs");
         // A bottomless append-only store: capacities unknown and
         // effectively unbounded.
         reply.statfs(0, 0, 0, 0, 0, 1, 4096, 0);
@@ -2208,6 +2271,22 @@ mod tests {
             errno_of(&ViewError::Store("disk".into())),
             fuser::Errno::EIO
         );
+    }
+
+    /// The request probe records the reply errno inline and passes it
+    /// through unchanged, so `reply.error(log.fail(errno))` reads at
+    /// the reply site and logs opcode + errno + latency on drop. An
+    /// unfailed probe logs the dispatch as clean.
+    #[test]
+    fn request_log_records_the_reply_errno() {
+        let log = RequestLog::new("lookup");
+        assert_eq!(log.err.get(), None);
+        let returned = log.fail(fuser::Errno::ENOENT);
+        assert_eq!(returned, fuser::Errno::ENOENT);
+        assert_eq!(log.err.get(), Some(i32::from(fuser::Errno::ENOENT)));
+
+        let clean = RequestLog::new("statfs");
+        assert_eq!(clean.err.get(), None);
     }
 
     #[test]

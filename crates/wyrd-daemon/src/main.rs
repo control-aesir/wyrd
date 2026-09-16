@@ -796,6 +796,30 @@ mod tests {
         }
     }
 
+    /// Scoped `RUST_LOG` removal: the diagnostics tests need the default
+    /// filter, not ambient environment. Restores on drop so a panicking
+    /// assert cannot leak the mutation into sibling tests sharing the
+    /// process.
+    struct WithoutRustLog {
+        previous: Option<String>,
+    }
+
+    impl WithoutRustLog {
+        fn take() -> Self {
+            let previous = std::env::var("RUST_LOG").ok();
+            std::env::remove_var("RUST_LOG");
+            WithoutRustLog { previous }
+        }
+    }
+
+    impl Drop for WithoutRustLog {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var("RUST_LOG", value);
+            }
+        }
+    }
+
     fn write_secret(path: &Path, bytes: impl AsRef<[u8]>) {
         fs::write(path, bytes).unwrap();
         #[cfg(unix)]
@@ -1079,10 +1103,8 @@ mod tests {
     #[test]
     fn mount_events_reach_the_configured_log_file() {
         // RUST_LOG would override the gate under test; nothing else in
-        // this binary reads it, so take it out of the way and restore
-        // it after.
-        let rust_log = std::env::var("RUST_LOG").ok();
-        std::env::remove_var("RUST_LOG");
+        // this binary reads it, so take it out of the way under a guard.
+        let _no_rust_log = WithoutRustLog::take();
 
         let temp = TempDir::new();
         let log = temp.0.join("mount.log");
@@ -1111,10 +1133,6 @@ mod tests {
             text.contains("visible with verbose"),
             "verbose opens the debug gate: {text}"
         );
-
-        if let Some(value) = rust_log {
-            std::env::set_var("RUST_LOG", value);
-        }
     }
 
     /// Two subscribers route to their own files: per-mount file routing

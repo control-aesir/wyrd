@@ -2346,6 +2346,24 @@ mod tests {
         );
     }
 
+    /// Synthetic ownership presents the mounting user: kernels that
+    /// enforce permissions from attrs must see the mounter, or writes
+    /// fail before reaching the backend (observed EACCES on macFUSE
+    /// with uid/gid-zero presentation).
+    #[test]
+    fn attrs_present_the_mounting_user() {
+        let backend = backend();
+        let attr = backend.attr(
+            1,
+            &Node::Dir {
+                subtree: ContentId::from_bytes([0x02; 32]),
+            },
+        );
+        let (uid, gid) = current_owner();
+        assert_eq!(attr.uid, uid, "attrs carry the mounting uid");
+        assert_eq!(attr.gid, gid, "attrs carry the mounting gid");
+    }
+
     /// A first write whose resulting logical length exceeds the
     /// per-handle budget fails closed with `ENOSPC` *before*
     /// materializing the base, so an oversized file never allocates

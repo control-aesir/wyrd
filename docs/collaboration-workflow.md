@@ -78,6 +78,11 @@ open and triggers CI for PRs touching the filtered paths
 ngit pr ready <pr> --reason "ready for review" --json
 ```
 
+If CI fails on a PR, it posts the truncated failure tail as a PR comment
+and returns the PR to draft automatically. Push the fix (drafts run no
+CI) and mark ready again to re-trigger. Master-push failures have no PR
+to report to and change no PR state.
+
 Do not rewrite published history unless the workflow explicitly requires it.
 Keep unrelated worktree changes out of the PR.
 

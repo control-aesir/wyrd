@@ -3,10 +3,12 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
+use tracing_subscriber::layer::SubscriberExt as _;
 use wyrd_daemon::{Daemon, LiveConfig, LiveError, LiveSummary};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -45,7 +47,7 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
-    /// Mount a live read-only projection at `mountpoint`.
+    /// Mount a live projection at `mountpoint` (read-write).
     Mount {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -55,6 +57,12 @@ enum Command {
         /// stays idle.
         #[arg(long, value_name = "URL")]
         relay: Vec<String>,
+        /// Verbose mount diagnostics: debug-level FUSE request logs
+        /// (opcode + latency + reply errno) in stderr and `mount.log`.
+        /// Without it the mount logs at info level, and each request
+        /// costs one enabled-check.
+        #[arg(long)]
+        verbose: bool,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -93,6 +101,13 @@ enum CliError {
     Mailbox(#[from] wyrd_sync::transport::mailbox::MailboxError),
     #[error("live sync failed: {0}")]
     Live(#[from] LiveError),
+    #[error("serving endpoint failed: {0}")]
+    Serving(std::io::Error),
+    #[error("bulk source failed: {0}")]
+    Bulk(std::io::Error),
+    #[error("macOS FUSE preflight failed: {0}")]
+    #[cfg(any(test, target_os = "macos"))]
+    Preflight(String),
     #[error("FUSE mount failed: {0}")]
     Mount(#[from] std::io::Error),
 }
@@ -128,8 +143,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             drive_dir,
             mountpoint,
             relay,
+            verbose,
             ..
-        } => mount(drive_dir, mountpoint, relay, &passphrase, identity),
+        } => mount(drive_dir, mountpoint, relay, verbose, &passphrase, identity),
     }
 }
 
@@ -276,13 +292,136 @@ fn install_shutdown_handler() -> Result<(), CliError> {
     Ok(())
 }
 
+/// Cloneable file sink for the mount-log layer: the `fmt` layer needs
+/// a `MakeWriter`, and a shared `Arc<Mutex<File>>` is the simplest one
+/// that survives into the spawned session thread. A poisoned lock maps
+/// to an I/O error rather than panicking the mount.
+#[derive(Clone, Debug)]
+struct SharedWriter {
+    file: Arc<Mutex<fs::File>>,
+}
+
+impl SharedWriter {
+    fn new(file: fs::File) -> Self {
+        SharedWriter {
+            file: Arc::new(Mutex::new(file)),
+        }
+    }
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::other("mount log lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::other("mount log lock poisoned"))?
+            .flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for SharedWriter {
+    type Writer = SharedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Build the mount subscriber over an open log file: stderr plus
+/// file layers under one filter. Pure construction with no global
+/// state, so tests install it thread-scoped via
+/// [`tracing::subscriber::with_default`] and assert what lands in the
+/// file — including the `--verbose` debug gate — without disturbing
+/// the process-global subscriber other tests may have installed.
+fn build_mount_subscriber(file: fs::File, verbose: bool) -> impl tracing::Subscriber {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Both crates: the binary (`wyrd`, this file) and the library
+        // (`wyrd_daemon`, the FUSE backend) emit request and stage
+        // events under their own target roots.
+        tracing_subscriber::EnvFilter::new(if verbose {
+            "info,wyrd=debug,wyrd_daemon=debug"
+        } else {
+            "info"
+        })
+    });
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(SharedWriter::new(file))
+        .with_ansi(false);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer)
+}
+
+/// Mount diagnostics: structured events to stderr plus a per-mount
+/// file, and a bridge so fuser's `log` records land in the same
+/// stream.
+///
+/// The file (`drive_dir/mount.log`, truncated per mount) is the record
+/// a dead mount leaves behind — terminal scrollback is gone when the
+/// terminal is. Truncation keeps it bounded with zero rotation code:
+/// one mount, one log. Logs never contain secret bytes (same rule as
+/// CLI errors): stages, ids, errnos, latencies. They do record the
+/// drive and mountpoint paths as diagnostic metadata.
+///
+/// Call first in [`mount`], before preflight or the session thread
+/// exists. The daemon binary serves exactly one mount per process, so
+/// the first install wins by design. A second init in the same process
+/// (tests sharing one test binary) reuses the installed subscriber and
+/// says so on the existing stream instead of claiming a fresh install;
+/// it still truncates and returns the caller's own log path.
+fn init_mount_diagnostics(drive_dir: &Path, verbose: bool) -> Result<PathBuf, CliError> {
+    let log_path = drive_dir.join("mount.log");
+    let file = fs::File::create(&log_path).map_err(|source| CliError::Io {
+        path: log_path.clone(),
+        source,
+    })?;
+    // fuser's handshake errors and iroh internals log via the `log`
+    // crate; without this bridge those records vanish because no
+    // logger is ever initialized.
+    let _ = tracing_log::LogTracer::init();
+    let subscriber = build_mount_subscriber(file, verbose);
+    if tracing_subscriber::util::SubscriberInitExt::try_init(subscriber).is_err() {
+        tracing::warn!(
+            stage = "start",
+            log = %log_path.display(),
+            "diagnostics already initialized; reusing the installed subscriber",
+        );
+    }
+    Ok(log_path)
+}
+
 fn mount(
     drive_dir: PathBuf,
     mountpoint: PathBuf,
     relays: Vec<String>,
+    verbose: bool,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    // Diagnostics first: the bridge plus stderr/file layers must exist
+    // before preflight, the serving endpoint, or the session thread
+    // emit anything — otherwise a failed handshake or a dying loop
+    // leaves no record.
+    let log_path = init_mount_diagnostics(&drive_dir, verbose)?;
+    let mount_span = tracing::info_span!(
+        "mount",
+        drive = %drive_dir.display(),
+        mountpoint = %mountpoint.display(),
+        verbose = verbose,
+    );
+    let _mount_guard = mount_span.enter();
+    tracing::info!(stage = "start", log = %log_path.display(), "mount diagnostics initialized");
+
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
     let mut daemon = Daemon::new(
         engine,
@@ -291,18 +430,29 @@ fn mount(
     )?;
     daemon.refresh_live_heads()?;
 
+    // Fail fast on macOS before binding any endpoint: a missing
+    // macFUSE runtime can never mount, and every later stage would
+    // report the same opaque failure.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_preflight(&mountpoint) {
+        tracing::error!(stage = "preflight", error = %error, "macOS FUSE preflight failed");
+        return Err(error);
+    }
+    #[cfg(target_os = "macos")]
+    tracing::info!(stage = "preflight", "macOS FUSE preflight passed");
+
     // Serving: a real-iroh endpoint over the drive's durable vault, so
     // peers holding an announcement route can fetch what this drive
     // holds. The fetch side is the matching real bulk source; routes
     // publish from recorded announcements on every sync pass.
     let serving = daemon
         .open_serving(&drive_dir, false)
-        .map_err(CliError::Mount)?;
+        .map_err(CliError::Serving)?;
     let mut bulk = bind_bulk_source()?;
-    eprintln!(
-        "serving over iroh: {}",
-        hex::encode(serving.addr().id.as_bytes())
-    );
+    tracing::info!(stage = "bulk", "bulk source bound");
+    let serving_id = hex::encode(serving.addr().id.as_bytes());
+    eprintln!("serving over iroh: {serving_id}");
+    tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
 
     let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
@@ -321,15 +471,44 @@ fn mount(
     )?;
     if relays.is_empty() {
         eprintln!("warning: no --relay given; control-plane intake stays idle");
+        tracing::warn!(
+            stage = "mailbox",
+            "control-plane intake stays idle: no --relay given"
+        );
     }
 
     // Arm shutdown before mounting: every post-mount failure path
     // below returns through the unmount-and-join sequence, never
     // leaking a detached session.
     install_shutdown_handler()?;
+    // On macOS the reported errno may be stale: macFUSE's libfuse2
+    // mount can fail without setting errno at all, so name the
+    // checklist alongside the raw error instead of trusting it.
+    #[cfg(target_os = "macos")]
+    let mut session = match fuser::Session::new(backend, &mountpoint, &session_config()) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{MACOS_MOUNT_HINT}");
+            return Err(CliError::Mount(error));
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
-    let server = std::thread::spawn(move || session.run());
+    // The session loop owns the backend: log its exit immediately on
+    // the thread, so a dead event loop leaves a record even while the
+    // live loop below is still blocked — the main thread only learns
+    // the outcome at join time during shutdown.
+    let server = std::thread::spawn(move || {
+        let outcome = session.run();
+        match &outcome {
+            Ok(()) => tracing::info!(stage = "session", "FUSE session loop exited cleanly"),
+            Err(error) => {
+                tracing::error!(stage = "session", error = %error, "FUSE session loop exited with error");
+            }
+        }
+        outcome
+    });
     let result = live.run_loop(
         &mut mailbox,
         Some(&mut bulk),
@@ -337,6 +516,7 @@ fn mount(
         &LiveConfig::default(),
         &mut |error, consecutive| {
             eprintln!("live sync pass failed ({consecutive} consecutive): {error}");
+            tracing::warn!(stage = "sync", consecutive, error = %error, "live sync pass failed");
         },
     );
     bulk.shutdown();
@@ -348,10 +528,25 @@ fn mount(
     // when the loop stopped cleanly.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
+        tracing::warn!(stage = "session", error = %error, "unmount failed");
     }
+    // The exit itself is already logged on the session thread above;
+    // the join outcome is shutdown sequencing (debug), except a panic,
+    // which has no thread-side record and fails the mount as an error.
     let session_result = match server.join() {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::other("FUSE session thread panicked")),
+        Ok(result) => {
+            match &result {
+                Ok(()) => tracing::debug!(stage = "session", "session thread joined cleanly"),
+                Err(error) => {
+                    tracing::debug!(stage = "session", error = %error, "session thread joined with error");
+                }
+            }
+            result
+        }
+        Err(_) => {
+            tracing::error!(stage = "session", "FUSE session thread panicked");
+            Err(std::io::Error::other("FUSE session thread panicked"))
+        }
     };
     combine_status(result, session_result)
 }
@@ -359,7 +554,187 @@ fn mount(
 /// Bind the fetch side's iroh endpoint (N0 relays for peer
 /// reachability) and wrap it in the real bulk source.
 fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
-    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Mount)
+    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Bulk)
+}
+
+/// macOS mount-failure checklist, printed next to the raw error.
+/// macFUSE's libfuse2 mount can return -1 without setting errno, so
+/// the errno in the error line may be stale (observed: EOPNOTSUPP
+/// left over from an iroh socket op, ENOTTY from elsewhere). The
+/// checklist names the fix; the README carries the full procedure.
+#[cfg(target_os = "macos")]
+const MACOS_MOUNT_HINT: &str = "macOS hint: the errno above may be stale; check \
+    the kext (ls /dev/macfuse0; if missing: load macFUSE, approve it in \
+    Privacy & Security, reboot), the mount daemon (pgrep -af \
+    io.macfuse.app.launchservice.daemon; if missing: sudo launchctl kickstart \
+    -k system/io.macfuse.app.launchservice.daemon), and the README macOS section.";
+
+/// Fail fast when the macOS FUSE runtime cannot mount: macFUSE
+/// missing entirely, or installed with its kext unloaded. Both states
+/// are plain path probes so the logic stays unit-testable; only the
+/// wiring (real /Library and /dev roots) is macOS-gated at the call
+/// site. The mountpoint itself must already be a directory — fuser
+/// would reject anything else with a bare ENOENT.
+///
+/// Best-effort only: a passing preflight does not guarantee the mount
+/// will succeed (stale device nodes, alternate install layouts), and
+/// the real mount error remains authoritative.
+#[cfg(target_os = "macos")]
+fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
+    if let Err(reason) = check_mountpoint(mountpoint) {
+        return Err(CliError::Preflight(reason));
+    }
+    // macFUSE 4.x installs macfuse.fs; older osxfuse layouts used
+    // fuse.fs. Accept either so the probe does not reject a supported
+    // runtime it was not taught about. Each bundle is paired with the
+    // kext node it needs and a candidate wins only when both probe
+    // usable, so a stale or unloaded first layout never shadows a
+    // valid second one.
+    let dev = Path::new("/dev");
+    let candidates = [
+        (Path::new("/Library/Filesystems/macfuse.fs"), dev),
+        (Path::new("/Library/Filesystems/fuse.fs"), dev),
+    ];
+    let bundle = select_macfuse_runtime(&candidates).map_err(CliError::Preflight)?;
+    let _ = bundle;
+    Ok(())
+}
+
+/// Typed outcome of the macFUSE probes, so callers branch on variants
+/// instead of matching rendered error strings.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, PartialEq, Eq)]
+enum MacfuseProbe {
+    Ready,
+    BundleMissing,
+    BundleUnusable(String),
+    KextMissing,
+    KextUnusable(String),
+}
+
+/// Probe one bundle directory plus the kext node without rendering: the
+/// caller decides which errors are retryable across candidates.
+#[cfg(any(test, target_os = "macos"))]
+fn probe_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> MacfuseProbe {
+    match std::fs::metadata(bundle) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return MacfuseProbe::BundleUnusable(format!(
+                "macFUSE bundle {} is not a directory: reinstall it with `brew install --cask macfuse`, then approve and reboot per the README",
+                bundle.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return MacfuseProbe::BundleMissing;
+        }
+        Err(error) => {
+            return MacfuseProbe::BundleUnusable(format!(
+                "macFUSE bundle {} cannot be inspected: {error}",
+                bundle.display()
+            ));
+        }
+    }
+    let node = dev_dir.join("macfuse0");
+    match std::fs::metadata(&node) {
+        Ok(metadata) if metadata.is_dir() => MacfuseProbe::KextUnusable(format!(
+            "macFUSE kext node {}/macfuse0 is a directory (expected a device node): reload macFUSE per the README",
+            dev_dir.display()
+        )),
+        Ok(_) => MacfuseProbe::Ready,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MacfuseProbe::KextMissing,
+        Err(error) => MacfuseProbe::KextUnusable(format!(
+            "macFUSE kext node {}/macfuse0 cannot be inspected: {error}",
+            dev_dir.display()
+        )),
+    }
+}
+
+/// Select the first candidate whose bundle directory and kext node both
+/// probe usable. Every pair is probed before giving up: a missing,
+/// corrupt, or unloaded first layout falls through to the next, so
+/// ordering never shadows a valid later layout. When bundles are
+/// installed but no candidate's runtime is usable, the last failure is
+/// reported (each later candidate was probed too, so nothing valid was
+/// skipped).
+#[cfg(any(test, target_os = "macos"))]
+fn select_macfuse_runtime(candidates: &[(&Path, &Path)]) -> Result<PathBuf, String> {
+    let mut last_reason: Option<String> = None;
+    for (bundle, dev_dir) in candidates {
+        match probe_macfuse_runtime(bundle, dev_dir) {
+            MacfuseProbe::Ready => return Ok(bundle.to_path_buf()),
+            MacfuseProbe::BundleMissing => {}
+            MacfuseProbe::BundleUnusable(reason) | MacfuseProbe::KextUnusable(reason) => {
+                last_reason = Some(reason);
+            }
+            MacfuseProbe::KextMissing => {
+                last_reason = Some(format!(
+                    "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
+                    dev_dir.display()
+                ));
+            }
+        }
+    }
+    if let Some(reason) = last_reason {
+        return Err(reason);
+    }
+    let names = candidates
+        .iter()
+        .map(|(bundle, _)| bundle.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "macFUSE is not installed (none of {names}): install it with `brew install --cask macfuse`, then approve and reboot per the README"
+    ))
+}
+
+/// The mountpoint must be an existing directory before fuser sees it.
+/// Missing and unreadable are distinct: a permission or I/O failure
+/// must never report "does not exist" with a wrong remediation.
+#[cfg(any(test, target_os = "macos"))]
+fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
+    match std::fs::metadata(mountpoint) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "mountpoint {} is not a directory",
+            mountpoint.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "mountpoint {} does not exist",
+            mountpoint.display()
+        )),
+        Err(error) => Err(format!(
+            "mountpoint {} cannot be inspected: {error}",
+            mountpoint.display()
+        )),
+    }
+}
+
+/// Distinguish macFUSE absent from macFUSE present-but-unloaded: the
+/// bundle probe names the install step, the device probe names the
+/// load/approve/reboot step. `dev_dir` is a parameter (not `/dev`
+/// inline) so tests can point it at a tempdir.
+///
+/// Best-effort: the device probe checks presence, not device type — a
+/// stale regular file at macfuse0 passes here and fails at mount, where
+/// the mount error stays authoritative.
+///
+/// Test-only single-bundle renderer over [`probe_macfuse_runtime`];
+/// production selects pairs with [`select_macfuse_runtime`].
+#[cfg(test)]
+fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(), String> {
+    match probe_macfuse_runtime(bundle, dev_dir) {
+        MacfuseProbe::Ready => Ok(()),
+        MacfuseProbe::BundleMissing => Err(format!(
+            "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
+            bundle.display()
+        )),
+        MacfuseProbe::BundleUnusable(reason)
+        | MacfuseProbe::KextUnusable(reason) => Err(reason),
+        MacfuseProbe::KextMissing => Err(format!(
+            "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
+            dev_dir.display()
+        )),
+    }
 }
 
 /// Fold the loop and session outcomes into the process exit status: a
@@ -377,9 +752,13 @@ fn combine_status(
     }
 }
 
+/// The mount serves read-write: the session backend already carries
+/// the live daemon's mutation channel, so the kernel must not gate
+/// writes behind a read-only flag. The FSName keeps the volume
+/// identifiable in mount tables.
 fn session_config() -> Config {
     let mut config = Config::default();
-    config.mount_options = vec![MountOption::RO, MountOption::FSName("wyrd".into())];
+    config.mount_options = vec![MountOption::FSName("wyrd".into())];
     config
 }
 
@@ -414,6 +793,30 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Scoped `RUST_LOG` removal: the diagnostics tests need the default
+    /// filter, not ambient environment. Restores on drop so a panicking
+    /// assert cannot leak the mutation into sibling tests sharing the
+    /// process.
+    struct WithoutRustLog {
+        previous: Option<String>,
+    }
+
+    impl WithoutRustLog {
+        fn take() -> Self {
+            let previous = std::env::var("RUST_LOG").ok();
+            std::env::remove_var("RUST_LOG");
+            WithoutRustLog { previous }
+        }
+    }
+
+    impl Drop for WithoutRustLog {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var("RUST_LOG", value);
+            }
         }
     }
 
@@ -663,17 +1066,140 @@ mod tests {
         assert!(!text.contains("ssss"), "oversized content leaked: {text}");
     }
 
-    /// The static mount serves a read-only `wyrd` filesystem: the
-    /// kernel must never see a writable mount from this binary.
+    /// Mount diagnostics initialize a per-mount log file. A second init
+    /// in the same process truncates its own path but reuses the
+    /// installed subscriber — the first install wins by design — and
+    /// records that reuse instead of claiming a fresh install. (This
+    /// test is the only global installer in the binary, so its first
+    /// init is the installing one.)
     #[test]
-    fn mount_uses_a_read_only_filesystem_name() {
+    fn mount_diagnostics_create_a_per_mount_log() {
+        let temp = TempDir::new();
+        let drive = temp.0.join("drive");
+        fs::create_dir_all(&drive).unwrap();
+
+        let first = init_mount_diagnostics(&drive, false).unwrap();
+        assert_eq!(first, drive.join("mount.log"));
+        assert!(first.is_file(), "the mount leaves a log in the drive dir");
+
+        fs::write(&first, b"stale").unwrap();
+        let second = init_mount_diagnostics(&drive, true).unwrap();
+        assert_eq!(second, first);
+        let text = fs::read_to_string(&second).unwrap();
+        assert!(
+            !text.contains("stale"),
+            "each mount starts its own truncated log"
+        );
+        assert!(
+            text.contains("reusing the installed subscriber"),
+            "the reuse is recorded, not silent: {text}"
+        );
+    }
+
+    /// End-to-end diagnostics: events emitted under a thread-scoped
+    /// subscriber land in that subscriber's file, and `--verbose`
+    /// controls the debug gate — without touching the process-global
+    /// subscriber other tests may have installed.
+    #[test]
+    fn mount_events_reach_the_configured_log_file() {
+        // RUST_LOG would override the gate under test; nothing else in
+        // this binary reads it, so take it out of the way under a guard.
+        let _no_rust_log = WithoutRustLog::take();
+
+        let temp = TempDir::new();
+        let log = temp.0.join("mount.log");
+        let subscriber = build_mount_subscriber(fs::File::create(&log).unwrap(), false);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(stage = "test", "visible at info");
+            tracing::debug!(opcode = "lookup", latency_us = 7, "hidden without verbose");
+        });
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(
+            text.contains("visible at info"),
+            "info events reach the file: {text}"
+        );
+        assert!(
+            !text.contains("hidden without verbose"),
+            "debug stays gated without verbose: {text}"
+        );
+
+        let verbose_log = temp.0.join("verbose.log");
+        let subscriber = build_mount_subscriber(fs::File::create(&verbose_log).unwrap(), true);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(opcode = "lookup", latency_us = 7, "visible with verbose");
+        });
+        let text = fs::read_to_string(&verbose_log).unwrap();
+        assert!(
+            text.contains("visible with verbose"),
+            "verbose opens the debug gate: {text}"
+        );
+    }
+
+    /// Two subscribers route to their own files: per-mount file routing
+    /// holds wherever a subscriber is constructed per mount, while the
+    /// process-global install stays first-wins by design (see
+    /// [`init_mount_diagnostics`]).
+    #[test]
+    fn mount_subscribers_route_to_their_own_files() {
+        let temp = TempDir::new();
+        let first = temp.0.join("first.log");
+        let second = temp.0.join("second.log");
+        let first_subscriber = build_mount_subscriber(fs::File::create(&first).unwrap(), false);
+        let second_subscriber = build_mount_subscriber(fs::File::create(&second).unwrap(), false);
+        tracing::subscriber::with_default(first_subscriber, || {
+            tracing::info!("event for the first log");
+        });
+        tracing::subscriber::with_default(second_subscriber, || {
+            tracing::info!("event for the second log");
+        });
+        let first_text = fs::read_to_string(&first).unwrap();
+        let second_text = fs::read_to_string(&second).unwrap();
+        assert!(
+            first_text.contains("event for the first log")
+                && !first_text.contains("event for the second log"),
+            "the first subscriber keeps its own record: {first_text}"
+        );
+        assert!(
+            second_text.contains("event for the second log")
+                && !second_text.contains("event for the first log"),
+            "the second subscriber keeps its own record: {second_text}"
+        );
+    }
+
+    /// `--verbose` is a mount-only diagnostics flag: it parses on
+    /// mount and stays rejected for init like the other mount flags.
+    #[test]
+    fn mount_accepts_a_verbose_diagnostics_flag() {
+        let cli = Cli::try_parse_from([
+            "wyrd".to_owned(),
+            "mount".into(),
+            "/tmp/drive".into(),
+            "/tmp/mnt".into(),
+            "--identity-file".into(),
+            "/tmp/id".into(),
+            "--passphrase-file".into(),
+            "/tmp/pp".into(),
+            "--verbose".into(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Mount { verbose: true, .. }),
+            "mount carries the verbose diagnostics flag"
+        );
+    }
+
+    /// The mount serves a read-write `wyrd` filesystem: the backend
+    /// carries the live daemon's mutation channel, so the kernel must
+    /// not gate writes behind a read-only flag.
+    #[test]
+    fn mount_uses_a_read_write_filesystem_name() {
         let config = session_config();
         assert!(
             config
                 .mount_options
                 .iter()
-                .any(|option| matches!(option, MountOption::RO)),
-            "the mount is read-only"
+                .all(|option| !matches!(option, MountOption::RO)),
+            "the mount is read-write"
         );
         assert!(
             config
@@ -719,16 +1245,17 @@ mod tests {
         assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello mount");
     }
 
-    /// The full static mount: init, author, mount in a thread, read
-    /// through the mountpoint, prove read-only, shut down, and
-    /// rejoin cleanly. Ignored by default — opting in is the test
-    /// runner's job, so an explicit run always attempts the mount
+    /// The full live mount: init, author, mount in a thread, read
+    /// through the mountpoint, write a file through it and read it
+    /// back, shut down, rejoin cleanly, and prove the write survived
+    /// by reopening the drive. Ignored by default — opting in is the
+    /// test runner's job, so an explicit run always attempts the mount
     /// instead of silently passing. Needs kernel FUSE plus local
     /// networking for the serving endpoint. Run it where both hold:
     /// `cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
     #[test]
     #[ignore = "needs kernel FUSE and local networking"]
-    fn live_mount_serves_read_only_until_shutdown() {
+    fn live_mount_serves_read_write_until_shutdown() {
         // The shutdown latch is process-global: start unset so a
         // previous run in this process cannot cut this mount short.
         SHUTDOWN.store(false, Ordering::Relaxed);
@@ -762,9 +1289,10 @@ mod tests {
         // of orphaning the mount. The explicit join reports the
         // mount outcome; the Drop path stays best-effort (it must
         // never panic while unwinding).
+        let drive_path = drive.clone();
         let mut mount = MountGuard {
             server: Some(std::thread::spawn(move || {
-                mount(drive, mountpoint, Vec::new(), "test-pass", identity)
+                mount(drive, mountpoint, Vec::new(), false, "test-pass", identity)
             })),
         };
         let target = temp.0.join("mnt").join("hello.txt");
@@ -777,15 +1305,25 @@ mod tests {
             panic!("the mount did not serve in time");
         }
         assert_eq!(fs::read(&target).unwrap(), b"hello mount");
-        assert!(
-            fs::write(&target, b"nope").is_err(),
-            "the static mount is read-only"
-        );
+        // The mount serves read-write: a file written through the
+        // mountpoint reads back, and survives the mount: reopening
+        // the drive finds the authored content.
+        let written = temp.0.join("mnt").join("written.txt");
+        fs::write(&written, b"hello write").unwrap();
+        assert_eq!(fs::read(&written).unwrap(), b"hello write");
         mount.shutdown_and_join("during shutdown");
         assert!(
             fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
             "a clean unmount releases the mountpoint"
         );
+        let identity = read_identity(&identity_file).unwrap();
+        let engine = Engine::open_keystore(drive_path.clone(), "test-pass", identity).unwrap();
+        let store = FsObjectStore::open(drive_path).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.refresh_live_heads().unwrap();
+        let node = daemon.view().lookup("written.txt").unwrap();
+        let file = daemon.view().open(&node).unwrap();
+        assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello write");
     }
 
     /// Owns a spawned mount thread: signals shutdown and rejoins on
@@ -882,5 +1420,128 @@ mod tests {
             "the rejoin is bounded"
         );
         drop(send);
+    }
+
+    /// Each mount stage names itself: serving, bulk, preflight, and
+    /// the FUSE session render distinct prefixes, so a failure can
+    /// never again report every stage as "FUSE mount failed".
+    #[test]
+    fn mount_stages_name_themselves() {
+        let serving = CliError::Serving(std::io::Error::other("down"));
+        let bulk = CliError::Bulk(std::io::Error::other("down"));
+        let preflight = CliError::Preflight("kext missing".into());
+        let mount = CliError::Mount(std::io::Error::other("down"));
+        for (error, prefix) in [
+            (serving, "serving endpoint failed"),
+            (bulk, "bulk source failed"),
+            (preflight, "macOS FUSE preflight failed"),
+            (mount, "FUSE mount failed"),
+        ] {
+            assert!(
+                format!("{error}").starts_with(prefix),
+                "staged error must name its stage: {error}"
+            );
+        }
+    }
+
+    /// The mountpoint probe accepts a directory and names anything
+    /// else: fuser's bare ENOENT never reaches the user.
+    #[test]
+    fn mountpoint_probe_names_missing_or_file() {
+        let temp = TempDir::new();
+        assert!(check_mountpoint(&temp.0).is_ok());
+        let missing = temp.0.join("nope");
+        assert!(
+            matches!(check_mountpoint(&missing), Err(reason) if reason.contains("does not exist"))
+        );
+        let file = temp.0.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(
+            matches!(check_mountpoint(&file), Err(reason) if reason.contains("not a directory"))
+        );
+    }
+
+    /// The runtime probe distinguishes absent macFUSE from an
+    /// unloaded kext, and passes when both probes hit.
+    #[test]
+    fn runtime_probe_distinguishes_absent_from_unloaded() {
+        let temp = TempDir::new();
+        let bundle = temp.0.join("macfuse.fs");
+        let dev = temp.0.join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        assert!(
+            matches!(check_macfuse_runtime(&bundle, &dev), Err(reason) if reason.contains("not installed"))
+        );
+        fs::create_dir_all(&bundle).unwrap();
+        assert!(
+            matches!(check_macfuse_runtime(&bundle, &dev), Err(reason) if reason.contains("not loaded"))
+        );
+        fs::write(dev.join("macfuse0"), b"").unwrap();
+        assert!(check_macfuse_runtime(&bundle, &dev).is_ok());
+    }
+
+    /// Candidate selection probes bundle and kext as a pair and falls
+    /// through to later layouts: a missing or corrupt first bundle never
+    /// shadows a valid second one, and neither does a first bundle
+    /// directory whose kext is down while the second pair is valid.
+    #[test]
+    fn bundle_selection_falls_through_to_later_layouts() {
+        let temp = TempDir::new();
+        let first = temp.0.join("macfuse.fs");
+        let second = temp.0.join("fuse.fs");
+        let dev1 = temp.0.join("dev1");
+        let dev2 = temp.0.join("dev2");
+        fs::create_dir_all(&dev1).unwrap();
+        fs::create_dir_all(&dev2).unwrap();
+        assert!(
+            matches!(select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]), Err(reason) if reason.contains("not installed"))
+        );
+        fs::create_dir_all(&second).unwrap();
+        fs::write(dev2.join("macfuse0"), b"").unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            second
+        );
+        fs::write(&first, b"stale").unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            second
+        );
+        // The stale-directory case: the first bundle exists as a
+        // directory but its kext is down, while the second pair is
+        // fully valid. Selection must skip the first pair.
+        fs::remove_file(&first).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            second
+        );
+        // And a valid first pair still wins when both are usable.
+        fs::write(dev1.join("macfuse0"), b"").unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            first
+        );
+    }
+
+    /// The typed probe names each state without string matching: bundle
+    /// absence, kext absence, and readiness are distinct variants.
+    #[test]
+    fn typed_probe_names_each_state() {
+        let temp = TempDir::new();
+        let bundle = temp.0.join("macfuse.fs");
+        let dev = temp.0.join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        assert_eq!(
+            probe_macfuse_runtime(&bundle, &dev),
+            MacfuseProbe::BundleMissing
+        );
+        fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(
+            probe_macfuse_runtime(&bundle, &dev),
+            MacfuseProbe::KextMissing
+        );
+        fs::write(dev.join("macfuse0"), b"").unwrap();
+        assert_eq!(probe_macfuse_runtime(&bundle, &dev), MacfuseProbe::Ready);
     }
 }

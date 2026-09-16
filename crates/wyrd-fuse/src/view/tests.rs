@@ -1286,3 +1286,23 @@ fn set_heads_moves_the_mount() {
     let file = view.open(&view.lookup("f.txt").unwrap()).unwrap();
     assert_eq!(view.read(&file, 0, 3).unwrap(), b"bbb");
 }
+
+/// A fresh drive with no authored heads still has a root: it serves
+/// as an empty directory, never NotFound. Without this the root
+/// getattr fails and kernels refuse the mount (ENXIO on macFUSE for
+/// every later op), so an empty drive can never mount at all.
+#[test]
+fn empty_drive_serves_an_empty_root() {
+    let view = DriveView::new(
+        MemoryObjectStore::default(),
+        FakeMaterialization::empty(),
+        Vec::new(),
+    );
+    let empty = Node::MergedDir {
+        subtrees: Vec::new(),
+    };
+    assert_eq!(view.lookup("").unwrap(), empty);
+    assert_eq!(view.lookup("/").unwrap(), empty);
+    assert!(view.readdir(&empty).unwrap().is_empty());
+    assert!(matches!(view.lookup("nope"), Err(ViewError::NotFound)));
+}

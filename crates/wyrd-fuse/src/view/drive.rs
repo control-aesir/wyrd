@@ -106,6 +106,15 @@ where
     /// (see the `grammar` module); real stored names always win over the grammar.
     pub fn lookup(&self, path: &str) -> Result<Node, ViewError> {
         let components = parse_path(path)?;
+        if components.is_empty() && self.heads.is_empty() {
+            // A fresh drive with no authored heads still has a root:
+            // it serves as an empty directory, never NotFound. Without
+            // this the root getattr fails and kernels refuse the mount
+            // (observed as ENXIO on macFUSE for every later op).
+            return Ok(Node::MergedDir {
+                subtrees: Vec::new(),
+            });
+        }
         match self.lookup_literal(&components) {
             Ok(node) => Ok(node),
             // The grammar applies only where the literal path exists

@@ -64,8 +64,8 @@ Landed:
   fetch-on-open demand machinery (want registry, blocking open/read with a
   bounded `EIO` deadline) proven against the bulk-source contract
 
-Remaining in this phase: write support (the mount is read-only by design
-until the write path lands).
+Remaining in this phase: nothing — the write path landed and the mount
+serves read-write by default.
 
 ## Phase 3: Recovery Foundations — shipped; workflow pending
 

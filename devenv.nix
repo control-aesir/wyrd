@@ -19,13 +19,15 @@ in
     # linker without it.
     mold
   ] ++ optionals isDarwin [
-    # Build-time headers/stubs for fuser's libfuse2 probe (fuse.pc).
+    # Build-time headers/stubs for fuser's libfuse probes (fuse.pc from
+    # nixpkgs, fuse3.pc from our own stubs: nix/macfuse3-stubs.nix).
     macfuse-stubs
+    (pkgs.callPackage ./nix/macfuse3-stubs.nix { })
   ];
 
-  # FUSE on darwin is a build/runtime split: macfuse-stubs above only
-  # covers compiling and linking (headers + fuse.pc; devenv wires
-  # PKG_CONFIG_PATH to its pkgconfig dir automatically, so the manual
+  # FUSE on darwin is a build/runtime split: the stubs above only cover
+  # compiling and linking (headers + fuse.pc/fuse3.pc; devenv wires
+  # PKG_CONFIG_PATH to their pkgconfig dirs automatically, so the manual
   # `export PKG_CONFIG_PATH=...` from fuser's README for `nix-env`
   # installs is not needed here). Mounting at runtime still needs the
   # real system macFUSE (kernel extension,

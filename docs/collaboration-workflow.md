@@ -44,14 +44,13 @@ git checkout -b pr/<name>
 git push -u origin pr/<name>
 ```
 
-Set the PR to draft immediately after the first push. CI triggers on
-`ready_for_review` and `synchronize` for PRs touching the paths listed in
-the workflows under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust
-workspace: `crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow
-itself; `nix.yml` for the flake: those plus `flake.*`) — docs-only PRs run
-no CI. Jobs skip while the PR is draft, so draft pushes cost nothing; the
-gate runs on ready and re-runs on every push after that. The merge gate
-below is what guarantees the final revision is green.
+Set the PR to draft immediately after the first push. CI runs on
+`ready_for_review` only, for PRs touching the paths listed in the workflows
+under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust workspace:
+`crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow itself;
+`nix.yml` for the flake: those plus `flake.*`) — docs-only PRs run no CI,
+and drafts run none. The merge check below verifies the final revision is
+green.
 Work stays in draft until it is ready:
 
 ```bash
@@ -75,12 +74,17 @@ git push origin pr/<name>
 
 When the work is ready, mark the PR ready. This moves it from draft to
 open and triggers CI for PRs touching the filtered paths
-(`ready_for_review` and `synchronize` are the `pull_request` triggers;
-jobs skip on drafts, docs-only PRs trigger none):
+(`ready_for_review` is the only `pull_request` trigger; drafts and
+docs-only PRs trigger none):
 
 ```bash
 ngit pr ready <pr> --reason "ready for review" --json
 ```
+
+If CI fails on a PR, it posts the truncated failure tail as a PR comment
+and returns the PR to draft automatically. Push the fix (drafts run no
+CI) and mark ready again to re-trigger. Master-push failures have no PR
+to report to and change no PR state.
 
 Do not rewrite published history unless the workflow explicitly requires it.
 Keep unrelated worktree changes out of the PR.

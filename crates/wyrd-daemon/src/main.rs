@@ -98,6 +98,7 @@ enum CliError {
     #[error("bulk source failed: {0}")]
     Bulk(std::io::Error),
     #[error("macOS FUSE preflight failed: {0}")]
+    #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
     #[error("FUSE mount failed: {0}")]
     Mount(#[from] std::io::Error),
@@ -431,6 +432,7 @@ fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
 
 /// Typed outcome of the macFUSE probes, so callers branch on variants
 /// instead of matching rendered error strings.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, PartialEq, Eq)]
 enum MacfuseProbe {
     Ready,
@@ -442,6 +444,7 @@ enum MacfuseProbe {
 
 /// Probe one bundle directory plus the kext node without rendering: the
 /// caller decides which errors are retryable across candidates.
+#[cfg(any(test, target_os = "macos"))]
 fn probe_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> MacfuseProbe {
     match std::fs::metadata(bundle) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -483,6 +486,7 @@ fn probe_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> MacfuseProbe {
 /// installed but no candidate's runtime is usable, the last failure is
 /// reported (each later candidate was probed too, so nothing valid was
 /// skipped).
+#[cfg(any(test, target_os = "macos"))]
 fn select_macfuse_runtime(candidates: &[(&Path, &Path)]) -> Result<PathBuf, String> {
     let mut last_reason: Option<String> = None;
     for (bundle, dev_dir) in candidates {
@@ -516,6 +520,7 @@ fn select_macfuse_runtime(candidates: &[(&Path, &Path)]) -> Result<PathBuf, Stri
 /// The mountpoint must be an existing directory before fuser sees it.
 /// Missing and unreadable are distinct: a permission or I/O failure
 /// must never report "does not exist" with a wrong remediation.
+#[cfg(any(test, target_os = "macos"))]
 fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
     match std::fs::metadata(mountpoint) {
         Ok(metadata) if metadata.is_dir() => Ok(()),

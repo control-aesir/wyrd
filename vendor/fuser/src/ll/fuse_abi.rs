@@ -536,6 +536,8 @@ pub(crate) struct fuse_init_out {
 
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
+// ABI mirror: kept for wire-layout completeness, never constructed here.
+#[allow(dead_code)]
 pub(crate) struct cuse_init_in {
     pub(crate) major: u32,
     pub(crate) minor: u32,
@@ -545,6 +547,8 @@ pub(crate) struct cuse_init_in {
 
 #[repr(C)]
 #[derive(Debug, KnownLayout, Immutable)]
+// ABI mirror: kept for wire-layout completeness, never constructed here.
+#[allow(dead_code)]
 pub(crate) struct cuse_init_out {
     pub(crate) major: u32,
     pub(crate) minor: u32,
@@ -590,6 +594,8 @@ pub(crate) struct fuse_ioctl_in {
 
 #[repr(C)]
 #[derive(Debug, KnownLayout, Immutable)]
+// ABI mirror: kept for wire-layout completeness, never constructed here.
+#[allow(dead_code)]
 pub(crate) struct fuse_ioctl_iovec {
     pub(crate) base: u64,
     pub(crate) len: u64,
@@ -711,6 +717,8 @@ pub(crate) struct fuse_notify_store_out {
 
 #[repr(C)]
 #[derive(Debug, KnownLayout, Immutable)]
+// ABI mirror: kept for wire-layout completeness, never constructed here.
+#[allow(dead_code)]
 pub(crate) struct fuse_notify_retrieve_out {
     pub(crate) notify_unique: u64,
     pub(crate) nodeid: u64,
@@ -721,6 +729,8 @@ pub(crate) struct fuse_notify_retrieve_out {
 
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
+// ABI mirror: kept for wire-layout completeness, never constructed here.
+#[allow(dead_code)]
 pub(crate) struct fuse_notify_retrieve_in {
     // matches the size of fuse_write_in
     pub(crate) dummy1: u64,

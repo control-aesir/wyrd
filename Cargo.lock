@@ -5164,7 +5164,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-contracts"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "fuser",
@@ -5180,7 +5180,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-daemon"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
  "fuser",
@@ -5205,7 +5205,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-format"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "fastcdc",
@@ -5215,7 +5215,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-fuse"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "thiserror 2.0.20",
  "wyrd-format",
@@ -5223,7 +5223,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sync"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "argon2",
  "bao-tree",

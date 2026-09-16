@@ -45,9 +45,12 @@ git push -u origin pr/<name>
 ```
 
 Set the PR to draft immediately after the first push. CI runs on
-`ready_for_review` only, and only for PRs touching the paths listed in
-`.ngit/act/workflows/rust-ci.yml` (`crates/**`, `Cargo.*`,
-`rust-toolchain.toml`, the workflow itself) — docs-only PRs run no CI.
+`ready_for_review` only, for PRs touching the paths listed in the workflows
+under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust workspace:
+`crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow itself;
+`nix.yml` for the flake: those plus `flake.*`) — docs-only PRs run no CI,
+and drafts run none. The merge check below verifies the final revision is
+green.
 Work stays in draft until it is ready:
 
 ```bash
@@ -71,8 +74,8 @@ git push origin pr/<name>
 
 When the work is ready, mark the PR ready. This moves it from draft to
 open and triggers CI for PRs touching the filtered paths
-(`ready_for_review` is the only `pull_request` trigger in
-`.ngit/act/workflows/rust-ci.yml`; docs-only PRs trigger none):
+(`ready_for_review` is the only `pull_request` trigger; drafts and
+docs-only PRs trigger none):
 
 ```bash
 ngit pr ready <pr> --reason "ready for review" --json
@@ -89,9 +92,16 @@ Keep unrelated worktree changes out of the PR.
 ## 5. Merge
 
 Before merging, verify the PR is `open` (not `draft`), the final revision
-is correct, and CI is green where CI runs. Docs-only PRs run no CI:
-merge those on green local hooks plus review. Use ngit's merge
-command, then publish `master`.
+is correct, and CI is green where CI runs. CI results attach to revisions,
+so check green for the final revision itself — a green run on an older
+revision does not qualify:
+
+```bash
+ngit ci status <pr> --require-ci-trust maintainer-directed --json
+```
+
+Docs-only PRs run no CI: merge those on green local hooks plus review. Use
+ngit's merge command, then publish `master`.
 
 ```bash
 ngit merge <pr> --json

@@ -87,6 +87,118 @@ jobs:
           set -o pipefail
           cargo test --color never --workspace --doc 2>&1 | tee /tmp/doctests.log
 
+      # On `pull_request` failures only: post a truncated failure tail on
+      # the PR and return it to draft so the board stops advertising a
+      # ready PR. Master pushes and dispatch runs have no PR to draft and
+      # are excluded by the step condition. NGIT_NSEC lives only in this
+      # step's env: earlier steps run untrusted PR code and must never see
+      # it. The CI identity must be a confirmed co-maintainer (invite plus
+      # the key's signed accept); when the secret is withheld there is no
+      # connected relay for this identity, so skip gracefully instead of
+      # failing. After auto-draft the author pushes the fix (drafts run no
+      # CI) and marks ready again to re-trigger.
+      - name: Report failure to PR and return to draft
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
+        run: |
+          set -euo pipefail
+
+          # Withheld bot credential: nothing to publish with, and no
+          # connected relay for this identity. Skip without masking the
+          # real test failure.
+          if [ -z "${NGIT_NSEC:-}" ]; then
+            echo "NGIT_NSEC is not configured; skipping PR failure report."
+            exit 0
+          fi
+
+          if [ -z "${PR_BRANCH:-}" ]; then
+            echo "PR branch is unknown; skipping PR failure report."
+            exit 0
+          fi
+
+          curl -Ls https://ngit.dev/install.sh | bash
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Keep the secret out of every other process environment: file it,
+          # drop it from env, and remove the file as soon as ngit is done.
+          NGIT_NSEC_FILE="$RUNNER_TEMP/ngit-nsec"
+          printf '%s' "$NGIT_NSEC" > "$NGIT_NSEC_FILE"
+          chmod 600 "$NGIT_NSEC_FILE"
+          unset NGIT_NSEC
+          trap 'rm -f "$NGIT_NSEC_FILE"' EXIT
+
+          PR_INFO="$(ngit pr list --json)"
+          PR_ID="$(
+            printf '%s\n' "$PR_INFO" |
+              jq -r --arg branch "$PR_BRANCH" '
+                .[] |
+                select(.branch == $branch) |
+                .id
+              ' |
+              head -n1
+          )"
+
+          if [ -z "$PR_ID" ] || [ "$PR_ID" = "null" ]; then
+            echo "Could not determine ngit PR ID for branch: $PR_BRANCH"
+            echo "$PR_INFO"
+            exit 1
+          fi
+
+          echo "Reporting CI failure on PR: $PR_ID (branch: $PR_BRANCH)"
+
+          # Truncated failure tail: last lines of whichever gate logs exist.
+          # Capped so the comment stays a readable signal, not a log dump.
+          COMMENT_BODY="/tmp/failure-comment.md"
+          {
+            echo "## CI failed - PR returned to draft"
+            echo ""
+            echo "Branch: \`$PR_BRANCH\`"
+            echo "Commit: \`${GITHUB_SHA:-unknown}\`"
+            echo ""
+            echo "The failing run's tail is below (truncated). Push the fix"
+            echo "(drafts run no CI) and mark ready again to re-trigger."
+            echo ""
+            for log in /tmp/check.log /tmp/clippy.log /tmp/features.log /tmp/test.log /tmp/doctests.log; do
+              if [ -f "$log" ]; then
+                echo "<details>"
+                echo "<summary><code>$(basename "$log")</code> (last 100 lines)</summary>"
+                echo ""
+                echo '```'
+                tail -n 100 "$log"
+                echo '```'
+                echo "</details>"
+                echo ""
+              fi
+            done
+          } > "$COMMENT_BODY"
+
+          # Bound the event payload: keep the header, cut the tail to size.
+          if [ "$(wc -c < "$COMMENT_BODY")" -gt 8000 ]; then
+            tail -c 8000 "$COMMENT_BODY" > "$COMMENT_BODY.trimmed"
+            {
+              echo "## CI failed - PR returned to draft"
+              echo ""
+              echo "(Failure tail truncated to the last 8 KB.)"
+              echo ""
+              cat "$COMMENT_BODY.trimmed"
+            } > "$COMMENT_BODY"
+            rm -f "$COMMENT_BODY.trimmed"
+          fi
+
+          ngit \
+            --nsec-file "$NGIT_NSEC_FILE" \
+            pr comment "$PR_ID" \
+            --body "$(cat "$COMMENT_BODY")" \
+            --json
+
+          ngit \
+            --nsec-file "$NGIT_NSEC_FILE" \
+            pr draft "$PR_ID" \
+            --reason "CI failed - returned to draft automatically" \
+            --json
+
       # Disabled since it's not working for now
       # - if: github.event_name == 'pull_request'
       - if: false

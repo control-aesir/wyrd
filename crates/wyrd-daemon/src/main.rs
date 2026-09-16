@@ -93,6 +93,13 @@ enum CliError {
     Mailbox(#[from] wyrd_sync::transport::mailbox::MailboxError),
     #[error("live sync failed: {0}")]
     Live(#[from] LiveError),
+    #[error("serving endpoint failed: {0}")]
+    Serving(std::io::Error),
+    #[error("bulk source failed: {0}")]
+    Bulk(std::io::Error),
+    #[error("macOS FUSE preflight failed: {0}")]
+    #[cfg(any(test, target_os = "macos"))]
+    Preflight(String),
     #[error("FUSE mount failed: {0}")]
     Mount(#[from] std::io::Error),
 }
@@ -291,13 +298,19 @@ fn mount(
     )?;
     daemon.refresh_live_heads()?;
 
+    // Fail fast on macOS before binding any endpoint: a missing
+    // macFUSE runtime can never mount, and every later stage would
+    // report the same opaque failure.
+    #[cfg(target_os = "macos")]
+    macos_preflight(&mountpoint)?;
+
     // Serving: a real-iroh endpoint over the drive's durable vault, so
     // peers holding an announcement route can fetch what this drive
     // holds. The fetch side is the matching real bulk source; routes
     // publish from recorded announcements on every sync pass.
     let serving = daemon
         .open_serving(&drive_dir, false)
-        .map_err(CliError::Mount)?;
+        .map_err(CliError::Serving)?;
     let mut bulk = bind_bulk_source()?;
     eprintln!(
         "serving over iroh: {}",
@@ -327,6 +340,18 @@ fn mount(
     // below returns through the unmount-and-join sequence, never
     // leaking a detached session.
     install_shutdown_handler()?;
+    // On macOS the reported errno may be stale: macFUSE's libfuse2
+    // mount can fail without setting errno at all, so name the
+    // checklist alongside the raw error instead of trusting it.
+    #[cfg(target_os = "macos")]
+    let mut session = match fuser::Session::new(backend, &mountpoint, &session_config()) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{MACOS_MOUNT_HINT}");
+            return Err(CliError::Mount(error));
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
     let server = std::thread::spawn(move || session.run());
@@ -359,7 +384,187 @@ fn mount(
 /// Bind the fetch side's iroh endpoint (N0 relays for peer
 /// reachability) and wrap it in the real bulk source.
 fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
-    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Mount)
+    wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Bulk)
+}
+
+/// macOS mount-failure checklist, printed next to the raw error.
+/// macFUSE's libfuse2 mount can return -1 without setting errno, so
+/// the errno in the error line may be stale (observed: EOPNOTSUPP
+/// left over from an iroh socket op, ENOTTY from elsewhere). The
+/// checklist names the fix; the README carries the full procedure.
+#[cfg(target_os = "macos")]
+const MACOS_MOUNT_HINT: &str = "macOS hint: the errno above may be stale; check \
+    the kext (ls /dev/macfuse0; if missing: load macFUSE, approve it in \
+    Privacy & Security, reboot), the mount daemon (pgrep -af \
+    io.macfuse.app.launchservice.daemon; if missing: sudo launchctl kickstart \
+    -k system/io.macfuse.app.launchservice.daemon), and the README macOS section.";
+
+/// Fail fast when the macOS FUSE runtime cannot mount: macFUSE
+/// missing entirely, or installed with its kext unloaded. Both states
+/// are plain path probes so the logic stays unit-testable; only the
+/// wiring (real /Library and /dev roots) is macOS-gated at the call
+/// site. The mountpoint itself must already be a directory — fuser
+/// would reject anything else with a bare ENOENT.
+///
+/// Best-effort only: a passing preflight does not guarantee the mount
+/// will succeed (stale device nodes, alternate install layouts), and
+/// the real mount error remains authoritative.
+#[cfg(target_os = "macos")]
+fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
+    if let Err(reason) = check_mountpoint(mountpoint) {
+        return Err(CliError::Preflight(reason));
+    }
+    // macFUSE 4.x installs macfuse.fs; older osxfuse layouts used
+    // fuse.fs. Accept either so the probe does not reject a supported
+    // runtime it was not taught about. Each bundle is paired with the
+    // kext node it needs and a candidate wins only when both probe
+    // usable, so a stale or unloaded first layout never shadows a
+    // valid second one.
+    let dev = Path::new("/dev");
+    let candidates = [
+        (Path::new("/Library/Filesystems/macfuse.fs"), dev),
+        (Path::new("/Library/Filesystems/fuse.fs"), dev),
+    ];
+    let bundle = select_macfuse_runtime(&candidates).map_err(CliError::Preflight)?;
+    let _ = bundle;
+    Ok(())
+}
+
+/// Typed outcome of the macFUSE probes, so callers branch on variants
+/// instead of matching rendered error strings.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, PartialEq, Eq)]
+enum MacfuseProbe {
+    Ready,
+    BundleMissing,
+    BundleUnusable(String),
+    KextMissing,
+    KextUnusable(String),
+}
+
+/// Probe one bundle directory plus the kext node without rendering: the
+/// caller decides which errors are retryable across candidates.
+#[cfg(any(test, target_os = "macos"))]
+fn probe_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> MacfuseProbe {
+    match std::fs::metadata(bundle) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return MacfuseProbe::BundleUnusable(format!(
+                "macFUSE bundle {} is not a directory: reinstall it with `brew install --cask macfuse`, then approve and reboot per the README",
+                bundle.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return MacfuseProbe::BundleMissing;
+        }
+        Err(error) => {
+            return MacfuseProbe::BundleUnusable(format!(
+                "macFUSE bundle {} cannot be inspected: {error}",
+                bundle.display()
+            ));
+        }
+    }
+    let node = dev_dir.join("macfuse0");
+    match std::fs::metadata(&node) {
+        Ok(metadata) if metadata.is_dir() => MacfuseProbe::KextUnusable(format!(
+            "macFUSE kext node {}/macfuse0 is a directory (expected a device node): reload macFUSE per the README",
+            dev_dir.display()
+        )),
+        Ok(_) => MacfuseProbe::Ready,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MacfuseProbe::KextMissing,
+        Err(error) => MacfuseProbe::KextUnusable(format!(
+            "macFUSE kext node {}/macfuse0 cannot be inspected: {error}",
+            dev_dir.display()
+        )),
+    }
+}
+
+/// Select the first candidate whose bundle directory and kext node both
+/// probe usable. Every pair is probed before giving up: a missing,
+/// corrupt, or unloaded first layout falls through to the next, so
+/// ordering never shadows a valid later layout. When bundles are
+/// installed but no candidate's runtime is usable, the last failure is
+/// reported (each later candidate was probed too, so nothing valid was
+/// skipped).
+#[cfg(any(test, target_os = "macos"))]
+fn select_macfuse_runtime(candidates: &[(&Path, &Path)]) -> Result<PathBuf, String> {
+    let mut last_reason: Option<String> = None;
+    for (bundle, dev_dir) in candidates {
+        match probe_macfuse_runtime(bundle, dev_dir) {
+            MacfuseProbe::Ready => return Ok(bundle.to_path_buf()),
+            MacfuseProbe::BundleMissing => {}
+            MacfuseProbe::BundleUnusable(reason) | MacfuseProbe::KextUnusable(reason) => {
+                last_reason = Some(reason);
+            }
+            MacfuseProbe::KextMissing => {
+                last_reason = Some(format!(
+                    "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
+                    dev_dir.display()
+                ));
+            }
+        }
+    }
+    if let Some(reason) = last_reason {
+        return Err(reason);
+    }
+    let names = candidates
+        .iter()
+        .map(|(bundle, _)| bundle.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "macFUSE is not installed (none of {names}): install it with `brew install --cask macfuse`, then approve and reboot per the README"
+    ))
+}
+
+/// The mountpoint must be an existing directory before fuser sees it.
+/// Missing and unreadable are distinct: a permission or I/O failure
+/// must never report "does not exist" with a wrong remediation.
+#[cfg(any(test, target_os = "macos"))]
+fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
+    match std::fs::metadata(mountpoint) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "mountpoint {} is not a directory",
+            mountpoint.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "mountpoint {} does not exist",
+            mountpoint.display()
+        )),
+        Err(error) => Err(format!(
+            "mountpoint {} cannot be inspected: {error}",
+            mountpoint.display()
+        )),
+    }
+}
+
+/// Distinguish macFUSE absent from macFUSE present-but-unloaded: the
+/// bundle probe names the install step, the device probe names the
+/// load/approve/reboot step. `dev_dir` is a parameter (not `/dev`
+/// inline) so tests can point it at a tempdir.
+///
+/// Best-effort: the device probe checks presence, not device type — a
+/// stale regular file at macfuse0 passes here and fails at mount, where
+/// the mount error stays authoritative.
+///
+/// Test-only single-bundle renderer over [`probe_macfuse_runtime`];
+/// production selects pairs with [`select_macfuse_runtime`].
+#[cfg(test)]
+fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(), String> {
+    match probe_macfuse_runtime(bundle, dev_dir) {
+        MacfuseProbe::Ready => Ok(()),
+        MacfuseProbe::BundleMissing => Err(format!(
+            "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
+            bundle.display()
+        )),
+        MacfuseProbe::BundleUnusable(reason)
+        | MacfuseProbe::KextUnusable(reason) => Err(reason),
+        MacfuseProbe::KextMissing => Err(format!(
+            "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
+            dev_dir.display()
+        )),
+    }
 }
 
 /// Fold the loop and session outcomes into the process exit status: a
@@ -882,5 +1087,128 @@ mod tests {
             "the rejoin is bounded"
         );
         drop(send);
+    }
+
+    /// Each mount stage names itself: serving, bulk, preflight, and
+    /// the FUSE session render distinct prefixes, so a failure can
+    /// never again report every stage as "FUSE mount failed".
+    #[test]
+    fn mount_stages_name_themselves() {
+        let serving = CliError::Serving(std::io::Error::other("down"));
+        let bulk = CliError::Bulk(std::io::Error::other("down"));
+        let preflight = CliError::Preflight("kext missing".into());
+        let mount = CliError::Mount(std::io::Error::other("down"));
+        for (error, prefix) in [
+            (serving, "serving endpoint failed"),
+            (bulk, "bulk source failed"),
+            (preflight, "macOS FUSE preflight failed"),
+            (mount, "FUSE mount failed"),
+        ] {
+            assert!(
+                format!("{error}").starts_with(prefix),
+                "staged error must name its stage: {error}"
+            );
+        }
+    }
+
+    /// The mountpoint probe accepts a directory and names anything
+    /// else: fuser's bare ENOENT never reaches the user.
+    #[test]
+    fn mountpoint_probe_names_missing_or_file() {
+        let temp = TempDir::new();
+        assert!(check_mountpoint(&temp.0).is_ok());
+        let missing = temp.0.join("nope");
+        assert!(
+            matches!(check_mountpoint(&missing), Err(reason) if reason.contains("does not exist"))
+        );
+        let file = temp.0.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(
+            matches!(check_mountpoint(&file), Err(reason) if reason.contains("not a directory"))
+        );
+    }
+
+    /// The runtime probe distinguishes absent macFUSE from an
+    /// unloaded kext, and passes when both probes hit.
+    #[test]
+    fn runtime_probe_distinguishes_absent_from_unloaded() {
+        let temp = TempDir::new();
+        let bundle = temp.0.join("macfuse.fs");
+        let dev = temp.0.join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        assert!(
+            matches!(check_macfuse_runtime(&bundle, &dev), Err(reason) if reason.contains("not installed"))
+        );
+        fs::create_dir_all(&bundle).unwrap();
+        assert!(
+            matches!(check_macfuse_runtime(&bundle, &dev), Err(reason) if reason.contains("not loaded"))
+        );
+        fs::write(dev.join("macfuse0"), b"").unwrap();
+        assert!(check_macfuse_runtime(&bundle, &dev).is_ok());
+    }
+
+    /// Candidate selection probes bundle and kext as a pair and falls
+    /// through to later layouts: a missing or corrupt first bundle never
+    /// shadows a valid second one, and neither does a first bundle
+    /// directory whose kext is down while the second pair is valid.
+    #[test]
+    fn bundle_selection_falls_through_to_later_layouts() {
+        let temp = TempDir::new();
+        let first = temp.0.join("macfuse.fs");
+        let second = temp.0.join("fuse.fs");
+        let dev1 = temp.0.join("dev1");
+        let dev2 = temp.0.join("dev2");
+        fs::create_dir_all(&dev1).unwrap();
+        fs::create_dir_all(&dev2).unwrap();
+        assert!(
+            matches!(select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]), Err(reason) if reason.contains("not installed"))
+        );
+        fs::create_dir_all(&second).unwrap();
+        fs::write(dev2.join("macfuse0"), b"").unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            second
+        );
+        fs::write(&first, b"stale").unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            second
+        );
+        // The stale-directory case: the first bundle exists as a
+        // directory but its kext is down, while the second pair is
+        // fully valid. Selection must skip the first pair.
+        fs::remove_file(&first).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            second
+        );
+        // And a valid first pair still wins when both are usable.
+        fs::write(dev1.join("macfuse0"), b"").unwrap();
+        assert_eq!(
+            select_macfuse_runtime(&[(&first, &dev1), (&second, &dev2)]).unwrap(),
+            first
+        );
+    }
+
+    /// The typed probe names each state without string matching: bundle
+    /// absence, kext absence, and readiness are distinct variants.
+    #[test]
+    fn typed_probe_names_each_state() {
+        let temp = TempDir::new();
+        let bundle = temp.0.join("macfuse.fs");
+        let dev = temp.0.join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        assert_eq!(
+            probe_macfuse_runtime(&bundle, &dev),
+            MacfuseProbe::BundleMissing
+        );
+        fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(
+            probe_macfuse_runtime(&bundle, &dev),
+            MacfuseProbe::KextMissing
+        );
+        fs::write(dev.join("macfuse0"), b"").unwrap();
+        assert_eq!(probe_macfuse_runtime(&bundle, &dev), MacfuseProbe::Ready);
     }
 }

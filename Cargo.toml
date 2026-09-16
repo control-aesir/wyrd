@@ -19,6 +19,16 @@ edition = "2021"
 # none, so an accidental capability impl cannot compile.
 unsafe_code = "deny"
 
+# Vendored fuser 0.18.0 (vendor/fuser) with one divergence: the macOS
+# branch mounts via libfuse3, because upstream's libfuse2 probe targets
+# macFUSE 4.x and macFUSE 5.x fails that path silently. The vendored
+# crate is deliberately not a workspace member, so the workspace lints
+# above do not apply to it. Re-sync by copying crates.io 0.18.0 over
+# vendor/fuser and re-applying the build.rs divergence; drop the patch
+# once upstream moves macOS to libfuse3.
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
+
 [workspace.dependencies]
 # wyrd crates
 wyrd-format = { path = "crates/wyrd-format" }

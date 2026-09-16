@@ -333,34 +333,19 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for SharedWriter {
     }
 }
 
-/// Mount diagnostics: structured events to stderr plus a per-mount
-/// file, and a bridge so fuser's `log` records land in the same
-/// stream.
-///
-/// The file (`drive_dir/mount.log`, truncated per mount) is the record
-/// a dead mount leaves behind — terminal scrollback is gone when the
-/// terminal is. Truncation keeps it bounded with zero rotation code:
-/// one mount, one log. Logs never contain secret bytes (same rule as
-/// CLI errors): stages, ids, errnos, latencies.
-///
-/// Call first in [`mount`], before preflight or the session thread
-/// exists. Only the first caller's filter wins: the process-wide
-/// subscriber is set once, so a second init (tests, a future
-/// multi-mount process) keeps the first filter and still returns the
-/// log path.
-fn init_mount_diagnostics(drive_dir: &Path, verbose: bool) -> Result<PathBuf, CliError> {
-    let log_path = drive_dir.join("mount.log");
-    let file = fs::File::create(&log_path).map_err(|source| CliError::Io {
-        path: log_path.clone(),
-        source,
-    })?;
-    // fuser's handshake errors and iroh internals log via the `log`
-    // crate; without this bridge those records vanish because no
-    // logger is ever initialized.
-    let _ = tracing_log::LogTracer::init();
+/// Build the mount subscriber over an open log file: stderr plus
+/// file layers under one filter. Pure construction with no global
+/// state, so tests install it thread-scoped via
+/// [`tracing::subscriber::with_default`] and assert what lands in the
+/// file — including the `--verbose` debug gate — without disturbing
+/// the process-global subscriber other tests may have installed.
+fn build_mount_subscriber(file: fs::File, verbose: bool) -> impl tracing::Subscriber {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Both crates: the binary (`wyrd`, this file) and the library
+        // (`wyrd_daemon`, the FUSE backend) emit request and stage
+        // events under their own target roots.
         tracing_subscriber::EnvFilter::new(if verbose {
-            "info,wyrd_daemon=debug"
+            "info,wyrd=debug,wyrd_daemon=debug"
         } else {
             "info"
         })
@@ -371,11 +356,47 @@ fn init_mount_diagnostics(drive_dir: &Path, verbose: bool) -> Result<PathBuf, Cl
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(SharedWriter::new(file))
         .with_ansi(false);
-    let subscriber = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(filter)
         .with(stderr_layer)
-        .with(file_layer);
-    let _ = tracing_subscriber::util::SubscriberInitExt::try_init(subscriber);
+        .with(file_layer)
+}
+
+/// Mount diagnostics: structured events to stderr plus a per-mount
+/// file, and a bridge so fuser's `log` records land in the same
+/// stream.
+///
+/// The file (`drive_dir/mount.log`, truncated per mount) is the record
+/// a dead mount leaves behind — terminal scrollback is gone when the
+/// terminal is. Truncation keeps it bounded with zero rotation code:
+/// one mount, one log. Logs never contain secret bytes (same rule as
+/// CLI errors): stages, ids, errnos, latencies. They do record the
+/// drive and mountpoint paths as diagnostic metadata.
+///
+/// Call first in [`mount`], before preflight or the session thread
+/// exists. The daemon binary serves exactly one mount per process, so
+/// the first install wins by design. A second init in the same process
+/// (tests sharing one test binary) reuses the installed subscriber and
+/// says so on the existing stream instead of claiming a fresh install;
+/// it still truncates and returns the caller's own log path.
+fn init_mount_diagnostics(drive_dir: &Path, verbose: bool) -> Result<PathBuf, CliError> {
+    let log_path = drive_dir.join("mount.log");
+    let file = fs::File::create(&log_path).map_err(|source| CliError::Io {
+        path: log_path.clone(),
+        source,
+    })?;
+    // fuser's handshake errors and iroh internals log via the `log`
+    // crate; without this bridge those records vanish because no
+    // logger is ever initialized.
+    let _ = tracing_log::LogTracer::init();
+    let subscriber = build_mount_subscriber(file, verbose);
+    if tracing_subscriber::util::SubscriberInitExt::try_init(subscriber).is_err() {
+        tracing::warn!(
+            stage = "start",
+            log = %log_path.display(),
+            "diagnostics already initialized; reusing the installed subscriber",
+        );
+    }
     Ok(log_path)
 }
 
@@ -1021,10 +1042,12 @@ mod tests {
         assert!(!text.contains("ssss"), "oversized content leaked: {text}");
     }
 
-    /// Mount diagnostics initialize a per-mount log file and tolerate
-    /// repeat init: the process-wide subscriber is set once, and the
-    /// log path is still returned. Each init truncates, so one mount
-    /// leaves one bounded log.
+    /// Mount diagnostics initialize a per-mount log file. A second init
+    /// in the same process truncates its own path but reuses the
+    /// installed subscriber — the first install wins by design — and
+    /// records that reuse instead of claiming a fresh install. (This
+    /// test is the only global installer in the binary, so its first
+    /// init is the installing one.)
     #[test]
     fn mount_diagnostics_create_a_per_mount_log() {
         let temp = TempDir::new();
@@ -1038,9 +1061,90 @@ mod tests {
         fs::write(&first, b"stale").unwrap();
         let second = init_mount_diagnostics(&drive, true).unwrap();
         assert_eq!(second, first);
+        let text = fs::read_to_string(&second).unwrap();
         assert!(
-            fs::read(&second).unwrap().is_empty(),
+            !text.contains("stale"),
             "each mount starts its own truncated log"
+        );
+        assert!(
+            text.contains("reusing the installed subscriber"),
+            "the reuse is recorded, not silent: {text}"
+        );
+    }
+
+    /// End-to-end diagnostics: events emitted under a thread-scoped
+    /// subscriber land in that subscriber's file, and `--verbose`
+    /// controls the debug gate — without touching the process-global
+    /// subscriber other tests may have installed.
+    #[test]
+    fn mount_events_reach_the_configured_log_file() {
+        // RUST_LOG would override the gate under test; nothing else in
+        // this binary reads it, so take it out of the way and restore
+        // it after.
+        let rust_log = std::env::var("RUST_LOG").ok();
+        std::env::remove_var("RUST_LOG");
+
+        let temp = TempDir::new();
+        let log = temp.0.join("mount.log");
+        let subscriber = build_mount_subscriber(fs::File::create(&log).unwrap(), false);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(stage = "test", "visible at info");
+            tracing::debug!(opcode = "lookup", latency_us = 7, "hidden without verbose");
+        });
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(
+            text.contains("visible at info"),
+            "info events reach the file: {text}"
+        );
+        assert!(
+            !text.contains("hidden without verbose"),
+            "debug stays gated without verbose: {text}"
+        );
+
+        let verbose_log = temp.0.join("verbose.log");
+        let subscriber = build_mount_subscriber(fs::File::create(&verbose_log).unwrap(), true);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(opcode = "lookup", latency_us = 7, "visible with verbose");
+        });
+        let text = fs::read_to_string(&verbose_log).unwrap();
+        assert!(
+            text.contains("visible with verbose"),
+            "verbose opens the debug gate: {text}"
+        );
+
+        if let Some(value) = rust_log {
+            std::env::set_var("RUST_LOG", value);
+        }
+    }
+
+    /// Two subscribers route to their own files: per-mount file routing
+    /// holds wherever a subscriber is constructed per mount, while the
+    /// process-global install stays first-wins by design (see
+    /// [`init_mount_diagnostics`]).
+    #[test]
+    fn mount_subscribers_route_to_their_own_files() {
+        let temp = TempDir::new();
+        let first = temp.0.join("first.log");
+        let second = temp.0.join("second.log");
+        let first_subscriber = build_mount_subscriber(fs::File::create(&first).unwrap(), false);
+        let second_subscriber = build_mount_subscriber(fs::File::create(&second).unwrap(), false);
+        tracing::subscriber::with_default(first_subscriber, || {
+            tracing::info!("event for the first log");
+        });
+        tracing::subscriber::with_default(second_subscriber, || {
+            tracing::info!("event for the second log");
+        });
+        let first_text = fs::read_to_string(&first).unwrap();
+        let second_text = fs::read_to_string(&second).unwrap();
+        assert!(
+            first_text.contains("event for the first log")
+                && !first_text.contains("event for the second log"),
+            "the first subscriber keeps its own record: {first_text}"
+        );
+        assert!(
+            second_text.contains("event for the second log")
+                && !second_text.contains("event for the first log"),
+            "the second subscriber keeps its own record: {second_text}"
         );
     }
 

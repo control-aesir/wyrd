@@ -35,7 +35,8 @@ bounded log): stage events for serving, bulk, preflight, mailbox, and
 the session thread exit, plus fuser handshake errors via the `log`
 bridge. `wyrd mount --verbose` adds debug-level FUSE request logs
 (opcode + latency + reply errno); `RUST_LOG` overrides the filter.
-Logs never contain secret bytes.
+The log records diagnostic metadata including the drive and mountpoint
+paths; it never contains secret bytes.
 
 ## What does not belong here
 

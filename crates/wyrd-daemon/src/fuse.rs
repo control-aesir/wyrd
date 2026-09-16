@@ -13,9 +13,10 @@
 //! this boundary is allowed to block or serve).
 //!
 //! Synthetic ownership: v0 preserves no uid/gid or permission metadata;
-//! apart from the represented exec bit, the backend presents uid/gid
-//! zero and synthesized mode bits (files `0644`/`0755`, directories
-//! `0755`).
+//! apart from the represented exec bit, the backend presents the
+//! mounting user's ids and synthesized mode bits (files `0644`/`0755`,
+//! directories `0755`), so kernels that enforce permissions from attrs
+//! let the mounter read and write.
 //!
 //! Lock discipline: a poisoned lock is a local data-path failure, so
 //! kernel callbacks answer `EIO` instead of panicking the mount. File
@@ -275,8 +276,10 @@ impl InodeTable {
     }
 }
 
-/// The read-only FUSE backend over one drive's published projection. The
-/// projection sits behind a lock only as a publication mechanism: the
+/// The FUSE backend over one drive's published projection: read-write
+/// when the live daemon's mutation channel is wired, read-only without
+/// it. The projection sits behind a lock only as a publication
+/// mechanism: the
 /// loop swaps whole immutable generations, and each backend call clones
 /// the current [`Arc`](std::sync::Arc) and serves lock-free from it, so
 /// readers never observe a half-published projection and never block
@@ -307,6 +310,28 @@ where
     budget: Arc<WriteBudget>,
     /// How long `open`/`read` may block on demand before `EIO`.
     open_timeout: Duration,
+    /// The mounting user's ids, presented as synthetic ownership so
+    /// kernels that enforce permissions from attrs (macFUSE) let the
+    /// mounter read and write. v0 stores no ownership metadata; apart
+    /// from the represented exec bit, modes stay synthesized.
+    uid: u32,
+    gid: u32,
+}
+
+/// The mounting user's ids for synthetic ownership. Unix reads the
+/// calling process's kernel credentials; elsewhere there is no
+/// mounter to name, so ownership stays zero.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn current_owner() -> (u32, u32) {
+    // SAFETY: geteuid/getegid take no pointers and only read the
+    // calling process's kernel credentials.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
+#[cfg(not(unix))]
+fn current_owner() -> (u32, u32) {
+    (0, 0)
 }
 
 /// Map a mutation failure to the POSIX errno the write-path contract
@@ -415,6 +440,7 @@ where
     S::Error: std::fmt::Debug,
 {
     pub fn new(view: DriveView<S, M>) -> Self {
+        let (uid, gid) = current_owner();
         FuseBackend {
             projection: Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
             inodes: RwLock::new(InodeTable::new()),
@@ -430,6 +456,8 @@ where
             mutations: None,
             budget: Arc::new(WriteBudget::default()),
             open_timeout: Duration::ZERO,
+            uid,
+            gid,
         }
     }
 
@@ -439,6 +467,7 @@ where
     /// remounting. Each backend keeps its own inode tables; construct
     /// once per session.
     pub fn shared(projection: Arc<RwLock<Arc<Projection<S, M>>>>) -> Self {
+        let (uid, gid) = current_owner();
         FuseBackend {
             projection,
             inodes: RwLock::new(InodeTable::new()),
@@ -454,6 +483,8 @@ where
             mutations: None,
             budget: Arc::new(WriteBudget::default()),
             open_timeout: Duration::ZERO,
+            uid,
+            gid,
         }
     }
 
@@ -467,6 +498,7 @@ where
         mutations: Arc<MutationQueue>,
         open_timeout: Duration,
     ) -> Self {
+        let (uid, gid) = current_owner();
         FuseBackend {
             projection,
             inodes: RwLock::new(InodeTable::new()),
@@ -482,6 +514,8 @@ where
             mutations: Some(mutations),
             budget: Arc::new(WriteBudget::default()),
             open_timeout,
+            uid,
+            gid,
         }
     }
 
@@ -1159,8 +1193,8 @@ where
                 _ => 0o644,
             },
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,

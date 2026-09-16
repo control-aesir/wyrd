@@ -30,7 +30,7 @@ fn ensure_last_os_error() -> io::Error {
 
 #[derive(Debug)]
 pub(crate) struct MountImpl {
-    fuse_session: *mut c_void,
+    fuse_session: Option<*mut c_void>,
     mountpoint: CString,
 }
 impl MountImpl {
@@ -54,42 +54,81 @@ impl MountImpl {
             if fuse_session.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let mount = MountImpl {
-                fuse_session,
-                mountpoint: mnt.clone(),
-            };
-            let result = unsafe { fuse_session_mount(mount.fuse_session, mnt.as_ptr()) };
+            let result = unsafe { fuse_session_mount(fuse_session, mnt.as_ptr()) };
             if result != 0 {
-                return Err(ensure_last_os_error());
+                let err = ensure_last_os_error();
+                unsafe { fuse_session_destroy(fuse_session) };
+                return Err(err);
             }
-            let fd = unsafe { fuse_session_fd(mount.fuse_session) };
+            let fd = unsafe { fuse_session_fd(fuse_session) };
             if fd < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                unsafe {
+                    fuse_session_unmount(fuse_session);
+                    fuse_session_destroy(fuse_session);
+                }
+                return Err(err);
             }
             let fd = unsafe { BorrowedFd::borrow_raw(fd) };
             // We dup the fd here as the existing fd is owned by the fuse_session, and we
             // don't want it being closed out from under us:
-            let fd = fd.try_clone_to_owned()?;
-            let file = File::from(fd);
+            let owned = match fd.try_clone_to_owned() {
+                Ok(owned) => owned,
+                Err(err) => {
+                    unsafe {
+                        fuse_session_unmount(fuse_session);
+                        fuse_session_destroy(fuse_session);
+                    }
+                    return Err(err);
+                }
+            };
+            let file = File::from(owned);
+            let mount = MountImpl {
+                fuse_session: Some(fuse_session),
+                mountpoint: mnt.clone(),
+            };
             Ok((Arc::new(DevFuse(file)), mount))
         })
     }
 
     pub(crate) fn umount_impl(&mut self) -> io::Result<()> {
+        let Some(session) = self.fuse_session.take() else {
+            return Ok(());
+        };
         if let Err(err) = crate::mnt::libc_umount(&self.mountpoint) {
             // Linux always returns EPERM for non-root users.  We have to let the
             // library go through the setuid-root "fusermount -u" to unmount.
             if err == nix::errno::Errno::EPERM {
                 #[cfg(target_os = "linux")]
                 unsafe {
-                    fuse_session_unmount(self.fuse_session);
-                    fuse_session_destroy(self.fuse_session);
+                    fuse_session_unmount(session);
+                    fuse_session_destroy(session);
                     return Ok(());
                 }
             }
+            self.fuse_session = Some(session);
             return Err(err.into());
+        }
+        // The kernel mount is gone but libfuse still owns the session
+        // allocation: unmount (best-effort, already unmounted) then destroy,
+        // on every platform. Previously only the Linux EPERM fallback did
+        // this, leaking the session on macOS success paths.
+        unsafe {
+            fuse_session_unmount(session);
+            fuse_session_destroy(session);
         }
         Ok(())
     }
 }
 unsafe impl Send for MountImpl {}
+
+impl Drop for MountImpl {
+    fn drop(&mut self) {
+        if let Some(session) = self.fuse_session.take() {
+            unsafe {
+                fuse_session_unmount(session);
+                fuse_session_destroy(session);
+            }
+        }
+    }
+}

@@ -404,21 +404,38 @@ const MACOS_MOUNT_HINT: &str = "macOS hint: the errno above may be stale; check 
 /// wiring (real /Library and /dev roots) is macOS-gated at the call
 /// site. The mountpoint itself must already be a directory — fuser
 /// would reject anything else with a bare ENOENT.
+///
+/// Best-effort only: a passing preflight does not guarantee the mount
+/// will succeed (stale device nodes, alternate install layouts), and
+/// the real mount error remains authoritative.
 #[cfg(target_os = "macos")]
 fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
     if let Err(reason) = check_mountpoint(mountpoint) {
         return Err(CliError::Preflight(reason));
     }
-    if let Err(reason) = check_macfuse_runtime(
-        Path::new("/Library/Filesystems/macfuse.fs"),
-        Path::new("/dev"),
-    ) {
-        return Err(CliError::Preflight(reason));
+    // macFUSE 4.x installs macfuse.fs; older osxfuse layouts used
+    // fuse.fs. Accept either so the probe does not reject a supported
+    // runtime it was not taught about.
+    const BUNDLES: [&str; 2] = [
+        "/Library/Filesystems/macfuse.fs",
+        "/Library/Filesystems/fuse.fs",
+    ];
+    let mut last_reason = String::new();
+    for bundle in BUNDLES {
+        match check_macfuse_runtime(Path::new(bundle), Path::new("/dev")) {
+            Ok(()) => return Ok(()),
+            Err(reason) if reason.contains("not loaded") => {
+                return Err(CliError::Preflight(reason));
+            }
+            Err(reason) => last_reason = reason,
+        }
     }
-    Ok(())
+    Err(CliError::Preflight(last_reason))
 }
 
 /// The mountpoint must be an existing directory before fuser sees it.
+/// Missing and unreadable are distinct: a permission or I/O failure
+/// must never report "does not exist" with a wrong remediation.
 fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
     match std::fs::metadata(mountpoint) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
@@ -426,8 +443,12 @@ fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
             "mountpoint {} is not a directory",
             mountpoint.display()
         )),
-        Err(_) => Err(format!(
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "mountpoint {} does not exist",
+            mountpoint.display()
+        )),
+        Err(error) => Err(format!(
+            "mountpoint {} cannot be inspected: {error}",
             mountpoint.display()
         )),
     }
@@ -437,20 +458,48 @@ fn check_mountpoint(mountpoint: &Path) -> Result<(), String> {
 /// bundle probe names the install step, the device probe names the
 /// load/approve/reboot step. `dev_dir` is a parameter (not `/dev`
 /// inline) so tests can point it at a tempdir.
+///
+/// Best-effort: the device probe checks presence, not device type — a
+/// stale regular file at macfuse0 passes here and fails at mount, where
+/// the mount error stays authoritative.
 fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(), String> {
-    if !bundle.exists() {
-        return Err(format!(
-            "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
-            bundle.display()
-        ));
+    match std::fs::metadata(bundle) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "macFUSE bundle {} is not a directory: reinstall it with `brew install --cask macfuse`, then approve and reboot per the README",
+                bundle.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "macFUSE is not installed (no {}): install it with `brew install --cask macfuse`, then approve and reboot per the README",
+                bundle.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "macFUSE bundle {} cannot be inspected: {error}",
+                bundle.display()
+            ));
+        }
     }
-    if !dev_dir.join("macfuse0").exists() {
-        return Err(format!(
+    let node = dev_dir.join("macfuse0");
+    match std::fs::metadata(&node) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "macFUSE kext node {}/macfuse0 is a directory (expected a device node): reload macFUSE per the README",
+            dev_dir.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "macFUSE kext is not loaded (no {}/macfuse0): load it, approve \"Benjamin Fleischer\" in Privacy & Security, and reboot per the README",
             dev_dir.display()
-        ));
+        )),
+        Err(error) => Err(format!(
+            "macFUSE kext node {}/macfuse0 cannot be inspected: {error}",
+            dev_dir.display()
+        )),
     }
-    Ok(())
 }
 
 /// Fold the loop and session outcomes into the process exit status: a

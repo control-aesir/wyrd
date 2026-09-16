@@ -13,7 +13,7 @@
 ## 0.17.0 - 2026-02-14
 
 Major changes:
-* Change many integer-based public API parameters to strongly-typed newtypes and bitflags. 
+* Change many integer-based public API parameters to strongly-typed newtypes and bitflags.
   This breaking changes affects many of the methods on `Filesystem`
 * Change `Filesystem` trait methods to use `&self`, and require mounted filesystems to be `Send + Sync + 'static`
 * Improve typed error handling across request/reply APIs

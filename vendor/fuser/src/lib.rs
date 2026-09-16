@@ -248,7 +248,7 @@ impl KernelConfig {
     ///
     /// The kernel currently has a hard maximum value of 2.  Anything higher won't work.
     ///
-    /// On success, returns the previous value.  
+    /// On success, returns the previous value.
     /// # Errors
     /// If argument is too large, returns the nearest value which will succeed.
     pub fn set_max_stack_depth(&mut self, value: u32) -> Result<u32, u32> {
@@ -268,7 +268,7 @@ impl KernelConfig {
     ///
     /// Must be a power of 10 nanoseconds. i.e. 1s, 0.1s, 0.01s, 1ms, 0.1ms...etc
     ///
-    /// On success returns the previous value.  
+    /// On success returns the previous value.
     /// # Errors
     /// If the argument does not match any valid granularity, returns the nearest value which will succeed.
     pub fn set_time_granularity(&mut self, value: Duration) -> Result<Duration, Duration> {
@@ -613,7 +613,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// will be undefined if the open method didn't set any value.
     ///
     /// `write_flags`: will contain `FUSE_WRITE_CACHE`, if this write is from the page cache. If set,
-    /// the pid, uid, gid, and fh may not match the value that would have been sent if write cachin
+    /// the pid, uid, gid, and fh may not match the value that would have been sent if write caching
     /// is disabled
     /// flags: these are the file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
     /// `lock_owner`: only supported with ABI >= 7.9

@@ -27,6 +27,16 @@ read-only FUSE mount today, mobile file surfaces later. The `wyrd` binary
   `wyrd mount --relay …` serves the drive's read-only projection and joins
   the control plane.
 
+## Mount diagnostics
+
+`wyrd mount` logs structured events to stderr and to
+`drive_dir/mount.log` (truncated per mount, so one mount leaves one
+bounded log): stage events for serving, bulk, preflight, mailbox, and
+the session thread exit, plus fuser handshake errors via the `log`
+bridge. `wyrd mount --verbose` adds debug-level FUSE request logs
+(opcode + latency + reply errno); `RUST_LOG` overrides the filter.
+Logs never contain secret bytes.
+
 ## What does not belong here
 
 Format, cryptography, membership, and transport logic. The daemon composes

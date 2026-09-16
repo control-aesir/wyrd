@@ -3,10 +3,12 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
+use tracing_subscriber::layer::SubscriberExt as _;
 use wyrd_daemon::{Daemon, LiveConfig, LiveError, LiveSummary};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -55,6 +57,12 @@ enum Command {
         /// stays idle.
         #[arg(long, value_name = "URL")]
         relay: Vec<String>,
+        /// Verbose mount diagnostics: debug-level FUSE request logs
+        /// (opcode + latency + reply errno) in stderr and `mount.log`.
+        /// Without it the mount logs at info level, and each request
+        /// costs one enabled-check.
+        #[arg(long)]
+        verbose: bool,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -135,8 +143,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             drive_dir,
             mountpoint,
             relay,
+            verbose,
             ..
-        } => mount(drive_dir, mountpoint, relay, &passphrase, identity),
+        } => mount(drive_dir, mountpoint, relay, verbose, &passphrase, identity),
     }
 }
 
@@ -283,13 +292,115 @@ fn install_shutdown_handler() -> Result<(), CliError> {
     Ok(())
 }
 
+/// Cloneable file sink for the mount-log layer: the `fmt` layer needs
+/// a `MakeWriter`, and a shared `Arc<Mutex<File>>` is the simplest one
+/// that survives into the spawned session thread. A poisoned lock maps
+/// to an I/O error rather than panicking the mount.
+#[derive(Clone, Debug)]
+struct SharedWriter {
+    file: Arc<Mutex<fs::File>>,
+}
+
+impl SharedWriter {
+    fn new(file: fs::File) -> Self {
+        SharedWriter {
+            file: Arc::new(Mutex::new(file)),
+        }
+    }
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::other("mount log lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::other("mount log lock poisoned"))?
+            .flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for SharedWriter {
+    type Writer = SharedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Mount diagnostics: structured events to stderr plus a per-mount
+/// file, and a bridge so fuser's `log` records land in the same
+/// stream.
+///
+/// The file (`drive_dir/mount.log`, truncated per mount) is the record
+/// a dead mount leaves behind — terminal scrollback is gone when the
+/// terminal is. Truncation keeps it bounded with zero rotation code:
+/// one mount, one log. Logs never contain secret bytes (same rule as
+/// CLI errors): stages, ids, errnos, latencies.
+///
+/// Call first in [`mount`], before preflight or the session thread
+/// exists. Only the first caller's filter wins: the process-wide
+/// subscriber is set once, so a second init (tests, a future
+/// multi-mount process) keeps the first filter and still returns the
+/// log path.
+fn init_mount_diagnostics(drive_dir: &Path, verbose: bool) -> Result<PathBuf, CliError> {
+    let log_path = drive_dir.join("mount.log");
+    let file = fs::File::create(&log_path).map_err(|source| CliError::Io {
+        path: log_path.clone(),
+        source,
+    })?;
+    // fuser's handshake errors and iroh internals log via the `log`
+    // crate; without this bridge those records vanish because no
+    // logger is ever initialized.
+    let _ = tracing_log::LogTracer::init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(if verbose {
+            "info,wyrd_daemon=debug"
+        } else {
+            "info"
+        })
+    });
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(SharedWriter::new(file))
+        .with_ansi(false);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer);
+    let _ = tracing_subscriber::util::SubscriberInitExt::try_init(subscriber);
+    Ok(log_path)
+}
+
 fn mount(
     drive_dir: PathBuf,
     mountpoint: PathBuf,
     relays: Vec<String>,
+    verbose: bool,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    // Diagnostics first: the bridge plus stderr/file layers must exist
+    // before preflight, the serving endpoint, or the session thread
+    // emit anything — otherwise a failed handshake or a dying loop
+    // leaves no record.
+    let log_path = init_mount_diagnostics(&drive_dir, verbose)?;
+    let mount_span = tracing::info_span!(
+        "mount",
+        drive = %drive_dir.display(),
+        mountpoint = %mountpoint.display(),
+        verbose = verbose,
+    );
+    let _mount_guard = mount_span.enter();
+    tracing::info!(stage = "start", log = %log_path.display(), "mount diagnostics initialized");
+
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
     let mut daemon = Daemon::new(
         engine,
@@ -302,7 +413,12 @@ fn mount(
     // macFUSE runtime can never mount, and every later stage would
     // report the same opaque failure.
     #[cfg(target_os = "macos")]
-    macos_preflight(&mountpoint)?;
+    if let Err(error) = macos_preflight(&mountpoint) {
+        tracing::error!(stage = "preflight", error = %error, "macOS FUSE preflight failed");
+        return Err(error);
+    }
+    #[cfg(target_os = "macos")]
+    tracing::info!(stage = "preflight", "macOS FUSE preflight passed");
 
     // Serving: a real-iroh endpoint over the drive's durable vault, so
     // peers holding an announcement route can fetch what this drive
@@ -312,10 +428,10 @@ fn mount(
         .open_serving(&drive_dir, false)
         .map_err(CliError::Serving)?;
     let mut bulk = bind_bulk_source()?;
-    eprintln!(
-        "serving over iroh: {}",
-        hex::encode(serving.addr().id.as_bytes())
-    );
+    tracing::info!(stage = "bulk", "bulk source bound");
+    let serving_id = hex::encode(serving.addr().id.as_bytes());
+    eprintln!("serving over iroh: {serving_id}");
+    tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
 
     let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
 
@@ -334,6 +450,10 @@ fn mount(
     )?;
     if relays.is_empty() {
         eprintln!("warning: no --relay given; control-plane intake stays idle");
+        tracing::warn!(
+            stage = "mailbox",
+            "control-plane intake stays idle: no --relay given"
+        );
     }
 
     // Arm shutdown before mounting: every post-mount failure path
@@ -354,7 +474,20 @@ fn mount(
     #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
-    let server = std::thread::spawn(move || session.run());
+    // The session loop owns the backend: log its exit immediately on
+    // the thread, so a dead event loop leaves a record even while the
+    // live loop below is still blocked — the main thread only learns
+    // the outcome at join time during shutdown.
+    let server = std::thread::spawn(move || {
+        let outcome = session.run();
+        match &outcome {
+            Ok(()) => tracing::info!(stage = "session", "FUSE session loop exited cleanly"),
+            Err(error) => {
+                tracing::error!(stage = "session", error = %error, "FUSE session loop exited with error");
+            }
+        }
+        outcome
+    });
     let result = live.run_loop(
         &mut mailbox,
         Some(&mut bulk),
@@ -362,6 +495,7 @@ fn mount(
         &LiveConfig::default(),
         &mut |error, consecutive| {
             eprintln!("live sync pass failed ({consecutive} consecutive): {error}");
+            tracing::warn!(stage = "sync", consecutive, error = %error, "live sync pass failed");
         },
     );
     bulk.shutdown();
@@ -373,10 +507,25 @@ fn mount(
     // when the loop stopped cleanly.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
+        tracing::warn!(stage = "session", error = %error, "unmount failed");
     }
+    // The exit itself is already logged on the session thread above;
+    // the join outcome is shutdown sequencing (debug), except a panic,
+    // which has no thread-side record and fails the mount as an error.
     let session_result = match server.join() {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::other("FUSE session thread panicked")),
+        Ok(result) => {
+            match &result {
+                Ok(()) => tracing::debug!(stage = "session", "session thread joined cleanly"),
+                Err(error) => {
+                    tracing::debug!(stage = "session", error = %error, "session thread joined with error");
+                }
+            }
+            result
+        }
+        Err(_) => {
+            tracing::error!(stage = "session", "FUSE session thread panicked");
+            Err(std::io::Error::other("FUSE session thread panicked"))
+        }
     };
     combine_status(result, session_result)
 }
@@ -872,6 +1021,51 @@ mod tests {
         assert!(!text.contains("ssss"), "oversized content leaked: {text}");
     }
 
+    /// Mount diagnostics initialize a per-mount log file and tolerate
+    /// repeat init: the process-wide subscriber is set once, and the
+    /// log path is still returned. Each init truncates, so one mount
+    /// leaves one bounded log.
+    #[test]
+    fn mount_diagnostics_create_a_per_mount_log() {
+        let temp = TempDir::new();
+        let drive = temp.0.join("drive");
+        fs::create_dir_all(&drive).unwrap();
+
+        let first = init_mount_diagnostics(&drive, false).unwrap();
+        assert_eq!(first, drive.join("mount.log"));
+        assert!(first.is_file(), "the mount leaves a log in the drive dir");
+
+        fs::write(&first, b"stale").unwrap();
+        let second = init_mount_diagnostics(&drive, true).unwrap();
+        assert_eq!(second, first);
+        assert!(
+            fs::read(&second).unwrap().is_empty(),
+            "each mount starts its own truncated log"
+        );
+    }
+
+    /// `--verbose` is a mount-only diagnostics flag: it parses on
+    /// mount and stays rejected for init like the other mount flags.
+    #[test]
+    fn mount_accepts_a_verbose_diagnostics_flag() {
+        let cli = Cli::try_parse_from([
+            "wyrd".to_owned(),
+            "mount".into(),
+            "/tmp/drive".into(),
+            "/tmp/mnt".into(),
+            "--identity-file".into(),
+            "/tmp/id".into(),
+            "--passphrase-file".into(),
+            "/tmp/pp".into(),
+            "--verbose".into(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Mount { verbose: true, .. }),
+            "mount carries the verbose diagnostics flag"
+        );
+    }
+
     /// The mount serves a read-write `wyrd` filesystem: the backend
     /// carries the live daemon's mutation channel, so the kernel must
     /// not gate writes behind a read-only flag.
@@ -976,7 +1170,7 @@ mod tests {
         let drive_path = drive.clone();
         let mut mount = MountGuard {
             server: Some(std::thread::spawn(move || {
-                mount(drive, mountpoint, Vec::new(), "test-pass", identity)
+                mount(drive, mountpoint, Vec::new(), false, "test-pass", identity)
             })),
         };
         let target = temp.0.join("mnt").join("hello.txt");

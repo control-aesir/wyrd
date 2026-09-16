@@ -2282,6 +2282,36 @@ mod tests {
         assert_eq!(backend.open_write("x", 0), Err(fuser::Errno::EROFS));
     }
 
+    /// A headless view (fresh drive, no authored heads) still resolves,
+    /// opens, and enumerates the root through the backend: the resolve
+    /// path behind getattr, the open path behind opendir, and an empty
+    /// listing behind readdir. Kernels refuse a mount whose root fails,
+    /// so this must hold before first authoring.
+    #[test]
+    fn headless_view_serves_an_empty_root_end_to_end() {
+        let backend = FuseBackend::new(DriveView::new(
+            MemoryObjectStore::default(),
+            NoMaterialization,
+            Vec::new(),
+        ));
+        let (ino, node, _) = backend.resolve_inode("").unwrap();
+        assert_eq!(ino, 1, "the root path interns to ino 1");
+        assert!(
+            matches!(node, Node::MergedDir { .. }),
+            "a headless root is an empty directory"
+        );
+        let fh = backend.open_dir(1, "").unwrap();
+        let entries = backend.dir_entries(fh).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, _, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec![".", ".."],
+            "no children before first authoring"
+        );
+    }
+
     /// A first write whose resulting logical length exceeds the
     /// per-handle budget fails closed with `ENOSPC` *before*
     /// materializing the base, so an oversized file never allocates

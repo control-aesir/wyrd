@@ -63,9 +63,9 @@ When GC arrives, it will be the only way data is removed, and it will require:
 
 ## User Interface & Presentation
 
-Wyrd mounts via **FUSE** to present standard filesystem interfaces (pre-alpha today: a read-only FUSE mount via the daemon):
+Wyrd mounts via **FUSE** to present standard filesystem interfaces (pre-alpha today: a read-write FUSE mount via the daemon):
 
-* **Live View:** Operates as a standard read-only local folder.
+* **Live View:** Operates as a standard read-write local folder; writes commit as snapshots.
 * **Time Travel:** Historical snapshots and previous roots can be browsed using ordinary file manipulation tools.
 
 ---
@@ -93,8 +93,8 @@ transport identities, the real-iroh serving router (a serving endpoint
 over the durable vault answers peer fetches by transport root), and a
 read-only FUSE mount via the daemon (`wyrd
 mount`) are in place and under test. Still pending: relay pool supervision
-and signer-client wiring (NIP-46), write support behind the mount,
-automatic peer repair, and garbage collection (post-v1 by contract).
+and signer-client wiring (NIP-46), automatic peer repair, and garbage
+collection (post-v1 by contract).
 
 See `ROADMAP.md` for the current phase plan and issue links.
 
@@ -124,7 +124,7 @@ Wyrd's bet is that these are one system: git's object model, Syncthing's replica
 | `crates/wyrd-format` | The format contract: two identities (content/storage), canonical encoding, chunking, Merkle file trees, snapshot DAG |
 | `crates/wyrd-sync` | Peer replication on iroh: snapshot announcements, encrypted manifests, roles × materialization, two-phase content, zero-trust encryption |
 | `crates/wyrd-fuse` | The drive as a filesystem: live view, time travel, visible conflicts |
-| `crates/wyrd-daemon` | Composition: engine + view + presentation backends (read-only FUSE today) and the `wyrd` binary (`init`, `mount`) |
+| `crates/wyrd-daemon` | Composition: engine + view + presentation backends (read-write FUSE today) and the `wyrd` binary (`init`, `mount`) |
 | `crates/wyrd-contracts` | Cross-crate architectural contract suite: one named test per review contract, composed end to end |
 
 Design docs live in `docs/` (`architecture.md` is the one-page entry point);
@@ -164,7 +164,6 @@ supply the runtime library or the kernel extension. `cargo check` and the
 `wyrd-format`, `wyrd-sync`, and `wyrd-fuse` suites need no FUSE at all.
 
 `crates/wyrd-format` carries the format contract and `crates/wyrd-sync`
-the cryptography and state machines (both under test); the read-only FUSE
-backend is implemented in `crates/wyrd-daemon` (`wyrd init`, `wyrd
-mount`), which also opens the drive's real-iroh serving endpoint; write
-support behind the mount is pending.
+the cryptography and state machines (both under test); the read-write
+FUSE backend is implemented in `crates/wyrd-daemon` (`wyrd init`, `wyrd
+mount`), which also opens the drive's real-iroh serving endpoint.

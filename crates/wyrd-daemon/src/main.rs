@@ -45,7 +45,7 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
-    /// Mount a live read-only projection at `mountpoint`.
+    /// Mount a live projection at `mountpoint` (read-write).
     Mount {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -582,9 +582,13 @@ fn combine_status(
     }
 }
 
+/// The mount serves read-write: the session backend already carries
+/// the live daemon's mutation channel, so the kernel must not gate
+/// writes behind a read-only flag. The FSName keeps the volume
+/// identifiable in mount tables.
 fn session_config() -> Config {
     let mut config = Config::default();
-    config.mount_options = vec![MountOption::RO, MountOption::FSName("wyrd".into())];
+    config.mount_options = vec![MountOption::FSName("wyrd".into())];
     config
 }
 
@@ -868,17 +872,18 @@ mod tests {
         assert!(!text.contains("ssss"), "oversized content leaked: {text}");
     }
 
-    /// The static mount serves a read-only `wyrd` filesystem: the
-    /// kernel must never see a writable mount from this binary.
+    /// The mount serves a read-write `wyrd` filesystem: the backend
+    /// carries the live daemon's mutation channel, so the kernel must
+    /// not gate writes behind a read-only flag.
     #[test]
-    fn mount_uses_a_read_only_filesystem_name() {
+    fn mount_uses_a_read_write_filesystem_name() {
         let config = session_config();
         assert!(
             config
                 .mount_options
                 .iter()
-                .any(|option| matches!(option, MountOption::RO)),
-            "the mount is read-only"
+                .all(|option| !matches!(option, MountOption::RO)),
+            "the mount is read-write"
         );
         assert!(
             config
@@ -924,16 +929,17 @@ mod tests {
         assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello mount");
     }
 
-    /// The full static mount: init, author, mount in a thread, read
-    /// through the mountpoint, prove read-only, shut down, and
-    /// rejoin cleanly. Ignored by default — opting in is the test
-    /// runner's job, so an explicit run always attempts the mount
+    /// The full live mount: init, author, mount in a thread, read
+    /// through the mountpoint, write a file through it and read it
+    /// back, shut down, rejoin cleanly, and prove the write survived
+    /// by reopening the drive. Ignored by default — opting in is the
+    /// test runner's job, so an explicit run always attempts the mount
     /// instead of silently passing. Needs kernel FUSE plus local
     /// networking for the serving endpoint. Run it where both hold:
     /// `cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
     #[test]
     #[ignore = "needs kernel FUSE and local networking"]
-    fn live_mount_serves_read_only_until_shutdown() {
+    fn live_mount_serves_read_write_until_shutdown() {
         // The shutdown latch is process-global: start unset so a
         // previous run in this process cannot cut this mount short.
         SHUTDOWN.store(false, Ordering::Relaxed);
@@ -967,6 +973,7 @@ mod tests {
         // of orphaning the mount. The explicit join reports the
         // mount outcome; the Drop path stays best-effort (it must
         // never panic while unwinding).
+        let drive_path = drive.clone();
         let mut mount = MountGuard {
             server: Some(std::thread::spawn(move || {
                 mount(drive, mountpoint, Vec::new(), "test-pass", identity)
@@ -982,15 +989,25 @@ mod tests {
             panic!("the mount did not serve in time");
         }
         assert_eq!(fs::read(&target).unwrap(), b"hello mount");
-        assert!(
-            fs::write(&target, b"nope").is_err(),
-            "the static mount is read-only"
-        );
+        // The mount serves read-write: a file written through the
+        // mountpoint reads back, and survives the mount: reopening
+        // the drive finds the authored content.
+        let written = temp.0.join("mnt").join("written.txt");
+        fs::write(&written, b"hello write").unwrap();
+        assert_eq!(fs::read(&written).unwrap(), b"hello write");
         mount.shutdown_and_join("during shutdown");
         assert!(
             fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
             "a clean unmount releases the mountpoint"
         );
+        let identity = read_identity(&identity_file).unwrap();
+        let engine = Engine::open_keystore(drive_path.clone(), "test-pass", identity).unwrap();
+        let store = FsObjectStore::open(drive_path).unwrap();
+        let mut daemon = Daemon::new(engine, store).unwrap();
+        daemon.refresh_live_heads().unwrap();
+        let node = daemon.view().lookup("written.txt").unwrap();
+        let file = daemon.view().open(&node).unwrap();
+        assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello write");
     }
 
     /// Owns a spawned mount thread: signals shutdown and rejoins on

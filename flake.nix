@@ -58,10 +58,13 @@
           # strictDeps the pkg-config role hook only exposes host-offset
           # deps on the unsuffixed PKG_CONFIG_PATH the probe reads.
           buildInputs = lib.optionals stdenv.isDarwin [
-            # Build-time headers/stubs for fuser's libfuse2 probe. Mounting
-            # at runtime still needs system macFUSE, which nix cannot
-            # provide; same split as devenv.nix.
+            # Build-time headers/stubs for fuser's libfuse probes
+            # (fuse.pc from nixpkgs, fuse3.pc from our own stubs:
+            # nix/macfuse3-stubs.nix, same split as devenv.nix).
+            # Mounting at runtime still needs system macFUSE, which nix
+            # cannot provide.
             pkgs.macfuse-stubs
+            (pkgs.callPackage ./nix/macfuse3-stubs.nix { })
           ] ++ lib.optionals stdenv.isLinux [
             # libfuse2 headers for fuser's link probe.
             pkgs.fuse

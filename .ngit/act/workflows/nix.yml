@@ -35,6 +35,19 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v23
 
+      # Warm /nix/store across runs: without this every run recompiles
+      # the whole Rust dependency closure from source on a cold store
+      # (~4 minutes of the flake check). Scoped by repository and trigger
+      # trust, so third-party PRs never touch the maintainer cache.
+      # continue-on-error keeps coordinators with caching disabled green.
+      - name: Restore Nix store cache
+        continue-on-error: true
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          token: unused
+
       # Flake evaluation needs an openable Git repository (libgit2
       # ENOTFOUND otherwise) and the coordinator worktree can carry a stub
       # or no .git metadata at all. Rebuild it when git itself cannot open

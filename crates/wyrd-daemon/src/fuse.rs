@@ -56,6 +56,43 @@ const TTL: Duration = Duration::from_secs(1);
 /// The single well-known timestamp: the view has no time source and
 /// snapshot timestamps are display-only (object-model.md).
 const MOUNT_TIME: SystemTime = UNIX_EPOCH;
+/// Synthetic capacity reported by `statfs`, in blocks. The store is
+/// append-only and effectively unbounded, so there is no real total to
+/// report; zeros read as an empty/full disk and make Finder refuse
+/// copies before writing anything. 2^40 blocks at 4 KiB is 4 PiB: large
+/// enough to never gate a real copy, small enough that `blocks * frsize`
+/// cannot overflow u64.
+const STATFS_BLOCKS: u64 = 1 << 40;
+/// Block size reported by `statfs`, for both `bsize` and `frsize`.
+const STATFS_BSIZE: u32 = 4096;
+
+/// The synthetic `statfs` capacity with named fields, so the mapping
+/// onto the positional FUSE ABI reply is pinned in one place. Free
+/// equals total: nothing is ever reported as used; files/ffree mirror
+/// the same unboundedness for the namespace.
+struct StatfsCapacity {
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    bsize: u32,
+    namelen: u32,
+    frsize: u32,
+}
+
+fn statfs_capacity() -> StatfsCapacity {
+    StatfsCapacity {
+        blocks: STATFS_BLOCKS,
+        bfree: STATFS_BLOCKS,
+        bavail: STATFS_BLOCKS,
+        files: STATFS_BLOCKS,
+        ffree: STATFS_BLOCKS,
+        bsize: STATFS_BSIZE,
+        namelen: 4096,
+        frsize: STATFS_BSIZE,
+    }
+}
 
 /// The inode table: kernel ino → the path it was minted for, plus
 /// the kind and projection generation that last validated the
@@ -2146,9 +2183,17 @@ where
 
     fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         let _log = RequestLog::new("statfs");
-        // A bottomless append-only store: capacities unknown and
-        // effectively unbounded.
-        reply.statfs(0, 0, 0, 0, 0, 1, 4096, 0);
+        let cap = statfs_capacity();
+        reply.statfs(
+            cap.blocks,
+            cap.bfree,
+            cap.bavail,
+            cap.files,
+            cap.ffree,
+            cap.bsize,
+            cap.namelen,
+            cap.frsize,
+        );
     }
 
     fn destroy(&mut self) {
@@ -2287,6 +2332,25 @@ mod tests {
 
         let clean = RequestLog::new("statfs");
         assert_eq!(clean.err.get(), None);
+    }
+
+    /// The synthetic `statfs` capacity must read as a usable disk: zeros
+    /// make Finder refuse copies before writing anything, free must equal
+    /// total (nothing is ever reported as used), and the byte product
+    /// must not overflow the kernels that multiply it out.
+    #[test]
+    fn statfs_capacity_is_nonzero_and_overflow_free() {
+        let cap = statfs_capacity();
+        assert!(cap.blocks > 0, "zero blocks read as an empty disk");
+        assert_eq!(cap.bfree, cap.blocks, "free must equal total");
+        assert_eq!(cap.bavail, cap.blocks, "available must equal total");
+        assert!(cap.ffree > 0, "zero free inodes read as a full disk");
+        assert!(cap.bsize > 0, "zero block size breaks size math");
+        let bytes = (cap.blocks as u128) * (cap.frsize as u128);
+        assert!(
+            bytes < u64::MAX as u128,
+            "blocks * frsize must fit u64 ({bytes} does not)"
+        );
     }
 
     #[test]

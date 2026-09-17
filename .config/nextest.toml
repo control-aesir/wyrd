@@ -1,0 +1,19 @@
+# Heavy live-mailbox flood tests are crypto- (NIP-59 seal per wrap) and
+# fsync-bound (one sync per ack) and each spawns parallel seal workers
+# plus relay/client runtimes. Running them concurrently oversubscribes
+# the machine and they all crawl, so they share one serial group while
+# the rest of the suite keeps full parallelism.
+[test-groups]
+mailbox-flood = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(flood)'
+test-group = 'mailbox-flood'
+
+[[profile.default.overrides]]
+filter = 'test(saturation)'
+test-group = 'mailbox-flood'
+
+[[profile.default.overrides]]
+filter = 'test(unacked_bound)'
+test-group = 'mailbox-flood'

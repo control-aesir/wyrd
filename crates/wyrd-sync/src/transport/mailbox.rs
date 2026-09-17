@@ -169,6 +169,12 @@ impl DeliveryId {
     pub fn new(value: u64) -> Self {
         DeliveryId(value)
     }
+
+    /// The raw counter value, for mailbox-internal bookkeeping (low-water
+    /// marks over densely minted session ids). Opaque to the engine.
+    pub fn value(&self) -> u64 {
+        self.0
+    }
 }
 
 /// One envelope handover: the envelope plus the id the engine hands

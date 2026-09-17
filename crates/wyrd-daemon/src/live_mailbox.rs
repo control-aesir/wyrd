@@ -121,6 +121,30 @@ const INCOMING_CAPACITY: usize = 1024;
 /// resubscribe that may never come.
 const MAX_UNACKED_DELIVERIES: usize = 1024;
 
+/// Most acked wrap ids retained in the dedupe store. The store is a
+/// FIFO over distinct acks: beyond the bound the oldest ack is evicted
+/// (its wrap may redeliver once, converging through engine
+/// idempotency — the same duplicate window a crash before ack already
+/// allows), and the file is compacted back to one line per retained id
+/// once appends pass the bound again. 64k entries hold every plausible
+/// in-flight and replay window (~4MB file, ~4MB heap) while keeping
+/// restart load independent of lifetime history. Tests use a small
+/// bound so floods exercise eviction and compaction quickly.
+#[cfg(test)]
+const MAX_SEEN_ENTRIES: usize = 512;
+#[cfg(not(test))]
+const MAX_SEEN_ENTRIES: usize = 65_536;
+
+/// Most undecryptable wrap ids remembered in-session. Pre-envelope
+/// garbage is never recorded durably — it cannot become a permanent
+/// entry — but remembering recent poison avoids re-decrypting the same
+/// wraps on every replay. Evicted poison simply decrypts again on its
+/// next receipt; restarts re-decrypt once and re-discard.
+#[cfg(test)]
+const MAX_POISON_ENTRIES: usize = 128;
+#[cfg(not(test))]
+const MAX_POISON_ENTRIES: usize = 4096;
+
 /// Supervisor tick: how often relay connection statuses are polled into
 /// shared health. Fast enough to surface an outage within a couple of
 /// seconds; slow enough to stay background noise.
@@ -212,21 +236,76 @@ struct SupervisorState {
 }
 
 /// Durable record of consumed gift wraps: one hex event id per line,
-/// appended (and fsynced) at every `Ack`; rebuilt as an in-memory set on
-/// open. Opening fails closed — only a missing file starts empty, while an
+/// FIFO-bounded id set: insertion-ordered membership with oldest-first
+/// eviction past capacity. Backs both the durable ack store (bounded
+/// disk, heap, and restart load) and the in-memory poison cache
+/// (bounded heap). Eviction forgets; a forgotten ack may redeliver
+/// once and converge through engine idempotency — the same duplicate
+/// window a crash before ack already allows.
+#[derive(Debug)]
+struct BoundedIds {
+    order: VecDeque<EventId>,
+    set: HashSet<EventId>,
+    cap: usize,
+}
+
+impl BoundedIds {
+    fn new(cap: usize) -> Self {
+        debug_assert!(cap > 0, "bounded id set needs a nonzero cap");
+        Self {
+            order: VecDeque::new(),
+            set: HashSet::new(),
+            cap,
+        }
+    }
+
+    fn contains(&self, id: &EventId) -> bool {
+        self.set.contains(id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Insert, evicting the oldest present id past capacity. Duplicate
+    /// inserts are no-ops and evict nothing.
+    fn insert(&mut self, id: EventId) {
+        if self.set.contains(&id) {
+            return;
+        }
+        if self.set.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.order.push_back(id);
+        self.set.insert(id);
+    }
+}
+
+/// Durable dedupe log: one line per acked wrap id, appended (and
+/// fsynced) at every `Ack`; rebuilt as a bounded set on open. Opening
+/// fails closed — only a missing file starts empty, while an
 /// unreadable, non-UTF-8, or corrupt ledger refuses startup, because
 /// silently replaying acknowledged wraps is the worse failure. A torn
 /// final line (crash mid-append, no trailing newline) is the one benign
 /// case: that ack never synced, so the tail is truncated away and the
 /// delivery comes back for re-acknowledgement. Throughput is fsync-bound
 /// by design (one sync per ack); batching is a future optimization that
-/// must not weaken the crash guarantee. The file grows with
-/// consumed-delivery history and is never compacted in v0 (append-only
-/// store posture; compaction/rekey is a tracked design item).
+/// must not weaken the crash guarantee. Retention is FIFO-bounded at
+/// `MAX_SEEN_ENTRIES`: evicted ids stay on disk until the next
+/// compaction, and the file is rewritten to one line per retained id
+/// once appends pass the bound again — disk stays under twice the
+/// bound, restart load under one bound, regardless of lifetime history.
 #[derive(Debug)]
 struct SeenStore {
-    seen: HashSet<EventId>,
+    path: PathBuf,
+    seen: BoundedIds,
     file: std::fs::File,
+    /// Lines appended since the last compaction (including lines for
+    /// since-evicted ids): the rewrite trigger.
+    appended: usize,
 }
 
 impl SeenStore {
@@ -249,11 +328,13 @@ impl SeenStore {
             None if text.is_empty() => (text, 0),
             None => ("", text.len()),
         };
-        let mut seen = HashSet::new();
+        let mut seen = BoundedIds::new(MAX_SEEN_ENTRIES);
+        let mut lines = 0;
         for line in recorded.lines() {
             let id = EventId::from_hex(line)
                 .map_err(|_| MailboxError::Transport("dedupe log: corrupt entry".into()))?;
             seen.insert(id);
+            lines += 1;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -264,7 +345,19 @@ impl SeenStore {
             file.set_len((bytes.len() - torn) as u64)
                 .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         }
-        Ok(Self { seen, file })
+        let mut store = Self {
+            path: path.to_owned(),
+            seen,
+            file,
+            appended: 0,
+        };
+        // One-time migration for pre-bound logs: the load above already
+        // evicted past the cap in memory, so rewrite the file down to
+        // the retained set instead of carrying unbounded history.
+        if lines > MAX_SEEN_ENTRIES {
+            store.compact()?;
+        }
+        Ok(store)
     }
 
     fn contains(&self, id: &EventId) -> bool {
@@ -274,15 +367,61 @@ impl SeenStore {
     /// Persist an acknowledgement durably before the caller may forget the
     /// delivery. A failed append keeps the delivery offered (the caller
     /// keeps it queued), so a disk failure cannot drop mail on the floor.
-    /// Re-recording an id (a repeated `Ack` after a lost response) appends
-    /// a duplicate line, which is harmless: the set keeps it unique.
+    /// Re-recording an id is a no-op: the first record already synced,
+    /// and the set keeps it unique without growing the file.
     fn record(&mut self, id: &EventId) -> Result<(), MailboxError> {
+        if self.seen.contains(id) {
+            return Ok(());
+        }
         self.file
             .write_all(format!("{id}\n").as_bytes())
             .and_then(|()| self.file.flush())
             .and_then(|()| self.file.sync_data())
             .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         self.seen.insert(*id);
+        self.appended += 1;
+        if self.appended >= MAX_SEEN_ENTRIES {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the log to exactly the retained set: temp file, fsync,
+    /// atomic rename, dir fsync. A crash leaves either the old or the
+    /// new complete file — never a half-rewritten log — and a torn tail
+    /// from a crash mid-rewrite truncates away on the next open.
+    fn compact(&mut self) -> Result<(), MailboxError> {
+        let tmp_path = self.path.with_extension("tmp");
+        {
+            let mut tmp = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+            for id in &self.seen.order {
+                tmp.write_all(format!("{id}\n").as_bytes())
+                    .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+            }
+            tmp.flush()
+                .and_then(|()| tmp.sync_all())
+                .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        }
+        std::fs::rename(&tmp_path, &self.path)
+            .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+            }
+        }
+        self.appended = 0;
         Ok(())
     }
 }
@@ -335,12 +474,23 @@ pub struct LiveMailbox<S> {
     /// notification channel while the bound is full (backpressure, not
     /// loss), so this length is the whole bound.
     unacked: VecDeque<Held>,
-    /// Delivery ids already consumed durably this session, so a repeated
-    /// or delayed settle is an idempotent no-op instead of an error (the
-    /// `Mailbox` contract requires a repeated `Ack` to succeed).
-    settled: HashSet<DeliveryId>,
+    /// Delivery ids consumed this session, as a low-water mark plus the
+    /// above-mark outstanding set: ids are minted densely from 1 per
+    /// boot, so a repeated or delayed settle is an idempotent no-op
+    /// (the `Mailbox` contract requires a repeated `Ack` to succeed)
+    /// without retaining every consumed id for the mailbox lifetime.
+    /// The outstanding set stays near the unacked depth — it only holds
+    /// settled ids whose predecessors are still held.
+    settled_below: u64,
+    outstanding: HashSet<DeliveryId>,
     next_delivery: u64,
     seen: SeenStore,
+    /// Wrap ids that failed envelope extraction this session: never
+    /// recorded durably, remembered boundedly so the same garbage is
+    /// not re-decrypted on every replay. Evicted poison simply
+    /// decrypts again on its next receipt; restarts re-decrypt once
+    /// and re-discard.
+    poison: BoundedIds,
 }
 
 impl<S> LiveMailbox<S>
@@ -457,9 +607,11 @@ where
             health,
             total_relays,
             unacked: VecDeque::new(),
-            settled: HashSet::new(),
+            settled_below: 0,
+            outstanding: HashSet::new(),
             next_delivery: 1,
             seen,
+            poison: BoundedIds::new(MAX_POISON_ENTRIES),
         })
     }
 
@@ -539,6 +691,23 @@ where
         let (_, fresh) = tokio_mpsc::channel(INCOMING_CAPACITY);
         let mut incoming = self.incoming.lock().expect("mailbox channel lock");
         let _abandoned = std::mem::replace(&mut *incoming, fresh);
+    }
+
+    /// Test observability for retention-bound assertions: retained ack
+    /// count, poison count, and settlement watermark.
+    #[cfg(test)]
+    fn seen_len(&self) -> usize {
+        self.seen.seen.len()
+    }
+
+    #[cfg(test)]
+    fn poison_len(&self) -> usize {
+        self.poison.len()
+    }
+
+    #[cfg(test)]
+    fn settled_below(&self) -> u64 {
+        self.settled_below
     }
 }
 
@@ -833,10 +1002,17 @@ where
             let Some(wrap) = self.next_wrap() else {
                 break;
             };
-            if self.seen.contains(&wrap.id) || self.held_by_wrap(&wrap.id) {
+            if self.seen.contains(&wrap.id)
+                || self.poison.contains(&wrap.id)
+                || self.held_by_wrap(&wrap.id)
+            {
                 continue;
             }
             let Ok(envelope) = self.envelope_from_wrap(&wrap) else {
+                // Pre-envelope garbage is never recorded durably, but
+                // remembering it for the session avoids re-decrypting the
+                // same wraps on every replay.
+                self.poison.insert(wrap.id);
                 continue;
             };
             let id = DeliveryId::new(self.next_delivery);
@@ -869,7 +1045,18 @@ where
                     let wrap_id = self.unacked[pos].wrap_id;
                     self.seen.record(&wrap_id)?;
                     self.unacked.remove(pos);
-                    self.settled.insert(id);
+                    // Idempotent-settlement bookkeeping: ids are dense
+                    // from 1 per boot, so consumed ids collapse into a
+                    // low-water mark; only settled ids with still-held
+                    // predecessors stay in the outstanding set.
+                    self.outstanding.insert(id);
+                    while self
+                        .settled_below
+                        .checked_add(1)
+                        .is_some_and(|next| self.outstanding.remove(&DeliveryId::new(next)))
+                    {
+                        self.settled_below += 1;
+                    }
                 }
                 // Retry leaves the delivery held; recv rotates held mail
                 // round-robin, so a retry is re-offered on a later pass
@@ -879,7 +1066,7 @@ where
             // Idempotent settlement: an id already consumed this session
             // is a no-op for either disposition — a lost ack response or
             // repeated settlement must not fail the engine's drain.
-            None if self.settled.contains(&id) => Ok(()),
+            None if id.value() <= self.settled_below || self.outstanding.contains(&id) => Ok(()),
             None => Err(MailboxError::Transport("unknown delivery".into())),
         }
     }
@@ -1583,10 +1770,13 @@ mod tests {
     }
 
     /// Backlog pressure: more wraps than the notification channel
-    /// holds still all arrive exactly once. Overflow backpressures
-    /// into the relay (which retains everything); the seen log
-    /// dedupes replays, so flooding costs latency, never loss or
-    /// duplicates.
+    /// holds still all arrive. Overflow backpressures into the relay
+    /// (which retains everything); the seen log dedupes replays, so
+    /// flooding costs latency, never loss. (Exactly-once delivery no
+    /// longer holds mailbox-wide: retention is FIFO-bounded, so a
+    /// forgotten ack may redeliver — convergence here keys on content
+    /// coverage.)
+    #[ignore = "slow flood gate (~2min loaded): default suite stays fast; CI runs it via --run-ignored all"]
     #[test]
     fn flood_beyond_channel_capacity_delivers_all_once() {
         const FLOOD: usize = 1500;
@@ -1610,26 +1800,27 @@ mod tests {
             );
         }
 
-        let mut payloads = std::collections::HashSet::new();
-        for _ in 0..FLOOD {
-            let delivery =
-                wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("each wrap arrives");
-            assert!(
-                payloads.insert(delivery.envelope().ciphertext.clone()),
-                "no duplicate deliveries"
-            );
-            mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
-        }
-        assert_eq!(payloads.len(), FLOOD);
-        assert_quiet(&mut mailbox);
+        let mut settled = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
+        drain_to(
+            &mut mailbox,
+            &mut settled,
+            &mut covered,
+            FLOOD,
+            Duration::from_secs(120),
+        );
+        assert_eq!(covered.len(), FLOOD, "no wrap lost");
+        // No assert_quiet: evicted acks may legitimately redeliver on a
+        // later replay, which is redelivery, not loss.
     }
 
     /// Saturation: more unseen wraps than the unacked bound. Exactly the
     /// bound becomes held deliveries; the overflow waits unread in the
     /// notification channel (backpressure, never consumed-and-dropped)
     /// and is admitted as the engine settles room free. Latency, never
-    /// loss: every injected wrap is eventually delivered and acked
-    /// exactly once.
+    /// loss: every injected wrap is eventually delivered and acked.
+    /// (Exactly-once delivery no longer holds mailbox-wide: retention is
+    /// FIFO-bounded, so a forgotten ack may redeliver.)
     #[test]
     fn unacked_bound_backpressures_overflow_without_loss() {
         const EXTRA: usize = 64;
@@ -1678,7 +1869,7 @@ mod tests {
 
         // Settle everything: each ack frees room the queued overflow is
         // pulled into, so all FLOOD wraps are eventually delivered and
-        // acked exactly once — the seen log proves it.
+        // acked — the bounded seen log proves it.
         for _ in 0..FLOOD {
             let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT)
                 .expect("overflow drains as room frees");
@@ -1686,21 +1877,39 @@ mod tests {
             mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
         }
         assert_eq!(ids.len(), FLOOD, "no wrap lost, none duplicated");
+        // Drain resurrected stragglers: an in-flight replay can land
+        // evicted acks as new held mail after the fixed pull count.
+        // Replays only recur on burst overflow, so the pipeline goes dry.
+        let drained = Instant::now();
+        while let Some(delivery) = mailbox.recv() {
+            mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
+            assert!(
+                drained.elapsed() < Duration::from_secs(60),
+                "stragglers drain"
+            );
+        }
         assert!(mailbox.unacked.is_empty(), "acked mail leaves");
-        let seen_lines = std::fs::read_to_string(&seen_path)
+        let lines = std::fs::read_to_string(&seen_path)
             .expect("seen log reads")
             .lines()
             .count();
-        assert_eq!(seen_lines, FLOOD, "every wrap acked exactly once");
-        assert_quiet(&mut mailbox);
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "dedupe log stays bounded, got {lines} lines"
+        );
+        // No assert_quiet: evicted acks may legitimately redeliver on a
+        // later replay, which is redelivery, not loss.
     }
 
     /// Saturation past the SDK broadcast buffer: flood past broadcast +
     /// channel capacity with no settling, so the SDK silently drops what
     /// the parked drainer cannot take. Settling then drains what arrived;
     /// the supervisor's saturation replay recovers the dropped wraps
-    /// without any reconnect, and every wrap is delivered and acked
-    /// exactly once.
+    /// without any reconnect, and every wrap is acked at least once.
+    /// (Exactly-once delivery no longer holds mailbox-wide: retention is
+    /// FIFO-bounded, so a forgotten ack may redeliver — convergence here
+    /// keys on content coverage, and the log stays bounded.)
+    #[ignore = "slow flood gate (~3min loaded): default suite stays fast; CI runs it via --run-ignored all"]
     #[test]
     fn saturation_recovers_broadcast_drops_via_replay() {
         // Pigeonhole over the notification path: the SDK broadcast holds
@@ -1742,19 +1951,9 @@ mod tests {
                 let sender = sender.clone();
                 let receiver_key = receiver.public_key();
                 handles.push(scope.spawn(move || {
-                    let mut out = Vec::with_capacity(end - start);
-                    for index in start..end {
-                        let rumor =
-                            EventBuilder::new(Kind::Custom(RUMOR_KIND), format!("payload-{index}"))
-                                .tag(Tag::public_key(receiver_key))
-                                .finalize_unsigned(sender.public_key());
-                        out.push(
-                            GiftWrapBuilder::new(receiver_key, rumor)
-                                .finalize(&sender)
-                                .unwrap(),
-                        );
-                    }
-                    out
+                    (start..end)
+                        .map(|index| seal_rumor(&sender, receiver_key, format!("payload-{index}")))
+                        .collect::<Vec<_>>()
                 }));
             }
             handles
@@ -1766,42 +1965,93 @@ mod tests {
             relay.inject(event);
         }
 
-        // Settle until everything converges or the deadline bites.
-        // Drain ready mail without sleeping between deliveries: the
-        // 50ms poll sleep in `wait_for_delivery` is per empty poll, and
-        // a flood plus a full-history replay mean ~11k deliveries — a
-        // sleep per delivery would burn minutes. Sleep only on a truly
-        // dry pipeline (replay still in flight); quiet windows while a
-        // replay is pending are normal, a stall is not.
-        let start = Instant::now();
-        let mut ids = std::collections::HashSet::new();
-        while ids.len() < FLOOD {
+        // Settle until every wrap is acked at least once or the deadline
+        // bites. Coverage keys on content indices (see `drain_to`):
+        // retention eviction means redelivered wraps mint fresh delivery
+        // ids. Quiet windows while a replay is pending are normal, a
+        // stall is not.
+        let mut settled = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
+        drain_to(&mut mailbox, &mut settled, &mut covered, FLOOD, DEADLINE);
+        assert_eq!(covered.len(), FLOOD, "all flood wraps converge via replay");
+        assert!(
+            mailbox.health().saturation_recoveries >= 1,
+            "recovery replay engaged"
+        );
+        // Drain resurrected stragglers before asserting emptiness: an
+        // in-flight replay can land evicted acks as new held mail after
+        // coverage completes. Replays only recur on burst overflow, so
+        // the pipeline goes dry.
+        let drained = Instant::now();
+        while let Some(delivery) = mailbox.recv() {
+            mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
             assert!(
-                start.elapsed() < DEADLINE,
-                "all flood wraps converge via replay"
+                drained.elapsed() < Duration::from_secs(60),
+                "stragglers drain"
             );
+        }
+        assert!(mailbox.unacked.is_empty(), "acked mail leaves");
+        let lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "dedupe log stays bounded under replay churn, got {lines} lines"
+        );
+        assert!(
+            mailbox.seen_len() <= MAX_SEEN_ENTRIES,
+            "retained acks bounded"
+        );
+        // No assert_quiet: evicted acks may legitimately redeliver on a
+        // later replay, which is redelivery, not loss.
+    }
+
+    /// Seal one rumor addressed to the receiver: the shared flood
+    /// builder for saturation tests. Content distinguishes scenarios;
+    /// the wrap shape is always a deliverable Wyrd control envelope.
+    fn seal_rumor(sender: &Keys, receiver_key: PublicKey, content: String) -> Event {
+        let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), content)
+            .tag(Tag::public_key(receiver_key))
+            .finalize_unsigned(sender.public_key());
+        GiftWrapBuilder::new(receiver_key, rumor)
+            .finalize(sender)
+            .unwrap()
+    }
+
+    /// Drain ready mail and ack every delivery until `target` distinct
+    /// content indices converge or the deadline bites. Coverage keys on
+    /// the rumor content index (`prefix-{index}` floods only): delivery
+    /// ids are per-handover, so a redelivered wrap mints a fresh one
+    /// and delivery-id counting would inflate. Every distinct delivery
+    /// is still settled exactly once. Sleeps only on a dry pipeline, so
+    /// floods and full-history replays sift fast.
+    fn drain_to(
+        mailbox: &mut LiveMailbox<Keys>,
+        settled: &mut std::collections::HashSet<DeliveryId>,
+        covered: &mut std::collections::HashSet<usize>,
+        target: usize,
+        deadline: Duration,
+    ) {
+        let start = Instant::now();
+        while covered.len() < target {
+            assert!(start.elapsed() < deadline, "flood converges");
             let mut progressed = false;
             while let Some(delivery) = mailbox.recv() {
                 progressed = true;
-                if ids.insert(delivery.id()) {
+                if settled.insert(delivery.id()) {
                     mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
+                    if let Some((_, index)) = delivery.envelope().ciphertext.rsplit_once('-') {
+                        if let Ok(index) = index.parse::<usize>() {
+                            covered.insert(index);
+                        }
+                    }
                 }
             }
             if !progressed {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        assert!(
-            mailbox.health().saturation_recoveries >= 1,
-            "recovery replay engaged"
-        );
-        assert!(mailbox.unacked.is_empty(), "acked mail leaves");
-        let seen_lines = std::fs::read_to_string(&seen_path)
-            .expect("seen log reads")
-            .lines()
-            .count();
-        assert_eq!(seen_lines, FLOOD, "every wrap acked exactly once");
-        assert_quiet(&mut mailbox);
     }
 
     /// Repeated saturation recoveries keep exactly one relay subscription:
@@ -1812,13 +2062,14 @@ mod tests {
     /// stays fast) — with a cooldown wait between them so the second
     /// replay is due; then one fresh event proving post-recovery delivery
     /// is exact-once, not multiplied across leaked subscriptions.
+    #[ignore = "slow lifecycle gate (~3min loaded, waits a real 30s cooldown): default suite stays fast; CI runs it via --run-ignored all"]
     #[test]
     fn saturation_recoveries_keep_single_subscription() {
-        // 1280 wraps emit 2560 notifications: past the 1024 handover
+        // 800 wraps emit 1600 notifications: past the 1024 handover
         // channel (saturation certain) but below the 5120 broadcast +
         // channel slots (no drops, so convergence needs no replayed
         // history and stays fast).
-        const FLOOD: usize = 1280;
+        const FLOOD: usize = 800;
         const DEADLINE: Duration = Duration::from_secs(120);
         let relay = MiniRelay::spawn();
         let url = relay.url().to_string();
@@ -1827,37 +2078,6 @@ mod tests {
         let receiver_key = receiver.public_key();
         let relays = vec![url];
         let seen_path = temp_path("seen-saturation-lifecycle");
-
-        fn seal(sender: &Keys, receiver_key: PublicKey, index: usize) -> Event {
-            let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), format!("payload-{index}"))
-                .tag(Tag::public_key(receiver_key))
-                .finalize_unsigned(sender.public_key());
-            GiftWrapBuilder::new(receiver_key, rumor)
-                .finalize(sender)
-                .unwrap()
-        }
-
-        fn drain_to(
-            mailbox: &mut LiveMailbox<Keys>,
-            ids: &mut std::collections::HashSet<DeliveryId>,
-            target: usize,
-            deadline: Duration,
-        ) {
-            let start = Instant::now();
-            while ids.len() < target {
-                assert!(start.elapsed() < deadline, "flood converges");
-                let mut progressed = false;
-                while let Some(delivery) = mailbox.recv() {
-                    progressed = true;
-                    if ids.insert(delivery.id()) {
-                        mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
-                    }
-                }
-                if !progressed {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        }
 
         let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
         // The initial REQ races the relay core loop: wait for
@@ -1871,11 +2091,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let mut ids = std::collections::HashSet::new();
+        let mut settled = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
         for index in 0..FLOOD {
-            relay.inject(seal(&sender, receiver_key, index));
+            relay.inject(seal_rumor(
+                &sender,
+                receiver_key,
+                format!("payload-{index}"),
+            ));
         }
-        drain_to(&mut mailbox, &mut ids, FLOOD, DEADLINE);
+        drain_to(&mut mailbox, &mut settled, &mut covered, FLOOD, DEADLINE);
         assert!(
             mailbox.health().saturation_recoveries >= 1,
             "first recovery replay engaged"
@@ -1894,9 +2119,19 @@ mod tests {
         }
 
         for index in FLOOD..2 * FLOOD {
-            relay.inject(seal(&sender, receiver_key, index));
+            relay.inject(seal_rumor(
+                &sender,
+                receiver_key,
+                format!("payload-{index}"),
+            ));
         }
-        drain_to(&mut mailbox, &mut ids, 2 * FLOOD, DEADLINE);
+        drain_to(
+            &mut mailbox,
+            &mut settled,
+            &mut covered,
+            2 * FLOOD,
+            DEADLINE,
+        );
         assert!(
             mailbox.health().saturation_recoveries >= 2,
             "second recovery replay engaged"
@@ -1909,16 +2144,221 @@ mod tests {
 
         // One fresh event after two recoveries: delivered exactly once,
         // not multiplied across leaked subscriptions.
-        relay.inject(seal(&sender, receiver_key, 2 * FLOOD));
+        relay.inject(seal_rumor(
+            &sender,
+            receiver_key,
+            format!("payload-{}", 2 * FLOOD),
+        ));
         let delivery =
             wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("post-recovery mail delivers");
         mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
-        let seen_lines = std::fs::read_to_string(&seen_path)
+        // Retention stays bounded across the whole episode; no
+        // assert_quiet here — evicted acks may legitimately redeliver on
+        // a later replay, which is redelivery, not loss.
+        let lines = std::fs::read_to_string(&seen_path)
             .expect("seen log reads")
             .lines()
             .count();
-        assert_eq!(seen_lines, 2 * FLOOD + 1, "every wrap acked exactly once");
-        assert_quiet(&mut mailbox);
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "dedupe log stays bounded across recoveries, got {lines} lines"
+        );
+        assert!(
+            mailbox.seen_len() <= MAX_SEEN_ENTRIES,
+            "retained acks bounded"
+        );
+    }
+
+    /// Useless-but-valid flood stays bounded on disk: wraps that decrypt
+    /// and deliver but carry no useful content are acked (the engine
+    /// discards them), and today every ack appends a permanent dedupe
+    /// line — an attacker can manufacture unique ones forever. The flood
+    /// stays below broadcast-wrap volume (no drops, fast converge) but
+    /// past twice the retention bound, so eviction and compaction must
+    /// engage. Sized to stay local-fast (~25s): below broadcast-wrap
+    /// volume, so convergence needs no replayed history.
+    #[test]
+    fn useless_flood_does_not_grow_dedupe_log_forever() {
+        const FLOOD: usize = 1500;
+        const DEADLINE: Duration = Duration::from_secs(180);
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let receiver_key = receiver.public_key();
+        let relays = vec![url];
+        let seen_path = temp_path("seen-useless-flood");
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
+        // Pre-seal off the relay path so setup crypto does not pace the
+        // measured episode.
+        let sealed: Vec<Event> = std::thread::scope(|scope| {
+            const WORKERS: usize = 8;
+            let chunk = FLOOD.div_ceil(WORKERS);
+            let mut handles = Vec::new();
+            for worker in 0..WORKERS {
+                let start = worker * chunk;
+                let end = (start + chunk).min(FLOOD);
+                if start >= end {
+                    break;
+                }
+                let sender = sender.clone();
+                handles.push(scope.spawn(move || {
+                    (start..end)
+                        .map(|index| seal_rumor(&sender, receiver_key, format!("useless-{index}")))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for event in sealed {
+            relay.inject(event);
+        }
+
+        let mut settled = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
+        drain_to(&mut mailbox, &mut settled, &mut covered, FLOOD, DEADLINE);
+        assert_eq!(covered.len(), FLOOD, "useless mail still delivers for ack");
+        let lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "dedupe log bounded, got {lines} lines for {FLOOD} useless acks"
+        );
+        assert!(
+            mailbox.seen_len() <= MAX_SEEN_ENTRIES,
+            "retained acks bounded"
+        );
+    }
+
+    /// Pre-envelope garbage never reaches durable storage and stays
+    /// bounded in memory: wraps that fail extraction are remembered in
+    /// the session poison cache (no re-decrypt per replay) and never
+    /// recorded. Two waves: the first fits the cache (every wrap
+    /// provably skipped), the second overflows it (eviction holds).
+    #[test]
+    fn garbage_wraps_stay_memory_only_and_bounded() {
+        const WAVE: usize = 100;
+        const DEADLINE: Duration = Duration::from_secs(60);
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let receiver_key = receiver.public_key();
+        let relays = vec![url];
+        let seen_path = temp_path("seen-garbage");
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
+        for wave in 0..2 {
+            for index in 0..WAVE {
+                // Wrong rumor kind: decrypts, then fails extraction.
+                let rumor = EventBuilder::new(
+                    Kind::Custom(RUMOR_KIND + 1),
+                    format!("garbage-{wave}-{index}"),
+                )
+                .tag(Tag::public_key(receiver_key))
+                .finalize_unsigned(sender.public_key());
+                relay.inject(
+                    GiftWrapBuilder::new(receiver_key, rumor)
+                        .finalize(&sender)
+                        .unwrap(),
+                );
+            }
+            // Arrival is proven by the poison count itself: skipped wraps
+            // are never delivered, so nothing else can move this number.
+            let start = Instant::now();
+            let expect = (MAX_POISON_ENTRIES).min((wave + 1) * WAVE);
+            while mailbox.poison_len() < expect {
+                assert!(start.elapsed() < DEADLINE, "garbage arrives and is skipped");
+                assert!(mailbox.recv().is_none(), "garbage never delivers");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        assert!(
+            mailbox.poison_len() <= MAX_POISON_ENTRIES,
+            "poison cache bounded"
+        );
+        assert!(mailbox.recv().is_none(), "garbage never delivers");
+        let lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert_eq!(lines, 0, "garbage never reaches durable storage");
+    }
+
+    /// Settlement bookkeeping collapses to a watermark: out-of-order
+    /// acks advance the low-water mark past the contiguous prefix,
+    /// repeats stay no-ops, and unknown ids still fail.
+    #[test]
+    fn settled_ids_collapse_to_watermark() {
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let receiver_key = receiver.public_key();
+        let relays = vec![url];
+        let seen_path = temp_path("seen-watermark");
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
+        for index in 0..3 {
+            relay.inject(seal_rumor(&sender, receiver_key, format!("wm-{index}")));
+        }
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let delivery =
+                wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("mail delivers");
+            ids.push(delivery.id());
+        }
+        // Settle newest first: nothing is contiguous yet.
+        mailbox.settle(ids[2], Disposition::Ack).unwrap();
+        assert_eq!(mailbox.settled_below(), 0, "gap blocks the watermark");
+        mailbox.settle(ids[2], Disposition::Ack).unwrap();
+        // Settle oldest: the prefix advances past it.
+        mailbox.settle(ids[0], Disposition::Ack).unwrap();
+        assert_eq!(mailbox.settled_below(), 1, "watermark advances past id 1");
+        // Settle the middle: everything is contiguous now.
+        mailbox.settle(ids[1], Disposition::Ack).unwrap();
+        assert_eq!(mailbox.settled_below(), 3, "watermark covers all three");
+        assert!(mailbox.unacked.is_empty(), "acked mail leaves");
+        mailbox.settle(ids[1], Disposition::Ack).unwrap();
+        assert!(mailbox
+            .settle(DeliveryId::new(99), Disposition::Ack)
+            .is_err());
+    }
+
+    /// The store itself, without a relay: past-cap records evict
+    /// oldest-first, the file compacts to the retained set, and a
+    /// reopen keeps recent acks while forgetting evicted ones — with
+    /// restart load proportional to the bound, not history.
+    #[test]
+    fn seen_store_evicts_compacts_and_reopens_bounded() {
+        let path = temp_path("seen-unit-bound");
+        let total = MAX_SEEN_ENTRIES * 3 + 7;
+        let id_at = |i: usize| EventId::from_hex(&format!("{i:064x}")).unwrap();
+        let mut store = SeenStore::open(&path).expect("open creates");
+        for i in 0..total {
+            store.record(&id_at(i)).expect("record appends");
+        }
+        assert!(store.seen.len() <= MAX_SEEN_ENTRIES, "retained set bounded");
+        let lines = std::fs::read_to_string(&path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "compacted file bounded, got {lines} lines"
+        );
+        let reopened = SeenStore::open(&path).expect("reopen reads bounded file");
+        assert!(
+            reopened.contains(&id_at(total - 1)),
+            "recent ack survives restart"
+        );
+        assert!(!reopened.contains(&id_at(0)), "evicted ack forgotten");
     }
 
     /// The replay cooldown: the first observed saturation is always due,

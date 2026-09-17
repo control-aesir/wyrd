@@ -282,6 +282,89 @@ fn failed_projection_leaves_installed_heads_untouched() {
     loaded.rig.teardown();
 }
 
+/// A mixed-validity head set never partially projects: with two eligible
+/// heads where one fails closure, `refresh_live_heads` errors and the
+/// previously installed heads stay installed. This is the per-head path
+/// the all-or-nothing contract above does not cover on its own: that
+/// test damages the commit watermark (engine-level failure), while here
+/// the engine is healthy and exactly one head's closure is unverifiable.
+#[test]
+fn partial_head_set_never_projects_mixed_validity_heads() {
+    // Head A fully published and installed first.
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("keeper.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 6).unwrap(), b"keeper");
+
+    // Head B: announced with body, but root manifest and sealed objects
+    // withheld, so B is eligible yet its closure cannot verify.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk_b = scratch.insert(ObjectKind::Chunk, b"second").unwrap();
+    let tree_b = Tree::from_entries(vec![
+        Entry::file("second.txt", 6, false, vec![chunk_b]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut scratch)
+    .unwrap();
+    let snapshot_b = signed_snapshot(
+        Vec::new(),
+        tree_b,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        2_000,
+    );
+    let snapshot_b_id = snapshot_b.snapshot_id();
+    let content_b = seal_flat_drive(
+        &drive(),
+        &loaded.rig.epoch2,
+        2,
+        &snapshot_b_id,
+        &[("second.txt", b"second")],
+    );
+    let body_b = snapshot_b.encode();
+    loaded.bulk.publish_snapshot(snapshot_b_id, body_b.clone());
+    loaded.bulk.publish_transport(body_b.clone());
+    loaded.rig.enqueue_announcement(
+        snapshot_b_id,
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body_b).as_bytes()),
+            root_manifest: content_b.manifest_id,
+            root_transport: BaoRoot::from_bytes(*blake3::hash(&content_b.root.sealed).as_bytes()),
+        },
+        None,
+    );
+
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    let err = daemon.refresh_live_heads().unwrap_err();
+    assert!(
+        matches!(err, EngineError::Closure(_)),
+        "an unverifiable head fails the refresh at closure: {err:?}"
+    );
+
+    // Installed heads untouched: A still serves, B never mounts.
+    let node = daemon.view().lookup("keeper.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(daemon.view().read(&file, 0, 6).unwrap(), b"keeper");
+    assert!(daemon.view().lookup("second.txt").is_err());
+
+    drop(daemon);
+    loaded.rig.teardown();
+}
+
 /// The local write path, end to end: a member authors a snapshot for a
 /// tree in the local store, and the daemon's classified projection makes
 /// the drive serve it. Authorship binds the canonical membership state;
@@ -1027,9 +1110,10 @@ fn conflicted_drive_rejects_mounted_writes() {
 
 /// A validly signed body whose manifest describes different, individually
 /// valid content must not become a mounted head. The daemon verifies the
-/// tree/manifest closure before installing; without the gate the head would
-/// mount over its (locally present) tree and serve content the manifest does
-/// not describe.
+/// tree/manifest closure before installing anything: a mismatch fails the
+/// refresh with an error and installs nothing, where without the gate the
+/// head would mount over its (locally present) tree and serve content the
+/// manifest does not describe.
 #[test]
 fn a_mismatched_snapshot_manifest_never_mounts() {
     let mut rig = Rig::new();
@@ -1139,7 +1223,11 @@ fn a_mismatched_snapshot_manifest_never_mounts() {
     let mut daemon = Daemon::new(engine, store).unwrap();
     daemon.drain(&mut rig.relay).unwrap();
     daemon.execute_plan(&mut bulk).unwrap();
-    daemon.refresh_live_heads().unwrap();
+    let err = daemon.refresh_live_heads().unwrap_err();
+    assert!(
+        matches!(err, EngineError::Closure(_)),
+        "a body whose manifest describes other content fails the refresh at closure: {err:?}"
+    );
 
     assert!(
         matches!(daemon.view().lookup("honest.txt"), Err(ViewError::NotFound)),

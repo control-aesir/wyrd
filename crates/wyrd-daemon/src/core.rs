@@ -194,28 +194,29 @@ where
     /// bodies the authorization engine marks `Eligible`, replayed and
     /// classified inside `wyrd-sync` (see [`Engine::live_heads`]). This
     /// is the only production projection into the view.
+    ///
+    /// All-or-nothing: every eligible head's closure is verified before
+    /// anything is installed, so a damaged head fails the refresh and
+    /// leaves the previously installed set untouched instead of
+    /// silently projecting a partial namespace.
     pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
         let runtime = self.engine.runtime_state()?;
         let heads = self.engine.live_heads()?;
-        let verified = {
+        {
             let store = self
                 .view
                 .store_read()
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
-            heads
-                .into_iter()
-                .filter(|head| {
-                    wyrd_sync::closure::verify_head_closure(
-                        &runtime,
-                        head.snapshot(),
-                        &*store,
-                        &wyrd_sync::ingest::Limits::V0,
-                    )
-                    .is_ok()
-                })
-                .collect::<Vec<_>>()
-        };
-        self.view.set_heads(view_heads(verified));
+            for head in &heads {
+                wyrd_sync::closure::verify_head_closure(
+                    &runtime,
+                    head.snapshot(),
+                    &*store,
+                    &wyrd_sync::ingest::Limits::V0,
+                )?;
+            }
+        }
+        self.view.set_heads(view_heads(heads));
         Ok(())
     }
 

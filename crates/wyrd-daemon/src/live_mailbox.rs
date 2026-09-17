@@ -93,7 +93,7 @@
 //! nothing new.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -343,31 +343,51 @@ struct SeenStore {
 
 impl SeenStore {
     fn open(path: &Path) -> Result<Self, MailboxError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        // Streaming load: pre-bound logs from older versions can be far
+        // larger than the retention cap (the old code was append-only),
+        // so startup must never hold the whole file — memory stays at
+        // one line plus the bounded set while bytes stream once. Time is
+        // linear in file size; memory is not.
+        let read = match std::fs::File::open(path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(MailboxError::Transport(format!("dedupe log: {error}")));
             }
         };
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| MailboxError::Transport("dedupe log: not valid UTF-8".into()))?;
-        // A trailing segment without a newline is a torn append, not a
-        // record: truncate it so later appends cannot weld a fresh id
-        // onto the garbage. Its ack never synced, so redelivery is safe.
-        let (recorded, torn) = match text.rfind('\n') {
-            Some(cut) if cut + 1 == text.len() => (text, 0),
-            Some(cut) => (&text[..=cut], text.len() - cut - 1),
-            None if text.is_empty() => (text, 0),
-            None => ("", text.len()),
-        };
         let mut seen = BoundedIds::new(MAX_SEEN_ENTRIES);
-        let mut lines = 0;
-        for line in recorded.lines() {
-            let id = EventId::from_hex(line)
-                .map_err(|_| MailboxError::Transport("dedupe log: corrupt entry".into()))?;
-            seen.insert(id);
-            lines += 1;
+        let mut lines: usize = 0;
+        let mut total: u64 = 0;
+        let mut torn: u64 = 0;
+        if let Some(file) = read {
+            total = file
+                .metadata()
+                .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?
+                .len();
+            let mut reader = std::io::BufReader::new(file);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let chunk = reader
+                    .read_until(b'\n', &mut buf)
+                    .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+                if chunk == 0 {
+                    break;
+                }
+                if !buf.ends_with(b"\n") {
+                    // Trailing segment without a newline is a torn
+                    // append, not a record: its ack never synced, so
+                    // redelivery is safe and the tail truncates below.
+                    torn = buf.len() as u64;
+                    break;
+                }
+                let line = std::str::from_utf8(&buf[..buf.len() - 1])
+                    .map_err(|_| MailboxError::Transport("dedupe log: not valid UTF-8".into()))?;
+                let id = EventId::from_hex(line)
+                    .map_err(|_| MailboxError::Transport("dedupe log: corrupt entry".into()))?;
+                seen.insert(id);
+                lines += 1;
+            }
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -375,7 +395,7 @@ impl SeenStore {
             .open(path)
             .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         if torn > 0 {
-            file.set_len((bytes.len() - torn) as u64)
+            file.set_len(total - torn)
                 .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         }
         let mut store = Self {
@@ -2449,6 +2469,40 @@ mod tests {
             "recent ack survives restart"
         );
         assert!(!reopened.contains(&id_at(0)), "evicted ack forgotten");
+    }
+
+    /// Legacy migration stays bounded: a pre-bound log (many lines over
+    /// the cap, duplicates, torn tail) opens without loading the whole
+    /// file — memory is one line plus the bounded set — retaining the
+    /// newest entries, dropping the rest, truncating the tear, and
+    /// compacting down to the retained set.
+    #[test]
+    fn legacy_log_migrates_bounded() {
+        let path = temp_path("seen-legacy-migration");
+        let id_at = |i: usize| EventId::from_hex(&format!("{i:064x}")).unwrap();
+        let total = MAX_SEEN_ENTRIES * 5 + 13;
+        let mut raw = String::new();
+        for i in 0..total {
+            raw.push_str(&format!("{}\n", id_at(i)));
+            if i % 3 == 0 {
+                // Duplicate lines: the old code appended re-acks verbatim.
+                raw.push_str(&format!("{}\n", id_at(i)));
+            }
+        }
+        raw.push_str("torn-tail-no-newline");
+        std::fs::write(&path, &raw).expect("legacy log written");
+
+        let store = SeenStore::open(&path).expect("migration opens");
+        assert!(store.seen.len() <= MAX_SEEN_ENTRIES, "retained set bounded");
+        assert!(store.contains(&id_at(total - 1)), "newest retained");
+        assert!(!store.contains(&id_at(0)), "oldest evicted");
+        let text = std::fs::read_to_string(&path).expect("migrated log reads");
+        assert!(
+            text.lines().count() <= MAX_SEEN_ENTRIES * 2,
+            "migrated file compacted"
+        );
+        assert!(text.ends_with('\n'), "torn tail truncated");
+        EventId::from_hex(text.lines().last().unwrap()).expect("tail parses");
     }
 
     /// Failure injection for the compaction window the reviewer flagged:

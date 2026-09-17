@@ -488,7 +488,9 @@ impl Rig {
     /// `epoch`. Every call seals fresh, so every envelope carries a
     /// distinct message id. `node_addr` rides the announcement opaquely
     /// (the route codec interprets it); `Some` makes it fetchable
-    /// against the naming peer.
+    /// against the naming peer. Returns the sealed envelope so tests can
+    /// re-queue identical bytes — the only true redelivery, since a
+    /// fresh seal mints a fresh id.
     pub(crate) fn enqueue_announcement(
         &mut self,
         snapshot: SnapshotId,
@@ -496,7 +498,7 @@ impl Rig {
         epoch: u64,
         roots: AnnouncedRoots,
         node_addr: Option<Vec<u8>>,
-    ) {
+    ) -> MailboxEnvelope {
         let mut announcement = SnapshotAnnouncement {
             snapshot,
             author: self.owner.id,
@@ -519,7 +521,8 @@ impl Rig {
             epoch,
             &message,
         );
-        self.relay.queue([envelope]);
+        self.relay.queue([envelope.clone()]);
+        envelope
     }
 
     /// Mint the capability covering `secrets.len()` epochs for the
@@ -743,8 +746,11 @@ impl Loaded {
     /// Publish the snapshot body and enqueue its announcement naming the
     /// real transport identities (decision 26), leaving the manifest
     /// and objects unpublished: for tests that stage the manifest
-    /// deliberately.
-    pub(crate) fn publish_body_and_announcement(&mut self, node_addr: Option<Vec<u8>>) {
+    /// deliberately. Returns the announcement envelope for redelivery tests.
+    pub(crate) fn publish_body_and_announcement(
+        &mut self,
+        node_addr: Option<Vec<u8>>,
+    ) -> MailboxEnvelope {
         let snapshot_id = self.snapshot.snapshot_id();
         let body_bytes = self.snapshot.encode();
         self.bulk.publish_snapshot(snapshot_id, body_bytes.clone());
@@ -761,7 +767,7 @@ impl Loaded {
                 ),
             },
             node_addr,
-        );
+        )
     }
 
     /// Drain the control plane: the capability and the announcement

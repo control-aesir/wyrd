@@ -1,7 +1,7 @@
 //! The sync-facing contracts: verified heads, queue pressure, and
 //! bounded bulk.
 
-use wyrd_daemon::core::Daemon;
+use wyrd_daemon::core::{Daemon, LiveError};
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
     BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, Manifest, ManifestEntry,
@@ -362,6 +362,96 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
     assert!(daemon.view().lookup("second.txt").is_err());
 
     drop(daemon);
+    loaded.rig.teardown();
+}
+
+/// The live sync pass enforces the same all-or-nothing rule as the direct
+/// refresh: with two eligible heads where one fails closure, `sync_once`
+/// errors and the previously published generation keeps serving. This is
+/// the production mount path (`into_live` + `sync_once`, the composer
+/// startup sequence in `main.rs`), not just the direct
+/// `Daemon::refresh_live_heads` API.
+#[test]
+fn live_sync_pass_never_projects_mixed_validity_heads() {
+    // Head A fully published; refresh installs it, and the live split
+    // adopts it as the baseline generation.
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (mut live, backend) = daemon.into_live(std::time::Duration::from_secs(30));
+    assert_eq!(live.generation(), 0, "the split publishes baseline zero");
+    let handle = backend.open_at("keeper.txt").expect("baseline serves");
+    assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
+
+    // Head B: announced with body, but root manifest and sealed objects
+    // withheld, so B is eligible yet its closure cannot verify.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk_b = scratch.insert(ObjectKind::Chunk, b"second").unwrap();
+    let tree_b = Tree::from_entries(vec![
+        Entry::file("second.txt", 6, false, vec![chunk_b]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut scratch)
+    .unwrap();
+    let snapshot_b = signed_snapshot(
+        Vec::new(),
+        tree_b,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        2_000,
+    );
+    let snapshot_b_id = snapshot_b.snapshot_id();
+    let content_b = seal_flat_drive(
+        &drive(),
+        &loaded.rig.epoch2,
+        2,
+        &snapshot_b_id,
+        &[("second.txt", b"second")],
+    );
+    let body_b = snapshot_b.encode();
+    loaded.bulk.publish_snapshot(snapshot_b_id, body_b.clone());
+    loaded.bulk.publish_transport(body_b.clone());
+    loaded.rig.enqueue_announcement(
+        snapshot_b_id,
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body_b).as_bytes()),
+            root_manifest: content_b.manifest_id,
+            root_transport: BaoRoot::from_bytes(*blake3::hash(&content_b.root.sealed).as_bytes()),
+        },
+        None,
+    );
+
+    let err = match live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk)) {
+        // SyncReport carries no Debug; match instead of unwrap_err.
+        Ok(_) => panic!("a mixed-validity head set must fail the live pass"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, LiveError::Engine(EngineError::Closure(_))),
+        "an unverifiable head fails the live pass at closure: {err:?}"
+    );
+
+    // No new generation publishes: the old one keeps serving A, and B
+    // never mounts.
+    assert_eq!(live.generation(), 0, "a failed pass publishes nothing");
+    let handle = backend
+        .open_at("keeper.txt")
+        .expect("old generation serves");
+    assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
+    assert!(backend.open_at("second.txt").is_err());
+
+    drop(live);
+    drop(backend);
     loaded.rig.teardown();
 }
 

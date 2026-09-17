@@ -67,6 +67,31 @@ fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<ViewHe
         .collect()
 }
 
+/// All-or-nothing closure gate shared by the direct refresh and the live
+/// sync pass: every eligible head must verify, or the caller installs
+/// nothing. Returns the heads unchanged for installation; any failure
+/// surfaces the closure error before any publication happens, so the two
+/// production paths cannot diverge on partial head sets again.
+fn verified_heads<S>(
+    runtime: &wyrd_sync::runtime::RuntimeState,
+    heads: Vec<AuthorizedSnapshot>,
+    store: &S,
+) -> Result<Vec<AuthorizedSnapshot>, wyrd_sync::closure::ClosureError>
+where
+    S: ObjectStore,
+    S::Error: std::fmt::Debug,
+{
+    for head in &heads {
+        wyrd_sync::closure::verify_head_closure(
+            runtime,
+            head.snapshot(),
+            store,
+            &wyrd_sync::ingest::Limits::V0,
+        )?;
+    }
+    Ok(heads)
+}
+
 /// Why a daemon write failed. Store and mutation errors keep the
 /// store's own error type; engine errors (membership, authoring) surface
 /// unchanged so callers can match on them.
@@ -202,20 +227,13 @@ where
     pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
         let runtime = self.engine.runtime_state()?;
         let heads = self.engine.live_heads()?;
-        {
+        let heads = {
             let store = self
                 .view
                 .store_read()
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
-            for head in &heads {
-                wyrd_sync::closure::verify_head_closure(
-                    &runtime,
-                    head.snapshot(),
-                    &*store,
-                    &wyrd_sync::ingest::Limits::V0,
-                )?;
-            }
-        }
+            verified_heads(&runtime, heads, &*store)?
+        };
         self.view.set_heads(view_heads(heads));
         Ok(())
     }
@@ -610,31 +628,20 @@ where
                 generation,
             });
         }
-        // Install only heads whose tree/manifest closure is complete and
-        // corresponds: a head whose closure is missing or mismatched is not
-        // materializable and must never be served.
+        // All-or-nothing projection: every eligible head must verify or
+        // nothing new publishes — a damaged head fails the pass and the
+        // previous generation keeps serving (see `verified_heads`).
         let heads = self.engine.live_heads()?;
-        let verified = {
+        let heads = {
             let store = self.store.read().map_err(|_| LiveError::Lock)?;
-            heads
-                .into_iter()
-                .filter(|head| {
-                    wyrd_sync::closure::verify_head_closure(
-                        &completed_runtime,
-                        head.snapshot(),
-                        &*store,
-                        &wyrd_sync::ingest::Limits::V0,
-                    )
-                    .is_ok()
-                })
-                .collect::<Vec<_>>()
+            verified_heads(&completed_runtime, heads, &*store).map_err(EngineError::Closure)?
         };
         let next = Projection::new(
             Arc::clone(&self.store),
             DaemonMaterialization {
                 runtime: completed_runtime,
             },
-            view_heads(verified),
+            view_heads(heads),
             generation + 1,
             revision,
         );

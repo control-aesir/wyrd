@@ -285,13 +285,19 @@ pub(crate) fn sealed_envelope(
 }
 
 pub(crate) fn scratch_dir(label: &str) -> PathBuf {
+    // Process-unique sequence: two threads can read the same clock tick,
+    // and same-tick names would share one LOCK file and fail the second
+    // open with StoreLocked. Pids and timestamps alone do not isolate
+    // parallel tests.
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "wyrd-contracts-{label}-{}-{}",
+        "wyrd-contracts-{label}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir

@@ -35,13 +35,16 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v23
 
-      # cache-nix-action's save phase chowns the Nix db to a hardcoded
-      # `runner:runner` user absent from act containers: without it the
-      # save fails and every run rebuilds cold.
-      - name: Provide runner user for cache permissions
+      # cache-nix-action assumes GitHub-hosted runners: its save phase
+      # chowns the Nix db to a hardcoded `runner:runner` user and
+      # checkpoints it with `sqlite3`, neither of which exists in act
+      # containers. Without both shims the save fails silently and every
+      # run rebuilds cold.
+      - name: Prepare cache tooling
         run: |
           set -euo pipefail
           id runner >/dev/null 2>&1 || sudo useradd -r -U -M -s /usr/sbin/nologin runner
+          command -v sqlite3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y sqlite3; }
 
       # Warm /nix/store across runs: without this every run recompiles
       # the whole Rust dependency closure from source on a cold store

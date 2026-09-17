@@ -164,6 +164,13 @@ impl MiniRelay {
         &self.url
     }
 
+    /// Number of currently registered subscriptions: test observability
+    /// for subscription-lifecycle assertions (a mailbox must hold exactly
+    /// one matching subscription no matter how many recoveries fire).
+    pub(crate) fn subscription_count(&self) -> usize {
+        self.subs.lock().expect("subs lock").len()
+    }
+
     /// Store and broadcast an event without a publishing client; no
     /// signature checks, so tests can inject garbage frames. Panics while
     /// the relay is shut down — tests only ever inject into a serving relay.

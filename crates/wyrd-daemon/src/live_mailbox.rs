@@ -90,7 +90,9 @@ use nostr::event::{AsyncSignEvent, FinalizeEventAsync, FinalizeUnsignedEvent};
 use nostr::message::RelayMessage;
 use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
 use nostr::prelude::{AsyncGetPublicKey, AsyncNip44};
-use nostr::prelude::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, UnsignedEvent};
+use nostr::prelude::{
+    Event, EventBuilder, EventId, Keys, Kind, PublicKey, SubscriptionId, Tag, UnsignedEvent,
+};
 use nostr_sdk::prelude::{Client, ClientNotification, Filter};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -177,8 +179,11 @@ pub struct MailboxHealth {
     /// for offline boundary use, where "live" is stream-alive alone.
     pub total_relays: usize,
     /// Saturation replays issued to recover suspected SDK broadcast lag,
-    /// lifetime total. A replay re-subscribes and converges through
-    /// seen/held dedupe; the count keeps that recovery observable.
+    /// lifetime total. A replay sends CLOSE before REQ under the stable
+    /// subscription ID and converges through seen/held dedupe; the count
+    /// keeps that recovery observable. It counts replay subscriptions
+    /// successfully requested, not confirmed redelivery — a replay whose
+    /// history is itself dropped schedules the next one instead.
     pub saturation_recoveries: u64,
 }
 
@@ -404,6 +409,12 @@ where
         // subscriptions on reconnects. With no relays there is nothing to
         // dial (nostr-sdk refuses an empty `connect`), and the mailbox
         // stays constructible for offline boundary use.
+        // One stable subscription ID for the mailbox lifetime: every
+        // (re)subscribe sends CLOSE before REQ under this ID (see
+        // `resubscribe`), so recovery replays never accumulate relay-side
+        // subscriptions.
+        let subscription_id = SubscriptionId::generate();
+        let setup_subscription_id = subscription_id.clone();
         let setup_filter = filter.clone();
         runtime.block_on(async move {
             for relay in relay_urls {
@@ -418,6 +429,7 @@ where
             client_for_setup.connect().await;
             client_for_setup
                 .subscribe(setup_filter)
+                .with_id(setup_subscription_id)
                 .await
                 .map_err(|error| MailboxError::Transport(error.to_string()))?;
             Ok::<(), MailboxError>(())
@@ -430,6 +442,7 @@ where
             filter,
             Arc::clone(&incoming),
             Arc::clone(&health),
+            subscription_id,
             total_relays,
         ));
 
@@ -620,6 +633,27 @@ async fn connected_count(client: &Client) -> usize {
 /// meaningfully.
 const OUTAGE_GRACE_TICKS: u32 = 3;
 
+/// Replace the mailbox subscription under its stable ID: CLOSE the
+/// previous episode before REQing with the same ID, so the relay never
+/// accumulates one subscription per recovery. Both halves are required:
+/// the SDK rejects a REQ under a locally still-registered ID
+/// ("subscription ID already exists", so no replay would happen), and a
+/// fresh ID per recovery would leave every old subscription delivering
+/// (and the relay replaying) forever. Between CLOSE and REQ the relay
+/// retains everything and the new REQ replays it, so the gap loses
+/// nothing; seen/held dedupe converges the replay.
+async fn resubscribe(client: &Client, filter: &Filter, subscription_id: &SubscriptionId) -> bool {
+    // Unsubscribe only reports per-relay results inside its output, so
+    // this cannot fail the episode: at worst the CLOSE is lost and the
+    // relay holds one extra subscription until the next recovery.
+    let _ = client.unsubscribe(subscription_id).await;
+    client
+        .subscribe(filter.clone())
+        .with_id(subscription_id.clone())
+        .await
+        .is_ok()
+}
+
 /// Supervisor: poll relay statuses into shared health, and rebuild the
 /// attachment when it degrades. Two recovery paths: a dead notification
 /// stream (client-level failure) is re-driven with reconnect plus a fresh
@@ -630,14 +664,17 @@ const OUTAGE_GRACE_TICKS: u32 = 3;
 /// with a connection attempt in flight strands its connection task (the
 /// spawn guard never clears), so re-driving always goes through `connect`,
 /// which is a no-op for relays whose task is already driving or retrying.
-/// Both paths never give up — the composer owns lifecycle. Relay replay
-/// after any resubscribe converges through the durable dedupe log, so
-/// extra subscriptions are idempotent.
+/// Both paths never give up — the composer owns lifecycle. Every
+/// (re)subscribe goes through [`resubscribe`]: one stable subscription
+/// ID per mailbox, CLOSE before REQ, so recovery never accumulates
+/// relay-side subscriptions. Relay replay after any resubscribe
+/// converges through the durable dedupe log.
 async fn supervise(
     client: Arc<Client>,
     filter: Filter,
     incoming: Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
     health: Arc<SupervisorState>,
+    subscription_id: SubscriptionId,
     total_relays: usize,
 ) {
     let mut tick = tokio::time::interval(SUPERVISOR_INTERVAL);
@@ -653,19 +690,25 @@ async fn supervise(
         }
         // Saturation recovery: the drainer flagged a full handover
         // channel, so the SDK broadcast may have dropped events its lag
-        // hides. A fresh subscription replays relay history, which
-        // converges through seen/held dedupe; failure keeps the flag so
-        // a later due tick retries.
-        if health.saturated.load(Ordering::Relaxed)
-            && saturation_replay_due(last_saturation_replay, Instant::now())
-            && client.subscribe(filter.clone()).await.is_ok()
+        // hides. CLOSE before REQ under the stable subscription ID replays
+        // relay history, which converges through seen/held dedupe. The
+        // flag is claimed before the async replay: saturation observed
+        // mid-replay re-arms for the next due tick instead of being
+        // wiped by this episode's completion. A failed replay re-arms
+        // too — nothing was replayed, so a later due tick must retry
+        // rather than wait for a fresh saturation episode.
+        if saturation_replay_due(last_saturation_replay, Instant::now())
+            && health.saturated.swap(false, Ordering::Relaxed)
         {
-            health.saturated.store(false, Ordering::Relaxed);
-            health.saturation_recoveries.fetch_add(1, Ordering::Relaxed);
-            last_saturation_replay = Some(Instant::now());
+            if resubscribe(&client, &filter, &subscription_id).await {
+                health.saturation_recoveries.fetch_add(1, Ordering::Relaxed);
+                last_saturation_replay = Some(Instant::now());
+            } else {
+                health.saturated.store(true, Ordering::Relaxed);
+            }
         }
         if !health.stream_alive.load(Ordering::Relaxed) {
-            recover_stream(&client, &filter, &incoming, &health).await;
+            recover_stream(&client, &filter, &incoming, &health, &subscription_id).await;
             refresh(&client, &health).await;
             down_ticks = 0;
         }
@@ -675,7 +718,7 @@ async fn supervise(
             down_ticks = 0;
         }
         if down_ticks >= OUTAGE_GRACE_TICKS {
-            recover_relays(&client, &filter, &health).await;
+            recover_relays(&client, &filter, &health, &subscription_id).await;
             refresh(&client, &health).await;
             down_ticks = 0;
         }
@@ -698,18 +741,17 @@ async fn recover_stream(
     filter: &Filter,
     incoming: &Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
     health: &Arc<SupervisorState>,
+    subscription_id: &SubscriptionId,
 ) {
     let receiver = establish_drainer(client, health).await;
     let mut attempt: u32 = 0;
     loop {
         client.connect().await;
-        match client.subscribe(filter.clone()).await {
-            Ok(_) => break,
-            Err(_) => {
-                tokio::time::sleep(recovery_delay(attempt)).await;
-                attempt = attempt.saturating_add(1);
-            }
+        if resubscribe(client, filter, subscription_id).await {
+            break;
         }
+        tokio::time::sleep(recovery_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
     }
     // Swap without holding the lock across an await (`recv` only needs
     // it for a non-blocking `try_recv`); undelivered events in the old
@@ -722,15 +764,20 @@ async fn recover_stream(
 /// stretch, so ensure a connection task exists (`connect` is a no-op for
 /// relays whose task is already driving or retrying — the supervisor never
 /// disconnects, see above) and wait briefly for progress, backing off with
-/// a capped delay between attempts. On success, subscribe once to refresh
-/// relay-side subscription state; relay replay plus the durable dedupe log
-/// make the extra subscription idempotent.
-async fn recover_relays(client: &Arc<Client>, filter: &Filter, health: &Arc<SupervisorState>) {
+/// a capped delay between attempts. On success, replace the subscription
+/// under the stable ID to refresh relay-side state; relay replay plus the
+/// durable dedupe log converge the replacement.
+async fn recover_relays(
+    client: &Arc<Client>,
+    filter: &Filter,
+    health: &Arc<SupervisorState>,
+    subscription_id: &SubscriptionId,
+) {
     let mut attempt: u32 = 0;
     loop {
         client.connect().and_wait(RECOVERY_ATTEMPT_TIMEOUT).await;
         let connected = connected_count(client).await;
-        let recovered = connected > 0 && client.subscribe(filter.clone()).await.is_ok();
+        let recovered = connected > 0 && resubscribe(client, filter, subscription_id).await;
         health.connected_relays.store(connected, Ordering::Relaxed);
         if recovered {
             return;
@@ -1754,6 +1801,123 @@ mod tests {
             .lines()
             .count();
         assert_eq!(seen_lines, FLOOD, "every wrap acked exactly once");
+        assert_quiet(&mut mailbox);
+    }
+
+    /// Repeated saturation recoveries keep exactly one relay subscription:
+    /// each replay sends CLOSE before REQ under the stable ID instead of
+    /// accumulating a fresh subscription per episode. Two saturating
+    /// floods — each past the handover channel (so the flag fires) but
+    /// below broadcast-wrap volume (so nothing is dropped and draining
+    /// stays fast) — with a cooldown wait between them so the second
+    /// replay is due; then one fresh event proving post-recovery delivery
+    /// is exact-once, not multiplied across leaked subscriptions.
+    #[test]
+    fn saturation_recoveries_keep_single_subscription() {
+        // 1280 wraps emit 2560 notifications: past the 1024 handover
+        // channel (saturation certain) but below the 5120 broadcast +
+        // channel slots (no drops, so convergence needs no replayed
+        // history and stays fast).
+        const FLOOD: usize = 1280;
+        const DEADLINE: Duration = Duration::from_secs(120);
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let receiver_key = receiver.public_key();
+        let relays = vec![url];
+        let seen_path = temp_path("seen-saturation-lifecycle");
+
+        fn seal(sender: &Keys, receiver_key: PublicKey, index: usize) -> Event {
+            let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), format!("payload-{index}"))
+                .tag(Tag::public_key(receiver_key))
+                .finalize_unsigned(sender.public_key());
+            GiftWrapBuilder::new(receiver_key, rumor)
+                .finalize(sender)
+                .unwrap()
+        }
+
+        fn drain_to(
+            mailbox: &mut LiveMailbox<Keys>,
+            ids: &mut std::collections::HashSet<DeliveryId>,
+            target: usize,
+            deadline: Duration,
+        ) {
+            let start = Instant::now();
+            while ids.len() < target {
+                assert!(start.elapsed() < deadline, "flood converges");
+                let mut progressed = false;
+                while let Some(delivery) = mailbox.recv() {
+                    progressed = true;
+                    if ids.insert(delivery.id()) {
+                        mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
+                    }
+                }
+                if !progressed {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
+        // The initial REQ races the relay core loop: wait for
+        // registration instead of assuming it.
+        let registered = Instant::now();
+        while relay.subscription_count() != 1 {
+            assert!(
+                registered.elapsed() < DELIVERY_TIMEOUT,
+                "initial subscribe registers once"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for index in 0..FLOOD {
+            relay.inject(seal(&sender, receiver_key, index));
+        }
+        drain_to(&mut mailbox, &mut ids, FLOOD, DEADLINE);
+        assert!(
+            mailbox.health().saturation_recoveries >= 1,
+            "first recovery replay engaged"
+        );
+        assert_eq!(
+            relay.subscription_count(),
+            1,
+            "first replay replaces instead of accumulating"
+        );
+
+        // The second replay is due one cooldown after the first, which
+        // necessarily fired before the first flood converged.
+        let second_due = Instant::now() + SATURATION_REPLAY_COOLDOWN + Duration::from_secs(2);
+        while Instant::now() < second_due {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        for index in FLOOD..2 * FLOOD {
+            relay.inject(seal(&sender, receiver_key, index));
+        }
+        drain_to(&mut mailbox, &mut ids, 2 * FLOOD, DEADLINE);
+        assert!(
+            mailbox.health().saturation_recoveries >= 2,
+            "second recovery replay engaged"
+        );
+        assert_eq!(
+            relay.subscription_count(),
+            1,
+            "second replay replaces instead of accumulating"
+        );
+
+        // One fresh event after two recoveries: delivered exactly once,
+        // not multiplied across leaked subscriptions.
+        relay.inject(seal(&sender, receiver_key, 2 * FLOOD));
+        let delivery =
+            wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("post-recovery mail delivers");
+        mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
+        let seen_lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert_eq!(seen_lines, 2 * FLOOD + 1, "every wrap acked exactly once");
         assert_quiet(&mut mailbox);
     }
 

@@ -30,9 +30,11 @@
 //! history hostile to cursors, so there are none: delivery identity is the
 //! wrapper event id, and [`Disposition::Ack`] durably records it in an
 //! append-only seen-id log, which survives restarts. Unsettled handovers
-//! stay in memory (`unacked`) and are re-offered round-robin — new mail is
-//! always pulled before a retry is re-offered, so one poisoned message
-//! cannot starve the inbox. Framing-level garbage (wrong kind, missing or
+//! stay in memory (bounded `unacked`) and are re-offered round-robin —
+//! new mail is pulled before a retry is re-offered while there is room,
+//! so one poisoned message cannot starve the inbox; at saturation the
+//! channel is left unread and held mail rotates instead, so the engine
+//! can always drain room free. Framing-level garbage (wrong kind, missing or
 //! foreign recipient tag, failed signature) is rejected at the boundary
 //! and never queued; because it is not persisted, it costs only one
 //! rejection per relay redelivery — the same re-discard-per-pass cost the
@@ -79,7 +81,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,10 +112,11 @@ const INCOMING_CAPACITY: usize = 1024;
 
 /// Most handovers held unacked at once. Mirrors the engine's
 /// `MAX_PENDING_MESSAGES` intake bound: the mailbox is upstream of it,
-/// so it must not be the unbounded stage. At saturation new mail is shed
-/// locally without Ack — the relay retains it for redelivery — while held
-/// deliveries keep rotating to the engine, so shedding costs latency,
-/// never loss.
+/// so it must not be the unbounded stage. At saturation `recv` stops
+/// pulling from the notification channel until the engine settles room
+/// free — backpressure stalls the SDK stream with the relay retaining
+/// everything, which the no-cursor delivery model can rely on, unlike a
+/// resubscribe that may never come.
 const MAX_UNACKED_DELIVERIES: usize = 1024;
 
 /// Supervisor tick: how often relay connection statuses are polled into
@@ -154,10 +157,6 @@ pub struct MailboxHealth {
     /// Relays registered at construction. Zero means the mailbox was built
     /// for offline boundary use, where "live" is stream-alive alone.
     pub total_relays: usize,
-    /// New mail shed at the unacked bound without Ack, lifetime total.
-    /// Shed mail stays in relay history for redelivery; the counter
-    /// exists so silent shedding is observable, never silent loss.
-    pub shed: u64,
 }
 
 impl MailboxHealth {
@@ -170,13 +169,11 @@ impl MailboxHealth {
 
 /// Health flags shared between the drainer task, the supervisor task, and
 /// the synchronous [`LiveMailbox`] handle. Plain atomics — updated on the
-/// supervisor tick (and on the `recv` path for shed counts), read
-/// lock-free from `health`, never held across await.
+/// supervisor tick, read lock-free from `health`, never held across await.
 #[derive(Debug, Default)]
 struct SupervisorState {
     stream_alive: AtomicBool,
     connected_relays: AtomicUsize,
-    shed: AtomicU64,
 }
 
 /// Durable record of consumed gift wraps: one hex event id per line,
@@ -299,7 +296,9 @@ pub struct LiveMailbox<S> {
     /// Handovers taken from the relay and not yet acked, in pull order,
     /// bounded by [`MAX_UNACKED_DELIVERIES`]. `recv` prefers new mail and
     /// otherwise rotates this deque front-to-back, re-offering each
-    /// delivery under its stable id.
+    /// delivery under its stable id. Overflow is never pulled from the
+    /// notification channel while the bound is full (backpressure, not
+    /// loss), so this length is the whole bound.
     unacked: VecDeque<Held>,
     /// Delivery ids already consumed durably this session, so a repeated
     /// or delayed settle is an idempotent no-op instead of an error (the
@@ -360,7 +359,6 @@ where
         let health = Arc::new(SupervisorState {
             stream_alive: AtomicBool::new(true),
             connected_relays: AtomicUsize::new(0),
-            shed: AtomicU64::new(0),
         });
         // Listen before subscribing: the drainer must be polled past its
         // broadcast subscription before the REQ whose replay it has to
@@ -430,7 +428,6 @@ where
             stream_alive: self.health.stream_alive.load(Ordering::Relaxed),
             connected_relays: self.health.connected_relays.load(Ordering::Relaxed),
             total_relays: self.total_relays,
-            shed: self.health.shed.load(Ordering::Relaxed),
         }
     }
 
@@ -719,23 +716,25 @@ where
     }
 
     fn recv(&mut self) -> Option<Delivery> {
-        // New mail first: a retried delivery must never starve mail still
-        // sitting in the queue. Garbage and duplicate wraps collapse here
-        // and never become handovers.
-        while let Some(wrap) = self.next_wrap() {
+        // New mail first, while there is room to hold it: a retried
+        // delivery must never starve mail still sitting in the queue.
+        // Garbage and duplicate wraps collapse here and never become
+        // handovers. At saturation the channel is left unread —
+        // backpressure stalls the SDK stream with the relay retaining
+        // everything — and held mail rotates instead, so the engine can
+        // drain and free room. Nothing is ever consumed-and-dropped: the
+        // live stream has no cursor, so a dropped event would wait for a
+        // resubscribe that may never come.
+        while self.unacked.len() < MAX_UNACKED_DELIVERIES {
+            let Some(wrap) = self.next_wrap() else {
+                break;
+            };
             if self.seen.contains(&wrap.id) || self.held_by_wrap(&wrap.id) {
                 continue;
             }
             let Ok(envelope) = self.envelope_from_wrap(&wrap) else {
                 continue;
             };
-            // Saturation: shed new mail locally without Ack — the relay
-            // retains it for redelivery — and keep rotating held mail so
-            // the engine drains while the flood waits its turn.
-            if self.unacked.len() >= MAX_UNACKED_DELIVERIES {
-                self.health.shed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             let id = DeliveryId::new(self.next_delivery);
             self.next_delivery = self
                 .next_delivery
@@ -1521,15 +1520,14 @@ mod tests {
         assert_quiet(&mut mailbox);
     }
 
-    /// Saturation: more unseen wraps than the unacked bound, never
-    /// settled (deferred payloads). Exactly the bound becomes held
-    /// deliveries; the overflow is shed locally — counted, never acked,
-    /// retained by the relay — while held mail keeps flowing behind it.
-    /// The shed count is a lower bound, not exact: the drainer forwards
-    /// both pool events and raw relay frames by design, so redelivered
-    /// overflow re-sheds idempotently (seen/held dedupe converges it).
+    /// Saturation: more unseen wraps than the unacked bound. Exactly the
+    /// bound becomes held deliveries; the overflow waits unread in the
+    /// notification channel (backpressure, never consumed-and-dropped)
+    /// and is admitted as the engine settles room free. Latency, never
+    /// loss: every injected wrap is eventually delivered and acked
+    /// exactly once.
     #[test]
-    fn unacked_bound_sheds_overflow_without_acking() {
+    fn unacked_bound_backpressures_overflow_without_loss() {
         const EXTRA: usize = 64;
         const FLOOD: usize = MAX_UNACKED_DELIVERIES + EXTRA;
         let relay = MiniRelay::spawn();
@@ -1537,7 +1535,7 @@ mod tests {
         let sender = sender_keys();
         let receiver = keys();
         let relays = vec![url];
-        let seen_path = temp_path("seen-shed");
+        let seen_path = temp_path("seen-backpressure");
 
         let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
         for index in 0..FLOOD {
@@ -1551,7 +1549,8 @@ mod tests {
             );
         }
 
-        // Pull without settling: deferred mail stays held, overflow sheds.
+        // Pull without settling: deferred mail stays held, overflow waits
+        // unread past the bound — never offered while full.
         let mut ids = std::collections::HashSet::new();
         for _ in 0..FLOOD {
             let delivery =
@@ -1570,30 +1569,25 @@ mod tests {
         assert_eq!(
             ids.len(),
             MAX_UNACKED_DELIVERIES,
-            "exactly the bound is admitted"
-        );
-        assert!(
-            mailbox.health().shed >= EXTRA as u64,
-            "every overflow wrap sheds at least once"
+            "overflow is not offered while full"
         );
 
-        // Settle everything held: each ack lands once, and once the bound
-        // drains the mailbox is quiet — shed mail was never consumed, so
-        // the seen log holds exactly the admitted acks.
-        for _ in 0..MAX_UNACKED_DELIVERIES {
-            let delivery =
-                wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("held mail settles");
+        // Settle everything: each ack frees room the queued overflow is
+        // pulled into, so all FLOOD wraps are eventually delivered and
+        // acked exactly once — the seen log proves it.
+        for _ in 0..FLOOD {
+            let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT)
+                .expect("overflow drains as room frees");
+            ids.insert(delivery.id());
             mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
         }
+        assert_eq!(ids.len(), FLOOD, "no wrap lost, none duplicated");
         assert!(mailbox.unacked.is_empty(), "acked mail leaves");
         let seen_lines = std::fs::read_to_string(&seen_path)
             .expect("seen log reads")
             .lines()
             .count();
-        assert_eq!(
-            seen_lines, MAX_UNACKED_DELIVERIES,
-            "shed wraps never reach the seen log"
-        );
+        assert_eq!(seen_lines, FLOOD, "every wrap acked exactly once");
         assert_quiet(&mut mailbox);
     }
 

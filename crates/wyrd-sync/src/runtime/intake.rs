@@ -273,6 +273,12 @@ fn message_action(
                 },
             }
         }
+        // Envelope-defined but unhandled in v0: no rotation handler
+        // exists, so rotation messages are terminal no-ops —
+        // acknowledged and discarded, never deferred (deferral would
+        // park poison for retry). When rotation handling lands this arm
+        // becomes a commit or a deferral; until then no durable record
+        // distinguishes consumed from never-recorded (see trust.md).
         Message::KeyRotation(_) => Action::Suppress,
         Message::Capability(_) => capability_action(engine, id, message),
     }
@@ -329,7 +335,7 @@ mod tests {
     use wyrd_format::{BaoRoot, Change, ContentId, DeviceId, DriveId, SnapshotId, TransitionId};
     use zeroize::Zeroizing;
 
-    use crate::control::{CapabilityPayload, Message, TransitionPayload};
+    use crate::control::{CapabilityPayload, KeyRotation, Message, TransitionPayload};
     use crate::keys::capability::Capability;
     use crate::keys::{DeviceEncryptionSecret, EpochSecret};
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
@@ -528,6 +534,26 @@ mod tests {
         assert_eq!(report.duplicates, 0);
         let facts = engine.store.load().expect("loads");
         assert!(facts.seen.is_empty(), "revalidation writes nothing durable");
+    }
+
+    /// KeyRotation is envelope-defined but unhandled in v0: the message
+    /// is a terminal no-op — acknowledged with a memory-only verdict,
+    /// no durable fact — and redelivery short-circuits while cached.
+    #[test]
+    fn key_rotation_is_a_terminal_noop_without_durable_trace() {
+        let mut fixture = fixture();
+        let rotation = Message::KeyRotation(KeyRotation {
+            transition: TransitionId::from_bytes([0x31; 32]),
+        });
+        let mail = vec![deliver(&fixture, 1, &rotation)];
+        queue(&mut fixture, mail.clone());
+        assert_eq!(drain(&mut fixture).accepted, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.seen.is_empty(), "rotation commits no durable fact");
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 0, "no revalidation on redelivery");
+        assert_eq!(report.duplicates, 1);
     }
 
     #[test]

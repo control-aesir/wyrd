@@ -284,10 +284,11 @@ pub enum IngestReport {
 }
 
 /// Bound on remembered suppression verdicts: the negative cache only
-/// short-circuits redelivery revalidation, so it covers the redelivery
-/// horizon rather than history (~4k ids, ~128KiB). Evicted verdicts
-/// revalidate to the same outcome — suppression verdicts are
-/// deterministic — so eviction costs CPU, never correctness.
+/// short-circuits redelivery revalidation, so it is sized for hot
+/// redeliveries (~4k ids, ~128KiB) — deliberately smaller than the
+/// relay retention window. Evicted verdicts revalidate to the same
+/// outcome, so the smaller cache costs CPU within the window, never
+/// correctness.
 const MAX_SUPPRESSED_IDS: usize = 4096;
 
 /// One drive's control inbox: per-drive scoped like [`DriveKeyring`],

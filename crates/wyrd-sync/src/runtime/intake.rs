@@ -19,6 +19,12 @@ const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
 enum Action {
     Commit(Vec<Fact>),
+    /// Deterministic suppression verdict: the message is invalid and
+    /// will never become processable. Commits nothing durable — the
+    /// verdict is cached memory-only and bounded — so unique invalid
+    /// messages cannot grow state. Redelivery revalidates to the same
+    /// outcome after eviction or restart.
+    Suppress,
     Defer,
 }
 
@@ -131,6 +137,10 @@ fn commit_action(
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
     let mut facts = match message_action(engine, id, message, &mut staged) {
         Action::Commit(facts) => facts,
+        Action::Suppress => {
+            engine.inbox.suppress(id);
+            return Ok(Outcome::Accepted);
+        }
         Action::Defer if engine.pending.len() >= MAX_PENDING_MESSAGES => {
             // Shed without consuming: the bound protects memory, but a
             // resource decision must never write a semantic fact. The
@@ -157,6 +167,9 @@ fn commit_action(
         for (pending_id, pending_message) in std::mem::take(&mut engine.pending) {
             match message_action(engine, &pending_id, &pending_message, &mut staged) {
                 Action::Commit(more) => facts.extend(more),
+                Action::Suppress => {
+                    engine.inbox.suppress(&pending_id);
+                }
                 Action::Defer => {
                     engine.hold_pending(pending_id, pending_message);
                 }
@@ -186,16 +199,15 @@ fn message_action(
 ) -> Action {
     match message {
         Message::MembershipTransition(payload) => {
-            let seen = || vec![Fact::ControlMessage(*id)];
             if check_total_len(&Limits::V0, "transition", payload.transition.len()).is_err() {
-                return Action::Commit(seen());
+                return Action::Suppress;
             }
             let transition = match MembershipTransition::from_canonical_bytes(&payload.transition) {
                 Ok(transition) => transition,
-                Err(_) => return Action::Commit(seen()),
+                Err(_) => return Action::Suppress,
             };
             if check_transition(&Limits::V0, &transition).is_err() {
-                return Action::Commit(seen());
+                return Action::Suppress;
             }
             engine.log.observe(transition.clone());
             Action::Commit(vec![
@@ -207,16 +219,14 @@ fn message_action(
             // Authorship first: an announcement is evidence only when
             // the author's signature verifies against the drive-bound
             // challenge. A bad signature is malformed evidence like an
-            // unparsable transition — suppress without a durable fact,
-            // never defer.
+            // unparsable transition — suppress memory-only, never
+            // defer.
             if verify_announcement(&engine.drive(), announcement).is_err() {
-                return Action::Commit(vec![Fact::ControlMessage(*id)]);
+                return Action::Suppress;
             }
             match engine.log.transition(&announcement.membership) {
                 None => Action::Defer,
-                Some(t) if t.epoch != announcement.epoch => {
-                    Action::Commit(vec![Fact::ControlMessage(*id)])
-                }
+                Some(t) if t.epoch != announcement.epoch => Action::Suppress,
                 Some(_) => match engine
                     .log
                     .status(&announcement.membership)
@@ -230,8 +240,8 @@ fn message_action(
                         // earlier in this commit batch. Route updates
                         // (mutable `node_addr` only) commit a fresh fact;
                         // the last accepted route wins. An immutable fork is
-                        // the sender's invalid data: the seen-id commits
-                        // (verdicts are final) and no announcement fact is
+                        // the sender's invalid data: the verdict is final
+                        // but memory-only, and no announcement fact is
                         // written, so replay never meets a conflict intake
                         // could have detected.
                         let known = engine
@@ -252,10 +262,10 @@ fn message_action(
                                 Fact::ControlMessage(*id),
                             ])
                         } else {
-                            Action::Commit(vec![Fact::ControlMessage(*id)])
+                            Action::Suppress
                         }
                     }
-                    TransitionStatus::Invalid(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
+                    TransitionStatus::Invalid(_) => Action::Suppress,
                     TransitionStatus::Contested
                     | TransitionStatus::Voided
                     | TransitionStatus::Orphaned
@@ -263,7 +273,13 @@ fn message_action(
                 },
             }
         }
-        Message::KeyRotation(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
+        // Envelope-defined but unhandled in v0: no rotation handler
+        // exists, so rotation messages are terminal no-ops —
+        // acknowledged and discarded, never deferred (deferral would
+        // park poison for retry). When rotation handling lands this arm
+        // becomes a commit or a deferral; until then no durable record
+        // distinguishes consumed from never-recorded (see trust.md).
+        Message::KeyRotation(_) => Action::Suppress,
         Message::Capability(_) => capability_action(engine, id, message),
     }
 }
@@ -276,15 +292,15 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
         .unwrap(&engine.encryption_secret)
     {
         Ok(capability) => capability,
-        Err(_) => return Action::Commit(vec![Fact::ControlMessage(*id)]),
+        Err(_) => return Action::Suppress,
     };
     // Redundant-field agreement, mirrored from the control envelope
     // (T15): the sealed payload's device and epoch are authenticated
     // delivery metadata and must match the capability they deliver. A
     // disagreement is tampering or a broken sender — it never heals by
-    // deferring, so suppress without a durable capability fact.
+    // deferring, so suppress memory-only.
     if payload.device != capability.device || payload.epoch != capability.covered_epoch() {
-        return Action::Commit(vec![Fact::ControlMessage(*id)]);
+        return Action::Suppress;
     }
     // One authoritative lookup inside authorize: the transition and
     // the state it produces are inseparable, so the capability is
@@ -300,7 +316,7 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
             Fact::ControlMessage(*id),
         ]),
         Err(CapabilityError::UnknownTransition(_)) => Action::Defer,
-        Err(_) => Action::Commit(vec![Fact::ControlMessage(*id)]),
+        Err(_) => Action::Suppress,
     }
 }
 
@@ -319,7 +335,7 @@ mod tests {
     use wyrd_format::{BaoRoot, Change, ContentId, DeviceId, DriveId, SnapshotId, TransitionId};
     use zeroize::Zeroizing;
 
-    use crate::control::{CapabilityPayload, Message, TransitionPayload};
+    use crate::control::{CapabilityPayload, KeyRotation, Message, TransitionPayload};
     use crate::keys::capability::Capability;
     use crate::keys::{DeviceEncryptionSecret, EpochSecret};
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
@@ -409,8 +425,9 @@ mod tests {
         ];
         queue(&mut fixture, mail);
         assert_eq!(drain(&mut fixture).accepted, 4);
-        // The fork is the sender's invalid data: its seen-id committed
-        // (verdicts are final) and no announcement fact was written.
+        // The fork is the sender's invalid data: its verdict is final
+        // but memory-only (no durable seen-id fact) and no announcement
+        // fact was written.
         let facts = fixture.engine.store.load().expect("loads");
         assert_eq!(facts.announcements.len(), 1);
         let snapshot = SnapshotId::from_bytes([0x11; 32]);
@@ -425,6 +442,118 @@ mod tests {
             engine.announcements[&snapshot].root_manifest,
             ContentId::from_bytes([0x55; 32])
         );
+    }
+
+    /// Suppression leaves no durable trace: unique semantically invalid
+    /// messages (valid seal, garbage transition bytes) reach a verdict
+    /// but must not grow the durable seen set — one permanent fact per
+    /// invalid message is attacker-mintable state growth.
+    #[test]
+    fn suppressed_invalid_messages_leave_no_durable_seen_fact() {
+        let mut fixture = fixture();
+        let mut mail = Vec::new();
+        for i in 0..64u8 {
+            mail.push(deliver(
+                &fixture,
+                1,
+                &Message::MembershipTransition(TransitionPayload {
+                    transition: vec![0x5A, i],
+                }),
+            ));
+        }
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(
+            report.accepted, 64,
+            "every invalid message reaches a verdict"
+        );
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(
+            facts.seen.is_empty(),
+            "suppressions must not grow durable state, got {}",
+            facts.seen.len()
+        );
+    }
+
+    /// Suppressed ids short-circuit redelivery: the same envelopes
+    /// report Duplicate without revalidation and still write nothing
+    /// durable.
+    #[test]
+    fn suppressed_ids_short_circuit_redelivery() {
+        let mut fixture = fixture();
+        let mut mail = Vec::new();
+        for i in 0..64u8 {
+            mail.push(deliver(
+                &fixture,
+                1,
+                &Message::MembershipTransition(TransitionPayload {
+                    transition: vec![0x5A, i],
+                }),
+            ));
+        }
+        queue(&mut fixture, mail.clone());
+        assert_eq!(drain(&mut fixture).accepted, 64);
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 0, "no revalidation on redelivery");
+        assert_eq!(report.duplicates, 64);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.seen.is_empty(), "redelivery writes nothing durable");
+    }
+
+    /// Restarts forget suppression verdicts (memory-only) but converge:
+    /// redelivery revalidates to the same outcome, still with no
+    /// durable trace.
+    #[test]
+    fn suppression_revalidates_after_restart() {
+        let mut fixture = fixture();
+        let mut mail = Vec::new();
+        for i in 0..64u8 {
+            mail.push(deliver(
+                &fixture,
+                1,
+                &Message::MembershipTransition(TransitionPayload {
+                    transition: vec![0x5A, i],
+                }),
+            ));
+        }
+        queue(&mut fixture, mail.clone());
+        assert_eq!(drain(&mut fixture).accepted, 64);
+        let mut engine = reopen(&mut fixture);
+        queue(&mut fixture, mail);
+        let recipient = fixture.recipient;
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        };
+        let report = engine.drain(&mut mailbox).unwrap();
+        assert_eq!(
+            report.accepted, 64,
+            "verdicts revalidate to the same outcome"
+        );
+        assert_eq!(report.duplicates, 0);
+        let facts = engine.store.load().expect("loads");
+        assert!(facts.seen.is_empty(), "revalidation writes nothing durable");
+    }
+
+    /// KeyRotation is envelope-defined but unhandled in v0: the message
+    /// is a terminal no-op — acknowledged with a memory-only verdict,
+    /// no durable fact — and redelivery short-circuits while cached.
+    #[test]
+    fn key_rotation_is_a_terminal_noop_without_durable_trace() {
+        let mut fixture = fixture();
+        let rotation = Message::KeyRotation(KeyRotation {
+            transition: TransitionId::from_bytes([0x31; 32]),
+        });
+        let mail = vec![deliver(&fixture, 1, &rotation)];
+        queue(&mut fixture, mail.clone());
+        assert_eq!(drain(&mut fixture).accepted, 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.seen.is_empty(), "rotation commits no durable fact");
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 0, "no revalidation on redelivery");
+        assert_eq!(report.duplicates, 1);
     }
 
     #[test]

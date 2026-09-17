@@ -277,11 +277,20 @@ Encrypted (opaque to relays):
 
 Every sealed message is versioned and duplicate-delivery idempotent
 within the retained inbox state: receivers dedupe by message id (BLAKE3
-over the sealed bytes) and the machines are set-based. Semantic replay
-safety belongs to the receiving state machines. Messages are delivery
-hints, never authority — the receiver acts only after machine-side
-verification. Bootstrapping travels outside this envelope (below): no
-sealed kind opens without a held epoch key.
+over the sealed bytes) and the machines are set-based. Processed
+messages dedupe from durable `Fact::ControlMessage` records, so
+redelivery after a restart is a no-op. Terminal invalid messages —
+framing-valid but semantically unprocessable — take a different path:
+suppression verdicts are deterministic but memory-only and
+FIFO-bounded (4096 ids), committing no durable fact, so unique invalid
+messages can neither grow durable state nor exhaust memory. A
+suppressed id redelivered while cached reports Duplicate without
+revalidation; after eviction or restart it revalidates to the same
+outcome. Semantic replay safety belongs to the receiving state
+machines. Messages are delivery hints, never authority — the receiver
+acts only after machine-side verification. Bootstrapping travels
+outside this envelope (below): no sealed kind opens without a held
+epoch key.
 
 | Kind | Tag | Carries |
 |---|---|---|
@@ -289,6 +298,14 @@ sealed kind opens without a held epoch key.
 | `MembershipTransition` | 0x01 | opaque canonical transition bytes (the membership machine verifies) |
 | `KeyRotation` | 0x02 | the epoch's transition id — new epoch material exists, capability follows |
 | `SnapshotAnnouncement` | 0x03 | snapshot id, author, epoch, membership transition id — enough to fetch and classify |
+
+`KeyRotation` is envelope-defined but unhandled in v0: the runtime has
+no rotation handler, so rotation messages are terminal no-ops —
+acknowledged and discarded with a memory-only suppression verdict,
+never deferred (deferral would park poison for retry). When rotation
+handling lands, that arm becomes a commit or a deferral; until then no
+durable record distinguishes a consumed rotation message from one never
+recorded, so a future handler must treat every rotation message as new.
 
 Sealed envelope (changing any byte changes every seal — a format
 constant): `version (1) ‖ DriveId (32) ‖ kind (1) ‖ epoch u64 LE ‖ nonce
@@ -360,9 +377,12 @@ deliberately:
   seen-event-id dedupe log (FIFO-bounded at 65,536 entries, fsynced at
   each ack, survives restarts). Delivery is at-least-once: a wrap whose
   ack aged out of retention may redeliver after a restart or resubscribe,
-  converging through engine idempotency — the engine dedupes the inner
-  Wyrd message id from durable `Fact::ControlMessage` records, the same
-  duplicate window a crash before ack already allows. Relay history is
+   converging through engine idempotency — the engine dedupes the inner
+   Wyrd message id of processed messages from durable
+   `Fact::ControlMessage` records, the same duplicate window a crash
+   before ack already allows. Terminal invalid messages carry no durable
+   record: they dedupe through the bounded memory-only suppression cache
+   and revalidate to the same verdict after eviction or restart. Relay history is
   the redelivery backstop — never dropped on ack, never used as a cursor:
   NIP-59 wrappers carry randomized timestamps
   and per-delivery ephemeral authors, so there are no timestamp cursors and

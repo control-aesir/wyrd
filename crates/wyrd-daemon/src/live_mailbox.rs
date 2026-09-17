@@ -93,7 +93,7 @@
 //! nothing new.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -158,6 +158,12 @@ const MAX_SEEN_ENTRIES: usize = 65_536;
 const MAX_POISON_ENTRIES: usize = 128;
 #[cfg(not(test))]
 const MAX_POISON_ENTRIES: usize = 4096;
+
+/// Longest ledger line the streaming loader buffers: a 64-char event id
+/// plus its newline. Anything longer without a newline is not a torn
+/// valid line (those are at most 64 chars) but corruption, and is
+/// rejected instead of allocated.
+const MAX_RECORD_LEN: usize = 64 + 1;
 
 /// Supervisor tick: how often relay connection statuses are polled into
 /// shared health. Fast enough to surface an outage within a couple of
@@ -346,8 +352,8 @@ impl SeenStore {
         // Streaming load: pre-bound logs from older versions can be far
         // larger than the retention cap (the old code was append-only),
         // so startup must never hold the whole file — memory stays at
-        // one line plus the bounded set while bytes stream once. Time is
-        // linear in file size; memory is not.
+        // one capped line plus the bounded set while bytes stream once.
+        // Time is linear in file size; memory is not.
         let read = match std::fs::File::open(path) {
             Ok(file) => Some(file),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -356,7 +362,6 @@ impl SeenStore {
             }
         };
         let mut seen = BoundedIds::new(MAX_SEEN_ENTRIES);
-        let mut lines: usize = 0;
         let mut total: u64 = 0;
         let mut torn: u64 = 0;
         if let Some(file) = read {
@@ -368,13 +373,26 @@ impl SeenStore {
             let mut buf = Vec::new();
             loop {
                 buf.clear();
+                // take() caps the allocation first: even a hostile
+                // multi-megabyte unterminated line yields at most
+                // MAX_RECORD_LEN + 1 bytes here.
                 let chunk = reader
+                    .by_ref()
+                    .take(MAX_RECORD_LEN as u64 + 1)
                     .read_until(b'\n', &mut buf)
                     .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
                 if chunk == 0 {
                     break;
                 }
                 if !buf.ends_with(b"\n") {
+                    if buf.len() > MAX_RECORD_LEN {
+                        // Longer than any valid line without a newline:
+                        // not a torn append but corruption. Fail closed
+                        // (acks replay) rather than truncating blindly.
+                        return Err(MailboxError::Transport(
+                            "dedupe log: overlong corrupt line".into(),
+                        ));
+                    }
                     // Trailing segment without a newline is a torn
                     // append, not a record: its ack never synced, so
                     // redelivery is safe and the tail truncates below.
@@ -386,7 +404,6 @@ impl SeenStore {
                 let id = EventId::from_hex(line)
                     .map_err(|_| MailboxError::Transport("dedupe log: corrupt entry".into()))?;
                 seen.insert(id);
-                lines += 1;
             }
         }
         let file = std::fs::OpenOptions::new()
@@ -398,7 +415,7 @@ impl SeenStore {
             file.set_len(total - torn)
                 .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         }
-        let mut store = Self {
+        let store = Self {
             path: path.to_owned(),
             seen,
             file,
@@ -406,12 +423,11 @@ impl SeenStore {
             handle_ok: true,
             durable: true,
         };
-        // One-time migration for pre-bound logs: the load above already
-        // evicted past the cap in memory, so rewrite the file down to
-        // the retained set instead of carrying unbounded history.
-        if lines > MAX_SEEN_ENTRIES {
-            store.compact()?;
-        }
+        // No migration path by policy: pre-alpha, no deployed ledgers
+        // exist, and the format never changed — the bound applies from
+        // the first write. An oversized file (operator-planted) still
+        // loads bounded (eviction during load) and compacts back down
+        // on subsequent appends.
         Ok(store)
     }
 
@@ -2471,38 +2487,25 @@ mod tests {
         assert!(!reopened.contains(&id_at(0)), "evicted ack forgotten");
     }
 
-    /// Legacy migration stays bounded: a pre-bound log (many lines over
-    /// the cap, duplicates, torn tail) opens without loading the whole
-    /// file — memory is one line plus the bounded set — retaining the
-    /// newest entries, dropping the rest, truncating the tear, and
-    /// compacting down to the retained set.
+    /// Overlong unterminated lines fail closed: a hostile or corrupted
+    /// multi-kilobyte tail without a newline is rejected rather than
+    /// allocated unboundedly or silently truncated — it cannot be a torn
+    /// valid line (those are at most 64 chars), and its acks were never
+    /// synced, so redelivery is safe.
     #[test]
-    fn legacy_log_migrates_bounded() {
-        let path = temp_path("seen-legacy-migration");
+    fn overlong_tail_fails_closed() {
+        let path = temp_path("seen-overlong-tail");
         let id_at = |i: usize| EventId::from_hex(&format!("{i:064x}")).unwrap();
-        let total = MAX_SEEN_ENTRIES * 5 + 13;
-        let mut raw = String::new();
-        for i in 0..total {
-            raw.push_str(&format!("{}\n", id_at(i)));
-            if i % 3 == 0 {
-                // Duplicate lines: the old code appended re-acks verbatim.
-                raw.push_str(&format!("{}\n", id_at(i)));
-            }
-        }
-        raw.push_str("torn-tail-no-newline");
+        let mut raw = format!("{}\n", id_at(0));
+        raw.push_str(&"x".repeat(10_000));
         std::fs::write(&path, &raw).expect("legacy log written");
-
-        let store = SeenStore::open(&path).expect("migration opens");
-        assert!(store.seen.len() <= MAX_SEEN_ENTRIES, "retained set bounded");
-        assert!(store.contains(&id_at(total - 1)), "newest retained");
-        assert!(!store.contains(&id_at(0)), "oldest evicted");
-        let text = std::fs::read_to_string(&path).expect("migrated log reads");
-        assert!(
-            text.lines().count() <= MAX_SEEN_ENTRIES * 2,
-            "migrated file compacted"
-        );
-        assert!(text.ends_with('\n'), "torn tail truncated");
-        EventId::from_hex(text.lines().last().unwrap()).expect("tail parses");
+        match SeenStore::open(&path) {
+            Err(MailboxError::Transport(message)) => assert!(
+                message.contains("overlong"),
+                "explicit corruption error, got {message}"
+            ),
+            other => panic!("overlong tail must fail closed, got {other:?}"),
+        }
     }
 
     /// Failure injection for the compaction window the reviewer flagged:

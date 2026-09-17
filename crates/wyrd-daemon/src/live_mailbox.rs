@@ -81,9 +81,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use nostr::event::{AsyncSignEvent, FinalizeEventAsync, FinalizeUnsignedEvent};
@@ -124,6 +124,25 @@ const MAX_UNACKED_DELIVERIES: usize = 1024;
 /// seconds; slow enough to stay background noise.
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Minimum interval between saturation replays: each replay is a fresh
+/// subscription that re-drives full relay history, so repeats are paced
+/// while the first observed saturation always replays immediately.
+/// Re-drive cost scales with mailbox age, and a replay burst bigger than
+/// the broadcast buffer re-drops its own head — recovery of a large
+/// backlog converges over successive paced replays, so the cooldown is
+/// short enough to converge in about a minute and long enough that a
+/// sustained flood cannot turn recovery into relay hammering.
+const SATURATION_REPLAY_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether a saturation replay is due: always on the first observed
+/// saturation, then at most once per cooldown.
+fn saturation_replay_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(previous) => now.duration_since(previous) >= SATURATION_REPLAY_COOLDOWN,
+    }
+}
+
 /// Drainer-recovery backoff bounds: first retry after one second, doubling
 /// per attempt, capped at thirty. See the module supervision notes for why
 /// the delay is bounded but the attempts are not.
@@ -157,6 +176,10 @@ pub struct MailboxHealth {
     /// Relays registered at construction. Zero means the mailbox was built
     /// for offline boundary use, where "live" is stream-alive alone.
     pub total_relays: usize,
+    /// Saturation replays issued to recover suspected SDK broadcast lag,
+    /// lifetime total. A replay re-subscribes and converges through
+    /// seen/held dedupe; the count keeps that recovery observable.
+    pub saturation_recoveries: u64,
 }
 
 impl MailboxHealth {
@@ -174,6 +197,13 @@ impl MailboxHealth {
 struct SupervisorState {
     stream_alive: AtomicBool,
     connected_relays: AtomicUsize,
+    /// Set by the drainer when the handover channel is full: the SDK
+    /// broadcast may have dropped events its lag hides, so the next due
+    /// supervisor tick replays via a fresh subscription. Cleared when
+    /// that replay subscription succeeds.
+    saturated: AtomicBool,
+    /// Saturation replays issued, lifetime total (see `saturated`).
+    saturation_recoveries: AtomicU64,
 }
 
 /// Durable record of consumed gift wraps: one hex event id per line,
@@ -359,6 +389,8 @@ where
         let health = Arc::new(SupervisorState {
             stream_alive: AtomicBool::new(true),
             connected_relays: AtomicUsize::new(0),
+            saturated: AtomicBool::new(false),
+            saturation_recoveries: AtomicU64::new(0),
         });
         // Listen before subscribing: the drainer must be polled past its
         // broadcast subscription before the REQ whose replay it has to
@@ -428,6 +460,7 @@ where
             stream_alive: self.health.stream_alive.load(Ordering::Relaxed),
             connected_relays: self.health.connected_relays.load(Ordering::Relaxed),
             total_relays: self.total_relays,
+            saturation_recoveries: self.health.saturation_recoveries.load(Ordering::Relaxed),
         }
     }
 
@@ -528,8 +561,18 @@ async fn drain_notifications(
             ClientNotification::Shutdown => None,
         };
         if let Some(event) = event {
-            if sender.send(*event).await.is_err() {
-                break;
+            match sender.try_send(*event) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    // Bounded handover: the mailbox is saturated, so park
+                    // here (backpressure) and flag a replay — the SDK
+                    // broadcast may drop events its lag hides while parked.
+                    health.saturated.store(true, Ordering::Relaxed);
+                    if sender.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
     }
@@ -599,6 +642,7 @@ async fn supervise(
 ) {
     let mut tick = tokio::time::interval(SUPERVISOR_INTERVAL);
     let mut down_ticks: u32 = 0;
+    let mut last_saturation_replay: Option<Instant> = None;
     loop {
         tick.tick().await;
         refresh(&client, &health).await;
@@ -606,6 +650,19 @@ async fn supervise(
         // alone, and an empty client refuses connect/subscribe.
         if total_relays == 0 {
             continue;
+        }
+        // Saturation recovery: the drainer flagged a full handover
+        // channel, so the SDK broadcast may have dropped events its lag
+        // hides. A fresh subscription replays relay history, which
+        // converges through seen/held dedupe; failure keeps the flag so
+        // a later due tick retries.
+        if health.saturated.load(Ordering::Relaxed)
+            && saturation_replay_due(last_saturation_replay, Instant::now())
+            && client.subscribe(filter.clone()).await.is_ok()
+        {
+            health.saturated.store(false, Ordering::Relaxed);
+            health.saturation_recoveries.fetch_add(1, Ordering::Relaxed);
+            last_saturation_replay = Some(Instant::now());
         }
         if !health.stream_alive.load(Ordering::Relaxed) {
             recover_stream(&client, &filter, &incoming, &health).await;
@@ -1589,6 +1646,133 @@ mod tests {
             .count();
         assert_eq!(seen_lines, FLOOD, "every wrap acked exactly once");
         assert_quiet(&mut mailbox);
+    }
+
+    /// Saturation past the SDK broadcast buffer: flood past broadcast +
+    /// channel capacity with no settling, so the SDK silently drops what
+    /// the parked drainer cannot take. Settling then drains what arrived;
+    /// the supervisor's saturation replay recovers the dropped wraps
+    /// without any reconnect, and every wrap is delivered and acked
+    /// exactly once.
+    #[test]
+    fn saturation_recovers_broadcast_drops_via_replay() {
+        // Pigeonhole over the notification path: the SDK broadcast holds
+        // 4096 and the handover channel 1024, so at most 5120
+        // notifications survive while the drainer is parked (nothing is
+        // pulled during injection, so the channel fills and the drainer
+        // parks deterministically). A fresh EVENT frame yields exactly
+        // two adjacent notifications — `Event` then `Message` for the
+        // same frame, sequentially in `handle_relay_message`
+        // (nostr-sdk 0.45.3 `relay/inner.rs`) — so the dropped oldest
+        // 2*FLOOD - 5120 notifications are whole wraps: at least 512
+        // arrive only via the recovery replay. FLOOD stays small enough
+        // to converge inside the replay cooldowns: acks are fsync-bound,
+        // and spilling past a cooldown re-drives the full history again
+        // for no additional coverage.
+        const FLOOD: usize = 3072;
+        const DEADLINE: Duration = Duration::from_secs(240);
+        let relay = MiniRelay::spawn();
+        let url = relay.url().to_string();
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+        let seen_path = temp_path("seen-saturation-replay");
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
+        // Pre-seal off the relay path: sealing is pure CPU (ECDH per
+        // wrap), so parallelize it across workers instead of paying it
+        // serially inside the measured episode.
+        let sealed: Vec<Event> = std::thread::scope(|scope| {
+            const WORKERS: usize = 8;
+            let chunk = FLOOD.div_ceil(WORKERS);
+            let mut handles = Vec::new();
+            for worker in 0..WORKERS {
+                let start = worker * chunk;
+                let end = (start + chunk).min(FLOOD);
+                if start >= end {
+                    break;
+                }
+                let sender = sender.clone();
+                let receiver_key = receiver.public_key();
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(end - start);
+                    for index in start..end {
+                        let rumor =
+                            EventBuilder::new(Kind::Custom(RUMOR_KIND), format!("payload-{index}"))
+                                .tag(Tag::public_key(receiver_key))
+                                .finalize_unsigned(sender.public_key());
+                        out.push(
+                            GiftWrapBuilder::new(receiver_key, rumor)
+                                .finalize(&sender)
+                                .unwrap(),
+                        );
+                    }
+                    out
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for event in sealed {
+            relay.inject(event);
+        }
+
+        // Settle until everything converges or the deadline bites.
+        // Drain ready mail without sleeping between deliveries: the
+        // 50ms poll sleep in `wait_for_delivery` is per empty poll, and
+        // a flood plus a full-history replay mean ~11k deliveries — a
+        // sleep per delivery would burn minutes. Sleep only on a truly
+        // dry pipeline (replay still in flight); quiet windows while a
+        // replay is pending are normal, a stall is not.
+        let start = Instant::now();
+        let mut ids = std::collections::HashSet::new();
+        while ids.len() < FLOOD {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "all flood wraps converge via replay"
+            );
+            let mut progressed = false;
+            while let Some(delivery) = mailbox.recv() {
+                progressed = true;
+                if ids.insert(delivery.id()) {
+                    mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
+                }
+            }
+            if !progressed {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        assert!(
+            mailbox.health().saturation_recoveries >= 1,
+            "recovery replay engaged"
+        );
+        assert!(mailbox.unacked.is_empty(), "acked mail leaves");
+        let seen_lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert_eq!(seen_lines, FLOOD, "every wrap acked exactly once");
+        assert_quiet(&mut mailbox);
+    }
+
+    /// The replay cooldown: the first observed saturation is always due,
+    /// later episodes at most once per cooldown, so a sustained flood
+    /// cannot turn recovery into relay hammering.
+    #[test]
+    fn saturation_replay_due_first_then_per_cooldown() {
+        let now = Instant::now();
+        assert!(saturation_replay_due(None, now));
+        assert!(!saturation_replay_due(Some(now), now));
+        assert!(saturation_replay_due(
+            Some(now - SATURATION_REPLAY_COOLDOWN - Duration::from_secs(1)),
+            now
+        ));
+        assert!(!saturation_replay_due(
+            Some(now - SATURATION_REPLAY_COOLDOWN + Duration::from_secs(1)),
+            now
+        ));
     }
 
     #[test]

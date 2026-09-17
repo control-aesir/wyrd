@@ -54,7 +54,9 @@ The boundary, stated as a rule:
   identity-continuity conventions are not inherited.
 - **NIP-46 remote signing is optional, scoped, and default-deny** (see
   below): the signing key may live in a hardware signer, phone, or bunker
-  while the Wyrd daemon requests signatures. Wyrd never receives the nsec.
+  while the Wyrd daemon requests signatures. In that mode Wyrd never receives
+  the nsec. The pre-alpha daemon does not implement it yet; see Custody modes
+  (what ships today).
 
 Three distinct uses of Nostr, kept separate:
 
@@ -104,8 +106,9 @@ Rules:
 - Capability wrapping reuses the same primitive set (secp256k1 ECDH →
   HKDF-SHA256 → AEAD) with the Wyrd AAD context binding — audited building
   blocks, Wyrd-defined semantics.
-- NIP-46 remote signing (below) rides `nostr-connect`-style tooling; the
-  daemon still never holds the nsec.
+- NIP-46 remote signing (below) rides `nostr-connect`-style tooling; in that
+  mode the daemon never holds the nsec (not yet implemented; see Custody
+  modes).
 
 ## Principals
 
@@ -665,6 +668,29 @@ above), and returns the BIP-340 signature. Scoping rules: the Wyrd signer sessio
 demands it — **default-deny**. This is especially desirable when the
 daemon runs as a privileged system service.
 
+### Custody modes (what ships today)
+
+T6 is the target custody model. The pre-alpha implements only the first
+mode below, so no shipped build satisfies T6 yet.
+
+- **Local-key mode — the only mode implemented.** `wyrd init` and `wyrd
+  mount` read the device identity secret from `--identity-file` (32 raw
+  bytes or 64 hex characters), and the daemon process holds it for its whole
+  lifetime. The engine signs snapshots and announcements with it and seals
+  NIP-44 envelopes with it (`wyrd-sync/src/runtime/author.rs`); the live
+  mailbox is built from the same key, which unwraps inbound gift wraps
+  (`LiveMailbox::connect`, called from `wyrd-daemon/src/main.rs`). In this
+  mode the daemon **does** hold the nsec: anyone who can read the identity
+  file or the daemon's memory holds the device identity.
+- **NIP-46 mode — specified, not wired.** The `SignerSession` trait
+  (`wyrd-sync/src/transport/signer.rs`) and the `sign_message` request and
+  response bytes (`control::nip46`) are pinned and tested against an
+  in-memory fake signer. No concrete `nostr-connect` session client exists,
+  and the CLI has no way to select one (open question 9).
+
+Until NIP-46 mode lands, statements in this document that the daemon never
+holds the nsec describe NIP-46 mode only.
+
 ## What each party can know (the security boundary, stated precisely)
 
 | Party | Can know | Cannot know |
@@ -694,7 +720,7 @@ holds the epoch material that makes the ciphertext meaningful.
 | T3 | Control plane: Nostr (async mailbox) + iroh (live data plane); Wyrd-defined control messages inside encrypted Nostr events | offline devices/vaults need asynchronous rendezvous; bulk never through Nostr; rendezvous must be replaceable |
 | T4 | Epoch-derived keys with **fresh random epoch secrets** (never derived from the root or each other); membership change → new epoch secret → manifest/object KDFs; never re-encrypt history | exact revocation: possession of epoch N yields nothing about N+1; root possession must not imply every epoch; revocation without rewriting immutable objects |
 | T5 | Snapshots commit to the **membership transition** that authorizes them (not merely an epoch number); historical validity vs current eligibility are separate predicates; superseded/stranded forks never advance state; recovery grafts content, never lineage | an epoch number says *when*, a membership-state commitment says *which authorization state*; deterministic authorization everywhere; valid-signature ≠ valid transition; bounded-fork semantics for propagation races |
-| T6 | NIP-46 optional, scoped, default-deny; daemon never holds the nsec | protects identity keys from the (possibly privileged) daemon process |
+| T6 | NIP-46 optional, scoped, default-deny; daemon never holds the nsec (target: the pre-alpha ships local-key mode only, see Custody modes) | protects identity keys from the (possibly privileged) daemon process |
 | T7 | Recovery reserved: guardian set (emergency contacts) as membership-log state; Shamir k-of-n shares over the encrypted Nostr mailbox; WoT for vetting only | root-key loss is unrecoverable by crypto alone; social recovery is the deferred Shamir decision given UX; design space held open without changing the epoch model |
 | T8 | DriveRootKey is owner/recovery custody only; never part of an ordinary member capability | a member holding the root could derive every future epoch; revocation would collapse |
 | T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, encryption_key, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |

@@ -375,14 +375,16 @@ impl ControlInbox {
             .ok_or(ControlError::UnknownEpoch(sealed.epoch))?;
         let (_, _, message) = open(key, &sealed)?;
         let id = sealed.message_id();
-        if !self.seen.insert(id) {
+        // A remembered suppression verdict short-circuits before the
+        // seen insert: the same bytes revalidate to the same outcome,
+        // and touching `seen` here would pin an id with no durable
+        // fact past its verdict's eviction. Durable-tracked ids are
+        // checked next; an id is never in both sets — suppressing
+        // removes it from `seen`.
+        if self.suppressed.contains(&id) {
             return Ok(IngestReport::Duplicate);
         }
-        // A remembered suppression verdict: the same bytes revalidate
-        // to the same outcome, so short-circuit without redoing the
-        // work. Durable-tracked ids (above) win; an id is never in
-        // both sets — suppressing removes it from `seen`.
-        if self.suppressed.contains(&id) {
+        if !self.seen.insert(id) {
             return Ok(IngestReport::Duplicate);
         }
         Ok(IngestReport::Accepted { id, message })
@@ -595,6 +597,56 @@ mod tests {
                 Ok(IngestReport::Accepted { .. })
             ),
             "oldest verdict evicted past the bound, ingests fresh"
+        );
+    }
+
+    /// A suppression-cache hit must not pin the id in `seen`: redeliver
+    /// while cached, evict the verdict, and the next redelivery ingests
+    /// fresh (revalidating to the same outcome) instead of sticking on
+    /// a stale seen-Duplicate for an id with no durable fact.
+    #[test]
+    fn suppression_cache_hit_does_not_pin_the_id_in_seen() {
+        let mut inbox = inbox();
+        let first = seal(
+            &control_key(5),
+            &drive(),
+            5,
+            &Message::MembershipTransition(TransitionPayload {
+                transition: vec![0x5A],
+            }),
+        )
+        .unwrap()
+        .encode();
+        let id = match inbox.ingest(&first) {
+            Ok(IngestReport::Accepted { id, .. }) => id,
+            other => panic!("ingest accepts openable bytes, got {other:?}"),
+        };
+        inbox.suppress(&id);
+        assert!(
+            matches!(inbox.ingest(&first), Ok(IngestReport::Duplicate)),
+            "redelivery short-circuits while cached"
+        );
+        // Overflow the cache with other verdicts, evicting the first.
+        for i in 0..=MAX_SUPPRESSED_IDS as u32 {
+            let mut transition = vec![0xA5];
+            transition.extend_from_slice(&i.to_le_bytes());
+            let envelope = seal(
+                &control_key(5),
+                &drive(),
+                5,
+                &Message::MembershipTransition(TransitionPayload { transition }),
+            )
+            .unwrap()
+            .encode();
+            let id = match inbox.ingest(&envelope) {
+                Ok(IngestReport::Accepted { id, .. }) => id,
+                other => panic!("ingest accepts openable bytes, got {other:?}"),
+            };
+            inbox.suppress(&id);
+        }
+        assert!(
+            matches!(inbox.ingest(&first), Ok(IngestReport::Accepted { .. })),
+            "evicted verdict ingests fresh, no stale seen-Duplicate"
         );
     }
 

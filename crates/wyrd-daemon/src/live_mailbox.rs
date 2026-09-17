@@ -157,7 +157,15 @@ const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 /// the broadcast buffer re-drops its own head — recovery of a large
 /// backlog converges over successive paced replays, so the cooldown is
 /// short enough to converge in about a minute and long enough that a
-/// sustained flood cannot turn recovery into relay hammering.
+/// sustained flood cannot turn recovery into relay hammering. Tests use
+/// a shorter cooldown, but not too short: each replay re-drives full
+/// history, so the cooldown must exceed drain time — otherwise replays
+/// burst into a still-choked pipeline, re-drop their own head, and the
+/// test converges one slice per episode instead of once per replay.
+/// The boundary math is covered symbolically by the due-helper unit test.
+#[cfg(test)]
+const SATURATION_REPLAY_COOLDOWN: Duration = Duration::from_secs(20);
+#[cfg(not(test))]
 const SATURATION_REPLAY_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Whether a saturation replay is due: always on the first observed
@@ -306,6 +314,12 @@ struct SeenStore {
     /// Lines appended since the last compaction (including lines for
     /// since-evicted ids): the rewrite trigger.
     appended: usize,
+    /// fsync every record and rewrite (the crash guarantee) vs plain
+    /// writes. Always true in production; tests opt out per mailbox via
+    /// `set_ephemeral` so flood gates measure logic, not macOS sync
+    /// latency. The guarantee itself is covered by a dedicated
+    /// real-fsync test.
+    durable: bool,
 }
 
 impl SeenStore {
@@ -350,6 +364,7 @@ impl SeenStore {
             seen,
             file,
             appended: 0,
+            durable: true,
         };
         // One-time migration for pre-bound logs: the load above already
         // evicted past the cap in memory, so rewrite the file down to
@@ -376,7 +391,13 @@ impl SeenStore {
         self.file
             .write_all(format!("{id}\n").as_bytes())
             .and_then(|()| self.file.flush())
-            .and_then(|()| self.file.sync_data())
+            .and_then(|()| {
+                if self.durable {
+                    self.file.sync_data()
+                } else {
+                    Ok(())
+                }
+            })
             .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         self.seen.insert(*id);
         self.appended += 1;
@@ -404,7 +425,7 @@ impl SeenStore {
                     .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
             }
             tmp.flush()
-                .and_then(|()| tmp.sync_all())
+                .and_then(|()| if self.durable { tmp.sync_all() } else { Ok(()) })
                 .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
         }
         std::fs::rename(&tmp_path, &self.path)
@@ -414,11 +435,13 @@ impl SeenStore {
             .append(true)
             .open(&self.path)
             .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::File::open(parent)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        if self.durable {
+            if let Some(parent) = self.path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::File::open(parent)
+                        .and_then(|dir| dir.sync_all())
+                        .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+                }
             }
         }
         self.appended = 0;
@@ -691,6 +714,17 @@ where
         let (_, fresh) = tokio_mpsc::channel(INCOMING_CAPACITY);
         let mut incoming = self.incoming.lock().expect("mailbox channel lock");
         let _abandoned = std::mem::replace(&mut *incoming, fresh);
+    }
+
+    /// Test hook: skip fsync on records and rewrites for this mailbox.
+    /// Flood gates validate eviction/compaction math, not durability;
+    /// without this every ack pays macOS sync latency (~5ms) and floods
+    /// take minutes. Must precede the first settle; the durability
+    /// guarantee itself is covered by a dedicated real-fsync test.
+    /// Production construction leaves the store durable.
+    #[cfg(test)]
+    fn set_ephemeral(&mut self) {
+        self.seen.durable = false;
     }
 
     /// Test observability for retention-bound assertions: retained ack
@@ -1383,13 +1417,18 @@ mod tests {
     use crate::mini_relay::MiniRelay;
 
     fn live_mailbox(device: &Keys, relays: &[String], seen: PathBuf) -> LiveMailbox<Keys> {
-        LiveMailbox::connect(
+        let mut mailbox = LiveMailbox::connect(
             device.clone(),
             device.secret_key().clone(),
             relays.to_vec(),
             seen,
         )
-        .expect("live mailbox connects")
+        .expect("live mailbox connects");
+        // All relay tests run ephemeral: they validate eviction,
+        // replay, and delivery logic, not fsync durability (covered by
+        // a dedicated real-fsync test). Called before any settle.
+        mailbox.set_ephemeral();
+        mailbox
     }
 
     fn sender_keys() -> Keys {
@@ -1776,7 +1815,6 @@ mod tests {
     /// longer holds mailbox-wide: retention is FIFO-bounded, so a
     /// forgotten ack may redeliver — convergence here keys on content
     /// coverage.)
-    #[ignore = "slow flood gate (~2min loaded): default suite stays fast; CI runs it via --run-ignored all"]
     #[test]
     fn flood_beyond_channel_capacity_delivers_all_once() {
         const FLOOD: usize = 1500;
@@ -1909,7 +1947,6 @@ mod tests {
     /// (Exactly-once delivery no longer holds mailbox-wide: retention is
     /// FIFO-bounded, so a forgotten ack may redeliver — convergence here
     /// keys on content coverage, and the log stays bounded.)
-    #[ignore = "slow flood gate (~3min loaded): default suite stays fast; CI runs it via --run-ignored all"]
     #[test]
     fn saturation_recovers_broadcast_drops_via_replay() {
         // Pigeonhole over the notification path: the SDK broadcast holds
@@ -2059,10 +2096,10 @@ mod tests {
     /// accumulating a fresh subscription per episode. Two saturating
     /// floods — each past the handover channel (so the flag fires) but
     /// below broadcast-wrap volume (so nothing is dropped and draining
-    /// stays fast) — with a cooldown wait between them so the second
-    /// replay is due; then one fresh event proving post-recovery delivery
-    /// is exact-once, not multiplied across leaked subscriptions.
-    #[ignore = "slow lifecycle gate (~3min loaded, waits a real 30s cooldown): default suite stays fast; CI runs it via --run-ignored all"]
+    /// stays fast) — polling for the second replay (due one short
+    /// test-scoped cooldown after the first); then one fresh event
+    /// proving post-recovery delivery is exact-once, not multiplied
+    /// across leaked subscriptions.
     #[test]
     fn saturation_recoveries_keep_single_subscription() {
         // 800 wraps emit 1600 notifications: past the 1024 handover
@@ -2111,11 +2148,17 @@ mod tests {
             "first replay replaces instead of accumulating"
         );
 
-        // The second replay is due one cooldown after the first, which
-        // necessarily fired before the first flood converged.
-        let second_due = Instant::now() + SATURATION_REPLAY_COOLDOWN + Duration::from_secs(2);
-        while Instant::now() < second_due {
-            std::thread::sleep(Duration::from_secs(1));
+        // The second replay is due one (short, test-scoped) cooldown
+        // after the first, which necessarily fired before the first
+        // flood converged: poll for it instead of sleeping out a fixed
+        // wait.
+        let second_due = Instant::now() + Duration::from_secs(30);
+        while mailbox.health().saturation_recoveries < 2 {
+            assert!(
+                Instant::now() < second_due,
+                "second recovery replay engages"
+            );
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         for index in FLOOD..2 * FLOOD {
@@ -2359,6 +2402,55 @@ mod tests {
             "recent ack survives restart"
         );
         assert!(!reopened.contains(&id_at(0)), "evicted ack forgotten");
+    }
+
+    /// The durability guarantee itself, with real fsyncs: acked wraps
+    /// survive a reopen (simulated crash) and are not redelivered.
+    /// Small on purpose — per-ack sync latency is production behavior,
+    /// so this is the one test that pays it. NOTE: connects directly
+    /// instead of via `live_mailbox()`, which runs ephemeral.
+    #[test]
+    fn durable_acks_survive_reopen() {
+        const COUNT: usize = 10;
+        const DEADLINE: Duration = Duration::from_secs(60);
+        let relay = MiniRelay::spawn();
+        let relays = vec![relay.url().to_string()];
+        let receiver = keys();
+        let receiver_key = receiver.public_key();
+        let seen_path = temp_path("seen-durable");
+
+        let mut mailbox = LiveMailbox::connect(
+            receiver.clone(),
+            receiver.secret_key().clone(),
+            relays.clone(),
+            seen_path.clone(),
+        )
+        .expect("mailbox connects");
+        for index in 0..COUNT {
+            relay.inject(seal_rumor(
+                &sender_keys(),
+                receiver_key,
+                format!("durable-{index}"),
+            ));
+        }
+        let mut settled = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
+        drain_to(&mut mailbox, &mut settled, &mut covered, COUNT, DEADLINE);
+        let lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert_eq!(lines, COUNT, "every ack synced to the log");
+        drop(mailbox);
+
+        let mut reopened = LiveMailbox::connect(
+            receiver.clone(),
+            receiver.secret_key().clone(),
+            relays,
+            seen_path,
+        )
+        .expect("mailbox reopens");
+        assert_quiet(&mut reopened);
     }
 
     /// The replay cooldown: the first observed saturation is always due,

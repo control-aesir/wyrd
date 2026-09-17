@@ -78,9 +78,7 @@ jobs:
       - name: Tests
         run: |
           set -o pipefail
-          # --run-ignored all: slow flood/lifecycle gates are #[ignore]d
-          # so the default local run stays ~1min; CI still enforces them.
-          cargo nextest run --color never --workspace --run-ignored all 2>&1 | tee /tmp/test.log
+          cargo nextest run --color never --workspace 2>&1 | tee /tmp/test.log
 
       # Nextest skips doctests; this gate keeps them validated as API
       # examples appear. Cheap while empty, load-bearing later.

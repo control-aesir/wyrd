@@ -38,7 +38,7 @@ pub mod nip46;
 
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use thiserror::Error;
 use wyrd_format::DriveId;
 use zeroize::Zeroizing;
@@ -283,18 +283,27 @@ pub enum IngestReport {
     },
 }
 
+/// Bound on remembered suppression verdicts: the negative cache only
+/// short-circuits redelivery revalidation, so it covers the redelivery
+/// horizon rather than history (~4k ids, ~128KiB). Evicted verdicts
+/// revalidate to the same outcome — suppression verdicts are
+/// deterministic — so eviction costs CPU, never correctness.
+const MAX_SUPPRESSED_IDS: usize = 4096;
+
 /// One drive's control inbox: per-drive scoped like [`DriveKeyring`],
 /// opening only with held epoch keys. Failures leave no state behind:
 /// a rejected ingest changes nothing, so hostile bytes are safe to
 /// attempt.
 ///
 /// Two lifecycle notes, both acceptable in v0 and stated here so they
-/// stay deliberate: the seen set grows with every accepted message
-/// (bounded by the append-only log; a retention policy rides with GC,
-/// which does not exist yet), and dedupe runs after open, so a
-/// redelivery for an epoch whose key was removed reports UnknownEpoch
-/// rather than Duplicate. v0 never evicts keys, so the coupling is
-/// documented, not exercised.
+/// stay deliberate: the durable seen set grows with every processed
+/// valid message (bounded by the append-only log; a retention policy
+/// rides with GC, which does not exist yet), while suppression
+/// verdicts are memory-only and FIFO-bounded — unique invalid messages
+/// can neither grow durable state nor exhaust memory — and dedupe runs
+/// after open, so a redelivery for an epoch whose key was removed
+/// reports UnknownEpoch rather than Duplicate. v0 never evicts keys,
+/// so the coupling is documented, not exercised.
 ///
 /// [`DriveKeyring`]: crate::keys::DriveKeyring
 #[derive(Clone)]
@@ -306,6 +315,13 @@ pub struct ControlInbox {
     /// material.
     keys: BTreeMap<u64, Zeroizing<[u8; 32]>>,
     seen: HashSet<ControlMessageId>,
+    /// Memory-only suppression verdicts, FIFO-bounded: redeliveries
+    /// short-circuit without revalidation. Never durable — restarts
+    /// and resyncs forget verdicts, and redelivery revalidates to the
+    /// same outcome. The deque holds insertion order for eviction; the
+    /// set holds membership.
+    suppressed: HashSet<ControlMessageId>,
+    suppressed_order: VecDeque<ControlMessageId>,
 }
 
 impl std::fmt::Debug for ControlInbox {
@@ -314,6 +330,7 @@ impl std::fmt::Debug for ControlInbox {
             .field("drive", &self.drive)
             .field("key_epochs", &self.keys.keys().collect::<Vec<_>>())
             .field("seen_len", &self.seen.len())
+            .field("suppressed_len", &self.suppressed.len())
             .finish()
     }
 }
@@ -326,6 +343,8 @@ impl ControlInbox {
             drive,
             keys: BTreeMap::new(),
             seen: HashSet::new(),
+            suppressed: HashSet::new(),
+            suppressed_order: VecDeque::new(),
         }
     }
 
@@ -358,6 +377,13 @@ impl ControlInbox {
         if !self.seen.insert(id) {
             return Ok(IngestReport::Duplicate);
         }
+        // A remembered suppression verdict: the same bytes revalidate
+        // to the same outcome, so short-circuit without redoing the
+        // work. Durable-tracked ids (above) win; an id is never in
+        // both sets — suppressing removes it from `seen`.
+        if self.suppressed.contains(&id) {
+            return Ok(IngestReport::Duplicate);
+        }
         Ok(IngestReport::Accepted { id, message })
     }
 
@@ -371,6 +397,25 @@ impl ControlInbox {
     /// so they must never be re-ingested.
     pub fn remember(&mut self, id: &ControlMessageId) -> bool {
         self.seen.insert(*id)
+    }
+
+    /// Record a suppression verdict: the id leaves the durable-tracked
+    /// seen set (no fact was written for it) and enters the bounded
+    /// memory-only negative cache. Redeliveries report Duplicate
+    /// without revalidation until the verdict is evicted or forgotten
+    /// by restart/resync — then they revalidate to the same outcome.
+    /// Only call for ids with no durable facts; withdrawing a
+    /// committed id would allow double-processing.
+    pub fn suppress(&mut self, id: &ControlMessageId) {
+        self.seen.remove(id);
+        if self.suppressed.insert(*id) {
+            self.suppressed_order.push_back(*id);
+            while self.suppressed_order.len() > MAX_SUPPRESSED_IDS {
+                if let Some(oldest) = self.suppressed_order.pop_front() {
+                    self.suppressed.remove(&oldest);
+                }
+            }
+        }
     }
 
     /// Withdraw a seen id that will never commit (pending-overflow
@@ -509,6 +554,47 @@ mod tests {
         let mut inbox = ControlInbox::new(drive());
         inbox.add_epoch_key(5, Zeroizing::new(control_key(5)));
         inbox
+    }
+
+    /// Suppression verdicts are memory-only and FIFO-bounded: the
+    /// newest redelivery short-circuits as Duplicate, while verdicts
+    /// past the bound ingest fresh (revalidating to the same outcome).
+    #[test]
+    fn suppression_short_circuits_redelivery_and_evicts_fifo() {
+        let mut inbox = inbox();
+        let mut sealed = Vec::new();
+        for i in 0..=MAX_SUPPRESSED_IDS as u32 {
+            let mut transition = vec![0x5A];
+            transition.extend_from_slice(&i.to_le_bytes());
+            let envelope = seal(
+                &control_key(5),
+                &drive(),
+                5,
+                &Message::MembershipTransition(TransitionPayload { transition }),
+            )
+            .unwrap()
+            .encode();
+            let id = match inbox.ingest(&envelope) {
+                Ok(IngestReport::Accepted { id, .. }) => id,
+                other => panic!("ingest accepts openable bytes, got {other:?}"),
+            };
+            inbox.suppress(&id);
+            sealed.push(envelope);
+        }
+        assert!(
+            matches!(
+                inbox.ingest(sealed.last().unwrap()),
+                Ok(IngestReport::Duplicate)
+            ),
+            "newest verdict short-circuits"
+        );
+        assert!(
+            matches!(
+                inbox.ingest(sealed.first().unwrap()),
+                Ok(IngestReport::Accepted { .. })
+            ),
+            "oldest verdict evicted past the bound, ingests fresh"
+        );
     }
 
     #[test]

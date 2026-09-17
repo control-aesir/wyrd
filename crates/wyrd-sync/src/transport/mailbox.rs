@@ -217,13 +217,15 @@ impl Delivery {
 /// retains them all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
-    /// Permanently consume: the engine took durable responsibility —
-    /// facts committed (including poison-suppression commits), or an
+    /// Permanently consume: the engine took responsibility — facts
+    /// committed, a memory-only suppression verdict reached, or an
     /// already-committed id redelivered — so the relay may discard the
     /// envelope. Safe to repeat: redelivery of a committed message is
-    /// a duplicate no-op, so a lost ack degrades to one redundant
-    /// offer. In-memory pending holds are NOT durable responsibility:
-    /// they settle `Retry` so the relay keeps the crash backstop.
+    /// a duplicate no-op, and redelivery of a suppressed one
+    /// revalidates to the same verdict, so a lost ack degrades to one
+    /// redundant offer. In-memory pending holds are NOT Ack
+    /// responsibility: they settle `Retry` so the relay keeps the
+    /// crash backstop.
     Ack,
     /// Leave for redelivery: the engine holds nothing for this
     /// envelope, so the relay MUST retain it.

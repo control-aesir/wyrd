@@ -19,18 +19,24 @@
 //! duplicate delivery ............ no-op (already committed)
 //! undecodable / wrong drive ..... discarded as terminal poison (no fact)
 //! unknown epoch key ............. skipped, left unacked for redelivery
-//! forged or undecryptable ....... seen-id committed (poison suppression)
+//! forged or undecryptable ....... suppressed memory-only (poison suppression)
 //! capability, state unknown ..... held pending and relay-retained; retried as transitions land
-//! capability, unauthorized ..... seen-id committed (derived state is immutable)
-//! capability, undecryptable ..... seen-id committed (deterministic)
+//! capability, unauthorized ...... suppressed memory-only (derived state is immutable)
+//! capability, undecryptable ...... suppressed memory-only (deterministic)
 //! announcement, membership unseen  held pending and relay-retained; retried as transitions land
 //! announcement, noncanonical .... held pending and relay-retained; retried as membership resolves
-//! announcement, invalid ......... seen-id committed (verdicts are final)
-//! announcement, epoch mismatched . seen-id committed (epochs are immutable)
-//! announcement, immutable fork .. seen-id committed, no announcement fact (forks never commit)
+//! announcement, invalid ......... suppressed memory-only (verdicts are final)
+//! announcement, epoch mismatched . suppressed memory-only (epochs are immutable)
+//! announcement, immutable fork .. suppressed memory-only, no announcement fact (forks never commit)
 //! announcement, route update .... fresh announcement fact (last accepted route wins)
 //! held-message overflow ......... left unacked (pending is bounded; relay retains)
 //! ```
+//!
+//! Suppression verdicts are deterministic but memory-only and
+//! FIFO-bounded: they commit no durable fact, so unique invalid
+//! messages cannot grow state. Redelivery short-circuits while the
+//! verdict is cached and revalidates to the same outcome after
+//! eviction or restart.
 //!
 //! Pending is a fast path, not the recovery path: a held message is
 //! also retained by the relay, so a crash loses only the in-memory
@@ -137,7 +143,8 @@ pub enum EngineError {
 /// What one [`Engine::drain`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainReport {
-    /// Messages whose facts committed (including poison suppressions).
+    /// Messages processed to a verdict (including memory-only
+    /// suppressions, which commit no fact).
     pub accepted: usize,
     /// Redeliveries of already-committed messages.
     pub duplicates: usize,

@@ -66,6 +66,34 @@ const STATFS_BLOCKS: u64 = 1 << 40;
 /// Block size reported by `statfs`, for both `bsize` and `frsize`.
 const STATFS_BSIZE: u32 = 4096;
 
+/// The synthetic `statfs` capacity with named fields, so the mapping
+/// onto the positional FUSE ABI reply is pinned in one place. Free
+/// equals total: nothing is ever reported as used; files/ffree mirror
+/// the same unboundedness for the namespace.
+struct StatfsCapacity {
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    bsize: u32,
+    namelen: u32,
+    frsize: u32,
+}
+
+fn statfs_capacity() -> StatfsCapacity {
+    StatfsCapacity {
+        blocks: STATFS_BLOCKS,
+        bfree: STATFS_BLOCKS,
+        bavail: STATFS_BLOCKS,
+        files: STATFS_BLOCKS,
+        ffree: STATFS_BLOCKS,
+        bsize: STATFS_BSIZE,
+        namelen: 4096,
+        frsize: STATFS_BSIZE,
+    }
+}
+
 /// The inode table: kernel ino → the path it was minted for, plus
 /// the kind and projection generation that last validated the
 /// mapping. Inodes are never reused within a mount; the root is
@@ -2155,17 +2183,16 @@ where
 
     fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         let _log = RequestLog::new("statfs");
-        // Free equals total: nothing is ever reported as used. files/ffree
-        // mirror the same unboundedness for the namespace.
+        let cap = statfs_capacity();
         reply.statfs(
-            STATFS_BLOCKS,
-            STATFS_BLOCKS,
-            STATFS_BLOCKS,
-            STATFS_BLOCKS,
-            STATFS_BLOCKS,
-            STATFS_BSIZE,
-            4096,
-            STATFS_BSIZE,
+            cap.blocks,
+            cap.bfree,
+            cap.bavail,
+            cap.files,
+            cap.ffree,
+            cap.bsize,
+            cap.namelen,
+            cap.frsize,
         );
     }
 
@@ -2308,20 +2335,21 @@ mod tests {
     }
 
     /// The synthetic `statfs` capacity must read as a usable disk: zeros
-    /// make Finder refuse copies before writing anything, and the byte
-    /// product must not overflow the kernels that multiply it out.
+    /// make Finder refuse copies before writing anything, free must equal
+    /// total (nothing is ever reported as used), and the byte product
+    /// must not overflow the kernels that multiply it out.
     #[test]
     fn statfs_capacity_is_nonzero_and_overflow_free() {
-        // black_box: the values are constants and the test pins them as
-        // compiled; without it clippy flags assertions on constants.
-        let blocks = std::hint::black_box(STATFS_BLOCKS);
-        let bsize = std::hint::black_box(STATFS_BSIZE);
-        assert!(blocks > 0, "zero blocks read as an empty disk");
-        assert!(bsize > 0, "zero block size breaks size math");
-        let bytes = (blocks as u128) * (bsize as u128);
+        let cap = statfs_capacity();
+        assert!(cap.blocks > 0, "zero blocks read as an empty disk");
+        assert_eq!(cap.bfree, cap.blocks, "free must equal total");
+        assert_eq!(cap.bavail, cap.blocks, "available must equal total");
+        assert!(cap.ffree > 0, "zero free inodes read as a full disk");
+        assert!(cap.bsize > 0, "zero block size breaks size math");
+        let bytes = (cap.blocks as u128) * (cap.frsize as u128);
         assert!(
             bytes < u64::MAX as u128,
-            "blocks * bsize must fit u64 ({bytes} does not)"
+            "blocks * frsize must fit u64 ({bytes} does not)"
         );
     }
 

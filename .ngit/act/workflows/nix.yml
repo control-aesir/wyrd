@@ -35,6 +35,14 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v23
 
+      # cache-nix-action's save phase chowns the Nix db to a hardcoded
+      # `runner:runner` user absent from act containers: without it the
+      # save fails and every run rebuilds cold.
+      - name: Provide runner user for cache permissions
+        run: |
+          set -euo pipefail
+          id runner >/dev/null 2>&1 || sudo useradd -r -U -M -s /usr/sbin/nologin runner
+
       # Warm /nix/store across runs: without this every run recompiles
       # the whole Rust dependency closure from source on a cold store
       # (~4 minutes of the flake check). Scoped by repository and trigger

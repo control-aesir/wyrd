@@ -78,8 +78,10 @@ first backend, not a property of the core.
 
 ## Non-goals (for now)
 
-- Garbage collection (v0 is append-only indefinitely; the retention/ack
-  protocol is a later, serious design task)
+- Garbage collection (v0 object stores are append-only indefinitely; the
+  mailbox ack-retention protocol has landed separately as a FIFO-bounded
+  dedupe log — the retention/ack protocol line above refers to object GC,
+  which remains a later, serious design task)
 - Merging file content three-way (both heads are kept and surfaced instead)
 - Full filesystem metadata (mtimes, xattrs, ACLs, resource forks — see the
   explicit list in `object-model.md`)

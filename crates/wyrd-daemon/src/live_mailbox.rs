@@ -28,9 +28,10 @@
 //!
 //! The NIP-59 wrapper's random timestamps and ephemeral authors make relay
 //! history hostile to cursors, so there are none: delivery identity is the
-//! wrapper event id, and [`Disposition::Ack`] durably records it in an
-//! append-only seen-id log, which survives restarts. Unsettled handovers
-//! stay in memory (bounded `unacked`) and are re-offered round-robin —
+//! wrapper event id, and [`Disposition::Ack`] durably records it in a
+//! FIFO-bounded seen-id log (65,536 entries, fsynced at each ack), which
+//! survives restarts. Unsettled handovers stay in memory (bounded
+//! `unacked`) and are re-offered round-robin —
 //! new mail is pulled before a retry is re-offered while there is room,
 //! so one poisoned message cannot starve the inbox; at saturation the
 //! channel is left unread and held mail rotates instead, so the engine
@@ -40,9 +41,22 @@
 //! rejection per relay redelivery — the same re-discard-per-pass cost the
 //! engine already pays for Wyrd-level poison.
 //!
-//! Acknowledgement is fsync-bound by design (one sync per ack): control
-//! traffic is low-rate, and the crash guarantee ("an acked delivery never
-//! replays") is not negotiable in v0. Payload bounds are not enforced
+//! Delivery is at-least-once, not exactly-once: an ack forgotten to
+//! retention eviction may redeliver after a restart or resubscribe, and
+//! converges through engine idempotency (the engine dedupes the inner
+//! Wyrd message id from durable facts — the same duplicate window a
+//! crash before ack already allows). Redelivery after eviction is
+//! complete, not partial: acking a redelivered wrap evicts retained ones
+//! still ahead in an oldest-first replay, so the whole evicted span
+//! rotates through — replay CPU scales with relay history, which real
+//! relays expire themselves. Acknowledgement is fsync-bound by
+//! design (one sync per ack): control
+//! traffic is low-rate, and the crash guarantee ("an acked delivery
+//! replays only after retention eviction, never from a lost write") is
+//! not negotiable in v0. Retention itself has an operational cost worth
+//! knowing: every 65,536 acks rewrites the ~4 MB log plus file and
+//! directory fsyncs on the settlement path — fine for low-rate control
+//! traffic, to be measured on supported filesystems. Payload bounds are not enforced
 //! here; the engine's ingest limits (`wyrd-sync` `Limits`/`check_total_len`)
 //! reject oversized control payloads, so a flood of oversized wraps is
 //! discarded per redelivery rather than queued.
@@ -314,6 +328,11 @@ struct SeenStore {
     /// Lines appended since the last compaction (including lines for
     /// since-evicted ids): the rewrite trigger.
     appended: usize,
+    /// False after a compaction whose rename succeeded but whose handle
+    /// reopen failed: the on-disk file is complete, but appending
+    /// through the old handle would write to the renamed-away inode.
+    /// `ensure_handle` repairs this on the next mutating call instead.
+    handle_ok: bool,
     /// fsync every record and rewrite (the crash guarantee) vs plain
     /// writes. Always true in production; tests opt out per mailbox via
     /// `set_ephemeral` so flood gates measure logic, not macOS sync
@@ -364,6 +383,7 @@ impl SeenStore {
             seen,
             file,
             appended: 0,
+            handle_ok: true,
             durable: true,
         };
         // One-time migration for pre-bound logs: the load above already
@@ -388,6 +408,7 @@ impl SeenStore {
         if self.seen.contains(id) {
             return Ok(());
         }
+        self.ensure_handle()?;
         self.file
             .write_all(format!("{id}\n").as_bytes())
             .and_then(|()| self.file.flush())
@@ -410,7 +431,10 @@ impl SeenStore {
     /// Rewrite the log to exactly the retained set: temp file, fsync,
     /// atomic rename, dir fsync. A crash leaves either the old or the
     /// new complete file — never a half-rewritten log — and a torn tail
-    /// from a crash mid-rewrite truncates away on the next open.
+    /// from a crash mid-rewrite truncates away on the next open. If the
+    /// rename succeeds but reopening the append handle fails, the store
+    /// is poisoned for writes (not reads) and the next mutating call
+    /// repairs the handle: the data is safe, only the handle is stale.
     fn compact(&mut self) -> Result<(), MailboxError> {
         let tmp_path = self.path.with_extension("tmp");
         {
@@ -430,11 +454,17 @@ impl SeenStore {
         }
         std::fs::rename(&tmp_path, &self.path)
             .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
-        self.file = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
-            .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        {
+            Ok(file) => self.file = file,
+            Err(error) => {
+                self.handle_ok = false;
+                return Err(MailboxError::Transport(format!("dedupe log: {error}")));
+            }
+        }
         if self.durable {
             if let Some(parent) = self.path.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -445,6 +475,23 @@ impl SeenStore {
             }
         }
         self.appended = 0;
+        Ok(())
+    }
+
+    /// Repair a handle poisoned by a failed post-rename reopen, so a
+    /// later retry repairs instead of writing through a stale handle
+    /// into the renamed-away inode. No-op while healthy; failure keeps
+    /// the delivery held for a later retry.
+    fn ensure_handle(&mut self) -> Result<(), MailboxError> {
+        if self.handle_ok {
+            return Ok(());
+        }
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| MailboxError::Transport(format!("dedupe log: {error}")))?;
+        self.handle_ok = true;
         Ok(())
     }
 }
@@ -2402,6 +2449,99 @@ mod tests {
             "recent ack survives restart"
         );
         assert!(!reopened.contains(&id_at(0)), "evicted ack forgotten");
+    }
+
+    /// Failure injection for the compaction window the reviewer flagged:
+    /// rename succeeded, handle reopen failed. The poisoned store must
+    /// repair its handle on the next record instead of writing through
+    /// the stale handle into the renamed-away inode — both records stay
+    /// visible in the live file and after reopen.
+    #[test]
+    fn stale_handle_repairs_on_next_record() {
+        let path = temp_path("seen-stale-handle");
+        let id_at = |i: usize| EventId::from_hex(&format!("{i:064x}")).unwrap();
+        let mut store = SeenStore::open(&path).expect("open creates");
+        store.record(&id_at(1)).expect("record appends");
+        // White-box fault: the on-disk file is complete, only the
+        // handle state is stale — exactly a failed post-rename reopen.
+        store.handle_ok = false;
+        store.record(&id_at(2)).expect("repair on use");
+        let text = std::fs::read_to_string(&path).expect("seen log reads");
+        assert!(
+            text.contains(&format!("{}", id_at(1))),
+            "pre-fault record stayed in the live file"
+        );
+        assert!(
+            text.contains(&format!("{}", id_at(2))),
+            "post-repair record landed in the live file, not an orphaned inode"
+        );
+        let reopened = SeenStore::open(&path).expect("reopen reads repaired file");
+        assert!(reopened.contains(&id_at(1)));
+        assert!(reopened.contains(&id_at(2)));
+    }
+
+    /// Restart past the retention bound: evicted acks come back and are
+    /// acked again — redelivery is complete, not partial, and still no
+    /// loss. Completeness is structural: with FIFO retention, acking a
+    /// redelivered wrap evicts retained ones still ahead in an
+    /// oldest-first replay, so the whole evicted span rotates through.
+    /// Real relays expire history themselves; the test fake retains
+    /// forever, which is the adversarial case. The log stays bounded
+    /// throughout.
+    #[test]
+    fn restart_past_retention_redelivers_evicted_without_loss() {
+        const FLOOD: usize = 700;
+        const DEADLINE: Duration = Duration::from_secs(120);
+        let relay = MiniRelay::spawn();
+        let relays = vec![relay.url().to_string()];
+        let sender = sender_keys();
+        let receiver = keys();
+        let receiver_key = receiver.public_key();
+        let seen_path = temp_path("seen-restart-overflow");
+
+        let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
+        for index in 0..FLOOD {
+            relay.inject(seal_rumor(
+                &sender,
+                receiver_key,
+                format!("restart-{index}"),
+            ));
+        }
+        let mut settled = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
+        drain_to(&mut mailbox, &mut settled, &mut covered, FLOOD, DEADLINE);
+        assert_eq!(covered.len(), FLOOD, "all wraps acked before restart");
+        drop(mailbox);
+
+        // Restart: the evicted span redelivers through the replay and is
+        // acked again — every wrap covered twice, none lost.
+        let mut restarted = live_mailbox(&receiver, &relays, seen_path.clone());
+        let mut resettled = std::collections::HashSet::new();
+        let mut recovered = std::collections::HashSet::new();
+        drain_to(
+            &mut restarted,
+            &mut resettled,
+            &mut recovered,
+            FLOOD,
+            DEADLINE,
+        );
+        assert_eq!(
+            recovered.len(),
+            FLOOD,
+            "evicted span recovered after restart"
+        );
+        assert!(
+            restarted.seen_len() <= MAX_SEEN_ENTRIES,
+            "retained acks bounded across restart"
+        );
+        let lines = std::fs::read_to_string(&seen_path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "log stays bounded across restart, got {lines} lines"
+        );
     }
 
     /// The durability guarantee itself, with real fsyncs: acked wraps

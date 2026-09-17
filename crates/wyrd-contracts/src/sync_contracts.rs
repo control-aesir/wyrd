@@ -184,6 +184,27 @@ impl<M: Mailbox> Mailbox for FailFirstSettle<'_, M> {
     }
 }
 
+/// A redelivered announcement collapses to a duplicate no-op: the
+/// mailbox retention bound means evicted acks come back after replays
+/// and restarts, so the engine must absorb committed messages twice
+/// without committing new facts. The identical sealed bytes are queued
+/// twice — a fresh seal would mint a fresh id, so only identical bytes
+/// are a true redelivery.
+#[test]
+fn redelivered_announcement_collapses_to_duplicate_noop() {
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    let envelope = loaded.publish_body_and_announcement(None);
+    let first = loaded.drain();
+    assert_eq!(first.accepted, 2, "capability and announcement commit");
+    assert_eq!(first.duplicates, 0);
+
+    loaded.rig.relay.queue([envelope.clone(), envelope]);
+    let second = loaded.drain();
+    assert_eq!(second.accepted, 0, "nothing commits twice");
+    assert_eq!(second.duplicates, 2, "both copies are duplicates");
+    loaded.rig.teardown();
+}
+
 /// A failed pass must not strand a durable commit behind a stale
 /// projection. Intake commits the capability, settlement fails, and
 /// the pass aborts before republication — the backend stays empty.

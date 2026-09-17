@@ -147,10 +147,15 @@ pub trait Mailbox {
     /// unique per envelope: a cursor derived from queue position (which
     /// shifts when predecessors are acked) violates this — derive
     /// cursors from content or a monotonic counter instead.
+    /// Delivery is at-least-once: bounded-retention implementations may
+    /// redeliver long-ago-acked mail after eviction, so engines must be
+    /// idempotent over redelivery (dedupe the inner message id from
+    /// durable facts).
     fn recv(&mut self) -> Option<Delivery>;
 
-    /// Settle one handover: `Ack` permanently consumes (the relay may
-    /// discard the envelope), `Retry` retains it for redelivery.
+    /// Settle one handover: `Ack` consumes (the relay may discard the
+    /// envelope), `Retry` retains it for redelivery. Consumption is
+    /// durable but not eternal under bounded retention — see `recv`.
     /// Settling is idempotent — a repeated `Ack` is a no-op — and
     /// dropping a [`Delivery`] without settling is an implicit `Retry`.
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError>;

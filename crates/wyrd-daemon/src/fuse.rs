@@ -56,6 +56,15 @@ const TTL: Duration = Duration::from_secs(1);
 /// The single well-known timestamp: the view has no time source and
 /// snapshot timestamps are display-only (object-model.md).
 const MOUNT_TIME: SystemTime = UNIX_EPOCH;
+/// Synthetic capacity reported by `statfs`, in blocks. The store is
+/// append-only and effectively unbounded, so there is no real total to
+/// report; zeros read as an empty/full disk and make Finder refuse
+/// copies before writing anything. 2^40 blocks at 4 KiB is 4 PiB: large
+/// enough to never gate a real copy, small enough that `blocks * frsize`
+/// cannot overflow u64.
+const STATFS_BLOCKS: u64 = 1 << 40;
+/// Block size reported by `statfs`, for both `bsize` and `frsize`.
+const STATFS_BSIZE: u32 = 4096;
 
 /// The inode table: kernel ino → the path it was minted for, plus
 /// the kind and projection generation that last validated the
@@ -2146,9 +2155,18 @@ where
 
     fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         let _log = RequestLog::new("statfs");
-        // A bottomless append-only store: capacities unknown and
-        // effectively unbounded.
-        reply.statfs(0, 0, 0, 0, 0, 1, 4096, 0);
+        // Free equals total: nothing is ever reported as used. files/ffree
+        // mirror the same unboundedness for the namespace.
+        reply.statfs(
+            STATFS_BLOCKS,
+            STATFS_BLOCKS,
+            STATFS_BLOCKS,
+            STATFS_BLOCKS,
+            STATFS_BLOCKS,
+            STATFS_BSIZE,
+            4096,
+            STATFS_BSIZE,
+        );
     }
 
     fn destroy(&mut self) {
@@ -2287,6 +2305,24 @@ mod tests {
 
         let clean = RequestLog::new("statfs");
         assert_eq!(clean.err.get(), None);
+    }
+
+    /// The synthetic `statfs` capacity must read as a usable disk: zeros
+    /// make Finder refuse copies before writing anything, and the byte
+    /// product must not overflow the kernels that multiply it out.
+    #[test]
+    fn statfs_capacity_is_nonzero_and_overflow_free() {
+        // black_box: the values are constants and the test pins them as
+        // compiled; without it clippy flags assertions on constants.
+        let blocks = std::hint::black_box(STATFS_BLOCKS);
+        let bsize = std::hint::black_box(STATFS_BSIZE);
+        assert!(blocks > 0, "zero blocks read as an empty disk");
+        assert!(bsize > 0, "zero block size breaks size math");
+        let bytes = (blocks as u128) * (bsize as u128);
+        assert!(
+            bytes < u64::MAX as u128,
+            "blocks * bsize must fit u64 ({bytes} does not)"
+        );
     }
 
     #[test]

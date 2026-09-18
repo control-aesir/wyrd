@@ -292,8 +292,9 @@ A commit proceeds in this order, and the order is the contract:
    is flushed (`ServingEndpoint::flush`) so the new representations are
    servable by transport root.
 6. **Announcement discharge.** The recorded obligation is sent
-   asynchronously with retry through the durable outbox
-   (`feat(sync): durable announcement outbox and retry contract`).
+   with retry through the durable outbox (`Engine::announce_snapshot`
+   for one snapshot, `Engine::announce_pending` for the resume path:
+   per-recipient delivered markers, byte-identical sealed retries).
 
 **Objects prepared at 1; authoring prepared at 2; durable at 3 (with the
 announcement obligation recorded); visible at 4; servable at 5;
@@ -316,11 +317,11 @@ step 3, atomically with the commit**, not at step 6. Step 6 only
 *discharges* it. Therefore outbox-enqueue failure cannot lose an
 announcement: if step 3 committed, the obligation is durable, and a
 restart reconciles un-discharged obligations back through the outbox
-(this is the mechanism `feat(sync): durable announcement outbox and retry
-contract` must provide; the write path requires only that the
-obligation is durable with the commit). The outbox entry is eligible for
-discharge only once serving readiness (step 5) has succeeded for that
-snapshot.
+(`Fact::AnnouncementQueued` / `AnnouncementSealed` /
+`AnnouncementDelivered`; pending derives as queued-minus-delivered).
+The outbox entry is eligible for discharge only once serving readiness
+(step 5) has succeeded for that snapshot — eligibility is
+composer-ordered (announce after flush), not engine-gated.
 
 Failure at each stage, explicitly:
 

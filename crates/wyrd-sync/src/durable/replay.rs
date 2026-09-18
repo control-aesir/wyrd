@@ -10,7 +10,7 @@
 //! [`DriveKeyring`]: crate::keys::capability::DriveKeyring
 //! [`RuntimeState`]: crate::runtime::RuntimeState
 
-use wyrd_format::{ContentId, DeviceId, DriveId, MembershipTransition, Snapshot};
+use wyrd_format::{ContentId, DeviceId, DriveId, MembershipTransition, Snapshot, SnapshotId};
 
 use super::codec::DecodedFact;
 use super::DurableError;
@@ -32,6 +32,9 @@ pub enum RuntimeFact {
     ObjectRemoved(ContentId),
     Materialization(ContentId, MaterializationState),
     ControlMessage(ControlMessageId),
+    AnnouncementQueued(SnapshotId, DeviceId),
+    AnnouncementSealed(SnapshotId, Vec<u8>),
+    AnnouncementDelivered(SnapshotId, DeviceId),
 }
 
 /// The replayed facts of commits `1..=CURRENT`, in commit order within
@@ -47,6 +50,9 @@ pub struct LoadedFacts {
     pub removed_objects: Vec<ContentId>,
     pub materialization: Vec<(ContentId, MaterializationState)>,
     pub seen: Vec<ControlMessageId>,
+    pub announcement_queued: Vec<(SnapshotId, DeviceId)>,
+    pub announcement_sealed: Vec<(SnapshotId, Vec<u8>)>,
+    pub announcement_delivered: Vec<(SnapshotId, DeviceId)>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -82,6 +88,21 @@ impl LoadedFacts {
             DecodedFact::ControlMessage(id) => {
                 self.seen.push(id);
                 self.runtime_facts.push(RuntimeFact::ControlMessage(id));
+            }
+            DecodedFact::AnnouncementQueued(snapshot, recipient) => {
+                self.announcement_queued.push((snapshot, recipient));
+                self.runtime_facts
+                    .push(RuntimeFact::AnnouncementQueued(snapshot, recipient));
+            }
+            DecodedFact::AnnouncementSealed(snapshot, sealed) => {
+                self.announcement_sealed.push((snapshot, sealed.clone()));
+                self.runtime_facts
+                    .push(RuntimeFact::AnnouncementSealed(snapshot, sealed));
+            }
+            DecodedFact::AnnouncementDelivered(snapshot, recipient) => {
+                self.announcement_delivered.push((snapshot, recipient));
+                self.runtime_facts
+                    .push(RuntimeFact::AnnouncementDelivered(snapshot, recipient));
             }
         }
     }
@@ -147,6 +168,15 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::ControlMessage(id) => {
                 runtime.remember_control_message(&id);
+            }
+            RuntimeFact::AnnouncementQueued(snapshot, recipient) => {
+                runtime.record_announcement_queued(snapshot, recipient);
+            }
+            RuntimeFact::AnnouncementSealed(snapshot, sealed) => {
+                runtime.record_announcement_sealed(snapshot, sealed);
+            }
+            RuntimeFact::AnnouncementDelivered(snapshot, recipient) => {
+                runtime.record_announcement_delivered(snapshot, recipient);
             }
         }
     }

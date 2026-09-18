@@ -272,15 +272,28 @@ where
 
     /// Announce an authored local snapshot through the control plane. The
     /// snapshot returned by [`Daemon::put_file`] or [`Daemon::remove`] is
-    /// already durable; announcement failure therefore leaves it available
-    /// for a later retry and never rolls the local write back.
+    /// already durable, and its announcement obligation was queued with
+    /// it; announcement failure therefore leaves the remaining
+    /// recipients pending in the engine's durable outbox for a later
+    /// retry and never rolls the local write back.
     pub fn announce_snapshot(
-        &self,
+        &mut self,
         snapshot: &AuthorizedSnapshot,
         mailbox: &mut impl Mailbox,
         node_addr: Option<&[u8]>,
     ) -> Result<usize, wyrd_sync::runtime::EngineError> {
         self.engine.announce_snapshot(snapshot, mailbox, node_addr)
+    }
+
+    /// Resume every undischarged announcement obligation in the
+    /// engine's durable outbox, without re-authoring anything. The
+    /// restart path after a crash or a partial send.
+    pub fn announce_pending(
+        &mut self,
+        mailbox: &mut impl Mailbox,
+        node_addr: Option<&[u8]>,
+    ) -> Result<usize, wyrd_sync::runtime::EngineError> {
+        self.engine.announce_pending(mailbox, node_addr)
     }
 
     /// The tree a write builds from when the drive has exactly one live

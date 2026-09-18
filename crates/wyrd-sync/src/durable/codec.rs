@@ -12,7 +12,8 @@
 //! no silent interpretation, no migration until v1 freezes the format.
 
 use wyrd_format::{
-    BaoRoot, ContentId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot, StorageId,
+    BaoRoot, ContentId, DeviceId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot,
+    SnapshotId, StorageId,
 };
 
 use super::{DurableError, Fact};
@@ -37,10 +38,16 @@ const TAG_OBJECT_REMOVED: u8 = 0x08;
 /// Crate-visible for the raw-commit test seam: the planted-forgery tests
 /// encode records no typed `Fact` can carry.
 pub(crate) const TAG_SNAPSHOT_BODY: u8 = 0x09;
+/// One announcement obligation: snapshot id (32) ‖ recipient (32).
+const TAG_ANNOUNCEMENT_QUEUED: u8 = 0x0A;
+/// Sealed announcement bytes: snapshot id (32) ‖ sealed control bytes.
+const TAG_ANNOUNCEMENT_SEALED: u8 = 0x0B;
+/// One discharged obligation: snapshot id (32) ‖ recipient (32).
+const TAG_ANNOUNCEMENT_DELIVERED: u8 = 0x0C;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 9] = [
+const KNOWN_TAGS: [u8; 12] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -50,6 +57,9 @@ const KNOWN_TAGS: [u8; 9] = [
     TAG_CONTROL_MESSAGE,
     TAG_OBJECT_REMOVED,
     TAG_SNAPSHOT_BODY,
+    TAG_ANNOUNCEMENT_QUEUED,
+    TAG_ANNOUNCEMENT_SEALED,
+    TAG_ANNOUNCEMENT_DELIVERED,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -203,6 +213,24 @@ pub(super) fn encode_fact(
             Ok((TAG_MATERIALIZATION, bytes))
         }
         Fact::ControlMessage(id) => Ok((TAG_CONTROL_MESSAGE, id.as_bytes().to_vec())),
+        Fact::AnnouncementQueued(snapshot, recipient) => {
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(snapshot.as_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            Ok((TAG_ANNOUNCEMENT_QUEUED, bytes))
+        }
+        Fact::AnnouncementSealed(snapshot, sealed) => {
+            let mut bytes = Vec::with_capacity(32 + sealed.len());
+            bytes.extend_from_slice(snapshot.as_bytes());
+            bytes.extend_from_slice(sealed);
+            Ok((TAG_ANNOUNCEMENT_SEALED, bytes))
+        }
+        Fact::AnnouncementDelivered(snapshot, recipient) => {
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(snapshot.as_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            Ok((TAG_ANNOUNCEMENT_DELIVERED, bytes))
+        }
     }
 }
 
@@ -343,6 +371,32 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
                 raw,
             )))
         }
+        TAG_ANNOUNCEMENT_QUEUED => {
+            if record.len() != 64 {
+                return None;
+            }
+            let snapshot = SnapshotId::from_bytes(record[..32].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+            Some(DecodedFact::AnnouncementQueued(snapshot, recipient))
+        }
+        TAG_ANNOUNCEMENT_SEALED => {
+            if record.len() <= 32 {
+                return None;
+            }
+            let snapshot = SnapshotId::from_bytes(record[..32].try_into().ok()?);
+            Some(DecodedFact::AnnouncementSealed(
+                snapshot,
+                record[32..].to_vec(),
+            ))
+        }
+        TAG_ANNOUNCEMENT_DELIVERED => {
+            if record.len() != 64 {
+                return None;
+            }
+            let snapshot = SnapshotId::from_bytes(record[..32].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+            Some(DecodedFact::AnnouncementDelivered(snapshot, recipient))
+        }
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
@@ -413,6 +467,9 @@ pub(super) enum DecodedFact {
     ObjectRemoved(ContentId),
     Materialization(ContentId, MaterializationState),
     ControlMessage(ControlMessageId),
+    AnnouncementQueued(SnapshotId, DeviceId),
+    AnnouncementSealed(SnapshotId, Vec<u8>),
+    AnnouncementDelivered(SnapshotId, DeviceId),
 }
 
 #[cfg(test)]

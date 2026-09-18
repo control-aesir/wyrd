@@ -5,6 +5,10 @@
 # the rest of the suite keeps full parallelism.
 [test-groups]
 mailbox-flood = { max-threads = 1 }
+contracts-serial = { max-threads = 1 }
+# The whole contracts binary runs its tests one at a time (other
+# binaries keep full parallelism: groups only constrain their own
+# process). See the override below for why.
 
 [[profile.default.overrides]]
 filter = 'test(flood)'
@@ -17,3 +21,20 @@ test-group = 'mailbox-flood'
 [[profile.default.overrides]]
 filter = 'test(unacked_bound)'
 test-group = 'mailbox-flood'
+
+# The live-iroh serving contract owns multi-thread runtimes whose worker
+# threads are born during its run. Nextest attributes threads present at
+# a test's end but absent at its start to that test — so under load, when
+# runtime init straddles a fast concurrent test's sub-second window, the
+# fast test eats a LEAK verdict for threads it never created (observed:
+# three different synchronous-only tests blamed across runs, none of
+# which spawns anything). threads-required does not isolate in this
+# setup (verified: the iroh test still overlaps with threads-required
+# set), so the whole contracts binary shares one serial group instead:
+# no two tests in the process ever overlap, which removes the
+# misattribution condition outright. ~9s becomes ~25s; the rest of the
+# workspace keeps full parallelism. See the leaky-verdict issue for the
+# attribution evidence.
+[[profile.default.overrides]]
+filter = 'package(wyrd-contracts)'
+test-group = 'contracts-serial'

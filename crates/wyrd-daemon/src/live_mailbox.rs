@@ -56,10 +56,11 @@
 //! not negotiable in v0. Retention itself has an operational cost worth
 //! knowing: every 65,536 acks rewrites the ~4 MB log plus file and
 //! directory fsyncs on the settlement path — fine for low-rate control
-//! traffic, to be measured on supported filesystems. Payload bounds are not enforced
-//! here; the engine's ingest limits (`wyrd-sync` `Limits`/`check_total_len`)
-//! reject oversized control payloads, so a flood of oversized wraps is
-//! discarded per redelivery rather than queued.
+//! traffic, to be measured on supported filesystems. Payload bounds are enforced
+//! at the sync mailbox boundary (`wyrd-sync` `open_from_sender` rejects
+//! ciphertext over `MAX_MAILBOX_CIPHERTEXT_LEN` before NIP-44 decryption
+//! and decrypted bytes over `MAX_MAILBOX_OPEN_BYTES` before ingest), so a
+//! flood of oversized wraps is discarded per redelivery rather than queued.
 //!
 //! One `LiveMailbox` owns one Tokio runtime and one relay client: the
 //! daemon composes exactly one mailbox per process (see the review note on

@@ -100,7 +100,10 @@ fn accept_envelope(
     let bytes = match open_from_sender(&engine.identity_secret, engine.device, envelope) {
         // The outer seal opens with our always-held identity key or
         // never will: an unopenable envelope is terminal poison, not a
-        // retryable unknown. Consume it without a fact.
+        // retryable unknown. Consume it without a fact. Oversize
+        // ciphertext/decrypted bytes (`MailboxError::Oversize`) land here
+        // too: the mailbox already rejected them before ingest, and the
+        // relay retains nothing for an acked handover.
         Ok(bytes) => bytes,
         Err(_) => return Ok(Outcome::Discarded),
     };
@@ -345,6 +348,7 @@ mod tests {
         capability_message, control_key, deliver, drain, encryption_key, fixture, identity, owner,
         queue, reopen, transition_message, MemoryMailbox,
     };
+    use crate::transport::mailbox::MAX_MAILBOX_CIPHERTEXT_LEN;
     /// Hand-sign one transition against the fixture drive (mirrors
     /// the conformance helper): for siblings the builder cannot
     /// produce.
@@ -898,6 +902,26 @@ mod tests {
         assert_eq!(report.duplicates, 0);
         assert_eq!(report.deferred, 0);
         assert_eq!(report.skipped, 0);
+        assert_eq!(report.discarded, 0);
+    }
+
+    #[test]
+    fn oversize_envelope_discarded_without_commit() {
+        let mut fixture = fixture();
+        let genesis_id = Builder::genesis(10).1.transition_id();
+        let mut envelope = deliver(&fixture, 1, &announcement_for(1, genesis_id));
+        // Over the mailbox ciphertext ceiling: rejected before NIP-44
+        // decryption, so the drain consumes it as terminal poison.
+        envelope.ciphertext = "A".repeat(MAX_MAILBOX_CIPHERTEXT_LEN + 1);
+        queue(&mut fixture, vec![envelope]);
+        let report = drain(&mut fixture);
+        assert_eq!(report.discarded, 1);
+        assert_eq!(fixture.engine.current(), 0);
+        // Bytes that never decoded write no durable fact, and the ack
+        // consumed the handover: a second pass sees nothing.
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.announcements.is_empty());
+        let report = drain(&mut fixture);
         assert_eq!(report.discarded, 0);
     }
 

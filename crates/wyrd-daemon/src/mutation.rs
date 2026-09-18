@@ -156,6 +156,12 @@ pub enum MutationError {
     /// Authoring, durability, or validation failed. POSIX `EIO`.
     #[error("engine failed")]
     Engine,
+    /// The live loop stopped before completing the request — terminal
+    /// error or shutdown — so it may never have executed. POSIX `EIO`:
+    /// a distinct variant (not a bare `Engine`) so supervisors and
+    /// tests can tell "never serviced" from "serviced but failed".
+    #[error("live loop stopped before completing the mutation")]
+    Shutdown,
 }
 
 impl MutationError {
@@ -395,6 +401,20 @@ impl MutationQueue {
             queue: self,
             entries,
         }
+    }
+
+    /// Complete every still-queued request with [`MutationError::Shutdown`]:
+    /// the loop will never drain again, so admitted-but-incomplete callers
+    /// must hear it now rather than block forever. Idempotent — a second
+    /// call (or the supervisor's belt-and-braces call after the loop
+    /// already drained on exit) finds nothing pending and does nothing.
+    /// Taken-but-unfinished requests are the batch guard's duty, not this.
+    pub fn shutdown(&self) {
+        let mut batch = self.take_batch();
+        for index in 0..batch.len() {
+            batch.record(index, Err(MutationError::Shutdown));
+        }
+        batch.finish();
     }
 
     /// Complete one taken request: record the outcome, release its

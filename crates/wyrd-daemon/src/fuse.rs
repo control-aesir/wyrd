@@ -388,6 +388,7 @@ fn mutation_errno(error: &MutationError) -> fuser::Errno {
         | MutationError::Stale(_)
         | MutationError::Lock
         | MutationError::Store
+        | MutationError::Shutdown
         | MutationError::Engine => fuser::Errno::EIO,
     }
 }
@@ -2316,6 +2317,35 @@ mod tests {
             errno_of(&ViewError::Store("disk".into())),
             fuser::Errno::EIO
         );
+    }
+
+    /// The mutation errno mapping is pinned the same way: saturation is
+    /// retryable, malformed names are caller errors, everything else —
+    /// including a loop shutdown mid-syscall — is EIO, never a hang.
+    #[test]
+    fn mutation_errors_map_to_posix_errors() {
+        assert_eq!(
+            mutation_errno(&MutationError::Saturated),
+            fuser::Errno::EAGAIN
+        );
+        assert_eq!(
+            mutation_errno(&MutationError::Invalid("x".into())),
+            fuser::Errno::EINVAL
+        );
+        assert_eq!(
+            mutation_errno(&MutationError::NotFound("x".into())),
+            fuser::Errno::ENOENT
+        );
+        for fatal in [
+            MutationError::Conflicted { heads: 2 },
+            MutationError::Stale("x".into()),
+            MutationError::Lock,
+            MutationError::Store,
+            MutationError::Engine,
+            MutationError::Shutdown,
+        ] {
+            assert_eq!(mutation_errno(&fatal), fuser::Errno::EIO);
+        }
     }
 
     /// The request probe records the reply errno inline and passes it

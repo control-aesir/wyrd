@@ -1086,6 +1086,13 @@ where
     /// flag — it publishes no data, so `Relaxed` ordering is the honest
     /// level and must stay that way.
     ///
+    /// No admitted mutation submitter outlives the loop: every return
+    /// path completes still-queued requests with
+    /// [`MutationError::Shutdown`](crate::mutation::MutationError::Shutdown)
+    /// first, so a terminal error or a stop with in-flight demand resolves
+    /// blocked callers instead of stranding them. Taken-but-unfinished
+    /// requests are already covered by the batch guard's drop.
+    ///
     /// Backlog behavior under sustained traffic: each pass drains what
     /// the mailbox currently holds, so a flood costs latency (poll
     /// intervals), never loss. Overflow backpressures into the relay,
@@ -1120,6 +1127,10 @@ where
                     summary.errors_retried += 1;
                     observe(&error, consecutive);
                     if consecutive > config.max_consecutive_errors {
+                        // Terminal: no further pass will drain, so complete
+                        // still-queued submitters now — returning first
+                        // would strand every admitted caller forever.
+                        self.mutations.shutdown();
                         return Err(error);
                     }
                     self.mutations.wait_for_work(stop, delay);
@@ -1127,7 +1138,17 @@ where
                 }
             }
         }
+        // Stopped with demand possibly in flight: same guarantee as the
+        // terminal path — resolve, never strand.
+        self.mutations.shutdown();
         Ok(summary)
+    }
+
+    /// The mutation channel the backend submits through: the supervisor
+    /// half of the lifecycle contract (session end trips the stop flag
+    /// the loop polls; loop end completes the queue this returns).
+    pub fn mutations(&self) -> &Arc<MutationQueue> {
+        &self.mutations
     }
 }
 
@@ -2889,6 +2910,96 @@ mod tests {
         assert!(result.is_err(), "the cap aborts the loop");
         // Errors at consecutive counts 1, 2, and 3 (which trips the cap).
         assert_eq!(observed, 3);
+
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A blocked mutation submitter is completed when the loop aborts:
+    /// terminal error must not strand admitted callers. The submit lands
+    /// in pending (drain fails first, so it is never taken); the loop
+    /// trips the cap within milliseconds; the waiter must resolve
+    /// instead of blocking forever.
+    #[test]
+    fn terminal_loop_error_completes_blocked_submitters() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+        drop(backend);
+        let queue = Arc::clone(&live.mutations);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = queue.submit(MutationKind::Mkdir {
+                path: "docs".to_string(),
+            });
+            let _ = tx.send(result);
+        });
+        // Let the submission land in pending before the loop trips the cap.
+        std::thread::sleep(Duration::from_millis(100));
+        let stop = AtomicBool::new(false);
+        let config = LiveConfig {
+            interval: Duration::from_millis(1),
+            error_base_delay: Duration::from_millis(1),
+            error_max_delay: Duration::from_millis(5),
+            max_consecutive_errors: 2,
+        };
+        let mut mailbox = SettlementFailingMailbox;
+        let result = live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &stop,
+            &config,
+            &mut |_, _| {},
+        );
+        assert!(result.is_err(), "the cap aborts the loop");
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Err(MutationError::Shutdown)) => {}
+            other => panic!("blocked submitter must resolve with Shutdown, got {other:?}"),
+        }
+
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A clean stop with an in-flight submitter completes it too: loop
+    /// exit for any reason leaves no admitted-but-incomplete request.
+    #[test]
+    fn clean_stop_completes_blocked_submitters() {
+        let (engine, dir, _) = scratch_drive();
+        let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+        let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+        drop(backend);
+        let queue = Arc::clone(&live.mutations);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = queue.submit(MutationKind::Mkdir {
+                    path: "docs".to_string(),
+                });
+                let _ = tx.send(result);
+            });
+            // Let the submission land in pending, then stop: the loop
+            // exits Ok, and the waiter must still resolve.
+            std::thread::sleep(Duration::from_millis(100));
+            stop.store(true, Ordering::Relaxed);
+            let mut mailbox = NoopMailbox;
+            live.run_loop(
+                &mut mailbox,
+                None::<&mut MemoryBulkSource>,
+                &stop,
+                &LiveConfig {
+                    interval: Duration::from_millis(10),
+                    ..LiveConfig::default()
+                },
+                &mut |_, _| {},
+            )
+            .expect("loop stops cleanly");
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Err(MutationError::Shutdown)) => {}
+            other => panic!("blocked submitter must resolve with Shutdown, got {other:?}"),
+        }
 
         drop(live);
         std::fs::remove_dir_all(dir).unwrap();

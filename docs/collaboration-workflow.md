@@ -44,6 +44,16 @@ git checkout -b pr/<name>
 git push -u origin pr/<name>
 ```
 
+Verify the branch before every commit: `checkout -b` on an already
+existing name fails and leaves you wherever you were, so a quiet
+checkout followed by a commit can land work on the wrong branch —
+including `master`, where nothing commits directly. Chain the check
+into the commit so a wrong branch aborts the sequence:
+
+```bash
+git branch --show-current && git commit -m "..."
+```
+
 Set the PR to draft immediately after the first push. CI runs on
 `ready_for_review` only, for PRs touching the paths listed in the workflows
 under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust workspace:

@@ -156,6 +156,12 @@ pub enum MutationError {
     /// Authoring, durability, or validation failed. POSIX `EIO`.
     #[error("engine failed")]
     Engine,
+    /// The live loop stopped before completing the request — terminal
+    /// error or shutdown — so it may never have executed. POSIX `EIO`:
+    /// a distinct variant (not a bare `Engine`) so supervisors and
+    /// tests can tell "never serviced" from "serviced but failed".
+    #[error("live loop stopped before completing the mutation")]
+    Shutdown,
 }
 
 impl MutationError {
@@ -316,6 +322,9 @@ struct QueueState {
     /// Admitted-but-incomplete, including executing requests: the bound
     /// covers every request whose caller is still blocked.
     outstanding: usize,
+    /// Closed by [`MutationQueue::shutdown`]: the loop will never drain
+    /// again, so new submissions fail fast instead of queueing behind it.
+    closed: bool,
 }
 
 /// The channel: FUSE submits and blocks, the loop drains and completes.
@@ -351,12 +360,17 @@ impl MutationQueue {
     /// admission the request is durably unordered but total-ordered; the
     /// caller returns only after the executing pass completes it, so a
     /// success means the state is served. Saturation (`EAGAIN`) is the
-    /// only failure that means the request never executed.
+    /// only failure that means the request never executed — and a closed
+    /// queue (loop stopped) fails fast with `Shutdown` without enqueueing,
+    /// so no admitted caller can outlive the loop that would drain it.
     pub fn submit(&self, kind: MutationKind) -> Result<MutationOutcome, MutationError> {
         let id = MutationId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let reply = Arc::new(Reply::default());
         {
             let mut state = self.lock_state();
+            if state.closed {
+                return Err(MutationError::Shutdown);
+            }
             if state.outstanding >= self.limit {
                 return Err(MutationError::Saturated);
             }
@@ -395,6 +409,25 @@ impl MutationQueue {
             queue: self,
             entries,
         }
+    }
+
+    /// Close admission and complete every still-queued request with
+    /// [`MutationError::Shutdown`]: the loop will never drain again, so
+    /// admitted-but-incomplete callers must hear it now rather than block
+    /// forever, and later submissions fail fast at admission instead of
+    /// queueing behind a dead loop. Idempotent — a second call finds the
+    /// queue closed with nothing pending and does nothing. Taken-but-
+    /// unfinished requests are the batch guard's duty, not this.
+    pub fn shutdown(&self) {
+        {
+            let mut state = self.lock_state();
+            state.closed = true;
+        }
+        let mut batch = self.take_batch();
+        for index in 0..batch.len() {
+            batch.record(index, Err(MutationError::Shutdown));
+        }
+        batch.finish();
     }
 
     /// Complete one taken request: record the outcome, release its
@@ -647,5 +680,69 @@ mod tests {
         batch.record(0, Ok(MutationOutcome::Done));
         batch.finish();
         assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+    }
+
+    /// Shutdown closes admission: a submit after shutdown fails fast
+    /// with `Shutdown` instead of queueing behind a loop that will
+    /// never drain. Immediate by construction — no thread, no timeout.
+    #[test]
+    fn submit_after_shutdown_fails_fast() {
+        let queue = MutationQueue::default();
+        queue.shutdown();
+        assert_eq!(
+            queue.submit(mkdir("docs")),
+            Err(MutationError::Shutdown),
+            "a closed queue refuses at admission"
+        );
+        // Idempotent shutdown keeps refusing.
+        queue.shutdown();
+        assert_eq!(queue.submit(mkdir("docs")), Err(MutationError::Shutdown));
+        assert_eq!(queue.outstanding(), 0, "refusals hold no slots");
+    }
+
+    /// Submitters racing shutdown all resolve with `Shutdown`, whether
+    /// admitted-then-drained or refused-at-admission: no interleaving
+    /// blocks. The channel (not a join) bounds the wait so a regression
+    /// fails the test instead of hanging the suite.
+    #[test]
+    fn concurrent_submit_during_shutdown_never_blocks() {
+        let queue = Arc::new(MutationQueue::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let submitters: Vec<_> = (0..4)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let result = queue.submit(mkdir("docs"));
+                        if tx.send(result).is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        // Interleave shutdowns with the submissions; the closed flag and
+        // the drain are both under the queue lock, so every outcome is
+        // either drained-then-Shutdown or refused-at-admission.
+        for _ in 0..25 {
+            queue.shutdown();
+            std::thread::yield_now();
+        }
+        queue.shutdown();
+        for handle in submitters {
+            handle.join().expect("submitters never block");
+        }
+        let results: Vec<_> = rx.iter().collect();
+        assert_eq!(results.len(), 100, "every submission resolved");
+        for result in &results {
+            assert_eq!(
+                result,
+                &Err(MutationError::Shutdown),
+                "no interleaving commits, strands, or saturates"
+            );
+        }
+        assert_eq!(queue.outstanding(), 0, "all slots released");
     }
 }

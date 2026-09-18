@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use tracing_subscriber::layer::SubscriberExt as _;
-use wyrd_daemon::{Daemon, LiveConfig, LiveError, LiveSummary};
+use wyrd_daemon::{Daemon, LiveConfig, LiveError, LiveSummary, Supervisor};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
@@ -495,10 +495,18 @@ fn mount(
     #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
+    // One lifecycle supervisor owns the stop flag and the mutation
+    // queue: session end trips shutdown below, loop end settles the
+    // queue after run_loop returns. Either direction alone strands
+    // somebody — a dead session with a syncing loop, or a dead loop
+    // with blocked submitters — so both are wired.
+    let supervisor = Supervisor::new(Arc::clone(live.mutations()), &SHUTDOWN);
+    let session_supervisor = supervisor.clone();
     // The session loop owns the backend: log its exit immediately on
-    // the thread, so a dead event loop leaves a record even while the
-    // live loop below is still blocked — the main thread only learns
-    // the outcome at join time during shutdown.
+    // the thread, then trip shutdown so the live loop exits promptly
+    // instead of syncing and serving behind a dead presentation
+    // surface. The unmount-and-join sequence below still reaps the
+    // thread and reports the combined outcome.
     let server = std::thread::spawn(move || {
         let outcome = session.run();
         match &outcome {
@@ -507,6 +515,7 @@ fn mount(
                 tracing::error!(stage = "session", error = %error, "FUSE session loop exited with error");
             }
         }
+        session_supervisor.note_session_ended();
         outcome
     });
     let result = live.run_loop(
@@ -519,6 +528,10 @@ fn mount(
             tracing::warn!(stage = "sync", consecutive, error = %error, "live sync pass failed");
         },
     );
+    // The loop returned cleanly or terminally: settle the mutation
+    // queue (run_loop already drained on exit; this is the idempotent
+    // supervisor half) before tearing down serving and the bulk source.
+    supervisor.note_loop_ended();
     bulk.shutdown();
     let _ = serving.shutdown();
 

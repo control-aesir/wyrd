@@ -15,15 +15,16 @@
 # instead of failing. NGIT_NSEC lives only in the calling step's env:
 # earlier steps run untrusted code and must never see it.
 #
-# PR resolution keys on the checked-out head sha first: it is exact even
-# with several PRs open and needs no trigger context. The trigger-event
-# and head-ref paths stay as alternatives for coordinators that provide
-# them — the installed coordinator documents no NGIT_CI_TRIGGER_EVENT,
-# and synthesized pull_request events carry no head.ref (GITHUB_REF is
-# just refs/pull/ngit). Every ngit call passes --repo explicitly: the
-# coordinator checks out over https/file with no nostr remote, and ngit
-# fails rather than guessing. Unresolvable runs fail loudly, never skip
-# silently.
+# PR resolution prefers context over scanning, fastest exact path first:
+# the coordinator trigger event (ngit maps a 1618 proposal or 1619
+# revision to its PR), then the pull_request head ref (one list call, no
+# per-PR views, and immune to CI-record lag on first runs). Head-sha
+# matching against per-revision CI records is the last resort: it is
+# exact but slow and blind on first runs, where the record lags the run
+# itself. Zero or multiple matches at any level fail loudly — never
+# guess. Every ngit call passes --repo explicitly: the coordinator checks
+# out over https/file with no nostr remote, and ngit fails rather than
+# guessing. Unresolvable runs fail loudly, never skip silently.
 #
 # This repo's naddr (ngit 3.0.1 rejects the raw 30617: coordinate form);
 # refresh it with `ngit repo --json | jq -r .coordinate` if the repo is

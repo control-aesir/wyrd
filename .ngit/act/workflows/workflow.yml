@@ -1,0 +1,318 @@
+name: pipeline
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "flake.nix"
+      - "flake.lock"
+      - ".ngit/act/workflows/workflow.yml"
+  pull_request:
+    types: [opened, ready_for_review]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "flake.nix"
+      - "flake.lock"
+      - ".ngit/act/workflows/workflow.yml"
+
+jobs:
+  draft:
+    if: github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Warms the auto-draft scan: the first-ever cold scan takes
+      # minutes (full-state relay sync per call), later runs reuse this.
+      - name: Restore ngit event cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+          restore-keys: ngit-events-Linux-
+
+      - name: Install ngit for auto-draft
+        uses: danconwaydev/setup-ngit@v3
+        with:
+          version: 3.0.1
+
+      # New PRs land open; the project works draft-first, so draft them
+      # at creation instead of waiting for a human pass. Silent state
+      # change, no comment; skips gracefully without the credential.
+      # Best-effort: a failed auto-draft must never red a fresh PR when
+      # the author can draft manually, so failures don't fail the job.
+      - name: Draft the new PR
+        continue-on-error: true
+        env:
+          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source .ngit/act/lib/ngit-reporter.sh
+          draft_new_pr
+
+      # Saves the scan's sync progress even when drafting failed: the
+      # next run restores warmer instead of starting cold again.
+      - name: Save ngit event cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+
+  rust:
+    if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Resolve the channel pinned in rust-toolchain.toml. It is passed as an
+      # explicit `toolchain` input rather than letting the action read the
+      # file: file-driven mode installs every target in the file (the macOS
+      # and Linux cross-compile triples), and a literal "rust-toolchain.toml"
+      # value is rejected by rustup as an invalid toolchain name.
+      - name: Resolve pinned channel
+        id: pin
+        run:
+          echo "channel=$(awk -F'"' '/^channel/{print $2}'
+          rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      # Installs rustup when missing (the ngit/act ubuntu image doesn't ship
+      # it), then the pinned channel with a minimal profile + clippy.
+      # Toolchain and registry are cached between runs.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: clippy
+
+      # Pre-built nextest binary (nextest-rs recommended installer).
+      - uses: taiki-e/install-action@nextest
+
+      - name: Check
+        run: |
+          set -o pipefail
+          echo "===== cargo check =====" >> /tmp/rust.log
+          cargo check --color never 2>&1 | tee -a /tmp/rust.log
+
+      - name: Clippy
+        run: |
+          set -o pipefail
+          echo "===== clippy =====" >> /tmp/rust.log
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a /tmp/rust.log
+
+      # `insecure-fast-kdf` deliberately weakens the keystore KDF and is
+      # enabled only from dev-dependencies so integration tests can build a
+      # real Engine affordably. Guard production: the normal dependency graph
+      # (no dev/test edges) must never enable it. Never treat an
+      # `--all-features` artifact as production.
+      - name: Production feature graph excludes insecure-fast-kdf
+        run: |
+          set -euo pipefail
+          echo "===== feature graph =====" >> /tmp/rust.log
+          cargo tree -e normal,features --workspace > /tmp/features.log
+          cat /tmp/features.log >> /tmp/rust.log
+          if grep -q insecure-fast-kdf /tmp/features.log; then
+            echo "error: the normal dependency graph enables insecure-fast-kdf" >&2
+            grep -n insecure-fast-kdf /tmp/features.log >&2
+            exit 1
+          fi
+
+      - name: Tests
+        run: |
+          set -o pipefail
+          echo "===== nextest =====" >> /tmp/rust.log
+          cargo nextest run --color never --workspace 2>&1 | tee -a /tmp/rust.log
+
+      # Nextest skips doctests; this gate keeps them validated as API
+      # examples appear. Cheap while empty, load-bearing later.
+      - name: Doctests
+        run: |
+          set -o pipefail
+          echo "===== doctests =====" >> /tmp/rust.log
+          cargo test --color never --workspace --doc 2>&1 | tee -a /tmp/rust.log
+
+      # Upload all logs — runs even when a step above failed, so you get the
+      # partial log up to the failure point.
+      - name: Upload combined log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-log
+          path: /tmp/rust.log
+
+  nix:
+    if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      # cache-nix-action assumes GitHub-hosted runners: its save phase
+      # chowns the Nix db to a hardcoded `runner:runner` user and
+      # checkpoints it with `sqlite3`, neither of which exists in act
+      # containers. Without both shims the save fails silently and every
+      # run rebuilds cold.
+      - name: Prepare cache tooling
+        run: |
+          set -euo pipefail
+          id runner >/dev/null 2>&1 || sudo useradd -r -U -M -s /usr/sbin/nologin runner
+          command -v sqlite3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y sqlite3; }
+
+      # Warm /nix/store across runs: without this every run recompiles
+      # the whole Rust dependency closure from source on a cold store
+      # (~4 minutes of the flake check). Scoped by repository and trigger
+      # trust, so third-party PRs never touch the maintainer cache.
+      # continue-on-error keeps coordinators with caching disabled green.
+      - name: Restore Nix store cache
+        continue-on-error: true
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          token: unused
+
+      # Flake evaluation needs an openable Git repository (libgit2
+      # ENOTFOUND otherwise) and the coordinator worktree can carry a stub
+      # or no .git metadata at all. Rebuild it when git itself cannot open
+      # it. Respects .gitignore, so build output and dev state stay out.
+      - name: Prepare git metadata for flake evaluation
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          echo "===== git metadata =====" >> /tmp/nix.log
+          {
+            git config --global --add safe.directory "$PWD"
+            if ! git rev-parse --git-dir >/dev/null 2>&1; then
+              rm -rf .git
+              git init -q
+              git add -A
+              git -c user.email=ci@localhost -c user.name=ci commit -qm ci
+            fi
+          } 2>&1 | tee -a /tmp/nix.log
+
+      # Builds packages.wyrd, packages.wyrd-dist, and checks.wyrd* for the
+      # runner's system (linux-x86_64). Darwin coverage comes from the
+      # maintainer's machine; see the packaging issue.
+      - name: Flake check
+        run: |
+          set -o pipefail
+          echo "===== flake check =====" >> /tmp/nix.log
+          nix flake check --print-build-logs 2>&1 | tee -a /tmp/nix.log
+
+      # Proves the release archive path end to end: the tarball filename is
+      # exactly what .ngit/release.yaml publishes for this platform, and it
+      # unpacks to a working wyrd. Full `--rebuild` reproducibility is
+      # verified at change time (it rebuilds the whole Rust closure, too
+      # expensive for every CI run); see the distFor comment in flake.nix.
+      - name: Release archive smoke test
+        if: github.ref == 'refs/heads/master'
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          echo "===== archive smoke test =====" >> /tmp/nix.log
+          {
+            nix build .#wyrd-dist --print-build-logs
+            # The built filename must be one of the version-expanded `file:`
+            # paths in .ngit/release.yaml (whose entries keep the literal
+            # {version} placeholder).
+            name=$(nix eval --raw .#wyrd-dist.name)
+            version=$(nix eval --raw .#wyrd.version)
+            grep -o 'dist/[^ ]*' .ngit/release.yaml \
+              | sed "s/{version}/$version/" \
+              | grep -qxF "dist/$name"
+            rm -rf /tmp/wyrd-dist-smoke && mkdir -p /tmp/wyrd-dist-smoke
+            tar -xzf result -C /tmp/wyrd-dist-smoke
+            bin=$(echo /tmp/wyrd-dist-smoke/*/bin/wyrd)
+            test -x "$bin"
+            "$bin" --version
+          } 2>&1 | tee -a /tmp/nix.log
+
+      # Upload all logs — runs even when a step above failed, so you get the
+      # partial log up to the failure point.
+      - name: Upload combined log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-log
+          path: /tmp/nix.log
+
+  reporter:
+    if: failure() && github.event_name == 'pull_request'
+    needs: [rust, nix]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Warms the reporter's event cache first: cold full-state relay
+      # syncs cost minutes per ngit call, and the scan makes several.
+      - name: Restore ngit event cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+          restore-keys: ngit-events-Linux-
+
+      # Installs ngit for the failure reporter below, from a
+      # checksum-pinned manifest.
+      - name: Install ngit for failure reporting
+        uses: danconwaydev/setup-ngit@v3
+        with:
+          version: 3.0.1
+
+      # Collect the per-job logs uploaded with `if: always()`. /tmp is
+      # per-job, so failed-gate logs only reach this job via artifacts.
+      # Pattern matches rust-log + nix-log; a missing sibling (e.g. nix
+      # skipped because rust failed) still matches the other.
+      - name: Download job logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-log'
+          path: /tmp/logs
+          merge-multiple: true
+
+      # On `pull_request` failures only (job condition above): post a
+      # truncated failure tail on the PR and return it to draft. The
+      # shared reporter library holds the resolution, comment, and draft
+      # logic (see .ngit/act/lib/ngit-reporter.sh); missing logs are
+      # skipped, never fatal.
+      - name: Report failure to PR and return to draft
+        env:
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source .ngit/act/lib/ngit-reporter.sh
+          report_failure_to_pr \
+            /tmp/logs/rust.log /tmp/logs/nix.log
+
+      # Saves whatever the reporter synced (even on resolution failure:
+      # partial warmth still helps the next run).
+      - name: Save ngit event cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+

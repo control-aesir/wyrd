@@ -31,6 +31,13 @@ jobs:
     # Backstop for the resolve-and-draft operation below: healthy runs
     # finish in seconds, so ten minutes is pure pathology cover.
     timeout-minutes: 10
+    # The shared lib honors a pre-exported NGIT_CACHE_DIR; point it into
+    # the workspace (always absolute and present) rather than $HOME:
+    # ${{ env.HOME }} does not resolve in this runner, so a HOME-based
+    # path silently disables both the cache steps and ngit's own
+    # persistent cache below.
+    env:
+      NGIT_CACHE_DIR: ${{ github.workspace }}/.ngit-event-cache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -42,7 +49,7 @@ jobs:
       - name: Restore ngit event cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.HOME }}/.ngit-event-cache
+          path: ${{ github.workspace }}/.ngit-event-cache
           key: ngit-events-Linux-${{ github.run_id }}
           restore-keys: ngit-events-Linux-
 
@@ -73,7 +80,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.HOME }}/.ngit-event-cache
+          path: ${{ github.workspace }}/.ngit-event-cache
           key: ngit-events-Linux-${{ github.run_id }}
 
   rust:
@@ -267,6 +274,9 @@ jobs:
     runs-on: ubuntu-latest
     # Same pathology cover as the draft job: healthy runs finish fast.
     timeout-minutes: 10
+    # Same workspace-absolute cache location as the draft job (see it).
+    env:
+      NGIT_CACHE_DIR: ${{ github.workspace }}/.ngit-event-cache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -278,7 +288,7 @@ jobs:
       - name: Restore ngit event cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.HOME }}/.ngit-event-cache
+          path: ${{ github.workspace }}/.ngit-event-cache
           key: ngit-events-Linux-${{ github.run_id }}
           restore-keys: ngit-events-Linux-
 
@@ -321,6 +331,6 @@ jobs:
       - name: Save ngit event cache
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.HOME }}/.ngit-event-cache
+          path: ${{ github.workspace }}/.ngit-event-cache
           key: ngit-events-Linux-${{ github.run_id }}
 

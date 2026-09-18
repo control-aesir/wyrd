@@ -48,9 +48,11 @@ impl Supervisor {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// The live loop returned, cleanly or not: trip shutdown and settle
-    /// the mutation queue so every admitted-but-incomplete caller
-    /// resolves with `Shutdown` instead of blocking forever.
+    /// The live loop returned, cleanly or not: trip shutdown, close
+    /// admission, and settle the mutation queue so every
+    /// admitted-but-incomplete caller resolves with `Shutdown` instead
+    /// of blocking forever — and no later submission can queue behind
+    /// the dead loop.
     pub fn note_loop_ended(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.queue.shutdown();
@@ -64,46 +66,64 @@ mod tests {
     use crate::mutation::MutationKind;
     use std::time::Duration;
 
-    static FLAG: AtomicBool = AtomicBool::new(false);
+    /// A per-test stop flag: tests run in parallel, so a shared static
+    /// would let one test observe another's reset/store.
+    fn flag() -> &'static AtomicBool {
+        Box::leak(Box::new(AtomicBool::new(false)))
+    }
 
-    fn supervisor() -> (Supervisor, Arc<MutationQueue>) {
-        FLAG.store(false, Ordering::Relaxed);
+    fn supervisor() -> (Supervisor, Arc<MutationQueue>, &'static AtomicBool) {
+        let flag = flag();
         let queue = Arc::new(MutationQueue::default());
-        (Supervisor::new(Arc::clone(&queue), &FLAG), queue)
+        (Supervisor::new(Arc::clone(&queue), flag), queue, flag)
+    }
+
+    /// Block until a request is queued (or fail on timeout): faster and
+    /// less flaky than a fixed sleep, and it fails the test instead of
+    /// hanging the suite.
+    fn await_pending(queue: &MutationQueue) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue.outstanding() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submission never landed in pending"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn submit_blocking(
         queue: Arc<MutationQueue>,
     ) -> std::sync::mpsc::Receiver<Result<crate::mutation::MutationOutcome, MutationError>> {
         let (tx, rx) = std::sync::mpsc::channel();
+        let submitter = Arc::clone(&queue);
         std::thread::spawn(move || {
-            let result = queue.submit(MutationKind::Mkdir {
+            let result = submitter.submit(MutationKind::Mkdir {
                 path: "docs".to_string(),
             });
             let _ = tx.send(result);
         });
-        // Let the submission land in pending before the assertion below.
-        std::thread::sleep(Duration::from_millis(100));
+        await_pending(&queue);
         rx
     }
 
     #[test]
     fn session_end_trips_shutdown() {
-        let (supervisor, _queue) = supervisor();
-        assert!(!FLAG.load(Ordering::Relaxed));
+        let (supervisor, _queue, flag) = supervisor();
+        assert!(!flag.load(Ordering::Relaxed));
         supervisor.note_session_ended();
-        assert!(FLAG.load(Ordering::Relaxed));
+        assert!(flag.load(Ordering::Relaxed));
         // Idempotent: repeated ends stay stopped, never panic.
         supervisor.note_session_ended();
-        assert!(FLAG.load(Ordering::Relaxed));
+        assert!(flag.load(Ordering::Relaxed));
     }
 
     #[test]
     fn loop_end_completes_pending_and_trips_shutdown() {
-        let (supervisor, queue) = supervisor();
+        let (supervisor, queue, flag) = supervisor();
         let rx = submit_blocking(Arc::clone(&queue));
         supervisor.note_loop_ended();
-        assert!(FLAG.load(Ordering::Relaxed));
+        assert!(flag.load(Ordering::Relaxed));
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Err(MutationError::Shutdown)) => {}
             other => panic!("blocked submitter must resolve with Shutdown, got {other:?}"),

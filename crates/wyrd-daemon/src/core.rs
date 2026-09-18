@@ -1089,9 +1089,11 @@ where
     /// No admitted mutation submitter outlives the loop: every return
     /// path completes still-queued requests with
     /// [`MutationError::Shutdown`](crate::mutation::MutationError::Shutdown)
-    /// first, so a terminal error or a stop with in-flight demand resolves
-    /// blocked callers instead of stranding them. Taken-but-unfinished
-    /// requests are already covered by the batch guard's drop.
+    /// and closes admission first, so a terminal error or a stop with
+    /// in-flight demand resolves blocked callers instead of stranding
+    /// them — and no later submission can queue behind the dead loop.
+    /// Taken-but-unfinished requests are already covered by the batch
+    /// guard's drop.
     ///
     /// Backlog behavior under sustained traffic: each pass drains what
     /// the mailbox currently holds, so a flood costs latency (poll
@@ -2915,6 +2917,20 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Block until a mutation submission lands in pending (or fail on
+    /// timeout): faster and less flaky than a fixed sleep, and it fails
+    /// the test instead of hanging the suite.
+    fn await_pending(queue: &std::sync::Arc<crate::mutation::MutationQueue>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue.outstanding() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submission never landed in pending"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// A blocked mutation submitter is completed when the loop aborts:
     /// terminal error must not strand admitted callers. The submit lands
     /// in pending (drain fails first, so it is never taken); the loop
@@ -2928,14 +2944,16 @@ mod tests {
         drop(backend);
         let queue = Arc::clone(&live.mutations);
         let (tx, rx) = std::sync::mpsc::channel();
+        let submitter = Arc::clone(&queue);
         std::thread::spawn(move || {
-            let result = queue.submit(MutationKind::Mkdir {
+            let result = submitter.submit(MutationKind::Mkdir {
                 path: "docs".to_string(),
             });
             let _ = tx.send(result);
         });
-        // Let the submission land in pending before the loop trips the cap.
-        std::thread::sleep(Duration::from_millis(100));
+        // Wait until the submission lands in pending before the loop
+        // trips the cap.
+        await_pending(&queue);
         let stop = AtomicBool::new(false);
         let config = LiveConfig {
             interval: Duration::from_millis(1),
@@ -2979,9 +2997,9 @@ mod tests {
                 });
                 let _ = tx.send(result);
             });
-            // Let the submission land in pending, then stop: the loop
-            // exits Ok, and the waiter must still resolve.
-            std::thread::sleep(Duration::from_millis(100));
+            // Wait until the submission lands in pending, then stop: the
+            // loop exits Ok, and the waiter must still resolve.
+            await_pending(&queue);
             stop.store(true, Ordering::Relaxed);
             let mut mailbox = NoopMailbox;
             live.run_loop(

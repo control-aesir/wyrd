@@ -139,7 +139,9 @@ MutationRequest {
 2. **Bounded.** `MAX_PENDING_MUTATIONS` bounds all admitted, incomplete
    requests — including the request currently executing, not just those
    waiting. Admission beyond it returns `EAGAIN`. The queue has its own
-   lock, never the view's or the store's.
+   lock, never the view's or the store's. Shutdown closes admission:
+   once the live loop stops, new submissions are refused with `EIO`
+   (`Shutdown`) instead of queueing behind a loop that will never drain.
 3. **Synchronous, no silent post-timeout commit.** Unlike a fetch want
    (which may outlive its waiter), a mutation has no wait timeout:
    admission is immediate (or `EAGAIN`), and once admitted the request
@@ -150,7 +152,11 @@ MutationRequest {
    hard liveness dependency for every committing FUSE operation: a wedged
    loop blocks the caller indefinitely. That is a daemon health failure
    bounded by the process supervisor, not a per-request cancellation, and
-   it is the deliberate price of the no-post-timeout guarantee.
+   it is the deliberate price of the no-post-timeout guarantee. Loop
+   *exit* is different from a wedged loop: terminal error or shutdown
+   resolves every admitted-but-incomplete request with `EIO`
+   (`Shutdown`) instead of stranding it, and the closed queue refuses
+   new submissions the same way.
 5. **Publication is the same path as fetch.** A mutation applies under
    the store write path and publishes heads and materialization under
    one short view write lock, exactly as a fetch pass does. Neither lock

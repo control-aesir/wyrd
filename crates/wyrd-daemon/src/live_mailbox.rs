@@ -2731,26 +2731,24 @@ mod tests {
     //
     // `#[ignore]` keeps the group out of the default `cargo nextest run`
     // gate, so third-party availability can never flake CI. Selecting the
-    // group without the variable is a loud failure, never a silent pass:
-    // an explicitly requested interop run that asserts nothing would be a
-    // green lie. Each run publishes a few gift wraps to fresh random
+    // group runs it against `WYRD_TEST_RELAY_URL`, defaulting to the
+    // proven relay below — real assertions either way, never a silent
+    // pass. Each run publishes a few gift wraps to fresh random
     // recipients — negligible traffic addressed to keys nobody holds.
 
-    /// Public relay URL for the opt-in interop group. Missing or empty
-    /// means "not configured", which fails loudly: these tests only run
-    /// when explicitly selected, so silence would be a false green.
+    /// Public relay URL for the opt-in interop group: `WYRD_TEST_RELAY_URL`
+    /// when set and non-empty, otherwise the default public relay below.
+    /// The group always executes real assertions when selected — there is
+    /// no configured-but-silent mode to mistake for green.
     fn external_relay_url() -> String {
         let url = std::env::var("WYRD_TEST_RELAY_URL").unwrap_or_default();
-        let url = url.trim().to_owned();
-        assert!(
-            !url.is_empty(),
-            "set WYRD_TEST_RELAY_URL to a public relay to run the interop group"
-        );
+        let url = url.trim();
+        let url = if url.is_empty() { "wss://nos.lol" } else { url };
         assert!(
             url.starts_with("wss://"),
             "interop covers the TLS path; use a wss:// relay URL, got {url}"
         );
-        url
+        url.to_owned()
     }
 
     /// Longer waits for the external group: TLS handshake, real-relay
@@ -2770,7 +2768,7 @@ mod tests {
     /// allowlist) fails this test at the delivery wait — a relay-policy
     /// signal, not mailbox logic; pick an open relay.
     #[test]
-    #[ignore = "needs WYRD_TEST_RELAY_URL pointing at a public relay"]
+    #[ignore = "opt-in: runs live assertions against a public relay"]
     fn external_relay_gift_wrap_round_trip_over_tls() {
         let relays = vec![external_relay_url()];
         let sender = sender_keys();
@@ -2820,7 +2818,7 @@ mod tests {
     /// covered hermetically by the MiniRelay outage tests — no public API
     /// can force a live relay into an outage.
     #[test]
-    #[ignore = "needs WYRD_TEST_RELAY_URL pointing at a public relay"]
+    #[ignore = "opt-in: runs live assertions against a public relay"]
     fn external_relay_restart_replay_converges() {
         let relays = vec![external_relay_url()];
         let sender = sender_keys();

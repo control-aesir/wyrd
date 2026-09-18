@@ -34,6 +34,19 @@
 # republished.
 REPO_NADDR="naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl97nj2qvzqqqrhnyzuuxrw"
 
+# Bound every ngit call: a hung relay must fail fast and loud, never
+# stall the reporter into the job timeout. Kills are safe on the
+# read path (list/view/status are side-effect free); on the publish
+# path a kill risks a half-done report, which still beats a hung job.
+# `timeout` may be absent on some runners; degrade to a direct call.
+bounded_ngit() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 120 ngit "$@"
+  else
+    ngit "$@"
+  fi
+}
+
 report_failure_to_pr() {
   if [ "$#" -eq 0 ]; then
     echo "report_failure_to_pr: no log files given" >&2
@@ -53,6 +66,18 @@ report_failure_to_pr() {
     exit 1
   }
 
+  command -v git >/dev/null || {
+    echo "git is required for PR resolution" >&2
+    exit 1
+  }
+
+  # ngit commands anchor on a git repository, but the act checkout can
+  # carry a stub or no .git metadata at all. A bare init suffices: the
+  # target travels in --repo explicitly, so no remotes are needed.
+  if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    git init -q
+  fi
+
   local PR_ID=""
   # Primary resolution: match the checked-out head sha against
   # per-revision commits in each open/draft PR's CI record. Multiple
@@ -61,12 +86,12 @@ report_failure_to_pr() {
     local sha_matches=()
     local candidates candidate
     candidates="$(
-      ngit --repo "$REPO_NADDR" pr list --json --status open,draft |
+      bounded_ngit --repo "$REPO_NADDR" pr list --json --status open,draft |
         jq -r '.[].id' || true
     )"
     # Intentional word splitting: ngit emits one id per line.
     for candidate in $candidates; do
-      if ngit --repo "$REPO_NADDR" pr view "$candidate" --json |
+      if bounded_ngit --repo "$REPO_NADDR" pr view "$candidate" --json |
         jq -e --arg sha "$GITHUB_SHA" '
           ([(.ci.runs // [] | .[].commit),
             (.ci.outdated // [] | .[].commit)]
@@ -87,7 +112,7 @@ report_failure_to_pr() {
   # a 1618 proposal or a 1619 revision to its PR.
   if [ -z "$PR_ID" ] && [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
     PR_ID="$(
-      ngit --repo "$REPO_NADDR" \
+      bounded_ngit --repo "$REPO_NADDR" \
         ci status "$NGIT_CI_TRIGGER_EVENT" --json |
         jq -r '.target.pr // empty' || true
     )"
@@ -98,7 +123,7 @@ report_failure_to_pr() {
   # bare name too.
   if [ -z "$PR_ID" ] && [ -n "${PR_BRANCH:-}" ]; then
     PR_ID="$(
-      ngit --repo "$REPO_NADDR" pr list --json |
+      bounded_ngit --repo "$REPO_NADDR" pr list --json |
         jq -r --arg branch "$PR_BRANCH" '
           .[] |
           select(.branch == $branch or
@@ -163,13 +188,13 @@ report_failure_to_pr() {
     rm -f "$COMMENT_BODY.trimmed"
   fi
 
-  ngit --repo "$REPO_NADDR" \
+  bounded_ngit --repo "$REPO_NADDR" \
     --nsec-file "$NGIT_NSEC_FILE" \
     pr comment "$PR_ID" \
     --body "$(cat "$COMMENT_BODY")" \
     --json
 
-  ngit --repo "$REPO_NADDR" \
+  bounded_ngit --repo "$REPO_NADDR" \
     --nsec-file "$NGIT_NSEC_FILE" \
     pr draft "$PR_ID" \
     --reason "CI failed - returned to draft automatically" \

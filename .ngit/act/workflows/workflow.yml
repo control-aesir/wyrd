@@ -11,6 +11,7 @@ on:
       - "flake.nix"
       - "flake.lock"
       - ".ngit/act/workflows/workflow.yml"
+      - ".ngit/act/lib/ngit.sh"
   pull_request:
     types: [opened, ready_for_review]
     paths:
@@ -21,11 +22,15 @@ on:
       - "flake.nix"
       - "flake.lock"
       - ".ngit/act/workflows/workflow.yml"
+      - ".ngit/act/lib/ngit.sh"
 
 jobs:
   draft:
     if: github.event.action == 'opened'
     runs-on: ubuntu-latest
+    # Backstop for the resolve-and-draft operation below: healthy runs
+    # finish in seconds, so ten minutes is pure pathology cover.
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -54,11 +59,12 @@ jobs:
       - name: Draft the new PR
         continue-on-error: true
         env:
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
-          source .ngit/act/lib/ngit-reporter.sh
+          source .ngit/act/lib/ngit.sh
           draft_new_pr
 
       # Saves the scan's sync progress even when drafting failed: the
@@ -259,6 +265,8 @@ jobs:
     if: failure() && github.event_name == 'pull_request'
     needs: [rust, nix]
     runs-on: ubuntu-latest
+    # Same pathology cover as the draft job: healthy runs finish fast.
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -295,7 +303,7 @@ jobs:
       # On `pull_request` failures only (job condition above): post a
       # truncated failure tail on the PR and return it to draft. The
       # shared reporter library holds the resolution, comment, and draft
-      # logic (see .ngit/act/lib/ngit-reporter.sh); missing logs are
+      # logic (see .ngit/act/lib/ngit.sh); missing logs are
       # skipped, never fatal.
       - name: Report failure to PR and return to draft
         env:
@@ -304,7 +312,7 @@ jobs:
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
-          source .ngit/act/lib/ngit-reporter.sh
+          source .ngit/act/lib/ngit.sh
           report_failure_to_pr \
             /tmp/logs/rust.log /tmp/logs/nix.log
 

@@ -34,6 +34,12 @@
 # republished.
 REPO_NADDR="naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl97nj2qvzqqqrhnyzuuxrw"
 
+# Event-cache override: the workflows restore/save this directory around
+# red runs so relay reads warm up instead of cold-syncing full repo state
+# on every reporter invocation. Defaults here so the reporter works
+# standalone; a calling step may export its own value first.
+: "${NGIT_CACHE_DIR:=$HOME/.ngit-event-cache}"
+
 # Bound every ngit call: a hung relay must fail fast and loud, never
 # stall the reporter into the job timeout. Kills are safe on the
 # read path (list/view/status are side-effect free); on the publish

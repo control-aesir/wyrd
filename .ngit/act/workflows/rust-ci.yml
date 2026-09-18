@@ -87,6 +87,16 @@ jobs:
           set -o pipefail
           cargo test --color never --workspace --doc 2>&1 | tee /tmp/doctests.log
 
+      # Warms the reporter's event cache first: cold full-state relay
+      # syncs cost minutes per ngit call, and the scan makes several.
+      - name: Restore ngit event cache
+        if: failure()
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+          restore-keys: ngit-events-Linux-
+
       # Installs ngit for the failure reporter below, from a
       # checksum-pinned manifest. Runs only on `pull_request` failures,
       # matching the reporter condition, so green runs pay nothing.
@@ -115,156 +125,12 @@ jobs:
           report_failure_to_pr \
             /tmp/check.log /tmp/clippy.log /tmp/features.log /tmp/test.log /tmp/doctests.log
 
-      # Disabled since it's not working for now
-      # - if: github.event_name == 'pull_request'
-      - if: false
-        name: Run OpenCode review
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y curl wget gnupg
-
-          # Install ngit and OpenCode
-          curl -Ls https://ngit.dev/install.sh | bash
-          curl -fsSL https://opencode.ai/install | bash
-
-          # Make installed binaries available
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-
-          # Fetch the actual PR base branch.
-          git fetch origin "$BASE_BRANCH" --depth=1
-
-          # Keep the ngit secret out of OpenCode's environment.
-          NGIT_NSEC_FILE="$RUNNER_TEMP/ngit-nsec"
-          printf '%s' "$NGIT_NSEC" > "$NGIT_NSEC_FILE"
-          chmod 600 "$NGIT_NSEC_FILE"
-          unset NGIT_NSEC
-
-          # Gather PR metadata for the reviewer.
-          PR_INFO="$(ngit pr list --json)"
-          PR_ID="$(
-            printf '%s\n' "$PR_INFO" |
-              jq -r --arg branch "$PR_BRANCH" '
-                .[] |
-                select(.branch == $branch) |
-                .id
-              ' |
-              head -n1
-          )"
-
-          if [ -z "$PR_ID" ] || [ "$PR_ID" = "null" ]; then
-            echo "Could not determine ngit PR ID for branch: $PR_BRANCH"
-            echo "$PR_INFO"
-            exit 1
-          fi
-
-          echo "Reviewing PR: $PR_ID"
-          echo "Branch: $PR_BRANCH"
-          echo "Base: $BASE_BRANCH"
-
-          # Ask OpenCode to perform the review.
-          opencode run \
-            --model openrouter/openrouter/free \
-            "$(cat <<EOF
-          # Full branch code review
-
-          You are reviewing a pull request.
-
-          PR branch: ${PR_BRANCH}
-          Base branch: ${BASE_BRANCH}
-          PR ID: ${PR_ID}
-
-          ## Recent commits
-
-          !git log origin/${BASE_BRANCH}..HEAD --oneline
-
-          ## Diff statistics
-
-          !git diff origin/${BASE_BRANCH}...HEAD --stat
-
-          ## Full diff
-
-          !git diff origin/${BASE_BRANCH}...HEAD
-
-          ## Code quality checks
-
-          ### Check
-
-          !cat /tmp/check.log
-
-          ### Clippy
-
-          !cat /tmp/clippy.log
-
-          ### Tests
-
-          !cat /tmp/test.log
-
-          ## Your task
-
-          Perform a comprehensive code review of the current branch compared
-          with the base branch.
-
-          Do not limit the review to the supplied diff summary. Inspect the
-          repository and relevant surrounding code as necessary to understand
-          the changes and their invariants.
-
-          Cover:
-
-          1. Overall assessment
-          2. Potential bugs and edge cases
-          3. Correctness and architectural concerns
-          4. Code quality, readability, and maintainability
-          5. Test coverage and missing tests
-          6. Clippy warnings and suggestions
-          7. Performance considerations
-          8. API, serialization, compatibility, and security concerns where
-             applicable
-          9. Specific improvements with file:line references
-
-          Prioritize actionable findings over generic praise.
-
-          Clearly distinguish:
-          - actual bugs
-          - likely problems
-          - risks / design concerns
-          - optional improvements
-
-          Do not invent issues that are not supported by the code.
-
-          The final output must be well-formatted Markdown suitable for posting
-          directly as a pull-request review comment.
-
-          Do not post the review yourself.
-
-          Write the final review to:
-
-              /tmp/pr-review.md
-          EOF
-          )"
-
-          # Make sure OpenCode actually produced the review.
-          if [ ! -s /tmp/pr-review.md ]; then
-            echo "OpenCode did not produce /tmp/pr-review.md"
-            exit 1
-          fi
-
-          echo "Review generated:"
-          sed -n '1,120p' /tmp/pr-review.md
-
-          # Publish the review through ngit.
-          ngit \
-            --nsec-file "$NGIT_NSEC_FILE" \
-            pr comment "$PR_ID" \
-            --body "$(cat /tmp/pr-review.md)" \
-            --json
-
-          # Remove the secret as soon as it is no longer needed.
-          rm -f "$NGIT_NSEC_FILE"
+      # Saves whatever the reporter synced (even on resolution failure:
+      # partial warmth still helps the next run). Failure-gated like the
+      # restore, so green runs pay nothing.
+      - name: Save ngit event cache
+        if: failure()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}

@@ -115,6 +115,16 @@ jobs:
       #       "$bin" --version
       #     } 2>&1 | tee /tmp/nix-dist.log
 
+      # Warms the reporter's event cache first: cold full-state relay
+      # syncs cost minutes per ngit call, and the scan makes several.
+      - name: Restore ngit event cache
+        if: failure()
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+          restore-keys: ngit-events-Linux-
+
       # Installs ngit for the failure reporter below, from a
       # checksum-pinned manifest. Runs only on `pull_request` failures,
       # matching the reporter condition, so green runs pay nothing.
@@ -140,3 +150,13 @@ jobs:
           source .ngit/act/lib/ngit-reporter.sh
           report_failure_to_pr \
             /tmp/nix-git.log /tmp/nix-check.log /tmp/nix-dist.log
+
+      # Saves whatever the reporter synced (even on resolution failure:
+      # partial warmth still helps the next run). Failure-gated like the
+      # restore, so green runs pay nothing.
+      - name: Save ngit event cache
+        if: failure()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}

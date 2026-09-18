@@ -2730,18 +2730,27 @@ mod tests {
     // from here, so prefer a relay that answers.
     //
     // `#[ignore]` keeps the group out of the default `cargo nextest run`
-    // gate, and without the variable each test passes trivially after a
-    // skip notice, so third-party availability can never flake CI. Each run
-    // publishes a few gift wraps to fresh random recipients — negligible
-    // traffic addressed to keys nobody holds.
+    // gate, so third-party availability can never flake CI. Selecting the
+    // group without the variable is a loud failure, never a silent pass:
+    // an explicitly requested interop run that asserts nothing would be a
+    // green lie. Each run publishes a few gift wraps to fresh random
+    // recipients — negligible traffic addressed to keys nobody holds.
 
-    /// Public relay URL for the opt-in interop group. `None` means "not
-    /// configured": the caller skips with a notice instead of failing.
-    fn external_relay_url() -> Option<String> {
-        std::env::var("WYRD_TEST_RELAY_URL")
-            .ok()
-            .map(|url| url.trim().to_owned())
-            .filter(|url| !url.is_empty())
+    /// Public relay URL for the opt-in interop group. Missing or empty
+    /// means "not configured", which fails loudly: these tests only run
+    /// when explicitly selected, so silence would be a false green.
+    fn external_relay_url() -> String {
+        let url = std::env::var("WYRD_TEST_RELAY_URL").unwrap_or_default();
+        let url = url.trim().to_owned();
+        assert!(
+            !url.is_empty(),
+            "set WYRD_TEST_RELAY_URL to a public relay to run the interop group"
+        );
+        assert!(
+            url.starts_with("wss://"),
+            "interop covers the TLS path; use a wss:// relay URL, got {url}"
+        );
+        url
     }
 
     /// Longer waits for the external group: TLS handshake, real-relay
@@ -2763,17 +2772,9 @@ mod tests {
     #[test]
     #[ignore = "needs WYRD_TEST_RELAY_URL pointing at a public relay"]
     fn external_relay_gift_wrap_round_trip_over_tls() {
-        let Some(url) = external_relay_url() else {
-            eprintln!("skipping: set WYRD_TEST_RELAY_URL to run the interop group");
-            return;
-        };
-        assert!(
-            url.starts_with("wss://"),
-            "interop covers the TLS path; use a wss:// relay URL, got {url}"
-        );
+        let relays = vec![external_relay_url()];
         let sender = sender_keys();
         let receiver = keys();
-        let relays = vec![url];
 
         let mut first = live_mailbox(&receiver, &relays, temp_path("seen-external"));
         assert_eq!(
@@ -2807,23 +2808,23 @@ mod tests {
         assert_quiet(&mut first);
     }
 
-    /// Reconnect plus resubscribe against real relay history: after acking,
-    /// a fresh mailbox on the same dedupe log replays whatever the relay
-    /// retained and must converge to nothing new — the MiniRelay restart
-    /// test, but over a relay that expires, rate-limits, and replays on
-    /// its own terms. The grace sleep lets the replay pass through `recv`'s
-    /// dedupe before the quiet assertion, so the collapse path is
-    /// exercised rather than merely untriggered.
+    /// Restart against real relay history, in two reopens that prove both
+    /// halves: after acking, a fresh mailbox on a *fresh* dedupe log must
+    /// deliver the retained wrap — observable proof the relay actually
+    /// replayed history, not a vacuous quiet. Only then does a reopen on
+    /// the *original* log assert convergence to nothing new, exercising
+    /// the durable-dedupe collapse path rather than merely untriggering
+    /// it. Named for what it is: a restart/dedupe check over a relay that
+    /// expires, rate-limits, and replays on its own terms. Supervisor
+    /// recovery (`recover_stream`, `recover_relays`, `resubscribe`) stays
+    /// covered hermetically by the MiniRelay outage tests — no public API
+    /// can force a live relay into an outage.
     #[test]
     #[ignore = "needs WYRD_TEST_RELAY_URL pointing at a public relay"]
-    fn external_relay_resubscribe_replay_converges() {
-        let Some(url) = external_relay_url() else {
-            eprintln!("skipping: set WYRD_TEST_RELAY_URL to run the interop group");
-            return;
-        };
+    fn external_relay_restart_replay_converges() {
+        let relays = vec![external_relay_url()];
         let sender = sender_keys();
         let receiver = keys();
-        let relays = vec![url];
         let seen = temp_path("seen-external-replay");
 
         let mut first = live_mailbox(&receiver, &relays, seen.clone());
@@ -2844,9 +2845,24 @@ mod tests {
         assert_quiet(&mut first);
         drop(first);
 
+        // Fresh log: the retained wrap must redeliver, proving the relay
+        // replayed real history into this subscription.
+        let mut replayed =
+            live_mailbox(&receiver, &relays, temp_path("seen-external-replay-fresh"));
+        wait_for_health(&replayed, true, EXTERNAL_DELIVERY_TIMEOUT);
+        let redelivery = wait_for_delivery(&mut replayed, EXTERNAL_DELIVERY_TIMEOUT)
+            .expect("relay replays retained history");
+        replayed
+            .settle(redelivery.id(), Disposition::Ack)
+            .expect("acks");
+        drop(replayed);
+
+        // Original log: the proven replay must now collapse to silence.
+        // The grace window only needs to cover the resubscribe round trip —
+        // replay itself was just observed seconds ago on the same relay.
         let mut reopened = live_mailbox(&receiver, &relays, seen);
         wait_for_health(&reopened, true, EXTERNAL_DELIVERY_TIMEOUT);
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(3));
         assert_quiet(&mut reopened);
     }
 }

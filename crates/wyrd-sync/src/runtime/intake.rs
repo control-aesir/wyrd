@@ -13,9 +13,7 @@ use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::{CapabilityError, WrappedCapability};
 use crate::membership::TransitionStatus;
-use crate::transport::mailbox::{
-    open_from_sender, Disposition, Mailbox, MailboxEnvelope, MAX_MAILBOX_CIPHERTEXT_LEN,
-};
+use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxEnvelope};
 
 const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
@@ -350,6 +348,7 @@ mod tests {
         capability_message, control_key, deliver, drain, encryption_key, fixture, identity, owner,
         queue, reopen, transition_message, MemoryMailbox,
     };
+    use crate::transport::mailbox::MAX_MAILBOX_CIPHERTEXT_LEN;
     /// Hand-sign one transition against the fixture drive (mirrors
     /// the conformance helper): for siblings the builder cannot
     /// produce.

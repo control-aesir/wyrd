@@ -3,7 +3,7 @@ use super::store::{atomic_write, commit_name, DurableStore};
 use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
-use crate::control::{ControlMessageId, SnapshotAnnouncement};
+use crate::control::{ControlKind, ControlMessageId, SealedControl, SnapshotAnnouncement};
 use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::epoch::EpochSecret;
 use crate::membership::test_util::{admit, drive, key, sign, Builder};
@@ -993,15 +993,35 @@ fn announcement_outbox_round_trips_and_derives_pending() {
     let other = SnapshotId::from_bytes([0xA2; 32]);
     let alice = DeviceId::from_bytes([0xB1; 32]);
     let bob = DeviceId::from_bytes([0xB2; 32]);
+    // Structurally valid sealed bytes (decodable envelope of the
+    // announcement kind — the codec checks structure, not the seal).
+    let sealed = SealedControl {
+        version: 0x00,
+        drive: drive(),
+        kind: ControlKind::SnapshotAnnouncement,
+        epoch: 2,
+        nonce: [0xC1; 24],
+        ciphertext: vec![0xC2; 32],
+    }
+    .encode();
+    let rival = SealedControl {
+        version: 0x00,
+        drive: drive(),
+        kind: ControlKind::SnapshotAnnouncement,
+        epoch: 2,
+        nonce: [0xD1; 24],
+        ciphertext: vec![0xD2; 32],
+    }
+    .encode();
     store
         .commit(&[
             Fact::AnnouncementQueued(snapshot, alice),
             Fact::AnnouncementQueued(snapshot, bob),
             Fact::AnnouncementQueued(other, alice),
-            Fact::AnnouncementSealed(snapshot, vec![0xC1, 0xC2]),
+            Fact::AnnouncementSealed(snapshot, sealed.clone()),
             // A rival seal must not displace the first: retries stay
             // byte-identical to the first send.
-            Fact::AnnouncementSealed(snapshot, vec![0xD1]),
+            Fact::AnnouncementSealed(snapshot, rival),
             Fact::AnnouncementDelivered(snapshot, alice),
         ])
         .unwrap();
@@ -1014,7 +1034,7 @@ fn announcement_outbox_round_trips_and_derives_pending() {
     );
     assert_eq!(
         rebuilt.runtime.announcement_sealed_bytes(&snapshot),
-        Some(&vec![0xC1, 0xC2]),
+        Some(sealed.as_slice()),
         "first seal wins"
     );
     assert!(rebuilt.runtime.announcement_sealed_bytes(&other).is_none());

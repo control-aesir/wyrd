@@ -90,6 +90,12 @@ impl LoadedFacts {
                 self.runtime_facts.push(RuntimeFact::ControlMessage(id));
             }
             DecodedFact::AnnouncementQueued(snapshot, recipient) => {
+                // Orphan-tolerant by design: a queued pair whose
+                // snapshot never materializes (or whose recipient is
+                // gone) stays pending and `announce_pending` skips
+                // bodyless entries — the same recoverable-orphan class
+                // as announcements for unfetched snapshots. Only the
+                // structural decode above fails closed.
                 self.announcement_queued.push((snapshot, recipient));
                 self.runtime_facts
                     .push(RuntimeFact::AnnouncementQueued(snapshot, recipient));

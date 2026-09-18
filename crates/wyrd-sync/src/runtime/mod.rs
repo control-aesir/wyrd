@@ -271,9 +271,10 @@ impl RuntimeState {
     }
 
     /// The sealed announcement bytes for one snapshot, if the first
-    /// send sealed them.
-    pub fn announcement_sealed_bytes(&self, snapshot: &SnapshotId) -> Option<&Vec<u8>> {
-        self.announcement_sealed.get(snapshot)
+    /// send sealed them. A slice, not the stored vector: callers only
+    /// ever read or re-send the bytes.
+    pub fn announcement_sealed_bytes(&self, snapshot: &SnapshotId) -> Option<&[u8]> {
+        self.announcement_sealed.get(snapshot).map(Vec::as_slice)
     }
 
     /// Every still-undischarged obligation, in `(snapshot, recipient)`

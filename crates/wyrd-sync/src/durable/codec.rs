@@ -18,7 +18,7 @@ use wyrd_format::{
 
 use super::{DurableError, Fact};
 use crate::control::message::{ControlKind, Message};
-use crate::control::{ControlMessageId, SnapshotAnnouncement};
+use crate::control::{ControlMessageId, SealedControl, SnapshotAnnouncement};
 use crate::keys::capability::{encoding, Capability};
 
 use crate::keys::{aead, random_bytes};
@@ -41,7 +41,8 @@ pub(crate) const TAG_SNAPSHOT_BODY: u8 = 0x09;
 /// One announcement obligation: snapshot id (32) ‖ recipient (32).
 const TAG_ANNOUNCEMENT_QUEUED: u8 = 0x0A;
 /// Sealed announcement bytes: snapshot id (32) ‖ sealed control bytes.
-const TAG_ANNOUNCEMENT_SEALED: u8 = 0x0B;
+/// Crate-visible for the raw-commit test seam.
+pub(crate) const TAG_ANNOUNCEMENT_SEALED: u8 = 0x0B;
 /// One discharged obligation: snapshot id (32) ‖ recipient (32).
 const TAG_ANNOUNCEMENT_DELIVERED: u8 = 0x0C;
 
@@ -384,6 +385,16 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
                 return None;
             }
             let snapshot = SnapshotId::from_bytes(record[..32].try_into().ok()?);
+            // Structural check only: the bytes must decode as a sealed
+            // announcement envelope. Opening (and cross-checking
+            // snapshot/author/epoch) needs epoch keys Replay does not
+            // hold — that verification belongs to intake, not to the
+            // structural rebuild. Garbage fails the file, like any
+            // malformed known record.
+            let sealed = SealedControl::decode(&record[32..]).ok()?;
+            if sealed.kind != ControlKind::SnapshotAnnouncement {
+                return None;
+            }
             Some(DecodedFact::AnnouncementSealed(
                 snapshot,
                 record[32..].to_vec(),

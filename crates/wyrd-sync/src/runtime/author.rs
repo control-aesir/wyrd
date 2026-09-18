@@ -513,9 +513,13 @@ pub(super) fn announce(
         .members_of(&body.membership)
         .ok_or(EngineError::NoCanonicalMembership)?;
 
-    // Top up the author-time obligation for pre-outbox snapshots and
-    // memberships that grew since authoring. Already-covered pairs are
-    // skipped, so a re-announce commits nothing new here.
+    // Top up the author-time obligation for pre-outbox snapshots
+    // (authored before the outbox existed, so no queue facts). The
+    // membership of a fixed transition is immutable, so for current
+    // snapshots this always matches what authoring queued — the branch
+    // exists for legacy stores, not for recipient-set growth.
+    // Already-covered pairs are skipped, so a re-announce commits
+    // nothing new here.
     let mut obligation = Vec::new();
     for member in &members {
         if *member != engine.device
@@ -533,7 +537,7 @@ pub(super) fn announce(
         .runtime
         .announcement_sealed_bytes(&body.snapshot_id())
     {
-        Some(bytes) => bytes.clone(),
+        Some(bytes) => bytes.to_vec(),
         None => {
             let mut announcement = SnapshotAnnouncement {
                 snapshot: body.snapshot_id(),
@@ -562,6 +566,13 @@ pub(super) fn announce(
                 &Message::SnapshotAnnouncement(announcement),
             )?;
             let bytes = sealed.encode();
+            // Validate before committing: persisting oversize bytes
+            // would poison the obligation — first-seal-wins means the
+            // retry could never replace them, failing every resend
+            // even with a valid route. The queue facts stay
+            // uncommitted too; the author-time obligation (already
+            // durable) still covers the retry.
+            crate::transport::mailbox::check_outbound_size(&bytes)?;
             obligation.push(Fact::AnnouncementSealed(body.snapshot_id(), bytes.clone()));
             bytes
         }
@@ -615,7 +626,7 @@ pub(super) fn announce_pending(
         // store lock), so the set cannot drift mid-resume.
         match rebuilt.runtime.announcement_sealed_bytes(&snapshot_id) {
             Some(bytes) => {
-                let bytes = bytes.clone();
+                let bytes = bytes.to_vec();
                 sent += send_pending_for(engine, snapshot_id, &bytes, mailbox)?;
             }
             None => {

@@ -89,6 +89,23 @@ fn device_id_from_secret(secret: &SecretKey) -> DeviceId {
     DeviceId::from_bytes(xonly.serialize())
 }
 
+/// Fail-fast outbound gate, shared by the send path and the
+/// announcement outbox: control bytes over [`MAX_MAILBOX_OPEN_BYTES`]
+/// are rejected before sealing, because the peer's matching inbound
+/// gate would discard them after a wasted relay round trip. The outbox
+/// checks this *before* committing its sealed-bytes fact — persisting
+/// oversize bytes would poison the obligation into permanent retry
+/// failure under first-seal-wins.
+pub fn check_outbound_size(control_bytes: &[u8]) -> Result<(), MailboxError> {
+    if control_bytes.len() > MAX_MAILBOX_OPEN_BYTES {
+        return Err(MailboxError::Oversize {
+            bytes: control_bytes.len(),
+            max: MAX_MAILBOX_OPEN_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// Seal Wyrd control bytes (`SealedControl::encode()` or
 /// `SealedBootstrap::encode()`) for one recipient under NIP-44, using
 /// the sender's Nostr identity secret key as the ECDH source. The sender
@@ -103,12 +120,7 @@ pub fn seal_for_recipient(
     recipient: DeviceId,
     control_bytes: &[u8],
 ) -> Result<MailboxEnvelope, MailboxError> {
-    if control_bytes.len() > MAX_MAILBOX_OPEN_BYTES {
-        return Err(MailboxError::Oversize {
-            bytes: control_bytes.len(),
-            max: MAX_MAILBOX_OPEN_BYTES,
-        });
-    }
+    check_outbound_size(control_bytes)?;
     let sender_key = sender_secret.secret_key();
     let sk = nostr_secret(&sender_key)?;
     let sender = device_id_from_secret(&sender_key);

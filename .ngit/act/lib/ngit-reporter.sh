@@ -82,9 +82,9 @@ resolve_pr() {
     # Overall deadline: every ngit call cold-syncs full repo state, so
     # per-call timeouts alone still allow a multi-minute loop. Expire
     # the whole scan loudly instead of stalling into the job timeout.
-    # Overridable for tests; production default bounds the scan while
-    # leaving healthy (tens of seconds) syncs room.
-    local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-240}))
+    # Overridable for tests; production default covers the observed
+    # healthy-cold range (minutes) while still bounding pathology.
+    local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-420}))
     for candidate in $candidates; do
       if [ "$SECONDS" -ge "$deadline" ]; then
         echo "PR resolution by head sha timed out" >&2

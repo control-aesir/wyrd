@@ -32,6 +32,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Warms the auto-draft scan: the first-ever cold scan takes
+      # minutes (full-state relay sync per call), later runs reuse this.
+      - name: Restore ngit event cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+          restore-keys: ngit-events-Linux-
+
       - name: Install ngit for auto-draft
         uses: danconwaydev/setup-ngit@v3
         with:
@@ -40,7 +49,10 @@ jobs:
       # New PRs land open; the project works draft-first, so draft them
       # at creation instead of waiting for a human pass. Silent state
       # change, no comment; skips gracefully without the credential.
+      # Best-effort: a failed auto-draft must never red a fresh PR when
+      # the author can draft manually, so failures don't fail the job.
       - name: Draft the new PR
+        continue-on-error: true
         env:
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
         run: |
@@ -48,6 +60,15 @@ jobs:
           # shellcheck disable=SC1091
           source .ngit/act/lib/ngit-reporter.sh
           draft_new_pr
+
+      # Saves the scan's sync progress even when drafting failed: the
+      # next run restores warmer instead of starting cold again.
+      - name: Save ngit event cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
 
   rust:
     if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'

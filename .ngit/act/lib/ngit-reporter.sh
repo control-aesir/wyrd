@@ -89,8 +89,17 @@ report_failure_to_pr() {
       bounded_ngit --repo "$REPO_NADDR" pr list --json --status open,draft |
         jq -r '.[].id' || true
     )"
-    # Intentional word splitting: ngit emits one id per line.
+    # Overall deadline: every ngit call cold-syncs full repo state, so
+    # per-call timeouts alone still allow a multi-minute loop. Expire
+    # the whole scan loudly instead of stalling into the job timeout.
+    # Overridable for tests; production default bounds the scan while
+    # leaving healthy (tens of seconds) syncs room.
+    local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-240}))
     for candidate in $candidates; do
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "PR resolution by head sha timed out" >&2
+        exit 1
+      fi
       if bounded_ngit --repo "$REPO_NADDR" pr view "$candidate" --json |
         jq -e --arg sha "$GITHUB_SHA" '
           ([(.ci.runs // [] | .[].commit),

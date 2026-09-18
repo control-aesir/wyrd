@@ -221,6 +221,18 @@ pub(super) fn encode_fact(
             Ok((TAG_ANNOUNCEMENT_QUEUED, bytes))
         }
         Fact::AnnouncementSealed(snapshot, sealed) => {
+            // Same structural gate as the decoder, at commit time:
+            // only a decodable announcement-kind envelope commits, so
+            // a malformed sealed fact fails here with the store
+            // untouched instead of poisoning a later rebuild. (The
+            // size gate lives in the outbox call path, which checks
+            // before committing.)
+            let decoded = SealedControl::decode(sealed)
+                .ok()
+                .filter(|envelope| envelope.kind == ControlKind::SnapshotAnnouncement);
+            if decoded.is_none() {
+                return Err(DurableError::InvalidOutbox);
+            }
             let mut bytes = Vec::with_capacity(32 + sealed.len());
             bytes.extend_from_slice(snapshot.as_bytes());
             bytes.extend_from_slice(sealed);

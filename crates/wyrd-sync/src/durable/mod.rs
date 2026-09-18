@@ -158,6 +158,8 @@ pub enum DurableError {
     Install(#[from] InstallError),
     #[error("commit {0} is missing at or below CURRENT")]
     MissingCommit(u64),
+    #[error("announcement outbox fact failed validation")]
+    InvalidOutbox,
     #[error("commit sequence exhausted")]
     SequenceExhausted,
 }

@@ -18,8 +18,9 @@ The protocol/core layers are effectively frozen for v0:
 
 Phases 1 to 4 shipped their tracked scope: the runtime sync engine, the
 read-only filesystem slice, crash recovery, recovery foundations, and
-the hardening passes are in place and under test. The frontier is the
-live network and the write path (see Current Focus below). "Recovery"
+the hardening passes are in place and under test. The mounted write path
+has landed since, and the mount serves read-write by default. The
+frontier is the live network (see Current Focus below). "Recovery"
 below always means root-loss recovery per `docs/trust.md` (guardians,
 Shamir reconstruction); crash/restart recovery shipped in Phase 1 and
 the guardian workflow itself is unshipped — see Phase 3.
@@ -115,25 +116,27 @@ Tracked by (all applied):
 Landed: decode-cost and allocation bounds, property coverage for canonical
 state transitions, and fuzzing for the envelope and decoder surfaces.
 
-## Current Focus: The Live Network and the Write Path
+## Current Focus: The Live Network
 
 The serving router loopback has landed: a real-iroh endpoint over the
 durable vault serves peer fetches by transport root, announcement
 `node_addr` routes publish into the fetch plane on every sync pass, and a
-serving restart's route update rewires serving (contract 13). What comes
-next, roughly in order:
+serving restart's route update rewires serving (contract 13).
+
+The mounted write path has landed too, as designed in
+`docs/write-path.md` (`docs(write-path): design the mounted write path`):
+`feat(format): mkdir, rmdir, and rename mutations`, `feat(fuse):
+session-to-loop mutation channel with mkdir`, and `feat(daemon): mount
+read-write by default for the alpha`.
+
+What comes next, roughly in order:
 
 - multi-relay mailbox: cancel-aware recovery supervision for a relay pool
   (`refactor(daemon): cancel-aware recovery supervision for a multi-relay
   mailbox`)
 - external relay interoperability coverage (`test(daemon): cover external
   relay interoperability`)
-- write support behind the FUSE mount: designed in `docs/write-path.md`
-  (`docs(write-path): design the mounted write path`), then
-  `feat(format): mkdir, rmdir, and rename mutations` and
-  `feat(fuse): mounted write operations`, on the composition seam from
-  `refactor(daemon): make runtime ownership and projection publication
-  explicit`; automatic peer repair follows
+- automatic peer repair
 - NIP-46 signer-session client wiring
 
 ## Post-v1

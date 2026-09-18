@@ -91,8 +91,8 @@ recovery and restart reconciliation, author-side manifest generation,
 fetch-on-open demand machinery, author-signed snapshot announcements with
 transport identities, the real-iroh serving router (a serving endpoint
 over the durable vault answers peer fetches by transport root), and a
-read-only FUSE mount via the daemon (`wyrd
-mount`) are in place and under test. Still pending: relay pool supervision
+read-write FUSE mount via the daemon (`wyrd mount`, writes committing as
+snapshots) are in place and under test. Still pending: relay pool supervision
 and signer-client wiring (NIP-46), automatic peer repair, and garbage
 collection (post-v1 by contract).
 
@@ -134,7 +134,7 @@ Design docs live in `docs/` (`architecture.md` is the one-page entry point);
 
 ## Quick Start
 
-Wyrd is pre-alpha: there is no mountable drive yet. To hack on it:
+Wyrd is pre-alpha (see Status above). To hack on it:
 
 ```bash
 # enter the dev environment (rust toolchain, git hooks)

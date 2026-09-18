@@ -67,8 +67,13 @@ pub const MAX_MAILBOX_CIPHERTEXT_LEN: usize = 96 * 1024;
 /// open and before handoff to [`ControlInbox::ingest`] or
 /// [`open_bootstrap`]. Aligned with NIP-44's own plaintext bound
 /// (65535): anything NIP-44 opens fits, and anything larger never leaves
-/// the AEAD. Defense in depth alongside the ciphertext gate — the two
-/// together bound allocation on both sides of decryption.
+/// the AEAD. Intentionally defense in depth beneath the NIP-44 maximum
+/// rather than a tighter protocol ceiling: under a conforming NIP-44
+/// implementation this branch never fires (hence no direct
+/// end-to-end test exercises it), but the bound holds even if the
+/// NIP-44 ceiling ever moves, and it documents the contract ingest may
+/// rely on — the two gates together bound allocation on both sides of
+/// decryption.
 ///
 /// [`ControlInbox::ingest`]: crate::control::ControlInbox::ingest
 /// [`open_bootstrap`]: crate::control::bootstrap::open_bootstrap
@@ -89,11 +94,21 @@ fn device_id_from_secret(secret: &SecretKey) -> DeviceId {
 /// the sender's Nostr identity secret key as the ECDH source. The sender
 /// identity is derived from the same secret so the relay-visible metadata
 /// cannot lie about who sealed the envelope.
+///
+/// Fail-fast outbound gate: bytes over [`MAX_MAILBOX_OPEN_BYTES`] are
+/// rejected before sealing, because the peer's matching inbound gate
+/// would discard them after a wasted relay round trip.
 pub fn seal_for_recipient(
     sender_secret: &DeviceIdentitySecret,
     recipient: DeviceId,
     control_bytes: &[u8],
 ) -> Result<MailboxEnvelope, MailboxError> {
+    if control_bytes.len() > MAX_MAILBOX_OPEN_BYTES {
+        return Err(MailboxError::Oversize {
+            bytes: control_bytes.len(),
+            max: MAX_MAILBOX_OPEN_BYTES,
+        });
+    }
     let sender_key = sender_secret.secret_key();
     let sk = nostr_secret(&sender_key)?;
     let sender = device_id_from_secret(&sender_key);
@@ -672,5 +687,21 @@ mod tests {
         assert!(envelope.ciphertext.len() <= MAX_MAILBOX_CIPHERTEXT_LEN);
         let opened = open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
         assert_eq!(opened.as_slice(), control_bytes.as_slice());
+    }
+
+    #[test]
+    fn oversize_outbound_bytes_fail_fast_before_sealing() {
+        // The peer would discard these after a wasted relay round trip,
+        // so the sender API refuses them before NIP-44 ever runs.
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let control_bytes = vec![0x42u8; MAX_MAILBOX_OPEN_BYTES + 1];
+        assert_eq!(
+            seal_for_recipient(&sender_sk, recipient, &control_bytes),
+            Err(MailboxError::Oversize {
+                bytes: control_bytes.len(),
+                max: MAX_MAILBOX_OPEN_BYTES,
+            })
+        );
     }
 }

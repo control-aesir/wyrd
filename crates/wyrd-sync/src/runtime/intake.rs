@@ -13,7 +13,9 @@ use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::{CapabilityError, WrappedCapability};
 use crate::membership::TransitionStatus;
-use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxEnvelope};
+use crate::transport::mailbox::{
+    open_from_sender, Disposition, Mailbox, MailboxEnvelope, MAX_MAILBOX_CIPHERTEXT_LEN,
+};
 
 const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
@@ -901,6 +903,26 @@ mod tests {
         assert_eq!(report.duplicates, 0);
         assert_eq!(report.deferred, 0);
         assert_eq!(report.skipped, 0);
+        assert_eq!(report.discarded, 0);
+    }
+
+    #[test]
+    fn oversize_envelope_discarded_without_commit() {
+        let mut fixture = fixture();
+        let genesis_id = Builder::genesis(10).1.transition_id();
+        let mut envelope = deliver(&fixture, 1, &announcement_for(1, genesis_id));
+        // Over the mailbox ciphertext ceiling: rejected before NIP-44
+        // decryption, so the drain consumes it as terminal poison.
+        envelope.ciphertext = "A".repeat(MAX_MAILBOX_CIPHERTEXT_LEN + 1);
+        queue(&mut fixture, vec![envelope]);
+        let report = drain(&mut fixture);
+        assert_eq!(report.discarded, 1);
+        assert_eq!(fixture.engine.current(), 0);
+        // Bytes that never decoded write no durable fact, and the ack
+        // consumed the handover: a second pass sees nothing.
+        let facts = fixture.engine.store.load().expect("loads");
+        assert!(facts.announcements.is_empty());
+        let report = drain(&mut fixture);
         assert_eq!(report.discarded, 0);
     }
 

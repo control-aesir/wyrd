@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr};
 use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
@@ -237,6 +238,13 @@ impl Vault {
 /// post-v1 storage question (GC does not exist in v0).
 const SERVE_DIR: &str = "serve";
 
+/// Bound for the blocking runtime shutdown in [`ServingEndpoint::shutdown`]:
+/// worker threads normally exit in milliseconds once the endpoint, router,
+/// and mirror drain are done; the bound only bites when teardown itself is
+/// wedged, and a wedged shutdown must surface as a slow close rather than
+/// a silently lingering thread pool.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A real-iroh serving surface over the durable vault.
 ///
 /// One iroh endpoint accepting iroh-blobs fetches from an [`FsStore`]
@@ -406,16 +414,33 @@ impl ServingEndpoint {
             .map_err(|_| std::io::Error::other("serving mirror closed"))
     }
 
-    /// Stop serving and drop the runtime. The vault's write-through slot
+    /// Stop serving and join the runtime. The vault's write-through slot
     /// is cleared first: imports made after shutdown must not enqueue
     /// into a channel whose drain task is about to die with no readiness
     /// signal. Reopening attaches a fresh channel.
+    ///
+    /// The shutdown blocks until the worker threads exit (bounded by
+    /// [`RUNTIME_SHUTDOWN_TIMEOUT`]) instead of dropping the runtime:
+    /// a dropped multi-thread runtime shuts its workers down in the
+    /// background, and under load those lingering threads outlive the
+    /// caller — nextest attributes them to whatever test runs next.
+    /// The mirror sender is dropped before the blocking shutdown: the
+    /// drain task ends when its last sender goes away, and holding one
+    /// would stall the join for the full timeout on every call.
+    ///
+    /// A failing router shutdown is captured, not returned early: the
+    /// sender drop and the runtime join below must run regardless, or a
+    /// panicked handler task reintroduces exactly the lingering threads
+    /// this shutdown exists to join. The first error is still reported.
     pub fn shutdown(self) -> std::io::Result<()> {
         *self.mirror.lock().expect("vault mirror lock") = None;
-        self.runtime
-            .block_on(async { self.router.shutdown().await })
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let router_result = self
+            .runtime
+            .block_on(async { self.router.shutdown().await });
         self.runtime.block_on(self.endpoint.close());
+        drop(self.sender);
+        self.runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        router_result.map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(())
     }
 }
@@ -696,6 +721,29 @@ mod tests {
         let decoded = crate::transport::decode_node_addr(&serving.node_addr_bytes()).unwrap();
         assert_eq!(decoded.id, serving.addr().id);
         serving.shutdown().unwrap();
+    }
+
+    /// Shutdown runs the full cleanup sequence instead of returning
+    /// early: the endpoint reads closed and the write-through mirror is
+    /// detached, so a skipped close would fail here rather than leaving
+    /// a connectable address behind. Router-shutdown failure itself is
+    /// not simulated — iroh reports it only for a panicked handler
+    /// task, which no public trigger produces — so the error path is
+    /// enforced by construction (the result is captured before the
+    /// sender drop and the runtime join, and returned after).
+    #[test]
+    fn shutdown_closes_the_endpoint_and_clears_the_mirror() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let endpoint = serving.endpoint.clone();
+        assert!(!endpoint.is_closed(), "a live endpoint reads open");
+        serving.shutdown().unwrap();
+        assert!(endpoint.is_closed(), "shutdown closes the endpoint");
+        assert!(
+            vault.mirror_slot().lock().expect("mirror lock").is_none(),
+            "shutdown detaches the write-through mirror"
+        );
     }
 
     fn serve_dir() -> PathBuf {

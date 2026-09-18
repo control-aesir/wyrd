@@ -165,6 +165,16 @@ where
     // The tree nodes and freshly sealed chunks are local plaintext now;
     // recording them keeps the fetch plan from re-requesting held content.
     facts.extend(local.into_iter().map(Fact::LocalObject));
+    // The announcement obligation, atomically with the body: a crash
+    // between commit and the first send still leaves a discoverable
+    // outbox entry, so restart resumes without re-authoring. One entry
+    // per other member; a lone member announces to nobody.
+    let snapshot_id = authorized.snapshot().snapshot_id();
+    for member in &members {
+        if *member != engine.device {
+            facts.push(Fact::AnnouncementQueued(snapshot_id, *member));
+        }
+    }
     engine.commit_facts(&facts)?;
     Ok(authorized)
 }
@@ -453,8 +463,7 @@ where
 }
 
 /// Announce an authored snapshot to every other member over the control
-/// plane: seal one epoch-keyed announcement and address it to each
-/// member's identity. Returns the number of envelopes sent (the author
+/// plane, returning the number of envelopes sent this call (the author
 /// is skipped: it already holds the body). The epoch must be one this
 /// engine holds a control key for, and the snapshot's root manifest must
 /// be recorded — the announcement carries the transport identities the
@@ -463,8 +472,19 @@ where
 /// author's own sealed representation. The author signs the payload
 /// before sealing, so peers can verify authorship and the identities at
 /// intake.
+///
+/// Delivery is durable and retryable, not best-effort. The obligation
+/// was queued atomically at authoring; this call tops it up for
+/// pre-outbox snapshots (idempotent), seals the announcement once (the
+/// sealed bytes persist, so every retry resends byte-identical bytes
+/// and the receiver's message-id dedupe collapses the retry to a
+/// no-op), and records one delivered marker per successful send. A
+/// mid-loop send failure returns the error with the remaining
+/// recipients still pending — resume with [`announce_pending`], which
+/// resends only the undischarged obligations. The first seal wins, so
+/// the route rides the first send's `node_addr`.
 pub(super) fn announce(
-    engine: &Engine,
+    engine: &mut Engine,
     snapshot: &AuthorizedSnapshot,
     mailbox: &mut impl Mailbox,
     node_addr: Option<&[u8]>,
@@ -472,7 +492,8 @@ pub(super) fn announce(
     let body = snapshot.snapshot();
     // The announcement is signed by this engine's identity, so it may
     // only carry a snapshot this engine authored: anything else produces
-    // authorship every recipient rejects, before any mailbox traffic.
+    // authorship every recipient rejects, before any mailbox traffic or
+    // any outbox fact.
     if body.author != engine.device {
         return Err(EngineError::NotAnnounceAuthor(body.snapshot_id()));
     }
@@ -487,41 +508,157 @@ pub(super) fn announce(
         .root_manifest_record(&body.snapshot_id())
         .ok_or_else(|| EngineError::RootManifestUnavailable(body.snapshot_id()))?;
 
-    let mut announcement = SnapshotAnnouncement {
-        snapshot: body.snapshot_id(),
-        author: body.author,
-        epoch: body.epoch,
-        membership: body.membership,
-        // The body's transport root: raw BLAKE3 over the canonical
-        // bytes, the verified-fetch address for the bulk body.
-        body_root: crate::seal::blob_root(&body.encode()),
-        root_manifest: root_record.manifest_id,
-        root_manifest_transport: root_record.transport,
-        // The composer's current retrieval route, sealed with the rest
-        // (T17): authenticated routing metadata, opaque to control.
-        node_addr: node_addr.map(<[u8]>::to_vec),
-        signature: [0; 64],
-    };
-    crate::control::sign_announcement(&mut announcement, &engine.identity_secret, &engine.drive);
-    let sealed = seal_control(
-        key,
-        &engine.drive,
-        body.epoch,
-        &Message::SnapshotAnnouncement(announcement),
-    )?;
-
     let members = rebuilt
         .log
         .members_of(&body.membership)
         .ok_or(EngineError::NoCanonicalMembership)?;
 
+    // Top up the author-time obligation for pre-outbox snapshots
+    // (authored before the outbox existed, so no queue facts). The
+    // membership of a fixed transition is immutable, so for current
+    // snapshots this always matches what authoring queued — the branch
+    // exists for legacy stores, not for recipient-set growth.
+    // Already-covered pairs are skipped, so a re-announce commits
+    // nothing new here.
+    let mut obligation = Vec::new();
+    for member in &members {
+        if *member != engine.device
+            && !rebuilt
+                .runtime
+                .announcement_covered(body.snapshot_id(), *member)
+        {
+            obligation.push(Fact::AnnouncementQueued(body.snapshot_id(), *member));
+        }
+    }
+
+    // Seal once: reuse the persisted bytes when a previous attempt
+    // sealed them, so retries are byte-identical.
+    let sealed_bytes = match rebuilt
+        .runtime
+        .announcement_sealed_bytes(&body.snapshot_id())
+    {
+        Some(bytes) => bytes.to_vec(),
+        None => {
+            let mut announcement = SnapshotAnnouncement {
+                snapshot: body.snapshot_id(),
+                author: body.author,
+                epoch: body.epoch,
+                membership: body.membership,
+                // The body's transport root: raw BLAKE3 over the canonical
+                // bytes, the verified-fetch address for the bulk body.
+                body_root: crate::seal::blob_root(&body.encode()),
+                root_manifest: root_record.manifest_id,
+                root_manifest_transport: root_record.transport,
+                // The composer's current retrieval route, sealed with the rest
+                // (T17): authenticated routing metadata, opaque to control.
+                node_addr: node_addr.map(<[u8]>::to_vec),
+                signature: [0; 64],
+            };
+            crate::control::sign_announcement(
+                &mut announcement,
+                &engine.identity_secret,
+                &engine.drive,
+            );
+            let sealed = seal_control(
+                key,
+                &engine.drive,
+                body.epoch,
+                &Message::SnapshotAnnouncement(announcement),
+            )?;
+            let bytes = sealed.encode();
+            // Validate before committing: persisting oversize bytes
+            // would poison the obligation — first-seal-wins means the
+            // retry could never replace them, failing every resend
+            // even with a valid route. The queue facts stay
+            // uncommitted too; the author-time obligation (already
+            // durable) still covers the retry.
+            crate::transport::mailbox::check_outbound_size(&bytes)?;
+            obligation.push(Fact::AnnouncementSealed(body.snapshot_id(), bytes.clone()));
+            bytes
+        }
+    };
+    if !obligation.is_empty() {
+        engine.commit_facts(&obligation)?;
+    }
+
+    send_pending_for(engine, body.snapshot_id(), &sealed_bytes, mailbox)
+}
+
+/// Resume every undischarged announcement obligation across snapshots,
+/// returning the number of envelopes sent this call. This is the
+/// restart path: after a crash or a partial send, the durable outbox
+/// still holds the queued-minus-delivered pairs, and this sends them
+/// without re-authoring anything. Snapshots with no persisted sealed
+/// bytes are sealed now (the epoch key must be held; the root manifest
+/// must be recorded) under the given `node_addr`; already-sealed
+/// snapshots resend their exact bytes. Entries for snapshots this
+/// device did not author are skipped — both writers check authorship
+/// first, so such an entry cannot arise through the public API.
+pub(super) fn announce_pending(
+    engine: &mut Engine,
+    mailbox: &mut impl Mailbox,
+    node_addr: Option<&[u8]>,
+) -> Result<usize, EngineError> {
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    // Distinct snapshots with pending obligations, in snapshot-id
+    // order (`pending_announcements` already yields sorted pairs).
+    let mut snapshots: Vec<wyrd_format::SnapshotId> = rebuilt
+        .runtime
+        .pending_announcements()
+        .into_iter()
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    snapshots.dedup();
     let mut sent = 0usize;
-    for member in members {
-        if member == engine.device {
+    for snapshot_id in snapshots {
+        let Some(body) = rebuilt.runtime.snapshot_body(&snapshot_id) else {
+            continue;
+        };
+        if body.author != engine.device {
             continue;
         }
-        let envelope = seal_for_recipient(&engine.identity_secret, member, &sealed.encode())?;
+        let authorized = AuthorizedSnapshot::authorize(body.clone(), &engine.drive)
+            .map_err(EngineError::InvalidHead)?;
+        // The per-snapshot path tops up nothing (the obligation is
+        // already queued) but seals when unsealed and sends exactly
+        // this snapshot's current pending set, which it re-reads
+        // fresh — nothing else can write (this engine holds the
+        // store lock), so the set cannot drift mid-resume.
+        match rebuilt.runtime.announcement_sealed_bytes(&snapshot_id) {
+            Some(bytes) => {
+                let bytes = bytes.to_vec();
+                sent += send_pending_for(engine, snapshot_id, &bytes, mailbox)?;
+            }
+            None => {
+                sent += announce(engine, &authorized, mailbox, node_addr)?;
+            }
+        }
+    }
+    Ok(sent)
+}
+
+/// Send the sealed bytes to every still-pending recipient of one
+/// snapshot, recording one delivered marker per successful send. A
+/// send failure returns immediately with the rest still pending.
+fn send_pending_for(
+    engine: &mut Engine,
+    snapshot: wyrd_format::SnapshotId,
+    sealed_bytes: &[u8],
+    mailbox: &mut impl Mailbox,
+) -> Result<usize, EngineError> {
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let recipients: Vec<wyrd_format::DeviceId> = rebuilt
+        .runtime
+        .pending_announcements()
+        .into_iter()
+        .filter(|(id, _)| *id == snapshot)
+        .map(|(_, recipient)| recipient)
+        .collect();
+    let mut sent = 0usize;
+    for recipient in recipients {
+        let envelope = seal_for_recipient(&engine.identity_secret, recipient, sealed_bytes)?;
         mailbox.send(envelope)?;
+        engine.commit_facts(&[Fact::AnnouncementDelivered(snapshot, recipient)])?;
         sent += 1;
     }
     Ok(sent)

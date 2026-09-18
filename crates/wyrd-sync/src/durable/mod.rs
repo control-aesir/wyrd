@@ -102,7 +102,7 @@ mod tests;
 pub use replay::{LoadedFacts, Rebuilt};
 // Raw-commit test seam (planted-forgery tests): test-only re-exports.
 #[cfg(test)]
-pub(crate) use codec::{encode_commit, TAG_SNAPSHOT_BODY};
+pub(crate) use codec::{encode_commit, TAG_ANNOUNCEMENT_SEALED, TAG_SNAPSHOT_BODY};
 pub(crate) use store::atomic_write;
 #[cfg(test)]
 pub(crate) use store::commit_name;
@@ -112,8 +112,8 @@ pub use store::DurableStore;
 
 use thiserror::Error;
 use wyrd_format::{
-    ContentId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
-    TransitionId,
+    ContentId, DeviceId, DriveId, ManifestError, MembershipError, MembershipTransition, Snapshot,
+    SnapshotId, TransitionId,
 };
 
 use crate::authorization::predicates::verify_snapshot;
@@ -158,6 +158,8 @@ pub enum DurableError {
     Install(#[from] InstallError),
     #[error("commit {0} is missing at or below CURRENT")]
     MissingCommit(u64),
+    #[error("announcement outbox fact failed validation")]
+    InvalidOutbox,
     #[error("commit sequence exhausted")]
     SequenceExhausted,
 }
@@ -243,4 +245,21 @@ pub enum Fact {
     Materialization(ContentId, MaterializationState),
     /// A seen control-message id (dedupe set).
     ControlMessage(ControlMessageId),
+    /// An announcement obligation: this snapshot must still be sent to
+    /// this recipient. Committed atomically with the authored body (so a
+    /// crash before the first send still leaves a discoverable
+    /// obligation) and for snapshots authored before the outbox existed.
+    /// Pending means queued-but-undelivered; see
+    /// [`RuntimeState`](crate::runtime::RuntimeState).
+    AnnouncementQueued(SnapshotId, DeviceId),
+    /// The sealed announcement bytes for one snapshot, committed on the
+    /// first send and reused by every retry: retries are byte-identical,
+    /// so the receiver's control-message dedupe collapses them to a
+    /// no-op instead of recording a route-update duplicate per attempt.
+    /// First seal wins; the route rides the first send's `node_addr`.
+    AnnouncementSealed(SnapshotId, Vec<u8>),
+    /// One queued obligation discharged: these exact bytes were handed
+    /// to the mailbox for this recipient. Append-only like every fact —
+    /// pending is derived as queued-minus-delivered, never by deletion.
+    AnnouncementDelivered(SnapshotId, DeviceId),
 }

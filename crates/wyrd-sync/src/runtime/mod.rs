@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use wyrd_format::{
-    BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, Manifest, ManifestEntry, ObjectKind,
-    Snapshot, SnapshotId, StorageId,
+    BaoRoot, ChildManifest, ContentId, DeviceId, DriveId, FetchStatus, Manifest, ManifestEntry,
+    ObjectKind, Snapshot, SnapshotId, StorageId,
 };
 
 use crate::control::{AnnouncementUpdate, ControlMessageId, SnapshotAnnouncement};
@@ -154,6 +154,13 @@ pub struct RuntimeState {
     child_parent_by_manifest: BTreeMap<ContentId, SnapshotId>,
     local_objects: BTreeSet<ContentId>,
     materialization: BTreeMap<ContentId, MaterializationState>,
+    /// Announcement outbox: queued obligations, sealed bytes, and
+    /// delivered markers. Pending is derived as queued-minus-delivered;
+    /// nothing is ever deleted. The sealed bytes are first-seal-wins so
+    /// retries stay byte-identical and collapse in receiver dedupe.
+    announcement_queued: BTreeSet<(SnapshotId, DeviceId)>,
+    announcement_sealed: BTreeMap<SnapshotId, Vec<u8>>,
+    announcement_delivered: BTreeSet<(SnapshotId, DeviceId)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -188,6 +195,9 @@ impl RuntimeState {
             child_parent_by_manifest: BTreeMap::new(),
             local_objects: BTreeSet::new(),
             materialization: BTreeMap::new(),
+            announcement_queued: BTreeSet::new(),
+            announcement_sealed: BTreeMap::new(),
+            announcement_delivered: BTreeSet::new(),
         }
     }
 
@@ -224,6 +234,66 @@ impl RuntimeState {
     /// first sighting of the id.
     pub fn remember_control_message(&mut self, id: &ControlMessageId) -> bool {
         self.seen_control_messages.insert(*id)
+    }
+
+    /// Record an announcement obligation for one recipient. Returns
+    /// `true` if this was the first queueing of the pair; replays and
+    /// re-announces are idempotent.
+    pub fn record_announcement_queued(
+        &mut self,
+        snapshot: SnapshotId,
+        recipient: DeviceId,
+    ) -> bool {
+        self.announcement_queued.insert((snapshot, recipient))
+    }
+
+    /// Record the sealed announcement bytes for one snapshot. First
+    /// seal wins (later seals for the same snapshot are ignored) so a
+    /// retry always resends the exact bytes the first send used and the
+    /// receiver's message-id dedupe collapses it. Returns `true` if
+    /// this sealed the snapshot.
+    pub fn record_announcement_sealed(&mut self, snapshot: SnapshotId, sealed: Vec<u8>) -> bool {
+        if self.announcement_sealed.contains_key(&snapshot) {
+            return false;
+        }
+        self.announcement_sealed.insert(snapshot, sealed);
+        true
+    }
+
+    /// Record one queued obligation discharged. Returns `true` if this
+    /// was the first delivery marker for the pair.
+    pub fn record_announcement_delivered(
+        &mut self,
+        snapshot: SnapshotId,
+        recipient: DeviceId,
+    ) -> bool {
+        self.announcement_delivered.insert((snapshot, recipient))
+    }
+
+    /// The sealed announcement bytes for one snapshot, if the first
+    /// send sealed them. A slice, not the stored vector: callers only
+    /// ever read or re-send the bytes.
+    pub fn announcement_sealed_bytes(&self, snapshot: &SnapshotId) -> Option<&[u8]> {
+        self.announcement_sealed.get(snapshot).map(Vec::as_slice)
+    }
+
+    /// Every still-undischarged obligation, in `(snapshot, recipient)`
+    /// order: queued pairs minus delivered ones. Deterministic under
+    /// replay, so resume sends in a stable order.
+    pub fn pending_announcements(&self) -> Vec<(SnapshotId, DeviceId)> {
+        self.announcement_queued
+            .iter()
+            .copied()
+            .filter(|pair| !self.announcement_delivered.contains(pair))
+            .collect()
+    }
+
+    /// Whether one obligation is already covered — queued or
+    /// discharged — so re-announces stay idempotent instead of
+    /// appending duplicate queue facts per call.
+    pub fn announcement_covered(&self, snapshot: SnapshotId, recipient: DeviceId) -> bool {
+        self.announcement_queued.contains(&(snapshot, recipient))
+            || self.announcement_delivered.contains(&(snapshot, recipient))
     }
 
     /// Record a snapshot announcement. Replaying the same announcement is a

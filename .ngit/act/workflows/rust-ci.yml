@@ -87,6 +87,16 @@ jobs:
           set -o pipefail
           cargo test --color never --workspace --doc 2>&1 | tee /tmp/doctests.log
 
+      # Warms the reporter's event cache first: cold full-state relay
+      # syncs cost minutes per ngit call, and the scan makes several.
+      - name: Restore ngit event cache
+        if: failure()
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}
+          restore-keys: ngit-events-Linux-
+
       # Installs ngit for the failure reporter below, from a
       # checksum-pinned manifest. Runs only on `pull_request` failures,
       # matching the reporter condition, so green runs pay nothing.
@@ -99,25 +109,10 @@ jobs:
       # On `pull_request` failures only: post a truncated failure tail on
       # the PR and return it to draft so the board stops advertising a
       # ready PR. Master pushes and dispatch runs have no PR to draft and
-      # are excluded by the step condition. NGIT_NSEC lives only in this
-      # step's env: earlier steps run untrusted PR code and must never see
-      # it. The CI identity must be a confirmed co-maintainer (invite plus
-      # the key's signed accept); third-party PRs run with empty secrets
-      # by design, so a withheld secret skips gracefully instead of
-      # failing. After auto-draft the author pushes the fix (drafts run no
-      # CI) and marks ready again to re-trigger.
-      #
-      # PR resolution never keys on the head ref: PR updates (kind-1619)
-      # carry no branch name and GITHUB_REF is just refs/pull/ngit there,
-      # so resolve through NGIT_CI_TRIGGER_EVENT instead. ngit maps a 1618
-      # proposal or a 1619 revision to its PR; the head ref stays only as
-      # a fallback. Unresolvable runs fail loudly, never skip silently.
-      #
-      # Every ngit call passes --repo explicitly: the coordinator checks
-      # out over https/file with no nostr remote, and ngit fails rather
-      # than guessing. The value is this repo's naddr (ngit 3.0.1 rejects
-      # the raw 30617: coordinate form); refresh it with
-      # `ngit repo --json | jq -r .coordinate` if the repo is republished.
+      # are excluded by the step condition. The shared reporter library
+      # holds the resolution, comment, and draft logic (see
+      # .ngit/act/lib/ngit-reporter.sh); only the gate logs differ per
+      # workflow and pass as arguments below.
       - name: Report failure to PR and return to draft
         if: failure() && github.event_name == 'pull_request'
         env:
@@ -125,262 +120,17 @@ jobs:
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1091
+          source .ngit/act/lib/ngit-reporter.sh
+          report_failure_to_pr \
+            /tmp/check.log /tmp/clippy.log /tmp/features.log /tmp/test.log /tmp/doctests.log
 
-          REPO_NADDR="naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl97nj2qvzqqqrhnyzuuxrw"
-
-          # Withheld bot credential: nothing to publish with, and no
-          # connected relay for this identity. Skip without masking the
-          # real test failure.
-          if [ -z "${NGIT_NSEC:-}" ]; then
-            echo "NGIT_NSEC is not configured; skipping PR failure report."
-            exit 0
-          fi
-
-          command -v jq >/dev/null || {
-            echo "jq is required for PR resolution" >&2
-            exit 1
-          }
-
-          PR_ID=""
-          if [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
-            PR_ID="$(
-              ngit --repo "$REPO_NADDR" \
-                ci status "$NGIT_CI_TRIGGER_EVENT" --json |
-                jq -r '.target.pr // empty' || true
-            )"
-          fi
-
-          # Fallback for triggers that still carry the branch (e.g. opened).
-          # Listed branches render as `pr/<name>(<short-id>)`, so match the
-          # bare name too.
-          if [ -z "$PR_ID" ] && [ -n "${PR_BRANCH:-}" ]; then
-            PR_ID="$(
-              ngit --repo "$REPO_NADDR" pr list --json |
-                jq -r --arg branch "$PR_BRANCH" '
-                  .[] |
-                  select(.branch == $branch or
-                    (.branch | startswith($branch + "("))) |
-                  .id
-                ' | head -n1 || true
-            )"
-          fi
-
-          if [ -z "$PR_ID" ] || [ "$PR_ID" = "null" ]; then
-            echo "Could not resolve the PR for this run; refusing to skip silently." >&2
-            echo "trigger=${NGIT_CI_TRIGGER_EVENT:-unknown} branch=${PR_BRANCH:-unknown} sha=${GITHUB_SHA:-unknown}" >&2
-            exit 1
-          fi
-
-          echo "Reporting CI failure on PR: $PR_ID"
-
-          # Keep the secret out of every other process environment: file it,
-          # drop it from env, and remove the file as soon as ngit is done.
-          NGIT_NSEC_FILE="$RUNNER_TEMP/ngit-nsec"
-          printf '%s' "$NGIT_NSEC" > "$NGIT_NSEC_FILE"
-          chmod 600 "$NGIT_NSEC_FILE"
-          unset NGIT_NSEC
-          trap 'rm -f "$NGIT_NSEC_FILE"' EXIT
-
-          # Truncated failure tail: last lines of whichever gate logs exist.
-          # Capped so the comment stays a readable signal, not a log dump.
-          COMMENT_BODY="/tmp/failure-comment.md"
-          {
-            echo "## CI failed - PR returned to draft"
-            echo ""
-            echo "Commit: \`${GITHUB_SHA:-unknown}\`"
-            echo ""
-            echo "The failing run's tail is below (truncated). Push the fix"
-            echo "(drafts run no CI) and mark ready again to re-trigger."
-            echo ""
-            for log in /tmp/check.log /tmp/clippy.log /tmp/features.log /tmp/test.log /tmp/doctests.log; do
-              if [ -f "$log" ]; then
-                echo "<details>"
-                echo "<summary><code>$(basename "$log")</code> (last 100 lines)</summary>"
-                echo ""
-                echo '```'
-                tail -n 100 "$log"
-                echo '```'
-                echo "</details>"
-                echo ""
-              fi
-            done
-          } > "$COMMENT_BODY"
-
-          # Bound the event payload: keep the header, cut the tail to size.
-          if [ "$(wc -c < "$COMMENT_BODY")" -gt 8000 ]; then
-            tail -c 8000 "$COMMENT_BODY" > "$COMMENT_BODY.trimmed"
-            {
-              echo "## CI failed - PR returned to draft"
-              echo ""
-              echo "(Failure tail truncated to the last 8 KB.)"
-              echo ""
-              cat "$COMMENT_BODY.trimmed"
-            } > "$COMMENT_BODY"
-            rm -f "$COMMENT_BODY.trimmed"
-          fi
-
-          ngit --repo "$REPO_NADDR" \
-            --nsec-file "$NGIT_NSEC_FILE" \
-            pr comment "$PR_ID" \
-            --body "$(cat "$COMMENT_BODY")" \
-            --json
-
-          ngit --repo "$REPO_NADDR" \
-            --nsec-file "$NGIT_NSEC_FILE" \
-            pr draft "$PR_ID" \
-            --reason "CI failed - returned to draft automatically" \
-            --json
-
-      # Disabled since it's not working for now
-      # - if: github.event_name == 'pull_request'
-      - if: false
-        name: Run OpenCode review
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y curl wget gnupg
-
-          # Install ngit and OpenCode
-          curl -Ls https://ngit.dev/install.sh | bash
-          curl -fsSL https://opencode.ai/install | bash
-
-          # Make installed binaries available
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-
-          # Fetch the actual PR base branch.
-          git fetch origin "$BASE_BRANCH" --depth=1
-
-          # Keep the ngit secret out of OpenCode's environment.
-          NGIT_NSEC_FILE="$RUNNER_TEMP/ngit-nsec"
-          printf '%s' "$NGIT_NSEC" > "$NGIT_NSEC_FILE"
-          chmod 600 "$NGIT_NSEC_FILE"
-          unset NGIT_NSEC
-
-          # Gather PR metadata for the reviewer.
-          PR_INFO="$(ngit pr list --json)"
-          PR_ID="$(
-            printf '%s\n' "$PR_INFO" |
-              jq -r --arg branch "$PR_BRANCH" '
-                .[] |
-                select(.branch == $branch) |
-                .id
-              ' |
-              head -n1
-          )"
-
-          if [ -z "$PR_ID" ] || [ "$PR_ID" = "null" ]; then
-            echo "Could not determine ngit PR ID for branch: $PR_BRANCH"
-            echo "$PR_INFO"
-            exit 1
-          fi
-
-          echo "Reviewing PR: $PR_ID"
-          echo "Branch: $PR_BRANCH"
-          echo "Base: $BASE_BRANCH"
-
-          # Ask OpenCode to perform the review.
-          opencode run \
-            --model openrouter/openrouter/free \
-            "$(cat <<EOF
-          # Full branch code review
-
-          You are reviewing a pull request.
-
-          PR branch: ${PR_BRANCH}
-          Base branch: ${BASE_BRANCH}
-          PR ID: ${PR_ID}
-
-          ## Recent commits
-
-          !git log origin/${BASE_BRANCH}..HEAD --oneline
-
-          ## Diff statistics
-
-          !git diff origin/${BASE_BRANCH}...HEAD --stat
-
-          ## Full diff
-
-          !git diff origin/${BASE_BRANCH}...HEAD
-
-          ## Code quality checks
-
-          ### Check
-
-          !cat /tmp/check.log
-
-          ### Clippy
-
-          !cat /tmp/clippy.log
-
-          ### Tests
-
-          !cat /tmp/test.log
-
-          ## Your task
-
-          Perform a comprehensive code review of the current branch compared
-          with the base branch.
-
-          Do not limit the review to the supplied diff summary. Inspect the
-          repository and relevant surrounding code as necessary to understand
-          the changes and their invariants.
-
-          Cover:
-
-          1. Overall assessment
-          2. Potential bugs and edge cases
-          3. Correctness and architectural concerns
-          4. Code quality, readability, and maintainability
-          5. Test coverage and missing tests
-          6. Clippy warnings and suggestions
-          7. Performance considerations
-          8. API, serialization, compatibility, and security concerns where
-             applicable
-          9. Specific improvements with file:line references
-
-          Prioritize actionable findings over generic praise.
-
-          Clearly distinguish:
-          - actual bugs
-          - likely problems
-          - risks / design concerns
-          - optional improvements
-
-          Do not invent issues that are not supported by the code.
-
-          The final output must be well-formatted Markdown suitable for posting
-          directly as a pull-request review comment.
-
-          Do not post the review yourself.
-
-          Write the final review to:
-
-              /tmp/pr-review.md
-          EOF
-          )"
-
-          # Make sure OpenCode actually produced the review.
-          if [ ! -s /tmp/pr-review.md ]; then
-            echo "OpenCode did not produce /tmp/pr-review.md"
-            exit 1
-          fi
-
-          echo "Review generated:"
-          sed -n '1,120p' /tmp/pr-review.md
-
-          # Publish the review through ngit.
-          ngit \
-            --nsec-file "$NGIT_NSEC_FILE" \
-            pr comment "$PR_ID" \
-            --body "$(cat /tmp/pr-review.md)" \
-            --json
-
-          # Remove the secret as soon as it is no longer needed.
-          rm -f "$NGIT_NSEC_FILE"
+      # Saves whatever the reporter synced (even on resolution failure:
+      # partial warmth still helps the next run). Failure-gated like the
+      # restore, so green runs pay nothing.
+      - name: Save ngit event cache
+        if: failure()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HOME }}/.ngit-event-cache
+          key: ngit-events-Linux-${{ github.run_id }}

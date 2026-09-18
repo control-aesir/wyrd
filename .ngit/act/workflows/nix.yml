@@ -134,11 +134,13 @@ jobs:
       # instead of failing. After auto-draft the author pushes the fix
       # (drafts run no CI) and marks ready again to re-trigger.
       #
-      # PR resolution never keys on the head ref: PR updates (kind-1619)
-      # carry no branch name and GITHUB_REF is just refs/pull/ngit there,
-      # so resolve through NGIT_CI_TRIGGER_EVENT instead. ngit maps a 1618
-      # proposal or a 1619 revision to its PR; the head ref stays only as
-      # a fallback. Unresolvable runs fail loudly, never skip silently.
+      # PR resolution keys on the checked-out head sha first: it is exact
+      # even with several PRs open and needs no trigger context. The
+      # trigger-event and head-ref paths below stay as alternatives for
+      # coordinators that provide them — the installed coordinator
+      # documents no NGIT_CI_TRIGGER_EVENT, and synthesized pull_request
+      # events carry no head.ref (GITHUB_REF is just refs/pull/ngit).
+      # Unresolvable runs fail loudly, never skip silently.
       #
       # Every ngit call passes --repo explicitly: the coordinator checks
       # out over https/file with no nostr remote, and ngit fails rather
@@ -169,7 +171,38 @@ jobs:
           }
 
           PR_ID=""
-          if [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
+          # Primary resolution: match the checked-out head sha against
+          # per-revision commits in each open/draft PR's CI record. Exact
+          # even with several PRs open, and needs no trigger context.
+          # Multiple matches fail loudly below — never guess.
+          if [ -n "${GITHUB_SHA:-}" ]; then
+            sha_matches=""
+            candidates="$(
+              ngit --repo "$REPO_NADDR" pr list --json --status open,draft |
+                jq -r '.[].id' || true
+            )"
+            for candidate in $candidates; do
+              if ngit --repo "$REPO_NADDR" pr view "$candidate" --json |
+                jq -e --arg sha "$GITHUB_SHA" '
+                  ([(.ci.runs // [] | .[].commit),
+                    (.ci.outdated // [] | .[].commit)]
+                   | map(select(. != null))
+                   | any(. == $sha))' >/dev/null 2>&1; then
+                sha_matches="${sha_matches:+$sha_matches }$candidate"
+              fi
+            done
+            set -- $sha_matches
+            if [ "$#" -eq 1 ]; then
+              PR_ID="$1"
+            elif [ "$#" -gt 1 ]; then
+              echo "Head sha matches multiple PRs; refusing to guess: $sha_matches" >&2
+              exit 1
+            fi
+          fi
+
+          # Alternative for coordinators that export the trigger event:
+          # ngit maps a 1618 proposal or a 1619 revision to its PR.
+          if [ -z "$PR_ID" ] && [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
             PR_ID="$(
               ngit --repo "$REPO_NADDR" \
                 ci status "$NGIT_CI_TRIGGER_EVENT" --json |
@@ -177,7 +210,7 @@ jobs:
             )"
           fi
 
-          # Fallback for triggers that still carry the branch (e.g. opened).
+          # Alternative for triggers that still carry the branch (e.g. opened).
           # Listed branches render as `pr/<name>(<short-id>)`, so match the
           # bare name too.
           if [ -z "$PR_ID" ] && [ -n "${PR_BRANCH:-}" ]; then

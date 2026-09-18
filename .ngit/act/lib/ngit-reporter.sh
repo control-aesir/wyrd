@@ -69,27 +69,77 @@ resolve_pr() {
   fi
 
   local PR_ID=""
-  # Primary resolution: match the checked-out head sha against
-  # per-revision commits in each open/draft PR's CI record. Multiple
-  # matches fail loudly below — never guess.
-  if [ -n "${GITHUB_SHA:-}" ]; then
+
+  # One knob bounds the whole scan below: every ngit call cold-syncs full
+  # repo state and each hangs up to the per-call bound, so per-call
+  # timeouts alone still allow multi-minute stacking (three hung calls
+  # burned six minutes on a fresh PR). Expire the scan loudly instead of
+  # stalling into the job timeout. Overridable for tests; production
+  # default keeps healthy runs (seconds) far from pathology.
+  local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-180}))
+  check_deadline() {
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "PR resolution timed out" >&2
+      exit 1
+    fi
+  }
+
+  # Fastest exact path first: coordinators that export the trigger event
+  # let ngit map a 1618 proposal or a 1619 revision to its PR directly.
+  if [ -z "$PR_ID" ] && [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
+    check_deadline
+    PR_ID="$(
+      bounded_ngit --repo "$REPO_NADDR" \
+        ci status "$NGIT_CI_TRIGGER_EVENT" --json |
+        jq -r '.target.pr // empty' || true
+    )"
+  fi
+
+  # Fast path for pull_request events: the branch rides the event payload
+  # (PR_BRANCH), so one list call resolves it — no per-PR view loop, and
+  # immune to the CI-record lag that starves head-sha matching on first
+  # runs. Listed branches render as `pr/<name>(<short-id>)`, so match the
+  # bare name too. Zero or multiple matches fall through / fail loudly —
+  # never guess.
+  if [ -z "$PR_ID" ] && [ -n "${PR_BRANCH:-}" ]; then
+    check_deadline
+    local matches
+    matches="$(
+      bounded_ngit --repo "$REPO_NADDR" pr list --json |
+        jq -r --arg branch "$PR_BRANCH" '
+          .[] |
+          select(.branch == $branch or
+            (.branch | startswith($branch + "("))) |
+          .id
+        ' || true
+    )"
+    if [ -n "$matches" ] && [ "$matches" != "null" ]; then
+      local count
+      count="$(printf '%s\n' "$matches" | grep -c .)"
+      if [ "$count" -gt 1 ]; then
+        echo "Branch matches multiple PRs; refusing to guess:" >&2
+        printf '%s\n' "$matches" >&2
+        exit 1
+      fi
+      PR_ID="$matches"
+    fi
+  fi
+
+  # Last resort, for triggers with no PR payload (e.g. manual replays):
+  # match the checked-out head sha against per-revision commits in each
+  # open/draft PR's CI record. Slow (one view per candidate) and blind on
+  # first runs (the record lags the run itself), so it runs last under the
+  # same deadline. Multiple matches fail loudly below — never guess.
+  if [ -z "$PR_ID" ] && [ -n "${GITHUB_SHA:-}" ]; then
+    check_deadline
     local sha_matches=()
     local candidates candidate
     candidates="$(
       bounded_ngit --repo "$REPO_NADDR" pr list --json --status open,draft |
         jq -r '.[].id' || true
     )"
-    # Overall deadline: every ngit call cold-syncs full repo state, so
-    # per-call timeouts alone still allow a multi-minute loop. Expire
-    # the whole scan loudly instead of stalling into the job timeout.
-    # Overridable for tests; production default covers the observed
-    # healthy-cold range (minutes) while still bounding pathology.
-    local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-420}))
     for candidate in $candidates; do
-      if [ "$SECONDS" -ge "$deadline" ]; then
-        echo "PR resolution by head sha timed out" >&2
-        exit 1
-      fi
+      check_deadline
       if bounded_ngit --repo "$REPO_NADDR" pr view "$candidate" --json |
         jq -e --arg sha "$GITHUB_SHA" '
           ([(.ci.runs // [] | .[].commit),
@@ -105,31 +155,6 @@ resolve_pr() {
       echo "Head sha matches multiple PRs; refusing to guess: ${sha_matches[*]}" >&2
       exit 1
     fi
-  fi
-
-  # Alternative for coordinators that export the trigger event: ngit maps
-  # a 1618 proposal or a 1619 revision to its PR.
-  if [ -z "$PR_ID" ] && [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
-    PR_ID="$(
-      bounded_ngit --repo "$REPO_NADDR" \
-        ci status "$NGIT_CI_TRIGGER_EVENT" --json |
-        jq -r '.target.pr // empty' || true
-    )"
-  fi
-
-  # Alternative for triggers that still carry the branch (e.g. opened).
-  # Listed branches render as `pr/<name>(<short-id>)`, so match the
-  # bare name too.
-  if [ -z "$PR_ID" ] && [ -n "${PR_BRANCH:-}" ]; then
-    PR_ID="$(
-      bounded_ngit --repo "$REPO_NADDR" pr list --json |
-        jq -r --arg branch "$PR_BRANCH" '
-          .[] |
-          select(.branch == $branch or
-            (.branch | startswith($branch + "("))) |
-          .id
-        ' | head -n1 || true
-    )"
   fi
 
   if [ -z "$PR_ID" ] || [ "$PR_ID" = "null" ]; then

@@ -26,6 +26,9 @@ jobs:
   draft:
     if: github.event.action == 'opened'
     runs-on: ubuntu-latest
+    # Backstop for the resolve-and-draft operation below: healthy runs
+    # finish in seconds, so ten minutes is pure pathology cover.
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -54,6 +57,7 @@ jobs:
       - name: Draft the new PR
         continue-on-error: true
         env:
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           NGIT_NSEC: ${{ secrets.NGIT_NSEC }}
         run: |
           set -euo pipefail
@@ -259,6 +263,8 @@ jobs:
     if: failure() && github.event_name == 'pull_request'
     needs: [rust, nix]
     runs-on: ubuntu-latest
+    # Same pathology cover as the draft job: healthy runs finish fast.
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

@@ -159,7 +159,9 @@ report_failure_to_pr() {
   trap 'rm -f "$NGIT_NSEC_FILE"' EXIT
 
   # Truncated failure tail: last lines of whichever gate logs exist.
-  # Capped so the comment stays a readable signal, not a log dump.
+  # Capped so the comment stays a readable signal, not a log dump. Plain
+  # markdown headings, not <details> collapsibles: renderers escape raw
+  # HTML, so the tags would show up as literal text.
   COMMENT_BODY="/tmp/failure-comment.md"
   {
     echo "## CI failed - PR returned to draft"
@@ -172,13 +174,11 @@ report_failure_to_pr() {
     local log
     for log in "$@"; do
       if [ -f "$log" ]; then
-        echo "<details>"
-        echo "<summary><code>$(basename "$log")</code> (last 100 lines)</summary>"
+        echo "### \`$(basename "$log")\` (last 100 lines)"
         echo ""
         echo '```'
         tail -n 100 "$log"
         echo '```'
-        echo "</details>"
         echo ""
       fi
     done

@@ -856,6 +856,19 @@ async fn drain_notifications(
             ClientNotification::Event { event, .. } => Some(event),
             ClientNotification::Message { message, .. } => match *message {
                 RelayMessage::Event { event, .. } => Some(Box::new(event.into_owned())),
+                // Interop record (external-relay issue): every other relay
+                // message — CLOSED, AUTH, NOTICE, OK — is dropped here. A
+                // relay that closes our subscription (auth-required,
+                // rate-limited, unsupported filter) therefore reads as an
+                // idle mailbox, not an error: health still reports the TCP
+                // attachment as connected while no delivery can ever arrive.
+                // NIP-42 in particular must stay unimplemented until a trust
+                // decision allows it: answering an AUTH challenge signs with
+                // the device key, teaching the relay the device pubkey and
+                // breaking the attribution-freedom property above (relays
+                // cannot attribute sends to the device). Until then, relays
+                // that demand auth are simply incompatible, and the opt-in
+                // interop tests prove the open-relay path instead.
                 _ => None,
             },
             ClientNotification::Shutdown => None,
@@ -2701,5 +2714,139 @@ mod tests {
             )),
             Err(MailboxError::Identity)
         ));
+    }
+
+    // --- external-relay interop: opt-in, never in the default gate ---
+    //
+    // MiniRelay proves the mailbox against exactly the protocol slice it
+    // uses, without signature verification, TLS, relay auth, or
+    // relay-specific replay behavior. This group runs the same
+    // send/receive/recovery suite against a real public relay:
+    //
+    // `WYRD_TEST_RELAY_URL=wss://nos.lol cargo test -p wyrd-daemon
+    //  external_relay -- --ignored`
+    //
+    // Proven against nos.lol; relay.damus.io never completed the attach
+    // from here, so prefer a relay that answers.
+    //
+    // `#[ignore]` keeps the group out of the default `cargo nextest run`
+    // gate, and without the variable each test passes trivially after a
+    // skip notice, so third-party availability can never flake CI. Each run
+    // publishes a few gift wraps to fresh random recipients — negligible
+    // traffic addressed to keys nobody holds.
+
+    /// Public relay URL for the opt-in interop group. `None` means "not
+    /// configured": the caller skips with a notice instead of failing.
+    fn external_relay_url() -> Option<String> {
+        std::env::var("WYRD_TEST_RELAY_URL")
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty())
+    }
+
+    /// Longer waits for the external group: TLS handshake, real-relay
+    /// publish round trips, and history replay all cost more than
+    /// localhost.
+    const EXTERNAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Gift-wrap publish plus delivery over TLS against a real relay: the
+    /// relay verifies real signatures, answers a real OK, and replays real
+    /// history — everything MiniRelay deliberately skips. Attachment is
+    /// observed through health, not assumed from construction.
+    ///
+    /// Publish success is proven by delivery, not by `send` returning Ok:
+    /// `send` awaits the relay OKs under the SDK's default ack policy but
+    /// discards the per-relay output, so a rejection surfaces only as
+    /// missing mail. A relay that refuses gift-wrap writes (fee, PoW,
+    /// allowlist) fails this test at the delivery wait — a relay-policy
+    /// signal, not mailbox logic; pick an open relay.
+    #[test]
+    #[ignore = "needs WYRD_TEST_RELAY_URL pointing at a public relay"]
+    fn external_relay_gift_wrap_round_trip_over_tls() {
+        let Some(url) = external_relay_url() else {
+            eprintln!("skipping: set WYRD_TEST_RELAY_URL to run the interop group");
+            return;
+        };
+        assert!(
+            url.starts_with("wss://"),
+            "interop covers the TLS path; use a wss:// relay URL, got {url}"
+        );
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+
+        let mut first = live_mailbox(&receiver, &relays, temp_path("seen-external"));
+        assert_eq!(
+            wait_for_health(&first, true, EXTERNAL_DELIVERY_TIMEOUT).connected_relays,
+            1,
+            "mailbox attaches to the public relay"
+        );
+        {
+            let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-external-sender"));
+            outbox
+                .send(envelope(
+                    device_id(&sender),
+                    device_id(&receiver),
+                    "external-first",
+                ))
+                .expect("publish reaches the relay client");
+            outbox
+                .send(envelope(
+                    device_id(&sender),
+                    device_id(&receiver),
+                    "external-second",
+                ))
+                .expect("publish reaches the relay client");
+        }
+
+        let a = wait_for_delivery(&mut first, EXTERNAL_DELIVERY_TIMEOUT).expect("first delivery");
+        first.settle(a.id(), Disposition::Ack).expect("acks");
+        let b = wait_for_delivery(&mut first, EXTERNAL_DELIVERY_TIMEOUT).expect("second delivery");
+        assert_ne!(a.id(), b.id(), "deliveries stay distinct");
+        first.settle(b.id(), Disposition::Ack).expect("acks");
+        assert_quiet(&mut first);
+    }
+
+    /// Reconnect plus resubscribe against real relay history: after acking,
+    /// a fresh mailbox on the same dedupe log replays whatever the relay
+    /// retained and must converge to nothing new — the MiniRelay restart
+    /// test, but over a relay that expires, rate-limits, and replays on
+    /// its own terms. The grace sleep lets the replay pass through `recv`'s
+    /// dedupe before the quiet assertion, so the collapse path is
+    /// exercised rather than merely untriggered.
+    #[test]
+    #[ignore = "needs WYRD_TEST_RELAY_URL pointing at a public relay"]
+    fn external_relay_resubscribe_replay_converges() {
+        let Some(url) = external_relay_url() else {
+            eprintln!("skipping: set WYRD_TEST_RELAY_URL to run the interop group");
+            return;
+        };
+        let sender = sender_keys();
+        let receiver = keys();
+        let relays = vec![url];
+        let seen = temp_path("seen-external-replay");
+
+        let mut first = live_mailbox(&receiver, &relays, seen.clone());
+        wait_for_health(&first, true, EXTERNAL_DELIVERY_TIMEOUT);
+        {
+            let mut outbox =
+                live_mailbox(&sender, &relays, temp_path("seen-external-replay-sender"));
+            outbox
+                .send(envelope(
+                    device_id(&sender),
+                    device_id(&receiver),
+                    "replay-me",
+                ))
+                .expect("publish reaches the relay client");
+        }
+        let delivery = wait_for_delivery(&mut first, EXTERNAL_DELIVERY_TIMEOUT).expect("delivery");
+        first.settle(delivery.id(), Disposition::Ack).expect("acks");
+        assert_quiet(&mut first);
+        drop(first);
+
+        let mut reopened = live_mailbox(&receiver, &relays, seen);
+        wait_for_health(&reopened, true, EXTERNAL_DELIVERY_TIMEOUT);
+        std::thread::sleep(Duration::from_secs(5));
+        assert_quiet(&mut reopened);
     }
 }

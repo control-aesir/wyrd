@@ -105,11 +105,16 @@ jobs:
 
       # Installs rustup when missing (the ngit/act ubuntu image doesn't ship
       # it), then the pinned channel with a minimal profile + clippy.
-      # Toolchain and registry are cached between runs.
+      # Toolchain and registry are cached between runs. The shared cache
+      # key keeps one stable entry across jobs and branches: without it
+      # every PR's first run is cold even when master saved the identical
+      # key minutes earlier (the coordinator shows no cross-branch
+      # fallback). Bump the suffix to bust the cache manually.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.pin.outputs.channel }}
           components: clippy
+          cache-shared-key: wyrd-rust-cache-v1
 
       # Pre-built nextest binary (nextest-rs recommended installer).
       - uses: taiki-e/install-action@nextest

@@ -14,10 +14,6 @@
 //! the remaining slices. The iroh version set is validated as a set;
 //! change all three together and run the full test suite.
 
-// PROBE: deliberate failure to exercise the CI failure reporter. Revert
-// before merge — the reporter must comment and draft this PR on red.
-compile_error!("reporter probe: deliberate CI failure");
-
 pub mod authorization;
 pub mod bulk;
 pub mod closure;

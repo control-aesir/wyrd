@@ -100,7 +100,10 @@ fn accept_envelope(
     let bytes = match open_from_sender(&engine.identity_secret, engine.device, envelope) {
         // The outer seal opens with our always-held identity key or
         // never will: an unopenable envelope is terminal poison, not a
-        // retryable unknown. Consume it without a fact.
+        // retryable unknown. Consume it without a fact. Oversize
+        // ciphertext/decrypted bytes (`MailboxError::Oversize`) land here
+        // too: the mailbox already rejected them before ingest, and the
+        // relay retains nothing for an acked handover.
         Ok(bytes) => bytes,
         Err(_) => return Ok(Outcome::Discarded),
     };

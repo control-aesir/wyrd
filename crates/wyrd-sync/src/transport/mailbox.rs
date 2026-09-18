@@ -30,6 +30,8 @@ use zeroize::Zeroizing;
 pub enum MailboxError {
     #[error("NIP-44 seal/open failed")]
     Crypto,
+    #[error("mailbox payload of {bytes} bytes exceeds the {max}-byte ceiling")]
+    Oversize { bytes: usize, max: usize },
     #[error("a device key is not a valid secp256k1 key")]
     InvalidKey,
     #[error(
@@ -49,6 +51,28 @@ pub struct MailboxEnvelope {
     pub recipient: DeviceId,
     pub ciphertext: String,
 }
+
+/// Max NIP-44 ciphertext (base64 wire string, ASCII so chars are
+/// bytes) accepted before decryption. NIP-44 v2 encodes at most a
+/// 65535-byte plaintext: 1 version byte + 32 nonce bytes + 65536 padded
+/// bytes + 32 MAC bytes = 65601 raw bytes = 87468 base64 chars. The
+/// ceiling sits above that with margin so legitimate maxima flow, while
+/// anything larger is rejected before the AEAD allocates. This is the
+/// relay/event ceiling at the mailbox boundary: the ciphertext is the
+/// only attacker-sized field in the handover (sender and recipient are
+/// fixed 32-byte identities).
+pub const MAX_MAILBOX_CIPHERTEXT_LEN: usize = 96 * 1024;
+
+/// Max decrypted control bytes accepted from the mailbox, checked after
+/// open and before handoff to [`ControlInbox::ingest`] or
+/// [`open_bootstrap`]. Aligned with NIP-44's own plaintext bound
+/// (65535): anything NIP-44 opens fits, and anything larger never leaves
+/// the AEAD. Defense in depth alongside the ciphertext gate — the two
+/// together bound allocation on both sides of decryption.
+///
+/// [`ControlInbox::ingest`]: crate::control::ControlInbox::ingest
+/// [`open_bootstrap`]: crate::control::bootstrap::open_bootstrap
+pub const MAX_MAILBOX_OPEN_BYTES: usize = 64 * 1024;
 
 fn nostr_secret(sk: &SecretKey) -> Result<NostrSecretKey, MailboxError> {
     NostrSecretKey::from_slice(&sk.secret_bytes()).map_err(|_| MailboxError::InvalidKey)
@@ -95,6 +119,13 @@ pub fn seal_for_recipient(
 /// misdelivered envelope can fail with an addressing error before the
 /// AEAD path.
 ///
+/// Size gates bracket decryption: ciphertext over
+/// [`MAX_MAILBOX_CIPHERTEXT_LEN`] fails with [`MailboxError::Oversize`]
+/// before the AEAD runs, and decrypted bytes over
+/// [`MAX_MAILBOX_OPEN_BYTES`] fail the same way before ingest sees them.
+/// The engine treats both as terminal poison (consumed without a fact),
+/// so oversize mail cannot accumulate in the relay.
+///
 /// The outer buffer is [`Zeroizing`]: it holds the inner sealed
 /// envelope (ciphertext, not key material), but defense in depth
 /// wipes it anyway once ingest and parsing are done. Parsed control
@@ -113,11 +144,29 @@ pub fn open_from_sender(
     if envelope.recipient != expected_recipient {
         return Err(MailboxError::Crypto);
     }
+    // Length gate before the AEAD: attacker-sized input is rejected
+    // without decrypting or allocating past the wire string itself.
+    if envelope.ciphertext.len() > MAX_MAILBOX_CIPHERTEXT_LEN {
+        return Err(MailboxError::Oversize {
+            bytes: envelope.ciphertext.len(),
+            max: MAX_MAILBOX_CIPHERTEXT_LEN,
+        });
+    }
     let sk = nostr_secret(&recipient_secret.secret_key())?;
     let pk = NostrPublicKey::from_byte_array(*envelope.sender.as_bytes());
-    nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext)
+    let opened = nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext)
         .map(Zeroizing::new)
-        .map_err(|_| MailboxError::Crypto)
+        .map_err(|_| MailboxError::Crypto)?;
+    // Length gate after open, before ingest: the decrypted envelope is
+    // still attacker-controlled bytes, and ingest must never see more
+    // than the ceiling.
+    if opened.len() > MAX_MAILBOX_OPEN_BYTES {
+        return Err(MailboxError::Oversize {
+            bytes: opened.len(),
+            max: MAX_MAILBOX_OPEN_BYTES,
+        });
+    }
+    Ok(opened)
 }
 
 /// The relay send/receive boundary a concrete client implements
@@ -571,5 +620,57 @@ mod tests {
             open_from_sender(&sender_sk, other, &envelope),
             Err(MailboxError::Crypto)
         ));
+    }
+
+    #[test]
+    fn oversize_ciphertext_is_rejected_before_decrypt() {
+        // Base64-valid but over the ceiling: the length gate must fire
+        // before NIP-44 ever sees the bytes, so this reports Oversize,
+        // never Crypto.
+        let (sender_sk, sender) = identity(0x01);
+        let (recipient_sk, recipient) = identity(0x02);
+        let envelope = MailboxEnvelope {
+            sender,
+            recipient,
+            ciphertext: "A".repeat(MAX_MAILBOX_CIPHERTEXT_LEN + 1),
+        };
+        let result = open_from_sender(&recipient_sk, recipient, &envelope);
+        assert!(
+            matches!(result, Err(MailboxError::Oversize { .. })),
+            "over-ceiling ciphertext must fail at the length gate, got {result:?}"
+        );
+        let _ = sender_sk;
+    }
+
+    #[test]
+    fn ceiling_boundary_reaches_decrypt() {
+        // Exactly at the ceiling the gate stays silent: garbage at the
+        // boundary still reaches the AEAD and fails as Crypto, proving
+        // the gate is length-precise rather than over-eager.
+        let (sender_sk, sender) = identity(0x01);
+        let (recipient_sk, recipient) = identity(0x02);
+        let envelope = MailboxEnvelope {
+            sender,
+            recipient,
+            ciphertext: "A".repeat(MAX_MAILBOX_CIPHERTEXT_LEN),
+        };
+        assert!(matches!(
+            open_from_sender(&recipient_sk, recipient, &envelope),
+            Err(MailboxError::Crypto)
+        ));
+        let _ = sender_sk;
+    }
+
+    #[test]
+    fn legitimate_large_control_bytes_still_flow() {
+        // A near-NIP-44-maximum plaintext is legitimate mail: it must
+        // pass both mailbox ceilings end to end.
+        let (sender_sk, _sender) = identity(0x01);
+        let (recipient_sk, recipient) = identity(0x02);
+        let control_bytes = vec![0x42u8; MAX_MAILBOX_OPEN_BYTES - 1];
+        let envelope = seal_for_recipient(&sender_sk, recipient, &control_bytes).unwrap();
+        assert!(envelope.ciphertext.len() <= MAX_MAILBOX_CIPHERTEXT_LEN);
+        let opened = open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
+        assert_eq!(opened.as_slice(), control_bytes.as_slice());
     }
 }

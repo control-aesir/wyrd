@@ -2,6 +2,7 @@
 name = "wyrd-daemon"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Wyrd's daemon: composes the sync engine with the drive view and presentation backends (FUSE today, platform file surfaces later)"
 
 [[bin]]

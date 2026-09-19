@@ -11,6 +11,8 @@ in
   languages.rust.toolchainFile = ./rust-toolchain.toml;
 
   packages = with unstable; [
+    cargo-audit
+    cargo-deny
     cargo-nextest
     pkg-config
   ] ++ optionals isLinux [
@@ -41,15 +43,21 @@ in
     commitizen.enable = true;
     typos.enable = true;
 
-    review = {
-      enable = false;
+    # Dependency-policy gates run on push, not on commit: `cargo audit`
+    # fetches the advisory database over the network, and both checks scan
+    # the whole lockfile. Policy itself lives in deny.toml; CI enforces the
+    # same checks so a push without hooks installed is still caught.
+    cargo-audit = {
+      enable = true;
+      entry = "cargo audit";
       stages = [ "push" ];
-      entry = "${pkgs.writeShellScriptBin "review" ''
-        if command -v opencode >/dev/null 2>&1; then
-          nohup opencode run --model openrouter/openrouter/free --agent plan "$(cat .agents/prompts/branch-review.md)" \
-            >/dev/null 2>&1 &
-        fi
-      ''}/bin/review";
+      pass_filenames = false;
+    };
+    cargo-deny = {
+      enable = true;
+      entry = "cargo deny check";
+      stages = [ "push" ];
+      pass_filenames = false;
     };
   };
 }

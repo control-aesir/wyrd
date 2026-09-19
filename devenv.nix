@@ -92,6 +92,14 @@ in
     docker volume create wyrd-nix-store >/dev/null
     for TARGET in linux/arm64 linux/amd64; do
       echo "building $TARGET from $TAG..."
+      # Address the package by explicit system, never the bare
+      # `#wyrd-dist` attr: under Rosetta emulation nix resolved the
+      # bare attr to the aarch64 output inside the amd64 container,
+      # silently rebuilding one arch twice (verified by eval).
+      case "$TARGET" in
+        linux/arm64) SYSTEM=aarch64-linux ;;
+        linux/amd64) SYSTEM=x86_64-linux ;;
+      esac
       # seccomp=unconfined: Docker Desktop (and Rosetta emulation for
       # amd64) rejects the seccomp-BPF sandbox Nix installs for its
       # builds. Unconfining the container seccomp profile lets Nix
@@ -100,7 +108,7 @@ in
       docker run --rm --platform "$TARGET" --security-opt seccomp=unconfined \
         -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" -v wyrd-nix-store:/nix \
         "$NIX_IMAGE" sh -c \
-          'nix --extra-experimental-features "nix-command flakes" build /src#wyrd-dist --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist "/out/$(basename "$(readlink /tmp/wyrd-dist)")"'
+          'nix --extra-experimental-features "nix-command flakes" build "/src#packages-'"''$SYSTEM"'.wyrd-dist" --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist "/out/$(basename "$(readlink /tmp/wyrd-dist)")"'
     done
     # Smoke check: release.yaml names exactly these two archives, and
     # ngit rejects partial platform coverage on the main channel.

@@ -1592,7 +1592,7 @@ mod tests {
             Err(EngineError::NotAnnounceAuthor(_))
         ));
         assert!(
-            mailbox.recv().is_none(),
+            mailbox.recv().unwrap().is_none(),
             "a refused announcement never sends"
         );
     }
@@ -1612,8 +1612,8 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self) -> Option<Delivery> {
-            None
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Ok(None)
         }
 
         fn settle(
@@ -1623,6 +1623,41 @@ mod tests {
         ) -> Result<(), MailboxError> {
             Ok(())
         }
+    }
+
+    /// A mailbox whose channel lock is poisoned: every `recv` fails
+    /// instead of handing over mail.
+    struct BrokenMailbox;
+
+    impl Mailbox for BrokenMailbox {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Err(MailboxError::Transport(
+                "mailbox channel lock poisoned".into(),
+            ))
+        }
+
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_broken_mailbox_fails_the_drain_pass() {
+        let (mut pair, _, _) = scenario();
+        // The envelopes stay retained for redelivery: the failure is
+        // the pass's, not the mail's.
+        assert!(matches!(
+            pair.a.engine.drain(&mut BrokenMailbox),
+            Err(EngineError::Mailbox(_))
+        ));
     }
 
     #[test]
@@ -1661,7 +1696,7 @@ mod tests {
             self.inner.send(envelope)
         }
 
-        fn recv(&mut self) -> Option<Delivery> {
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
             self.inner.recv()
         }
 

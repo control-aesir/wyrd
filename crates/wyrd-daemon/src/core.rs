@@ -1218,8 +1218,10 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self) -> Option<Delivery> {
-            None
+        fn recv(
+            &mut self,
+        ) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(None)
         }
 
         fn settle(
@@ -1518,10 +1520,13 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self) -> Option<Delivery> {
-            self.queue
+        fn recv(
+            &mut self,
+        ) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(self
+                .queue
                 .front()
-                .map(|(id, envelope)| Delivery::new(*id, envelope.clone()))
+                .map(|(id, envelope)| Delivery::new(*id, envelope.clone())))
         }
 
         fn settle(
@@ -1559,15 +1564,17 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self) -> Option<Delivery> {
-            Some(Delivery::new(
+        fn recv(
+            &mut self,
+        ) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(Some(Delivery::new(
                 DeliveryId::new(1),
                 MailboxEnvelope {
                     sender: DeviceId::from_bytes([0xD0; 32]),
                     recipient: DeviceId::from_bytes([0xD0; 32]),
                     ciphertext: "not-a-seal".to_string(),
                 },
-            ))
+            )))
         }
 
         fn settle(
@@ -2726,7 +2733,10 @@ mod tests {
             .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
             .unwrap();
         assert_eq!(report.drained.discarded, 1, "poison is consumed");
-        assert!(mailbox.recv().is_none(), "acked mail leaves the queue");
+        assert!(
+            mailbox.recv().unwrap().is_none(),
+            "acked mail leaves the queue"
+        );
 
         let handle = backend.open_at("steady.txt").expect("still serves");
         let bytes = backend.read_handle(handle, 0, 1024).expect("still reads");

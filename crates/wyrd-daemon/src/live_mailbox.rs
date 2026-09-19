@@ -737,14 +737,20 @@ where
     }
 
     /// Pull the next gift-wrap candidate event from the relay stream.
-    fn next_wrap(&mut self) -> Option<Event> {
-        let mut incoming = self.incoming.lock().expect("mailbox channel lock");
+    /// A poisoned channel lock fails the drain pass as Transport: poison
+    /// means a thread panicked mid-critical-section, so serving threads
+    /// fail the operation, never the process.
+    fn next_wrap(&mut self) -> Result<Option<Event>, MailboxError> {
+        let mut incoming = self
+            .incoming
+            .lock()
+            .map_err(|_| MailboxError::Transport("mailbox channel lock poisoned".into()))?;
         loop {
             match incoming.try_recv() {
-                Ok(event) if event.kind == Kind::GiftWrap => return Some(event),
+                Ok(event) if event.kind == Kind::GiftWrap => return Ok(Some(event)),
                 Ok(_) => continue,
-                Err(tokio_mpsc::error::TryRecvError::Empty) => return None,
-                Err(tokio_mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(tokio_mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => return Ok(None),
             }
         }
     }
@@ -784,6 +790,18 @@ where
 
     fn held_by_wrap(&self, wrap_id: &EventId) -> bool {
         self.unacked.iter().any(|held| &held.wrap_id == wrap_id)
+    }
+
+    /// Mint the next delivery id. Exhausting the u64 space is
+    /// practically unreachable, but returning Transport costs nothing
+    /// and keeps a violated assumption a recoverable error, not a crash.
+    fn mint_delivery_id(&mut self) -> Result<DeliveryId, MailboxError> {
+        let id = DeliveryId::new(self.next_delivery);
+        self.next_delivery = self
+            .next_delivery
+            .checked_add(1)
+            .ok_or_else(|| MailboxError::Transport("delivery id space exhausted".into()))?;
+        Ok(id)
     }
 
     /// Test-only drainer kill: abandon the incoming channel so the live
@@ -1008,7 +1026,9 @@ async fn supervise(
             }
         }
         if !health.stream_alive.load(Ordering::Relaxed) {
-            recover_stream(&client, &filter, &incoming, &health, &subscription_id).await;
+            // A poisoned swap fails the tick, not the process: the
+            // stream stays flagged down and recovery retries next tick.
+            let _ = recover_stream(&client, &filter, &incoming, &health, &subscription_id).await;
             refresh(&client, &health).await;
             down_ticks = 0;
         }
@@ -1036,13 +1056,16 @@ async fn refresh(client: &Client, health: &SupervisorState) {
 /// The replacement drainer is established (listening) before the
 /// resubscribe whose replay it has to catch — reversing that order drops
 /// relay history into the broadcast void between REQ and listen.
+///
+/// A poisoned channel lock fails instead of panicking: the stream stays
+/// flagged down and the supervisor retries on the next tick.
 async fn recover_stream(
     client: &Arc<Client>,
     filter: &Filter,
     incoming: &Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
     health: &Arc<SupervisorState>,
     subscription_id: &SubscriptionId,
-) {
+) -> Result<(), MailboxError> {
     let receiver = establish_drainer(client, health).await;
     let mut attempt: u32 = 0;
     loop {
@@ -1056,8 +1079,11 @@ async fn recover_stream(
     // Swap without holding the lock across an await (`recv` only needs
     // it for a non-blocking `try_recv`); undelivered events in the old
     // channel are relay history and come back through the resubscribe.
-    *incoming.lock().expect("mailbox channel lock") = receiver;
+    *incoming
+        .lock()
+        .map_err(|_| MailboxError::Transport("mailbox channel lock poisoned".into()))? = receiver;
     health.stream_alive.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Relay-level recovery: no relay has been connected for a sustained
@@ -1119,7 +1145,7 @@ where
             .map_err(|error| MailboxError::Transport(error.to_string()))
     }
 
-    fn recv(&mut self) -> Option<Delivery> {
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
         // New mail first, while there is room to hold it: a retried
         // delivery must never starve mail still sitting in the queue.
         // Garbage and duplicate wraps collapse here and never become
@@ -1130,7 +1156,7 @@ where
         // live stream has no cursor, so a dropped event would wait for a
         // resubscribe that may never come.
         while self.unacked.len() < MAX_UNACKED_DELIVERIES {
-            let Some(wrap) = self.next_wrap() else {
+            let Some(wrap) = self.next_wrap()? else {
                 break;
             };
             if self.seen.contains(&wrap.id)
@@ -1146,25 +1172,24 @@ where
                 self.poison.insert(wrap.id);
                 continue;
             };
-            let id = DeliveryId::new(self.next_delivery);
-            self.next_delivery = self
-                .next_delivery
-                .checked_add(1)
-                .expect("delivery id space exhausted");
+            let id = self.mint_delivery_id()?;
             self.unacked.push_back(Held {
                 id,
                 wrap_id: wrap.id,
                 envelope: envelope.clone(),
             });
-            return Some(Delivery::new(id, envelope));
+            return Ok(Some(Delivery::new(id, envelope)));
         }
         // Nothing new: round-robin over held deliveries, re-offering the
         // oldest first under its stable id (front rotates to back), so
         // every held envelope is visited once per pass.
-        let held = self.unacked.pop_front()?;
+        let held = self.unacked.pop_front();
+        let Some(held) = held else {
+            return Ok(None);
+        };
         let delivery = Delivery::new(held.id, held.envelope.clone());
         self.unacked.push_back(held);
-        Some(delivery)
+        Ok(Some(delivery))
     }
 
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
@@ -1258,7 +1283,7 @@ mod tests {
     fn wait_for_delivery(mailbox: &mut LiveMailbox<Keys>, timeout: Duration) -> Option<Delivery> {
         let start = Instant::now();
         loop {
-            if let Some(delivery) = mailbox.recv() {
+            if let Some(delivery) = mailbox.recv().unwrap() {
                 return Some(delivery);
             }
             if start.elapsed() >= timeout {
@@ -1266,6 +1291,38 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// A poisoned channel lock fails the drain pass instead of panicking
+    /// the process: poison means a thread panicked mid-critical-section,
+    /// and serving threads fail the operation, never the process.
+    #[test]
+    fn poisoned_channel_lock_fails_recv() {
+        let open = keys();
+        let mut mailbox = offline_mailbox(&open);
+        let incoming = Arc::clone(&mailbox.incoming);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = incoming.lock().unwrap();
+            panic!("poison the channel lock");
+        });
+        let _ = poisoner.join();
+        assert!(
+            matches!(mailbox.recv(), Err(MailboxError::Transport(_))),
+            "a poisoned channel lock must fail recv, not panic"
+        );
+    }
+
+    /// Minting past u64::MAX fails instead of panicking: unreachable in
+    /// practice, but a violated assumption is a recoverable error.
+    #[test]
+    fn exhausted_delivery_ids_fail() {
+        let open = keys();
+        let mut mailbox = offline_mailbox(&open);
+        mailbox.next_delivery = u64::MAX;
+        assert!(
+            matches!(mailbox.mint_delivery_id(), Err(MailboxError::Transport(_))),
+            "an exhausted id space must fail, not panic"
+        );
     }
 
     fn assert_quiet(mailbox: &mut LiveMailbox<Keys>) {
@@ -2016,7 +2073,7 @@ mod tests {
         // evicted acks as new held mail after the fixed pull count.
         // Replays only recur on burst overflow, so the pipeline goes dry.
         let drained = Instant::now();
-        while let Some(delivery) = mailbox.recv() {
+        while let Some(delivery) = mailbox.recv().unwrap() {
             mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
             assert!(
                 drained.elapsed() < Duration::from_secs(60),
@@ -2117,7 +2174,7 @@ mod tests {
         // coverage completes. Replays only recur on burst overflow, so
         // the pipeline goes dry.
         let drained = Instant::now();
-        while let Some(delivery) = mailbox.recv() {
+        while let Some(delivery) = mailbox.recv().unwrap() {
             mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
             assert!(
                 drained.elapsed() < Duration::from_secs(60),
@@ -2171,7 +2228,7 @@ mod tests {
         while covered.len() < target {
             assert!(start.elapsed() < deadline, "flood converges");
             let mut progressed = false;
-            while let Some(delivery) = mailbox.recv() {
+            while let Some(delivery) = mailbox.recv().unwrap() {
                 progressed = true;
                 if settled.insert(delivery.id()) {
                     mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
@@ -2415,7 +2472,7 @@ mod tests {
             let expect = (MAX_POISON_ENTRIES).min((wave + 1) * WAVE);
             while mailbox.poison_len() < expect {
                 assert!(start.elapsed() < DEADLINE, "garbage arrives and is skipped");
-                assert!(mailbox.recv().is_none(), "garbage never delivers");
+                assert!(mailbox.recv().unwrap().is_none(), "garbage never delivers");
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -2423,7 +2480,7 @@ mod tests {
             mailbox.poison_len() <= MAX_POISON_ENTRIES,
             "poison cache bounded"
         );
-        assert!(mailbox.recv().is_none(), "garbage never delivers");
+        assert!(mailbox.recv().unwrap().is_none(), "garbage never delivers");
         let lines = std::fs::read_to_string(&seen_path)
             .expect("seen log reads")
             .lines()

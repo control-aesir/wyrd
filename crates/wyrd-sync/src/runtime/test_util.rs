@@ -98,13 +98,13 @@ impl Mailbox for MemoryMailbox<'_> {
         Ok(())
     }
 
-    fn recv(&mut self) -> Option<Delivery> {
-        let slot = self
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+        let found = self
             .relay
             .queue
             .iter()
-            .find(|s| s.envelope.recipient == self.owner)?;
-        Some(Delivery::new(slot.id, slot.envelope.clone()))
+            .find(|s| s.envelope.recipient == self.owner);
+        Ok(found.map(|slot| Delivery::new(slot.id, slot.envelope.clone())))
     }
 
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {

@@ -58,7 +58,10 @@ pub(super) fn drain(
     // pass with the envelope still unacked, so a pass always terminates
     // even when every envelope is retried.
     let mut offered = HashSet::new();
-    while let Some(delivery) = mailbox.recv() {
+    // A broken mailbox (poisoned lock, exhausted id space) fails the
+    // pass as EngineError::Mailbox via the #[from] conversion — the
+    // envelopes stay retained for redelivery on the next pass.
+    while let Some(delivery) = mailbox.recv()? {
         if !offered.insert(delivery.id()) {
             break;
         }
@@ -832,7 +835,7 @@ mod tests {
             relay: &mut fixture.relay,
             owner: recipient,
         };
-        let delivery = mailbox.recv().expect("offered");
+        let delivery = mailbox.recv().unwrap().expect("offered");
         drop(delivery);
 
         // Restart: the unacked envelope is still held by the relay and

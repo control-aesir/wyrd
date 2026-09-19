@@ -68,10 +68,15 @@ in
   # emulation: slower, but it only has to succeed once per release).
   # Input is pinned to the release tag via `git archive`, never the
   # working copy, so a dirty tree cannot bake into a release tarball.
+  # The builder image is pinned by digest (multi-arch manifest: docker
+  # resolves the right arch per --platform). Refresh it with
+  # `docker buildx imagetools inspect nixos/nix:latest` (or the Hub tag
+  # API) and record the new digest here; never float on `:latest`.
   scripts.build-linux-dist.exec = ''
     set -euo pipefail
     VERSION="''${1:?usage: build-linux-dist <version> (e.g. 0.1.0-alpha.1)}"
     TAG="v$VERSION"
+    NIX_IMAGE="nixos/nix@sha256:7a007c766426c1877758ddc5cb87a965ac131fc78c582ce0083d922d51ae945c"
     git rev-parse --verify --quiet "$TAG" >/dev/null \
       || { echo "tag $TAG does not exist" >&2; exit 1; }
     command -v docker >/dev/null \
@@ -85,8 +90,13 @@ in
       echo "building $TARGET from $TAG..."
       docker run --rm --platform "$TARGET" \
         -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" \
-        nixos/nix:latest sh -c \
+        "$NIX_IMAGE" sh -c \
           'nix --extra-experimental-features "nix-command flakes" build /src#wyrd-dist --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist /out/'
+    done
+    # Smoke check: release.yaml names exactly these two archives, and
+    # ngit rejects partial platform coverage on the main channel.
+    for ARTIFACT in "$ROOT/dist/wyrd-$VERSION-linux-x86_64.tar.gz" "$ROOT/dist/wyrd-$VERSION-linux-aarch64.tar.gz"; do
+      [ -f "$ARTIFACT" ] || { echo "missing expected artifact $ARTIFACT" >&2; exit 1; }
     done
     echo "dist/:"
     ls "$ROOT/dist"

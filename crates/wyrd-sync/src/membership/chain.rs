@@ -44,15 +44,21 @@ pub(crate) struct Analysis {
 
 pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
     let mut link: HashMap<TransitionId, Link> = HashMap::new();
+    // observed_ids and the record map are two views of the same set:
+    // a miss is an internal disagreement, so the id takes no part in
+    // this pass instead of panicking. The downstream classification
+    // gap surfaces at the runtime boundary (intake fails the pass).
     let mut by_epoch: Vec<(u64, TransitionId)> = log
         .observed_ids()
         .into_iter()
-        .map(|id| (log.transition(&id).expect("observed").epoch, id))
+        .filter_map(|id| log.transition(&id).map(|t| (t.epoch, id)))
         .collect();
     by_epoch.sort();
 
     for (_epoch, id) in &by_epoch {
-        let t = log.transition(id).expect("observed");
+        let Some(t) = log.transition(id) else {
+            continue;
+        };
         // `link_for` memoizes, so the ascending pass classifies each link
         // once while staying correct for any order.
         link_for(log, t, &mut link);
@@ -250,7 +256,10 @@ pub(crate) fn build_children_index(
 ) -> HashMap<TransitionId, Vec<TransitionId>> {
     let mut children: HashMap<TransitionId, Vec<TransitionId>> = HashMap::with_capacity(log.len());
     for id in log.observed_ids() {
-        if let Some(prev) = log.transition(&id).expect("observed").prev {
+        let Some(t) = log.transition(&id) else {
+            continue;
+        };
+        if let Some(prev) = t.prev {
             children.entry(prev).or_default().push(id);
         }
     }
@@ -286,7 +295,13 @@ fn walk(
         }
         if kids.len() == 1 {
             let child = kids[0];
-            let t = log.transition(&child).expect("observed");
+            // Kids come from the index built over the same observed set
+            // in this pass; a miss is an internal disagreement. Break
+            // rather than advance on it: canonical progress stalls
+            // instead of building on records that are not there.
+            let Some(t) = log.transition(&child) else {
+                break;
+            };
             if !t.resolves().is_empty() {
                 // Non-empty resolves where no conflict exists at prev.
                 result.status.insert(
@@ -305,7 +320,12 @@ fn walk(
         }
 
         // Conflict: two or more valid children of the canonical tip.
-        let conflict_epoch = log.transition(&kids[0]).expect("observed").epoch;
+        let conflict_epoch = match log.transition(&kids[0]) {
+            Some(t) => t.epoch,
+            // Same reasoning as above: stall instead of resolving on
+            // records that are not there.
+            None => break,
+        };
         match handle_conflict(log, link, children, result, &kids, conflict_epoch) {
             ConflictOutcome::Resolved { resolution } => {
                 current = resolution;
@@ -347,7 +367,13 @@ fn handle_conflict(
             if !matches!(link.get(grand), Some(Link::Valid(_))) {
                 continue;
             }
-            let gt = log.transition(grand).expect("observed");
+            // Grandchildren come from the same-pass index; a miss
+            // drops the candidate instead of panicking. Skipping is
+            // the conservative direction: fewer candidates can only
+            // freeze, never elect on records that are not there.
+            let Some(gt) = log.transition(grand) else {
+                continue;
+            };
             if gt.resolves().is_empty() {
                 continue;
             }
@@ -373,8 +399,17 @@ fn handle_conflict(
         }
         1 => {
             let r = candidates[0];
-            let rt = log.transition(&r).expect("observed");
-            let winner = rt.prev.expect("resolution has a prev");
+            // The candidate was just read from the same observed set;
+            // a miss freezes instead of resolving on records that are
+            // not there. A resolution without a predecessor is equally
+            // unresolvable: genesis-shaped resolutions cannot void
+            // siblings at a previous epoch.
+            let Some(rt) = log.transition(&r) else {
+                return ConflictOutcome::Unresolved;
+            };
+            let Some(winner) = rt.prev else {
+                return ConflictOutcome::Unresolved;
+            };
             result.status.insert(winner, TransitionStatus::Canonical);
             if let Some(Link::Valid(state)) = link.get(&winner) {
                 result.states.insert(winner, state.clone());
@@ -405,7 +440,10 @@ fn handle_conflict(
             ConflictOutcome::Resolved { resolution: r }
         }
         _ => {
-            result.frozen_at = Some(conflict_epoch.checked_add(1).expect("epoch fits u64"));
+            // Contradictory resolutions freeze evaluation at the
+            // resolution epoch. Saturating (not panicking) at u64::MAX:
+            // freezing at the max epoch is the same stall.
+            result.frozen_at = Some(conflict_epoch.saturating_add(1));
             mark_contested(link, result, contenders);
             mark_contested(link, result, &candidates);
             ConflictOutcome::Contradictory
@@ -435,7 +473,13 @@ fn classify_remaining(
         if result.status.contains_key(&id) {
             continue;
         }
-        let outcome = link.get(&id).expect("every observed link is classified");
+        // The link map covers every id the ascending pass visited; a
+        // miss is an internal disagreement. Skip instead of panicking:
+        // the missing verdict surfaces at the runtime boundary, where
+        // an observed-but-unclassified transition fails the pass.
+        let Some(outcome) = link.get(&id) else {
+            continue;
+        };
         match outcome {
             Link::Invalid(reason) => {
                 result.status.insert(id, TransitionStatus::Invalid(*reason));
@@ -450,7 +494,14 @@ fn classify_remaining(
                 // Inherit from the nearest classified ancestor.
                 let mut current = id;
                 let status = loop {
-                    let t = log.transition(&current).expect("observed");
+                    // Ancestors of a valid link are observed (validation
+                    // holds the predecessor record to classify); a miss
+                    // is an internal disagreement. Voided is the fail-
+                    // closed inheritance: never canonical, never
+                    // authorizing — mirroring Orphaned's philosophy.
+                    let Some(t) = log.transition(&current) else {
+                        break TransitionStatus::Voided;
+                    };
                     match t.prev {
                         Some(prev) => match result.status.get(&prev) {
                             Some(TransitionStatus::Contested | TransitionStatus::Voided) => {

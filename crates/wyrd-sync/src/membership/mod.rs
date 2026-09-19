@@ -189,18 +189,18 @@ impl MembershipLog {
     /// Classify a transition against the observed set. Each call runs a
     /// full analysis; callers needing many verdicts should prefer
     /// [`MembershipLog::statuses`].
+    ///
+    /// `None` covers unobserved ids — and, defensively, observed ids
+    /// the fresh analysis classifies nothing for. Both views read the
+    /// same observed set, so the latter is an internal disagreement:
+    /// callers on fallible paths fail the operation on it instead of
+    /// panicking (see intake's `TransitionUnclassified` arm).
     pub fn status(&self, id: &TransitionId) -> Option<TransitionStatus> {
         if !self.transitions.contains_key(id) {
             return None;
         }
         let analysis = chain::analyse(self);
-        Some(
-            analysis
-                .status
-                .get(id)
-                .copied()
-                .expect("every observed transition is classified"),
-        )
+        analysis.status.get(id).copied()
     }
 
     /// All verdicts from one analysis pass. Prefer this over repeated

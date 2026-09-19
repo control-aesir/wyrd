@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId};
+use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId, TransitionId};
 use zeroize::Zeroizing;
 
 use super::{MaterializationState, RuntimeError, RuntimeState};
@@ -138,6 +138,10 @@ pub enum EngineError {
     Keystore(#[from] crate::keys::KeystoreError),
     #[error("keystore I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("no announcement record for snapshot {0}: planned bodies derive from announcements")]
+    AnnouncementUnavailable(SnapshotId),
+    #[error("observed transition {0:?} has no classification")]
+    TransitionUnclassified(TransitionId),
 }
 
 /// What one [`Engine::drain`] pass did.

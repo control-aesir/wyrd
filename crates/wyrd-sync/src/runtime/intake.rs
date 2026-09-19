@@ -141,7 +141,7 @@ fn commit_action(
     // several pending messages into one commit, and a fork must never
     // reach the fact log merely because two deferrals resolved together.
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
-    let mut facts = match message_action(engine, id, message, &mut staged) {
+    let mut facts = match message_action(engine, id, message, &mut staged)? {
         Action::Commit(facts) => facts,
         Action::Suppress => {
             engine.inbox.suppress(id);
@@ -171,7 +171,7 @@ fn commit_action(
         // `Engine::hold_pending`): staged announcement compatibility
         // and the durable fact order are deterministic.
         for (pending_id, pending_message) in std::mem::take(&mut engine.pending) {
-            match message_action(engine, &pending_id, &pending_message, &mut staged) {
+            match message_action(engine, &pending_id, &pending_message, &mut staged)? {
                 Action::Commit(more) => facts.extend(more),
                 Action::Suppress => {
                     engine.inbox.suppress(&pending_id);
@@ -202,24 +202,24 @@ fn message_action(
     id: &ControlMessageId,
     message: &Message,
     staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
-) -> Action {
+) -> Result<Action, EngineError> {
     match message {
         Message::MembershipTransition(payload) => {
             if check_total_len(&Limits::V0, "transition", payload.transition.len()).is_err() {
-                return Action::Suppress;
+                return Ok(Action::Suppress);
             }
             let transition = match MembershipTransition::from_canonical_bytes(&payload.transition) {
                 Ok(transition) => transition,
-                Err(_) => return Action::Suppress,
+                Err(_) => return Ok(Action::Suppress),
             };
             if check_transition(&Limits::V0, &transition).is_err() {
-                return Action::Suppress;
+                return Ok(Action::Suppress);
             }
             engine.log.observe(transition.clone());
-            Action::Commit(vec![
+            Ok(Action::Commit(vec![
                 Fact::Transition(transition),
                 Fact::ControlMessage(*id),
-            ])
+            ]))
         }
         Message::SnapshotAnnouncement(announcement) => {
             // Authorship first: an announcement is evidence only when
@@ -228,17 +228,13 @@ fn message_action(
             // unparsable transition — suppress memory-only, never
             // defer.
             if verify_announcement(&engine.drive(), announcement).is_err() {
-                return Action::Suppress;
+                return Ok(Action::Suppress);
             }
             match engine.log.transition(&announcement.membership) {
-                None => Action::Defer,
-                Some(t) if t.epoch != announcement.epoch => Action::Suppress,
-                Some(_) => match engine
-                    .log
-                    .status(&announcement.membership)
-                    .expect("membership observed")
-                {
-                    TransitionStatus::Canonical => {
+                None => Ok(Action::Defer),
+                Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
+                Some(_) => match engine.log.status(&announcement.membership) {
+                    Some(TransitionStatus::Canonical) => {
                         // The compatibility gate: an announcement becomes a
                         // durable fact only when it is compatible with the
                         // announcement already known for the snapshot — the
@@ -263,19 +259,30 @@ fn message_action(
                         };
                         if committable {
                             staged.insert(announcement.snapshot, announcement.clone());
-                            Action::Commit(vec![
+                            Ok(Action::Commit(vec![
                                 Fact::Announcement(announcement.clone()),
                                 Fact::ControlMessage(*id),
-                            ])
+                            ]))
                         } else {
-                            Action::Suppress
+                            Ok(Action::Suppress)
                         }
                     }
-                    TransitionStatus::Invalid(_) => Action::Suppress,
-                    TransitionStatus::Contested
-                    | TransitionStatus::Voided
-                    | TransitionStatus::Orphaned
-                    | TransitionStatus::Pending => Action::Defer,
+                    Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
+                    Some(
+                        TransitionStatus::Contested
+                        | TransitionStatus::Voided
+                        | TransitionStatus::Orphaned
+                        | TransitionStatus::Pending,
+                    ) => Ok(Action::Defer),
+                    // Observed a moment ago via transition(), but the
+                    // fresh analysis classifies nothing for it: an
+                    // internal disagreement, not sender data. Fail the
+                    // pass — the envelope stays retained for redelivery.
+                    // Unreachable through the public log API (both views
+                    // read the same observed set); defense in depth for a
+                    // future analysis that can miss, mirroring the
+                    // mailbox ceiling gates.
+                    None => Err(EngineError::TransitionUnclassified(announcement.membership)),
                 },
             }
         }
@@ -285,8 +292,8 @@ fn message_action(
         // park poison for retry). When rotation handling lands this arm
         // becomes a commit or a deferral; until then no durable record
         // distinguishes consumed from never-recorded (see trust.md).
-        Message::KeyRotation(_) => Action::Suppress,
-        Message::Capability(_) => capability_action(engine, id, message),
+        Message::KeyRotation(_) => Ok(Action::Suppress),
+        Message::Capability(_) => Ok(capability_action(engine, id, message)),
     }
 }
 

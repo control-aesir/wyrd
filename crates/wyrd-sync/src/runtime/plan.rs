@@ -5,12 +5,26 @@
 //! objects. The individual fetch validators remain on `Engine` for now so the
 //! security-sensitive state access stays explicit during the decomposition.
 
-use wyrd_format::ObjectStore;
+use wyrd_format::{ObjectStore, SnapshotId};
 
 use super::engine::{Engine, EngineError, ExecuteReport, FetchKey};
 use super::fetch::FetchOutcome;
-use super::PendingObjectFetch;
+use super::{PendingObjectFetch, RuntimeState};
 use crate::bulk::BulkSource;
+use crate::control::SnapshotAnnouncement;
+
+/// Look up the announcement a planned body derives from. The plan's
+/// pending bodies come from the same projection, so a miss is a
+/// reconcile/projection disagreement — an internal bug, not sender
+/// data — and fails the pass instead of panicking the process.
+fn planned_announcement<'a>(
+    runtime: &'a RuntimeState,
+    snapshot: &SnapshotId,
+) -> Result<&'a SnapshotAnnouncement, EngineError> {
+    runtime
+        .announcement(snapshot)
+        .ok_or(EngineError::AnnouncementUnavailable(*snapshot))
+}
 
 /// Execute the current fetch plan to convergence.
 pub(super) fn execute(
@@ -44,9 +58,7 @@ pub(super) fn execute(
                     // the body's own binding drives authorization. Only
                     // an agreeing pair commits; a disagreement is the
                     // sender's invalid data, not a transport failure.
-                    let announced = runtime
-                        .announcement(snapshot)
-                        .expect("pending bodies derive from announcements");
+                    let announced = planned_announcement(&runtime, snapshot)?;
                     let agrees = announced.author == body.author
                         && announced.epoch == body.epoch
                         && announced.membership == body.membership;
@@ -230,8 +242,8 @@ mod tests {
 
     use wyrd_format::store::MemoryStoreError;
     use wyrd_format::{
-        BaoRoot, ContentId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind, SharedStore,
-        Snapshot, SnapshotId, StorageId,
+        BaoRoot, ContentId, DeviceId, Manifest, ManifestEntry, MemoryObjectStore, ObjectKind,
+        SharedStore, Snapshot, SnapshotId, StorageId, TransitionId,
     };
 
     use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -273,6 +285,40 @@ mod tests {
         fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
             self.0.has(id)
         }
+    }
+
+    /// A planned body without an announcement fails the lookup instead
+    /// of panicking: the plan and the announcement map are two views of
+    /// the same projection, so a miss is an internal disagreement.
+    #[test]
+    fn planned_body_without_announcement_fails() {
+        let runtime = RuntimeState::new(member_drive());
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        assert!(matches!(
+            planned_announcement(&runtime, &snapshot),
+            Err(EngineError::AnnouncementUnavailable(id)) if id == snapshot
+        ));
+    }
+
+    #[test]
+    fn planned_body_with_announcement_resolves() {
+        use crate::control::SnapshotAnnouncement;
+
+        let mut runtime = RuntimeState::new(member_drive());
+        let announcement = SnapshotAnnouncement {
+            snapshot: SnapshotId::from_bytes([0x11; 32]),
+            author: DeviceId::from_bytes([0x22; 32]),
+            epoch: 2,
+            membership: TransitionId::from_bytes([0x33; 32]),
+            body_root: BaoRoot::from_bytes([0x44; 32]),
+            root_manifest: ContentId::from_bytes([0x55; 32]),
+            root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
+            node_addr: None,
+            signature: [0x77; 64],
+        };
+        runtime.record_announcement(announcement.clone()).unwrap();
+        let found = planned_announcement(&runtime, &announcement.snapshot).unwrap();
+        assert_eq!(found, &announcement);
     }
 
     #[test]

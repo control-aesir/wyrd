@@ -72,7 +72,13 @@ pub(super) fn classify(
         live: HashMap::new(),
     };
     for id in &ids {
-        let s = dag.snapshot(id).expect("observed");
+        // ids() and the record map are two views of the same DAG: a
+        // miss is an internal disagreement. Skip instead of panicking;
+        // the missing pre-verdict strands the snapshot in phase 3
+        // (retained history that never advances the live view).
+        let Some(s) = dag.snapshot(id) else {
+            continue;
+        };
         engine.pre.insert(
             *id,
             preverdict(&dag.drive, log, &statuses, s, tip_owners.as_ref()),
@@ -89,7 +95,9 @@ pub(super) fn classify(
     engine.live_fixed_point();
     let mut recovery_rejected = false;
     for id in &ids {
-        let s = dag.snapshot(id).expect("observed");
+        let Some(s) = dag.snapshot(id) else {
+            continue;
+        };
         if s.flags() & RECOVERY_FLAG != 0
             && engine.pre.get(id) == Some(&Pre::Authorized)
             && !engine.recovery_parents_eligible(id)
@@ -113,10 +121,25 @@ pub(super) fn classify(
     let heads: HashSet<SnapshotId> = dag.heads().into_iter().collect();
     let mut out = HashMap::with_capacity(ids.len());
     for id in &ids {
-        let s = dag.snapshot(id).expect("observed");
+        let Some(s) = dag.snapshot(id) else {
+            // Same internal-disagreement reasoning as phase 1: strand
+            // instead of panicking. Stranded is retained history that
+            // never advances the live view — the safe direction.
+            out.insert(*id, Classification::Stranded);
+            continue;
+        };
+        let pre = match engine.pre.get(id) {
+            Some(pre) => *pre,
+            // Phase 1 saw this id but recorded no verdict for it:
+            // strand, same as above.
+            None => {
+                out.insert(*id, Classification::Stranded);
+                continue;
+            }
+        };
         out.insert(
             *id,
-            match engine.pre[id] {
+            match pre {
                 Pre::Rejected(r) => Classification::Rejected(r),
                 Pre::Pending(p) => Classification::Pending(p),
                 Pre::Voided => Classification::Voided,
@@ -201,7 +224,12 @@ impl<'a> Engine<'a> {
     /// permanent dead ancestry.
     fn compute_parent_fate(&mut self) {
         for id in self.dag.ids() {
-            let s = self.dag.snapshot(&id).expect("observed");
+            // Same-DAG ids: a miss is an internal disagreement. Skip
+            // instead of panicking; the missing fate reads Dead in the
+            // seed, the fail-closed direction.
+            let Some(s) = self.dag.snapshot(&id) else {
+                continue;
+            };
             let mut fate = ParentFate::Ok;
             for parent in &s.parents {
                 let Some(_) = self.dag.snapshot(parent) else {
@@ -278,13 +306,20 @@ impl<'a> Engine<'a> {
             Some(Pre::Pending(p)) => return Live::Undecided(*p),
             _ => return Live::Dead,
         }
-        let s = self.dag.snapshot(id).expect("observed");
+        // A Live parent is observed (parent fate Ok requires every
+        // parent observed); a miss here is an internal disagreement.
+        // Dead is fail-closed: never live on records that are not there.
+        let Some(s) = self.dag.snapshot(id) else {
+            return Live::Dead;
+        };
         for parent in &s.parents {
             match self.live.get(parent) {
                 Some(Live::Undecided(p)) => return Live::Undecided(*p),
                 Some(Live::Dead) => return Live::Dead,
                 Some(Live::Live) => {
-                    let ps = self.dag.snapshot(parent).expect("observed");
+                    let Some(ps) = self.dag.snapshot(parent) else {
+                        return Live::Dead;
+                    };
                     if ps.epoch > s.epoch {
                         return Live::Dead;
                     }
@@ -309,13 +344,22 @@ impl<'a> Engine<'a> {
     /// eligible head, with `id` itself excluded from the head
     /// computation.
     fn recovery_parents_eligible(&mut self, id: &SnapshotId) -> bool {
-        let s = self.dag.snapshot(id).expect("observed");
+        // The candidate comes from the same DAG under classification;
+        // a miss is an internal disagreement, and an ineligible
+        // verdict is the safe direction (no recovery on records that
+        // are not there).
+        let Some(s) = self.dag.snapshot(id) else {
+            return false;
+        };
         let mut referenced: HashSet<SnapshotId> = HashSet::new();
         for other in self.dag.ids() {
             if other == *id {
                 continue;
             }
-            for parent in &self.dag.snapshot(&other).expect("observed").parents {
+            let Some(other_s) = self.dag.snapshot(&other) else {
+                continue;
+            };
+            for parent in &other_s.parents {
                 referenced.insert(*parent);
             }
         }
@@ -336,7 +380,12 @@ fn children_of(dag: &SnapshotDag, ids: &[SnapshotId]) -> HashMap<SnapshotId, Vec
     let mut children: HashMap<SnapshotId, Vec<SnapshotId>> =
         ids.iter().map(|id| (*id, Vec::new())).collect();
     for id in ids {
-        for parent in &dag.snapshot(id).expect("observed").parents {
+        // Keys are pre-inserted above, so the index stays complete
+        // even when a record disagrees with the id list.
+        let Some(s) = dag.snapshot(id) else {
+            continue;
+        };
+        for parent in &s.parents {
             if let Some(list) = children.get_mut(parent) {
                 list.push(*id);
             }

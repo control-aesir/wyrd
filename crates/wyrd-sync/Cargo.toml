@@ -2,6 +2,7 @@
 name = "wyrd-sync"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Wyrd's peer-to-peer replication layer: iroh transport, peer roles, snapshot log exchange"
 
 [dependencies]

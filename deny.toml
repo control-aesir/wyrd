@@ -1,0 +1,51 @@
+# Dependency policy enforced by `cargo deny check` and the pre-push hooks in
+# devenv.nix. Reviewed 2026-09-19 against the full Cargo.lock license
+# inventory: every allowed license below appears in the current graph, and
+# every graph license is allowed. Re-review this list when adding a dependency
+# under a license not already here — especially copyleft ones.
+#
+# License notes from that inventory:
+# - `self_cell` and `r-efi` carry OR expressions with GPL-2.0-only /
+#   LGPL-2.1-or-later alternatives, but each also offers Apache-2.0 or MIT, so
+#   they check out under the permissive choice. No crate is GPL-only.
+# - `attohttpc` (via `igd-next`) is the single MPL-2.0-only crate. MPL-2.0 is
+#   file-level copyleft with no repo-wide effect; allowed deliberately.
+
+[advisories]
+# Vulnerabilities always fail and cannot be downgraded. Yanked crates only
+# warn. Unmaintained crates fail only when they are direct workspace
+# dependencies: the three unmaintained advisories in the graph today
+# (atomic-polyfill, paste, proc-macro-error) are transitive-only, so they are
+# reported but do not block. Promote to `all` once those are eliminated.
+yanked = "warn"
+unmaintained = "workspace"
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[bans]
+# Duplicate crate versions only warn: r-efi 5.3/6.0 already coexist via
+# wasi 0.13/0.14. Promote to deny once the graph converges.
+multiple-versions = "warn"
+
+[sources]
+# crates.io is the only permitted registry; the lockfile currently contains
+# no git sources. Unknown registries fail, unknown git sources fail.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

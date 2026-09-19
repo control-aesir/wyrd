@@ -2,6 +2,7 @@
 name = "wyrd-format"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Wyrd's core object model: content-addressed chunks, Merkle file trees, append-only snapshot log"
 
 [dependencies]

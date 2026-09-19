@@ -7,6 +7,7 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "deny.toml"
       - "rust-toolchain.toml"
       - "flake.nix"
       - "flake.lock"
@@ -18,6 +19,7 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "deny.toml"
       - "rust-toolchain.toml"
       - "flake.nix"
       - "flake.lock"
@@ -161,6 +163,25 @@ jobs:
           set -o pipefail
           echo "===== doctests =====" >> /tmp/rust.log
           cargo test --color never --workspace --doc 2>&1 | tee -a /tmp/rust.log
+
+      # Pre-built audit binaries (same installer as nextest above).
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@cargo-deny
+
+      # Dependency policy: vulnerability advisories plus the
+      # license/sources/bans policy in deny.toml. The same checks run as
+      # pre-push hooks via devenv; CI is the backstop for pushes without
+      # hooks installed. cargo-udeps is deliberately absent: it needs Rust
+      # >= 1.93 and the workspace pins 1.91.0 in rust-toolchain.toml.
+      # Revisit with the toolchain bump.
+      - name: Dependency audit
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          echo "===== cargo audit =====" >> /tmp/rust.log
+          cargo audit --color never 2>&1 | tee -a /tmp/rust.log
+          echo "===== cargo deny =====" >> /tmp/rust.log
+          cargo deny check 2>&1 | tee -a /tmp/rust.log
 
       # Upload all logs — runs even when a step above failed, so you get the
       # partial log up to the failure point.

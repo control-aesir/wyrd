@@ -11,6 +11,8 @@ members = [
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2021"
+# Matches the project LICENSE (MIT). Crates inherit via `license.workspace`.
+license = "MIT"
 
 [workspace.lints.rust]
 # The verified-head boundary rests on unsafe-impl auditability (see

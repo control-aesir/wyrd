@@ -11,7 +11,7 @@ ID / Storage ID). This doc describes how peers exchange them.
 
 - iroh endpoint with relay/DNS discovery, NAT traversal, and gossip
 - Pairing via tickets (one peer generates, the other imports)
-- The iroh version set (iroh 1.0.3 / iroh-blobs 0.103.0 fs-store /
+- The iroh version set (iroh 1.1.0 / iroh-blobs 0.103.0 fs-store /
   iroh-gossip 0.101.0) is validated as a set and changes as a set
 
 ## Runtime sync boundary

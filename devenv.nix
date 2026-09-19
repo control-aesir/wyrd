@@ -108,7 +108,7 @@ in
       docker run --rm --platform "$TARGET" --security-opt seccomp=unconfined \
         -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" -v wyrd-nix-store:/nix \
         "$NIX_IMAGE" sh -c \
-          'nix --extra-experimental-features "nix-command flakes" build "/src#packages-'"''$SYSTEM"'.wyrd-dist" --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist "/out/$(basename "$(readlink /tmp/wyrd-dist)")"'
+          'nix --extra-experimental-features "nix-command flakes" build "/src#packages.'"''$SYSTEM"'.wyrd-dist" --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist "/out/$(basename "$(readlink /tmp/wyrd-dist)")"'
     done
     # Smoke check: release.yaml names exactly these two archives, and
     # ngit rejects partial platform coverage on the main channel.

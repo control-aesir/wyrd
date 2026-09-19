@@ -86,12 +86,21 @@ in
     trap 'rm -rf "$EXPORT"' EXIT
     git archive "$TAG" | tar -x -C "$EXPORT"
     mkdir -p "$ROOT/dist"
+    # A named volume persists the container Nix store across runs: the
+    # store is content-addressed, so a retry or a second target reuses
+    # identical derivations instead of recompiling the world.
+    docker volume create wyrd-nix-store >/dev/null
     for TARGET in linux/arm64 linux/amd64; do
       echo "building $TARGET from $TAG..."
-      docker run --rm --platform "$TARGET" \
-        -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" \
+      # seccomp=unconfined: Docker Desktop (and Rosetta emulation for
+      # amd64) rejects the seccomp-BPF sandbox Nix installs for its
+      # builds. Unconfining the container seccomp profile lets Nix
+      # sandbox the build itself, which is the isolation that matters
+      # for reproducible artifacts.
+      docker run --rm --platform "$TARGET" --security-opt seccomp=unconfined \
+        -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" -v wyrd-nix-store:/nix \
         "$NIX_IMAGE" sh -c \
-          'nix --extra-experimental-features "nix-command flakes" build /src#wyrd-dist --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist /out/'
+          'nix --extra-experimental-features "nix-command flakes" build /src#wyrd-dist --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist "/out/$(basename "$(readlink /tmp/wyrd-dist)")"'
     done
     # Smoke check: release.yaml names exactly these two archives, and
     # ngit rejects partial platform coverage on the main channel.

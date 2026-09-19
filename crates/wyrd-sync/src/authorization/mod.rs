@@ -181,11 +181,15 @@ impl SnapshotDag {
 
     /// The live-head projection as bodies: the id set of
     /// [`SnapshotDag::eligible_heads`], resolved against the observed
-    /// DAG (sorted ascending, like the ids).
+    /// DAG (sorted ascending, like the ids). Eligible ids come from a
+    /// classification over this same DAG; a miss is an internal
+    /// disagreement. Dropping it keeps fewer heads live — the safe
+    /// direction, never advancing the view on records that are not
+    /// there.
     pub fn eligible_head_bodies(&self, log: &MembershipLog) -> Vec<Snapshot> {
         self.eligible_heads(log)
             .into_iter()
-            .map(|id| self.snapshot(&id).expect("eligible id is observed").clone())
+            .filter_map(|id| self.snapshot(&id).cloned())
             .collect()
     }
 

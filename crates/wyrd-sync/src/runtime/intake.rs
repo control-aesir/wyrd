@@ -142,12 +142,12 @@ fn commit_action(
     // reach the fact log merely because two deferrals resolved together.
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
     let mut facts = match message_action(engine, id, message, &mut staged) {
-        Action::Commit(facts) => facts,
-        Action::Suppress => {
+        Ok(Action::Commit(facts)) => facts,
+        Ok(Action::Suppress) => {
             engine.inbox.suppress(id);
             return Ok(Outcome::Accepted);
         }
-        Action::Defer if engine.pending.len() >= MAX_PENDING_MESSAGES => {
+        Ok(Action::Defer) if engine.pending.len() >= MAX_PENDING_MESSAGES => {
             // Shed without consuming: the bound protects memory, but a
             // resource decision must never write a semantic fact. The
             // relay retains the envelope (the drain settles `Retry`),
@@ -157,9 +157,23 @@ fn commit_action(
             engine.inbox.forget(id);
             return Ok(Outcome::RelayHeld);
         }
-        Action::Defer => {
+        Ok(Action::Defer) => {
             engine.hold_pending(*id, message.clone());
             return Ok(Outcome::Deferred);
+        }
+        Err(error) => {
+            // The pass fails after volatile writes: the transition (if
+            // any) is observed in the log, but no fact committed. A
+            // message taken from pending on redelivery is re-held so
+            // its slot survives; a fresh message rides relay redelivery
+            // (its handover was never settled). Either way resync drops
+            // the uncommitted observations and suppress verdicts,
+            // restoring the durable baseline before the error surfaces.
+            if !is_new {
+                engine.hold_pending(*id, message.clone());
+            }
+            let _ = engine.resync();
+            return Err(error);
         }
     };
     if !is_new {
@@ -170,16 +184,38 @@ fn commit_action(
         // The flush walks the pending queue in arrival order (see
         // `Engine::hold_pending`): staged announcement compatibility
         // and the durable fact order are deterministic.
-        for (pending_id, pending_message) in std::mem::take(&mut engine.pending) {
-            match message_action(engine, &pending_id, &pending_message, &mut staged) {
-                Action::Commit(more) => facts.extend(more),
-                Action::Suppress => {
-                    engine.inbox.suppress(&pending_id);
+        let taken = std::mem::take(&mut engine.pending);
+        let mut failed_at: Option<(usize, EngineError)> = None;
+        for (index, (pending_id, pending_message)) in taken.iter().enumerate() {
+            match message_action(engine, pending_id, pending_message, &mut staged) {
+                Ok(Action::Commit(more)) => facts.extend(more),
+                Ok(Action::Suppress) => {
+                    engine.inbox.suppress(pending_id);
                 }
-                Action::Defer => {
-                    engine.hold_pending(pending_id, pending_message);
+                Ok(Action::Defer) => {
+                    engine.hold_pending(*pending_id, pending_message.clone());
+                }
+                Err(error) => {
+                    failed_at = Some((index, error));
+                    break;
                 }
             }
+        }
+        if let Some((index, error)) = failed_at {
+            // Restore the in-flight message and the unprocessed
+            // remainder in arrival order. Every id here is disjoint
+            // from the re-held ones (each id exists once), so
+            // hold_pending appends without clobbering. Suppressed and
+            // fact-consumed prefixes redeliver via the relay (never
+            // settled); the observations and verdicts they left behind
+            // go away with the resync below, which must run after the
+            // restore — resync rebuilds from durable facts and never
+            // touches the volatile queue.
+            for (id, message) in taken.into_iter().skip(index) {
+                engine.hold_pending(id, message);
+            }
+            let _ = engine.resync();
+            return Err(error);
         }
     }
     if facts.is_empty() {
@@ -188,6 +224,16 @@ fn commit_action(
     if let Err(error) = engine.commit_facts(&facts) {
         let _ = engine.resync();
         return Err(error.into());
+    }
+    // The inbox mirrors durable seen-ness: ids committed durably are
+    // processed by definition and must never re-ingest. Ingest-time
+    // marking covers the normal flow, but a resync later in the same
+    // drain rebuilds the inbox from durable facts — without this,
+    // redelivery would report fresh and commit the same facts twice.
+    for fact in &facts {
+        if let Fact::ControlMessage(id) = fact {
+            engine.inbox.remember(id);
+        }
     }
     // The projection follows the durable state, never leads it: staged
     // announcements merge only after the fact batch committed.
@@ -202,24 +248,24 @@ fn message_action(
     id: &ControlMessageId,
     message: &Message,
     staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
-) -> Action {
+) -> Result<Action, EngineError> {
     match message {
         Message::MembershipTransition(payload) => {
             if check_total_len(&Limits::V0, "transition", payload.transition.len()).is_err() {
-                return Action::Suppress;
+                return Ok(Action::Suppress);
             }
             let transition = match MembershipTransition::from_canonical_bytes(&payload.transition) {
                 Ok(transition) => transition,
-                Err(_) => return Action::Suppress,
+                Err(_) => return Ok(Action::Suppress),
             };
             if check_transition(&Limits::V0, &transition).is_err() {
-                return Action::Suppress;
+                return Ok(Action::Suppress);
             }
             engine.log.observe(transition.clone());
-            Action::Commit(vec![
+            Ok(Action::Commit(vec![
                 Fact::Transition(transition),
                 Fact::ControlMessage(*id),
-            ])
+            ]))
         }
         Message::SnapshotAnnouncement(announcement) => {
             // Authorship first: an announcement is evidence only when
@@ -228,17 +274,13 @@ fn message_action(
             // unparsable transition — suppress memory-only, never
             // defer.
             if verify_announcement(&engine.drive(), announcement).is_err() {
-                return Action::Suppress;
+                return Ok(Action::Suppress);
             }
             match engine.log.transition(&announcement.membership) {
-                None => Action::Defer,
-                Some(t) if t.epoch != announcement.epoch => Action::Suppress,
-                Some(_) => match engine
-                    .log
-                    .status(&announcement.membership)
-                    .expect("membership observed")
-                {
-                    TransitionStatus::Canonical => {
+                None => Ok(Action::Defer),
+                Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
+                Some(_) => match engine.log.status(&announcement.membership) {
+                    Some(TransitionStatus::Canonical) => {
                         // The compatibility gate: an announcement becomes a
                         // durable fact only when it is compatible with the
                         // announcement already known for the snapshot — the
@@ -263,19 +305,30 @@ fn message_action(
                         };
                         if committable {
                             staged.insert(announcement.snapshot, announcement.clone());
-                            Action::Commit(vec![
+                            Ok(Action::Commit(vec![
                                 Fact::Announcement(announcement.clone()),
                                 Fact::ControlMessage(*id),
-                            ])
+                            ]))
                         } else {
-                            Action::Suppress
+                            Ok(Action::Suppress)
                         }
                     }
-                    TransitionStatus::Invalid(_) => Action::Suppress,
-                    TransitionStatus::Contested
-                    | TransitionStatus::Voided
-                    | TransitionStatus::Orphaned
-                    | TransitionStatus::Pending => Action::Defer,
+                    Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
+                    Some(
+                        TransitionStatus::Contested
+                        | TransitionStatus::Voided
+                        | TransitionStatus::Orphaned
+                        | TransitionStatus::Pending,
+                    ) => Ok(Action::Defer),
+                    // Observed a moment ago via transition(), but the
+                    // fresh analysis classifies nothing for it: an
+                    // internal disagreement, not sender data. Fail the
+                    // pass — the envelope stays retained for redelivery.
+                    // Unreachable through the public log API (both views
+                    // read the same observed set); defense in depth for a
+                    // future analysis that can miss, mirroring the
+                    // mailbox ceiling gates.
+                    None => Err(EngineError::TransitionUnclassified(announcement.membership)),
                 },
             }
         }
@@ -285,8 +338,8 @@ fn message_action(
         // park poison for retry). When rotation handling lands this arm
         // becomes a commit or a deferral; until then no durable record
         // distinguishes consumed from never-recorded (see trust.md).
-        Message::KeyRotation(_) => Action::Suppress,
-        Message::Capability(_) => capability_action(engine, id, message),
+        Message::KeyRotation(_) => Ok(Action::Suppress),
+        Message::Capability(_) => Ok(capability_action(engine, id, message)),
     }
 }
 
@@ -345,6 +398,7 @@ mod tests {
     use crate::keys::capability::Capability;
     use crate::keys::{DeviceEncryptionSecret, EpochSecret};
     use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
+    use crate::membership::ForceUnclassifiedGuard;
     use crate::membership::MembershipLog;
     use crate::runtime::test_util::{
         admit_engine, announcement_for, announcement_msg_routed, announcement_msg_with,
@@ -1034,6 +1088,68 @@ mod tests {
         assert_eq!(fixture.engine.pending_count(), 0);
         assert_eq!(fixture.engine.current(), 2);
         let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.announcements.len(), 1);
+    }
+
+    /// A classification disagreement fails the pass but loses nothing:
+    /// volatile state returns to the durable baseline with pending
+    /// intact, and redelivery converges. The disagreement is injected
+    /// (unreachable through the public log API by construction): with
+    /// classification forced to miss, the held announcement's
+    /// revalidation fails while the landing child sits observed-but-
+    /// uncommitted in the volatile log.
+    #[test]
+    fn classification_disagreement_recovers_and_converges_on_redelivery() {
+        let mut fixture = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let bound = announcement_for(2, child.transition_id());
+
+        // Announcement first: membership unobserved, so it holds.
+        let mail = vec![deliver(&fixture, 2, &bound)];
+        queue(&mut fixture, mail);
+        assert_eq!(drain(&mut fixture).deferred, 1);
+        assert_eq!(fixture.engine.pending_count(), 1);
+        assert_eq!(fixture.engine.current(), 0);
+
+        // Transitions land with classification forced to disagree. The
+        // genesis commits; then the child observes into the volatile
+        // log and the flushed announcement's revalidation fails the
+        // pass. Durable progress is kept, nothing else commits, and
+        // the held announcement survives in pending.
+        let mail = vec![
+            deliver(&fixture, 1, &transition_message(&genesis)),
+            deliver(&fixture, 1, &transition_message(&child)),
+        ];
+        queue(&mut fixture, mail);
+        let _guard = ForceUnclassifiedGuard::arm();
+        let recipient = fixture.recipient;
+        {
+            let mut mailbox = MemoryMailbox {
+                relay: &mut fixture.relay,
+                owner: recipient,
+            };
+            assert!(matches!(
+                fixture.engine.drain(&mut mailbox),
+                Err(EngineError::TransitionUnclassified(_))
+            ));
+        }
+        drop(_guard);
+        assert_eq!(fixture.engine.pending_count(), 1);
+        assert_eq!(fixture.engine.current(), 1);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.transitions.len(), 1);
+        assert!(facts.announcements.is_empty());
+
+        // Redelivery converges without re-queueing: the unsettled
+        // child and announcement envelopes are still retained, so a
+        // fresh drain commits both and drains pending.
+        let report = drain(&mut fixture);
+        assert!(report.accepted >= 1);
+        assert_eq!(fixture.engine.pending_count(), 0);
+        assert_eq!(fixture.engine.current(), 2);
+        let facts = fixture.engine.store.load().expect("loads");
+        assert_eq!(facts.transitions.len(), 2);
         assert_eq!(facts.announcements.len(), 1);
     }
 

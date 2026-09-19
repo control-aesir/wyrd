@@ -31,6 +31,42 @@ pub use state::{apply, ApplyError, MembershipState};
 pub(crate) use validate::sign_transition;
 pub use validate::CHALLENGE_CONTEXT;
 
+// Test seam for the intake recovery path: forces
+// [`MembershipLog::status`] to report its subject unclassified
+// (`None`), simulating the internal disagreement the runtime's
+// `TransitionUnclassified` arm defends against. That disagreement is
+// unreachable through the public log API by construction (both views
+// read the same observed set), so the regression test injects it here
+// instead of constructing an impossible log.
+//
+// Thread-local like the durable fsync counter: the suite runs tests
+// concurrently in one binary, and a thread runs one test at a time,
+// so arming on entry and resetting on drop is race-free.
+#[cfg(test)]
+thread_local! {
+    static FORCE_UNCLASSIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms [`FORCE_UNCLASSIFIED`] for the test body; dropping (including
+/// on panic or assertion failure) resets it.
+#[cfg(test)]
+pub(crate) struct ForceUnclassifiedGuard;
+
+#[cfg(test)]
+impl ForceUnclassifiedGuard {
+    pub(crate) fn arm() -> Self {
+        FORCE_UNCLASSIFIED.with(|flag| flag.set(true));
+        ForceUnclassifiedGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceUnclassifiedGuard {
+    fn drop(&mut self) {
+        FORCE_UNCLASSIFIED.with(|flag| flag.set(false));
+    }
+}
+
 /// Why a transition fails validation. The machine never deletes rejected
 /// transitions: an `Invalid` verdict is an assertion about evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +233,14 @@ impl MembershipLog {
     /// panicking (see intake's `TransitionUnclassified` arm).
     pub fn status(&self, id: &TransitionId) -> Option<TransitionStatus> {
         if !self.transitions.contains_key(id) {
+            return None;
+        }
+        // Test seam for the intake recovery path (see
+        // `ForceUnclassifiedGuard`): forces the internal-disagreement
+        // arm, which is unreachable through the public log API by
+        // construction.
+        #[cfg(test)]
+        if FORCE_UNCLASSIFIED.with(|flag| flag.get()) {
             return None;
         }
         let analysis = chain::analyse(self);

@@ -60,4 +60,35 @@ in
       pass_filenames = false;
     };
   };
+
+  # Release tooling: build the Linux distribution tarballs from a Mac.
+  # The flake builds natively per system, so `nix build .#wyrd-dist` on
+  # darwin only yields macos-aarch64. This wraps one containerized native
+  # build per Linux target (amd64 runs under Docker Desktop Rosetta
+  # emulation: slower, but it only has to succeed once per release).
+  # Input is pinned to the release tag via `git archive`, never the
+  # working copy, so a dirty tree cannot bake into a release tarball.
+  scripts.build-linux-dist.exec = ''
+    set -euo pipefail
+    VERSION="''${1:?usage: build-linux-dist <version> (e.g. 0.1.0-alpha.1)}"
+    TAG="v$VERSION"
+    git rev-parse --verify --quiet "$TAG" >/dev/null \
+      || { echo "tag $TAG does not exist" >&2; exit 1; }
+    command -v docker >/dev/null \
+      || { echo "docker is required (Docker Desktop with Rosetta enabled for amd64)" >&2; exit 1; }
+    ROOT=$(git rev-parse --show-toplevel)
+    EXPORT=$(mktemp -d)
+    trap 'rm -rf "$EXPORT"' EXIT
+    git archive "$TAG" | tar -x -C "$EXPORT"
+    mkdir -p "$ROOT/dist"
+    for TARGET in linux/arm64 linux/amd64; do
+      echo "building $TARGET from $TAG..."
+      docker run --rm --platform "$TARGET" \
+        -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" \
+        nixos/nix:latest sh -c \
+          'nix --extra-experimental-features "nix-command flakes" build /src#wyrd-dist --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist /out/'
+    done
+    echo "dist/:"
+    ls "$ROOT/dist"
+  '';
 }

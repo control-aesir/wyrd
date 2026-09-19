@@ -100,6 +100,14 @@ in
         linux/arm64) SYSTEM=aarch64-linux ;;
         linux/amd64) SYSTEM=x86_64-linux ;;
       esac
+      # Fail fast on platform chimeras: under Rosetta emulation uname
+      # reports x86_64 while nix detects the native aarch64, then
+      # refuses the derivation deep in the build. Assert first.
+      ACTUAL=$(docker run --rm --platform "$TARGET" --security-opt seccomp=unconfined \
+        -v wyrd-nix-store:/nix \
+        "$NIX_IMAGE" nix --extra-experimental-features 'nix-command flakes' config show system 2>/dev/null)
+      [ "$ACTUAL" = "$SYSTEM" ] \
+        || { echo "container reports system $ACTUAL for target $SYSTEM: no usable $TARGET builder here (need a native machine, not emulation)" >&2; exit 1; }
       # seccomp=unconfined: Docker Desktop (and Rosetta emulation for
       # amd64) rejects the seccomp-BPF sandbox Nix installs for its
       # builds. Unconfining the container seccomp profile lets Nix

@@ -339,6 +339,13 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for SharedWriter {
 /// [`tracing::subscriber::with_default`] and assert what lands in the
 /// file — including the `--verbose` debug gate — without disturbing
 /// the process-global subscriber other tests may have installed.
+///
+/// Both output layers sit behind a [`ShutdownNoiseGate`]: iroh's relay
+/// transport logs `error!` when its receive channel closes, including
+/// on a graceful `Endpoint::close` — which is exactly what the
+/// post-loop shutdown sequence does for both endpoints. The gate
+/// swallows only that one event, and only once [`SHUTDOWN`] is
+/// tripped, so a mid-operation relay death still fails visibly.
 fn build_mount_subscriber(file: fs::File, verbose: bool) -> impl tracing::Subscriber {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // Both crates: the binary (`wyrd`, this file) and the library
@@ -358,8 +365,140 @@ fn build_mount_subscriber(file: fs::File, verbose: bool) -> impl tracing::Subscr
         .with_ansi(false);
     tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer)
-        .with(file_layer)
+        .with(ShutdownNoiseGate {
+            inner: stderr_layer,
+        })
+        .with(ShutdownNoiseGate { inner: file_layer })
+}
+
+/// Suppression wrapper for one output layer: forwards every span and
+/// event callback to the inner layer except iroh's relay-transport
+/// teardown noise once shutdown is underway (see
+/// [`build_mount_subscriber`]). The delegation below is mechanical —
+/// every callback except `on_event` passes straight through.
+struct ShutdownNoiseGate<L> {
+    inner: L,
+}
+
+impl<S, L> tracing_subscriber::Layer<S> for ShutdownNoiseGate<L>
+where
+    S: tracing::Subscriber,
+    L: tracing_subscriber::Layer<S>,
+{
+    fn on_register_dispatch(&self, subscriber: &tracing::Dispatch) {
+        self.inner.on_register_dispatch(subscriber);
+    }
+
+    fn register_callsite(
+        &self,
+        callsite: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        self.inner.register_callsite(callsite)
+    }
+
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        self.inner.enabled(metadata, ctx)
+    }
+
+    fn on_layer(&mut self, subscriber: &mut S) {
+        self.inner.on_layer(subscriber);
+    }
+
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.inner.on_new_span(attrs, id, ctx);
+    }
+
+    fn on_record(
+        &self,
+        span: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.inner.on_record(span, values, ctx);
+    }
+
+    fn on_follows_from(
+        &self,
+        span: &tracing::span::Id,
+        follows: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.inner.on_follows_from(span, follows, ctx);
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if SHUTDOWN.load(Ordering::Relaxed) && is_relay_teardown_noise(event) {
+            return;
+        }
+        self.inner.on_event(event, ctx);
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        self.inner.on_enter(id, ctx);
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        self.inner.on_exit(id, ctx);
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        self.inner.on_close(id, ctx);
+    }
+
+    fn on_id_change(
+        &self,
+        old: &tracing::span::Id,
+        new: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.inner.on_id_change(old, new, ctx);
+    }
+}
+
+/// Whether an event is iroh `=1.1.0`'s relay-transport teardown log:
+/// `error!` on target `iroh::socket::transports::relay` with the
+/// `poll_recv_queue` channel-closed message. Matching is fail-open —
+/// if upstream ever rewords the message, the noise returns instead
+/// of anything going silent.
+fn is_relay_teardown_noise(event: &tracing::Event<'_>) -> bool {
+    if event.metadata().target() != "iroh::socket::transports::relay" {
+        return false;
+    }
+    if *event.metadata().level() != tracing::Level::ERROR {
+        return false;
+    }
+    let mut probe = MessageProbe { message: None };
+    event.record(&mut probe);
+    probe.message.as_deref() == Some("relay_recv_channel closed")
+}
+
+/// Collects an event's `message` field: `tracing` records formatted
+/// messages through `record_debug`, so both arms are needed.
+struct MessageProbe {
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for MessageProbe {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
 }
 
 /// Mount diagnostics: structured events to stderr plus a per-mount
@@ -1145,6 +1284,46 @@ mod tests {
         assert!(
             text.contains("visible with verbose"),
             "verbose opens the debug gate: {text}"
+        );
+    }
+
+    /// The shutdown noise gate: iroh's relay-transport teardown event
+    /// is suppressed once the shutdown latch is tripped (clean SIGINT
+    /// path goes quiet) and stays loud otherwise (a mid-operation
+    /// relay death must still fail visibly). The latch is
+    /// process-global, so save and restore it around the emissions.
+    #[test]
+    fn relay_teardown_noise_gated_on_shutdown_latch() {
+        let _no_rust_log = WithoutRustLog::take();
+        let was = SHUTDOWN.load(Ordering::Relaxed);
+
+        // The exact event iroh `=1.1.0` emits from
+        // `iroh::socket::transports::relay` on endpoint close.
+        let emit_noise = || {
+            tracing::error!(target: "iroh::socket::transports::relay", "relay_recv_channel closed");
+        };
+
+        let temp = TempDir::new();
+        SHUTDOWN.store(true, Ordering::Relaxed);
+        let quiet_log = temp.0.join("quiet.log");
+        let subscriber = build_mount_subscriber(fs::File::create(&quiet_log).unwrap(), false);
+        tracing::subscriber::with_default(subscriber, emit_noise);
+
+        SHUTDOWN.store(false, Ordering::Relaxed);
+        let loud_log = temp.0.join("loud.log");
+        let subscriber = build_mount_subscriber(fs::File::create(&loud_log).unwrap(), false);
+        tracing::subscriber::with_default(subscriber, emit_noise);
+
+        SHUTDOWN.store(was, Ordering::Relaxed);
+        let quiet = fs::read_to_string(&quiet_log).unwrap();
+        assert!(
+            !quiet.contains("relay_recv_channel closed"),
+            "teardown noise stays out of the log once shutdown is underway: {quiet}"
+        );
+        let loud = fs::read_to_string(&loud_log).unwrap();
+        assert!(
+            loud.contains("relay_recv_channel closed"),
+            "the same event still fails visibly outside shutdown: {loud}"
         );
     }
 

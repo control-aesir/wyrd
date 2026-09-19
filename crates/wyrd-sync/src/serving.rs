@@ -151,11 +151,13 @@ impl Vault {
                 // not known durable. Notify the mirror best-effort so the
                 // failure does not also strand serving readiness, then
                 // surface the error; a retry re-syncs the directory.
-                self.notify_mirror(sealed);
+                // A poisoned mirror slot fails too — the op fails either
+                // way, and poison outranks the durability error.
+                self.notify_mirror(sealed)?;
                 return Err(error.into());
             }
         }
-        self.notify_mirror(sealed);
+        self.notify_mirror(sealed)?;
         Ok(root)
     }
 
@@ -166,23 +168,39 @@ impl Vault {
     /// write-through, or a concurrent winner this process never observed.
     fn reconcile_held(&self, sealed: &[u8]) -> Result<(), VaultError> {
         self.durability.verify_dir(&self.dir)?;
-        self.notify_mirror(sealed);
+        self.notify_mirror(sealed)?;
         Ok(())
     }
 
     /// Write-through to the serving mirror. A dead channel only delays
-    /// serving until the next boot rebuild, never the publication.
-    fn notify_mirror(&self, sealed: &[u8]) {
-        if let Some(sender) = self.mirror.lock().expect("vault mirror lock").as_ref() {
+    /// serving until the next boot rebuild, never the publication — but a
+    /// poisoned slot lock fails the import: poison means a thread
+    /// panicked mid-critical-section, so the operation fails instead of
+    /// the process.
+    fn notify_mirror(&self, sealed: &[u8]) -> Result<(), VaultError> {
+        if let Some(sender) = self
+            .mirror
+            .lock()
+            .map_err(|_| std::io::Error::other("vault mirror lock poisoned"))?
+            .as_ref()
+        {
             let _ = sender.send(MirrorItem::Import(sealed.to_vec()));
         }
+        Ok(())
     }
 
     /// Attach the write-through channel of a serving mirror. Replacing
     /// an already-attached channel strands the old one (its sends fail
     /// and are ignored); a serving restart is the normal replacement.
-    pub(crate) fn attach_mirror(&self, sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>) {
-        *self.mirror.lock().expect("vault mirror lock") = Some(sender);
+    pub(crate) fn attach_mirror(
+        &self,
+        sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+    ) -> Result<(), VaultError> {
+        *self
+            .mirror
+            .lock()
+            .map_err(|_| std::io::Error::other("vault mirror lock poisoned"))? = Some(sender);
+        Ok(())
     }
 
     /// The sealed bytes at a transport root, if held — and the read is
@@ -369,7 +387,9 @@ impl ServingEndpoint {
                 .spawn()
         });
         let mirror = vault.mirror_slot();
-        vault.attach_mirror(sender.clone());
+        vault
+            .attach_mirror(sender.clone())
+            .map_err(std::io::Error::other)?;
         Ok(ServingEndpoint {
             runtime,
             router,
@@ -433,7 +453,10 @@ impl ServingEndpoint {
     /// panicked handler task reintroduces exactly the lingering threads
     /// this shutdown exists to join. The first error is still reported.
     pub fn shutdown(self) -> std::io::Result<()> {
-        *self.mirror.lock().expect("vault mirror lock") = None;
+        *self
+            .mirror
+            .lock()
+            .map_err(|_| std::io::Error::other("vault mirror lock poisoned"))? = None;
         let router_result = self
             .runtime
             .block_on(async { self.router.shutdown().await });
@@ -630,6 +653,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wyrd-vault-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Vault::open(&dir).unwrap()
+    }
+
+    /// Poison the mirror slot: a thread panics while holding the lock.
+    fn poisoned_vault() -> Vault {
+        let vault = vault();
+        let mirror = std::sync::Arc::clone(&vault.mirror);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = mirror.lock().unwrap();
+            panic!("poison the mirror slot");
+        });
+        let _ = poisoner.join();
+        vault
+    }
+
+    /// A poisoned mirror slot fails the import instead of panicking the
+    /// process: poison means a thread panicked mid-critical-section.
+    #[test]
+    fn poisoned_mirror_lock_fails_import() {
+        let vault = poisoned_vault();
+        assert!(
+            matches!(vault.import(b"poisoned mirror"), Err(VaultError::Io(_))),
+            "a poisoned mirror slot must fail the import, not panic"
+        );
+    }
+
+    /// Attaching to a poisoned mirror slot fails instead of panicking.
+    #[test]
+    fn poisoned_mirror_lock_fails_attach() {
+        let vault = poisoned_vault();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            matches!(vault.attach_mirror(sender), Err(VaultError::Io(_))),
+            "a poisoned mirror slot must fail the attach, not panic"
+        );
     }
 
     #[test]

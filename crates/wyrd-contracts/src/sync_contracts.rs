@@ -171,7 +171,7 @@ impl<M: Mailbox> Mailbox for FailFirstSettle<'_, M> {
         self.inner.send(envelope)
     }
 
-    fn recv(&mut self) -> Option<Delivery> {
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
         self.inner.recv()
     }
 
@@ -589,7 +589,7 @@ impl<M: Mailbox> Mailbox for FailFirstSend<'_, M> {
         self.inner.send(envelope)
     }
 
-    fn recv(&mut self) -> Option<Delivery> {
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
         self.inner.recv()
     }
 
@@ -1093,8 +1093,8 @@ fn conflicted_drive_rejects_mounted_writes() {
         fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
             Ok(())
         }
-        fn recv(&mut self) -> Option<Delivery> {
-            None
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Ok(None)
         }
         fn settle(&mut self, _id: DeliveryId, _d: Disposition) -> Result<(), MailboxError> {
             Ok(())

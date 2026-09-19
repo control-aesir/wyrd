@@ -24,7 +24,7 @@ use wyrd_sync::membership::MembershipLog;
 use wyrd_sync::runtime::{DrainReport, Engine, RuntimeState};
 use wyrd_sync::seal::{self, SEAL_VERSION};
 use wyrd_sync::transport::mailbox::{
-    seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope,
+    seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
 use zeroize::Zeroizing;
 
@@ -231,7 +231,7 @@ impl Mailbox for Relay {
         Ok(())
     }
 
-    fn recv(&mut self) -> Option<Delivery> {
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
         let found = self
             .live
             .iter()
@@ -241,13 +241,13 @@ impl Mailbox for Relay {
         match found {
             Some((id, envelope)) => {
                 self.offered.insert(id);
-                Some(Delivery::new(id, envelope))
+                Ok(Some(Delivery::new(id, envelope)))
             }
             None => {
                 // The pass is over: the next drain re-offers
                 // everything still unsettled.
                 self.offered.clear();
-                None
+                Ok(None)
             }
         }
     }

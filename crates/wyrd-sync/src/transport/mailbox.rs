@@ -227,7 +227,14 @@ pub trait Mailbox {
     /// redeliver long-ago-acked mail after eviction, so engines must be
     /// idempotent over redelivery (dedupe the inner message id from
     /// durable facts).
-    fn recv(&mut self) -> Option<Delivery>;
+    ///
+    /// The `Err` case is a broken mailbox, not missing mail: a poisoned
+    /// channel lock or an exhausted id space fails the drain pass with
+    /// [`MailboxError::Transport`] instead of panicking the process, and
+    /// the engine surfaces it as [`EngineError::Mailbox`].
+    ///
+    /// [`EngineError::Mailbox`]: crate::runtime::EngineError::Mailbox
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError>;
 
     /// Settle one handover: `Ack` consumes (the relay may discard the
     /// envelope), `Retry` retains it for redelivery. Consumption is
@@ -360,13 +367,13 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self) -> Option<Delivery> {
-            let slot = self
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            let found = self
                 .relay
                 .queue
                 .iter()
-                .find(|s| s.envelope.recipient == self.owner)?;
-            Some(Delivery::new(slot.id, slot.envelope.clone()))
+                .find(|s| s.envelope.recipient == self.owner);
+            Ok(found.map(|slot| Delivery::new(slot.id, slot.envelope.clone())))
         }
 
         fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
@@ -496,11 +503,17 @@ mod tests {
             relay: &mut relay,
             owner: recipient,
         };
-        let received = recipient_mailbox.recv().expect("envelope delivered");
+        let received = recipient_mailbox
+            .recv()
+            .unwrap()
+            .expect("envelope delivered");
         recipient_mailbox
             .settle(received.id(), Disposition::Ack)
             .unwrap();
-        assert!(recipient_mailbox.recv().is_none(), "acked deliveries go");
+        assert!(
+            recipient_mailbox.recv().unwrap().is_none(),
+            "acked deliveries go"
+        );
 
         let control_bytes =
             open_from_sender(&recipient_sk, recipient, received.envelope()).unwrap();
@@ -527,13 +540,13 @@ mod tests {
             relay: &mut relay,
             owner: other,
         };
-        assert!(other_mailbox.recv().is_none());
+        assert!(other_mailbox.recv().unwrap().is_none());
 
         let mut recipient_mailbox = MemoryMailbox {
             relay: &mut relay,
             owner: recipient,
         };
-        assert!(recipient_mailbox.recv().is_some());
+        assert!(recipient_mailbox.recv().unwrap().is_some());
         let _ = sender;
         let _ = recipient_sk;
     }
@@ -591,21 +604,21 @@ mod tests {
         };
         // The handover does not consume: dropping it without settling
         // leaves the envelope retained, like an explicit retry.
-        let first = mailbox.recv().expect("offered");
+        let first = mailbox.recv().unwrap().expect("offered");
         assert_eq!(first.envelope(), &envelope);
         let first_id = first.id();
         drop(first);
-        let second = mailbox.recv().expect("reoffered after drop");
+        let second = mailbox.recv().unwrap().expect("reoffered after drop");
         assert_eq!(second.id(), first_id);
         assert_eq!(second.envelope(), &envelope);
         mailbox
             .settle(second.id(), Disposition::Retry)
             .expect("retry retains");
-        let third = mailbox.recv().expect("reoffered after retry");
+        let third = mailbox.recv().unwrap().expect("reoffered after retry");
         assert_eq!(third.id(), first_id);
         // Acknowledging consumes: the relay holds nothing more.
         mailbox.settle(third.id(), Disposition::Ack).unwrap();
-        assert!(mailbox.recv().is_none());
+        assert!(mailbox.recv().unwrap().is_none());
     }
 
     #[test]
@@ -624,17 +637,20 @@ mod tests {
         // distinct id, and a dropped (unsettled) successor must come
         // back under that same id. A cursor derived from queue position
         // would shift on ack and violate the contract.
-        let first = mailbox.recv().expect("first offered");
+        let first = mailbox.recv().unwrap().expect("first offered");
         let first_id = first.id();
         mailbox.settle(first_id, Disposition::Ack).unwrap();
-        let second = mailbox.recv().expect("second offered");
+        let second = mailbox.recv().unwrap().expect("second offered");
         assert_ne!(second.id(), first_id);
         let second_id = second.id();
         drop(second);
-        let reoffered = mailbox.recv().expect("unsettled successor re-offered");
+        let reoffered = mailbox
+            .recv()
+            .unwrap()
+            .expect("unsettled successor re-offered");
         assert_eq!(reoffered.id(), second_id);
         mailbox.settle(second_id, Disposition::Ack).unwrap();
-        assert!(mailbox.recv().is_none());
+        assert!(mailbox.recv().unwrap().is_none());
     }
 
     #[test]

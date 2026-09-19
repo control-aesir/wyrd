@@ -17,6 +17,8 @@ One page. Read this, then the focused docs:
 - `write-path.md` — **normative** mounted write design: write session,
   mutation queue, commit pipeline and durability ordering, namespace
   operations, conflicted-drive policy
+- `error-conventions.md` — typed-error convention: thiserror enum per
+  boundary, fail-closed classification, raise-vs-count rule
 
 ## The system in one sentence
 

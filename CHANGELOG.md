@@ -16,7 +16,7 @@ alpha can change the format, the trust protocol, and the CLI: drives created
 by one alpha may not open under the next, and the release notes for each
 version say exactly what changed.
 
-## [Unreleased]
+## [0.1.0-alpha.1]
 
 ### Added
 

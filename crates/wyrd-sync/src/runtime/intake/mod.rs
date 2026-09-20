@@ -10,7 +10,7 @@ use crate::control::{
     verify_announcement, AnnouncementUpdate, ControlError, ControlMessageId, IngestReport, Message,
     SealedControl, SnapshotAnnouncement,
 };
-use crate::control::{RotationDelivery, RotationIngest, SealedRotation, ROTATION_VERSION};
+use crate::control::{RotationDelivery, RotationIngest, ROTATION_VERSION};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::{CapabilityError, WrappedCapability};
@@ -437,57 +437,38 @@ fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
         .map(|sealed| sealed.message_id())
 }
 
-fn rotation_id(bytes: &[u8]) -> Option<ControlMessageId> {
-    SealedRotation::decode(bytes)
-        .ok()
-        .map(|sealed| sealed.message_id())
-}
-
 /// Accept a rotation delivery: epoch-key delivery for a device holding
 /// no later epoch secret. The dispatch in [`accept_envelope`] routes
 /// here on the version byte, after the outer mailbox seal opened — the
 /// sender below is therefore authenticated transport metadata, not a
 /// claim.
 ///
-/// Sender authorization is two-deep, because the ECDH seal proves
-/// nothing about the sender (anyone can seal to a public key): a cheap
-/// pre-check against the known tip's members suppresses outsider spam
-/// before any crypto, and the authoritative check admits the delivery
-/// only from a member of the epoch it grants. A mint for an epoch the
-/// sender does not hold cannot bind the epoch's transition id — the id
-/// is unknowable without opening the epoch's traffic — and holders are
-/// already trusted with the secrets they hold, so member-sendership is
-/// exactly the epoch seal's old possession proof, restated.
+/// Sender authorization is single-predicate, because the ECDH seal
+/// proves nothing about the sender (anyone can seal to a public key):
+/// `rotation_commit` admits the delivery only from a member of the
+/// epoch it grants, and deliberately not from a member of the
+/// receiver's current tip — a delayed delivery from a since-removed
+/// member must still converge, so convergence never depends on
+/// arrival timing. A mint for an epoch the sender does not hold cannot
+/// bind the epoch's transition id — the id is unknowable without
+/// opening the epoch's traffic — and holders are already trusted with
+/// the secrets they hold, so member-sendership is exactly the epoch
+/// seal's old possession proof, restated.
 fn accept_rotation(
     engine: &mut Engine,
     envelope: &MailboxEnvelope,
     bytes: &[u8],
 ) -> Result<Outcome, EngineError> {
+    // No tip-based sender pre-check here, deliberately: a delivery
+    // authored by a member of epoch N may arrive after the receiver
+    // learns a later removal of that sender, and rejecting on the
+    // current tip would make convergence depend on arrival timing
+    // (discarding the only retained grant). Sender authorization
+    // belongs to `rotation_commit`, against the authorizing state —
+    // the single predicate that cannot mistime. Outsider spam pays
+    // one ECDH open before the authoritative check suppresses it,
+    // the same shape as any other poison.
     let sender = envelope.sender;
-    let tip_members = match engine
-        .log
-        .known_state()
-        .and_then(|state| engine.log.members_of(&state.transition_id))
-    {
-        // No tip, no member set: the delivery may still become
-        // processable as the log advances, so the relay retains it.
-        None => return Ok(Outcome::Skipped),
-        Some(members) => members,
-    };
-    if !tip_members.contains(&sender) {
-        // Deterministic spam: no genuine sender is ever outside the
-        // tip's members (senders hold the obligations their admission
-        // queued, and holders are members). Suppress memory-only like
-        // any invalid message; undecodable bytes discard without even
-        // a verdict.
-        return match rotation_id(bytes) {
-            Some(id) => {
-                engine.inbox.suppress(&id);
-                Ok(Outcome::Accepted)
-            }
-            None => Ok(Outcome::Discarded),
-        };
-    }
     match engine
         .inbox
         .ingest_rotation(bytes, &engine.encryption_secret)

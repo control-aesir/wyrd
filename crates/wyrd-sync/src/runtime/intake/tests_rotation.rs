@@ -340,3 +340,116 @@ fn rotation_observing_a_transition_flushes_held_announcements() {
     assert_eq!(facts.capabilities.len(), 1);
     assert_eq!(facts.transitions.len(), 3);
 }
+
+#[test]
+fn rotation_from_a_sender_removed_after_authorizing_still_converges() {
+    use crate::runtime::test_util::{identity_secret, owner};
+    use zeroize::Zeroizing;
+
+    // The authorizing rule is membership at the granted epoch, not at
+    // the receiver's tip: the sender is a member of epoch 3 but
+    // removed at epoch 4, and the epoch-3 rotation arrives after the
+    // receiver already learns the removal. Convergence must not
+    // depend on that arrival timing.
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let (_, sender) = identity(0x01);
+    let sender_key =
+        DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("fixture scalar is valid");
+    let admit_sender = builder.child(vec![Change::Admit(Admission {
+        device: sender,
+        encryption_key: encryption_key(&sender_key),
+    })]);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let admission = builder.child(vec![Change::Admit(Admission {
+        device,
+        encryption_key: encryption_key(&encryption_sk),
+    })]);
+    let removal = builder.child(vec![Change::Remove(sender)]);
+    let chain4 = vec![
+        genesis.clone(),
+        admit_sender.clone(),
+        admission.clone(),
+        removal.clone(),
+    ];
+    let wrapped3 = mint_wrap(
+        &chain3_from(&genesis, &admit_sender, &admission),
+        &admission,
+        device,
+        secrets(3),
+    );
+    let wrapped4 = mint_wrap(&chain4, &removal, device, secrets(4));
+
+    // The device holds epoch 3's control key out-of-band (as in the
+    // flush test), so the removal transition arrives epoch-sealed and
+    // the tip advances past the sender's membership before the
+    // delayed epoch-3 rotation is ever seen.
+    fixture
+        .engine
+        .inbox
+        .add_epoch_key(3, Zeroizing::new(control_key(3)));
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 2, &transition_message(&admit_sender)),
+        deliver(&fixture, 3, &transition_message(&admission)),
+    ];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 3);
+
+    // Epoch 4's rotation rides from the owner (still a member there).
+    let (owner_sk, _) = owner();
+    let owner_identity = identity_secret(&owner_sk);
+    let mail = vec![rotation_delivery_from(
+        &owner_identity,
+        device,
+        &encryption_key(&encryption_sk),
+        4,
+        &removal,
+        wrapped4,
+    )];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1);
+    assert_eq!(fixture.engine.log.known_state().map(|s| s.epoch), Some(4));
+
+    // The delayed epoch-3 rotation rides from the removed sender: a
+    // tip-membership gate would suppress it as terminal poison, but
+    // the authorizing state (epoch 3) still names the sender, so it
+    // commits — redundantly installing, like any redelivery.
+    let mail = vec![rotation_delivery_from(
+        &fixture.sender_sk,
+        device,
+        &encryption_key(&encryption_sk),
+        3,
+        &admission,
+        wrapped3,
+    )];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "delayed grant commits, not suppresses");
+    assert_eq!(report.skipped, 0);
+    assert_eq!(fixture.engine.pending_count(), 0);
+    for epoch in [1, 2, 3, 4] {
+        assert!(
+            fixture.engine.epoch_keys.contains_key(&epoch),
+            "every epoch's control key derives from its rotation"
+        );
+    }
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 2, "delayed grant commits");
+    assert_eq!(
+        facts.transitions.len(),
+        5,
+        "the delayed rotation recommits its transition; the set-based log absorbs the duplicate"
+    );
+}
+
+fn chain3_from(
+    genesis: &MembershipTransition,
+    admit_sender: &MembershipTransition,
+    admission: &MembershipTransition,
+) -> Vec<MembershipTransition> {
+    vec![genesis.clone(), admit_sender.clone(), admission.clone()]
+}

@@ -1112,7 +1112,7 @@ fn capability_sealed_accepts_rotation_framing() {
         .expect("matching epoch commits");
     assert!(
         matches!(
-            store.commit(&[Fact::CapabilitySealed(3, owner(), bytes)]),
+            store.commit(&[Fact::CapabilitySealed(3, owner(), bytes.clone())]),
             Err(DurableError::InvalidOutbox)
         ),
         "sealed for epoch 2, keyed at epoch 3"
@@ -1123,5 +1123,35 @@ fn capability_sealed_accepts_rotation_framing() {
             Err(DurableError::InvalidOutbox)
         ),
         "neither framing decodes"
+    );
+    // The clear recipient is correlated too: a rotation delivery to
+    // someone else filed under this obligation fails here, durably,
+    // rather than lingering as a poisoned obligation until a send
+    // pass. (The stranger never registered; its key is a valid curve
+    // point the gate needs no secrets for.)
+    let stranger = DeviceId::from_bytes([0x0B; 32]);
+    let stranger_sk = secp256k1::SecretKey::from_slice(&[0x0C; 32]).expect("valid scalar");
+    let stranger_kp = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, &stranger_sk);
+    let stranger_key = wyrd_format::DeviceEncryptionKey::from_bytes(
+        secp256k1::XOnlyPublicKey::from_keypair(&stranger_kp)
+            .0
+            .serialize(),
+    );
+    let misfiled = seal_rotation(
+        &drive(),
+        stranger,
+        &stranger_key,
+        2,
+        &child.canonical_bytes(),
+        &[0xCC; 64],
+    )
+    .unwrap()
+    .encode();
+    assert!(
+        matches!(
+            store.commit(&[Fact::CapabilitySealed(2, owner(), misfiled)]),
+            Err(DurableError::InvalidOutbox)
+        ),
+        "sealed for a stranger, keyed at the owner"
     );
 }

@@ -302,20 +302,23 @@ pub(super) fn encode_fact(
         }
         Fact::CapabilitySealed(epoch, recipient, sealed) => {
             // Commit-time correlation gate: the envelope must decode
-            // and name the obligation's epoch. Epoch-sealed bytes must
-            // carry a capability sealed under that epoch — delivery
-            // seals each obligation under its epoch key, so a foreign
-            // epoch here means a swapped pairing. Rotation bytes must
-            // name the epoch in the clear header. Either framing's
-            // recipient binding is verified at send time, where the
-            // chain state (rotation) or the sealing key (epoch-sealed)
-            // is at hand, before the send that discharges.
+            // and name the obligation. Epoch-sealed bytes must carry a
+            // capability sealed under the obligation's own epoch —
+            // delivery seals each obligation under its epoch key, so a
+            // foreign epoch here means a swapped pairing. Rotation
+            // bytes name their recipient in the clear header, so the
+            // gate correlates epoch and recipient keylessly; either
+            // framing's deeper binding is verified at send time, where
+            // the chain state (rotation) or the sealing key
+            // (epoch-sealed) is at hand, before the send that
+            // discharges. A mismatch fails here, durably, rather than
+            // lingering as a poisoned obligation until a send pass.
             let epoch_sealed = SealedControl::decode(sealed).ok().filter(|envelope| {
                 envelope.kind == ControlKind::Capability && envelope.epoch == *epoch
             });
             let rotation_sealed = SealedRotation::decode(sealed)
                 .ok()
-                .filter(|delivery| delivery.epoch == *epoch);
+                .filter(|delivery| delivery.epoch == *epoch && delivery.recipient == *recipient);
             if epoch_sealed.is_none() && rotation_sealed.is_none() {
                 return Err(DurableError::InvalidOutbox);
             }
@@ -563,14 +566,14 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
             // Structural check only, mirroring the announcement
             // variant: an epoch-sealed capability envelope, or a
-            // rotation delivery naming this epoch.
+            // rotation delivery naming this epoch and recipient.
             let sealed = &record[40..];
             let epoch_sealed = SealedControl::decode(sealed)
                 .ok()
                 .filter(|envelope| envelope.kind == ControlKind::Capability);
             let rotation_sealed = SealedRotation::decode(sealed)
                 .ok()
-                .filter(|delivery| delivery.epoch == epoch);
+                .filter(|delivery| delivery.epoch == epoch && delivery.recipient == recipient);
             if epoch_sealed.is_none() && rotation_sealed.is_none() {
                 return None;
             }

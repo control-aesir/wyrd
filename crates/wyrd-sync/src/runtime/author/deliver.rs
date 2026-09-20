@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 
 use crate::control::{
-    open as open_control, seal as seal_control, CapabilityPayload, Message, SealedControl,
-    TransitionPayload,
+    open as open_control, seal as seal_control, seal_rotation, Message, SealedControl,
+    SealedRotation, TransitionPayload, ROTATION_VERSION,
 };
 use crate::durable::{Fact, Rebuilt};
 use crate::keys::capability::{Capability, DriveKeyring};
@@ -287,12 +287,19 @@ fn deliver_transitions(
     Ok(sent)
 }
 
-/// Send all pending capability obligations. Each pair seals its own
-/// recipient-specific wrap (the ECDH wrap binds one recipient, so
-/// unlike transitions the sealed bytes are per-pair), minted at send
-/// time from the keyring against the epoch's canonical transition —
-/// the registered key comes from chain state, never from the caller —
-/// so the bytes always reflect current membership.
+/// Send all pending capability obligations, rotation-framed. Each
+/// pair seals its own recipient-specific delivery (the ECDH wrap binds
+/// one recipient, so unlike transitions the sealed bytes are per-pair),
+/// minted at send time from the keyring against the epoch's canonical
+/// transition — the registered key comes from chain state, never from
+/// the caller — so the bytes always reflect current membership.
+///
+/// The framing is rotation delivery, never the epoch-sealed envelope:
+/// the recipient may hold no later epoch key — that is the ordinary
+/// case this path serves — and an epoch seal would ask it for the very
+/// key it is being given. The epoch seal needs no sender key either
+/// (ECDH to the registered key), so a missing sender epoch key never
+/// stalls capability delivery; only missing keyring secrets do.
 fn deliver_capabilities(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
@@ -326,76 +333,90 @@ fn deliver_capabilities(
                     .capability_sealed_bytes(epoch, recipient)
                     .map(<[u8]>::to_vec)
             });
-        let sealed_bytes = if let Some(bytes) = reused {
-            // Reused sealed bytes are verified against the obligation
-            // before use: the fact's key must name the (epoch,
-            // recipient) the bytes actually grant, or the send would
-            // discharge one obligation while delivering another. The
-            // envelope binding needs no extra check here: the
-            // commit-time epoch gate pins the payload epoch to the
-            // fact's key, and the pair check below pins the fact's key
-            // to the obligation.
-            let obligation = format!("capability epoch {epoch} for {recipient}");
-            let Some(bytes) = verify_reused_sealed(
-                engine,
-                &rebuilt.keyring,
-                bytes,
-                &obligation,
-                |_, message| {
-                    let Message::Capability(payload) = message else {
-                        return Err(EngineError::SealedOutboxMismatch(format!(
-                            "{obligation}: sealed bytes carry {:?}, not a capability",
-                            message.kind()
-                        )));
-                    };
-                    if payload.device != recipient || payload.epoch != epoch {
-                        return Err(EngineError::SealedOutboxMismatch(format!(
-                            "{obligation}: sealed bytes grant epoch {} to {}, not the obligated pair",
-                            payload.epoch, payload.device,
-                        )));
+        let sealed_bytes = match reused {
+            // Rotation reuse: the fact's key must still name what the
+            // bytes carry (drive, epoch, recipient, current
+            // registration), or the send would discharge one obligation
+            // while delivering another. Re-opening is impossible — the
+            // ephemeral secret is gone by design — and unnecessary: the
+            // correlation below is the whole check, exactly as the
+            // envelope-epoch correlation is for epoch-sealed reuse.
+            Some(bytes) if bytes.first() == Some(&ROTATION_VERSION) => {
+                let obligation = format!("capability epoch {epoch} for {recipient}");
+                match verify_reused_rotation(
+                    engine,
+                    bytes,
+                    &obligation,
+                    epoch,
+                    recipient,
+                    &transition_id,
+                )? {
+                    Reused::Use(bytes) => bytes,
+                    // Stale registration: the recipient holds a new
+                    // secret the old bytes can never open under — mint
+                    // fresh instead of erroring, since healing beats
+                    // loudness here.
+                    Reused::Mint => {
+                        let Some(bytes) = mint_fresh_rotation(
+                            engine,
+                            &rebuilt.keyring,
+                            &mut sealed_overlay,
+                            epoch,
+                            recipient,
+                            &transition_id,
+                        )?
+                        else {
+                            continue;
+                        };
+                        bytes
                     }
-                    Ok(())
-                },
-            )?
-            else {
-                // No sealing key: retain the obligation for a later
-                // pass instead of failing the whole pass on every drain.
-                continue;
-            };
-            bytes
-        } else {
-            let Some(state) = engine.log.state_of(&transition_id) else {
-                continue;
-            };
-            let Some(transition) = engine.log.transition(&transition_id) else {
-                continue;
-            };
-            let Some(wrap) = mint_wrap(
-                engine.drive,
-                &rebuilt.keyring,
-                &state,
-                transition,
-                recipient,
-            ) else {
-                continue;
-            };
-            let message = Message::Capability(CapabilityPayload {
-                device: recipient,
-                epoch,
-                wrapped: wrap,
-            });
-            let Some(bytes) =
-                seal_fresh_for(engine, &rebuilt.keyring, epoch, &message, |sealed| {
-                    Fact::CapabilitySealed(epoch, recipient, sealed)
-                })?
-            else {
-                // No sealing key: the obligation stays pending and
-                // observable via the pending projection instead of
-                // failing the whole pass on every drain.
-                continue;
-            };
-            sealed_overlay.insert((epoch, recipient), bytes.clone());
-            bytes
+                }
+            }
+            // A pre-framing epoch-sealed fact: its bytes target keys the
+            // recipient may never hold, so they never send — mint fresh
+            // under rotation, which always opens. The stale fact lingers
+            // durably and harmlessly; the new seal takes the overlay.
+            // Bytes decoding as neither framing fail closed: legacy or
+            // not, undecodable outbox bytes never silently heal.
+            Some(bytes) => {
+                if SealedControl::decode(&bytes).is_err() {
+                    let obligation = format!("capability epoch {epoch} for {recipient}");
+                    return Err(EngineError::SealedOutboxMismatch(format!(
+                        "{obligation}: sealed bytes do not decode"
+                    )));
+                }
+                let Some(bytes) = mint_fresh_rotation(
+                    engine,
+                    &rebuilt.keyring,
+                    &mut sealed_overlay,
+                    epoch,
+                    recipient,
+                    &transition_id,
+                )?
+                else {
+                    continue;
+                };
+                bytes
+            }
+            None => {
+                let Some(bytes) = mint_fresh_rotation(
+                    engine,
+                    &rebuilt.keyring,
+                    &mut sealed_overlay,
+                    epoch,
+                    recipient,
+                    &transition_id,
+                )?
+                else {
+                    // No mintable wrap (missing secrets, or the
+                    // recipient left the epoch's state): the obligation
+                    // stays pending and observable via the pending
+                    // projection instead of failing the whole pass on
+                    // every drain.
+                    continue;
+                };
+                bytes
+            }
         };
         sent += send_sealed_to(engine, mailbox, &sealed_bytes, [recipient], |delivered| {
             Fact::CapabilityDelivered(epoch, delivered)
@@ -404,11 +425,94 @@ fn deliver_capabilities(
     Ok(sent)
 }
 
-/// Mint one recipient's wrap for an epoch from the delivery
-/// snapshot's keyring: `None` when the keyring lacks any secret
-/// through the epoch (the pair stays pending for a later pass) or the
-/// recipient is not a member of the epoch's state with a registered
-/// key.
+/// What reused rotation bytes offer: resend them verbatim, or mint
+/// fresh when they went stale.
+enum Reused {
+    /// The bytes still name the obligation: resend them verbatim.
+    Use(Vec<u8>),
+    /// The bytes went stale (or predate the framing): mint fresh.
+    Mint,
+}
+
+/// Verify reused rotation bytes against the obligation about to be
+/// discharged: the header must still name this drive, epoch,
+/// recipient, and the recipient's current registration. Anything
+/// undecodable or misaddressed fails closed (a fact-key/bytes mismatch
+/// would discharge one obligation while delivering another); a stale
+/// registration mints fresh instead, since the recipient holds a new
+/// secret the old bytes can never open under.
+fn verify_reused_rotation(
+    engine: &Engine,
+    bytes: Vec<u8>,
+    obligation: &str,
+    epoch: u64,
+    recipient: DeviceId,
+    transition_id: &TransitionId,
+) -> Result<Reused, EngineError> {
+    let sealed = SealedRotation::decode(&bytes).map_err(|_| {
+        EngineError::SealedOutboxMismatch(format!("{obligation}: sealed bytes do not decode"))
+    })?;
+    if sealed.version != ROTATION_VERSION
+        || sealed.drive != engine.drive
+        || sealed.epoch != epoch
+        || sealed.recipient != recipient
+    {
+        return Err(EngineError::SealedOutboxMismatch(format!(
+            "{obligation}: sealed bytes do not name the obligated delivery"
+        )));
+    }
+    let current = engine
+        .log
+        .state_of(transition_id)
+        .and_then(|state| state.encryption_key_of(&recipient).copied());
+    if current.is_some_and(|key| key == sealed.encryption_key) {
+        Ok(Reused::Use(bytes))
+    } else {
+        Ok(Reused::Mint)
+    }
+}
+
+/// Mint a fresh rotation delivery for the obligation and commit the
+/// sealed fact, so retries resend byte-identical bytes. Returns `None`
+/// — obligation stays pending — when the epoch has no state, the
+/// recipient is not a member with a registered key, or the keyring
+/// lacks any secret through the epoch. The size check runs before the
+/// commit: persisting oversize bytes would poison the obligation past
+/// retry.
+fn mint_fresh_rotation(
+    engine: &mut Engine,
+    keyring: &DriveKeyring,
+    sealed_overlay: &mut BTreeMap<(u64, DeviceId), Vec<u8>>,
+    epoch: u64,
+    recipient: DeviceId,
+    transition_id: &TransitionId,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let Some(state) = engine.log.state_of(transition_id) else {
+        return Ok(None);
+    };
+    let Some(transition) = engine.log.transition(transition_id) else {
+        return Ok(None);
+    };
+    let Some(registration) = state.encryption_key_of(&recipient).copied() else {
+        return Ok(None);
+    };
+    let Some(wrap) = mint_wrap(engine.drive, keyring, &state, transition, recipient) else {
+        return Ok(None);
+    };
+    let sealed = seal_rotation(
+        &engine.drive,
+        recipient,
+        &registration,
+        epoch,
+        &transition.canonical_bytes(),
+        &wrap,
+    )?;
+    let bytes = sealed.encode();
+    crate::transport::mailbox::check_outbound_size(&bytes)?;
+    engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
+    sealed_overlay.insert((epoch, recipient), bytes.clone());
+    Ok(Some(bytes))
+}
 fn mint_wrap(
     drive: DriveId,
     keyring: &DriveKeyring,

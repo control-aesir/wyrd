@@ -55,7 +55,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use thiserror::Error;
-use wyrd_format::{ContentId, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId, TransitionId};
+use wyrd_format::{
+    ContentId, DeviceEncryptionKey, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId,
+    TransitionId,
+};
 use zeroize::Zeroizing;
 
 use super::{MaterializationState, RuntimeError, RuntimeState};
@@ -69,6 +72,8 @@ use crate::durable::{DurableError, DurableStore, Fact};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
+
+pub use super::author::AdmitOutcome;
 
 /// Engine failures: durable-commit, runtime-record, and mailbox-
 /// settlement trouble are fatal. Per-envelope mailbox, decode, and
@@ -90,6 +95,12 @@ pub enum EngineError {
     NoCanonicalMembership,
     #[error("this device is not a member of the canonical membership state")]
     NotAMember,
+    #[error("this device is not an owner in the pre-transition state")]
+    NotOwner,
+    #[error("device is already a member")]
+    AlreadyMember,
+    #[error("no held epoch secret for epoch {0}")]
+    MissingEpochSecret(u64),
     #[error("no held control key for epoch {0}")]
     MissingEpochKey(u64),
     #[error("snapshot {0} was authored by another device: an engine announces only its own work")]
@@ -373,6 +384,19 @@ impl Engine {
         sealed: &crate::control::SealedBootstrap,
     ) -> Result<Engine, EngineError> {
         super::bootstrap::accept_invitation(dir, passphrase, identity, encryption, sealed)
+    }
+
+    /// Admit a device to the drive: author, sign, and commit the
+    /// admission transition (exactly one new epoch), install the new
+    /// epoch's self capability, and return the signed transition plus
+    /// the sealed invitation for out-of-band delivery to the newcomer.
+    /// Only an owner admits. See [`super::author::admit_device`].
+    pub fn admit_device(
+        &mut self,
+        device: DeviceId,
+        encryption_key: DeviceEncryptionKey,
+    ) -> Result<super::author::AdmitOutcome, EngineError> {
+        super::author::admit_device(self, device, encryption_key)
     }
 
     /// Arm the crash hook: the next durable commit stops after `stage`

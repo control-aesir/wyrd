@@ -28,7 +28,9 @@ mod plan;
 #[cfg(test)]
 pub(crate) mod test_util;
 
-pub use engine::{DrainReport, Engine, EngineError, ExecuteReport, MAX_PENDING_MESSAGES};
+pub use engine::{
+    AdmitOutcome, DrainReport, Engine, EngineError, ExecuteReport, MAX_PENDING_MESSAGES,
+};
 
 /// What one route-publication pass did. `published` counts the address
 /// maps filled; `undecodable` counts announcements whose opaque

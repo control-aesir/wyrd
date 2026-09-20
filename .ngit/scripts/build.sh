@@ -120,10 +120,19 @@ done
 if [ "$VERIFY" = true ]; then
   for SYSTEM in ${BUILT[@]+"${BUILT[@]}"}; do
     FILE="$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-$SYSTEM")")"
+    # Only foreign-OS binaries cannot run here (cross-arch macOS
+    # binaries still run under Rosetta); verifying those is CI's job
+    # on their native runners.
+    case "$FILE" in
+      *macos-*) [ "$(uname -s)" = Darwin ] || continue ;;
+      *linux-*) [ "$(uname -s)" = Linux ] || continue ;;
+    esac
     CHECK=$(mktemp -d)
     tar -xzf "$FILE" -C "$CHECK"
-    BIN="$CHECK"/*/bin/wyrd
-    test -x "$BIN" || {
+    # Glob must expand in command position: assignments store the
+    # literal pattern, so capture it through echo instead.
+    BIN=$(echo "$CHECK"/*/bin/wyrd)
+    test -f "$BIN" && test -x "$BIN" || {
       echo "$FILE: no executable bin/wyrd" >&2
       exit 1
     }

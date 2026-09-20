@@ -13,7 +13,7 @@
 
 use wyrd_format::{
     BaoRoot, ContentId, DeviceId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot,
-    SnapshotId, StorageId,
+    SnapshotId, StorageId, TransitionId,
 };
 
 use super::{DurableError, Fact};
@@ -45,10 +45,23 @@ const TAG_ANNOUNCEMENT_QUEUED: u8 = 0x0A;
 pub(crate) const TAG_ANNOUNCEMENT_SEALED: u8 = 0x0B;
 /// One discharged obligation: snapshot id (32) ‖ recipient (32).
 const TAG_ANNOUNCEMENT_DELIVERED: u8 = 0x0C;
+/// One transition-delivery obligation: transition id (32) ‖ recipient (32).
+const TAG_TRANSITION_QUEUED: u8 = 0x0D;
+/// Sealed transition bytes: transition id (32) ‖ sealed control bytes.
+const TAG_TRANSITION_SEALED: u8 = 0x0E;
+/// One discharged transition obligation: transition id (32) ‖ recipient (32).
+const TAG_TRANSITION_DELIVERED: u8 = 0x0F;
+/// One capability-delivery obligation: epoch u64 LE (8) ‖ recipient (32).
+const TAG_CAPABILITY_QUEUED: u8 = 0x10;
+/// Sealed capability bytes: epoch u64 LE (8) ‖ recipient (32) ‖ sealed
+/// control bytes.
+const TAG_CAPABILITY_SEALED: u8 = 0x11;
+/// One discharged capability obligation: epoch u64 LE (8) ‖ recipient (32).
+const TAG_CAPABILITY_DELIVERED: u8 = 0x12;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 12] = [
+const KNOWN_TAGS: [u8; 18] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -61,6 +74,12 @@ const KNOWN_TAGS: [u8; 12] = [
     TAG_ANNOUNCEMENT_QUEUED,
     TAG_ANNOUNCEMENT_SEALED,
     TAG_ANNOUNCEMENT_DELIVERED,
+    TAG_TRANSITION_QUEUED,
+    TAG_TRANSITION_SEALED,
+    TAG_TRANSITION_DELIVERED,
+    TAG_CAPABILITY_QUEUED,
+    TAG_CAPABILITY_SEALED,
+    TAG_CAPABILITY_DELIVERED,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -244,6 +263,62 @@ pub(super) fn encode_fact(
             bytes.extend_from_slice(recipient.as_bytes());
             Ok((TAG_ANNOUNCEMENT_DELIVERED, bytes))
         }
+        Fact::TransitionQueued(id, recipient) => {
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            Ok((TAG_TRANSITION_QUEUED, bytes))
+        }
+        Fact::TransitionSealed(id, sealed) => {
+            // Same structural gate as the announcement variant, at
+            // commit time: only a decodable transition-kind envelope
+            // commits, so a malformed sealed fact fails here with the
+            // store untouched instead of poisoning a later rebuild.
+            let decoded = SealedControl::decode(sealed)
+                .ok()
+                .filter(|envelope| envelope.kind == ControlKind::MembershipTransition);
+            if decoded.is_none() {
+                return Err(DurableError::InvalidOutbox);
+            }
+            let mut bytes = Vec::with_capacity(32 + sealed.len());
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.extend_from_slice(sealed);
+            Ok((TAG_TRANSITION_SEALED, bytes))
+        }
+        Fact::TransitionDelivered(id, recipient) => {
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            Ok((TAG_TRANSITION_DELIVERED, bytes))
+        }
+        Fact::CapabilityQueued(epoch, recipient) => {
+            let mut bytes = Vec::with_capacity(40);
+            bytes.extend_from_slice(&epoch.to_le_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            Ok((TAG_CAPABILITY_QUEUED, bytes))
+        }
+        Fact::CapabilitySealed(epoch, recipient, sealed) => {
+            // Same structural gate as the announcement variant, at
+            // commit time: only a decodable capability-kind envelope
+            // commits.
+            let decoded = SealedControl::decode(sealed)
+                .ok()
+                .filter(|envelope| envelope.kind == ControlKind::Capability);
+            if decoded.is_none() {
+                return Err(DurableError::InvalidOutbox);
+            }
+            let mut bytes = Vec::with_capacity(40 + sealed.len());
+            bytes.extend_from_slice(&epoch.to_le_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            bytes.extend_from_slice(sealed);
+            Ok((TAG_CAPABILITY_SEALED, bytes))
+        }
+        Fact::CapabilityDelivered(epoch, recipient) => {
+            let mut bytes = Vec::with_capacity(40);
+            bytes.extend_from_slice(&epoch.to_le_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            Ok((TAG_CAPABILITY_DELIVERED, bytes))
+        }
     }
 }
 
@@ -420,6 +495,70 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
             Some(DecodedFact::AnnouncementDelivered(snapshot, recipient))
         }
+        TAG_TRANSITION_QUEUED => {
+            if record.len() != 64 {
+                return None;
+            }
+            let id = TransitionId::from_bytes(record[..32].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+            Some(DecodedFact::TransitionQueued(id, recipient))
+        }
+        TAG_TRANSITION_SEALED => {
+            if record.len() <= 32 {
+                return None;
+            }
+            let id = TransitionId::from_bytes(record[..32].try_into().ok()?);
+            // Structural check only, mirroring the announcement
+            // variant: kind must be a transition envelope. Opening
+            // needs epoch keys replay does not hold.
+            let sealed = SealedControl::decode(&record[32..]).ok()?;
+            if sealed.kind != ControlKind::MembershipTransition {
+                return None;
+            }
+            Some(DecodedFact::TransitionSealed(id, record[32..].to_vec()))
+        }
+        TAG_TRANSITION_DELIVERED => {
+            if record.len() != 64 {
+                return None;
+            }
+            let id = TransitionId::from_bytes(record[..32].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+            Some(DecodedFact::TransitionDelivered(id, recipient))
+        }
+        TAG_CAPABILITY_QUEUED => {
+            if record.len() != 40 {
+                return None;
+            }
+            let epoch = u64::from_le_bytes(record[..8].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
+            Some(DecodedFact::CapabilityQueued(epoch, recipient))
+        }
+        TAG_CAPABILITY_SEALED => {
+            if record.len() <= 40 {
+                return None;
+            }
+            let epoch = u64::from_le_bytes(record[..8].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
+            // Structural check only, mirroring the announcement
+            // variant: kind must be a capability envelope.
+            let sealed = SealedControl::decode(&record[40..]).ok()?;
+            if sealed.kind != ControlKind::Capability {
+                return None;
+            }
+            Some(DecodedFact::CapabilitySealed(
+                epoch,
+                recipient,
+                record[40..].to_vec(),
+            ))
+        }
+        TAG_CAPABILITY_DELIVERED => {
+            if record.len() != 40 {
+                return None;
+            }
+            let epoch = u64::from_le_bytes(record[..8].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
+            Some(DecodedFact::CapabilityDelivered(epoch, recipient))
+        }
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
@@ -493,6 +632,12 @@ pub(super) enum DecodedFact {
     AnnouncementQueued(SnapshotId, DeviceId),
     AnnouncementSealed(SnapshotId, Vec<u8>),
     AnnouncementDelivered(SnapshotId, DeviceId),
+    TransitionQueued(TransitionId, DeviceId),
+    TransitionSealed(TransitionId, Vec<u8>),
+    TransitionDelivered(TransitionId, DeviceId),
+    CapabilityQueued(u64, DeviceId),
+    CapabilitySealed(u64, DeviceId, Vec<u8>),
+    CapabilityDelivered(u64, DeviceId),
 }
 
 #[cfg(test)]

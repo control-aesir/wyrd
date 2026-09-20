@@ -10,7 +10,9 @@
 //! [`DriveKeyring`]: crate::keys::capability::DriveKeyring
 //! [`RuntimeState`]: crate::runtime::RuntimeState
 
-use wyrd_format::{ContentId, DeviceId, DriveId, MembershipTransition, Snapshot, SnapshotId};
+use wyrd_format::{
+    ContentId, DeviceId, DriveId, MembershipTransition, Snapshot, SnapshotId, TransitionId,
+};
 
 use super::codec::DecodedFact;
 use super::DurableError;
@@ -35,6 +37,12 @@ pub enum RuntimeFact {
     AnnouncementQueued(SnapshotId, DeviceId),
     AnnouncementSealed(SnapshotId, Vec<u8>),
     AnnouncementDelivered(SnapshotId, DeviceId),
+    TransitionQueued(TransitionId, DeviceId),
+    TransitionSealed(TransitionId, Vec<u8>),
+    TransitionDelivered(TransitionId, DeviceId),
+    CapabilityQueued(u64, DeviceId),
+    CapabilitySealed(u64, DeviceId, Vec<u8>),
+    CapabilityDelivered(u64, DeviceId),
 }
 
 /// The replayed facts of commits `1..=CURRENT`, in commit order within
@@ -53,6 +61,12 @@ pub struct LoadedFacts {
     pub announcement_queued: Vec<(SnapshotId, DeviceId)>,
     pub announcement_sealed: Vec<(SnapshotId, Vec<u8>)>,
     pub announcement_delivered: Vec<(SnapshotId, DeviceId)>,
+    pub transition_queued: Vec<(TransitionId, DeviceId)>,
+    pub transition_sealed: Vec<(TransitionId, Vec<u8>)>,
+    pub transition_delivered: Vec<(TransitionId, DeviceId)>,
+    pub capability_queued: Vec<(u64, DeviceId)>,
+    pub capability_sealed: Vec<(u64, DeviceId, Vec<u8>)>,
+    pub capability_delivered: Vec<(u64, DeviceId)>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -109,6 +123,40 @@ impl LoadedFacts {
                 self.announcement_delivered.push((snapshot, recipient));
                 self.runtime_facts
                     .push(RuntimeFact::AnnouncementDelivered(snapshot, recipient));
+            }
+            DecodedFact::TransitionQueued(id, recipient) => {
+                // Same orphan tolerance as the announcement outbox: a
+                // queued pair whose transition never resolves stays
+                // pending and the send path skips unresolvable entries.
+                self.transition_queued.push((id, recipient));
+                self.runtime_facts
+                    .push(RuntimeFact::TransitionQueued(id, recipient));
+            }
+            DecodedFact::TransitionSealed(id, sealed) => {
+                self.transition_sealed.push((id, sealed.clone()));
+                self.runtime_facts
+                    .push(RuntimeFact::TransitionSealed(id, sealed));
+            }
+            DecodedFact::TransitionDelivered(id, recipient) => {
+                self.transition_delivered.push((id, recipient));
+                self.runtime_facts
+                    .push(RuntimeFact::TransitionDelivered(id, recipient));
+            }
+            DecodedFact::CapabilityQueued(epoch, recipient) => {
+                self.capability_queued.push((epoch, recipient));
+                self.runtime_facts
+                    .push(RuntimeFact::CapabilityQueued(epoch, recipient));
+            }
+            DecodedFact::CapabilitySealed(epoch, recipient, sealed) => {
+                self.capability_sealed
+                    .push((epoch, recipient, sealed.clone()));
+                self.runtime_facts
+                    .push(RuntimeFact::CapabilitySealed(epoch, recipient, sealed));
+            }
+            DecodedFact::CapabilityDelivered(epoch, recipient) => {
+                self.capability_delivered.push((epoch, recipient));
+                self.runtime_facts
+                    .push(RuntimeFact::CapabilityDelivered(epoch, recipient));
             }
         }
     }
@@ -183,6 +231,24 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::AnnouncementDelivered(snapshot, recipient) => {
                 runtime.record_announcement_delivered(snapshot, recipient);
+            }
+            RuntimeFact::TransitionQueued(id, recipient) => {
+                runtime.record_transition_queued(id, recipient);
+            }
+            RuntimeFact::TransitionSealed(id, sealed) => {
+                runtime.record_transition_sealed(id, sealed);
+            }
+            RuntimeFact::TransitionDelivered(id, recipient) => {
+                runtime.record_transition_delivered(id, recipient);
+            }
+            RuntimeFact::CapabilityQueued(epoch, recipient) => {
+                runtime.record_capability_queued(epoch, recipient);
+            }
+            RuntimeFact::CapabilitySealed(epoch, recipient, sealed) => {
+                runtime.record_capability_sealed(epoch, recipient, sealed);
+            }
+            RuntimeFact::CapabilityDelivered(epoch, recipient) => {
+                runtime.record_capability_delivered(epoch, recipient);
             }
         }
     }

@@ -399,6 +399,15 @@ impl Engine {
         super::author::admit_device(self, device, encryption_key)
     }
 
+    /// Send every undischarged transition- and capability-delivery
+    /// obligation, returning the number of envelopes sent this call.
+    /// Transitions go before capabilities; a mid-loop transport
+    /// failure leaves the rest pending for the next call. See
+    /// [`super::author::deliver_pending`].
+    pub fn deliver_pending(&mut self, mailbox: &mut impl Mailbox) -> Result<usize, EngineError> {
+        super::author::deliver_pending(self, mailbox)
+    }
+
     /// Arm the crash hook: the next durable commit stops after `stage`
     /// (test-only; production commits always run to completion).
     #[cfg(test)]

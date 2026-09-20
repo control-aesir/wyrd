@@ -262,4 +262,32 @@ pub enum Fact {
     /// to the mailbox for this recipient. Append-only like every fact —
     /// pending is derived as queued-minus-delivered, never by deletion.
     AnnouncementDelivered(SnapshotId, DeviceId),
+    /// A transition-delivery obligation: this transition must still be
+    /// sent to this recipient. Committed atomically with the admitting
+    /// (or any authored) transition, so a crash before the first send
+    /// still leaves a discoverable obligation. The same triple as the
+    /// announcement outbox, keyed by transition instead of snapshot:
+    /// it carries gossip to existing members and the chain suffix to
+    /// newcomers with one mechanism.
+    TransitionQueued(TransitionId, DeviceId),
+    /// The sealed transition bytes for one recipient set, committed on
+    /// the first send and reused by every retry: retries are
+    /// byte-identical, so the receiver's control-message dedupe
+    /// collapses them to a no-op. First seal wins.
+    TransitionSealed(TransitionId, Vec<u8>),
+    /// One transition obligation discharged for one recipient.
+    TransitionDelivered(TransitionId, DeviceId),
+    /// A capability-delivery obligation: the epoch's wrap for this
+    /// recipient must still be sent. Queued alongside the transition
+    /// that opens the epoch, so a newcomer receives the contiguous
+    /// admission..current sequence and existing members receive the new
+    /// epoch's material with the same mechanism.
+    CapabilityQueued(u64, DeviceId),
+    /// The sealed capability bytes for one recipient at one epoch,
+    /// committed on the first send and reused by every retry. The wrap
+    /// is ECDH-sealed to the recipient, so unlike transitions the
+    /// sealed bytes are per-recipient: first seal wins per pair.
+    CapabilitySealed(u64, DeviceId, Vec<u8>),
+    /// One capability obligation discharged for one recipient.
+    CapabilityDelivered(u64, DeviceId),
 }

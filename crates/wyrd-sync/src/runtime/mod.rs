@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use wyrd_format::{
     BaoRoot, ChildManifest, ContentId, DeviceId, DriveId, FetchStatus, Manifest, ManifestEntry,
-    ObjectKind, Snapshot, SnapshotId, StorageId,
+    ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
 use crate::control::{AnnouncementUpdate, ControlMessageId, SnapshotAnnouncement};
@@ -163,6 +163,18 @@ pub struct RuntimeState {
     announcement_queued: BTreeSet<(SnapshotId, DeviceId)>,
     announcement_sealed: BTreeMap<SnapshotId, Vec<u8>>,
     announcement_delivered: BTreeSet<(SnapshotId, DeviceId)>,
+    /// Transition-delivery outbox: the same queued/sealed/delivered
+    /// triple keyed by transition id. Carries gossip to existing
+    /// members and the chain suffix to newcomers with one mechanism.
+    transition_queued: BTreeSet<(TransitionId, DeviceId)>,
+    transition_sealed: BTreeMap<TransitionId, Vec<u8>>,
+    transition_delivered: BTreeSet<(TransitionId, DeviceId)>,
+    /// Capability-delivery outbox: the same triple keyed by epoch.
+    /// One entry per (epoch, recipient): the contiguous newcomer
+    /// sequence and existing members' new-epoch material share it.
+    capability_queued: BTreeSet<(u64, DeviceId)>,
+    capability_sealed: BTreeMap<(u64, DeviceId), Vec<u8>>,
+    capability_delivered: BTreeSet<(u64, DeviceId)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -200,6 +212,12 @@ impl RuntimeState {
             announcement_queued: BTreeSet::new(),
             announcement_sealed: BTreeMap::new(),
             announcement_delivered: BTreeSet::new(),
+            transition_queued: BTreeSet::new(),
+            transition_sealed: BTreeMap::new(),
+            transition_delivered: BTreeSet::new(),
+            capability_queued: BTreeSet::new(),
+            capability_sealed: BTreeMap::new(),
+            capability_delivered: BTreeSet::new(),
         }
     }
 
@@ -296,6 +314,100 @@ impl RuntimeState {
     pub fn announcement_covered(&self, snapshot: SnapshotId, recipient: DeviceId) -> bool {
         self.announcement_queued.contains(&(snapshot, recipient))
             || self.announcement_delivered.contains(&(snapshot, recipient))
+    }
+
+    /// Record a transition-delivery obligation for one recipient.
+    /// Returns `true` if this was the first queueing of the pair.
+    pub fn record_transition_queued(&mut self, id: TransitionId, recipient: DeviceId) -> bool {
+        self.transition_queued.insert((id, recipient))
+    }
+
+    /// Record the sealed transition bytes for one transition.
+    /// First seal wins, like the announcement outbox.
+    pub fn record_transition_sealed(&mut self, id: TransitionId, sealed: Vec<u8>) -> bool {
+        if self.transition_sealed.contains_key(&id) {
+            return false;
+        }
+        self.transition_sealed.insert(id, sealed);
+        true
+    }
+
+    /// Record one transition obligation discharged.
+    pub fn record_transition_delivered(&mut self, id: TransitionId, recipient: DeviceId) -> bool {
+        self.transition_delivered.insert((id, recipient))
+    }
+
+    /// The sealed transition bytes for one transition, if sealed.
+    pub fn transition_sealed_bytes(&self, id: &TransitionId) -> Option<&[u8]> {
+        self.transition_sealed.get(id).map(Vec::as_slice)
+    }
+
+    /// Every still-undischarged transition obligation, in
+    /// `(transition, recipient)` order. Deterministic under replay.
+    pub fn pending_transitions(&self) -> Vec<(TransitionId, DeviceId)> {
+        self.transition_queued
+            .iter()
+            .copied()
+            .filter(|pair| !self.transition_delivered.contains(pair))
+            .collect()
+    }
+
+    /// Whether one transition obligation is already covered — queued
+    /// or discharged.
+    pub fn transition_covered(&self, id: TransitionId, recipient: DeviceId) -> bool {
+        self.transition_queued.contains(&(id, recipient))
+            || self.transition_delivered.contains(&(id, recipient))
+    }
+
+    /// Record a capability-delivery obligation for one recipient at
+    /// one epoch. Returns `true` if this was the first queueing.
+    pub fn record_capability_queued(&mut self, epoch: u64, recipient: DeviceId) -> bool {
+        self.capability_queued.insert((epoch, recipient))
+    }
+
+    /// Record the sealed capability bytes for one recipient at one
+    /// epoch. First seal wins per pair, like the announcement outbox.
+    pub fn record_capability_sealed(
+        &mut self,
+        epoch: u64,
+        recipient: DeviceId,
+        sealed: Vec<u8>,
+    ) -> bool {
+        if self.capability_sealed.contains_key(&(epoch, recipient)) {
+            return false;
+        }
+        self.capability_sealed.insert((epoch, recipient), sealed);
+        true
+    }
+
+    /// Record one capability obligation discharged.
+    pub fn record_capability_delivered(&mut self, epoch: u64, recipient: DeviceId) -> bool {
+        self.capability_delivered.insert((epoch, recipient))
+    }
+
+    /// The sealed capability bytes for one recipient at one epoch,
+    /// if sealed.
+    pub fn capability_sealed_bytes(&self, epoch: &u64, recipient: &DeviceId) -> Option<&[u8]> {
+        self.capability_sealed
+            .get(&(*epoch, *recipient))
+            .map(Vec::as_slice)
+    }
+
+    /// Every still-undischarged capability obligation, in
+    /// `(epoch, recipient)` order. Deterministic under replay.
+    pub fn pending_capabilities(&self) -> Vec<(u64, DeviceId)> {
+        self.capability_queued
+            .iter()
+            .copied()
+            .filter(|pair| !self.capability_delivered.contains(pair))
+            .collect()
+    }
+
+    /// Whether one capability obligation is already covered — queued
+    /// or discharged.
+    pub fn capability_covered(&self, epoch: u64, recipient: DeviceId) -> bool {
+        self.capability_queued.contains(&(epoch, recipient))
+            || self.capability_delivered.contains(&(epoch, recipient))
     }
 
     /// Record a snapshot announcement. Replaying the same announcement is a

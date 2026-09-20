@@ -170,9 +170,28 @@ if [ "$VERIFY" = true ]; then
       # shellcheck disable=SC2016: awk program, not shell expansion.
       done < <(otool -L "$BIN" | awk '$1 ~ /\.dylib/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}')
       if [ -n "$MISSING_LIB" ]; then
-        echo "warning: $FILE not executed (missing system library $MISSING_LIB); structure checked only" >&2
-        rm -rf "$CHECK"
-        continue
+        # Narrow exemption: only the known macFUSE runtime may be absent
+        # (macFUSE is a documented user prerequisite, not part of the
+        # archive). Any other unresolved dependency — a linker regression,
+        # a broken release, or an @rpath token this check cannot resolve —
+        # fails loudly instead of passing verify with a warning.
+        case "$MISSING_LIB" in
+          @*)
+            echo "error: $FILE links $MISSING_LIB, which this check cannot resolve; refusing to skip verification" >&2
+            exit 1
+            ;;
+        esac
+        case "$(basename "$MISSING_LIB")" in
+          libfuse*.dylib | libosxfuse*.dylib)
+            echo "warning: $FILE not executed (missing system library $MISSING_LIB); structure checked only" >&2
+            rm -rf "$CHECK"
+            continue
+            ;;
+          *)
+            echo "error: $FILE links missing library $MISSING_LIB; refusing to skip verification" >&2
+            exit 1
+            ;;
+        esac
       fi
     fi
     "$BIN" --version

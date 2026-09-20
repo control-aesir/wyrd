@@ -85,10 +85,15 @@ Releases are not required to write every format they read:
   software release supports many protocol versions; the numbers stay
   decoupled.
 
-## Verification
+## Verification (planned, not yet implemented)
 
-`wyrd-contracts` carries one named test per invariant direction, over
-fixture stores checked in under `tests/fixtures/stores/<version>/`:
+`wyrd-contracts` will carry one named test per invariant direction, over
+fixture stores checked in under `tests/fixtures/stores/<version>/`.
+Status today: neither the upgrade contracts nor the fixture tree exist —
+the catalog in `crates/wyrd-contracts/src/lib.rs` covers the current
+protocol and format contracts only. Until the tests land, this document is
+the rulebook and the list below is the acceptance set for the contract
+issue:
 
 - upgrade store opens in the next release; history is byte-preserved
 - next release reads previous objects; writes oldest-compatible on demand

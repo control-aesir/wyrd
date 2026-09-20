@@ -10,10 +10,11 @@ version, so each release renames `[Unreleased]` below to its version.
 The number that decides whether two builds interoperate is the **on-disk
 format version**, not the app version. Every envelope carries it
 (`wyrd_format::envelope::VERSION`, currently `0x00` = v0); a build rejects
-envelopes it does not understand, and old envelopes are migrated at rest by
-future format versions once the v1 format freezes — never decoded in place,
-and never silently reinterpreted (see `docs/upgrade-contract.md` for the
-full upgrade rules). Until 1.0, assume **every**
+envelopes it does not understand. Newer formats arrive as additive
+representations alongside the old ones — or, when a genuine break is
+unavoidable, as a snapshot-producing migration — never as in-place rewrites:
+old representations stay readable for at least one full release window (see
+`docs/upgrade-contract.md` for the full upgrade rules). Until 1.0, assume **every**
 alpha can change the format, the trust protocol, and the CLI: drives created
 by one alpha may not open under the next, and the release notes for each
 version say exactly what changed.

@@ -39,7 +39,7 @@ use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTran
 use super::engine::{Engine, EngineError};
 use crate::control::bootstrap::{open_bootstrap, SealedBootstrap};
 use crate::durable::{atomic_write, AuthorizedCapability, DurableStore, Fact};
-use crate::keys::capability::{Capability, WrappedCapability};
+use crate::keys::capability::{Capability, DriveKeyring, WrappedCapability};
 use crate::keys::keystore::{
     unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, WrappedSecret,
 };
@@ -186,9 +186,14 @@ pub(super) fn open_keystore(
 ///   authorizes against the admission state, which the newcomer hasn't
 ///   observed yet; committing it now would launder an unverified grant
 ///   into the durable keyring. Instead the wrapped bytes commit as a
-///   [`Fact::BootstrapPending`] record and every open re-derives the
-///   control keys from it — restart-safe by construction — until the
-///   authorized capability arrives through intake and supersedes it.
+///   [`Fact::BootstrapPending`] record and every resync re-derives the
+///   control keys from it — restart-safe by construction. The record is
+///   never removed (append-only); it stays inert once authorized keys
+///   arrive because installation is gated: resync verifies every
+///   bootstrap secret against the authorized keyring and the held keys
+///   before installing anything, so provisional material can neither
+///   outrank nor silently replace authorized keys, and a disagreeing
+///   blob fails the resync closed.
 pub(super) fn accept_invitation(
     dir: PathBuf,
     passphrase: &str,
@@ -269,18 +274,43 @@ pub(super) fn accept_invitation(
 /// wrapped capability's secrets cover `1..=N` contiguously by
 /// construction, so every secret installs its epoch's key and the
 /// catch-up set opens regardless of which epoch sealed each message.
-/// Deterministic and idempotent: reopening re-installs identical keys.
+/// Provisional and gated, never authoritative: every secret is verified
+/// against the authorized keyring and the held keys before anything
+/// installs, so a stale or forged blob fails the resync closed instead
+/// of swapping keys behind sealed traffic. Deterministic and
+/// idempotent: reopening re-installs identical keys.
 pub(super) fn install_invitation_keys(
     engine: &mut Engine,
+    keyring: &DriveKeyring,
     wrapped: Vec<u8>,
 ) -> Result<(), EngineError> {
     let drive = engine.drive;
     let capability = WrappedCapability::from_bytes(wrapped)
         .unwrap(&engine.encryption_secret)
         .map_err(EngineError::Crypto)?;
+    // Verify everything before installing anything: a conflict leaves
+    // the held keys untouched and fails closed.
+    let mut derived = Vec::with_capacity(capability.secrets.len());
     for (index, secret) in capability.secrets.iter().enumerate() {
         let epoch = index as u64 + 1;
-        engine.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive, epoch)));
+        derived.push((epoch, secret.control_key(&drive, epoch)));
+    }
+    for (epoch, key) in &derived {
+        if let Some(known) = keyring.secret(*epoch) {
+            if known.control_key(&drive, *epoch) != *key {
+                return Err(EngineError::BootstrapKeyConflict(*epoch));
+            }
+        }
+        if let Some(held) = engine.epoch_keys.get(epoch) {
+            if held[..] != key[..] {
+                return Err(EngineError::BootstrapKeyConflict(*epoch));
+            }
+        }
+    }
+    for (epoch, key) in derived {
+        // `add_epoch_key` overwrites, but every held key above was just
+        // proven equal, so this only fills vacant epochs.
+        engine.add_epoch_key(epoch, Zeroizing::new(key));
     }
     Ok(())
 }
@@ -757,6 +787,61 @@ mod tests {
         assert!(
             !dir.path.join("DRIVE").exists(),
             "foreign grants never touch disk"
+        );
+    }
+
+    #[test]
+    fn resync_refuses_bootstrap_that_disagrees_with_the_keyring() {
+        let dir = TestDir::new("bootstrap-conflict");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", owner).unwrap();
+        let drive = engine.drive;
+        let genesis_id = engine
+            .log
+            .known_state()
+            .map(|state| state.transition_id)
+            .expect("creation commits genesis");
+        let self_cap = engine
+            .store
+            .load()
+            .unwrap()
+            .capabilities
+            .into_iter()
+            .find(|cap| cap.device == engine.device)
+            .expect("creation commits a self capability");
+        let held_before = engine
+            .epoch_keys
+            .get(&1)
+            .cloned()
+            .expect("escrow installs the epoch-1 key");
+
+        // A self-addressed wrap carrying a different epoch-1 secret,
+        // committed as a pending blob: the only way bootstrap material
+        // can disagree with the authorized keyring is a buggy or
+        // malicious inviter, so resync must fail closed, never swap.
+        let fake = Capability::new(
+            drive,
+            engine.device,
+            self_cap.encryption_key,
+            genesis_id,
+            1,
+            vec![EpochSecret::generate().unwrap()],
+        )
+        .unwrap();
+        engine
+            .commit_facts(&[Fact::BootstrapPending(
+                fake.wrap().unwrap().as_bytes().to_vec(),
+            )])
+            .unwrap();
+        let err = engine.resync().unwrap_err();
+        assert!(
+            matches!(err, EngineError::BootstrapKeyConflict(1)),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(
+            engine.epoch_keys.get(&1),
+            Some(&held_before),
+            "a conflicting blob installs nothing"
         );
     }
 }

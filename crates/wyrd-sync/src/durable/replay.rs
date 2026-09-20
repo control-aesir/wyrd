@@ -183,12 +183,15 @@ pub struct Rebuilt {
 /// Rebuild the live state: replay transitions into a fresh log,
 /// re-validate capabilities against their transition's derived state,
 /// install the local device's capabilities, and replay the runtime
-/// facts through the same mutators that accepted them.
-pub(super) fn rebuild_facts(
+/// The authorized key view over already-loaded facts: the single-device
+/// keyring as [`rebuild_facts`] builds it, without the runtime
+/// projection. Resync consults this (not a second store load) to gate
+/// provisional bootstrap installs against authorized epoch secrets.
+pub(crate) fn build_keyring(
     drive: &DriveId,
-    facts: LoadedFacts,
+    facts: &LoadedFacts,
     device: DeviceId,
-) -> Result<Rebuilt, DurableError> {
+) -> Result<DriveKeyring, DurableError> {
     let mut log = MembershipLog::new(*drive);
     for t in &facts.transitions {
         log.observe(t.clone());
@@ -207,6 +210,20 @@ pub(super) fn rebuild_facts(
         // drive, binding, or secret count is stale.
         keyring.install(cap, &log)?;
     }
+    Ok(keyring)
+}
+
+/// facts through the same mutators that accepted them.
+pub(super) fn rebuild_facts(
+    drive: &DriveId,
+    facts: LoadedFacts,
+    device: DeviceId,
+) -> Result<Rebuilt, DurableError> {
+    let mut log = MembershipLog::new(*drive);
+    for t in &facts.transitions {
+        log.observe(t.clone());
+    }
+    let keyring = build_keyring(drive, &facts, device)?;
     let mut runtime = RuntimeState::new(*drive);
     for fact in facts.runtime_facts {
         match fact {

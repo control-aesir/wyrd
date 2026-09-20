@@ -99,6 +99,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use replay::build_keyring;
 pub use replay::{LoadedFacts, Rebuilt};
 // Raw-commit test seam (planted-forgery tests): test-only re-exports.
 #[cfg(test)]

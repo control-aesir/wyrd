@@ -29,7 +29,8 @@ use super::ManifestRecord;
 use crate::authorization::SnapshotDag;
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
 use crate::control::{
-    seal as seal_control, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
+    open as open_control, seal as seal_control, CapabilityPayload, Message, SealedControl,
+    SnapshotAnnouncement, TransitionPayload,
 };
 use crate::durable::{AuthorizedCapability, AuthorizedSnapshot, Fact, Rebuilt};
 use crate::ingest::{check_manifest, check_tree, Limits};
@@ -638,10 +639,45 @@ pub(super) fn announce_pending(
         match rebuilt.runtime.announcement_sealed_bytes(&snapshot_id) {
             Some(bytes) => {
                 let bytes = bytes.to_vec();
+                // Reused sealed bytes are verified against the
+                // obligation before use: the fact's key must name the
+                // snapshot the bytes actually announce, or the send
+                // would discharge one obligation while delivering
+                // another.
+                let obligation = format!("announcement {snapshot_id:?}");
+                let Some((_, message)) =
+                    open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
+                else {
+                    // No sealing key: retain the obligation for a later
+                    // pass instead of failing the whole pass on every
+                    // drain.
+                    continue;
+                };
+                let Message::SnapshotAnnouncement(announcement) = message else {
+                    return Err(EngineError::SealedOutboxMismatch(format!(
+                        "{obligation}: sealed bytes carry {:?}, not an announcement",
+                        message.kind()
+                    )));
+                };
+                if announcement.snapshot != snapshot_id {
+                    return Err(EngineError::SealedOutboxMismatch(format!(
+                        "{obligation}: sealed bytes announce {:?}, not the obligated snapshot",
+                        announcement.snapshot
+                    )));
+                }
                 sent += send_pending_for(engine, snapshot_id, &bytes, mailbox)?;
             }
             None => {
-                sent += announce(engine, &authorized, mailbox, node_addr)?;
+                match announce(engine, &authorized, mailbox, node_addr) {
+                    Ok(sent_now) => sent += sent_now,
+                    // No sealing key: the obligation stays pending and
+                    // observable via the pending projection instead of
+                    // failing the whole pass on every drain.
+                    // `announce` fetches the key before any commit or
+                    // traffic, so skipping here loses nothing.
+                    Err(EngineError::MissingEpochKey(_)) => continue,
+                    Err(other) => return Err(other),
+                }
             }
         }
     }
@@ -664,9 +700,41 @@ fn reannounce_one(
     };
     let epoch = known.epoch;
     let sealed_bytes = match rebuilt.runtime.announcement_sealed_bytes(&snapshot) {
-        Some(bytes) => bytes.to_vec(),
+        Some(bytes) => {
+            let bytes = bytes.to_vec();
+            // Verify reused bytes against the obligation, as in
+            // `announce_pending`: a mismatched sealed fact must fail
+            // closed, never re-send foreign bytes under this snapshot.
+            let obligation = format!("announcement {snapshot:?}");
+            let Some((_, message)) =
+                open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
+            else {
+                // No sealing key: retain the obligation for a later pass.
+                return Ok(0);
+            };
+            let Message::SnapshotAnnouncement(announcement) = message else {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed bytes carry {:?}, not an announcement",
+                    message.kind()
+                )));
+            };
+            if announcement.snapshot != snapshot {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed bytes announce {:?}, not the obligated snapshot",
+                    announcement.snapshot
+                )));
+            }
+            bytes
+        }
         None => {
-            let key = control_key_for(engine, &rebuilt.keyring, epoch)?;
+            let key = match control_key_for(engine, &rebuilt.keyring, epoch) {
+                Ok(key) => key,
+                // No sealing key: the obligation stays pending and
+                // observable via the pending projection instead of
+                // failing the whole pass on every drain.
+                Err(EngineError::MissingEpochKey(_)) => return Ok(0),
+                Err(other) => return Err(other),
+            };
             let message = Message::SnapshotAnnouncement(known);
             let sealed = seal_control(&key, &engine.drive, epoch, &message)?;
             let bytes = sealed.encode();
@@ -936,6 +1004,41 @@ fn control_key_for(
     Ok(key)
 }
 
+/// Open sealed bytes reused from a durable outbox fact, for verification
+/// against the obligation about to be discharged. The envelope must
+/// decode under a held epoch key and name this drive; the caller checks
+/// the opened message against its obligation key. A missing sealing key
+/// is not corruption — the obligation stays pending for a later pass —
+/// so it reports `Ok(None)`; anything else wrong fails closed, because
+/// sending undecodable bytes would discharge the obligation while
+/// delivering nothing.
+fn open_reused_sealed(
+    engine: &mut Engine,
+    keyring: &DriveKeyring,
+    sealed_bytes: &[u8],
+    obligation: &str,
+) -> Result<Option<(u64, Message)>, EngineError> {
+    let sealed = SealedControl::decode(sealed_bytes).map_err(|_| {
+        EngineError::SealedOutboxMismatch(format!("{obligation}: sealed bytes do not decode"))
+    })?;
+    let key = match control_key_for(engine, keyring, sealed.epoch) {
+        Ok(key) => key,
+        Err(EngineError::MissingEpochKey(_)) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    let (drive, epoch, message) = open_control(&key, &sealed).map_err(|error| {
+        EngineError::SealedOutboxMismatch(format!(
+            "{obligation}: sealed bytes do not open: {error}"
+        ))
+    })?;
+    if drive != engine.drive {
+        return Err(EngineError::SealedOutboxMismatch(format!(
+            "{obligation}: sealed drive {drive} is not this drive"
+        )));
+    }
+    Ok(Some((epoch, message)))
+}
+
 /// Send all pending transition obligations. One sealed envelope per
 /// transition (recipient binding is the outer mailbox seal, so the
 /// bytes are shared), one delivered marker per recipient send.
@@ -964,28 +1067,72 @@ fn deliver_transitions(
             }
             continue;
         };
-        let sealed_bytes = match sealed_overlay.get(&id).cloned().or_else(|| {
+        let sealed_bytes = if let Some(bytes) = sealed_overlay.get(&id).cloned().or_else(|| {
             rebuilt
                 .runtime
                 .transition_sealed_bytes(id)
                 .map(<[u8]>::to_vec)
         }) {
-            Some(bytes) => bytes,
-            None => {
-                let key = control_key_for(engine, &rebuilt.keyring, epoch)?;
-                let message = Message::MembershipTransition(TransitionPayload {
-                    transition: canonical,
-                });
-                let sealed = seal_control(&key, &engine.drive, epoch, &message)?;
-                let bytes = sealed.encode();
-                // Validate before committing, mirroring the
-                // announcement path: persisting oversize bytes would
-                // poison the obligation past retry.
-                crate::transport::mailbox::check_outbound_size(&bytes)?;
-                engine.commit_facts(&[Fact::TransitionSealed(id, bytes.clone())])?;
-                sealed_overlay.insert(id, bytes.clone());
-                bytes
+            // Reused sealed bytes are verified against the obligation
+            // before use: the fact's key must name the transition the
+            // bytes actually carry, or the send would discharge one
+            // obligation while delivering another.
+            let obligation = format!("transition {id:?}");
+            let Some((_, message)) =
+                open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
+            else {
+                // No sealing key: retain the obligation for a later
+                // pass, like an orphaned one.
+                while index < pending.len() && pending[index].0 == id {
+                    index += 1;
+                }
+                continue;
+            };
+            let Message::MembershipTransition(payload) = message else {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed bytes carry {:?}, not a transition",
+                    message.kind()
+                )));
+            };
+            let transition = MembershipTransition::from_canonical_bytes(&payload.transition)
+                .map_err(|error| {
+                    EngineError::SealedOutboxMismatch(format!(
+                        "{obligation}: sealed transition does not decode: {error}"
+                    ))
+                })?;
+            if transition.transition_id() != id {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed bytes carry {:?}, not the obligated transition",
+                    transition.transition_id()
+                )));
             }
+            bytes
+        } else {
+            let key = match control_key_for(engine, &rebuilt.keyring, epoch) {
+                Ok(key) => key,
+                // No sealing key: the obligation stays pending and
+                // observable via the pending projection instead of
+                // failing the whole pass on every drain.
+                Err(EngineError::MissingEpochKey(_)) => {
+                    while index < pending.len() && pending[index].0 == id {
+                        index += 1;
+                    }
+                    continue;
+                }
+                Err(other) => return Err(other),
+            };
+            let message = Message::MembershipTransition(TransitionPayload {
+                transition: canonical,
+            });
+            let sealed = seal_control(&key, &engine.drive, epoch, &message)?;
+            let bytes = sealed.encode();
+            // Validate before committing, mirroring the
+            // announcement path: persisting oversize bytes would
+            // poison the obligation past retry.
+            crate::transport::mailbox::check_outbound_size(&bytes)?;
+            engine.commit_facts(&[Fact::TransitionSealed(id, bytes.clone())])?;
+            sealed_overlay.insert(id, bytes.clone());
+            bytes
         };
         // Every pair for this transition in the frozen pending list:
         // no re-read, since only this loop writes and it appends
@@ -1032,7 +1179,7 @@ fn deliver_capabilities(
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
         };
-        let sealed_bytes = match sealed_overlay
+        let reused = sealed_overlay
             .get(&(epoch, recipient))
             .cloned()
             .or_else(|| {
@@ -1040,37 +1187,68 @@ fn deliver_capabilities(
                     .runtime
                     .capability_sealed_bytes(epoch, recipient)
                     .map(<[u8]>::to_vec)
-            }) {
-            Some(bytes) => bytes,
-            None => {
-                let Some(state) = engine.log.state_of(&transition_id) else {
-                    continue;
-                };
-                let Some(transition) = engine.log.transition(&transition_id) else {
-                    continue;
-                };
-                let Some(wrap) = mint_wrap(
-                    engine.drive,
-                    &rebuilt.keyring,
-                    &state,
-                    transition,
-                    recipient,
-                ) else {
-                    continue;
-                };
-                let key = control_key_for(engine, &rebuilt.keyring, epoch)?;
-                let message = Message::Capability(CapabilityPayload {
-                    device: recipient,
-                    epoch,
-                    wrapped: wrap,
-                });
-                let sealed = seal_control(&key, &engine.drive, epoch, &message)?;
-                let bytes = sealed.encode();
-                crate::transport::mailbox::check_outbound_size(&bytes)?;
-                engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
-                sealed_overlay.insert((epoch, recipient), bytes.clone());
-                bytes
+            });
+        let sealed_bytes = if let Some(bytes) = reused {
+            // Reused sealed bytes are verified against the obligation
+            // before use: the fact's key must name the (epoch,
+            // recipient) the bytes actually grant, or the send would
+            // discharge one obligation while delivering another.
+            let obligation = format!("capability epoch {epoch} for {recipient}");
+            let Some((_, message)) =
+                open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
+            else {
+                // No sealing key: retain the obligation for a later
+                // pass instead of failing the whole pass on every drain.
+                continue;
+            };
+            let Message::Capability(payload) = message else {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed bytes carry {:?}, not a capability",
+                    message.kind()
+                )));
+            };
+            if payload.device != recipient || payload.epoch != epoch {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed bytes grant epoch {} to {}, not the obligated pair",
+                    payload.epoch, payload.device,
+                )));
             }
+            bytes
+        } else {
+            let Some(state) = engine.log.state_of(&transition_id) else {
+                continue;
+            };
+            let Some(transition) = engine.log.transition(&transition_id) else {
+                continue;
+            };
+            let Some(wrap) = mint_wrap(
+                engine.drive,
+                &rebuilt.keyring,
+                &state,
+                transition,
+                recipient,
+            ) else {
+                continue;
+            };
+            let key = match control_key_for(engine, &rebuilt.keyring, epoch) {
+                Ok(key) => key,
+                // No sealing key: the obligation stays pending and
+                // observable via the pending projection instead of
+                // failing the whole pass on every drain.
+                Err(EngineError::MissingEpochKey(_)) => continue,
+                Err(other) => return Err(other),
+            };
+            let message = Message::Capability(CapabilityPayload {
+                device: recipient,
+                epoch,
+                wrapped: wrap,
+            });
+            let sealed = seal_control(&key, &engine.drive, epoch, &message)?;
+            let bytes = sealed.encode();
+            crate::transport::mailbox::check_outbound_size(&bytes)?;
+            engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
+            sealed_overlay.insert((epoch, recipient), bytes.clone());
+            bytes
         };
         let envelope = seal_for_recipient(&engine.identity_secret, recipient, &sealed_bytes)?;
         mailbox.send(envelope)?;

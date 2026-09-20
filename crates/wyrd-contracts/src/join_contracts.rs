@@ -302,6 +302,92 @@ fn offline_device_catch_up_accumulates_contiguously() {
     assert_eq!(joined.pending_count(), 0, "nothing held");
 }
 
+/// Delivery fans out to several newcomers from one pass: the shared
+/// transition bytes serve every recipient under per-recipient outer
+/// seals, and each per-pair capability wrap opens only for its own
+/// device. B (admitted at 2) converges through epoch 2 and stalls
+/// loudly past its invitation; C (admitted at 3, holding 1..=3)
+/// converges fully from the same pass.
+#[test]
+fn two_newcomers_converge_from_one_delivery_pass() {
+    let mut owner = owner();
+    let device_b = device(0x20);
+    let device_c = device(0x30);
+    let outcome_b = owner
+        .engine
+        .admit_device(device_b.id, device_b.encryption_key)
+        .unwrap();
+    let outcome_c = owner
+        .engine
+        .admit_device(device_c.id, device_c.encryption_key)
+        .unwrap();
+
+    let mut outbox = Relay::new();
+    let sent = owner.engine.deliver_pending(&mut outbox).unwrap();
+    assert!(sent >= 4, "two transitions plus two wraps at minimum");
+    let mut b_envelopes = Vec::new();
+    let mut c_envelopes = Vec::new();
+    while let Some(delivery) = outbox.recv().unwrap() {
+        let id = delivery.id();
+        if delivery.envelope().recipient == device_b.id {
+            b_envelopes.push(delivery.envelope().clone());
+        } else if delivery.envelope().recipient == device_c.id {
+            c_envelopes.push(delivery.envelope().clone());
+        }
+        outbox.settle(id, Disposition::Ack).unwrap();
+    }
+    assert!(
+        !b_envelopes.is_empty() && !c_envelopes.is_empty(),
+        "one pass serves both newcomers"
+    );
+
+    // The owner's obligations to both newcomers discharge on send.
+    let state = owner.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .pending_capabilities()
+            .into_iter()
+            .all(|(_, recipient)| recipient != device_b.id && recipient != device_c.id),
+        "no capability obligation retained"
+    );
+    assert!(
+        state
+            .pending_transitions()
+            .into_iter()
+            .all(|(_, recipient)| recipient != device_b.id && recipient != device_c.id),
+        "no transition obligation retained"
+    );
+
+    let mut joined_b = Engine::accept_invitation(
+        scratch_dir("join-fanout-b"),
+        "contracts",
+        device_b.identity.clone(),
+        device_b.encryption.clone(),
+        &outcome_b.invitation,
+    )
+    .unwrap();
+    let mut relay_b = newcomer_relay(b_envelopes);
+    let report_b = joined_b.drain(&mut relay_b).unwrap();
+    assert_eq!(report_b.accepted, 2, "B converges through epoch 2");
+    assert_eq!(report_b.skipped, 2, "B stalls past its invitation");
+
+    let mut joined_c = Engine::accept_invitation(
+        scratch_dir("join-fanout-c"),
+        "contracts",
+        device_c.identity.clone(),
+        device_c.encryption.clone(),
+        &outcome_c.invitation,
+    )
+    .unwrap();
+    let c_len = c_envelopes.len();
+    let mut relay_c = newcomer_relay(c_envelopes);
+    let report_c = joined_c.drain(&mut relay_c).unwrap();
+    assert_eq!(report_c.accepted, c_len, "C opens everything it was sent");
+    assert_eq!(report_c.skipped, 0);
+    assert_eq!(report_c.deferred, 0);
+    assert_eq!(joined_c.pending_count(), 0, "nothing held");
+}
+
 /// A forged transition from a legitimate member cannot extend
 /// newcomer state: the pusher is transport, never authority. The
 /// owner-signed but invalid epoch-2 sibling is suppressed while the

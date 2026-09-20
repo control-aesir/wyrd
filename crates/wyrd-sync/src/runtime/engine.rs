@@ -147,6 +147,10 @@ pub enum EngineError {
     InvitationMismatch,
     #[error("invitation genesis is missing, undecodable, or not a valid epoch-1 root")]
     BadGenesis,
+    #[error("pending invitation control keys disagree with the authorized keyring at epoch {0}: refusing to install bootstrap keys over authorized ones")]
+    BootstrapKeyConflict(u64),
+    #[error("sealed outbox bytes do not match their obligation: {0}")]
+    SealedOutboxMismatch(String),
     #[error("authored manifest failed canonical construction: {0}")]
     InvalidManifest(#[from] wyrd_format::ManifestError),
     #[error("authored snapshot failed construction: {0}")]
@@ -514,6 +518,10 @@ impl Engine {
         for t in &facts.transitions {
             self.log.observe(t.clone());
         }
+        // Built before the projection loops below move fact vectors
+        // out: the bootstrap gate needs the authorized key view over
+        // the same loaded facts.
+        let keyring = crate::durable::build_keyring(&self.drive, &facts, self.device)?;
         // The announcement projection replays through the same mutator
         // the durable fact path uses: route updates replace (last
         // accepted wins), and a fork error here means store facts intake
@@ -524,13 +532,18 @@ impl Engine {
         }
         self.announcements = state.announcements;
         // Pending-invitation material re-derives the invitation's
-        // control keys on every open: the joined device holds no
+        // control keys on every resync: the joined device holds no
         // authorized capability yet, so without this a restart between
-        // accept and catch-up would strand it keyless. Deterministic
-        // and idempotent — reopening installs identical keys — and a
-        // wrong encryption secret fails closed here.
+        // accept and catch-up would strand it keyless. Installation is
+        // provisional and gated against the authorized keyring built
+        // from the same loaded facts (no second store load): where the
+        // keyring holds an epoch secret the bootstrap secret must
+        // agree, and a held key is never replaced — a disagreeing blob
+        // fails the resync closed with the held keys untouched. A wrong
+        // encryption secret fails closed in the unwrap before any
+        // install.
         for pending in facts.bootstrap_pending {
-            super::bootstrap::install_invitation_keys(self, pending)?;
+            super::bootstrap::install_invitation_keys(self, &keyring, pending)?;
         }
         Ok(())
     }
@@ -768,7 +781,8 @@ mod tests {
     use crate::seal::{EncryptedObject, SEAL_VERSION};
     use wyrd_format::membership::Admission;
     use wyrd_format::{
-        Change, ContentId, Entry, MemoryObjectStore, ObjectKind, Snapshot, TransitionId, Tree,
+        Change, ContentId, Entry, MembershipTransition, MemoryObjectStore, ObjectKind, Snapshot,
+        TransitionId, Tree,
     };
 
     use crate::bulk::MemoryBulkSource;
@@ -779,9 +793,9 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, capability_message, capability_message_for, deliver, drain, encryption_key,
-        fixture, identity, publish_into, queue, transition_message, MemoryMailbox, MemoryRelay,
-        PublishedSnapshot, TestDir, WithoutObjects,
+        admit_engine, capability_message, capability_message_for, control_key, deliver, drain,
+        encryption_key, fixture, identity, publish_into, queue, transition_message, MemoryMailbox,
+        MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::runtime::RoutePublishing;
     use crate::transport::mailbox::{
@@ -3062,5 +3076,177 @@ mod tests {
         );
         bulk.shutdown();
         serving.shutdown().unwrap();
+    }
+
+    /// Drains a two-transition world (genesis plus one rotation) into
+    /// the intake fixture: the log resolves both transitions, so
+    /// delivery tests start from authorized state, not orphans.
+    fn two_transition_world() -> (crate::runtime::test_util::Fixture, MembershipTransition) {
+        let mut fx = fixture();
+        let (mut builder, genesis) = Builder::genesis(10);
+        let child = builder.child(vec![Change::Rotate]);
+        let mail = vec![
+            deliver(&fx, 1, &transition_message(&genesis)),
+            deliver(&fx, 1, &transition_message(&child)),
+        ];
+        queue(&mut fx, mail);
+        let report = drain(&mut fx);
+        assert_eq!(report.accepted, 2, "world transitions commit");
+        (fx, child)
+    }
+
+    /// A sealed outbox fact naming the wrong transition fails closed:
+    /// reuse verifies the bytes against the obligation before the send
+    /// that would discharge it, and the obligation stays pending.
+    #[test]
+    fn delivery_refuses_transition_sealed_bytes_for_another_id() {
+        let (mut fx, child) = two_transition_world();
+        // `known_state` is the tip; the genesis is its predecessor.
+        let tip = fx
+            .engine
+            .log
+            .known_state()
+            .map(|state| state.transition_id)
+            .expect("tip observed");
+        let genesis_id = fx
+            .engine
+            .log
+            .transition(&tip)
+            .and_then(|t| t.prev)
+            .expect("genesis linked");
+        // Legit bytes carrying the child, filed under the genesis key.
+        let wrong = seal(
+            &control_key(2),
+            &member_drive(),
+            2,
+            &transition_message(&child),
+        )
+        .unwrap()
+        .encode();
+        let recipient = identity(0x03).1;
+        fx.engine
+            .commit_facts(&[
+                Fact::TransitionSealed(genesis_id, wrong),
+                Fact::TransitionQueued(genesis_id, recipient),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let err = fx.engine.deliver_pending(&mut mailbox).unwrap_err();
+        assert!(
+            matches!(err, EngineError::SealedOutboxMismatch(_)),
+            "unexpected: {err:?}"
+        );
+        let loaded = fx.engine.store.load().unwrap();
+        assert!(
+            loaded.transition_delivered.is_empty(),
+            "a mismatched fact discharges nothing"
+        );
+        assert_eq!(
+            loaded.transition_queued,
+            vec![(genesis_id, recipient)],
+            "the obligation stays pending"
+        );
+    }
+
+    /// A sealed capability fact naming the wrong recipient fails
+    /// closed: the opened grant must match the obligated pair before
+    /// the send discharges it.
+    #[test]
+    fn delivery_refuses_capability_sealed_bytes_for_another_recipient() {
+        let (mut fx, child) = two_transition_world();
+        let other_sk = DeviceEncryptionSecret::from_bytes([0xE4; 32]).unwrap();
+        let (_, other) = identity(0x04);
+        let recipient = identity(0x03).1;
+        // A well-formed grant to someone else, sealed under epoch 2 so
+        // the commit-time epoch gate passes and only the pair check
+        // can catch it.
+        let granted = capability_message_for(
+            &other_sk,
+            other,
+            child.transition_id(),
+            2,
+            vec![secret(0xAA), secret(0xBB)],
+        );
+        let bytes = seal(&control_key(2), &member_drive(), 2, &granted)
+            .unwrap()
+            .encode();
+        fx.engine
+            .commit_facts(&[
+                Fact::CapabilitySealed(2, recipient, bytes),
+                Fact::CapabilityQueued(2, recipient),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let err = fx.engine.deliver_pending(&mut mailbox).unwrap_err();
+        assert!(
+            matches!(err, EngineError::SealedOutboxMismatch(_)),
+            "unexpected: {err:?}"
+        );
+        let loaded = fx.engine.store.load().unwrap();
+        assert!(
+            loaded.capability_delivered.is_empty(),
+            "a mismatched fact discharges nothing"
+        );
+        assert_eq!(
+            loaded.capability_queued,
+            vec![(2, recipient)],
+            "the obligation stays pending"
+        );
+    }
+
+    /// Obligations without a held sealing key stay pending instead of
+    /// failing the pass: the rest of the outbox still sends, and the
+    /// skipped obligation remains observable via the pending
+    /// projection rather than surfacing as a send failure on every
+    /// drain.
+    #[test]
+    fn delivery_skips_obligations_without_a_sealing_key_and_sends_the_rest() {
+        let (mut fx, _child) = two_transition_world();
+        // Epoch 2 becomes unsealable: no held key and no keyring
+        // secret (no capability facts committed).
+        fx.engine.epoch_keys.remove(&2);
+        let unsealable = identity(0x03).1;
+        let sealable = identity(0x04).1;
+        let genesis_id = fx.engine.log.known_state().map(|state| state.transition_id);
+        // `known_state` is the tip (the child); the genesis is its
+        // predecessor.
+        let child_id = genesis_id.expect("tip observed");
+        let genesis_id = fx
+            .engine
+            .log
+            .transition(&child_id)
+            .and_then(|t| t.prev)
+            .expect("genesis linked");
+        fx.engine
+            .commit_facts(&[
+                Fact::TransitionQueued(child_id, unsealable),
+                Fact::TransitionQueued(genesis_id, sealable),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let sent = fx.engine.deliver_pending(&mut mailbox).unwrap();
+        assert_eq!(sent, 1, "only the sealable obligation sends");
+        let loaded = fx.engine.store.load().unwrap();
+        assert_eq!(
+            loaded.transition_delivered,
+            vec![(genesis_id, sealable)],
+            "exactly the sealable pair discharges"
+        );
+        // `transition_queued` is the raw fact history; pending is
+        // queued minus delivered.
+        assert_eq!(
+            fx.engine.runtime_state().unwrap().pending_transitions(),
+            vec![(child_id, unsealable)],
+            "the keyless obligation stays pending"
+        );
     }
 }

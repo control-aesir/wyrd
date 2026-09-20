@@ -179,7 +179,11 @@ Epoch-key delivery past the invitation epoch is circular under the
 current envelope rules (a wrap for N+1 must travel under envelope
 N+1, openable only with key N+1) and awaits the rotation-delivery
 decision — until then, post-invitation epochs stall loudly
-(retained, counted), never silently.
+(retained, counted), never silently. The sender side mirrors this:
+an obligation the sender holds no sealing key for stays pending and
+observable via the pending projection instead of failing its whole
+pass, and reused sealed bytes are verified against their obligation
+before the send that would discharge them.
 
 ## Conflicts
 

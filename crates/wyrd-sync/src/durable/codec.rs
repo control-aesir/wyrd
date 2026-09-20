@@ -301,12 +301,17 @@ pub(super) fn encode_fact(
             Ok((TAG_CAPABILITY_QUEUED, bytes))
         }
         Fact::CapabilitySealed(epoch, recipient, sealed) => {
-            // Same structural gate as the announcement variant, at
-            // commit time: only a decodable capability-kind envelope
-            // commits.
-            let decoded = SealedControl::decode(sealed)
-                .ok()
-                .filter(|envelope| envelope.kind == ControlKind::Capability);
+            // Commit-time correlation gate: the envelope must decode,
+            // carry a capability, and be sealed under the obligation's
+            // own epoch — delivery seals each obligation under its
+            // epoch key, so a foreign epoch here means a swapped
+            // pairing. The recipient binding lives inside the sealed
+            // payload (keys required) and is verified at send time,
+            // where the sealing key is held, before the obligation
+            // discharges.
+            let decoded = SealedControl::decode(sealed).ok().filter(|envelope| {
+                envelope.kind == ControlKind::Capability && envelope.epoch == *epoch
+            });
             if decoded.is_none() {
                 return Err(DurableError::InvalidOutbox);
             }

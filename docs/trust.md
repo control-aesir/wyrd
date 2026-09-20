@@ -291,9 +291,9 @@ suppressed id redelivered while cached reports Duplicate without
 revalidation; after eviction or restart it revalidates to the same
 outcome. Semantic replay safety belongs to the receiving state
 machines. Messages are delivery hints, never authority — the receiver
-acts only after machine-side verification. Bootstrapping travels
-outside this envelope (below): no sealed kind opens without a held
-epoch key.
+acts only after machine-side verification. Bootstrapping and rotation
+delivery travel outside this envelope (below): no sealed kind opens
+without a held epoch key.
 
 | Kind | Tag | Carries |
 |---|---|---|
@@ -358,8 +358,52 @@ context separates this challenge from every other derived value).
 Redelivery is safe downstream without inbox dedupe: capability install is
 monotonic and genesis processing idempotent.
 
+### Rotation delivery (pinned)
+
+A sealed control message opens under an epoch control key, but every
+post-invitation epoch faces the same bootstrap cycle from the other
+side: sealing epoch N+1 material that way asks a device holding only
+epochs ≤ N for the very key it is being given. Rotation delivery is
+therefore its own framing (envelope version `0x01`, distinct from the
+epoch-sealed `0x00`), secured by the recipient's registered encryption
+key — ECDH with a fresh sender-ephemeral key, the capability-wrap
+construction under its own HKDF context — never by an epoch key:
+
+```text
+version (1) ‖ drive (32) ‖ ephemeral pk (32) ‖ recipient DeviceId (32)
+‖ recipient encryption key (32) ‖ epoch u64 LE (8) ‖ nonce (24)
+‖ AEAD ciphertext
+```
+
+AAD is the header minus the nonce (`"wyrd rotation delivery v1"` ‖
+drive ‖ recipient ‖ encryption key ‖ epoch); the plaintext repeats
+`drive ‖ device ‖ epoch`, then the counted transition bytes the
+membership machine verifies and the counted wrapped-capability bytes.
+The AEAD key derives under `"wyrd rotation delivery key v1"` — a
+context distinct from the capability-wrap and bootstrap contexts, so
+one shared secret never yields two framings' keys. Message ids derive
+in the shared control id namespace (`"wyrd control message id v1"`
+over the sealed bytes), so one dedupe set covers both envelope
+versions. Redelivery is safe downstream: capability install is
+monotonic, transition observation idempotent.
+
+The ECDH seal proves nothing about the sender — anyone can seal to a
+public key — so sender authorization is the intake's job, in two
+layers: the outer NIP-44 mailbox seal authenticates the sender device
+(spoofed senders fail the decrypt), and intake admits the delivery
+only from a member of the authorizing state, after verifying the
+transition's owner signature and the capability's transition binding
+exactly as on every other path. A wrap minted for an epoch the sender
+does not hold cannot bind that epoch's transition id (unknowable
+without opening the epoch's traffic), and holders are already trusted
+with the secrets they hold — so member-sendership is exactly the epoch
+seal's old possession proof, restated for delivery. Rotation carries
+no sender signature: the outer seal binds the sender, and the payload
+needs no other authorship — the transition and the capability carry
+their own.
+
 **Mailbox transport (decided; `wyrd-sync/src/transport/`):** the sealed
-envelope above (`SealedControl`/`SealedBootstrap`) travels inside a second,
+envelope above (`SealedControl`/`SealedBootstrap`/`SealedRotation`) travels inside a second,
 outer NIP-44 seal between the two devices' Nostr identity keys — the mailbox
 seal is transport confidentiality, the inner seal is authenticity, exactly
 as this document's cryptographic-substrate rule states. The relay-visible
@@ -726,10 +770,10 @@ holds the epoch material that makes the ciphertext meaningful.
 | T9 | Capabilities wrapped under secp256k1-ECDH-derived keys (HKDF) with AAD binding `(DriveId, DeviceId, encryption_key, transition_id, epoch)`, installed **monotonically**; revocation bounds acquisition, not possession | AAD binding alone is not recipient authentication — the ECDH-wrapped AEAD is; capabilities cannot be transplanted or replayed across drives/epochs/devices; older-capability replay is a no-op |
 | T10 | Signatures are BIP-340 with **deterministic nonces** over a defined signing preimage (ASCII domain tag ‖ raw 32-byte DriveId ‖ self-delimiting preimage: counted vectors, fixed-width fields), tagged-hash challenge, full key validation (`lift_x`, 64-byte signatures); ids derive over preimage ‖ signature | BIP-340 is byte-exact, so the spec must be too; deterministic nonces make ids stable; a dedicated preimage avoids envelope-parse ambiguity |
 | T11 | Cryptographic substrate: reuse audited Nostr/secp256k1 ecosystem implementations (BIP-340, ECDH, HKDF, AEAD, CSPRNG); NIP-44 for control-plane transport; NIP-04 rejected; Wyrd owns serialization, authorization semantics, and the key hierarchy | never roll your own crypto; the security budget goes to the state machine and key lifecycle, not the elliptic curve |
-| T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |
+| T12 | AEAD is **XChaCha20-Poly1305** everywhere (keystore root wrap, capability wrap); ECDH takes the shared point's x-coordinate with even-parity peer canonicalization; HKDF-SHA256 with pinned info contexts (`wyrd capability key v1`, `wyrd bootstrap key v1`, `wyrd rotation delivery key v1`); ManifestKey/ObjectKey derivation contexts pinned (`wyrd manifest key v1`, `wyrd object key v1`) and bind `DriveId ‖ epoch` explicitly | 192-bit nonces remove nonce-management risk at these message counts; every derived constant must agree byte-for-byte across implementations (the TransitionId lesson); the namespace is explicit ("this key belongs to epoch N of drive X"), never a promise about randomness |
 | T13 | Epoch secrets are **escrowed under the root**, per epoch, as sealed records (root-derived key, context `wyrd escrow key v1`, AAD `DriveId ‖ epoch`, envelope `version ‖ DriveId ‖ epoch ‖ nonce ‖ ciphertext`, StorageId over the record bytes); escrow, never derivation; v0 owner publishes each record alongside its transition | root recovery must compose with data recovery: guardians reconstruct the root, unwrap the records, restore every historical epoch secret. T4 stands — no root→epoch derivation path exists |
 | T14 | **Two keys per device**: the Nostr identity key (= DeviceId) signs Wyrd objects and bounds NIP-46; a separate device **encryption key** (registered in the Admit transition, rotated via membership) is the capability-ECDH target | the NIP-46 daemon never needs a decryption capability; "who am I" and "how are secrets delivered to me" are different questions with different risk profiles |
-| T15 | Control-plane message set (`Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, duplicate-delivery-idempotent sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); bootstrap invitations under their own ECDH-plus-owner-signature framing; epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; the seal proves possession, never authorship; NIP-46 `sign_message` is `request { domain, drive, digest } → response { signature }` with a closed domain enum | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
+| T15 | Control-plane message set (`Capability`, `MembershipTransition`, `KeyRotation`, `SnapshotAnnouncement`): versioned, duplicate-delivery-idempotent sealed envelopes (`version ‖ DriveId ‖ kind ‖ epoch ‖ nonce ‖ ciphertext`, AAD = header minus nonce, plaintext repeats the header); bootstrap invitations under their own ECDH-plus-owner-signature framing; rotation deliveries (post-invitation epoch keys) under their own ECDH-to-registered-key framing (version `0x01`, wrap plus transition bytes, sender admitted only from the authorizing state's members); epoch-scoped control seal keys (`wyrd control key v1`); message ids (`wyrd control message id v1`); payload epochs must agree with the envelope epoch; the seal proves possession, never authorship; NIP-46 `sign_message` is `request { domain, drive, digest } → response { signature }` with a closed domain enum | the mailbox delivers evidence, the DAGs are the authority; rotation bounds control traffic like data; the signer session stays two methods, default-deny |
 | T16 | Mailbox transport: the control envelope travels inside an outer NIP-44 seal addressed directly to the recipient `DeviceId`, and the relay-visible wire format is NIP-59 gift wrap — Wyrd rumor kind 9501 (`p` tag = recipient) inside a kind 13 seal signed by the sender's identity key, inside a kind 1059 wrap signed by a discarded ephemeral key; consumption is a durable FIFO-bounded seen-wrap-event-id log (65,536 entries, fsynced per ack; evicted acks may redeliver and converge through engine inner-id dedupe), never a timestamp cursor; no NIP-09 deletion of wraps is issued; `Mailbox` and `SignerSession` are trait boundaries a concrete relay pool / `nostr-connect` client implements, exercised in this crate only against in-memory fakes | recipient addressing is the same traffic-analysis exposure already accepted as best-effort; the ephemeral wrap key hides sender identity from relays at the cost of never being able to delete (accepted: relay retention is the redelivery backstop and the state machines are set-based); the relay pool and signer session are network/UI wiring outside `wyrd-sync`'s scope (`wyrd-format` must never grow a network dependency; the same discipline applies one layer up) |
 | T17 | Peer addressing and serving authorization: snapshot announcements carry the sender's current iroh `NodeAddr` (`node_addr`) inside the same authenticated sealed plaintext — authenticated routing metadata, never identity, never snapshot content, never durable snapshot fields; announcement history is append-only with no cryptographic invalidation between announcements (freshness is operational, not validity); the serving member answers object-oriented `StorageId` lookups from its local store with ciphertext only, never paths, keys, or plaintext; authorization = membership, object admission = content verification, no per-object ACLs in v0, so a member who can name a `StorageId` can request its ciphertext from any serving member | a dead address is a stale advertisement, not an invalid snapshot; an unauthenticated address would be a redirection surface even against unforgeable announcements; content-addressed verification is the only admission a transfer needs; the availability/enumeration consequence is accepted because a member already holds the epoch material that makes the ciphertext meaningful |
 

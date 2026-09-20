@@ -21,7 +21,7 @@ One page. Read this, then the focused docs:
   boundary, fail-closed classification, raise-vs-count rule
 - `upgrade-contract.md` — **normative** upgrade and migration contract:
   compatibility levels, read-vs-write compatibility, the ten upgrade
-  invariants, what upgrades forbid, and how `wyrd-contracts` proves them
+  invariants, what upgrades forbid, and how `wyrd-contracts` will prove them
 
 ## The system in one sentence
 

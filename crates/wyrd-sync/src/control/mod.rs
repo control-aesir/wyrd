@@ -35,6 +35,7 @@
 pub mod bootstrap;
 pub mod message;
 pub mod nip46;
+pub mod rotation;
 
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
@@ -53,6 +54,10 @@ pub use message::{
     TransitionPayload,
 };
 pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
+pub use rotation::{
+    open_rotation, seal_rotation, RotationDelivery, SealedRotation, ROTATION_HEADER_LEN,
+    ROTATION_VERSION,
+};
 
 /// The only control-envelope version.
 pub const CONTROL_VERSION: u8 = 0x00;

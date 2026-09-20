@@ -1,0 +1,421 @@
+//! Control-plane intake and message classification for the runtime engine.
+
+use std::collections::{BTreeMap, HashSet};
+
+use wyrd_format::{MembershipTransition, SnapshotId};
+use zeroize::Zeroizing;
+
+use super::engine::{DrainReport, Engine, EngineError};
+use crate::control::{
+    verify_announcement, AnnouncementUpdate, ControlError, ControlMessageId, IngestReport, Message,
+    SealedControl, SnapshotAnnouncement,
+};
+use crate::durable::{AuthorizedCapability, Fact};
+use crate::ingest::{check_total_len, check_transition, Limits};
+use crate::keys::capability::{CapabilityError, WrappedCapability};
+use crate::membership::TransitionStatus;
+use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxEnvelope};
+
+const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
+
+enum Action {
+    Commit(Vec<Fact>),
+    /// Deterministic suppression verdict: the message is invalid and
+    /// will never become processable. Commits nothing durable — the
+    /// verdict is cached memory-only and bounded — so unique invalid
+    /// messages cannot grow state. Redelivery revalidates to the same
+    /// outcome after eviction or restart.
+    Suppress,
+    Defer,
+}
+
+enum Outcome {
+    Accepted,
+    Duplicate,
+    /// Held in the engine's pending map for transition-triggered
+    /// re-drive. The relay retains the envelope as the crash backstop
+    /// (pending is volatile), so the drain settles `Retry`.
+    Deferred,
+    /// Shed past the pending bound: the engine holds nothing, so the
+    /// drain settles `Retry` and the relay retains the envelope.
+    RelayHeld,
+    /// Not yet processable (unknown epoch key); the drain settles
+    /// `Retry` and the relay retains the envelope.
+    Skipped,
+    /// Terminal poison (unopenable outer seal, undecodable payload):
+    /// the bytes can never become a message, so the drain settles
+    /// `Ack` without writing any fact. There is no message id to
+    /// record — the bytes never decoded — and nothing legitimate is
+    /// lost by consuming them.
+    Discarded,
+}
+
+pub(super) fn drain(
+    engine: &mut Engine,
+    mailbox: &mut impl Mailbox,
+) -> Result<DrainReport, EngineError> {
+    let mut report = DrainReport::default();
+    // Each handover is offered once per pass: a re-offered id ends the
+    // pass with the envelope still unacked, so a pass always terminates
+    // even when every envelope is retried.
+    let mut offered = HashSet::new();
+    // A broken mailbox (poisoned lock, exhausted id space) fails the
+    // pass as EngineError::Mailbox via the #[from] conversion — the
+    // envelopes stay retained for redelivery on the next pass.
+    while let Some(delivery) = mailbox.recv()? {
+        if !offered.insert(delivery.id()) {
+            break;
+        }
+        let disposition = match accept_envelope(engine, delivery.envelope())? {
+            Outcome::Accepted => {
+                report.accepted += 1;
+                Disposition::Ack
+            }
+            Outcome::Duplicate => {
+                report.duplicates += 1;
+                Disposition::Ack
+            }
+            Outcome::Deferred => {
+                report.deferred += 1;
+                Disposition::Retry
+            }
+            Outcome::RelayHeld => {
+                report.deferred += 1;
+                Disposition::Retry
+            }
+            Outcome::Skipped => {
+                report.skipped += 1;
+                Disposition::Retry
+            }
+            Outcome::Discarded => {
+                report.discarded += 1;
+                Disposition::Ack
+            }
+        };
+        mailbox.settle(delivery.id(), disposition)?;
+    }
+    Ok(report)
+}
+
+fn accept_envelope(
+    engine: &mut Engine,
+    envelope: &MailboxEnvelope,
+) -> Result<Outcome, EngineError> {
+    let bytes = match open_from_sender(&engine.identity_secret, engine.device, envelope) {
+        // The outer seal opens with our always-held identity key or
+        // never will: an unopenable envelope is terminal poison, not a
+        // retryable unknown. Consume it without a fact. Oversize
+        // ciphertext/decrypted bytes (`MailboxError::Oversize`) land here
+        // too: the mailbox already rejected them before ingest, and the
+        // relay retains nothing for an acked handover.
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(Outcome::Discarded),
+    };
+    match engine.inbox.ingest(&bytes) {
+        // Only a missing epoch key can heal: the bytes are well-formed
+        // for our drive and may become openable when the key arrives.
+        Err(ControlError::UnknownEpoch(_)) => Ok(Outcome::Skipped),
+        // Decode, version, drive, and crypto failures under a held key
+        // are terminal: the bytes can never become a processable
+        // message. Consume without a fact so poison cannot accumulate
+        // in the relay.
+        Err(_) => Ok(Outcome::Discarded),
+        Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
+            Some(id) => match engine.take_pending(&id) {
+                Some(message) => commit_action(engine, &id, &message, false),
+                None => Ok(Outcome::Duplicate),
+            },
+            None => Ok(Outcome::Duplicate),
+        },
+        Ok(IngestReport::Accepted { id, message }) => commit_action(engine, &id, &message, true),
+    }
+}
+
+fn commit_action(
+    engine: &mut Engine,
+    id: &ControlMessageId,
+    message: &Message,
+    is_new: bool,
+) -> Result<Outcome, EngineError> {
+    // Announcements this pass would commit, validated against each other
+    // as well as the hydrated projection: a transition landing may flush
+    // several pending messages into one commit, and a fork must never
+    // reach the fact log merely because two deferrals resolved together.
+    let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
+    let mut facts = match message_action(engine, id, message, &mut staged) {
+        Ok(Action::Commit(facts)) => facts,
+        Ok(Action::Suppress) => {
+            engine.inbox.suppress(id);
+            return Ok(Outcome::Accepted);
+        }
+        Ok(Action::Defer) if engine.pending.len() >= MAX_PENDING_MESSAGES => {
+            // Shed without consuming: the bound protects memory, but a
+            // resource decision must never write a semantic fact. The
+            // relay retains the envelope (the drain settles `Retry`),
+            // and the inbox forgets the id so the redelivery ingests
+            // fresh instead of reporting a false duplicate. No durable
+            // fact is written for a message never processed.
+            engine.inbox.forget(id);
+            return Ok(Outcome::RelayHeld);
+        }
+        Ok(Action::Defer) => {
+            engine.hold_pending(*id, message.clone());
+            return Ok(Outcome::Deferred);
+        }
+        Err(error) => {
+            // The pass fails after volatile writes: the transition (if
+            // any) is observed in the log, but no fact committed. A
+            // message taken from pending on redelivery is re-held so
+            // its slot survives; a fresh message rides relay redelivery
+            // (its handover was never settled). Either way resync drops
+            // the uncommitted observations and suppress verdicts,
+            // restoring the durable baseline before the error surfaces.
+            if !is_new {
+                engine.hold_pending(*id, message.clone());
+            }
+            let _ = engine.resync();
+            return Err(error);
+        }
+    };
+    if !is_new {
+        facts.clear();
+        staged.clear();
+    }
+    if matches!(message, Message::MembershipTransition(_)) {
+        // The flush walks the pending queue in arrival order (see
+        // `Engine::hold_pending`): staged announcement compatibility
+        // and the durable fact order are deterministic.
+        let taken = std::mem::take(&mut engine.pending);
+        let mut failed_at: Option<(usize, EngineError)> = None;
+        for (index, (pending_id, pending_message)) in taken.iter().enumerate() {
+            match message_action(engine, pending_id, pending_message, &mut staged) {
+                Ok(Action::Commit(more)) => facts.extend(more),
+                Ok(Action::Suppress) => {
+                    engine.inbox.suppress(pending_id);
+                }
+                Ok(Action::Defer) => {
+                    engine.hold_pending(*pending_id, pending_message.clone());
+                }
+                Err(error) => {
+                    failed_at = Some((index, error));
+                    break;
+                }
+            }
+        }
+        if let Some((index, error)) = failed_at {
+            // Restore the in-flight message and the unprocessed
+            // remainder in arrival order. Every id here is disjoint
+            // from the re-held ones (each id exists once), so
+            // hold_pending appends without clobbering. Suppressed and
+            // fact-consumed prefixes redeliver via the relay (never
+            // settled); the observations and verdicts they left behind
+            // go away with the resync below, which must run after the
+            // restore — resync rebuilds from durable facts and never
+            // touches the volatile queue.
+            for (id, message) in taken.into_iter().skip(index) {
+                engine.hold_pending(id, message);
+            }
+            let _ = engine.resync();
+            return Err(error);
+        }
+    }
+    if facts.is_empty() {
+        return Ok(Outcome::Duplicate);
+    }
+    if let Err(error) = engine.commit_facts(&facts) {
+        let _ = engine.resync();
+        return Err(error.into());
+    }
+    // The inbox mirrors durable seen-ness: ids committed durably are
+    // processed by definition and must never re-ingest. Ingest-time
+    // marking covers the normal flow, but a resync later in the same
+    // drain rebuilds the inbox from durable facts — without this,
+    // redelivery would report fresh and commit the same facts twice.
+    for fact in &facts {
+        if let Fact::ControlMessage(id) = fact {
+            engine.inbox.remember(id);
+        }
+        // Newly authorized epoch material installs its control keys
+        // where none is held: a device that just received epoch N's
+        // capability opens epoch-N control traffic on the next
+        // envelope instead of stalling it as skipped. Fill-vacant
+        // only, matching the keyring's first-wins install: a held key
+        // is never replaced behind the traffic sealed under it, and
+        // conflicting epoch secrets stay the keyring's
+        // fail-closed `EpochConflict`, not a silent key swap. The
+        // grant was authorized above; only decryption keys derive
+        // here, and every message they open is still independently
+        // verified.
+        if let Fact::Capability(authorized) = fact {
+            let drive = engine.drive;
+            for (index, secret) in authorized.capability().secrets.iter().enumerate() {
+                let epoch = index as u64 + 1;
+                if !engine.epoch_keys.contains_key(&epoch) {
+                    engine.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive, epoch)));
+                }
+            }
+        }
+    }
+    // The projection follows the durable state, never leads it: staged
+    // announcements merge only after the fact batch committed.
+    for (snapshot, announcement) in std::mem::take(&mut staged) {
+        engine.announcements.insert(snapshot, announcement);
+    }
+    Ok(Outcome::Accepted)
+}
+
+fn message_action(
+    engine: &mut Engine,
+    id: &ControlMessageId,
+    message: &Message,
+    staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
+) -> Result<Action, EngineError> {
+    match message {
+        Message::MembershipTransition(payload) => {
+            if check_total_len(&Limits::V0, "transition", payload.transition.len()).is_err() {
+                return Ok(Action::Suppress);
+            }
+            let transition = match MembershipTransition::from_canonical_bytes(&payload.transition) {
+                Ok(transition) => transition,
+                Err(_) => return Ok(Action::Suppress),
+            };
+            if check_transition(&Limits::V0, &transition).is_err() {
+                return Ok(Action::Suppress);
+            }
+            engine.log.observe(transition.clone());
+            Ok(Action::Commit(vec![
+                Fact::Transition(transition),
+                Fact::ControlMessage(*id),
+            ]))
+        }
+        Message::SnapshotAnnouncement(announcement) => {
+            // Authorship first: an announcement is evidence only when
+            // the author's signature verifies against the drive-bound
+            // challenge. A bad signature is malformed evidence like an
+            // unparsable transition — suppress memory-only, never
+            // defer.
+            if verify_announcement(&engine.drive(), announcement).is_err() {
+                return Ok(Action::Suppress);
+            }
+            match engine.log.transition(&announcement.membership) {
+                None => Ok(Action::Defer),
+                Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
+                Some(_) => match engine.log.status(&announcement.membership) {
+                    Some(TransitionStatus::Canonical) => {
+                        // The compatibility gate: an announcement becomes a
+                        // durable fact only when it is compatible with the
+                        // announcement already known for the snapshot — the
+                        // hydrated projection, or an announcement staged
+                        // earlier in this commit batch. Route updates
+                        // (mutable `node_addr` only) commit a fresh fact;
+                        // the last accepted route wins. An immutable fork is
+                        // the sender's invalid data: the verdict is final
+                        // but memory-only, and no announcement fact is
+                        // written, so replay never meets a conflict intake
+                        // could have detected.
+                        let known = engine
+                            .announcements
+                            .get(&announcement.snapshot)
+                            .or_else(|| staged.get(&announcement.snapshot));
+                        let committable = match known {
+                            None => true,
+                            Some(existing) => !matches!(
+                                existing.check_update(announcement),
+                                AnnouncementUpdate::Fork
+                            ),
+                        };
+                        if committable {
+                            staged.insert(announcement.snapshot, announcement.clone());
+                            Ok(Action::Commit(vec![
+                                Fact::Announcement(announcement.clone()),
+                                Fact::ControlMessage(*id),
+                            ]))
+                        } else {
+                            Ok(Action::Suppress)
+                        }
+                    }
+                    Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
+                    Some(
+                        TransitionStatus::Contested
+                        | TransitionStatus::Voided
+                        | TransitionStatus::Orphaned
+                        | TransitionStatus::Pending,
+                    ) => Ok(Action::Defer),
+                    // Observed a moment ago via transition(), but the
+                    // fresh analysis classifies nothing for it: an
+                    // internal disagreement, not sender data. Fail the
+                    // pass — the envelope stays retained for redelivery.
+                    // Unreachable through the public log API (both views
+                    // read the same observed set); defense in depth for a
+                    // future analysis that can miss, mirroring the
+                    // mailbox ceiling gates.
+                    None => Err(EngineError::TransitionUnclassified(announcement.membership)),
+                },
+            }
+        }
+        // Envelope-defined but unhandled in v0: no rotation handler
+        // exists, so rotation messages are terminal no-ops —
+        // acknowledged and discarded, never deferred (deferral would
+        // park poison for retry). When rotation handling lands this arm
+        // becomes a commit or a deferral; until then no durable record
+        // distinguishes consumed from never-recorded (see trust.md).
+        Message::KeyRotation(_) => Ok(Action::Suppress),
+        Message::Capability(_) => Ok(capability_action(engine, id, message)),
+    }
+}
+
+fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) -> Action {
+    let Message::Capability(payload) = message else {
+        return Action::Defer;
+    };
+    let capability = match WrappedCapability::from_bytes(payload.wrapped.clone())
+        .unwrap(&engine.encryption_secret)
+    {
+        Ok(capability) => capability,
+        Err(_) => return Action::Suppress,
+    };
+    // Redundant-field agreement, mirrored from the control envelope
+    // (T15): the sealed payload's device and epoch are authenticated
+    // delivery metadata and must match the capability they deliver. A
+    // disagreement is tampering or a broken sender — it never heals by
+    // deferring, so suppress memory-only.
+    if payload.device != capability.device || payload.epoch != capability.covered_epoch() {
+        return Action::Suppress;
+    }
+    // One authoritative lookup inside authorize: the transition and
+    // the state it produces are inseparable, so the capability is
+    // checked against exactly its own authorizing history. Unobserved
+    // or pending transitions defer — the history may still arrive or
+    // resolve; terminally invalid or orphaned history, and every other
+    // authorization failure, suppress without a durable capability
+    // fact, so poison is never parked for retry.
+    let transition_id = capability.transition;
+    match AuthorizedCapability::authorize(capability, engine.drive(), &engine.log, &transition_id) {
+        Ok(authorized) => Action::Commit(vec![
+            Fact::Capability(authorized),
+            Fact::ControlMessage(*id),
+        ]),
+        Err(CapabilityError::UnknownTransition(_)) => Action::Defer,
+        Err(_) => Action::Suppress,
+    }
+}
+
+fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
+    SealedControl::decode(bytes)
+        .ok()
+        .map(|sealed| sealed.message_id())
+}
+
+// Intake behavior tests live beside the drain pipeline, one file per
+// theme: the commit pipeline, capability validation, announcement
+// binding, and backpressure/commit recovery.
+#[cfg(test)]
+mod tests_announcement;
+#[cfg(test)]
+mod tests_capability;
+#[cfg(test)]
+mod tests_harness;
+#[cfg(test)]
+mod tests_pipeline;
+#[cfg(test)]
+mod tests_resilience;

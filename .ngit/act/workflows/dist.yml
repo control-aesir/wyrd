@@ -76,15 +76,12 @@ jobs:
           # Ephemeral upload identity: integrity is hash-based, so the
           # uploader key carries no trust. The human publisher verifies
           # the sha256 below before referencing it in the release.
-          # nak is fetched, not vendored: pin truthfully or not at all.
-          curl -fsSL -o /tmp/nak \
-            https://github.com/fiatjaf/nak/releases/download/v0.20.6/nak-v0.20.6-linux-amd64
-          chmod +x /tmp/nak
-          eph=$(/tmp/nak key generate)
+          # nak runs straight from nixpkgs: nothing to install or pin.
+          eph=$(nix run nixpkgs#nak -- key generate)
           for server in \
             https://blossom.primal.net \
             https://nostr.download \
             https://cdn.hzrd149.com; do
             echo "--- $server"
-            /tmp/nak blossom upload --server "$server" --sec "$eph" "$file"
+            nix run nixpkgs#nak -- blossom upload --server "$server" --sec "$eph" "$file"
           done

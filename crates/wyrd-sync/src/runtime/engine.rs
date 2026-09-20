@@ -128,6 +128,12 @@ pub enum EngineError {
     MalformedKeystore,
     #[error("the supplied identity is not this drive's owner")]
     OwnerMismatch,
+    #[error("bootstrap invitation failed to open: {0}")]
+    Invitation(#[from] crate::control::ControlError),
+    #[error("bootstrap invitation is addressed to another device")]
+    InvitationMismatch,
+    #[error("invitation genesis is undecodable or not an epoch-1 root")]
+    BadGenesis,
     #[error("authored manifest failed canonical construction: {0}")]
     InvalidManifest(#[from] wyrd_format::ManifestError),
     #[error("authored snapshot failed construction: {0}")]
@@ -350,6 +356,23 @@ impl Engine {
         identity: DeviceIdentitySecret,
     ) -> Result<Engine, EngineError> {
         super::bootstrap::open_keystore(dir, passphrase, identity)
+    }
+
+    /// Join a drive as an invited device: open the owner's sealed
+    /// invitation, commit its genesis, and install the invited epoch
+    /// control keys so the first mailbox drain can open the catch-up
+    /// set. See [`super::bootstrap::accept_invitation`] for the trust
+    /// reasoning. The admission transition and the capability's
+    /// authorization arrive through the normal intake path afterwards —
+    /// this call commits no capability fact.
+    pub fn accept_invitation(
+        dir: PathBuf,
+        passphrase: &str,
+        identity: DeviceIdentitySecret,
+        encryption: DeviceEncryptionSecret,
+        sealed: &crate::control::SealedBootstrap,
+    ) -> Result<Engine, EngineError> {
+        super::bootstrap::accept_invitation(dir, passphrase, identity, encryption, sealed)
     }
 
     /// Arm the crash hook: the next durable commit stops after `stage`

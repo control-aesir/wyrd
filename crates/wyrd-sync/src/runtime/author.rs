@@ -645,7 +645,7 @@ pub(super) fn announce_pending(
                 // would discharge one obligation while delivering
                 // another.
                 let obligation = format!("announcement {snapshot_id:?}");
-                let Some((_, message)) =
+                let Some((sealed_epoch, message)) =
                     open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
                 else {
                     // No sealing key: retain the obligation for a later
@@ -663,6 +663,16 @@ pub(super) fn announce_pending(
                     return Err(EngineError::SealedOutboxMismatch(format!(
                         "{obligation}: sealed bytes announce {:?}, not the obligated snapshot",
                         announcement.snapshot
+                    )));
+                }
+                // The envelope epoch must be the body's own epoch, as
+                // for transitions: a correct announcement under a
+                // foreign epoch key would send to recipients that
+                // cannot open it and discharge the obligation anyway.
+                if sealed_epoch != body.epoch {
+                    return Err(EngineError::SealedOutboxMismatch(format!(
+                        "{obligation}: sealed under epoch {sealed_epoch}, not the body's epoch {}",
+                        body.epoch
                     )));
                 }
                 sent += send_pending_for(engine, snapshot_id, &bytes, mailbox)?;
@@ -706,7 +716,7 @@ fn reannounce_one(
             // `announce_pending`: a mismatched sealed fact must fail
             // closed, never re-send foreign bytes under this snapshot.
             let obligation = format!("announcement {snapshot:?}");
-            let Some((_, message)) =
+            let Some((sealed_epoch, message)) =
                 open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
             else {
                 // No sealing key: retain the obligation for a later pass.
@@ -722,6 +732,13 @@ fn reannounce_one(
                 return Err(EngineError::SealedOutboxMismatch(format!(
                     "{obligation}: sealed bytes announce {:?}, not the obligated snapshot",
                     announcement.snapshot
+                )));
+            }
+            // The envelope epoch must be the announcement's own epoch,
+            // matching what a fresh seal would use below.
+            if sealed_epoch != epoch {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed under epoch {sealed_epoch}, not the announcement's epoch {epoch}"
                 )));
             }
             bytes
@@ -1078,7 +1095,7 @@ fn deliver_transitions(
             // bytes actually carry, or the send would discharge one
             // obligation while delivering another.
             let obligation = format!("transition {id:?}");
-            let Some((_, message)) =
+            let Some((sealed_epoch, message)) =
                 open_reused_sealed(engine, &rebuilt.keyring, &bytes, &obligation)?
             else {
                 // No sealing key: retain the obligation for a later
@@ -1094,6 +1111,15 @@ fn deliver_transitions(
                     message.kind()
                 )));
             };
+            // The envelope epoch must be the transition's own epoch:
+            // the bytes are shared per transition, so a correct payload
+            // under a foreign epoch key would send to recipients that
+            // cannot open it and discharge the obligation anyway.
+            if sealed_epoch != epoch {
+                return Err(EngineError::SealedOutboxMismatch(format!(
+                    "{obligation}: sealed under epoch {sealed_epoch}, not the transition's epoch {epoch}"
+                )));
+            }
             let transition = MembershipTransition::from_canonical_bytes(&payload.transition)
                 .map_err(|error| {
                     EngineError::SealedOutboxMismatch(format!(

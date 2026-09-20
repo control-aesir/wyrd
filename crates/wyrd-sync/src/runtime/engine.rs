@@ -793,9 +793,9 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, capability_message, capability_message_for, control_key, deliver, drain,
-        encryption_key, fixture, identity, publish_into, queue, transition_message, MemoryMailbox,
-        MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
+        admit_engine, announcement_for, capability_message, capability_message_for, control_key,
+        deliver, drain, encryption_key, fixture, identity, publish_into, queue, transition_message,
+        MemoryMailbox, MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
     };
     use crate::runtime::RoutePublishing;
     use crate::transport::mailbox::{
@@ -3200,6 +3200,94 @@ mod tests {
         );
     }
 
+    /// A transition sealed under a foreign epoch key fails closed even
+    /// when the payload is correct: the envelope epoch must be the
+    /// transition's own epoch, or recipients without that key would
+    /// skip while the obligation discharges.
+    #[test]
+    fn delivery_refuses_transition_sealed_under_the_wrong_epoch() {
+        let (mut fx, child) = two_transition_world();
+        let child_id = child.transition_id();
+        // Correct payload, wrong envelope: an epoch-2 transition
+        // sealed under the epoch-1 key.
+        let wrong_epoch = seal(
+            &control_key(1),
+            &member_drive(),
+            1,
+            &transition_message(&child),
+        )
+        .unwrap()
+        .encode();
+        let recipient = identity(0x05).1;
+        fx.engine
+            .commit_facts(&[
+                Fact::TransitionSealed(child_id, wrong_epoch),
+                Fact::TransitionQueued(child_id, recipient),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let err = fx.engine.deliver_pending(&mut mailbox).unwrap_err();
+        assert!(
+            matches!(err, EngineError::SealedOutboxMismatch(_)),
+            "unexpected: {err:?}"
+        );
+        let loaded = fx.engine.store.load().unwrap();
+        assert!(
+            loaded.transition_delivered.is_empty(),
+            "a wrong-epoch fact discharges nothing"
+        );
+        assert_eq!(
+            fx.engine.runtime_state().unwrap().pending_transitions(),
+            vec![(child_id, recipient)],
+            "the obligation stays pending"
+        );
+    }
+
+    /// An announcement sealed under a foreign epoch key fails closed
+    /// even when the snapshot matches: the envelope epoch must be the
+    /// announcement's own epoch.
+    #[test]
+    fn delivery_refuses_announcement_sealed_under_the_wrong_epoch() {
+        let (mut fx, child) = two_transition_world();
+        let msg = announcement_for(2, child.transition_id());
+        let Message::SnapshotAnnouncement(announcement) = &msg else {
+            panic!("announcement_for builds announcements");
+        };
+        // Correct announcement, wrong envelope: sealed under epoch 1.
+        let wrong_epoch = seal(&control_key(1), &member_drive(), 1, &msg)
+            .unwrap()
+            .encode();
+        let recipient = identity(0x05).1;
+        fx.engine
+            .commit_facts(&[
+                Fact::Announcement(announcement.clone()),
+                Fact::AnnouncementQueued(announcement.snapshot, recipient),
+                Fact::AnnouncementSealed(announcement.snapshot, wrong_epoch),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let err = fx.engine.announce_pending(&mut mailbox, None).unwrap_err();
+        assert!(
+            matches!(err, EngineError::SealedOutboxMismatch(_)),
+            "unexpected: {err:?}"
+        );
+        let loaded = fx.engine.store.load().unwrap();
+        assert!(
+            loaded.announcement_delivered.is_empty(),
+            "a wrong-epoch fact discharges nothing"
+        );
+        assert_eq!(
+            fx.engine.runtime_state().unwrap().pending_announcements(),
+            vec![(announcement.snapshot, recipient)],
+            "the obligation stays pending"
+        );
+    }
     /// Obligations without a held sealing key stay pending instead of
     /// failing the pass: the rest of the outbox still sends, and the
     /// skipped obligation remains observable via the pending

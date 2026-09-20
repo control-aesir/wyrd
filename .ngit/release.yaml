@@ -5,15 +5,18 @@
 #      below are extracted from that exact section.
 #   2. Tag the release commit `v<version>` (the version derives from the tag
 #      with one leading `v` stripped, so it must equal the Cargo version).
-#   3. Produce every tarball named below (`dist/` is gitignored build
-#      output): `build <version> --strict` in the devenv shell
-#      builds all four combos it can (see its capability detection) and
-#      fails unless all four land. macOS builds run locally (x86_64 via
-#      Rosetta when present); Linux builds offload to the remote
-#      builders in /etc/nix/machines. Input is pinned to the release
-#      tag, never the working copy. A main release must ship all four:
-#      ngit rejects partial platform coverage on the main channel.
-#   4. `ngit release publish <version>` with `--blossom-server` (or a
+#   3. Build the three local legs: `build <version>` in the devenv
+#      shell (macos-aarch64 native, macos-x86_64 via Rosetta,
+#      linux-aarch64 via remote builder; linux-x86_64 is skipped with
+#      no x86 builder here). Input is pinned to the release tag in a
+#      detached worktree, never the working copy.
+#   4. Trigger the dist workflow for the tag to build linux-x86_64
+#      natively in CI: `ngit ci trigger <coordinator> v<version>
+#      --workflow .ngit/act/workflows/dist.yml`. Fetch the tarball by
+#      its printed sha256 from any listed mirror into `dist/`, then
+#      re-run `build <version> --strict` for the completeness gate
+#      (ngit rejects partial platform coverage on the main channel).
+#   5. `ngit release publish <version>` with `--blossom-server` (or a
 #      kind-10063 server list from the publisher), plus `--relay` as needed.
 #
 # The first publish also creates the `wyrd` application owned by the

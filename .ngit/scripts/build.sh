@@ -11,7 +11,11 @@
 # requires all four combos from release.yaml instead, since ngit rejects
 # partial platform coverage on the main channel. `--ref` pins the input
 # worktree to a git ref instead of the default `v<version>` tag (CI uses
-# HEAD); `--verify` unpacks each built tarball and runs its binary.
+# HEAD); `--verify` unpacks each built tarball and runs its binary
+# (when the sole missing system library is the documented macFUSE
+# prerequisite, the binary gets a structure check and a warning instead:
+# a missing macFUSE is an environment gap, not a broken binary. Any other
+# missing linkage fails the run).
 # Input is always a detached worktree, never the working copy, so a
 # dirty tree cannot bake into a release tarball.
 set -euo pipefail
@@ -49,13 +53,26 @@ git worktree add --detach "$EXPORT" "$PIN" >/dev/null
 mkdir -p "$ROOT/dist"
 
 NIX=(nix --extra-experimental-features 'nix-command flakes')
-NATIVE=$(nix --extra-experimental-features 'nix-command flakes' eval --impure --raw --expr 'builtins.currentSystem' 2>/dev/null)
+# Probes stay loud: a detection failure must say which probe failed (a mute
+# CI log cost us a release-day diagnosis once). nix's own stderr is the
+# diagnostic, so it is never suppressed here.
+NATIVE=$(nix --extra-experimental-features 'nix-command flakes' eval --impure --raw --expr 'builtins.currentSystem') || {
+  echo "build.sh: cannot detect the current system (nix eval failed)" >&2
+  exit 1
+}
 
 # Remote-builder systems: second column of each machines file
-# (comma-separated), comments skipped.
+# (comma-separated), comments skipped. A show-config failure warns instead
+# of silently disabling every remote leg.
 builder_systems() {
+  local config
+  config=$(nix show-config 2>&1) || {
+    echo "build.sh: 'nix show-config' failed, treating remote builders as absent:" >&2
+    echo "$config" >&2
+    return 0
+  }
   # shellcheck disable=SC2013
-  nix show-config 2>/dev/null | sed -n 's/^builders = //p' | tr ' ' '\n' | while read -r TOKEN; do
+  printf '%s\n' "$config" | sed -n 's/^builders = //p' | tr ' ' '\n' | while read -r TOKEN; do
     case "$TOKEN" in
       @*) awk '$1 !~ /^#/ {print $2}' "${TOKEN#@}" 2>/dev/null ;;
     esac
@@ -113,7 +130,9 @@ BUILT=()
 for SYSTEM in ${QUEUE[@]+"${QUEUE[@]}"}; do
   echo "building $SYSTEM from $PIN..."
   "${NIX[@]}" build "$EXPORT#packages.$SYSTEM.wyrd-dist" --out-link "$EXPORT/dist-$SYSTEM"
-  cp "$EXPORT/dist-$SYSTEM" "$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-$SYSTEM")")"
+  # Forced: nix outputs are read-only, so a re-run over an existing dist/
+  # must replace, not fail (BSD cp cannot overwrite read-only files).
+  cp -f "$EXPORT/dist-$SYSTEM" "$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-$SYSTEM")")"
   BUILT+=("$SYSTEM")
 done
 
@@ -136,6 +155,50 @@ if [ "$VERIFY" = true ]; then
       echo "$FILE: no executable bin/wyrd" >&2
       exit 1
     }
+    # Execution needs the binary's system libraries: a macOS binary without
+    # macFUSE installed dies in dyld (exit 134), which is an environment gap,
+    # not a broken binary. Check linkage after the structure check above and
+    # run only when every linked library is present.
+    if [ "$(uname -s)" = Darwin ]; then
+      # Collect every missing linkage: stopping early would SIGPIPE otool and
+      # trip pipefail, so the loop consumes all input. The exemption below
+      # applies only when the complete missing set is macFUSE — a FUSE gap
+      # must never mask another unresolved dependency.
+      # /usr/lib and /System residents resolve via the dyld shared cache and
+      # have no on-disk file to test: only third-party paths (macFUSE in
+      # /usr/local/lib) get the existence check.
+      MISSING_LIBS=()
+      while read -r lib; do
+        [ -e "$lib" ] || MISSING_LIBS+=("$lib")
+      # shellcheck disable=SC2016: awk program, not shell expansion.
+      done < <(otool -L "$BIN" | awk '$1 ~ /\.dylib/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}')
+      if [ -n "${MISSING_LIBS[*]:-}" ]; then
+        # Narrow exemption: only the known macFUSE runtime may be absent
+        # (macFUSE is a documented user prerequisite, not part of the
+        # archive). Any other unresolved dependency — a linker regression,
+        # a broken release, or an @rpath token this check cannot resolve —
+        # fails loudly instead of passing verify with a warning.
+        NON_FUSE=()
+        for lib in ${MISSING_LIBS[@]+"${MISSING_LIBS[@]}"}; do
+          case "$lib" in
+            @*) NON_FUSE+=("$lib") ;;
+            *)
+              case "$(basename "$lib")" in
+                libfuse*.dylib | libosxfuse*.dylib) ;;
+                *) NON_FUSE+=("$lib") ;;
+              esac
+              ;;
+          esac
+        done
+        if [ -z "${NON_FUSE[*]:-}" ]; then
+          echo "warning: $FILE not executed (missing system libraries: ${MISSING_LIBS[*]}); structure checked only" >&2
+          rm -rf "$CHECK"
+          continue
+        fi
+        echo "error: $FILE links missing libraries: ${NON_FUSE[*]}; refusing to skip verification" >&2
+        exit 1
+      fi
+    fi
     "$BIN" --version
     rm -rf "$CHECK"
   done

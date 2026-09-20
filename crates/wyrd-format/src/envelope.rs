@@ -63,8 +63,9 @@ impl Envelope {
 
     /// Parse an envelope from its canonical encoding. Rejects short inputs,
     /// wrong magic, unsupported versions, and unknown kinds. Never accepts
-    /// a version other than [`VERSION`] — old envelopes are migrated at
-    /// rest by future format versions, not decoded here.
+    /// a version other than [`VERSION`] — newer formats arrive as additive
+    /// representations (or snapshot-producing migrations), never as
+    /// in-place rewrites; see `docs/upgrade-contract.md`.
     pub fn decode(bytes: &[u8]) -> Result<Self, EnvelopeError> {
         if bytes.len() < HEADER_LEN {
             return Err(EnvelopeError::Truncated);

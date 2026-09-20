@@ -793,9 +793,10 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, Builder};
     use crate::runtime::test_util::{
-        admit_engine, announcement_for, capability_message, capability_message_for, control_key,
-        deliver, drain, encryption_key, fixture, identity, publish_into, queue, transition_message,
-        MemoryMailbox, MemoryRelay, PublishedSnapshot, TestDir, WithoutObjects,
+        admit_engine, announcement_for, announcement_msg, capability_message,
+        capability_message_for, control_key, deliver, drain, encryption_key, fixture, identity,
+        publish_into, queue, transition_message, MemoryMailbox, MemoryRelay, PublishedSnapshot,
+        TestDir, WithoutObjects,
     };
     use crate::runtime::RoutePublishing;
     use crate::transport::mailbox::{
@@ -3334,6 +3335,118 @@ mod tests {
         assert_eq!(
             fx.engine.runtime_state().unwrap().pending_transitions(),
             vec![(child_id, unsealable)],
+            "the keyless obligation stays pending"
+        );
+    }
+
+    /// A capability obligation without a sealing key stays pending
+    /// instead of failing the pass: the sealed pair still sends, and
+    /// the keyless pair remains observable via the pending projection.
+    #[test]
+    fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
+        let (mut fx, child) = two_transition_world();
+        // Epoch 2 becomes unsealable: no held key and no keyring
+        // secret, so the fresh seal cannot even mint its wrap.
+        fx.engine.epoch_keys.remove(&2);
+        let sealable = identity(0x03).1;
+        let keyless = identity(0x04).1;
+        let child_id = child.transition_id();
+        let genesis_id = fx
+            .engine
+            .log
+            .transition(&child_id)
+            .and_then(|t| t.prev)
+            .expect("genesis linked");
+        // A well-formed epoch-1 grant to `sealable`, sealed under the
+        // epoch-1 key the fixture still holds.
+        let wrap_sk = DeviceEncryptionSecret::from_bytes([0xE4; 32]).unwrap();
+        let granted = capability_message_for(&wrap_sk, sealable, genesis_id, 1, vec![secret(0xAA)]);
+        let bytes = seal(&control_key(1), &member_drive(), 1, &granted)
+            .unwrap()
+            .encode();
+        fx.engine
+            .commit_facts(&[
+                Fact::CapabilitySealed(1, sealable, bytes),
+                Fact::CapabilityQueued(1, sealable),
+                Fact::CapabilityQueued(2, keyless),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let sent = fx.engine.deliver_pending(&mut mailbox).unwrap();
+        assert_eq!(sent, 1, "only the sealed obligation sends");
+        let loaded = fx.engine.store.load().unwrap();
+        assert_eq!(
+            loaded.capability_delivered,
+            vec![(1, sealable)],
+            "exactly the sealed pair discharges"
+        );
+        assert_eq!(
+            fx.engine.runtime_state().unwrap().pending_capabilities(),
+            vec![(2, keyless)],
+            "the keyless obligation stays pending"
+        );
+    }
+
+    /// An announcement obligation without a sealing key stays pending
+    /// instead of failing the pass: the snapshot under the held key
+    /// still sends, and the keyless one remains observable via the
+    /// pending projection.
+    #[test]
+    fn announce_skips_snapshot_without_a_sealing_key_and_sends_the_rest() {
+        let (mut fx, child) = two_transition_world();
+        // Epoch 2 becomes unsealable: no held key and no keyring
+        // secret.
+        fx.engine.epoch_keys.remove(&2);
+        let child_id = child.transition_id();
+        let genesis_id = fx
+            .engine
+            .log
+            .transition(&child_id)
+            .and_then(|t| t.prev)
+            .expect("genesis linked");
+        let (author_sk, _) = identity(0x22);
+        // Two known snapshots, no bodies: both take the re-announce
+        // path, one under the held epoch-1 key, one under the missing
+        // epoch-2 key.
+        let snap1 = wyrd_format::SnapshotId::from_bytes([0xA1; 32]);
+        let snap2 = wyrd_format::SnapshotId::from_bytes([0xA2; 32]);
+        let Message::SnapshotAnnouncement(known1) =
+            announcement_msg(&author_sk, snap1, 1, genesis_id)
+        else {
+            panic!("announcement_msg builds announcements");
+        };
+        let Message::SnapshotAnnouncement(known2) =
+            announcement_msg(&author_sk, snap2, 2, child_id)
+        else {
+            panic!("announcement_msg builds announcements");
+        };
+        let recipient = identity(0x05).1;
+        fx.engine
+            .commit_facts(&[
+                Fact::Announcement(known1),
+                Fact::AnnouncementQueued(snap1, recipient),
+                Fact::Announcement(known2),
+                Fact::AnnouncementQueued(snap2, recipient),
+            ])
+            .unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        };
+        let sent = fx.engine.announce_pending(&mut mailbox, None).unwrap();
+        assert_eq!(sent, 1, "only the snapshot under the held key sends");
+        let loaded = fx.engine.store.load().unwrap();
+        assert_eq!(
+            loaded.announcement_delivered,
+            vec![(snap1, recipient)],
+            "exactly the sealable snapshot discharges"
+        );
+        assert_eq!(
+            fx.engine.runtime_state().unwrap().pending_announcements(),
+            vec![(snap2, recipient)],
             "the keyless obligation stays pending"
         );
     }

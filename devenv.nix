@@ -61,38 +61,10 @@ in
     };
   };
 
-  # Release tooling: build the Linux distribution tarballs from a Mac.
-  # The flake builds natively per system, so `nix build .#wyrd-dist` on
-  # darwin only yields macos-aarch64. The Linux legs below offload to
-  # remote builders (`builders = @/etc/nix/machines`) via
-  # `nix build --system`: no containers, no emulation. Input is pinned
-  # to the release tag in a detached worktree, never the working copy,
-  # so a dirty tree cannot bake into a release tarball. The x86_64 leg
-  # runs first so a missing x86 builder fails fast instead of after
-  # the aarch64 build.
-  scripts.build-linux-dist.exec = ''
-    set -euo pipefail
-    VERSION="''${1:?usage: build-linux-dist <version> (e.g. 0.1.0-alpha.1)}"
-    TAG="v$VERSION"
-    git rev-parse --verify --quiet "$TAG" >/dev/null \
-      || { echo "tag $TAG does not exist" >&2; exit 1; }
-    ROOT=$(git rev-parse --show-toplevel)
-    EXPORT=$(mktemp -d)
-    trap 'cd "$ROOT"; git worktree remove --force "$EXPORT" >/dev/null 2>&1 || rm -rf "$EXPORT"' EXIT
-    git worktree add --detach "$EXPORT" "$TAG" >/dev/null
-    mkdir -p "$ROOT/dist"
-    for SYSTEM in x86_64-linux aarch64-linux; do
-      echo "building $SYSTEM from $TAG..."
-      nix --extra-experimental-features 'nix-command flakes' \
-        build "$EXPORT#packages.''$SYSTEM.wyrd-dist" --out-link "$EXPORT/dist-link"
-      cp "$EXPORT/dist-link" "$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-link")")"
-    done
-    # Smoke check: release.yaml names exactly these two archives, and
-    # ngit rejects partial platform coverage on the main channel.
-    for ARTIFACT in "$ROOT/dist/wyrd-$VERSION-linux-x86_64.tar.gz" "$ROOT/dist/wyrd-$VERSION-linux-aarch64.tar.gz"; do
-      [ -f "$ARTIFACT" ] || { echo "missing expected artifact $ARTIFACT" >&2; exit 1; }
-    done
-    echo "dist/:"
-    ls "$ROOT/dist"
-  '';
+  # Release tooling: `build-dist` wraps `.ngit/scripts/build-dist.sh`,
+  # which builds every distribution tarball this machine can produce
+  # (native, Rosetta, and remote-builder legs with host capability
+  # detection). Input is pinned to the release tag in a detached
+  # worktree, never the working copy.
+  scripts.build-dist.exec = "${./.ngit/scripts/build-dist.sh} \"$@\"";
 }

@@ -5,12 +5,13 @@
 #      below are extracted from that exact section.
 #   2. Tag the release commit `v<version>` (the version derives from the tag
 #      with one leading `v` stripped, so it must equal the Cargo version).
-#   3. On each platform, produce the tarball named below (`dist/` is
-#      gitignored build output). macOS builds natively with
-#      `nix build .#wyrd-dist`; Linux tarballs come from
-#      `build-linux-dist <version>` in the devenv shell, which offloads
-#      to the remote builders in /etc/nix/machines from a worktree
-#      pinned to the release tag. A main release must ship all three:
+#   3. Produce every tarball named below (`dist/` is gitignored build
+#      output): `build-dist <version> --strict` in the devenv shell
+#      builds all four combos it can (see its capability detection) and
+#      fails unless all four land. macOS builds run locally (x86_64 via
+#      Rosetta when present); Linux builds offload to the remote
+#      builders in /etc/nix/machines. Input is pinned to the release
+#      tag, never the working copy. A main release must ship all four:
 #      ngit rejects partial platform coverage on the main channel.
 #   4. `ngit release publish <version>` with `--blossom-server` (or a
 #      kind-10063 server list from the publisher), plus `--relay` as needed.
@@ -43,3 +44,7 @@ assets:
     filename: wyrd-{version}-macos-aarch64.tar.gz
     mime: application/gzip
     platforms: [macos-aarch64]
+  - file: dist/wyrd-{version}-macos-x86_64.tar.gz
+    filename: wyrd-{version}-macos-x86_64.tar.gz
+    mime: application/gzip
+    platforms: [macos-x86_64]

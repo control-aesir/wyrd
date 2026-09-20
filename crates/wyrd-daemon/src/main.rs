@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::logging::init_mount_diagnostics;
-use crate::probes::{combine_status, macos_preflight};
+use crate::probes::combine_status;
+#[cfg(target_os = "macos")]
+use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_daemon::{Daemon, LiveConfig, LiveError, Supervisor};

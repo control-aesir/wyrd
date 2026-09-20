@@ -1,4 +1,5 @@
 use crate::CliError;
+#[cfg(any(test, target_os = "macos"))]
 use std::path::{Path, PathBuf};
 
 use wyrd_daemon::{LiveError, LiveSummary};

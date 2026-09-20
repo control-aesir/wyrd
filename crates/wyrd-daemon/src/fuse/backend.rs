@@ -1,317 +1,21 @@
-//! The FUSE presentation backend: kernel ops mapped onto the daemon's
-//! [`DriveView`] over an inode table. Reads are served directly; writes
-//! are buffered in per-handle sessions and committed as snapshots
-//! through the daemon's mutation channel (see `docs/write-path.md`).
-//! Namespace operations (`mkdir`, `create`, `unlink`, `rmdir`,
-//! `rename`, `setattr`) are served; unsupported node types (`mknod`,
-//! `symlink`, `link`) fall through to `ENOSYS`; `O_DIRECT`/`O_PATH`
-//! are `EOPNOTSUPP`.
-//!
-//! Error mapping happens only here, per `docs/sync-and-peers.md`:
-//! absence maps to `ENOENT`, `Unavailable`/`Corrupt`/`Conflict` to
-//! `EIO` (scrub/repair and fetch-on-open are the daemon's duties before
-//! this boundary is allowed to block or serve).
-//!
-//! Synthetic ownership: v0 preserves no uid/gid or permission metadata;
-//! apart from the represented exec bit, the backend presents the
-//! mounting user's ids and synthesized mode bits (files `0644`/`0755`,
-//! directories `0755`), so kernels that enforce permissions from attrs
-//! let the mounter read and write.
-//!
-//! Lock discipline: a poisoned lock is a local data-path failure, so
-//! kernel callbacks answer `EIO` instead of panicking the mount. File
-//! descriptors are snapshot-stable: `open` captures the immutable file
-//! identity and `read` serves from the capture, never by re-resolving
-//! the path against advanced heads.
-//!
-//! Symlink confinement: format symlink targets are arbitrary by design
-//! and member-authored, so untrusted. The kernel resolves whatever
-//! `readlink` returns in the host mount namespace, so the adapter
-//! serves a target only when [`wyrd_fuse::confine_symlink_target`]
-//! proves it stays inside the mount: absolute targets and `..` walks
-//! above the drive root fail with `EACCES`. The adapter never follows
-//! symlinks itself, and the view's component parser already rejects
-//! absolute or escaping walks for anything this backend resolves
-//! itself — `readlink` gating plus strict resolution is the whole
-//! policy, with no trusted-drive opt-out in v0.
-
 use std::collections::HashMap;
 
 use fuser::{FileHandle, INodeNo, LockOwner, OpenFlags};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
+use super::inode::{
+    statfs_capacity, DirectoryEntries, DirectoryState, Handle, InodeError, InodeTable, OpenDir,
+    OpenFiles, WriteHandle, MOUNT_TIME, TTL,
+};
 use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::Projection;
-use crate::session::{HandleId, WriteBudget};
+use crate::session::WriteBudget;
 use crate::want::{wait_for_materialization, WantRegistry};
-
-/// The attribute time-to-limit served to the kernel: short, since
-/// heads (and thus names and sizes) can advance at any drain.
-const TTL: Duration = Duration::from_secs(1);
-/// The single well-known timestamp: the view has no time source and
-/// snapshot timestamps are display-only (object-model.md).
-const MOUNT_TIME: SystemTime = UNIX_EPOCH;
-/// Synthetic capacity reported by `statfs`, in blocks. The store is
-/// append-only and effectively unbounded, so there is no real total to
-/// report; zeros read as an empty/full disk and make Finder refuse
-/// copies before writing anything. 2^40 blocks at 4 KiB is 4 PiB: large
-/// enough to never gate a real copy, small enough that `blocks * frsize`
-/// cannot overflow u64.
-const STATFS_BLOCKS: u64 = 1 << 40;
-/// Block size reported by `statfs`, for both `bsize` and `frsize`.
-const STATFS_BSIZE: u32 = 4096;
-
-/// The synthetic `statfs` capacity with named fields, so the mapping
-/// onto the positional FUSE ABI reply is pinned in one place. Free
-/// equals total: nothing is ever reported as used; files/ffree mirror
-/// the same unboundedness for the namespace.
-struct StatfsCapacity {
-    blocks: u64,
-    bfree: u64,
-    bavail: u64,
-    files: u64,
-    ffree: u64,
-    bsize: u32,
-    namelen: u32,
-    frsize: u32,
-}
-
-fn statfs_capacity() -> StatfsCapacity {
-    StatfsCapacity {
-        blocks: STATFS_BLOCKS,
-        bfree: STATFS_BLOCKS,
-        bavail: STATFS_BLOCKS,
-        files: STATFS_BLOCKS,
-        ffree: STATFS_BLOCKS,
-        bsize: STATFS_BSIZE,
-        namelen: 4096,
-        frsize: STATFS_BSIZE,
-    }
-}
-
-/// The inode table: kernel ino → the path it was minted for, plus
-/// the kind and projection generation that last validated the
-/// mapping. Inodes are never reused within a mount; the root is
-/// always 1. A mapping is only as fresh as its last validation:
-/// every lookup/getattr re-resolves the path against the current
-/// projection, and a kind change or deletion retires the ino instead
-/// of letting it silently attach to new content — the next lookup
-/// mints a fresh ino, and holders of the retired ino fail with
-/// ENOENT rather than serving stale identity.
-struct InodeTable {
-    by_ino: HashMap<u64, InodeEntry>,
-    by_path: HashMap<String, u64>,
-    next: u64,
-}
-
-/// One minted mapping: the path, the node kind it resolved to, and
-/// the projection generation that last confirmed both. The stamp is
-/// recorded for the mounted write path's invalidation (it tells
-/// whether a mapping predates a commit); validation correctness
-/// itself comes from re-resolving against one cloned immutable
-/// projection, not from comparing this field.
-struct InodeEntry {
-    path: String,
-    kind: fuser::FileType,
-    generation: u64,
-}
-
-pub(crate) type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
-
-/// One open directory: the listing pinned at opendir plus the
-/// projection generation it was enumerated from. Readdir serves the
-/// pinned listing — a stable snapshot of its generation — while
-/// lookup/getattr always resolve against the current projection, so
-/// a listing never mixes generations mid-stream; a fresh opendir
-/// picks up the new generation.
-struct OpenDir {
-    generation: u64,
-    entries: DirectoryEntries,
-}
-
-struct DirectoryState {
-    entries: HashMap<u64, OpenDir>,
-    next_handle: u64,
-}
-
-/// Open file handles: the immutable read capture, or the buffered
-/// writable session. A read descriptor serves the object that was
-/// opened; a writable handle adds one mutable logical image on top.
-enum Handle {
-    Read(OpenFile),
-    Write(Arc<Mutex<WriteHandle>>),
-}
-
-/// One writable open: the path, the identity it opened against, and the
-/// dense logical image its writes build.
-///
-/// State machine (serialized by this handle's own mutex, never held by
-/// the loop): a clean handle has `image == None` and serves its open-time
-/// `capture`. The first write materializes the base into `image` and sets
-/// `dirty`. Every commit-producing operation (`O_SYNC` write, `flush`,
-/// `fsync`, `release`) runs under this mutex, so no write can interleave
-/// with a commit and no two commits can overlap. A successful commit
-/// advances `base` to the committed identity, drops the image, and makes
-/// the handle clean; a failed commit is terminal (`failed`), discarding
-/// the image and mapping every later operation to `EIO`.
-struct WriteHandle {
-    path: String,
-    /// The open-time capture: clean reads serve exactly these bytes, so
-    /// head advancement never changes what an open descriptor returns.
-    capture: OpenFile,
-    /// The identity a commit must still find at `path` when the handle
-    /// is not an append handle.
-    base: FileIdentity,
-    /// The target exec bit for the next commit (buffered like content).
-    executable: bool,
-    /// The dense logical image; `None` while clean. For an append
-    /// handle this is the buffered append sequence (never the base).
-    image: Option<Vec<u8>>,
-    /// `O_APPEND`: writes buffer an ordered sequence that commits onto
-    /// the current file end; reads concatenate the capture and the
-    /// sequence.
-    append: bool,
-    /// The image differs from `base` (or `O_TRUNC` started it empty), so
-    /// the next committing boundary authors a snapshot.
-    dirty: bool,
-    /// A failed commit discarded the overlay; the handle is unusable.
-    failed: bool,
-    /// `O_SYNC`/`O_DSYNC`: each successful write is its own commit.
-    sync: bool,
-    /// Budget key for the buffered image.
-    id: HandleId,
-}
-
-/// Open file captures keyed by the handle the kernel uses.
-struct OpenFiles {
-    by_handle: HashMap<u64, Handle>,
-    next: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InodeError {
-    Exhausted,
-    Stale,
-}
-
-impl InodeTable {
-    fn new() -> Self {
-        let mut by_ino = HashMap::new();
-        by_ino.insert(
-            1u64,
-            InodeEntry {
-                path: String::new(),
-                kind: fuser::FileType::Directory,
-                generation: 0,
-            },
-        );
-        let mut by_path = HashMap::new();
-        by_path.insert(String::new(), 1);
-        InodeTable {
-            by_ino,
-            by_path,
-            next: 2,
-        }
-    }
-
-    fn path(&self, ino: u64) -> Option<&str> {
-        self.by_ino.get(&ino).map(|entry| entry.path.as_str())
-    }
-
-    /// Forget a mapping on both indexes. Deletion and kind changes
-    /// retire the ino; a later lookup mints a fresh one, so a retired
-    /// ino never silently reattaches to recreated or repurposed
-    /// content.
-    fn retire(&mut self, ino: u64) {
-        if let Some(entry) = self.by_ino.remove(&ino) {
-            self.by_path.remove(&entry.path);
-        }
-    }
-
-    /// Forget whatever mapping names `path`, if any. Failed
-    /// resolution retires by path: the resolving callback holds no
-    /// ino (lookup mints after resolving), but the stale mapping must
-    /// still go — otherwise a same-kind recreation would reuse an
-    /// identity whose content died with the deleted generation.
-    fn retire_path(&mut self, path: &str) {
-        if let Some(ino) = self.by_path.remove(path) {
-            self.by_ino.remove(&ino);
-        }
-    }
-
-    /// The ino for a freshly resolved path: reuse the mapping when it
-    /// still names the same kind (refreshing its validated
-    /// generation), otherwise retire the stale ino and mint a new one.
-    /// The root path (`""`) always maps to ino 1.
-    fn intern(
-        &mut self,
-        path: &str,
-        kind: fuser::FileType,
-        generation: u64,
-    ) -> Result<u64, InodeError> {
-        if path.is_empty() {
-            return Ok(1);
-        }
-        if let Some(ino) = self.by_path.get(path) {
-            let ino = *ino;
-            let matches = self
-                .by_ino
-                .get(&ino)
-                .is_some_and(|entry| entry.kind == kind);
-            if matches {
-                if let Some(entry) = self.by_ino.get_mut(&ino) {
-                    entry.generation = generation;
-                }
-                return Ok(ino);
-            }
-            self.retire(ino);
-        }
-        let ino = self.next;
-        self.next = self.next.checked_add(1).ok_or(InodeError::Exhausted)?;
-        let path = path.to_string();
-        self.by_path.insert(path.clone(), ino);
-        self.by_ino.insert(
-            ino,
-            InodeEntry {
-                path,
-                kind,
-                generation,
-            },
-        );
-        Ok(ino)
-    }
-
-    /// Confirm an ino still names its path at its kind: refresh the
-    /// validated generation on success, retire the mapping and report
-    /// stale on any divergence (kind change, path swap) or unknown
-    /// ino. Holders of a retired ino fail with ENOENT instead of
-    /// serving the path's new occupant.
-    fn validate(
-        &mut self,
-        ino: u64,
-        path: &str,
-        kind: fuser::FileType,
-        generation: u64,
-    ) -> Result<(), InodeError> {
-        let fresh = self
-            .by_ino
-            .get(&ino)
-            .is_some_and(|entry| entry.path.as_str() == path && entry.kind == kind);
-        if !fresh {
-            self.retire(ino);
-            return Err(InodeError::Stale);
-        }
-        if let Some(entry) = self.by_ino.get_mut(&ino) {
-            entry.generation = generation;
-        }
-        Ok(())
-    }
-}
 
 /// The FUSE backend over one drive's published projection: read-write
 /// when the live daemon's mutation channel is wired, read-only without
@@ -330,9 +34,9 @@ where
     S::Error: std::fmt::Debug,
 {
     projection: Arc<RwLock<Arc<Projection<S, M>>>>,
-    inodes: RwLock<InodeTable>,
-    directories: RwLock<DirectoryState>,
-    files: Mutex<OpenFiles>,
+    pub(super) inodes: RwLock<InodeTable>,
+    pub(super) directories: RwLock<DirectoryState>,
+    pub(super) files: Mutex<OpenFiles>,
     /// FUSE demand: registration + bounded blocking on `open`/`read`
     /// when a live daemon owns the same view. `None` keeps the
     /// instant-EIO behavior for standalone backends.
@@ -341,10 +45,10 @@ where
     /// mutations are submitted here and executed by the loop. `None`
     /// makes every mutating callback `EROFS` (a standalone read-only
     /// backend).
-    mutations: Option<Arc<MutationQueue>>,
+    pub(super) mutations: Option<Arc<MutationQueue>>,
     /// The session's write budget: bounds the buffered logical images of
     /// writable handles. Independent of the projection and store locks.
-    budget: Arc<WriteBudget>,
+    pub(super) budget: Arc<WriteBudget>,
     /// How long `open`/`read` may block on demand before `EIO`.
     open_timeout: Duration,
     /// The mounting user's ids, presented as synthetic ownership so
@@ -360,21 +64,21 @@ where
 /// mounter to name, so ownership stays zero.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn current_owner() -> (u32, u32) {
+pub(super) fn current_owner() -> (u32, u32) {
     // SAFETY: geteuid/getegid take no pointers and only read the
     // calling process's kernel credentials.
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
 #[cfg(not(unix))]
-fn current_owner() -> (u32, u32) {
+pub(super) fn current_owner() -> (u32, u32) {
     (0, 0)
 }
 
 /// Map a mutation failure to the POSIX errno the write-path contract
 /// names. Everything unclassified is `EIO`: a durability or validation
 /// failure never masquerades as a more benign error.
-fn mutation_errno(error: &MutationError) -> fuser::Errno {
+pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
     match error {
         MutationError::Saturated => fuser::Errno::EAGAIN,
         MutationError::Invalid(_) | MutationError::InvalidRename(_) => fuser::Errno::EINVAL,
@@ -405,7 +109,7 @@ fn inode_error(error: InodeError) -> fuser::Errno {
 
 /// A child path from a parent path: the root's children are the
 /// components themselves.
-fn join(parent: &str, name: &str) -> String {
+pub(super) fn join(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()
     } else {
@@ -429,7 +133,7 @@ fn slice_image(image: &[u8], offset: u64, size: u32) -> Vec<u8> {
 /// Presentation attributes for one node: kind, size, exec bit. A
 /// conflicted path presents as a directory — the readdir union rules
 /// keep it navigable, and the conflict itself fails on read.
-fn attr_of(node: &Node) -> (fuser::FileType, u64, bool) {
+pub(super) fn attr_of(node: &Node) -> (fuser::FileType, u64, bool) {
     match node {
         Node::File {
             size, executable, ..
@@ -459,7 +163,7 @@ fn unsupported_open_flags(_flags: i32) -> bool {
 }
 
 /// The POSIX error the kernel boundary documents for each view failure.
-fn errno_of(error: &ViewError) -> fuser::Errno {
+pub(super) fn errno_of(error: &ViewError) -> fuser::Errno {
     match error {
         ViewError::NotFound => fuser::Errno::ENOENT,
         ViewError::InvalidPath => fuser::Errno::EINVAL,
@@ -484,14 +188,14 @@ fn errno_of(error: &ViewError) -> fuser::Errno {
 /// drops at the end of the callback, after the reply is sent, so the
 /// latency covers the dispatch. Interior mutability keeps call sites
 /// to one line with no `mut` binding.
-struct RequestLog {
+pub(super) struct RequestLog {
     opcode: &'static str,
     start: Instant,
-    err: std::cell::Cell<Option<i32>>,
+    pub(super) err: std::cell::Cell<Option<i32>>,
 }
 
 impl RequestLog {
-    fn new(opcode: &'static str) -> Self {
+    pub(super) fn new(opcode: &'static str) -> Self {
         RequestLog {
             opcode,
             start: Instant::now(),
@@ -501,7 +205,7 @@ impl RequestLog {
 
     /// Record the reply errno for the drop log; returns it unchanged
     /// so it reads inline at the reply site.
-    fn fail(&self, err: fuser::Errno) -> fuser::Errno {
+    pub(super) fn fail(&self, err: fuser::Errno) -> fuser::Errno {
         self.err.set(Some(i32::from(err)));
         err
     }
@@ -644,7 +348,7 @@ where
     /// retires the stale ino and mints a fresh one. The node and the
     /// generation come from the same projection, so callers serve one
     /// consistent snapshot per call.
-    fn resolve_inode(&self, path: &str) -> Result<(u64, Node, u64), fuser::Errno> {
+    pub(super) fn resolve_inode(&self, path: &str) -> Result<(u64, Node, u64), fuser::Errno> {
         let projection = self.projection()?;
         let generation = projection.generation();
         let node = match projection.view().lookup(path) {
@@ -673,7 +377,7 @@ where
     /// current generation. A kind change, path swap, or unknown ino
     /// retires the mapping and reports ENOENT: holders of a retired
     /// ino re-resolve instead of serving the path's new occupant.
-    fn validate_inode(
+    pub(super) fn validate_inode(
         &self,
         ino: u64,
         path: &str,
@@ -1253,7 +957,7 @@ where
         Ok(())
     }
 
-    fn attr(&self, ino: u64, node: &Node) -> fuser::FileAttr {
+    pub(super) fn attr(&self, ino: u64, node: &Node) -> fuser::FileAttr {
         let (kind, size, executable) = attr_of(node);
         fuser::FileAttr {
             ino: fuser::INodeNo(ino),
@@ -1285,7 +989,7 @@ where
 
     /// The path an ino was minted for. A poisoned lock is a local
     /// data-path failure: EIO, never a panic inside a kernel callback.
-    fn inode_path(&self, ino: u64) -> Result<String, fuser::Errno> {
+    pub(super) fn inode_path(&self, ino: u64) -> Result<String, fuser::Errno> {
         let inodes = self.inodes.read().map_err(|_| fuser::Errno::EIO)?;
         inodes
             .path(ino)
@@ -2205,7 +1909,7 @@ where
     }
 }
 
-fn symlink_target<S: ObjectStore, M: Materialization>(
+pub(super) fn symlink_target<S: ObjectStore, M: Materialization>(
     view: &DriveView<S, M>,
     path: &str,
 ) -> Result<String, fuser::Errno>
@@ -2225,1057 +1929,5 @@ where
         }
         Ok(_) => Err(fuser::Errno::EINVAL),
         Err(error) => Err(errno_of(&error)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fuser::Filesystem as _;
-    use wyrd_format::{
-        ContentId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, SharedStore, Snapshot, Tree,
-    };
-    use wyrd_fuse::{ViewError, ViewHead};
-
-    /// Test materialization: everything is remote-only. Local reads
-    /// never consult it — the store answers from memory.
-    struct NoMaterialization;
-    impl Materialization for NoMaterialization {
-        fn status(&self, _id: &ContentId) -> FetchStatus {
-            FetchStatus::RemoteOnly
-        }
-    }
-
-    /// A test-local verification capability: backend unit tests exercise
-    /// presentation behavior, not the upstream verification boundary
-    /// (the daemon adapter and the contract suite cover that path).
-    struct TestHead(Snapshot);
-
-    // SAFETY: a deliberately forged capability for presentation
-    // fixtures — it asserts nothing real and must never escape test
-    // code. The upstream verification boundary is covered by the
-    // daemon adapter and the contract suite, not here.
-    #[allow(unsafe_code)]
-    unsafe impl wyrd_fuse::VerifiedSnapshot for TestHead {
-        fn into_snapshot(self) -> Snapshot {
-            self.0
-        }
-    }
-
-    fn heads(snapshots: Vec<Snapshot>) -> Vec<ViewHead> {
-        snapshots
-            .into_iter()
-            .map(TestHead)
-            .map(ViewHead::new)
-            .collect()
-    }
-
-    fn snapshot_of(tree: ContentId) -> Snapshot {
-        Snapshot::new(
-            Vec::new(),
-            tree,
-            wyrd_format::DeviceId::from_bytes([0xD0; 32]),
-            wyrd_format::TransitionId::from_bytes([0x71; 32]),
-            1,
-            0,
-            1,
-        )
-        .unwrap()
-    }
-
-    fn backend() -> FuseBackend<MemoryObjectStore, NoMaterialization> {
-        let mut store = MemoryObjectStore::default();
-        let root = Tree::from_entries(Vec::new())
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        FuseBackend::new(DriveView::new(
-            store,
-            NoMaterialization,
-            heads(vec![snapshot_of(root)]),
-        ))
-    }
-    /// The errno mapping is the POSIX contract at the mount boundary:
-    /// pinned variant by variant.
-    #[test]
-    fn view_errors_map_to_posix_errors() {
-        assert_eq!(errno_of(&ViewError::NotFound), fuser::Errno::ENOENT);
-        assert_eq!(errno_of(&ViewError::InvalidPath), fuser::Errno::EINVAL);
-        assert_eq!(errno_of(&ViewError::NotADirectory), fuser::Errno::ENOTDIR);
-        assert_eq!(errno_of(&ViewError::NotAFile), fuser::Errno::EISDIR);
-        for corruption in [
-            ViewError::Conflict,
-            ViewError::NotMaterialized {
-                content: ContentId::from_bytes([0; 32]),
-            },
-            ViewError::Unavailable,
-            ViewError::Corrupt,
-        ] {
-            assert_eq!(errno_of(&corruption), fuser::Errno::EIO);
-        }
-        assert_eq!(
-            errno_of(&ViewError::Store("disk".into())),
-            fuser::Errno::EIO
-        );
-    }
-
-    /// The mutation errno mapping is pinned the same way: saturation is
-    /// retryable, malformed names are caller errors, everything else —
-    /// including a loop shutdown mid-syscall — is EIO, never a hang.
-    #[test]
-    fn mutation_errors_map_to_posix_errors() {
-        assert_eq!(
-            mutation_errno(&MutationError::Saturated),
-            fuser::Errno::EAGAIN
-        );
-        assert_eq!(
-            mutation_errno(&MutationError::Invalid("x".into())),
-            fuser::Errno::EINVAL
-        );
-        assert_eq!(
-            mutation_errno(&MutationError::NotFound("x".into())),
-            fuser::Errno::ENOENT
-        );
-        for fatal in [
-            MutationError::Conflicted { heads: 2 },
-            MutationError::Stale("x".into()),
-            MutationError::Lock,
-            MutationError::Store,
-            MutationError::Engine,
-            MutationError::Shutdown,
-        ] {
-            assert_eq!(mutation_errno(&fatal), fuser::Errno::EIO);
-        }
-    }
-
-    /// The request probe records the reply errno inline and passes it
-    /// through unchanged, so `reply.error(log.fail(errno))` reads at
-    /// the reply site and logs opcode + errno + latency on drop. An
-    /// unfailed probe logs the dispatch as clean.
-    #[test]
-    fn request_log_records_the_reply_errno() {
-        let log = RequestLog::new("lookup");
-        assert_eq!(log.err.get(), None);
-        let returned = log.fail(fuser::Errno::ENOENT);
-        assert_eq!(returned, fuser::Errno::ENOENT);
-        assert_eq!(log.err.get(), Some(i32::from(fuser::Errno::ENOENT)));
-
-        let clean = RequestLog::new("statfs");
-        assert_eq!(clean.err.get(), None);
-    }
-
-    /// The synthetic `statfs` capacity must read as a usable disk: zeros
-    /// make Finder refuse copies before writing anything, free must equal
-    /// total (nothing is ever reported as used), and the byte product
-    /// must not overflow the kernels that multiply it out.
-    #[test]
-    fn statfs_capacity_is_nonzero_and_overflow_free() {
-        let cap = statfs_capacity();
-        assert!(cap.blocks > 0, "zero blocks read as an empty disk");
-        assert_eq!(cap.bfree, cap.blocks, "free must equal total");
-        assert_eq!(cap.bavail, cap.blocks, "available must equal total");
-        assert!(cap.ffree > 0, "zero free inodes read as a full disk");
-        assert!(cap.bsize > 0, "zero block size breaks size math");
-        let bytes = (cap.blocks as u128) * (cap.frsize as u128);
-        assert!(
-            bytes < u64::MAX as u128,
-            "blocks * frsize must fit u64 ({bytes} does not)"
-        );
-    }
-
-    #[test]
-    fn inode_table_interns_stably_and_never_reuses() {
-        use fuser::FileType;
-        let mut table = InodeTable::new();
-        assert_eq!(table.path(1), Some(""), "root is 1");
-        let a = table.intern("hello.txt", FileType::RegularFile, 0).unwrap();
-        let b = table.intern("sub", FileType::Directory, 0).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(
-            table.intern("hello.txt", FileType::RegularFile, 1),
-            Ok(a),
-            "re-interning is stable and refreshes the generation"
-        );
-        assert_eq!(table.path(a), Some("hello.txt"));
-        // The root path interns to the root ino, never a fresh one.
-        assert_eq!(table.intern("", FileType::Directory, 1), Ok(1));
-    }
-
-    /// A kind change retires the mapping: the next intern mints a
-    /// fresh ino, and the retired one validates stale instead of
-    /// silently attaching to the repurposed path.
-    #[test]
-    fn inode_table_retires_mappings_on_kind_change() {
-        use fuser::FileType;
-        let mut table = InodeTable::new();
-        let file_ino = table.intern("shape", FileType::RegularFile, 0).unwrap();
-        let dir_ino = table.intern("shape", FileType::Directory, 1).unwrap();
-        assert_ne!(file_ino, dir_ino, "a repurposed path mints a fresh ino");
-        assert_eq!(
-            table.validate(file_ino, "shape", FileType::RegularFile, 1),
-            Err(InodeError::Stale),
-            "the retired ino no longer validates"
-        );
-        assert_eq!(table.path(file_ino), None, "retirement clears both indexes");
-        assert!(table
-            .validate(dir_ino, "shape", FileType::Directory, 1)
-            .is_ok());
-    }
-
-    /// Validating an unknown ino is stale (never a fresh mapping for
-    /// someone else's identity), and retiring an unknown ino is quiet.
-    #[test]
-    fn inode_table_rejects_unknown_inos() {
-        use fuser::FileType;
-        let mut table = InodeTable::new();
-        assert_eq!(
-            table.validate(999, "ghost", FileType::RegularFile, 0),
-            Err(InodeError::Stale)
-        );
-        table.retire(999);
-    }
-
-    #[test]
-    fn child_paths_join_without_double_slashes() {
-        assert_eq!(join("", "a.txt"), "a.txt");
-        assert_eq!(join("sub", "a.txt"), "sub/a.txt");
-    }
-
-    #[test]
-    fn attrs_present_files_dirs_and_conflicts() {
-        let file = Node::File {
-            size: 11,
-            executable: true,
-            chunks: vec![ContentId::from_bytes([0x01; 32])],
-        };
-        let (kind, size, executable) = attr_of(&file);
-        assert_eq!(kind, fuser::FileType::RegularFile);
-        assert_eq!((size, executable), (11, true));
-        let (kind, _, _) = attr_of(&Node::Dir {
-            subtree: ContentId::from_bytes([0x02; 32]),
-        });
-        assert_eq!(kind, fuser::FileType::Directory);
-        let (kind, _, _) = attr_of(&Node::Symlink { target: "x".into() });
-        assert_eq!(kind, fuser::FileType::Symlink);
-        let (kind, _, _) = attr_of(&Node::Conflict { versions: vec![] });
-        assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
-    }
-
-    /// A backend with no mutation channel is the standalone read-only
-    /// mount: every mutating operation is refused with EROFS, never
-    /// silently accepted or half-applied.
-    #[test]
-    fn read_only_backend_refuses_mutations() {
-        let backend = backend();
-        assert_eq!(backend.mkdir_at(1, "x"), Err(fuser::Errno::EROFS));
-        assert_eq!(
-            backend.create_at(1, "x", libc::O_RDWR),
-            Err(fuser::Errno::EROFS)
-        );
-        assert_eq!(backend.unlink_at(1, "x"), Err(fuser::Errno::EROFS));
-        assert_eq!(backend.rmdir_at(1, "x"), Err(fuser::Errno::EROFS));
-        assert_eq!(
-            backend.rename_at(1, "x", 1, "y", false),
-            Err(fuser::Errno::EROFS)
-        );
-        assert_eq!(backend.set_size_at(1, 1), Err(fuser::Errno::EROFS));
-        assert_eq!(backend.set_exec_at(1, true), Err(fuser::Errno::EROFS));
-        assert_eq!(
-            backend.setattr_attrs(1, None, Some(1), None),
-            Err(fuser::Errno::EROFS)
-        );
-        // Read handles still serve; there is just no write handle to
-        // open.
-        assert_eq!(backend.open_write("x", 0), Err(fuser::Errno::EROFS));
-    }
-
-    /// A headless view (fresh drive, no authored heads) still resolves,
-    /// opens, and enumerates the root through the backend: the resolve
-    /// path behind getattr, the open path behind opendir, and an empty
-    /// listing behind readdir. Kernels refuse a mount whose root fails,
-    /// so this must hold before first authoring.
-    #[test]
-    fn headless_view_serves_an_empty_root_end_to_end() {
-        let backend = FuseBackend::new(DriveView::new(
-            MemoryObjectStore::default(),
-            NoMaterialization,
-            Vec::new(),
-        ));
-        let (ino, node, _) = backend.resolve_inode("").unwrap();
-        assert_eq!(ino, 1, "the root path interns to ino 1");
-        assert!(
-            matches!(node, Node::MergedDir { .. }),
-            "a headless root is an empty directory"
-        );
-        let fh = backend.open_dir(1, "").unwrap();
-        let entries = backend.dir_entries(fh).unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|(_, _, name)| name.as_str())
-                .collect::<Vec<_>>(),
-            vec![".", ".."],
-            "no children before first authoring"
-        );
-    }
-
-    /// Synthetic ownership presents the mounting user: kernels that
-    /// enforce permissions from attrs must see the mounter, or writes
-    /// fail before reaching the backend (observed EACCES on macFUSE
-    /// with uid/gid-zero presentation).
-    #[test]
-    fn attrs_present_the_mounting_user() {
-        let backend = backend();
-        let attr = backend.attr(
-            1,
-            &Node::Dir {
-                subtree: ContentId::from_bytes([0x02; 32]),
-            },
-        );
-        let (uid, gid) = current_owner();
-        assert_eq!(attr.uid, uid, "attrs carry the mounting uid");
-        assert_eq!(attr.gid, gid, "attrs carry the mounting gid");
-    }
-
-    /// A first write whose resulting logical length exceeds the
-    /// per-handle budget fails closed with `ENOSPC` *before*
-    /// materializing the base, so an oversized file never allocates
-    /// past the advertised bound.
-    #[test]
-    fn first_write_over_the_handle_budget_does_not_materialize() {
-        let mut store = MemoryObjectStore::default();
-        let root = Tree::from_entries(vec![Entry::file(
-            "big",
-            100,
-            false,
-            vec![ContentId::from_bytes([0x01; 32])],
-        )
-        .unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-        // A tiny budget and a channel so `open_write` is permitted; the
-        // write itself must be refused before any base read.
-        let mut backend = FuseBackend::new(view);
-        backend.budget = Arc::new(WriteBudget::with_limits(4, 100, 8));
-        backend.mutations = Some(Arc::new(MutationQueue::default()));
-
-        let fh = backend.open_write("big", libc::O_RDWR).unwrap();
-        assert_eq!(
-            backend.write_handle(fh, 0, b"x"),
-            Err(fuser::Errno::ENOSPC),
-            "a base over the per-handle cap is refused"
-        );
-        assert_eq!(
-            backend.budget.total(),
-            0,
-            "the refused write reserves nothing"
-        );
-    }
-
-    #[test]
-    fn symlink_targets_are_confined_to_the_mount() {
-        use wyrd_format::Entry;
-
-        fn view_with(entries: Vec<Entry>) -> DriveView<MemoryObjectStore, NoMaterialization> {
-            let mut store = MemoryObjectStore::default();
-            let root = Tree::from_entries(entries)
-                .unwrap()
-                .insert_into(&mut store)
-                .unwrap();
-            DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]))
-        }
-
-        // Absolute targets resolve in the host namespace: never served.
-        let view = view_with(vec![Entry::symlink("link", "/etc/passwd").unwrap()]);
-        assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
-        // A root-level `..` already escapes the mount.
-        let view = view_with(vec![Entry::symlink("link", "../target").unwrap()]);
-        assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
-
-        // Nested escapes: the walk is lexical from the link's parent.
-        let mut store = MemoryObjectStore::default();
-        let inner = Tree::from_entries(vec![Entry::symlink("link", "../../evil").unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let root = Tree::from_entries(vec![Entry::dir("sub", inner).unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-        assert_eq!(symlink_target(&view, "sub/link"), Err(fuser::Errno::EACCES));
-
-        // In-drive targets still serve verbatim: the kernel resolves
-        // them inside the mount.
-        let mut store = MemoryObjectStore::default();
-        let inner = Tree::from_entries(vec![Entry::symlink("link", "../sibling").unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let root = Tree::from_entries(vec![
-            Entry::dir("sub", inner).unwrap(),
-            Entry::file("sibling", 1, false, Vec::new()).unwrap(),
-        ])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-        assert_eq!(symlink_target(&view, "sub/link"), Ok("../sibling".into()));
-
-        // Non-target paths keep their existing mapping.
-        assert_eq!(symlink_target(&view, "missing"), Err(fuser::Errno::ENOENT));
-        assert_eq!(symlink_target(&view, "sibling"), Err(fuser::Errno::EINVAL));
-    }
-
-    /// A one-file drive whose `f.txt` holds `a`, with a second head
-    /// where it holds `b` — returned unbuilt so a test can advance
-    /// the mount to it.
-    fn evolving_backend(
-        a: &[u8],
-        b: &[u8],
-    ) -> (FuseBackend<MemoryObjectStore, NoMaterialization>, Snapshot) {
-        let mut store = MemoryObjectStore::default();
-        let first = store.insert(ObjectKind::Chunk, a).unwrap();
-        let second = store.insert(ObjectKind::Chunk, b).unwrap();
-        let root_a = Tree::from_entries(vec![Entry::file(
-            "f.txt",
-            a.len() as u64,
-            false,
-            vec![first],
-        )
-        .unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let root_b = Tree::from_entries(vec![Entry::file(
-            "f.txt",
-            b.len() as u64,
-            false,
-            vec![second],
-        )
-        .unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let next = snapshot_of(root_b);
-        let backend = FuseBackend::new(DriveView::new(
-            store,
-            NoMaterialization,
-            heads(vec![snapshot_of(root_a)]),
-        ));
-        (backend, next)
-    }
-
-    /// A file descriptor represents the object that was opened, not
-    /// whatever occupies that path later: reads serve the open-time
-    /// capture, so head advancement under an open descriptor changes
-    /// nothing it returns (M9).
-    #[test]
-    fn reads_serve_the_opened_version_across_head_advancement() {
-        let (backend, next) = evolving_backend(b"first", b"second");
-        let handle = backend.open_at("f.txt").unwrap();
-        assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
-
-        // Heads advance underneath the open descriptor: publication
-        // installs a whole new generation.
-        backend
-            .publish_without_revision(DriveView::shared(
-                backend.store_handle().unwrap(),
-                NoMaterialization,
-                heads(vec![next]),
-            ))
-            .unwrap();
-        assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
-        assert_eq!(backend.read_handle(handle, 1, 2).unwrap(), b"ir");
-
-        // A fresh open resolves the new heads; the stale descriptor
-        // keeps its own version.
-        let fresh = backend.open_at("f.txt").unwrap();
-        assert_eq!(backend.read_handle(fresh, 0, 64).unwrap(), b"second");
-        assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"first");
-    }
-
-    /// Three generations over one store: v0 serves `f.txt` as a file
-    /// beside an empty `sub`, v1 repurposes `f.txt` as a directory and
-    /// adds `new.txt`, v2 deletes `f.txt`. Each step publishes a new
-    /// backend generation without touching the durable revision.
-    fn kind_changing_backend() -> (
-        FuseBackend<MemoryObjectStore, NoMaterialization>,
-        Snapshot,
-        Snapshot,
-        Snapshot,
-    ) {
-        let mut store = MemoryObjectStore::default();
-        let chunk = store.insert(ObjectKind::Chunk, b"data").unwrap();
-        let empty = Tree::from_entries(Vec::new())
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let file_entry = || Entry::file("f.txt", 4, false, vec![chunk]).unwrap();
-        let root_file = Tree::from_entries(vec![file_entry(), Entry::dir("sub", empty).unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let root_dir = Tree::from_entries(vec![
-            Entry::dir("f.txt", empty).unwrap(),
-            Entry::dir("sub", empty).unwrap(),
-            Entry::file("new.txt", 4, false, vec![chunk]).unwrap(),
-        ])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let root_gone = Tree::from_entries(vec![Entry::dir("sub", empty).unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let backend = FuseBackend::new(DriveView::new(
-            store,
-            NoMaterialization,
-            heads(vec![snapshot_of(root_file)]),
-        ));
-        (
-            backend,
-            snapshot_of(root_dir),
-            snapshot_of(root_gone),
-            snapshot_of(root_file),
-        )
-    }
-
-    /// Publish `next` as the backend's new generation.
-    fn publish(backend: &FuseBackend<MemoryObjectStore, NoMaterialization>, next: Snapshot) {
-        backend
-            .publish_without_revision(DriveView::shared(
-                backend.store_handle().unwrap(),
-                NoMaterialization,
-                heads(vec![next]),
-            ))
-            .unwrap();
-    }
-
-    /// A file repurposed as a directory mints a fresh ino: the lookup
-    /// after publication resolves the new kind under a new identity,
-    /// and the retired ino fails instead of serving the new occupant.
-    #[test]
-    fn kind_change_retires_the_ino() {
-        let (backend, as_dir, _, _) = kind_changing_backend();
-        let (file_ino, file_node, _) = backend.resolve_inode("f.txt").unwrap();
-        assert!(matches!(file_node, Node::File { .. }));
-
-        publish(&backend, as_dir);
-        assert_eq!(backend.generation().unwrap(), 1);
-        let (dir_ino, dir_node, _) = backend.resolve_inode("f.txt").unwrap();
-        assert!(matches!(dir_node, Node::Dir { .. }));
-        assert_ne!(
-            file_ino, dir_ino,
-            "a repurposed path must not keep its identity"
-        );
-
-        // The retired ino no longer validates, even against the new
-        // node: holders re-resolve instead of serving stale identity.
-        assert_eq!(
-            backend.validate_inode(file_ino, "f.txt", &dir_node, 1),
-            Err(fuser::Errno::ENOENT)
-        );
-        assert!(backend
-            .validate_inode(dir_ino, "f.txt", &dir_node, 1)
-            .is_ok());
-    }
-
-    /// Deletion retires the mapping: resolution fails, the old ino
-    /// stops validating, and recreating the path mints a fresh ino
-    /// that never reattaches to the deleted content's identity.
-    #[test]
-    fn deletion_retires_and_recreation_mints_fresh() {
-        let (backend, as_dir, gone, file_again) = kind_changing_backend();
-        let (file_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
-        publish(&backend, as_dir);
-        let (dir_ino, dir_node, _) = backend.resolve_inode("f.txt").unwrap();
-
-        publish(&backend, gone);
-        assert_eq!(
-            backend.resolve_inode("f.txt"),
-            Err(fuser::Errno::ENOENT),
-            "a deleted path resolves to nothing"
-        );
-        // Retirement is lazy: the deleted mapping lingers until the
-        // path resolves again (a getattr on the stale ino re-resolves,
-        // fails, and retires it — the callback path, not this helper).
-        // Recreation is what observably retires it here: the fresh
-        // resolve finds the kind mismatch, drops the deleted mapping,
-        // and mints a new identity.
-        publish(&backend, file_again);
-        let (fresh_ino, fresh_node, _) = backend.resolve_inode("f.txt").unwrap();
-        assert!(matches!(fresh_node, Node::File { .. }));
-        assert_ne!(fresh_ino, file_ino);
-        assert_ne!(fresh_ino, dir_ino, "recreation never reuses a retired ino");
-        assert_eq!(
-            backend.validate_inode(dir_ino, "f.txt", &dir_node, 3),
-            Err(fuser::Errno::ENOENT),
-            "the deleted path's ino stopped validating on recreation"
-        );
-    }
-
-    /// A same-kind delete/recreate cycle mints a fresh ino: the
-    /// failed resolution between the generations retires the mapping
-    /// by path, so the recreated file never inherits the deleted
-    /// file's identity — even with no getattr on the stale ino in
-    /// between.
-    #[test]
-    fn same_kind_recreate_mints_fresh_ino() {
-        let (backend, _, gone, file_again) = kind_changing_backend();
-        // Skip the repurpose generation: file -> deleted -> file.
-        let (first_ino, first_node, _) = backend.resolve_inode("f.txt").unwrap();
-        assert!(matches!(first_node, Node::File { .. }));
-
-        publish(&backend, gone);
-        assert_eq!(
-            backend.resolve_inode("f.txt"),
-            Err(fuser::Errno::ENOENT),
-            "the failed resolution retires the mapping by path"
-        );
-
-        publish(&backend, file_again);
-        let (second_ino, second_node, _) = backend.resolve_inode("f.txt").unwrap();
-        assert!(matches!(second_node, Node::File { .. }));
-        assert_ne!(
-            first_ino, second_ino,
-            "same-kind recreation must not reuse the deleted identity"
-        );
-        assert_eq!(
-            backend.validate_inode(first_ino, "f.txt", &second_node, 2),
-            Err(fuser::Errno::ENOENT)
-        );
-    }
-
-    /// Directory handles pin their enumeration generation: a listing
-    /// opened before a publication keeps serving its own snapshot
-    /// while a fresh open picks up the new generation. The two never
-    /// mix mid-stream.
-    #[test]
-    fn directory_handles_pin_their_enumeration_generation() {
-        let (backend, as_dir, _, _) = kind_changing_backend();
-        let (root_ino, _, _) = backend.resolve_inode("").unwrap();
-        let old = backend.open_dir(root_ino, "").unwrap();
-        assert_eq!(backend.dir_generation(old).unwrap(), 0);
-        let before: Vec<String> = backend
-            .dir_entries(old)
-            .unwrap()
-            .iter()
-            .map(|(_, _, name)| name.clone())
-            .collect();
-        assert!(before.contains(&"f.txt".to_string()));
-        assert!(!before.contains(&"new.txt".to_string()));
-
-        publish(&backend, as_dir);
-        // The pinned handle is untouched by the publication: same
-        // generation, same listing.
-        assert_eq!(backend.dir_generation(old).unwrap(), 0);
-        let still: Vec<String> = backend
-            .dir_entries(old)
-            .unwrap()
-            .iter()
-            .map(|(_, _, name)| name.clone())
-            .collect();
-        assert_eq!(before, still);
-
-        // A fresh open enumerates the new generation.
-        let (fresh_root, _, _) = backend.resolve_inode("").unwrap();
-        let current = backend.open_dir(fresh_root, "").unwrap();
-        assert_eq!(backend.dir_generation(current).unwrap(), 1);
-        let after: Vec<String> = backend
-            .dir_entries(current)
-            .unwrap()
-            .iter()
-            .map(|(_, _, name)| name.clone())
-            .collect();
-        assert!(after.contains(&"new.txt".to_string()));
-    }
-
-    /// Unknown handles are EBADF, and a released handle stops
-    /// serving. A duplicate release stays quiet.
-    #[test]
-    fn open_handles_are_badf_after_release() {
-        let (backend, _) = evolving_backend(b"first", b"second");
-        let handle = backend.open_at("f.txt").unwrap();
-        assert!(backend.release_handle(handle).is_ok());
-        assert_eq!(backend.read_handle(handle, 0, 4), Err(fuser::Errno::EBADF));
-        assert!(backend.release_handle(handle).is_ok());
-        assert_eq!(
-            backend.read_handle(FileHandle(999), 0, 4),
-            Err(fuser::Errno::EBADF)
-        );
-    }
-
-    /// The handle table must not leak across unmounts.
-    #[test]
-    fn unmount_drops_open_handles() {
-        let (mut backend, _) = evolving_backend(b"first", b"second");
-        let handle = backend.open_at("f.txt").unwrap();
-        backend.destroy();
-        assert_eq!(backend.read_handle(handle, 0, 4), Err(fuser::Errno::EBADF));
-    }
-
-    type WithheldFixture = (
-        FuseBackend<SharedStore<MemoryObjectStore>, NoMaterialization>,
-        Arc<RwLock<MemoryObjectStore>>,
-        Arc<WantRegistry>,
-        ContentId,
-    );
-
-    /// A drive whose file tree is held but whose chunk object is
-    /// withheld, plus the shared want registry. `handle` gives the
-    /// test access to the store so a background thread can stand in
-    /// for a fetch landing.
-    fn withheld_backend(open_timeout: Duration) -> WithheldFixture {
-        let mut scratch = MemoryObjectStore::default();
-        let chunk = scratch.insert(ObjectKind::Chunk, b"streamed").unwrap();
-        let mut store = MemoryObjectStore::default();
-        let root = Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let store = Arc::new(RwLock::new(store));
-        let view = DriveView::new(
-            SharedStore::from(Arc::clone(&store)),
-            NoMaterialization,
-            heads(vec![snapshot_of(root)]),
-        );
-        let registry = Arc::new(WantRegistry::default());
-        let backend = FuseBackend::shared_with_wants(
-            Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
-            Arc::clone(&registry),
-            Arc::new(MutationQueue::default()),
-            open_timeout,
-        );
-        (backend, store, registry, chunk)
-    }
-
-    /// First touch of an unmaterialized chunk registers a want and
-    /// blocks bounded; when the bytes arrive the retried read serves
-    /// them and the demand entry is released. The FD pins identity, so
-    /// the served bytes are the pinned capture's.
-    #[test]
-    fn read_blocks_on_want_until_content_arrives() {
-        use wyrd_format::ObjectKind;
-        let (backend, store, registry, _chunk) = withheld_backend(Duration::from_secs(5));
-        let handle = backend
-            .open_at("f.txt")
-            .expect("the tree is held, so open serves");
-        let worker = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            store
-                .write()
-                .unwrap()
-                .insert(ObjectKind::Chunk, b"streamed")
-                .unwrap();
-        });
-        assert_eq!(
-            backend.read_handle(handle, 0, 8).unwrap(),
-            b"streamed",
-            "the retried read serves the arrived bytes"
-        );
-        worker.join().unwrap();
-        assert!(
-            registry.peek_pending().is_empty(),
-            "success released the demand"
-        );
-    }
-
-    /// The deadline is EIO, never a partial file, and the demand entry
-    /// is retired on expiry: a want whose fetch was never admitted
-    /// dies with the last waiter (the engine, once admitted, is not
-    /// cancelled — the registry tests cover that side).
-    #[test]
-    fn read_deadline_is_eio_and_releases_the_want() {
-        let (backend, _store, registry, _chunk) = withheld_backend(Duration::from_millis(150));
-        let handle = backend.open_at("f.txt").unwrap();
-        assert_eq!(
-            backend.read_handle(handle, 0, 8),
-            Err(fuser::Errno::EIO),
-            "deadline expiry is EIO, never a partial read"
-        );
-        assert!(
-            registry.peek_pending().is_empty(),
-            "expiry released the demand"
-        );
-    }
-
-    /// Identical outstanding wants coalesce: two concurrent readers of
-    /// the same missing chunk produce one demand entry, and both wake
-    /// when the bytes arrive (delivery, dedup, and completion are
-    /// distinct properties per `fetch-on-open.md`).
-    #[test]
-    fn concurrent_reads_coalesce_into_one_want() {
-        use wyrd_format::ObjectKind;
-        let (backend, store, registry, _chunk) = withheld_backend(Duration::from_secs(5));
-        let backend = Arc::new(backend);
-        let handle = backend.open_at("f.txt").unwrap();
-        let reader_a = {
-            let backend = Arc::clone(&backend);
-            std::thread::spawn(move || backend.read_handle(handle, 0, 8).unwrap())
-        };
-        let reader_b = {
-            let backend = Arc::clone(&backend);
-            std::thread::spawn(move || backend.read_handle(handle, 0, 8).unwrap())
-        };
-        std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(
-            registry.peek_pending().len(),
-            1,
-            "two waiters, one demand entry"
-        );
-        store
-            .write()
-            .unwrap()
-            .insert(ObjectKind::Chunk, b"streamed")
-            .unwrap();
-        assert_eq!(reader_a.join().unwrap(), b"streamed");
-        assert_eq!(reader_b.join().unwrap(), b"streamed");
-    }
-
-    /// The open table is a lock like any other: poison fails the
-    /// operation with EIO instead of panicking a kernel callback.
-    #[test]
-    fn poisoned_open_table_errors_instead_of_panicking() {
-        let (backend, _) = evolving_backend(b"first", b"second");
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = backend.files.lock().unwrap();
-            panic!("poison the open table");
-        }));
-        std::panic::set_hook(previous);
-
-        assert_eq!(backend.open_at("f.txt"), Err(fuser::Errno::EIO));
-        assert_eq!(
-            backend.read_handle(FileHandle(1), 0, 4),
-            Err(fuser::Errno::EIO)
-        );
-        assert_eq!(
-            backend.release_handle(FileHandle(1)),
-            Err(fuser::Errno::EIO)
-        );
-    }
-
-    /// Kernel callbacks never panic on a poisoned lock: the failure
-    /// mode is EIO (M10). Poisoning happens only when a panic strikes
-    /// while a lock is held; the tests force it and demand the
-    /// controlled error.
-    #[test]
-    fn poisoned_locks_error_instead_of_panicking() {
-        let backend = backend();
-        // Healthy locks keep their ordinary error: an unknown directory
-        // handle is EBADF, not EIO.
-        assert_eq!(backend.dir_entries(7), Err(fuser::Errno::EBADF));
-
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = backend.inodes.write().unwrap();
-            panic!("poison the inode lock");
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = backend.directories.write().unwrap();
-            panic!("poison the directory lock");
-        }));
-        std::panic::set_hook(previous);
-
-        assert_eq!(backend.inode_path(1), Err(fuser::Errno::EIO));
-        assert_eq!(backend.dir_entries(0), Err(fuser::Errno::EIO));
-    }
-
-    /// Two heads over one store for the merge/conflict matrix: head A
-    /// holds `a.txt`, `sub/x.txt`, `duel.txt` ("one"), a `mix/` dir,
-    /// and `gone.txt`; head B holds `b.txt`, `sub/y.txt`,
-    /// `duel.txt` ("two"), a `mix` file, and no `gone.txt`.
-    /// `common.txt` is byte-identical in both heads, so it serves as
-    /// a plain file. The root merges, `sub` merges, and `a.txt`,
-    /// `b.txt`, `duel.txt`, `mix`, `gone.txt` conflict four different
-    /// ways (presence/deletion both directions, file/file, dir/file).
-    fn matrix_backend() -> FuseBackend<MemoryObjectStore, NoMaterialization> {
-        fn chunk(store: &mut MemoryObjectStore, data: &[u8]) -> ContentId {
-            store.insert(ObjectKind::Chunk, data).unwrap()
-        }
-        let mut store = MemoryObjectStore::default();
-        let (one, two) = (chunk(&mut store, b"one"), chunk(&mut store, b"two"));
-        let (a, b) = (chunk(&mut store, b"a"), chunk(&mut store, b"b"));
-        let (x, y) = (chunk(&mut store, b"x"), chunk(&mut store, b"y"));
-        let inner = chunk(&mut store, b"inner");
-        let gone = chunk(&mut store, b"gone");
-        let mix_file = chunk(&mut store, b"mix-file");
-        let common = chunk(&mut store, b"common");
-        let sub_a = Tree::from_entries(vec![Entry::file("x.txt", 1, false, vec![x]).unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let sub_b = Tree::from_entries(vec![Entry::file("y.txt", 1, false, vec![y]).unwrap()])
-            .unwrap()
-            .insert_into(&mut store)
-            .unwrap();
-        let mix_dir = Tree::from_entries(vec![
-            Entry::file("inner.txt", 5, false, vec![inner]).unwrap()
-        ])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let root_a = Tree::from_entries(vec![
-            Entry::file("a.txt", 1, false, vec![a]).unwrap(),
-            Entry::file("common.txt", 6, false, vec![common]).unwrap(),
-            Entry::dir("sub", sub_a).unwrap(),
-            Entry::file("duel.txt", 3, false, vec![one]).unwrap(),
-            Entry::dir("mix", mix_dir).unwrap(),
-            Entry::file("gone.txt", 4, false, vec![gone]).unwrap(),
-        ])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        let root_b = Tree::from_entries(vec![
-            Entry::file("b.txt", 1, false, vec![b]).unwrap(),
-            Entry::file("common.txt", 6, false, vec![common]).unwrap(),
-            Entry::dir("sub", sub_b).unwrap(),
-            Entry::file("duel.txt", 3, false, vec![two]).unwrap(),
-            Entry::file("mix", 8, false, vec![mix_file]).unwrap(),
-        ])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-        FuseBackend::new(DriveView::new(
-            store,
-            NoMaterialization,
-            heads(vec![snapshot_of(root_a), snapshot_of(root_b)]),
-        ))
-    }
-
-    fn entry_names(entries: &DirectoryEntries) -> Vec<&str> {
-        entries.iter().map(|(_, _, name)| name.as_str()).collect()
-    }
-
-    /// Merged directories list the union through the adapter: entry
-    /// names come from the view's union walk, and each child is
-    /// interned through `attr_of` — the agreed file lists as a file,
-    /// merged dirs as directories, and every conflict (both
-    /// directions of presence/deletion included) as a navigable
-    /// directory. The listing pins at opendir and releases cleanly.
-    #[test]
-    fn merged_dirs_list_the_union_through_opendir() {
-        use fuser::FileType;
-        let backend = matrix_backend();
-
-        let fh = backend.open_dir(1, "").unwrap();
-        let all = backend.dir_entries(fh).unwrap();
-        let names = entry_names(&all);
-        for name in [
-            ".",
-            "..",
-            "a.txt",
-            "b.txt",
-            "common.txt",
-            "sub",
-            "duel.txt",
-            "mix",
-            "gone.txt",
-        ] {
-            assert!(names.contains(&name), "the union lists {name}");
-        }
-        let kind_of = |want: &str| {
-            all.iter()
-                .find(|(_, _, name)| name == want)
-                .map(|(_, kind, _)| *kind)
-        };
-        assert_eq!(kind_of("common.txt"), Some(FileType::RegularFile));
-        assert_eq!(
-            kind_of("sub"),
-            Some(FileType::Directory),
-            "merged dirs present as dirs"
-        );
-        for conflict in ["a.txt", "b.txt", "duel.txt", "mix", "gone.txt"] {
-            assert_eq!(
-                kind_of(conflict),
-                Some(FileType::Directory),
-                "{conflict} stays navigable"
-            );
-        }
-        // Dot entries address the opened directory itself.
-        assert_eq!(all[0], (1, FileType::Directory, ".".into()));
-        assert_eq!(all[1], (1, FileType::Directory, "..".into()));
-
-        // The merged child unions too.
-        let (sub_ino, sub_node, _) = backend.resolve_inode("sub").unwrap();
-        assert!(matches!(sub_node, Node::MergedDir { .. }));
-        let sub_fh = backend.open_dir(sub_ino, "sub").unwrap();
-        let sub_all = backend.dir_entries(sub_fh).unwrap();
-        let names = entry_names(&sub_all);
-        assert!(names.contains(&"x.txt") && names.contains(&"y.txt"));
-
-        backend.release_dir(fh).unwrap();
-        assert_eq!(
-            backend.dir_entries(fh),
-            Err(fuser::Errno::EBADF),
-            "released handles are gone"
-        );
-        backend.release_dir(sub_fh).unwrap();
-    }
-
-    /// Reads through a conflict fail with the documented errno: the
-    /// conflicted path opens as EIO however the versions diverge —
-    /// file against file, dir against file, or presence against
-    /// deletion in either direction — while the agreed file next to
-    /// them reads normally.
-    #[test]
-    fn conflicted_file_reads_fail_with_eio() {
-        let backend = matrix_backend();
-        for path in ["a.txt", "b.txt", "duel.txt", "mix", "gone.txt"] {
-            let (_, node, _) = backend.resolve_inode(path).unwrap();
-            assert!(matches!(node, Node::Conflict { .. }), "{path} conflicts");
-            assert_eq!(
-                backend.open_at(path),
-                Err(fuser::Errno::EIO),
-                "conflicted reads fail"
-            );
-        }
-        let agreed = backend.open_at("common.txt").unwrap();
-        assert_eq!(backend.read_handle(agreed, 0, 64).unwrap(), b"common");
-    }
-
-    /// A dir-against-file conflict lists the dir side: the union
-    /// rules keep the conflict navigable, and only the genuine
-    /// divergence stays unreadable as a file.
-    #[test]
-    fn dir_against_file_conflict_lists_the_dir_side() {
-        let backend = matrix_backend();
-        let (mix_ino, node, _) = backend.resolve_inode("mix").unwrap();
-        assert!(matches!(node, Node::Conflict { .. }));
-        let fh = backend.open_dir(mix_ino, "mix").unwrap();
-        let listed = backend.dir_entries(fh).unwrap();
-        assert_eq!(entry_names(&listed), vec![".", "..", "inner.txt"]);
-        backend.release_dir(fh).unwrap();
-    }
-
-    /// A file-against-file conflict has no dir side: opendir still
-    /// succeeds (conflicts stay navigable) with an empty listing, and
-    /// only reads fail.
-    #[test]
-    fn file_against_file_conflict_opens_empty() {
-        let backend = matrix_backend();
-        let (ino, _, _) = backend.resolve_inode("duel.txt").unwrap();
-        let fh = backend.open_dir(ino, "duel.txt").unwrap();
-        let listed = backend.dir_entries(fh).unwrap();
-        assert_eq!(entry_names(&listed), vec![".", ".."]);
-        backend.release_dir(fh).unwrap();
-    }
-
-    /// Opendir on a file is ENOTDIR and on a missing path ENOENT: the
-    /// adapter maps the view's failures at the boundary.
-    #[test]
-    fn opendir_rejects_files_and_missing_paths() {
-        let backend = matrix_backend();
-        let (ino, _, _) = backend.resolve_inode("common.txt").unwrap();
-        assert_eq!(
-            backend.open_dir(ino, "common.txt"),
-            Err(fuser::Errno::ENOTDIR)
-        );
-        assert_eq!(backend.open_dir(1, "nope"), Err(fuser::Errno::ENOENT));
     }
 }

@@ -161,11 +161,14 @@ if [ "$VERIFY" = true ]; then
     if [ "$(uname -s)" = Darwin ]; then
       # Read every linkage line: stopping early would SIGPIPE otool and trip
       # pipefail, so the loop consumes all input and remembers the first gap.
+      # /usr/lib and /System residents resolve via the dyld shared cache and
+      # have no on-disk file to test: only third-party paths (macFUSE in
+      # /usr/local/lib) get the existence check.
       MISSING_LIB=""
       while read -r lib; do
         if [ ! -e "$lib" ] && [ -z "$MISSING_LIB" ]; then MISSING_LIB="$lib"; fi
       # shellcheck disable=SC2016: awk program, not shell expansion.
-      done < <(otool -L "$BIN" | awk '$1 ~ /\.dylib/ {print $1}')
+      done < <(otool -L "$BIN" | awk '$1 ~ /\.dylib/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}')
       if [ -n "$MISSING_LIB" ]; then
         echo "warning: $FILE not executed (missing system library $MISSING_LIB); structure checked only" >&2
         rm -rf "$CHECK"

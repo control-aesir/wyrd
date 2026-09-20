@@ -13,7 +13,7 @@ on:
       - "flake.lock"
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
-      - ".ngit/scripts/build-dist.sh"
+      - ".ngit/scripts/build.sh"
   pull_request:
     types: [opened, ready_for_review]
     paths:
@@ -26,7 +26,7 @@ on:
       - "flake.lock"
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
-      - ".ngit/scripts/build-dist.sh"
+      - ".ngit/scripts/build.sh"
 
 jobs:
   draft:
@@ -260,7 +260,7 @@ jobs:
           nix flake check --print-build-logs 2>&1 | tee -a /tmp/nix.log
 
       # Proves the release archive path end to end via the same script
-      # releases use (.ngit/scripts/build-dist.sh): capability detection
+      # releases use (.ngit/scripts/build.sh): capability detection
       # picks this runner's system, --ref pins the checkout commit
       # instead of a tag, and --verify unpacks each tarball and runs
       # its binary. Full `--rebuild` reproducibility is verified at
@@ -274,7 +274,7 @@ jobs:
           echo "===== archive smoke test =====" >> /tmp/nix.log
           {
             version=$(nix eval --raw .#wyrd.version)
-            .ngit/scripts/build-dist.sh "$version" --ref HEAD --verify
+            .ngit/scripts/build.sh "$version" --ref HEAD --verify
           } 2>&1 | tee -a /tmp/nix.log
 
       # Upload all logs — runs even when a step above failed, so you get the

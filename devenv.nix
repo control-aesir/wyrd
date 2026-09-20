@@ -61,10 +61,10 @@ in
     };
   };
 
-  # Release tooling: `build-dist` wraps `.ngit/scripts/build-dist.sh`,
+  # Release tooling: `build` wraps `.ngit/scripts/build.sh`,
   # which builds every distribution tarball this machine can produce
   # (native, Rosetta, and remote-builder legs with host capability
   # detection). Input is pinned to the release tag in a detached
   # worktree, never the working copy.
-  scripts.build-dist.exec = "${./.ngit/scripts/build-dist.sh} \"$@\"";
+  scripts.build.exec = "${./.ngit/scripts/build.sh} \"$@\"";
 }

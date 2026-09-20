@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build every wyrd distribution tarball this machine can produce.
 #
-# Usage: build-dist.sh <version> [--strict] [--ref <git-ref>] [--verify] [system...]
+# Usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [system...]
 #
 # With no system arguments, host capability is detected and exactly the
 # buildable combos are built: the native system always, x86_64-darwin via
@@ -16,7 +16,7 @@
 # dirty tree cannot bake into a release tarball.
 set -euo pipefail
 
-VERSION="${1:?usage: build-dist.sh <version> [--strict] [--ref <git-ref>] [--verify] [system...] (e.g. 0.1.0-alpha.1 --strict)}"
+VERSION="${1:?usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [system...] (e.g. 0.1.0-alpha.1 --strict)}"
 shift
 STRICT=false
 REF=""

@@ -6,7 +6,7 @@
 #   2. Tag the release commit `v<version>` (the version derives from the tag
 #      with one leading `v` stripped, so it must equal the Cargo version).
 #   3. Produce every tarball named below (`dist/` is gitignored build
-#      output): `build-dist <version> --strict` in the devenv shell
+#      output): `build <version> --strict` in the devenv shell
 #      builds all four combos it can (see its capability detection) and
 #      fails unless all four land. macOS builds run locally (x86_64 via
 #      Rosetta when present); Linux builds offload to the remote

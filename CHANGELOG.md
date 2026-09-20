@@ -44,7 +44,7 @@ version say exactly what changed.
   (`nix build .#wyrd-dist`) produces the `wyrd-{version}-{platform}.tar.gz`
   named in `.ngit/release.yaml`, so a main release always covers every
   application platform.
-- `nix` CI gate (`.ngit/act/workflows/nix.yml`): `nix flake check` on push to
+- `nix` CI gate (`.ngit/act/workflows/workflow.yml`): `nix flake check` on push to
   `master` and on `ready_for_review` for PRs touching the flake, the Rust
   workspace, or the workflow itself.
 - Release manifest (`.ngit/release.yaml`): per-platform `wyrd-{version}`

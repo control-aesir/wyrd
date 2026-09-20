@@ -1,0 +1,87 @@
+name: dist
+
+# Release-artifact workflow: builds the Linux x86_64 distribution
+# tarball natively and uploads it to public Blossom mirrors. This is
+# the one release leg no maintainer machine can build (Apple Silicon
+# cannot execute x86_64-linux nix derivations, Rosetta included).
+#
+# Triggered explicitly per release, never by normal CI:
+#   ngit ci trigger <coordinator> v<version> \
+#     --workflow .ngit/act/workflows/dist.yml
+# A `push.tags` stanza is declared as well so hosted forges that honor
+# tag pushes run it automatically; the manual trigger works regardless.
+#
+# The human release flow then is: fetch the tarball by its printed
+# sha256 from any listed mirror into dist/, run
+# `build <version> --strict` locally for the other three legs plus the
+# completeness gate, and `ngit release publish`.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  dist-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      # Same store cache as the main pipeline (shared key): release
+      # builds reuse warmed dependencies instead of recompiling cold.
+      - name: Restore Nix store cache
+        continue-on-error: true
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          token: unused
+
+      # Flake evaluation needs an openable Git repository (libgit2
+      # ENOTFOUND otherwise) and the coordinator worktree can carry a
+      # stub or no .git metadata at all. Rebuild it when git itself
+      # cannot open it.
+      - name: Prepare git metadata for flake evaluation
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          git config --global --add safe.directory "$PWD"
+          if ! git rev-parse --git-dir >/dev/null 2>&1; then
+            rm -rf .git
+            git init -q
+            git add -A
+            git -c user.email=ci@localhost -c user.name=ci commit -qm ci
+          fi
+
+      # Native x86_64 build of exactly the archive release.yaml
+      # publishes, then upload to every mirror. The tarball filename
+      # embeds the Cargo version, so no version plumbing is needed.
+      - name: Build and mirror the x86_64 archive
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          nix build .#packages.x86_64-linux.wyrd-dist --print-build-logs --out-link dist-x86_64
+          file=$(readlink dist-x86_64)
+          test -f "$file"
+          sha=$(nix hash file --type sha256 --base16 "$file")
+          echo "artifact=$file"
+          echo "sha256=$sha"
+          # Ephemeral upload identity: integrity is hash-based, so the
+          # uploader key carries no trust. The human publisher verifies
+          # the sha256 below before referencing it in the release.
+          # nak runs straight from nixpkgs: nothing to install or pin.
+          eph=$(nix run nixpkgs#nak -- key generate)
+          for server in \
+            https://blossom.primal.net \
+            https://nostr.download \
+            https://cdn.hzrd149.com; do
+            echo "--- $server"
+            nix run nixpkgs#nak -- blossom upload --server "$server" --sec "$eph" "$file"
+          done

@@ -60,4 +60,11 @@ in
       pass_filenames = false;
     };
   };
+
+  # Release tooling: `build` wraps `.ngit/scripts/build.sh`,
+  # which builds every distribution tarball this machine can produce
+  # (native, Rosetta, and remote-builder legs with host capability
+  # detection). Input is pinned to the release tag in a detached
+  # worktree, never the working copy.
+  scripts.build.exec = "${./.ngit/scripts/build.sh} \"$@\"";
 }

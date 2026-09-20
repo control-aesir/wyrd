@@ -15,11 +15,12 @@
       # Product platforms. x86_64-darwin is deliberately absent even though
       # rust-toolchain.toml lists the target: no builder covers it, so it
       # ships nothing until one does.
-      systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
+      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       # ngit release platform tags, which order OS before architecture.
       ngitPlatforms = {
         aarch64-darwin = "macos-aarch64";
+        x86_64-darwin = "macos-x86_64";
         aarch64-linux = "linux-aarch64";
         x86_64-linux = "linux-x86_64";
       };

@@ -12,7 +12,8 @@ on:
       - "flake.nix"
       - "flake.lock"
       - ".ngit/act/workflows/workflow.yml"
-      - ".ngit/act/lib/ngit.sh"
+      - ".ngit/scripts/ngit.sh"
+      - ".ngit/scripts/build.sh"
   pull_request:
     types: [opened, ready_for_review]
     paths:
@@ -24,7 +25,8 @@ on:
       - "flake.nix"
       - "flake.lock"
       - ".ngit/act/workflows/workflow.yml"
-      - ".ngit/act/lib/ngit.sh"
+      - ".ngit/scripts/ngit.sh"
+      - ".ngit/scripts/build.sh"
 
 jobs:
   draft:
@@ -73,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
-          source .ngit/act/lib/ngit.sh
+          source .ngit/scripts/ngit.sh
           draft_new_pr
 
       # Saves the scan's sync progress even when drafting failed: the
@@ -257,11 +259,13 @@ jobs:
           echo "===== flake check =====" >> /tmp/nix.log
           nix flake check --print-build-logs 2>&1 | tee -a /tmp/nix.log
 
-      # Proves the release archive path end to end: the tarball filename is
-      # exactly what .ngit/release.yaml publishes for this platform, and it
-      # unpacks to a working wyrd. Full `--rebuild` reproducibility is
-      # verified at change time (it rebuilds the whole Rust closure, too
-      # expensive for every CI run); see the distFor comment in flake.nix.
+      # Proves the release archive path end to end via the same script
+      # releases use (.ngit/scripts/build.sh): capability detection
+      # picks this runner's system, --ref pins the checkout commit
+      # instead of a tag, and --verify unpacks each tarball and runs
+      # its binary. Full `--rebuild` reproducibility is verified at
+      # change time (it rebuilds the whole Rust closure, too expensive
+      # for every CI run); see the distFor comment in flake.nix.
       - name: Release archive smoke test
         if: github.ref == 'refs/heads/master'
         run: |
@@ -269,20 +273,8 @@ jobs:
           set -o pipefail
           echo "===== archive smoke test =====" >> /tmp/nix.log
           {
-            nix build .#wyrd-dist --print-build-logs
-            # The built filename must be one of the version-expanded `file:`
-            # paths in .ngit/release.yaml (whose entries keep the literal
-            # {version} placeholder).
-            name=$(nix eval --raw .#wyrd-dist.name)
             version=$(nix eval --raw .#wyrd.version)
-            grep -o 'dist/[^ ]*' .ngit/release.yaml \
-              | sed "s/{version}/$version/" \
-              | grep -qxF "dist/$name"
-            rm -rf /tmp/wyrd-dist-smoke && mkdir -p /tmp/wyrd-dist-smoke
-            tar -xzf result -C /tmp/wyrd-dist-smoke
-            bin=$(echo /tmp/wyrd-dist-smoke/*/bin/wyrd)
-            test -x "$bin"
-            "$bin" --version
+            .ngit/scripts/build.sh "$version" --ref HEAD --verify
           } 2>&1 | tee -a /tmp/nix.log
 
       # Upload all logs — runs even when a step above failed, so you get the
@@ -339,7 +331,7 @@ jobs:
       # On `pull_request` failures only (job condition above): post a
       # truncated failure tail on the PR and return it to draft. The
       # shared reporter library holds the resolution, comment, and draft
-      # logic (see .ngit/act/lib/ngit.sh); missing logs are
+      # logic (see .ngit/scripts/ngit.sh); missing logs are
       # skipped, never fatal.
       - name: Report failure to PR and return to draft
         env:
@@ -348,7 +340,7 @@ jobs:
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
-          source .ngit/act/lib/ngit.sh
+          source .ngit/scripts/ngit.sh
           report_failure_to_pr \
             /tmp/logs/rust.log /tmp/logs/nix.log
 

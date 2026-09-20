@@ -1,22 +1,38 @@
 # Release manifest for `ngit release publish`: with this committed, a release
-# needs nothing but a version. Cutting one:
+# needs nothing but a version. Cutting one (the v0.1.0-alpha.1 lessons are
+# baked into the steps; CI discipline lives in
+# docs/collaboration-workflow.md):
 #
-#   1. Rename the `[Unreleased]` CHANGELOG section to the version; the notes
-#      below are extracted from that exact section.
-#   2. Tag the release commit `v<version>` (the version derives from the tag
-#      with one leading `v` stripped, so it must equal the Cargo version).
-#   3. Build the three local legs: `build <version>` in the devenv
-#      shell (macos-aarch64 native, macos-x86_64 via Rosetta,
-#      linux-aarch64 via remote builder; linux-x86_64 is skipped with
-#      no x86 builder here). Input is pinned to the release tag in a
-#      detached worktree, never the working copy.
-#   4. Trigger the dist workflow for the tag to build linux-x86_64
-#      natively in CI: `ngit ci trigger <coordinator> v<version>
-#      --workflow .ngit/act/workflows/dist.yml`. Fetch the tarball by
-#      its printed sha256 from any listed mirror into `dist/`, then
-#      re-run `build <version> --strict` for the completeness gate
-#      (ngit rejects partial platform coverage on the main channel).
-#   5. `ngit release publish <version>` with `--blossom-server` (or a
+#   1. Do the pre-tag compatibility read first: confirm the fail-closed and
+#      egress stories still hold (the codec refuses old formats loudly, the
+#      old binary still opens them, the keep-the-binary rule is documented).
+#      Tagging is the point of no return for user expectations.
+#   2. Rename the `[Unreleased]` CHANGELOG section to the version on a pr/
+#      branch (the notes below are extracted from that exact section);
+#      merge and push master.
+#   3. Tag the release commit `v<version>` and push the tag (the version
+#      derives from the tag with one leading `v` stripped, so it must equal
+#      the Cargo version). Pushing the tag fires dist.yml in CI
+#      automatically: do NOT trigger it by hand as well. There is no cancel
+#      (`ci stop` ends all CI), so check `ci status` before any manual
+#      trigger, and trigger only to retry a failed run.
+#   4. Build the three local legs with explicit systems plus the gate:
+#      `build <version> --strict aarch64-darwin x86_64-darwin aarch64-linux`
+#      in the devenv shell (native, Rosetta, remote builder). A bare
+#      `--strict` re-attempts linux-x86_64 locally and fails without an x86
+#      builder, so name the systems. Input is pinned to the release tag in
+#      a detached worktree, never the working copy. Re-running over dist/
+#      needs the read-only hash-prefixed files deleted first (until
+#      build.sh learns `cp -f`); `--verify` needs system FUSE on macOS or
+#      the just-built binary dies in dyld (exit 134), which is an
+#      environment gap, not a broken binary.
+#   5. Fetch the linux-x86_64 tarball by its printed sha256 from any listed
+#      mirror into `dist/` under its canonical name and verify the hash
+#      matches. CI uploads with an ephemeral key, so the hash comparison is
+#      the trust anchor: never skip it. The step-4 gate passing means every
+#      archive below is present (ngit rejects partial platform coverage on
+#      the main channel).
+#   6. `ngit release publish <version>` with `--blossom-server` (or a
 #      kind-10063 server list from the publisher), plus `--relay` as needed.
 #
 # The first publish also creates the `wyrd` application owned by the

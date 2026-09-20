@@ -174,16 +174,17 @@ unreadable to it (`trust.md` revocation boundary). The admission
 commit and its catch-up obligations land in one durable batch, so a
 crash cannot commit the former while losing the latter.
 
-Known boundary: catch-up spans epochs the invitation covers.
-Epoch-key delivery past the invitation epoch is circular under the
-current envelope rules (a wrap for N+1 must travel under envelope
-N+1, openable only with key N+1) and awaits the rotation-delivery
-decision — until then, post-invitation epochs stall loudly
-(retained, counted), never silently. The sender side mirrors this:
-an obligation the sender holds no sealing key for stays pending and
-observable via the pending projection instead of failing its whole
-pass, and reused sealed bytes are verified against their obligation
-before the send that would discharge them.
+Known boundary, resolved: catch-up used to span only epochs the
+invitation covers, because epoch-key delivery past the invitation was
+circular under the envelope rules (a wrap for N+1 sealed under
+envelope N+1, openable only with key N+1). Rotation delivery decides
+it (option 2, ECDH to the registered key, `trust.md`): post-invitation
+epochs converge through the rotation framing, and pre-key offers skip
+transiently (retained, counted) until the settling drain goes quiet.
+The sender side mirrors this: an obligation with nothing mintable
+stays pending and observable via the pending projection instead of
+failing its whole pass, and reused sealed bytes are verified against
+their obligation before the send that would discharge them.
 
 ## Conflicts
 

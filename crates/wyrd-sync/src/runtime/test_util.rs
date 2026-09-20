@@ -21,7 +21,9 @@ use wyrd_format::{
 };
 
 use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
-use crate::control::{seal, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload};
+use crate::control::{
+    seal, seal_rotation, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
+};
 use crate::keys::capability::Capability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, Builder};
@@ -337,6 +339,47 @@ pub(crate) fn admit_engine(builder: &mut Builder, device: DeviceId) -> Membershi
     })])
 }
 
+/// A rotation delivery for the engine device, sealed the way the
+/// delivery path does (ECDH to the registered key, carrying the
+/// transition bytes plus the wrapped capability) and mailed from the
+/// fixture sender.
+pub(crate) fn rotation_delivery(
+    fixture: &Fixture,
+    epoch: u64,
+    transition: &MembershipTransition,
+    wrapped: Vec<u8>,
+) -> MailboxEnvelope {
+    rotation_delivery_from(
+        &fixture.sender_sk,
+        fixture.recipient,
+        &encryption_key(&engine_encryption_sk()),
+        epoch,
+        transition,
+        wrapped,
+    )
+}
+
+/// A rotation delivery with full control over sender, recipient, and
+/// registered key (outsider and wrong-device scenarios).
+pub(crate) fn rotation_delivery_from(
+    sender: &DeviceIdentitySecret,
+    recipient: DeviceId,
+    encryption_key: &DeviceEncryptionKey,
+    epoch: u64,
+    transition: &MembershipTransition,
+    wrapped: Vec<u8>,
+) -> MailboxEnvelope {
+    let sealed = seal_rotation(
+        &member_drive(),
+        recipient,
+        encryption_key,
+        epoch,
+        &transition.canonical_bytes(),
+        &wrapped,
+    )
+    .expect("seals");
+    seal_for_recipient(sender, recipient, &sealed.encode()).expect("mails")
+}
 /// A capability delivering `secrets` (exactly `epoch` of them) to
 /// the engine device, sealed the way the intake tests do.
 pub(crate) fn capability_message(

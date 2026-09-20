@@ -1074,3 +1074,84 @@ fn announcement_outbox_round_trips_and_derives_pending() {
         "a never-queued pair is uncovered"
     );
 }
+
+/// A rotation-framed sealed fact commits when it names the
+/// obligation's epoch, and fails when it names another: the
+/// commit-time gate accepts either framing, with the recipient
+/// correlation left to send time where chain state is at hand.
+#[test]
+fn capability_sealed_accepts_rotation_framing() {
+    use crate::control::seal_rotation;
+
+    let (mut b, genesis) = Builder::genesis(10);
+    let child = b.child(vec![wyrd_format::Change::Rotate]);
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    log.observe(child.clone());
+    let state = log
+        .state_of(&child.transition_id())
+        .expect("child has state");
+    let key = state
+        .encryption_key_of(&owner())
+        .copied()
+        .expect("owner has a registered key");
+    let bytes = seal_rotation(
+        &drive(),
+        owner(),
+        &key,
+        2,
+        &child.canonical_bytes(),
+        &[0xCC; 64],
+    )
+    .unwrap()
+    .encode();
+    let dir = TestDir::new("capability-sealed-rotation");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store
+        .commit(&[Fact::CapabilitySealed(2, owner(), bytes.clone())])
+        .expect("matching epoch commits");
+    assert!(
+        matches!(
+            store.commit(&[Fact::CapabilitySealed(3, owner(), bytes.clone())]),
+            Err(DurableError::InvalidOutbox)
+        ),
+        "sealed for epoch 2, keyed at epoch 3"
+    );
+    assert!(
+        matches!(
+            store.commit(&[Fact::CapabilitySealed(2, owner(), vec![0xFF; 200])]),
+            Err(DurableError::InvalidOutbox)
+        ),
+        "neither framing decodes"
+    );
+    // The clear recipient is correlated too: a rotation delivery to
+    // someone else filed under this obligation fails here, durably,
+    // rather than lingering as a poisoned obligation until a send
+    // pass. (The stranger never registered; its key is a valid curve
+    // point the gate needs no secrets for.)
+    let stranger = DeviceId::from_bytes([0x0B; 32]);
+    let stranger_sk = secp256k1::SecretKey::from_slice(&[0x0C; 32]).expect("valid scalar");
+    let stranger_kp = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, &stranger_sk);
+    let stranger_key = wyrd_format::DeviceEncryptionKey::from_bytes(
+        secp256k1::XOnlyPublicKey::from_keypair(&stranger_kp)
+            .0
+            .serialize(),
+    );
+    let misfiled = seal_rotation(
+        &drive(),
+        stranger,
+        &stranger_key,
+        2,
+        &child.canonical_bytes(),
+        &[0xCC; 64],
+    )
+    .unwrap()
+    .encode();
+    assert!(
+        matches!(
+            store.commit(&[Fact::CapabilitySealed(2, owner(), misfiled)]),
+            Err(DurableError::InvalidOutbox)
+        ),
+        "sealed for a stranger, keyed at the owner"
+    );
+}

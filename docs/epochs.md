@@ -226,7 +226,20 @@ A **capability** delivered to a member of epoch N:
   AEAD is what actually authenticates the recipient. A capability cannot be
   transplanted or replayed across drives, epochs, or devices.
 - is delivered via the Nostr mailbox, so the owner can mint epoch N+1 and
-  wrap the new capability while the device is offline.
+  wrap the new capability while the device is offline. The first
+  delivery (the invitation) is ECDH-sealed to the invitee, since the
+  device holds no epoch key yet; every later delivery is a *rotation
+  delivery* (envelope version `0x01`, decided): ECDH to the
+  recipient's registered encryption key under a fresh ephemeral key,
+  carrying the wrapped capability plus the authorizing transition's
+  bytes, so one drain converges without the recipient holding the
+  epoch's control key. The ECDH seal proves nothing about the sender,
+  so intake admits a rotation delivery only from a member of the
+  authorizing state (the outer mailbox seal authenticates the sender
+  device); the transition's owner signature and the capability's
+  transition binding are verified on every path, and installation
+  stays monotonic and contiguous — secrets only extend the held
+  `1..=N` prefix, never skip and never overwrite;
 
 **Capability installation is monotonic:** installing a capability may only
 add secrets for epochs the device does not yet hold. It must never decrease
@@ -506,4 +519,9 @@ downgrade); replay after removal (no future secrets); capability containing
 a future epoch secret (invalid); capability containing the DriveRootKey
 (invalid by construction); missing historical epochs in a fresh member's
 capability (invalid — must be 1..=N); known epoch without held capability
-(authorization waits for keys, knowledge does not imply decryption).
+(authorization waits for keys, knowledge does not imply decryption);
+rotation delivery to a device holding ≤ N converges (grant installs,
+transition observes, retained epoch-sealed traffic opens on redelivery);
+rotation from a non-member sender is refused; rotation for another
+device is refused; out-of-order rotation converges on redelivery
+(contiguous install, no gaps, no volatile-only observations).

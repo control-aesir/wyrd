@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use wyrd_format::{MembershipTransition, SnapshotId};
+use wyrd_format::{DeviceId, MembershipTransition, SnapshotId};
 use zeroize::Zeroizing;
 
 use super::engine::{DrainReport, Engine, EngineError};
@@ -10,6 +10,7 @@ use crate::control::{
     verify_announcement, AnnouncementUpdate, ControlError, ControlMessageId, IngestReport, Message,
     SealedControl, SnapshotAnnouncement,
 };
+use crate::control::{RotationDelivery, RotationIngest, ROTATION_VERSION};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::ingest::{check_total_len, check_transition, Limits};
 use crate::keys::capability::{CapabilityError, WrappedCapability};
@@ -111,6 +112,14 @@ fn accept_envelope(
         Ok(bytes) => bytes,
         Err(_) => return Ok(Outcome::Discarded),
     };
+    // Rotation deliveries ride their own framing under a distinct
+    // version: dispatch on the version byte before either framing
+    // decodes, so neither framing can ever misparse the other (a
+    // rotation header's ephemeral bytes would otherwise land where the
+    // control envelope keeps its kind tag).
+    if bytes.first() == Some(&ROTATION_VERSION) {
+        return accept_rotation(engine, envelope, &bytes);
+    }
     match engine.inbox.ingest(&bytes) {
         // Only a missing epoch key can heal: the bytes are well-formed
         // for our drive and may become openable when the key arrives.
@@ -182,41 +191,15 @@ fn commit_action(
         staged.clear();
     }
     if matches!(message, Message::MembershipTransition(_)) {
-        // The flush walks the pending queue in arrival order (see
-        // `Engine::hold_pending`): staged announcement compatibility
-        // and the durable fact order are deterministic.
-        let taken = std::mem::take(&mut engine.pending);
-        let mut failed_at: Option<(usize, EngineError)> = None;
-        for (index, (pending_id, pending_message)) in taken.iter().enumerate() {
-            match message_action(engine, pending_id, pending_message, &mut staged) {
-                Ok(Action::Commit(more)) => facts.extend(more),
-                Ok(Action::Suppress) => {
-                    engine.inbox.suppress(pending_id);
-                }
-                Ok(Action::Defer) => {
-                    engine.hold_pending(*pending_id, pending_message.clone());
-                }
-                Err(error) => {
-                    failed_at = Some((index, error));
-                    break;
-                }
+        // A newly committed transition flushes volatile pending like
+        // every transition commit, whether the transition arrived
+        // epoch-sealed or carried by a rotation delivery.
+        match flush_pending(engine, &mut staged) {
+            Ok(more) => facts.extend(more),
+            Err(error) => {
+                let _ = engine.resync();
+                return Err(error);
             }
-        }
-        if let Some((index, error)) = failed_at {
-            // Restore the in-flight message and the unprocessed
-            // remainder in arrival order. Every id here is disjoint
-            // from the re-held ones (each id exists once), so
-            // hold_pending appends without clobbering. Suppressed and
-            // fact-consumed prefixes redeliver via the relay (never
-            // settled); the observations and verdicts they left behind
-            // go away with the resync below, which must run after the
-            // restore — resync rebuilds from durable facts and never
-            // touches the volatile queue.
-            for (id, message) in taken.into_iter().skip(index) {
-                engine.hold_pending(id, message);
-            }
-            let _ = engine.resync();
-            return Err(error);
         }
     }
     if facts.is_empty() {
@@ -226,26 +209,80 @@ fn commit_action(
         let _ = engine.resync();
         return Err(error.into());
     }
-    // The inbox mirrors durable seen-ness: ids committed durably are
-    // processed by definition and must never re-ingest. Ingest-time
-    // marking covers the normal flow, but a resync later in the same
-    // drain rebuilds the inbox from durable facts — without this,
-    // redelivery would report fresh and commit the same facts twice.
-    for fact in &facts {
+    note_committed_facts(engine, &facts);
+    // The projection follows the durable state, never leads it: staged
+    // announcements merge only after the fact batch committed.
+    for (snapshot, announcement) in std::mem::take(&mut staged) {
+        engine.announcements.insert(snapshot, announcement);
+    }
+    Ok(Outcome::Accepted)
+}
+
+/// Walk the volatile pending queue in arrival order (see
+/// `Engine::hold_pending`), re-driving every held message against the
+/// newly committed state: staged announcement compatibility and the
+/// durable fact order stay deterministic. Shared by the transition arm
+/// and the rotation path — a newly observed transition flushes pending
+/// no matter which framing carried it.
+///
+/// On failure the in-flight message and the unprocessed remainder are
+/// restored in arrival order (every id here is disjoint from the
+/// re-held ones, so `hold_pending` appends without clobbering) and the
+/// error returns for the caller to resync: suppressed and
+/// fact-consumed prefixes redeliver via the relay (never settled), and
+/// the observations and verdicts they left behind go away with the
+/// caller's resync, which must run after the restore — resync rebuilds
+/// from durable facts and never touches the volatile queue.
+fn flush_pending(
+    engine: &mut Engine,
+    staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
+) -> Result<Vec<Fact>, EngineError> {
+    let taken = std::mem::take(&mut engine.pending);
+    let mut facts = Vec::new();
+    let mut failed_at: Option<(usize, EngineError)> = None;
+    for (index, (pending_id, pending_message)) in taken.iter().enumerate() {
+        match message_action(engine, pending_id, pending_message, staged) {
+            Ok(Action::Commit(more)) => facts.extend(more),
+            Ok(Action::Suppress) => {
+                engine.inbox.suppress(pending_id);
+            }
+            Ok(Action::Defer) => {
+                engine.hold_pending(*pending_id, pending_message.clone());
+            }
+            Err(error) => {
+                failed_at = Some((index, error));
+                break;
+            }
+        }
+    }
+    if let Some((index, error)) = failed_at {
+        for (id, message) in taken.into_iter().skip(index) {
+            engine.hold_pending(id, message);
+        }
+        return Err(error);
+    }
+    Ok(facts)
+}
+
+/// Mirror a committed fact batch into the volatile engine state: the
+/// inbox remembers durably-seen ids (ingest-time marking covers the
+/// normal flow, but a resync later in the same drain rebuilds the inbox
+/// from durable facts — without this, redelivery would report fresh
+/// and commit the same facts twice), and newly authorized epoch
+/// material installs its control keys where none is held, so a device
+/// that just received epoch N's capability opens epoch-N control
+/// traffic on the next envelope instead of stalling it as skipped.
+/// Fill-vacant only, matching the keyring's first-wins install: a held
+/// key is never replaced behind the traffic sealed under it, and
+/// conflicting epoch secrets stay the keyring's fail-closed
+/// `EpochConflict`, not a silent key swap. The grant was authorized
+/// above; only decryption keys derive here, and every message they open
+/// is still independently verified.
+fn note_committed_facts(engine: &mut Engine, facts: &[Fact]) {
+    for fact in facts {
         if let Fact::ControlMessage(id) = fact {
             engine.inbox.remember(id);
         }
-        // Newly authorized epoch material installs its control keys
-        // where none is held: a device that just received epoch N's
-        // capability opens epoch-N control traffic on the next
-        // envelope instead of stalling it as skipped. Fill-vacant
-        // only, matching the keyring's first-wins install: a held key
-        // is never replaced behind the traffic sealed under it, and
-        // conflicting epoch secrets stay the keyring's
-        // fail-closed `EpochConflict`, not a silent key swap. The
-        // grant was authorized above; only decryption keys derive
-        // here, and every message they open is still independently
-        // verified.
         if let Fact::Capability(authorized) = fact {
             let drive = engine.drive;
             for (index, secret) in authorized.capability().secrets.iter().enumerate() {
@@ -256,12 +293,6 @@ fn commit_action(
             }
         }
     }
-    // The projection follows the durable state, never leads it: staged
-    // announcements merge only after the fact batch committed.
-    for (snapshot, announcement) in std::mem::take(&mut staged) {
-        engine.announcements.insert(snapshot, announcement);
-    }
-    Ok(Outcome::Accepted)
 }
 
 fn message_action(
@@ -406,9 +437,177 @@ fn sealed_id(bytes: &[u8]) -> Option<ControlMessageId> {
         .map(|sealed| sealed.message_id())
 }
 
+/// Accept a rotation delivery: epoch-key delivery for a device holding
+/// no later epoch secret. The dispatch in [`accept_envelope`] routes
+/// here on the version byte, after the outer mailbox seal opened — the
+/// sender below is therefore authenticated transport metadata, not a
+/// claim.
+///
+/// Sender authorization is single-predicate, because the ECDH seal
+/// proves nothing about the sender (anyone can seal to a public key):
+/// `rotation_commit` admits the delivery only from a member of the
+/// epoch it grants, and deliberately not from a member of the
+/// receiver's current tip — a delayed delivery from a since-removed
+/// member must still converge, so convergence never depends on
+/// arrival timing. A mint for an epoch the sender does not hold cannot
+/// bind the epoch's transition id — the id is unknowable without
+/// opening the epoch's traffic — and holders are already trusted with
+/// the secrets they hold, so member-sendership is exactly the epoch
+/// seal's old possession proof, restated.
+fn accept_rotation(
+    engine: &mut Engine,
+    envelope: &MailboxEnvelope,
+    bytes: &[u8],
+) -> Result<Outcome, EngineError> {
+    // No tip-based sender pre-check here, deliberately: a delivery
+    // authored by a member of epoch N may arrive after the receiver
+    // learns a later removal of that sender, and rejecting on the
+    // current tip would make convergence depend on arrival timing
+    // (discarding the only retained grant). Sender authorization
+    // belongs to `rotation_commit`, against the authorizing state —
+    // the single predicate that cannot mistime. Outsider spam pays
+    // one ECDH open before the authoritative check suppresses it,
+    // the same shape as any other poison.
+    let sender = envelope.sender;
+    match engine
+        .inbox
+        .ingest_rotation(bytes, &engine.encryption_secret)
+    {
+        // Decode, version, drive, and crypto failures are terminal: the
+        // bytes can never become a processable delivery. Consume
+        // without a fact so poison cannot accumulate in the relay.
+        Err(_) => Ok(Outcome::Discarded),
+        // Rotation deliveries never enter the volatile pending queue
+        // (unprocessable ones skip for relay redelivery instead), so a
+        // duplicate has nothing to re-drive.
+        Ok(RotationIngest::Duplicate) => Ok(Outcome::Duplicate),
+        Ok(RotationIngest::Accepted { id, delivery }) => {
+            rotation_commit(engine, &id, sender, &delivery)
+        }
+    }
+}
+
+/// Commit an opened rotation delivery: unwrap, verify every binding,
+/// observe the carried transition, authorize the capability, and commit
+/// the transition, the grant, and the delivery id atomically — then
+/// flush volatile pending and fill control keys like any commit.
+/// Almost every failure below is deterministic-invalid (wrong device,
+/// unopenable wrap, binding mismatch, terminal history, non-member
+/// sender): suppress memory-only, never defer. The two healable cases
+/// skip for relay redelivery instead: an unobserved ancestry gap
+/// (the history may still arrive) and a missing tip (the log may still
+/// advance). Post-commit failures resync like every other commit path.
+fn rotation_commit(
+    engine: &mut Engine,
+    id: &ControlMessageId,
+    sender: DeviceId,
+    delivery: &RotationDelivery,
+) -> Result<Outcome, EngineError> {
+    let suppress = |engine: &mut Engine| {
+        engine.inbox.suppress(id);
+        Ok(Outcome::Accepted)
+    };
+    // Not for us: the mailbox routes by recipient, so a mismatch is a
+    // broken sender — terminal, never healed by redelivery.
+    if delivery.device != engine.device {
+        return suppress(engine);
+    }
+    let capability = match WrappedCapability::from_bytes(delivery.wrapped.clone())
+        .unwrap(&engine.encryption_secret)
+    {
+        Ok(capability) => capability,
+        Err(_) => return suppress(engine),
+    };
+    // Redundant-field agreement, mirrored from the capability arm: the
+    // delivery metadata and the capability it carries must name this
+    // device and epoch. Anyone can seal to our public key, so the wrap
+    // alone cannot prove address — the check happens here, before
+    // anything commits, and a mismatch never heals by deferring.
+    if capability.device != engine.device || delivery.epoch != capability.covered_epoch() {
+        return suppress(engine);
+    }
+    let transition = match MembershipTransition::from_canonical_bytes(&delivery.transition) {
+        Ok(transition) => transition,
+        Err(_) => return suppress(engine),
+    };
+    // The carried transition must be the capability's own binding, at
+    // the delivery's epoch, within ingest limits — a transition for
+    // another epoch or binding paired with this wrap is tampering or a
+    // broken sender, never a gap that fills.
+    if transition.transition_id() != capability.transition
+        || transition.epoch != delivery.epoch
+        || check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err()
+        || check_transition(&Limits::V0, &transition).is_err()
+    {
+        return suppress(engine);
+    }
+    let transition_id = transition.transition_id();
+    // Authorize against a scratch observation: the live log stays
+    // pristine until commit, so a skip leaves no volatile-only
+    // observation behind — volatile matches durable on every path,
+    // and a redelivery revalidates against the same baseline. The
+    // scratch set equals the live set plus this transition, and
+    // nothing mutates the live log between the clone and the real
+    // observe below, so the verdicts transfer exactly.
+    let mut scratch = engine.log.clone();
+    scratch.observe(transition.clone());
+    let authorized =
+        match AuthorizedCapability::authorize(capability, engine.drive(), &scratch, &transition_id)
+        {
+            Ok(authorized) => authorized,
+            // The ancestry gap may still fill (out-of-order rotation
+            // converges on redelivery): forget the ingest marking so the
+            // retained envelope ingests fresh instead of reporting a false
+            // duplicate, and leave it to the relay.
+            Err(CapabilityError::UnknownTransition(_)) => {
+                engine.inbox.forget(id);
+                return Ok(Outcome::Skipped);
+            }
+            Err(_) => return suppress(engine),
+        };
+    // Sender-member, against the authorizing state (not the tip): the
+    // delivery is authorized only from a member of the epoch it grants.
+    // A former member removed by this very history cannot speak its
+    // secrets; the owner never leaves the member set short of the
+    // terminal state, so genuine senders always pass.
+    match scratch.members_of(&transition_id) {
+        Some(members) if members.contains(&sender) => {}
+        Some(_) => return suppress(engine),
+        // Observed a moment ago, but the fresh analysis derives no
+        // state for it: the same internal disagreement the
+        // announcement arm fails loudly on, not sender data.
+        None => return Err(EngineError::TransitionUnclassified(transition_id)),
+    }
+    engine.log.observe(transition.clone());
+    let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
+    let mut facts = vec![
+        Fact::Transition(transition),
+        Fact::Capability(authorized),
+        Fact::ControlMessage(*id),
+    ];
+    match flush_pending(engine, &mut staged) {
+        Ok(more) => facts.extend(more),
+        Err(error) => {
+            let _ = engine.resync();
+            return Err(error);
+        }
+    }
+    if let Err(error) = engine.commit_facts(&facts) {
+        let _ = engine.resync();
+        return Err(error.into());
+    }
+    note_committed_facts(engine, &facts);
+    // Staged announcements merge only after the fact batch committed,
+    // mirroring the projection discipline of the control path.
+    for (snapshot, announcement) in std::mem::take(&mut staged) {
+        engine.announcements.insert(snapshot, announcement);
+    }
+    Ok(Outcome::Accepted)
+}
+
 // Intake behavior tests live beside the drain pipeline, one file per
 // theme: the commit pipeline, capability validation, announcement
-// binding, and backpressure/commit recovery.
+// binding, rotation delivery, and backpressure/commit recovery.
 #[cfg(test)]
 mod tests_announcement;
 #[cfg(test)]
@@ -419,3 +618,5 @@ mod tests_harness;
 mod tests_pipeline;
 #[cfg(test)]
 mod tests_resilience;
+#[cfg(test)]
+mod tests_rotation;

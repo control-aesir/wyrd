@@ -7,8 +7,8 @@ use crate::control::seal;
 use crate::durable::Fact;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
-    announcement_for, announcement_msg, capability_message_for, control_key, deliver, drain,
-    fixture, identity, queue, transition_message, MemoryMailbox,
+    announcement_for, announcement_msg, control_key, deliver, drain, fixture, identity, queue,
+    transition_message, MemoryMailbox,
 };
 
 /// Drains a two-transition world (genesis plus one rotation) into
@@ -80,55 +80,6 @@ fn delivery_refuses_transition_sealed_bytes_for_another_id() {
     assert_eq!(
         loaded.transition_queued,
         vec![(genesis_id, recipient)],
-        "the obligation stays pending"
-    );
-}
-
-/// A sealed capability fact naming the wrong recipient fails
-/// closed: the opened grant must match the obligated pair before
-/// the send discharges it.
-#[test]
-fn delivery_refuses_capability_sealed_bytes_for_another_recipient() {
-    let (mut fx, child) = two_transition_world();
-    let other_sk = DeviceEncryptionSecret::from_bytes([0xE4; 32]).unwrap();
-    let (_, other) = identity(0x04);
-    let recipient = identity(0x03).1;
-    // A well-formed grant to someone else, sealed under epoch 2 so
-    // the commit-time epoch gate passes and only the pair check
-    // can catch it.
-    let granted = capability_message_for(
-        &other_sk,
-        other,
-        child.transition_id(),
-        2,
-        vec![secret(0xAA), secret(0xBB)],
-    );
-    let bytes = seal(&control_key(2), &member_drive(), 2, &granted)
-        .unwrap()
-        .encode();
-    fx.engine
-        .commit_facts(&[
-            Fact::CapabilitySealed(2, recipient, bytes),
-            Fact::CapabilityQueued(2, recipient),
-        ])
-        .unwrap();
-    let mut mailbox = MemoryMailbox {
-        relay: &mut fx.relay,
-        owner: fx.recipient,
-    };
-    let err = fx.engine.deliver_pending(&mut mailbox).unwrap_err();
-    assert!(
-        matches!(err, EngineError::SealedOutboxMismatch(_)),
-        "unexpected: {err:?}"
-    );
-    let loaded = fx.engine.store.load().unwrap();
-    assert!(
-        loaded.capability_delivered.is_empty(),
-        "a mismatched fact discharges nothing"
-    );
-    assert_eq!(
-        loaded.capability_queued,
-        vec![(2, recipient)],
         "the obligation stays pending"
     );
 }
@@ -271,38 +222,101 @@ fn delivery_skips_obligations_without_a_sealing_key_and_sends_the_rest() {
     );
 }
 
-/// A capability obligation without a sealing key stays pending
-/// instead of failing the pass: the sealed pair still sends, and
-/// the keyless pair remains observable via the pending projection.
+/// A rotation obligation without a mintable wrap stays pending
+/// instead of failing the pass, while a sealed one sends: the pair
+/// for a device the epoch's state never registered cannot mint (no
+/// registered key, no wrap), and the sealed pair resends byte-identical
+/// bytes across passes.
 #[test]
 fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
+    use crate::control::{seal_rotation, SealedRotation};
+    use crate::keys::capability::Capability;
+    use crate::runtime::test_util::{identity_secret, owner};
+    use crate::transport::mailbox::{
+        open_from_sender, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    };
+
+    /// A mailbox whose sends fail: the seal commits, the delivery
+    /// does not — the next pass must resend the identical bytes.
+    struct FailSend;
+    impl Mailbox for FailSend {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            Err(MailboxError::Transport("injected send failure".into()))
+        }
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Ok(None)
+        }
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
     let (mut fx, child) = two_transition_world();
-    // Epoch 2 becomes unsealable: no held key and no keyring
-    // secret, so the fresh seal cannot even mint its wrap.
-    fx.engine.epoch_keys.remove(&2);
-    let sealable = identity(0x03).1;
-    let keyless = identity(0x04).1;
     let child_id = child.transition_id();
-    let genesis_id = fx
-        .engine
-        .log
-        .transition(&child_id)
-        .and_then(|t| t.prev)
-        .expect("genesis linked");
-    // A well-formed epoch-1 grant to `sealable`, sealed under the
-    // epoch-1 key the fixture still holds.
-    let wrap_sk = DeviceEncryptionSecret::from_bytes([0xE4; 32]).unwrap();
-    let granted = capability_message_for(&wrap_sk, sealable, genesis_id, 1, vec![secret(0xAA)]);
-    let bytes = seal(&control_key(1), &member_drive(), 1, &granted)
-        .unwrap()
-        .encode();
+    let (owner_sk, member) = owner();
+    let state = fx.engine.log.state_of(&child_id).expect("child is valid");
+    assert!(
+        state.members.contains(&member),
+        "the world owner is the delivery member"
+    );
+    let registration = state
+        .encryption_key_of(&member)
+        .copied()
+        .expect("member has a registered key");
+    // A pre-sealed rotation delivery to the world member. The sender
+    // holds no secrets for it — reuse header-correlates, never
+    // re-opens — so the wrap carries placeholder secrets.
+    let wrap = Capability::mint(
+        member_drive(),
+        member,
+        &state,
+        &child,
+        vec![secret(0xAA), secret(0xBB)],
+    )
+    .expect("member is a member")
+    .wrap()
+    .expect("wraps")
+    .as_bytes()
+    .to_vec();
+    let sealed = seal_rotation(
+        &member_drive(),
+        member,
+        &registration,
+        2,
+        &child.canonical_bytes(),
+        &wrap,
+    )
+    .expect("seals")
+    .encode();
+    let keyless = identity(0x04).1;
     fx.engine
         .commit_facts(&[
-            Fact::CapabilitySealed(1, sealable, bytes),
-            Fact::CapabilityQueued(1, sealable),
+            Fact::CapabilitySealed(2, member, sealed.clone()),
+            Fact::CapabilityQueued(2, member),
             Fact::CapabilityQueued(2, keyless),
         ])
         .unwrap();
+
+    // Pass one: the send fails after the seal commits. The obligation
+    // stays pending with sealed bytes on file.
+    let mut failing = FailSend;
+    let err = fx.engine.deliver_pending(&mut failing).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Mailbox(_)),
+        "transport failure surfaces, does not poison: {err:?}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "a failed send discharges nothing"
+    );
+
+    // Pass two: the sealed pair resends the identical bytes while the
+    // registration-less pair stays pending.
     let mut mailbox = MemoryMailbox {
         relay: &mut fx.relay,
         owner: fx.recipient,
@@ -312,14 +326,27 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
     let loaded = fx.engine.store.load().unwrap();
     assert_eq!(
         loaded.capability_delivered,
-        vec![(1, sealable)],
+        vec![(2, member)],
         "exactly the sealed pair discharges"
     );
     assert_eq!(
         fx.engine.runtime_state().unwrap().pending_capabilities(),
         vec![(2, keyless)],
-        "the keyless obligation stays pending"
+        "the registration-less obligation stays pending"
     );
+    // Byte-identity across the failure: the resent delivery is the
+    // sealed fact, not a fresh mint.
+    let mut receiver = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: member,
+    };
+    let delivery = receiver
+        .recv()
+        .unwrap()
+        .expect("the sent envelope is retained");
+    let inner = open_from_sender(&identity_secret(&owner_sk), member, delivery.envelope()).unwrap();
+    let resent = SealedRotation::decode(&inner).expect("rotation framed");
+    assert_eq!(resent.encode(), sealed, "retries resend identical bytes");
 }
 
 /// An announcement obligation without a sealing key stays pending

@@ -6,10 +6,12 @@
 //! where it converges: the pusher is transport, never authority.
 //!
 //! Cross-epoch catch-up (admitted at N, converging past N+1 while
-//! offline) is a documented boundary, not a contract here: epoch-key
-//! delivery for epochs past the invitation needs the rotation-delivery
-//! design, so contract 21 pins the contiguous queue plus the loud
-//! stall instead of convergence it cannot honestly promise.
+//! offline) converges through rotation delivery: the ECDH-framed
+//! capability lands the missing epoch secrets, the carried transition
+//! advances the log, and retained epoch-sealed traffic opens on
+//! redelivery. Contract 21 pins that convergence; the relay promises
+//! retention, not order, so a pre-key offer still skips transiently
+//! before the settling drain goes quiet.
 
 use wyrd_format::membership::Admission;
 use wyrd_format::{Change, MembershipTransition};
@@ -171,8 +173,9 @@ fn invited_device_converges_on_ordered_catch_up() {
     assert_eq!(joined.pending_count(), 0, "nothing held");
 }
 
-/// Reversed catch-up converges: the capability holds for its
-/// transition, then the transition flushes it in the same pass.
+/// Reversed catch-up converges identically: the rotation delivery
+/// carries its own transition, so arrival order is irrelevant — the
+/// grant commits with the history it needs attached.
 #[test]
 fn invited_device_converges_on_reversed_catch_up() {
     let mut owner = owner();
@@ -184,14 +187,10 @@ fn invited_device_converges_on_reversed_catch_up() {
 
     let mut relay = newcomer_relay(reversed);
     let report = joined.drain(&mut relay).unwrap();
+    assert_eq!(report.accepted, 2);
     assert_eq!(report.skipped, 0);
-    assert_eq!(joined.pending_count(), 0, "held capability flushed");
-    // The held wrap was retained for redelivery, which collapses to
-    // exactly one duplicate: convergence committed once, observes
-    // twice.
-    let report = joined.drain(&mut relay).unwrap();
-    assert_eq!(report.accepted, 0);
-    assert_eq!(report.duplicates, 1);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(joined.pending_count(), 0, "nothing held");
 }
 
 /// Duplicated catch-up converges: redelivery is dedupe, not state.
@@ -216,9 +215,11 @@ fn invited_device_converges_on_duplicated_catch_up() {
     assert_eq!(joined.pending_count(), 0, "nothing held");
 }
 
-/// A missing intermediate delivery heals on redelivery: the
-/// capability holds while its transition is unseen, then the
-/// transition resolves it with nothing lost.
+/// A missing transition does not block the rotation: the delivery
+/// carries the transition it needs, so the grant commits while the
+/// epoch-sealed transition is still in flight — and the late
+/// transition commits redundantly, which the set-based machines
+/// absorb.
 #[test]
 fn invited_device_converges_after_gap_then_redelivery() {
     let mut owner = owner();
@@ -227,25 +228,30 @@ fn invited_device_converges_after_gap_then_redelivery() {
     let (mut joined, envelopes) = admit_and_collect(&mut owner, &newcomer, &mut outbox);
     assert_eq!(envelopes.len(), 2);
 
-    // The wrap first: its transition is unobserved, so it holds.
+    // The rotation first, its transition unseen: self-contained, so
+    // it commits without holding.
     let mut relay = newcomer_relay(vec![envelopes[1].clone()]);
     let report = joined.drain(&mut relay).unwrap();
-    assert_eq!(report.deferred, 1);
-    assert_eq!(joined.pending_count(), 1);
+    assert_eq!(report.accepted, 1);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(joined.pending_count(), 0, "nothing held");
 
-    // The transition lands later: both commit, nothing held.
+    // The transition lands later: redundant commit, nothing lost.
     let mut relay = newcomer_relay(vec![envelopes[0].clone()]);
     let report = joined.drain(&mut relay).unwrap();
+    assert_eq!(report.accepted, 1);
     assert_eq!(report.skipped, 0);
     assert_eq!(joined.pending_count(), 0, "gap healed");
 }
 
-/// An offline device's catch-up accumulates contiguously while it is
-/// away — and epochs past its invitation stall loudly, not silently.
-/// B is admitted (epoch 2) and stays offline while C is admitted
-/// (epoch 3): the owner's queue holds B's contiguous 2..3 sequence,
-/// B converges through epoch 2 on drain, and the epoch-3 envelopes it
-/// cannot yet open stay retained instead of poisoning anything.
+/// An offline device converges past its invitation through rotation
+/// delivery. B is admitted (epoch 2) and stays offline while C is
+/// admitted (epoch 3): the owner's queue holds B's contiguous 2..3
+/// sequence, and B converges fully — the rotation lands epoch 3's
+/// secrets with its transition attached, and the epoch-sealed epoch-3
+/// transition retained from before the keys landed opens on redelivery.
+/// The relay promises retention, not order, so the pre-key offer still
+/// skips transiently; the settling drain goes quiet.
 #[test]
 fn offline_device_catch_up_accumulates_contiguously() {
     let mut owner = owner();
@@ -295,19 +301,32 @@ fn offline_device_catch_up_accumulates_contiguously() {
     .unwrap();
     let mut relay = newcomer_relay(envelopes);
     let report = joined.drain(&mut relay).unwrap();
-    // Epoch 2 commits; epoch 3 has no key yet, so its envelopes stay
-    // retained for redelivery once rotation delivery lands them a key.
-    assert_eq!(report.accepted, 2, "admission epoch converges");
-    assert_eq!(report.skipped, 2, "post-invitation epochs stall loudly");
+    // Epoch 2 commits; epoch 3 converges through its rotation — the
+    // epoch-sealed epoch-3 offer from before the keys landed skips
+    // transiently, then opens on redelivery once rotation installs
+    // the key.
+    assert_eq!(report.accepted, 3, "admission epoch plus rotation converge");
+    assert_eq!(report.skipped, 1, "pre-key offer retained, not lost");
     assert_eq!(joined.pending_count(), 0, "nothing held");
+    // The retained transition opens under the rotation-installed key:
+    // opening it is the public proof the epoch-3 secret landed.
+    let report = joined.drain(&mut relay).unwrap();
+    assert_eq!(report.accepted, 1);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(joined.pending_count(), 0, "nothing held");
+    // Settled: the third drain goes quiet.
+    let report = joined.drain(&mut relay).unwrap();
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.duplicates, 0);
 }
 
 /// Delivery fans out to several newcomers from one pass: the shared
 /// transition bytes serve every recipient under per-recipient outer
-/// seals, and each per-pair capability wrap opens only for its own
-/// device. B (admitted at 2) converges through epoch 2 and stalls
-/// loudly past its invitation; C (admitted at 3, holding 1..=3)
-/// converges fully from the same pass.
+/// seals, and each per-pair rotation opens only for its own
+/// device. B (admitted at 2) converges past its invitation through
+/// rotation; C (admitted at 3, holding 1..=3) converges fully from the
+/// same pass.
 #[test]
 fn two_newcomers_converge_from_one_delivery_pass() {
     let mut owner = owner();
@@ -368,8 +387,19 @@ fn two_newcomers_converge_from_one_delivery_pass() {
     .unwrap();
     let mut relay_b = newcomer_relay(b_envelopes);
     let report_b = joined_b.drain(&mut relay_b).unwrap();
-    assert_eq!(report_b.accepted, 2, "B converges through epoch 2");
-    assert_eq!(report_b.skipped, 2, "B stalls past its invitation");
+    assert_eq!(
+        report_b.accepted, 3,
+        "B converges through epoch 2 plus rotation"
+    );
+    assert_eq!(report_b.skipped, 1, "pre-key offer retained, not lost");
+    // The retained epoch-3 transition opens under the
+    // rotation-installed key; then the drain goes quiet.
+    let report_b = joined_b.drain(&mut relay_b).unwrap();
+    assert_eq!(report_b.accepted, 1);
+    assert_eq!(report_b.skipped, 0);
+    let report_b = joined_b.drain(&mut relay_b).unwrap();
+    assert_eq!(report_b.accepted, 0);
+    assert_eq!(report_b.skipped, 0);
 
     let mut joined_c = Engine::accept_invitation(
         scratch_dir("join-fanout-c"),

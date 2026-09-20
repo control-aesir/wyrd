@@ -143,9 +143,9 @@ pub enum EngineError {
     OwnerMismatch,
     #[error("bootstrap invitation failed to open: {0}")]
     Invitation(#[from] crate::control::ControlError),
-    #[error("bootstrap invitation is addressed to another device")]
+    #[error("bootstrap invitation and its capability disagree on the recipient")]
     InvitationMismatch,
-    #[error("invitation genesis is undecodable or not an epoch-1 root")]
+    #[error("invitation genesis is missing, undecodable, or not a valid epoch-1 root")]
     BadGenesis,
     #[error("authored manifest failed canonical construction: {0}")]
     InvalidManifest(#[from] wyrd_format::ManifestError),

@@ -46,7 +46,7 @@ use crate::keys::keystore::{
 use crate::keys::{
     escrow, random_bytes, DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey, EpochSecret,
 };
-use crate::membership::sign_transition;
+use crate::membership::{sign_transition, Authorizable, MembershipLog};
 
 /// The custody record file inside a drive directory.
 const KEYSTORE_FILE: &str = "keystore";
@@ -206,6 +206,20 @@ pub(super) fn accept_invitation(
     if genesis.epoch != 1 || genesis.prev.is_some() {
         return Err(EngineError::BadGenesis);
     }
+    // The envelope signature covers arbitrary bytes: a validly signed
+    // invitation can still carry an invalid transition. Observe the
+    // candidate in a temporary log and require a valid authoritative
+    // genesis — signature, drive binding, roots, owner/member state —
+    // before committing anything. A buggy or malicious inviter must
+    // not produce an engine with no canonical state.
+    let mut candidate = MembershipLog::new(invitation.drive);
+    let genesis_id = candidate.observe(genesis.clone());
+    if !matches!(
+        candidate.authoritative(&genesis_id),
+        Some(Authorizable::Valid(..))
+    ) {
+        return Err(EngineError::BadGenesis);
+    }
     // Fail before touching disk when the invitation's capability names
     // another device: the seal is addressed to us but the grant inside
     // is not ours. The unwrap also proves the encryption secret opens
@@ -214,6 +228,20 @@ pub(super) fn accept_invitation(
         .unwrap(&encryption)
         .map_err(EngineError::Crypto)?;
     if capability.device != device {
+        return Err(EngineError::InvitationMismatch);
+    }
+    // The wrap is ECDH-bound to our secret, but the grant names its
+    // own drive and registration: refuse a structurally valid
+    // capability for another drive before its secrets become our
+    // control keys. The encryption-key half is pinned independently by
+    // both the seal's header check and the wrap's AAD — the explicit
+    // comparison backstops future crypto refactors. The transition
+    // binding is deliberately unchecked here: the grant may bind the
+    // admission transition rather than the genesis, and it authorizes
+    // through intake once the catch-up set lands, never at accept.
+    if capability.drive != invitation.drive
+        || capability.encryption_key != invitation.encryption_key
+    {
         return Err(EngineError::InvitationMismatch);
     }
 
@@ -591,5 +619,144 @@ mod tests {
             ),
             Err(EngineError::InvitationMismatch)
         ));
+    }
+
+    #[test]
+    fn accept_invitation_with_invalid_genesis_is_refused_before_disk() {
+        let dir = TestDir::new("accept-invitation-tampered");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        let invitee_id = device_id(&invitee);
+        let invitee_key = encryption_key(&invitee_encryption);
+        let epoch = EpochSecret::generate().unwrap();
+
+        // A well-formed but invalid genesis: correctly signed by the
+        // owner, undecodable roots. The envelope signature covers
+        // arbitrary bytes, so this opens — validation must still refuse
+        // it.
+        let mut bad = MembershipTransition::new(
+            1,
+            None,
+            Vec::new(),
+            vec![Change::Admit(Admission {
+                device: device_id(&owner),
+                encryption_key: encryption_key(&owner_encryption),
+            })],
+            [0xFF; 32],
+            [0xFF; 32],
+            device_id(&owner),
+        )
+        .unwrap();
+        sign_transition(&mut bad, &owner.secret_key(), &drive);
+        let genesis_id = genesis_transition(drive, &owner, &owner_encryption)
+            .unwrap()
+            .transition_id();
+        let capability = Capability::new(
+            drive,
+            invitee_id,
+            invitee_key,
+            genesis_id,
+            1,
+            vec![epoch.clone()],
+        )
+        .unwrap();
+        let sealed = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            &bad.canonical_bytes(),
+            capability.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee.clone(),
+                invitee_encryption.clone(),
+                &sealed
+            ),
+            Err(EngineError::BadGenesis)
+        ));
+
+        // Undecodable genesis bytes fail the same gate.
+        let sealed_garbage = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            b"not a transition",
+            capability.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee,
+                invitee_encryption,
+                &sealed_garbage
+            ),
+            Err(EngineError::BadGenesis)
+        ));
+        assert!(
+            !dir.path.join("DRIVE").exists(),
+            "invalid invitations never touch disk"
+        );
+    }
+
+    #[test]
+    fn accept_invitation_with_foreign_capability_is_refused() {
+        let dir = TestDir::new("accept-invitation-foreign");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        let genesis = genesis_transition(drive, &owner, &owner_encryption).unwrap();
+        let invitee_id = device_id(&invitee);
+        let invitee_key = encryption_key(&invitee_encryption);
+        let epoch = EpochSecret::generate().unwrap();
+
+        // A structurally valid grant for another drive: it unwraps
+        // under our secret (ECDH binds the recipient, not the drive),
+        // so only the explicit drive cross-check refuses it before its
+        // secrets become our control keys.
+        let foreign = Capability::new(
+            drive_id(),
+            invitee_id,
+            invitee_key,
+            genesis.transition_id(),
+            1,
+            vec![epoch],
+        )
+        .unwrap();
+        let sealed = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            &genesis.canonical_bytes(),
+            foreign.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee,
+                invitee_encryption,
+                &sealed
+            ),
+            Err(EngineError::InvitationMismatch)
+        ));
+        assert!(
+            !dir.path.join("DRIVE").exists(),
+            "foreign grants never touch disk"
+        );
     }
 }

@@ -12,9 +12,10 @@
 # partial platform coverage on the main channel. `--ref` pins the input
 # worktree to a git ref instead of the default `v<version>` tag (CI uses
 # HEAD); `--verify` unpacks each built tarball and runs its binary
-# (binaries whose linked system libraries are absent get a structure check
-# and a warning instead: a missing macFUSE is an environment gap, not a
-# broken binary).
+# (when the sole missing system library is the documented macFUSE
+# prerequisite, the binary gets a structure check and a warning instead:
+# a missing macFUSE is an environment gap, not a broken binary. Any other
+# missing linkage fails the run).
 # Input is always a detached worktree, never the working copy, so a
 # dirty tree cannot bake into a release tarball.
 set -euo pipefail
@@ -159,39 +160,43 @@ if [ "$VERIFY" = true ]; then
     # not a broken binary. Check linkage after the structure check above and
     # run only when every linked library is present.
     if [ "$(uname -s)" = Darwin ]; then
-      # Read every linkage line: stopping early would SIGPIPE otool and trip
-      # pipefail, so the loop consumes all input and remembers the first gap.
+      # Collect every missing linkage: stopping early would SIGPIPE otool and
+      # trip pipefail, so the loop consumes all input. The exemption below
+      # applies only when the complete missing set is macFUSE — a FUSE gap
+      # must never mask another unresolved dependency.
       # /usr/lib and /System residents resolve via the dyld shared cache and
       # have no on-disk file to test: only third-party paths (macFUSE in
       # /usr/local/lib) get the existence check.
-      MISSING_LIB=""
+      MISSING_LIBS=()
       while read -r lib; do
-        if [ ! -e "$lib" ] && [ -z "$MISSING_LIB" ]; then MISSING_LIB="$lib"; fi
+        [ -e "$lib" ] || MISSING_LIBS+=("$lib")
       # shellcheck disable=SC2016: awk program, not shell expansion.
       done < <(otool -L "$BIN" | awk '$1 ~ /\.dylib/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}')
-      if [ -n "$MISSING_LIB" ]; then
+      if [ -n "${MISSING_LIBS[*]:-}" ]; then
         # Narrow exemption: only the known macFUSE runtime may be absent
         # (macFUSE is a documented user prerequisite, not part of the
         # archive). Any other unresolved dependency — a linker regression,
         # a broken release, or an @rpath token this check cannot resolve —
         # fails loudly instead of passing verify with a warning.
-        case "$MISSING_LIB" in
-          @*)
-            echo "error: $FILE links $MISSING_LIB, which this check cannot resolve; refusing to skip verification" >&2
-            exit 1
-            ;;
-        esac
-        case "$(basename "$MISSING_LIB")" in
-          libfuse*.dylib | libosxfuse*.dylib)
-            echo "warning: $FILE not executed (missing system library $MISSING_LIB); structure checked only" >&2
-            rm -rf "$CHECK"
-            continue
-            ;;
-          *)
-            echo "error: $FILE links missing library $MISSING_LIB; refusing to skip verification" >&2
-            exit 1
-            ;;
-        esac
+        NON_FUSE=()
+        for lib in ${MISSING_LIBS[@]+"${MISSING_LIBS[@]}"}; do
+          case "$lib" in
+            @*) NON_FUSE+=("$lib") ;;
+            *)
+              case "$(basename "$lib")" in
+                libfuse*.dylib | libosxfuse*.dylib) ;;
+                *) NON_FUSE+=("$lib") ;;
+              esac
+              ;;
+          esac
+        done
+        if [ -z "${NON_FUSE[*]:-}" ]; then
+          echo "warning: $FILE not executed (missing system libraries: ${MISSING_LIBS[*]}); structure checked only" >&2
+          rm -rf "$CHECK"
+          continue
+        fi
+        echo "error: $FILE links missing libraries: ${NON_FUSE[*]}; refusing to skip verification" >&2
+        exit 1
       fi
     fi
     "$BIN" --version

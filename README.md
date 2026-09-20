@@ -178,3 +178,42 @@ Prebuilt `wyrd-{version}-{platform}.tar.gz` archives ship with each ngit
 release (built reproducibly per platform via `nix build .#wyrd-dist`). Alpha caveat: the on-disk format, the trust protocol, and the CLI
 can all change between alphas — `CHANGELOG.md` leads with the format
 version so you can tell whether two builds interoperate.
+
+### Running the alpha release
+
+Each archive holds one binary, `bin/wyrd`. It does two things: create a
+drive, and mount one.
+
+```bash
+# 1. Credentials: an identity secret (32 raw bytes or 64 hex chars) and a
+#    passphrase (UTF-8 text). Both must be regular files owned by you with
+#    private permissions; the binary refuses anything else.
+printf 'my-passphrase' > passphrase.txt && chmod 600 passphrase.txt
+head -c 32 /dev/urandom > identity.bin && chmod 600 identity.bin
+
+# 2. Create a drive: identity, root custody, genesis membership.
+wyrd init ./mydrive --identity-file ./identity.bin --passphrase-file ./passphrase.txt
+
+# 3. Mount a live read-write projection of it.
+mkdir -p ./mnt
+wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./passphrase.txt
+# Stop with Ctrl-C (SIGINT/SIGTERM shuts down cleanly: flush, unmount, exit).
+```
+
+Mounting needs system FUSE (macFUSE on macOS, libfuse on Linux — see the
+macFUSE notes above). `--relay <url>` (repeatable) connects the
+control-plane mailbox so the daemon syncs; without relays intake stays
+idle and the drive is local-only. `--verbose` turns on FUSE request
+diagnostics when a mount misbehaves.
+
+What this alpha is: a local encrypted drive you can create, mount, read,
+and write, with demand-driven fetch (opening non-local content blocks
+bounded, then surfaces `EIO` on expiry) and a serving endpoint other
+peers can fetch from.
+
+What it is not: peer sync is not hardened (signer-session wiring and
+multi-relay supervision are still open), there is no garbage collection
+(the store grows forever), writes are whole-file (append/truncate flags
+are refused), there is no export command and no auto-update, and drives
+created by one alpha may not open under the next. Bugs go to the
+repository's ngit issues.

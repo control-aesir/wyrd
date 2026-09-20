@@ -20,6 +20,21 @@ version say exactly what changed.
 
 ### Added
 
+- Local drive lifecycle in the `wyrd` binary: `wyrd init` creates identity,
+  root custody, and genesis membership; `wyrd mount` serves a live
+  read-write projection with clean shutdown on SIGINT/SIGTERM.
+- Mounted write path: daemon-owned mutation queue, namespace operations,
+  and append-handle semantics behind the FUSE mount.
+- Demand-driven fetch: opening non-local content registers a want and
+  blocks bounded (`EIO` on expiry), with read-side chunk demand and a
+  real-iroh serving endpoint answering peer fetches by transport root.
+- Encrypted control plane: NIP-44 mailbox sealing with a durable
+  seen-event-id dedupe log, supervised live NIP-59 relay mailbox, and
+  per-pass route publication into the fetch plane.
+- Typed-error convention across daemon and sync boundaries (one
+  `thiserror` enum per module; fail-closed authorization with
+  restore-then-report recovery), documented in
+  `docs/error-conventions.md`.
 - Nix flake distribution: `packages.wyrd` / `apps.wyrd` (`nix build .#wyrd`,
   `nix run .#wyrd -- --help`) built from the committed `Cargo.lock` with the
   toolchain pinned in `rust-toolchain.toml`, for `aarch64-darwin`,

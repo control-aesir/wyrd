@@ -6,6 +6,8 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wyrd_format::{DeviceId, DriveId};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -63,6 +65,10 @@ pub struct DurableStore {
     /// The locked lock-file handle; holding it keeps the advisory lock.
     /// Closed and released on drop — no stale locks survive a crash.
     _lock: File,
+    /// Test-only delivery-pass accounting: counts `rebuild` calls so
+    /// tests prove one snapshot per pass instead of one per pair.
+    #[cfg(test)]
+    rebuilds: AtomicU64,
 }
 
 /// Crate-visible for the raw-commit test seam alongside `atomic_write`.
@@ -146,6 +152,8 @@ impl DurableStore {
             last_hash,
             store_key,
             _lock: lock,
+            #[cfg(test)]
+            rebuilds: AtomicU64::new(0),
         })
     }
 
@@ -369,7 +377,15 @@ impl DurableStore {
     ///
     /// [`replay`]: mod@replay
     pub fn rebuild(&self, device: DeviceId) -> Result<Rebuilt, DurableError> {
+        #[cfg(test)]
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
         let facts = self.load()?;
         replay::rebuild_facts(&self.drive, facts, device)
+    }
+
+    /// Test-only: how many `rebuild` calls this store has served.
+    #[cfg(test)]
+    pub(crate) fn rebuild_count(&self) -> u64 {
+        self.rebuilds.load(Ordering::Relaxed)
     }
 }

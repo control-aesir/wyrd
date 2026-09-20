@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use wyrd_format::{MembershipTransition, SnapshotId};
+use zeroize::Zeroizing;
 
 use super::engine::{DrainReport, Engine, EngineError};
 use crate::control::{
@@ -233,6 +234,26 @@ fn commit_action(
     for fact in &facts {
         if let Fact::ControlMessage(id) = fact {
             engine.inbox.remember(id);
+        }
+        // Newly authorized epoch material installs its control keys
+        // where none is held: a device that just received epoch N's
+        // capability opens epoch-N control traffic on the next
+        // envelope instead of stalling it as skipped. Fill-vacant
+        // only, matching the keyring's first-wins install: a held key
+        // is never replaced behind the traffic sealed under it, and
+        // conflicting epoch secrets stay the keyring's
+        // fail-closed `EpochConflict`, not a silent key swap. The
+        // grant was authorized above; only decryption keys derive
+        // here, and every message they open is still independently
+        // verified.
+        if let Fact::Capability(authorized) = fact {
+            let drive = engine.drive;
+            for (index, secret) in authorized.capability().secrets.iter().enumerate() {
+                let epoch = index as u64 + 1;
+                if !engine.epoch_keys.contains_key(&epoch) {
+                    engine.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive, epoch)));
+                }
+            }
         }
     }
     // The projection follows the durable state, never leads it: staged
@@ -1059,6 +1080,68 @@ mod tests {
         assert_eq!(fixture.engine.current(), 2);
         let facts = fixture.engine.store.load().expect("loads");
         assert_eq!(facts.capabilities.len(), 1);
+    }
+
+    #[test]
+    fn received_capability_installs_its_control_keys() {
+        let mut fixture = fixture();
+        let device = fixture.recipient;
+        let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+
+        // Strip the fixture's epoch-1 key: the epoch-2 capability
+        // below covers 1..=2 contiguously, so its commit must install
+        // the missing lower key — or the epoch-1 message after it
+        // stalls. Epoch 2 stays: the envelope carrying the capability
+        // can only open under a held key.
+        fixture.engine.epoch_keys.remove(&1);
+        fixture.engine.inbox = crate::control::ControlInbox::new(member_drive());
+        fixture
+            .engine
+            .add_epoch_key(2, Zeroizing::new(control_key(2)));
+
+        let (mut builder, genesis) = Builder::genesis(10);
+        let admission = builder.child(vec![Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        })]);
+        let mut scratch = MembershipLog::new(member_drive());
+        scratch.observe(genesis.clone());
+        scratch.observe(admission.clone());
+        let state = scratch
+            .state_of(&admission.transition_id())
+            .expect("admission is valid");
+        let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
+        let capability = Capability::mint(member_drive(), device, &state, &admission, secrets)
+            .expect("device is a member");
+        let wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
+        let delivery = Message::Capability(CapabilityPayload {
+            device,
+            epoch: 2,
+            wrapped,
+        });
+
+        let mail = vec![deliver(&fixture, 2, &delivery)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.deferred, 1, "capability holds for its transition");
+        let mail = vec![
+            deliver(&fixture, 2, &transition_message(&genesis)),
+            deliver(&fixture, 2, &transition_message(&admission)),
+        ];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.accepted, 2);
+
+        // Epoch-1 traffic opens on the installed key: no manual
+        // `add_epoch_key`, no restart, no skipped envelope.
+        let rotation = Message::KeyRotation(KeyRotation {
+            transition: admission.transition_id(),
+        });
+        let mail = vec![deliver(&fixture, 1, &rotation)];
+        queue(&mut fixture, mail);
+        let report = drain(&mut fixture);
+        assert_eq!(report.skipped, 0, "capability installed epoch 1");
+        assert_eq!(report.accepted, 1, "the rotation is consumed");
     }
 
     #[test]

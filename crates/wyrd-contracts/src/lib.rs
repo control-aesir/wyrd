@@ -71,9 +71,30 @@
 //!     vault, and serves the file; a failed announcement leaves the
 //!     authored snapshot durable and the retry converges without
 //!     re-authoring (`docs/epochs.md`, local write).
+//! 17. `invited_device_converges_on_ordered_catch_up` — the admission
+//!     transition plus its capability wrap drain to acceptance with
+//!     nothing held, skipped, or duplicated (P2 fresh-device discovery).
+//! 18. `invited_device_converges_on_reversed_catch_up` — the wrap holds
+//!     for its unseen transition, then the transition flushes it;
+//!     redelivery collapses to duplicates.
+//! 19. `invited_device_converges_on_duplicated_catch_up` — redelivery
+//!     is dedupe, not state.
+//! 20. `invited_device_converges_after_gap_then_redelivery` — a missing
+//!     intermediate delivery heals when the transition lands later.
+//! 21. `offline_device_catch_up_accumulates_contiguously` — while the
+//!     newcomer is away its queue holds every epoch from admission to
+//!     tip with nothing skipped or doubled; epochs past its invitation
+//!     stall loudly (retained) until rotation delivery lands them a
+//!     key — the documented cross-epoch boundary.
+//! 22. `forged_transition_from_member_cannot_extend_newcomer_state` —
+//!     an owner-signed but invalid sibling is suppressed while the
+//!     genuine admission converges around it; the pusher is transport,
+//!     never authority.
 
 #[cfg(test)]
 mod fuse_contracts;
+#[cfg(test)]
+mod join_contracts;
 #[cfg(test)]
 mod serving_contracts;
 #[cfg(test)]

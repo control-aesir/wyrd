@@ -37,15 +37,16 @@ use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition};
 
 use super::engine::{Engine, EngineError};
+use crate::control::bootstrap::{open_bootstrap, SealedBootstrap};
 use crate::durable::{atomic_write, AuthorizedCapability, DurableStore, Fact};
-use crate::keys::capability::Capability;
+use crate::keys::capability::{Capability, DriveKeyring, WrappedCapability};
 use crate::keys::keystore::{
     unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, WrappedSecret,
 };
 use crate::keys::{
     escrow, random_bytes, DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey, EpochSecret,
 };
-use crate::membership::sign_transition;
+use crate::membership::{sign_transition, Authorizable, MembershipLog};
 
 /// The custody record file inside a drive directory.
 const KEYSTORE_FILE: &str = "keystore";
@@ -164,6 +165,154 @@ pub(super) fn open_keystore(
     // install is a no-op when the durable capability already exists.
     install_self_capability(&mut engine, &genesis, &epoch)?;
     Ok(engine)
+}
+
+/// Join a drive as an invited device: open the owner's sealed
+/// invitation with the invitee's encryption secret, bind a fresh store
+/// directory to the invitation's drive, and commit its genesis.
+/// Idempotent like the interrupted-create resume: a redelivered
+/// invitation resumes where the first call stopped.
+///
+/// Trust reasoning, stated exactly because this path installs key
+/// material before the chain authorizes it:
+///
+/// - The invitation is owner-signed and ECDH-sealed to the invitee
+///   (`open_bootstrap` verifies both), so the epoch secrets inside
+///   carry the inviter's authority for control-plane decryption keys.
+///   Every message opened with those keys is still independently
+///   verified (signatures, chain, membership), so a control key alone
+///   grants no content and no authorship.
+/// - No capability fact commits here. The invitation capability
+///   authorizes against the admission state, which the newcomer hasn't
+///   observed yet; committing it now would launder an unverified grant
+///   into the durable keyring. Instead the wrapped bytes commit as a
+///   [`Fact::BootstrapPending`] record and every resync re-derives the
+///   control keys from it — restart-safe by construction. The record is
+///   never removed (append-only); it stays inert once authorized keys
+///   arrive because installation is gated: resync verifies every
+///   bootstrap secret against the authorized keyring and the held keys
+///   before installing anything, so provisional material can neither
+///   outrank nor silently replace authorized keys, and a disagreeing
+///   blob fails the resync closed.
+pub(super) fn accept_invitation(
+    dir: PathBuf,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+    encryption: DeviceEncryptionSecret,
+    sealed: &SealedBootstrap,
+) -> Result<Engine, EngineError> {
+    let device = device_id(&identity);
+    let invitation = open_bootstrap(&encryption, sealed)?;
+    if invitation.invitee != device {
+        return Err(EngineError::InvitationMismatch);
+    }
+    let genesis = MembershipTransition::from_canonical_bytes(&invitation.genesis)
+        .map_err(|_| EngineError::BadGenesis)?;
+    if genesis.epoch != 1 || genesis.prev.is_some() {
+        return Err(EngineError::BadGenesis);
+    }
+    // The envelope signature covers arbitrary bytes: a validly signed
+    // invitation can still carry an invalid transition. Observe the
+    // candidate in a temporary log and require a valid authoritative
+    // genesis — signature, drive binding, roots, owner/member state —
+    // before committing anything. A buggy or malicious inviter must
+    // not produce an engine with no canonical state.
+    let mut candidate = MembershipLog::new(invitation.drive);
+    let genesis_id = candidate.observe(genesis.clone());
+    if !matches!(
+        candidate.authoritative(&genesis_id),
+        Some(Authorizable::Valid(..))
+    ) {
+        return Err(EngineError::BadGenesis);
+    }
+    // Fail before touching disk when the invitation's capability names
+    // another device: the seal is addressed to us but the grant inside
+    // is not ours. The unwrap also proves the encryption secret opens
+    // the pending record every later open will re-derive from.
+    let capability = WrappedCapability::from_bytes(invitation.capability.clone())
+        .unwrap(&encryption)
+        .map_err(EngineError::Crypto)?;
+    if capability.device != device {
+        return Err(EngineError::InvitationMismatch);
+    }
+    // The wrap is ECDH-bound to our secret, but the grant names its
+    // own drive and registration: refuse a structurally valid
+    // capability for another drive before its secrets become our
+    // control keys. The encryption-key half is pinned independently by
+    // both the seal's header check and the wrap's AAD — the explicit
+    // comparison backstops future crypto refactors. The transition
+    // binding is deliberately unchecked here: the grant may bind the
+    // admission transition rather than the genesis, and it authorizes
+    // through intake once the catch-up set lands, never at accept.
+    if capability.drive != invitation.drive
+        || capability.encryption_key != invitation.encryption_key
+    {
+        return Err(EngineError::InvitationMismatch);
+    }
+
+    let store = DurableStore::open(dir.clone(), invitation.drive, passphrase)?;
+    if read_drive(&dir)? != invitation.drive {
+        return Err(EngineError::DriveExists);
+    }
+    let mut engine =
+        Engine::open_with_store(store, invitation.drive, device, identity, encryption)?;
+    if engine.log.known_state().is_none() {
+        engine.log.observe(genesis.clone());
+        engine.commit_facts(&[
+            Fact::Transition(genesis),
+            Fact::BootstrapPending(invitation.capability),
+        ])?;
+    }
+    // The commit above carries the pending record, so this resync
+    // installs the invitation's control keys from durable state — the
+    // same path every later open takes.
+    engine.resync()?;
+    Ok(engine)
+}
+
+/// Re-derive epoch control keys from one pending-invitation blob: the
+/// wrapped capability's secrets cover `1..=N` contiguously by
+/// construction, so every secret installs its epoch's key and the
+/// catch-up set opens regardless of which epoch sealed each message.
+/// Provisional and gated, never authoritative: every secret is verified
+/// against the authorized keyring and the held keys before anything
+/// installs, so a stale or forged blob fails the resync closed instead
+/// of swapping keys behind sealed traffic. Deterministic and
+/// idempotent: reopening re-installs identical keys.
+pub(super) fn install_invitation_keys(
+    engine: &mut Engine,
+    keyring: &DriveKeyring,
+    wrapped: Vec<u8>,
+) -> Result<(), EngineError> {
+    let drive = engine.drive;
+    let capability = WrappedCapability::from_bytes(wrapped)
+        .unwrap(&engine.encryption_secret)
+        .map_err(EngineError::Crypto)?;
+    // Verify everything before installing anything: a conflict leaves
+    // the held keys untouched and fails closed.
+    let mut derived = Vec::with_capacity(capability.secrets.len());
+    for (index, secret) in capability.secrets.iter().enumerate() {
+        let epoch = index as u64 + 1;
+        derived.push((epoch, secret.control_key(&drive, epoch)));
+    }
+    for (epoch, key) in &derived {
+        if let Some(known) = keyring.secret(*epoch) {
+            if known.control_key(&drive, *epoch) != *key {
+                return Err(EngineError::BootstrapKeyConflict(*epoch));
+            }
+        }
+        if let Some(held) = engine.epoch_keys.get(epoch) {
+            if held[..] != key[..] {
+                return Err(EngineError::BootstrapKeyConflict(*epoch));
+            }
+        }
+    }
+    for (epoch, key) in derived {
+        // `add_epoch_key` overwrites, but every held key above was just
+        // proven equal, so this only fills vacant epochs.
+        engine.add_epoch_key(epoch, Zeroizing::new(key));
+    }
+    Ok(())
 }
 
 /// Install the local owner's epoch material as a durable self-capability,
@@ -326,7 +475,12 @@ fn encryption_key(encryption: &DeviceEncryptionSecret) -> DeviceEncryptionKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_util::TestDir;
+    use crate::control::bootstrap::seal_bootstrap;
+    use crate::control::{seal, KeyRotation, Message};
+    use crate::keys::capability::Capability;
+    use crate::runtime::test_util::{MemoryMailbox, MemoryRelay, TestDir};
+    use crate::transport::mailbox::seal_for_recipient;
+    use wyrd_format::TransitionId;
 
     #[test]
     fn an_interrupted_bootstrap_resumes_on_open() {
@@ -371,5 +525,323 @@ mod tests {
             open_keystore(dir.path.clone(), "test-pass", other),
             Err(EngineError::OwnerMismatch)
         ));
+    }
+
+    /// Seal a genuine invitation: the owner admits nobody yet (the
+    /// admission transition arrives via catch-up), but grants the
+    /// invitee the epoch-1 secret bound to the genesis it anchors.
+    fn invitation(
+        drive: DriveId,
+        owner: &DeviceIdentitySecret,
+        owner_encryption: &DeviceEncryptionSecret,
+        invitee: &DeviceIdentitySecret,
+        invitee_encryption: &DeviceEncryptionSecret,
+        epoch: EpochSecret,
+    ) -> crate::control::bootstrap::SealedBootstrap {
+        let genesis = genesis_transition(drive, owner, owner_encryption).unwrap();
+        let invitee_id = device_id(invitee);
+        let invitee_key = encryption_key(invitee_encryption);
+        let capability = Capability::new(
+            drive,
+            invitee_id,
+            invitee_key,
+            genesis.transition_id(),
+            1,
+            vec![epoch],
+        )
+        .unwrap();
+        seal_bootstrap(
+            owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            &genesis.canonical_bytes(),
+            capability.wrap().unwrap().as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn drive_id() -> DriveId {
+        let mut bytes = [0u8; 32];
+        random_bytes(&mut bytes).unwrap();
+        DriveId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn accept_invitation_installs_genesis_and_first_epoch_key() {
+        let dir = TestDir::new("accept-invitation");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        let epoch = EpochSecret::generate().unwrap();
+        let sealed = invitation(
+            drive,
+            &owner,
+            &owner_encryption,
+            &invitee,
+            &invitee_encryption,
+            epoch.clone(),
+        );
+
+        let mut engine = Engine::accept_invitation(
+            dir.path.clone(),
+            "test-pass",
+            invitee,
+            invitee_encryption,
+            &sealed,
+        )
+        .unwrap();
+        assert_eq!(engine.drive, drive);
+        assert!(
+            engine.log.known_state().is_some(),
+            "the invitation genesis is committed"
+        );
+
+        // Behavioral proof of the epoch key: a control message sealed
+        // under the epoch-1 key drains instead of stalling as skipped.
+        // KeyRotation is envelope-defined but unhandled, so it is the
+        // cheapest accepted message with no chain to build.
+        let rotation = Message::KeyRotation(KeyRotation {
+            transition: TransitionId::from_bytes([0x31; 32]),
+        });
+        let sealed_msg = seal(&epoch.control_key(&drive, 1), &drive, 1, &rotation).unwrap();
+        let mut relay = MemoryRelay::default();
+        relay.push(seal_for_recipient(&owner, engine.device, &sealed_msg.encode()).unwrap());
+        let mut mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: engine.device,
+        };
+        let report = engine.drain(&mut mailbox).unwrap();
+        assert_eq!(report.skipped, 0, "epoch-1 key opens the message");
+        assert_eq!(report.accepted, 1, "the rotation is consumed");
+    }
+
+    #[test]
+    fn accept_invitation_for_another_device_is_refused() {
+        let dir = TestDir::new("accept-invitation-mismatch");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let sealed = invitation(
+            drive_id(),
+            &owner,
+            &owner_encryption,
+            &invitee,
+            &invitee_encryption,
+            EpochSecret::generate().unwrap(),
+        );
+
+        let stranger = DeviceIdentitySecret::generate().unwrap();
+        // The stranger holds the invitee's encryption secret, so the
+        // seal opens — but the invitation names another device. (With a
+        // wrong encryption secret the seal fails to open first, which
+        // surfaces as `Invitation`, not a mismatch.)
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                stranger,
+                invitee_encryption,
+                &sealed
+            ),
+            Err(EngineError::InvitationMismatch)
+        ));
+    }
+
+    #[test]
+    fn accept_invitation_with_invalid_genesis_is_refused_before_disk() {
+        let dir = TestDir::new("accept-invitation-tampered");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        let invitee_id = device_id(&invitee);
+        let invitee_key = encryption_key(&invitee_encryption);
+        let epoch = EpochSecret::generate().unwrap();
+
+        // A well-formed but invalid genesis: correctly signed by the
+        // owner, undecodable roots. The envelope signature covers
+        // arbitrary bytes, so this opens — validation must still refuse
+        // it.
+        let mut bad = MembershipTransition::new(
+            1,
+            None,
+            Vec::new(),
+            vec![Change::Admit(Admission {
+                device: device_id(&owner),
+                encryption_key: encryption_key(&owner_encryption),
+            })],
+            [0xFF; 32],
+            [0xFF; 32],
+            device_id(&owner),
+        )
+        .unwrap();
+        sign_transition(&mut bad, &owner.secret_key(), &drive);
+        let genesis_id = genesis_transition(drive, &owner, &owner_encryption)
+            .unwrap()
+            .transition_id();
+        let capability = Capability::new(
+            drive,
+            invitee_id,
+            invitee_key,
+            genesis_id,
+            1,
+            vec![epoch.clone()],
+        )
+        .unwrap();
+        let sealed = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            &bad.canonical_bytes(),
+            capability.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee.clone(),
+                invitee_encryption.clone(),
+                &sealed
+            ),
+            Err(EngineError::BadGenesis)
+        ));
+
+        // Undecodable genesis bytes fail the same gate.
+        let sealed_garbage = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            b"not a transition",
+            capability.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee,
+                invitee_encryption,
+                &sealed_garbage
+            ),
+            Err(EngineError::BadGenesis)
+        ));
+        assert!(
+            !dir.path.join("DRIVE").exists(),
+            "invalid invitations never touch disk"
+        );
+    }
+
+    #[test]
+    fn accept_invitation_with_foreign_capability_is_refused() {
+        let dir = TestDir::new("accept-invitation-foreign");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        let genesis = genesis_transition(drive, &owner, &owner_encryption).unwrap();
+        let invitee_id = device_id(&invitee);
+        let invitee_key = encryption_key(&invitee_encryption);
+        let epoch = EpochSecret::generate().unwrap();
+
+        // A structurally valid grant for another drive: it unwraps
+        // under our secret (ECDH binds the recipient, not the drive),
+        // so only the explicit drive cross-check refuses it before its
+        // secrets become our control keys.
+        let foreign = Capability::new(
+            drive_id(),
+            invitee_id,
+            invitee_key,
+            genesis.transition_id(),
+            1,
+            vec![epoch],
+        )
+        .unwrap();
+        let sealed = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &invitee_key,
+            &genesis.canonical_bytes(),
+            foreign.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee,
+                invitee_encryption,
+                &sealed
+            ),
+            Err(EngineError::InvitationMismatch)
+        ));
+        assert!(
+            !dir.path.join("DRIVE").exists(),
+            "foreign grants never touch disk"
+        );
+    }
+
+    #[test]
+    fn resync_refuses_bootstrap_that_disagrees_with_the_keyring() {
+        let dir = TestDir::new("bootstrap-conflict");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", owner).unwrap();
+        let drive = engine.drive;
+        let genesis_id = engine
+            .log
+            .known_state()
+            .map(|state| state.transition_id)
+            .expect("creation commits genesis");
+        let self_cap = engine
+            .store
+            .load()
+            .unwrap()
+            .capabilities
+            .into_iter()
+            .find(|cap| cap.device == engine.device)
+            .expect("creation commits a self capability");
+        let held_before = engine
+            .epoch_keys
+            .get(&1)
+            .cloned()
+            .expect("escrow installs the epoch-1 key");
+
+        // A self-addressed wrap carrying a different epoch-1 secret,
+        // committed as a pending blob: the only way bootstrap material
+        // can disagree with the authorized keyring is a buggy or
+        // malicious inviter, so resync must fail closed, never swap.
+        let fake = Capability::new(
+            drive,
+            engine.device,
+            self_cap.encryption_key,
+            genesis_id,
+            1,
+            vec![EpochSecret::generate().unwrap()],
+        )
+        .unwrap();
+        engine
+            .commit_facts(&[Fact::BootstrapPending(
+                fake.wrap().unwrap().as_bytes().to_vec(),
+            )])
+            .unwrap();
+        let err = engine.resync().unwrap_err();
+        assert!(
+            matches!(err, EngineError::BootstrapKeyConflict(1)),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(
+            engine.epoch_keys.get(&1),
+            Some(&held_before),
+            "a conflicting blob installs nothing"
+        );
     }
 }

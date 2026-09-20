@@ -3,6 +3,7 @@ use super::store::{atomic_write, commit_name, DurableStore};
 use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
+use crate::control::{seal, CapabilityPayload, Message};
 use crate::control::{ControlKind, ControlMessageId, SealedControl, SnapshotAnnouncement};
 use crate::keys::capability::{Capability, CapabilityError, InstallError};
 use crate::keys::epoch::EpochSecret;
@@ -932,6 +933,32 @@ fn rebuild_rejects_a_record_for_another_drive() {
     drop(store);
     let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
+}
+
+/// A capability sealed fact whose envelope epoch disagrees with its
+/// obligation key fails at commit: the seal epoch is the plaintext
+/// correlation the codec can check without keys. The recipient binding
+/// lives inside the sealed payload and is verified at send time.
+#[test]
+fn capability_sealed_with_foreign_epoch_fails_commit() {
+    let message = Message::Capability(CapabilityPayload {
+        device: owner(),
+        epoch: 1,
+        wrapped: vec![0x99; 64],
+    });
+    let bytes = seal(&[0x77; 32], &drive(), 1, &message).unwrap().encode();
+    let dir = TestDir::new("capability-sealed-epoch");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert!(
+        matches!(
+            store.commit(&[Fact::CapabilitySealed(2, owner(), bytes.clone())]),
+            Err(DurableError::InvalidOutbox)
+        ),
+        "sealed under epoch 1, keyed at epoch 2"
+    );
+    store
+        .commit(&[Fact::CapabilitySealed(1, owner(), bytes)])
+        .expect("matching epoch commits");
 }
 
 /// A clean commit round-trips exactly: no crash, no loss.

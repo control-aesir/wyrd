@@ -139,6 +139,52 @@ state, not drive creation. New devices join through admission and receive
 capabilities; there are no guest privileges. Membership is signed,
 replicated state that members agree on.
 
+### Post-admission discovery (catch-up obligation)
+
+The bootstrap invitation carries the genesis transition plus the
+admission-epoch capability and nothing else. Learning everything after
+that is a catch-up obligation on the admitter, not a second protocol:
+a durable set of existing control messages, addressed to the newcomer
+and retried until acknowledged.
+
+- **Membership:** the authoritative chain suffix after genesis,
+  replayed by the newcomer through the normal validation machinery —
+  no privileged path, no trust in the pusher beyond signatures.
+- **Capabilities:** one wrap per epoch, contiguous from the admission
+  epoch to the current epoch. A sparse union is accepted only if the
+  capability format and authorization rules prove it safe.
+- **Heads:** current head announcements with their retrieval routes,
+  re-sent byte-identical to the authors' signed statements.
+- **Rotation notices** are informational; transitions plus
+  capabilities are authoritative for epoch state.
+- **Redundancy without authority:** any member that observes the
+  admission may push the same set (intake dedupe makes repeats
+  no-ops), but only the admitting authority's committed admission
+  transition determines membership. Bootstrap changes
+  discoverability, not authorization.
+- **Ordering is an optimization:** intake already holds
+  membership-unseen messages pending, so the newcomer converges
+  regardless of mailbox delivery order. The invariant is eventual
+  convergence under arbitrary order and duplication, proven by
+  contracts 17–22 in `wyrd-contracts`.
+
+Pre-admission history stays opaque to the newcomer by design: it
+holds no old epoch secrets, so old snapshots and manifests are
+unreadable to it (`trust.md` revocation boundary). The admission
+commit and its catch-up obligations land in one durable batch, so a
+crash cannot commit the former while losing the latter.
+
+Known boundary: catch-up spans epochs the invitation covers.
+Epoch-key delivery past the invitation epoch is circular under the
+current envelope rules (a wrap for N+1 must travel under envelope
+N+1, openable only with key N+1) and awaits the rotation-delivery
+decision — until then, post-invitation epochs stall loudly
+(retained, counted), never silently. The sender side mirrors this:
+an obligation the sender holds no sealing key for stays pending and
+observable via the pending projection instead of failing its whole
+pass, and reused sealed bytes are verified against their obligation
+before the send that would discharge them.
+
 ## Conflicts
 
 No merging. Concurrent publishes create multiple heads; both remain

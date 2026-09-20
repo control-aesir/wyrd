@@ -6,11 +6,12 @@
 #   2. Tag the release commit `v<version>` (the version derives from the tag
 #      with one leading `v` stripped, so it must equal the Cargo version).
 #   3. On each platform, produce the tarball named below (`dist/` is
-#      gitignored build output). Native builds: `nix build .#wyrd-dist`
-#      on the machine itself. Linux tarballs from a Mac: `build-linux-dist
-#      <version>` from the devenv shell (containerized native builds,
-#      input pinned to the release tag). A main release must ship all
-#      three: ngit rejects partial platform coverage on the main channel.
+#      gitignored build output). macOS builds natively with
+#      `nix build .#wyrd-dist`; Linux tarballs come from
+#      `build-linux-dist <version>` in the devenv shell, which offloads
+#      to the remote builders in /etc/nix/machines from a worktree
+#      pinned to the release tag. A main release must ship all three:
+#      ngit rejects partial platform coverage on the main channel.
 #   4. `ngit release publish <version>` with `--blossom-server` (or a
 #      kind-10063 server list from the publisher), plus `--relay` as needed.
 #

@@ -63,60 +63,29 @@ in
 
   # Release tooling: build the Linux distribution tarballs from a Mac.
   # The flake builds natively per system, so `nix build .#wyrd-dist` on
-  # darwin only yields macos-aarch64. This wraps one containerized native
-  # build per Linux target (amd64 runs under Docker Desktop Rosetta
-  # emulation: slower, but it only has to succeed once per release).
-  # Input is pinned to the release tag via `git archive`, never the
-  # working copy, so a dirty tree cannot bake into a release tarball.
-  # The builder image is pinned by digest (multi-arch manifest: docker
-  # resolves the right arch per --platform). Refresh it with
-  # `docker buildx imagetools inspect nixos/nix:latest` (or the Hub tag
-  # API) and record the new digest here; never float on `:latest`.
+  # darwin only yields macos-aarch64. The Linux legs below offload to
+  # remote builders (`builders = @/etc/nix/machines`) via
+  # `nix build --system`: no containers, no emulation. Input is pinned
+  # to the release tag in a detached worktree, never the working copy,
+  # so a dirty tree cannot bake into a release tarball. The x86_64 leg
+  # runs first so a missing x86 builder fails fast instead of after
+  # the aarch64 build.
   scripts.build-linux-dist.exec = ''
     set -euo pipefail
     VERSION="''${1:?usage: build-linux-dist <version> (e.g. 0.1.0-alpha.1)}"
     TAG="v$VERSION"
-    NIX_IMAGE="nixos/nix@sha256:7a007c766426c1877758ddc5cb87a965ac131fc78c582ce0083d922d51ae945c"
     git rev-parse --verify --quiet "$TAG" >/dev/null \
       || { echo "tag $TAG does not exist" >&2; exit 1; }
-    command -v docker >/dev/null \
-      || { echo "docker is required (Docker Desktop with Rosetta enabled for amd64)" >&2; exit 1; }
     ROOT=$(git rev-parse --show-toplevel)
     EXPORT=$(mktemp -d)
-    trap 'rm -rf "$EXPORT"' EXIT
-    git archive "$TAG" | tar -x -C "$EXPORT"
+    trap 'cd "$ROOT"; git worktree remove --force "$EXPORT" >/dev/null 2>&1 || rm -rf "$EXPORT"' EXIT
+    git worktree add --detach "$EXPORT" "$TAG" >/dev/null
     mkdir -p "$ROOT/dist"
-    # A named volume persists the container Nix store across runs: the
-    # store is content-addressed, so a retry or a second target reuses
-    # identical derivations instead of recompiling the world.
-    docker volume create wyrd-nix-store >/dev/null
-    for TARGET in linux/arm64 linux/amd64; do
-      echo "building $TARGET from $TAG..."
-      # Address the package by explicit system, never the bare
-      # `#wyrd-dist` attr: under Rosetta emulation nix resolved the
-      # bare attr to the aarch64 output inside the amd64 container,
-      # silently rebuilding one arch twice (verified by eval).
-      case "$TARGET" in
-        linux/arm64) SYSTEM=aarch64-linux ;;
-        linux/amd64) SYSTEM=x86_64-linux ;;
-      esac
-      # Fail fast on platform chimeras: under Rosetta emulation uname
-      # reports x86_64 while nix detects the native aarch64, then
-      # refuses the derivation deep in the build. Assert first.
-      ACTUAL=$(docker run --rm --platform "$TARGET" --security-opt seccomp=unconfined \
-        -v wyrd-nix-store:/nix \
-        "$NIX_IMAGE" nix --extra-experimental-features 'nix-command flakes' config show system 2>/dev/null)
-      [ "$ACTUAL" = "$SYSTEM" ] \
-        || { echo "container reports system $ACTUAL for target $SYSTEM: no usable $TARGET builder here (need a native machine, not emulation)" >&2; exit 1; }
-      # seccomp=unconfined: Docker Desktop (and Rosetta emulation for
-      # amd64) rejects the seccomp-BPF sandbox Nix installs for its
-      # builds. Unconfining the container seccomp profile lets Nix
-      # sandbox the build itself, which is the isolation that matters
-      # for reproducible artifacts.
-      docker run --rm --platform "$TARGET" --security-opt seccomp=unconfined \
-        -v "$EXPORT:/src:ro" -v "$ROOT/dist:/out" -v wyrd-nix-store:/nix \
-        "$NIX_IMAGE" sh -c \
-          'nix --extra-experimental-features "nix-command flakes" build "/src#packages.'"''$SYSTEM"'.wyrd-dist" --out-link /tmp/wyrd-dist && cp /tmp/wyrd-dist "/out/$(basename "$(readlink /tmp/wyrd-dist)")"'
+    for SYSTEM in x86_64-linux aarch64-linux; do
+      echo "building $SYSTEM from $TAG..."
+      nix --extra-experimental-features 'nix-command flakes' \
+        build "$EXPORT#packages.''$SYSTEM.wyrd-dist" --out-link "$EXPORT/dist-link"
+      cp "$EXPORT/dist-link" "$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-link")")"
     done
     # Smoke check: release.yaml names exactly these two archives, and
     # ngit rejects partial platform coverage on the main channel.

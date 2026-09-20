@@ -290,4 +290,13 @@ pub enum Fact {
     CapabilitySealed(u64, DeviceId, Vec<u8>),
     /// One capability obligation discharged for one recipient.
     CapabilityDelivered(u64, DeviceId),
+    /// Pending invitation material: the invitation's wrapped
+    /// capability bytes, committed at accept time. The grant inside
+    /// cannot authorize yet (the admission transition is unobserved),
+    /// so it rides here instead of the keyring-bound capability facts;
+    /// every open re-derives the epoch control keys from it until the
+    /// authorized capability arrives through intake and supersedes it.
+    /// Append-only like every fact: superseded blobs stay and
+    /// re-derive the same keys deterministically.
+    BootstrapPending(Vec<u8>),
 }

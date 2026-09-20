@@ -58,10 +58,12 @@ const TAG_CAPABILITY_QUEUED: u8 = 0x10;
 const TAG_CAPABILITY_SEALED: u8 = 0x11;
 /// One discharged capability obligation: epoch u64 LE (8) ‖ recipient (32).
 const TAG_CAPABILITY_DELIVERED: u8 = 0x12;
+/// Pending invitation material: raw wrapped-capability bytes (non-empty).
+const TAG_BOOTSTRAP_PENDING: u8 = 0x13;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 18] = [
+const KNOWN_TAGS: [u8; 19] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -80,6 +82,7 @@ const KNOWN_TAGS: [u8; 18] = [
     TAG_CAPABILITY_QUEUED,
     TAG_CAPABILITY_SEALED,
     TAG_CAPABILITY_DELIVERED,
+    TAG_BOOTSTRAP_PENDING,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -318,6 +321,16 @@ pub(super) fn encode_fact(
             bytes.extend_from_slice(&epoch.to_le_bytes());
             bytes.extend_from_slice(recipient.as_bytes());
             Ok((TAG_CAPABILITY_DELIVERED, bytes))
+        }
+        Fact::BootstrapPending(wrapped) => {
+            // Opaque to the codec: the bytes open only under the
+            // invitee's encryption secret, which replay does not hold.
+            // Non-empty is the only structural gate; intake validates
+            // the grant itself once the admission transition lands.
+            if wrapped.is_empty() {
+                return Err(DurableError::InvalidOutbox);
+            }
+            Ok((TAG_BOOTSTRAP_PENDING, wrapped.clone()))
         }
     }
 }
@@ -559,6 +572,12 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
             Some(DecodedFact::CapabilityDelivered(epoch, recipient))
         }
+        TAG_BOOTSTRAP_PENDING => {
+            if record.is_empty() {
+                return None;
+            }
+            Some(DecodedFact::BootstrapPending(record.to_vec()))
+        }
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
@@ -638,13 +657,17 @@ pub(super) enum DecodedFact {
     CapabilityQueued(u64, DeviceId),
     CapabilitySealed(u64, DeviceId, Vec<u8>),
     CapabilityDelivered(u64, DeviceId),
+    BootstrapPending(Vec<u8>),
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use wyrd_format::{Manifest, SnapshotId};
+    use wyrd_format::membership::Admission;
+    use wyrd_format::{Change, Manifest, SnapshotId};
+
+    use crate::control::{seal, CapabilityPayload, KeyRotation, Message, TransitionPayload};
 
     use super::*;
 
@@ -721,5 +744,120 @@ mod tests {
         };
         let (tag, bytes) = encode_fact(&key, &drive, &Fact::Manifest(bare)).unwrap();
         assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+    }
+
+    /// Seal one control message of each delivery-obligation kind under
+    /// a throwaway key: the codec gate checks envelope kind only, so
+    /// the payloads need no chain behind them.
+    fn sealed_kind(drive: &DriveId, key: &[u8; 32], epoch: u64, message: &Message) -> Vec<u8> {
+        seal(key, drive, epoch, message).unwrap().encode()
+    }
+
+    fn transition_bytes() -> Vec<u8> {
+        let transition = MembershipTransition::new(
+            1,
+            None,
+            Vec::new(),
+            vec![Change::Admit(Admission {
+                device: DeviceId::from_bytes([0x01; 32]),
+                encryption_key: wyrd_format::DeviceEncryptionKey::from_bytes([0x02; 32]),
+            })],
+            [0x03; 32],
+            [0x04; 32],
+            DeviceId::from_bytes([0x01; 32]),
+        )
+        .unwrap();
+        transition.canonical_bytes()
+    }
+
+    /// The delivery-obligation sealed facts round-trip, and their kind
+    /// gates refuse cross-kind envelopes in both directions: a rotation
+    /// envelope must neither encode as a transition obligation nor
+    /// decode as one, so a wrong-but-decodable seal can never poison a
+    /// first-seal-wins obligation past retry.
+    #[test]
+    fn delivery_obligation_seals_gate_envelope_kind() {
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let key = [0x11u8; 32];
+        let seal_key = [0x07u8; 32];
+        let tid = TransitionId::from_bytes([0x11; 32]);
+        let recipient = DeviceId::from_bytes([0x22; 32]);
+
+        let good_transition = sealed_kind(
+            &drive,
+            &seal_key,
+            2,
+            &Message::MembershipTransition(TransitionPayload {
+                transition: transition_bytes(),
+            }),
+        );
+        let (tag, bytes) = encode_fact(
+            &key,
+            &drive,
+            &Fact::TransitionSealed(tid, good_transition.clone()),
+        )
+        .unwrap();
+        assert_eq!(tag, TAG_TRANSITION_SEALED);
+        assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+
+        let good_capability = sealed_kind(
+            &drive,
+            &seal_key,
+            2,
+            &Message::Capability(CapabilityPayload {
+                device: recipient,
+                epoch: 2,
+                wrapped: vec![0xAA; 64],
+            }),
+        );
+        let (tag, bytes) = encode_fact(
+            &key,
+            &drive,
+            &Fact::CapabilitySealed(2, recipient, good_capability),
+        )
+        .unwrap();
+        assert_eq!(tag, TAG_CAPABILITY_SEALED);
+        assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+
+        // Wrong kind in both directions, for both gates.
+        let rotation = sealed_kind(
+            &drive,
+            &seal_key,
+            2,
+            &Message::KeyRotation(KeyRotation {
+                transition: TransitionId::from_bytes([0x31; 32]),
+            }),
+        );
+        assert!(encode_fact(&key, &drive, &Fact::TransitionSealed(tid, rotation.clone())).is_err());
+        assert!(encode_fact(
+            &key,
+            &drive,
+            &Fact::CapabilitySealed(2, recipient, rotation.clone())
+        )
+        .is_err());
+        let mut bad_transition = tid.as_bytes().to_vec();
+        bad_transition.extend_from_slice(&rotation);
+        assert!(decode_record(&drive, &key, TAG_TRANSITION_SEALED, &bad_transition).is_none());
+        let mut bad_capability = 2u64.to_le_bytes().to_vec();
+        bad_capability.extend_from_slice(recipient.as_bytes());
+        bad_capability.extend_from_slice(&rotation);
+        assert!(decode_record(&drive, &key, TAG_CAPABILITY_SEALED, &bad_capability).is_none());
+
+        // Queued/delivered pairs and the pending-invitation blob are
+        // plain round-trips; an empty blob is refused.
+        let (tag, bytes) =
+            encode_fact(&key, &drive, &Fact::TransitionQueued(tid, recipient)).unwrap();
+        assert_eq!(tag, TAG_TRANSITION_QUEUED);
+        assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+        let (tag, bytes) =
+            encode_fact(&key, &drive, &Fact::CapabilityQueued(2, recipient)).unwrap();
+        assert_eq!(tag, TAG_CAPABILITY_QUEUED);
+        assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+        let (tag, bytes) =
+            encode_fact(&key, &drive, &Fact::BootstrapPending(vec![0xBB; 48])).unwrap();
+        assert_eq!(tag, TAG_BOOTSTRAP_PENDING);
+        assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+        assert!(encode_fact(&key, &drive, &Fact::BootstrapPending(Vec::new())).is_err());
+        assert!(decode_record(&drive, &key, TAG_BOOTSTRAP_PENDING, &[]).is_none());
     }
 }

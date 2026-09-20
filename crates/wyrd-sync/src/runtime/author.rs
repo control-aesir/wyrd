@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
 use wyrd_format::{
-    Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, Entry, Manifest,
+    Change, ChildManifest, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Entry, Manifest,
     ManifestEntry, MembershipTransition, ObjectKind, ObjectStore, Snapshot, TransitionId, Tree,
 };
 
@@ -31,9 +31,9 @@ use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
 use crate::control::{
     seal as seal_control, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
 };
-use crate::durable::{AuthorizedCapability, AuthorizedSnapshot, Fact};
+use crate::durable::{AuthorizedCapability, AuthorizedSnapshot, Fact, Rebuilt};
 use crate::ingest::{check_manifest, check_tree, Limits};
-use crate::keys::capability::Capability;
+use crate::keys::capability::{Capability, DriveKeyring};
 use crate::keys::EpochSecret;
 use crate::membership::sign_transition;
 use crate::seal::{entry_for, seal as seal_content, seal_manifest, SEAL_VERSION};
@@ -713,7 +713,7 @@ pub(super) fn admit_device(
     if pre.members.contains(&device) {
         return Err(EngineError::AlreadyMember);
     }
-    let epoch = tip.epoch + 1;
+    let epoch = next_epoch(tip.epoch)?;
     let secret = EpochSecret::generate()?;
     let mut members: Vec<DeviceId> = pre.members.iter().copied().collect();
     members.push(device);
@@ -735,7 +735,13 @@ pub(super) fn admit_device(
         &engine.identity_secret.secret_key(),
         &engine.drive,
     );
-    engine.log.observe(transition.clone());
+    // Validate against a staged log: the live log stays pristine until
+    // the batch commits, so any failure below (missing epoch material,
+    // minting, sealing, the durable commit itself) leaves no phantom
+    // tip for a retry to trip over. The post-commit `resync` adopts
+    // the committed state.
+    let mut staged = engine.log.clone();
+    staged.observe(transition.clone());
     // Secrets `1..=epoch`: the keyring holds every past epoch (each
     // installed from an authorized capability), plus the fresh one.
     let rebuilt = engine.store.rebuild(engine.device)?;
@@ -750,8 +756,7 @@ pub(super) fn admit_device(
         );
     }
     secrets.push(secret.clone());
-    let post = engine
-        .log
+    let post = staged
         .state_of(&transition.transition_id())
         .ok_or(EngineError::NoCanonicalMembership)?;
     // The newcomer's grant, sealed into the invitation: it authorizes
@@ -769,12 +774,8 @@ pub(super) fn admit_device(
     // The self grant authorizes immediately: the authoring device is an
     // owner, hence a member of the state its own transition produces.
     let own = Capability::mint(engine.drive, engine.device, &post, &transition, secrets)?;
-    let authorized = AuthorizedCapability::authorize(
-        own,
-        engine.drive,
-        &engine.log,
-        &transition.transition_id(),
-    )?;
+    let authorized =
+        AuthorizedCapability::authorize(own, engine.drive, &staged, &transition.transition_id())?;
     // Delivery obligations join the same batch: the admission is not
     // durable without its catch-up. The newcomer gets the chain suffix
     // after genesis (genesis rode the invitation) plus its admission-
@@ -788,8 +789,7 @@ pub(super) fn admit_device(
     ];
     let mut cursor = Some(tip_id);
     while let Some(id) = cursor {
-        let t = engine
-            .log
+        let t = staged
             .transition(&id)
             .ok_or(EngineError::NoCanonicalMembership)?;
         if t.epoch == 1 {
@@ -816,6 +816,13 @@ pub(super) fn admit_device(
         transition,
         invitation,
     })
+}
+
+/// The epoch after the tip, checked: the authoring path already treats
+/// the timestamp space as exhaustible, and the epoch counter is a
+/// `u64` protocol field with the same boundary.
+fn next_epoch(tip_epoch: u64) -> Result<u64, EngineError> {
+    tip_epoch.checked_add(1).ok_or(EngineError::EpochExhausted)
 }
 
 /// The canonical genesis bytes the invitation anchors to: epoch 1 with
@@ -850,23 +857,32 @@ pub(super) fn deliver_pending(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
 ) -> Result<usize, EngineError> {
+    // One validated delivery snapshot per pass: every read below comes
+    // from this rebuild. Mid-pass commits only append Sealed and
+    // Delivered facts — never new Queued pairs — so the frozen pending
+    // lists stay exact, and an in-memory overlay absorbs newly sealed
+    // bytes. No re-read per pair: a newcomer catch-up or a large
+    // fan-out costs one log decode, not one per obligation.
+    let rebuilt = engine.store.rebuild(engine.device)?;
     let mut sent = 0usize;
-    sent += deliver_transitions(engine, mailbox)?;
-    sent += deliver_capabilities(engine, mailbox)?;
+    sent += deliver_transitions(engine, mailbox, &rebuilt)?;
+    sent += deliver_capabilities(engine, mailbox, &rebuilt)?;
     Ok(sent)
 }
 
 /// An epoch's control key, held or derived: the in-memory map first,
-/// else derived from the durably held secret and installed. A device
-/// that never held the epoch has no key and no secret, which surfaces
-/// as [`EngineError::MissingEpochKey`].
-fn control_key_for(engine: &mut Engine, epoch: u64) -> Result<[u8; 32], EngineError> {
+/// else derived from the delivery snapshot's keyring and installed. A
+/// device that never held the epoch has no key and no secret, which
+/// surfaces as [`EngineError::MissingEpochKey`].
+fn control_key_for(
+    engine: &mut Engine,
+    keyring: &DriveKeyring,
+    epoch: u64,
+) -> Result<[u8; 32], EngineError> {
     if let Some(key) = engine.epoch_keys.get(&epoch) {
         return Ok(**key);
     }
-    let rebuilt = engine.store.rebuild(engine.device)?;
-    let secret = rebuilt
-        .keyring
+    let secret = keyring
         .secret(epoch)
         .cloned()
         .ok_or(EngineError::MissingEpochKey(epoch))?;
@@ -881,24 +897,37 @@ fn control_key_for(engine: &mut Engine, epoch: u64) -> Result<[u8; 32], EngineEr
 fn deliver_transitions(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
+    rebuilt: &Rebuilt,
 ) -> Result<usize, EngineError> {
-    let rebuilt = engine.store.rebuild(engine.device)?;
     let mut pending = rebuilt.runtime.pending_transitions();
     pending.sort();
+    let mut sealed_overlay: BTreeMap<TransitionId, Vec<u8>> = BTreeMap::new();
     let mut sent = 0usize;
-    for (id, _recipient) in pending {
+    let mut index = 0usize;
+    while index < pending.len() {
+        let id = pending[index].0;
         // Clone out of the log borrow before the mutable seal step.
         let Some((epoch, canonical)) = engine
             .log
             .transition(&id)
             .map(|t| (t.epoch, t.canonical_bytes()))
         else {
+            // Orphaned obligation: the transition never resolved. It
+            // stays pending; skip the whole recipient run for it.
+            while index < pending.len() && pending[index].0 == id {
+                index += 1;
+            }
             continue;
         };
-        let sealed_bytes = match rebuilt.runtime.transition_sealed_bytes(&id) {
-            Some(bytes) => bytes.to_vec(),
+        let sealed_bytes = match sealed_overlay.get(&id).cloned().or_else(|| {
+            rebuilt
+                .runtime
+                .transition_sealed_bytes(id)
+                .map(<[u8]>::to_vec)
+        }) {
+            Some(bytes) => bytes,
             None => {
-                let key = control_key_for(engine, epoch)?;
+                let key = control_key_for(engine, &rebuilt.keyring, epoch)?;
                 let message = Message::MembershipTransition(TransitionPayload {
                     transition: canonical,
                 });
@@ -909,26 +938,20 @@ fn deliver_transitions(
                 // poison the obligation past retry.
                 crate::transport::mailbox::check_outbound_size(&bytes)?;
                 engine.commit_facts(&[Fact::TransitionSealed(id, bytes.clone())])?;
+                sealed_overlay.insert(id, bytes.clone());
                 bytes
             }
         };
-        // Re-read the pending set fresh per transition: this engine
-        // holds the store lock, so only this loop writes — but the
-        // recipients below shrink it every send.
-        let recipients: Vec<DeviceId> = engine
-            .store
-            .rebuild(engine.device)?
-            .runtime
-            .pending_transitions()
-            .into_iter()
-            .filter(|(pending_id, _)| *pending_id == id)
-            .map(|(_, recipient)| recipient)
-            .collect();
-        for recipient in recipients {
+        // Every pair for this transition in the frozen pending list:
+        // no re-read, since only this loop writes and it appends
+        // Delivered facts, never new Queued ones.
+        while index < pending.len() && pending[index].0 == id {
+            let recipient = pending[index].1;
             let envelope = seal_for_recipient(&engine.identity_secret, recipient, &sealed_bytes)?;
             mailbox.send(envelope)?;
             engine.commit_facts(&[Fact::TransitionDelivered(id, recipient)])?;
             sent += 1;
+            index += 1;
         }
     }
     Ok(sent)
@@ -943,8 +966,8 @@ fn deliver_transitions(
 fn deliver_capabilities(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
+    rebuilt: &Rebuilt,
 ) -> Result<usize, EngineError> {
-    let rebuilt = engine.store.rebuild(engine.device)?;
     let mut pending = rebuilt.runtime.pending_capabilities();
     pending.sort();
     // The canonical chain's epoch-to-transition map, walked once:
@@ -958,13 +981,22 @@ fn deliver_capabilities(
         chain.insert(t.epoch, id);
         cursor = t.prev;
     }
+    let mut sealed_overlay: BTreeMap<(u64, DeviceId), Vec<u8>> = BTreeMap::new();
     let mut sent = 0usize;
     for (epoch, recipient) in pending {
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
         };
-        let sealed_bytes = match rebuilt.runtime.capability_sealed_bytes(&epoch, &recipient) {
-            Some(bytes) => bytes.to_vec(),
+        let sealed_bytes = match sealed_overlay
+            .get(&(epoch, recipient))
+            .cloned()
+            .or_else(|| {
+                rebuilt
+                    .runtime
+                    .capability_sealed_bytes(epoch, recipient)
+                    .map(<[u8]>::to_vec)
+            }) {
+            Some(bytes) => bytes,
             None => {
                 let Some(state) = engine.log.state_of(&transition_id) else {
                     continue;
@@ -972,10 +1004,16 @@ fn deliver_capabilities(
                 let Some(transition) = engine.log.transition(&transition_id) else {
                     continue;
                 };
-                let Some(wrap) = mint_wrap(engine, &state, transition, recipient) else {
+                let Some(wrap) = mint_wrap(
+                    engine.drive,
+                    &rebuilt.keyring,
+                    &state,
+                    transition,
+                    recipient,
+                ) else {
                     continue;
                 };
-                let key = control_key_for(engine, epoch)?;
+                let key = control_key_for(engine, &rebuilt.keyring, epoch)?;
                 let message = Message::Capability(CapabilityPayload {
                     device: recipient,
                     epoch,
@@ -985,6 +1023,7 @@ fn deliver_capabilities(
                 let bytes = sealed.encode();
                 crate::transport::mailbox::check_outbound_size(&bytes)?;
                 engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
+                sealed_overlay.insert((epoch, recipient), bytes.clone());
                 bytes
             }
         };
@@ -996,23 +1035,24 @@ fn deliver_capabilities(
     Ok(sent)
 }
 
-/// Mint one recipient's wrap for an epoch from the durably held
-/// secrets: `None` when the keyring lacks any secret through the epoch
-/// (the pair stays pending for a later pass) or the recipient is not a
-/// member of the epoch's state with a registered key.
+/// Mint one recipient's wrap for an epoch from the delivery
+/// snapshot's keyring: `None` when the keyring lacks any secret
+/// through the epoch (the pair stays pending for a later pass) or the
+/// recipient is not a member of the epoch's state with a registered
+/// key.
 fn mint_wrap(
-    engine: &Engine,
+    drive: DriveId,
+    keyring: &DriveKeyring,
     state: &crate::membership::MembershipState,
     transition: &MembershipTransition,
     recipient: DeviceId,
 ) -> Option<Vec<u8>> {
-    let rebuilt = engine.store.rebuild(engine.device).ok()?;
     let epoch = transition.epoch;
     let mut secrets = Vec::with_capacity(epoch as usize);
     for past in 1..=epoch {
-        secrets.push(rebuilt.keyring.secret(past)?.clone());
+        secrets.push(keyring.secret(past)?.clone());
     }
-    let cap = Capability::mint(engine.drive, recipient, state, transition, secrets).ok()?;
+    let cap = Capability::mint(drive, recipient, state, transition, secrets).ok()?;
     Some(cap.wrap().ok()?.as_bytes().to_vec())
 }
 /// The timestamp for the next locally authored snapshot: strictly
@@ -1138,6 +1178,48 @@ mod tests {
             .commit_facts(&[Fact::Capability(authorized)])
             .unwrap();
         (dir, engine, genesis.transition_id())
+    }
+
+    #[test]
+    fn epoch_increment_checked_at_boundary() {
+        assert_eq!(super::next_epoch(7).unwrap(), 8);
+        assert!(matches!(
+            super::next_epoch(u64::MAX),
+            Err(super::EngineError::EpochExhausted)
+        ));
+    }
+
+    #[test]
+    fn failed_admit_leaves_no_phantom_tip() {
+        use crate::durable::CrashStage;
+
+        let (_dir, mut engine, _genesis) = owner_engine();
+        let tip_before = engine.log.known_state().expect("tip").transition_id;
+        let newcomer_id = identity(0x57).1;
+        let newcomer_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE7; 32]).unwrap());
+
+        // Torn commit: Ok with nothing durable, like power loss. The
+        // staged validation drops with the failed call — the live log
+        // never observed the phantom.
+        engine.crash_after(CrashStage::AfterWriteTemp);
+        engine.admit_device(newcomer_id, newcomer_key).unwrap();
+        assert_eq!(
+            engine.log.known_state().expect("tip").transition_id,
+            tip_before,
+            "failed admit leaves no phantom tip"
+        );
+
+        // Retry on the same engine authorizes fresh and commits exactly
+        // one admission.
+        let outcome = engine.admit_device(newcomer_id, newcomer_key).unwrap();
+        let tip = engine.log.known_state().expect("tip");
+        assert_eq!(tip.transition_id, outcome.transition.transition_id());
+        assert_eq!(tip.epoch, 2);
+        assert!(engine
+            .log
+            .members_of(&tip.transition_id)
+            .expect("state")
+            .contains(&newcomer_id));
     }
 
     #[test]
@@ -1301,8 +1383,14 @@ mod tests {
             relay: &mut relay,
             owner: owner_id,
         };
+        let rebuilds_before = engine.store.rebuild_count();
         let sent = engine.deliver_pending(&mut sender).unwrap();
         assert_eq!(sent, 2, "transition plus capability");
+        assert_eq!(
+            engine.store.rebuild_count() - rebuilds_before,
+            1,
+            "one delivery snapshot per pass, not one per pair"
+        );
         let rebuilt = engine.store.rebuild(engine.device()).unwrap();
         assert!(
             rebuilt.runtime.pending_transitions().is_empty(),
@@ -1313,15 +1401,27 @@ mod tests {
             "capability obligations discharged"
         );
 
-        // The newcomer joins from the invitation, then drains the
-        // pushed set: admission observed, epoch-2 secret installed.
+        // The newcomer joins from the invitation, restarts before
+        // draining, then drains the pushed set: the pending-
+        // invitation record re-derives the control keys on open, so
+        // the join survives process loss mid-catch-up.
         let join_dir = TestDir::new("admit-deliver-join");
-        let mut joined = Engine::accept_invitation(
+        let joined = Engine::accept_invitation(
             join_dir.path.clone(),
+            "test-pass",
+            newcomer.clone(),
+            newcomer_encryption.clone(),
+            &outcome.invitation,
+        )
+        .unwrap();
+        joined.release_store_lock();
+        let mut joined = Engine::open(
+            join_dir.path.clone(),
+            member_drive(),
+            newcomer_id,
             "test-pass",
             newcomer,
             newcomer_encryption,
-            &outcome.invitation,
         )
         .unwrap();
         let mut receiver = MemoryMailbox {

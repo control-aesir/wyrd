@@ -101,6 +101,8 @@ pub enum EngineError {
     AlreadyMember,
     #[error("no held epoch secret for epoch {0}")]
     MissingEpochSecret(u64),
+    #[error("the epoch number space is exhausted at u64::MAX")]
+    EpochExhausted,
     #[error("no held control key for epoch {0}")]
     MissingEpochKey(u64),
     #[error("snapshot {0} was authored by another device: an engine announces only its own work")]
@@ -500,6 +502,15 @@ impl Engine {
             state.record_announcement(a)?;
         }
         self.announcements = state.announcements;
+        // Pending-invitation material re-derives the invitation's
+        // control keys on every open: the joined device holds no
+        // authorized capability yet, so without this a restart between
+        // accept and catch-up would strand it keyless. Deterministic
+        // and idempotent — reopening installs identical keys — and a
+        // wrong encryption secret fails closed here.
+        for pending in facts.bootstrap_pending {
+            super::bootstrap::install_invitation_keys(self, pending)?;
+        }
         Ok(())
     }
 

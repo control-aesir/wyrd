@@ -67,6 +67,7 @@ pub struct LoadedFacts {
     pub capability_queued: Vec<(u64, DeviceId)>,
     pub capability_sealed: Vec<(u64, DeviceId, Vec<u8>)>,
     pub capability_delivered: Vec<(u64, DeviceId)>,
+    pub bootstrap_pending: Vec<Vec<u8>>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -157,6 +158,13 @@ impl LoadedFacts {
                 self.capability_delivered.push((epoch, recipient));
                 self.runtime_facts
                     .push(RuntimeFact::CapabilityDelivered(epoch, recipient));
+            }
+            DecodedFact::BootstrapPending(wrapped) => {
+                // Key material, not runtime state: no RuntimeFact.
+                // The engine re-derives epoch keys from these blobs on
+                // every open until the authorized capability supersedes
+                // them.
+                self.bootstrap_pending.push(wrapped);
             }
         }
     }

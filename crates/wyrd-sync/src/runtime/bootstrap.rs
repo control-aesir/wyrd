@@ -183,12 +183,12 @@ pub(super) fn open_keystore(
 ///   verified (signatures, chain, membership), so a control key alone
 ///   grants no content and no authorship.
 /// - No capability fact commits here. The invitation capability
-///   authorizes against the admission transition's state, which the
-///   newcomer has not observed yet; committing it now would launder an
-///   unverified grant into the durable keyring. Authorization goes
-///   through the normal intake path once the catch-up set delivers the
-///   admission transition, and the keyring installs from that
-///   authorized fact, never from this call.
+///   authorizes against the admission state, which the newcomer hasn't
+///   observed yet; committing it now would launder an unverified grant
+///   into the durable keyring. Instead the wrapped bytes commit as a
+///   [`Fact::BootstrapPending`] record and every open re-derives the
+///   control keys from it — restart-safe by construction — until the
+///   authorized capability arrives through intake and supersedes it.
 pub(super) fn accept_invitation(
     dir: PathBuf,
     passphrase: &str,
@@ -208,8 +208,9 @@ pub(super) fn accept_invitation(
     }
     // Fail before touching disk when the invitation's capability names
     // another device: the seal is addressed to us but the grant inside
-    // is not ours.
-    let capability = WrappedCapability::from_bytes(invitation.capability)
+    // is not ours. The unwrap also proves the encryption secret opens
+    // the pending record every later open will re-derive from.
+    let capability = WrappedCapability::from_bytes(invitation.capability.clone())
         .unwrap(&encryption)
         .map_err(EngineError::Crypto)?;
     if capability.device != device {
@@ -224,20 +225,36 @@ pub(super) fn accept_invitation(
         Engine::open_with_store(store, invitation.drive, device, identity, encryption)?;
     if engine.log.known_state().is_none() {
         engine.log.observe(genesis.clone());
-        engine.commit_facts(&[Fact::Transition(genesis)])?;
-        engine.resync()?;
+        engine.commit_facts(&[
+            Fact::Transition(genesis),
+            Fact::BootstrapPending(invitation.capability),
+        ])?;
     }
-    // Capabilities cover 1..=N contiguously by construction, so every
-    // secret installs its epoch's control key: the catch-up set may be
-    // sealed under any epoch the invitation spans.
+    // The commit above carries the pending record, so this resync
+    // installs the invitation's control keys from durable state — the
+    // same path every later open takes.
+    engine.resync()?;
+    Ok(engine)
+}
+
+/// Re-derive epoch control keys from one pending-invitation blob: the
+/// wrapped capability's secrets cover `1..=N` contiguously by
+/// construction, so every secret installs its epoch's key and the
+/// catch-up set opens regardless of which epoch sealed each message.
+/// Deterministic and idempotent: reopening re-installs identical keys.
+pub(super) fn install_invitation_keys(
+    engine: &mut Engine,
+    wrapped: Vec<u8>,
+) -> Result<(), EngineError> {
+    let drive = engine.drive;
+    let capability = WrappedCapability::from_bytes(wrapped)
+        .unwrap(&engine.encryption_secret)
+        .map_err(EngineError::Crypto)?;
     for (index, secret) in capability.secrets.iter().enumerate() {
         let epoch = index as u64 + 1;
-        engine.add_epoch_key(
-            epoch,
-            Zeroizing::new(secret.control_key(&invitation.drive, epoch)),
-        );
+        engine.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive, epoch)));
     }
-    Ok(engine)
+    Ok(())
 }
 
 /// Install the local owner's epoch material as a durable self-capability,

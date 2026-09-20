@@ -338,8 +338,8 @@ impl RuntimeState {
     }
 
     /// The sealed transition bytes for one transition, if sealed.
-    pub fn transition_sealed_bytes(&self, id: &TransitionId) -> Option<&[u8]> {
-        self.transition_sealed.get(id).map(Vec::as_slice)
+    pub fn transition_sealed_bytes(&self, id: TransitionId) -> Option<&[u8]> {
+        self.transition_sealed.get(&id).map(Vec::as_slice)
     }
 
     /// Every still-undischarged transition obligation, in
@@ -387,9 +387,9 @@ impl RuntimeState {
 
     /// The sealed capability bytes for one recipient at one epoch,
     /// if sealed.
-    pub fn capability_sealed_bytes(&self, epoch: &u64, recipient: &DeviceId) -> Option<&[u8]> {
+    pub fn capability_sealed_bytes(&self, epoch: u64, recipient: DeviceId) -> Option<&[u8]> {
         self.capability_sealed
-            .get(&(*epoch, *recipient))
+            .get(&(epoch, recipient))
             .map(Vec::as_slice)
     }
 

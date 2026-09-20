@@ -599,9 +599,10 @@ pub(super) fn announce(
 /// without re-authoring anything. Snapshots with no persisted sealed
 /// bytes are sealed now (the epoch key must be held; the root manifest
 /// must be recorded) under the given `node_addr`; already-sealed
-/// snapshots resend their exact bytes. Entries for snapshots this
-/// device did not author are skipped — both writers check authorship
-/// first, so such an entry cannot arise through the public API.
+/// snapshots resend their exact bytes. Snapshots this device did not
+/// author — queued as newcomer catch-up at admit time — go through
+/// [`reannounce_one`], which re-sends the known signed announcement
+/// instead of authoring.
 pub(super) fn announce_pending(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
@@ -620,9 +621,11 @@ pub(super) fn announce_pending(
     let mut sent = 0usize;
     for snapshot_id in snapshots {
         let Some(body) = rebuilt.runtime.snapshot_body(&snapshot_id) else {
+            sent += reannounce_one(engine, &rebuilt, snapshot_id, mailbox)?;
             continue;
         };
         if body.author != engine.device {
+            sent += reannounce_one(engine, &rebuilt, snapshot_id, mailbox)?;
             continue;
         }
         let authorized = AuthorizedSnapshot::authorize(body.clone(), &engine.drive)
@@ -643,6 +646,36 @@ pub(super) fn announce_pending(
         }
     }
     Ok(sent)
+}
+
+/// Re-send a snapshot this engine did not author to its pending
+/// recipients: the known signed announcement goes out byte-identical
+/// to the author's statement (same routes included), sealed under its
+/// epoch key. Unknown snapshots are skipped orphan-tolerant — the
+/// obligation stays pending for a later pass.
+fn reannounce_one(
+    engine: &mut Engine,
+    rebuilt: &Rebuilt,
+    snapshot: wyrd_format::SnapshotId,
+    mailbox: &mut impl Mailbox,
+) -> Result<usize, EngineError> {
+    let Some(known) = rebuilt.runtime.announcement(&snapshot).cloned() else {
+        return Ok(0);
+    };
+    let epoch = known.epoch;
+    let sealed_bytes = match rebuilt.runtime.announcement_sealed_bytes(&snapshot) {
+        Some(bytes) => bytes.to_vec(),
+        None => {
+            let key = control_key_for(engine, &rebuilt.keyring, epoch)?;
+            let message = Message::SnapshotAnnouncement(known);
+            let sealed = seal_control(&key, &engine.drive, epoch, &message)?;
+            let bytes = sealed.encode();
+            crate::transport::mailbox::check_outbound_size(&bytes)?;
+            engine.commit_facts(&[Fact::AnnouncementSealed(snapshot, bytes.clone())])?;
+            bytes
+        }
+    };
+    send_pending_for(engine, snapshot, &sealed_bytes, mailbox)
 }
 
 /// Send the sealed bytes to every still-pending recipient of one
@@ -805,6 +838,18 @@ pub(super) fn admit_device(
         }
         batch.push(Fact::TransitionQueued(tip_id, *member));
         batch.push(Fact::CapabilityQueued(epoch, *member));
+    }
+    // Current heads ride the catch-up: the newcomer learns what exists
+    // before post-admission gossip reaches it. Every head is at or
+    // below the admission epoch, so the invited keys open all of them.
+    // Sending reuses the announcement outbox; the re-announce send
+    // path (not the authoring one) serves snapshots this engine did
+    // not author.
+    for head in engine.live_heads()? {
+        batch.push(Fact::AnnouncementQueued(
+            head.snapshot().snapshot_id(),
+            device,
+        ));
     }
     engine.commit_facts(&batch)?;
     engine.resync()?;
@@ -1081,14 +1126,14 @@ fn wall_clock_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::next_timestamp;
-    use super::{admit_device, Engine};
+    use super::{admit_device, Engine, ManifestRecord};
 
     use wyrd_format::TransitionId;
     use zeroize::Zeroizing;
 
     use crate::control::bootstrap::open_bootstrap;
-    use crate::control::seal;
-    use crate::durable::{AuthorizedCapability, Fact};
+    use crate::control::{seal, Message};
+    use crate::durable::{AuthorizedCapability, AuthorizedSnapshot, Fact};
     use crate::keys::capability::{Capability, WrappedCapability};
     use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
     use crate::membership::test_util::{drive as member_drive, key, Builder};
@@ -1444,6 +1489,116 @@ mod tests {
         assert!(
             held.keyring.secret(2).is_some(),
             "admission-epoch secret installed from the pushed wrap"
+        );
+    }
+
+    #[test]
+    fn admit_delivers_current_heads_to_the_newcomer() {
+        use crate::runtime::test_util::{announcement_msg_with, body_root, intake_body};
+        use crate::seal::seal_manifest;
+        use std::collections::BTreeMap;
+        use wyrd_format::{BaoRoot, Manifest};
+
+        let (_dir, mut engine, genesis_id) = owner_engine();
+        let (owner_sk, _) = key(10);
+        // A live head: the owner's epoch-1 snapshot, body plus
+        // announcement committed the way intake would record them,
+        // with a real root manifest record so the head projection
+        // holds.
+        let (builder, genesis) = Builder::genesis(10);
+        let body = intake_body(&builder, &genesis);
+        let head_id = body.snapshot_id();
+        let authorized =
+            AuthorizedSnapshot::authorize(body.clone(), &member_drive()).expect("owner-signed");
+        let epoch1 = EpochSecret::from_bytes([0x07; 32]);
+        let manifest = Manifest::new(head_id, Vec::new(), Vec::new()).unwrap();
+        let manifest_key = epoch1.manifest_key(&member_drive(), 1, &head_id);
+        let (manifest_id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+        let transport = BaoRoot::from_bytes(*blake3::hash(sealed.encode().as_slice()).as_bytes());
+        let record = ManifestRecord {
+            is_root: true,
+            manifest_id,
+            representations: BTreeMap::from([(sealed.storage_id(), transport)]),
+            transport,
+            manifest,
+        };
+        let Message::SnapshotAnnouncement(announcement) = announcement_msg_with(
+            &identity_secret(&owner_sk),
+            head_id,
+            1,
+            genesis_id,
+            body_root(&body),
+            manifest_id,
+            transport,
+        ) else {
+            panic!("announcement helper builds announcements");
+        };
+        engine
+            .commit_facts(&[
+                Fact::SnapshotBody(authorized),
+                Fact::Manifest(record),
+                Fact::Announcement(announcement),
+            ])
+            .unwrap();
+        assert!(
+            engine
+                .live_heads()
+                .unwrap()
+                .iter()
+                .any(|head| head.snapshot().snapshot_id() == head_id),
+            "owner holds a live head before admitting"
+        );
+
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let newcomer_id = device_of(&newcomer);
+        let outcome = engine
+            .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+            .unwrap();
+        let rebuilt = engine.store.rebuild(engine.device()).unwrap();
+        assert!(
+            rebuilt
+                .runtime
+                .pending_announcements()
+                .contains(&(head_id, newcomer_id)),
+            "current head queued for the newcomer at admit"
+        );
+
+        // The head announcement goes out through the re-announce path:
+        // this engine did not author it via `author_snapshot`, so the
+        // authoring send refuses it and the known signed statement
+        // travels instead.
+        let mut relay = MemoryRelay::default();
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: engine.device(),
+        };
+        let sent = engine.deliver_pending(&mut sender).unwrap();
+        assert_eq!(sent, 2, "transition plus capability");
+        let announced = engine.announce_pending(&mut sender, None).unwrap();
+        assert_eq!(announced, 1, "the head announcement");
+
+        // The newcomer joins and drains everything: transition,
+        // capability, and the head announcement it never saw authored.
+        let join_dir = TestDir::new("admit-head-join");
+        let mut joined = Engine::accept_invitation(
+            join_dir.path.clone(),
+            "test-pass",
+            newcomer,
+            newcomer_encryption,
+            &outcome.invitation,
+        )
+        .unwrap();
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.skipped, 0, "invitation keys open every message");
+        let held = joined.store.rebuild(newcomer_id).unwrap();
+        assert!(
+            held.runtime.announcement(&head_id).is_some(),
+            "newcomer learns the head snapshot"
         );
     }
 }

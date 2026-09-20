@@ -341,7 +341,28 @@ impl Engine {
             crash_stage: None,
         };
         engine.resync()?;
+        engine.restore_epoch_keys()?;
         Ok(engine)
+    }
+
+    /// Derive control keys for every durably held epoch secret. The
+    /// keyring survives restarts but the per-process keys do not, so
+    /// without this a reopened engine stalls previously receivable
+    /// traffic as skipped until a fresh capability happens to arrive.
+    /// Derivation is deterministic — reopening installs identical keys
+    /// — and authorization already happened when each secret was
+    /// installed.
+    fn restore_epoch_keys(&mut self) -> Result<(), EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        for epoch in 1..=rebuilt.keyring.up_to() {
+            if let Some(secret) = rebuilt.keyring.secret(epoch) {
+                self.add_epoch_key(
+                    epoch,
+                    Zeroizing::new(secret.control_key(&self.drive, epoch)),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Create a new single-device drive. `identity` is the owner's Nostr

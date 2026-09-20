@@ -81,6 +81,20 @@ pub(crate) const ROTATION_AAD_DOMAIN: &[u8] = b"wyrd rotation delivery v1";
 /// yields two framings' keys.
 pub(crate) const ROTATION_KEY_CONTEXT: &[u8] = b"wyrd rotation delivery key v1";
 
+/// What a rotation ingest did: first sight delivers, replay is a
+/// no-op. Mirrors [`super::IngestReport`] for the rotation framing —
+/// a separate type because rotation deliveries are not control-envelope
+/// `Message`s and never enter the volatile pending queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RotationIngest {
+    /// Already seen: harmless replay, no-op.
+    Duplicate,
+    /// First sight of this delivery id.
+    Accepted {
+        id: super::ControlMessageId,
+        delivery: RotationDelivery,
+    },
+}
 /// The opened rotation delivery: who gets which epoch's material,
 /// carrying the transition that authorizes it and the wrapped
 /// capability that installs it. The wrap stays sealed ciphertext here

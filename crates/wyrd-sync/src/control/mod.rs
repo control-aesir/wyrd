@@ -44,7 +44,7 @@ use thiserror::Error;
 use wyrd_format::DriveId;
 use zeroize::Zeroizing;
 
-use crate::keys::{random_bytes, CryptoError};
+use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret};
 
 pub use bootstrap::{
     BootstrapInvitation, SealedBootstrap, BOOTSTRAP_HEADER_LEN, BOOTSTRAP_VERSION,
@@ -55,11 +55,13 @@ pub use message::{
 };
 pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
 pub use rotation::{
-    open_rotation, seal_rotation, RotationDelivery, SealedRotation, ROTATION_HEADER_LEN,
-    ROTATION_VERSION,
+    open_rotation, seal_rotation, RotationDelivery, RotationIngest, SealedRotation,
+    ROTATION_HEADER_LEN, ROTATION_VERSION,
 };
 
-/// The only control-envelope version.
+/// The epoch-sealed control-envelope version. Rotation deliveries use
+/// their own framing and version (`rotation::ROTATION_VERSION`) and
+/// never enter the epoch-key open path.
 pub const CONTROL_VERSION: u8 = 0x00;
 
 /// Header length: version (1) + drive (32) + kind (1) + epoch (8) +
@@ -297,9 +299,10 @@ pub enum IngestReport {
 const MAX_SUPPRESSED_IDS: usize = 4096;
 
 /// One drive's control inbox: per-drive scoped like [`DriveKeyring`],
-/// opening only with held epoch keys. Failures leave no state behind:
-/// a rejected ingest changes nothing, so hostile bytes are safe to
-/// attempt.
+/// opening epoch-sealed messages only with held epoch keys and rotation
+/// deliveries only with the device's encryption secret. Failures leave
+/// no state behind: a rejected ingest changes nothing, so hostile bytes
+/// are safe to attempt.
 ///
 /// Two lifecycle notes, both acceptable in v0 and stated here so they
 /// stay deliberate: the durable seen set grows with every processed
@@ -433,6 +436,37 @@ impl ControlInbox {
     /// allow double-processing.
     pub fn forget(&mut self, id: &ControlMessageId) {
         self.seen.remove(id);
+    }
+
+    /// Ingest sealed rotation-delivery bytes: decode the rotation
+    /// framing, scope to this drive, open with the device's encryption
+    /// secret, dedupe. Error precedence mirrors [`ControlInbox::ingest`]:
+    /// framing first (version, drive), then crypto; dedupe runs last.
+    /// Wrong-drive and crypto failures are terminal errors that mutate
+    /// nothing. The epoch key plays no role here by design — this
+    /// framing exists to deliver the very secrets the epoch keys
+    /// derive from.
+    pub fn ingest_rotation(
+        &mut self,
+        sealed_bytes: &[u8],
+        secret: &DeviceEncryptionSecret,
+    ) -> Result<RotationIngest, ControlError> {
+        let sealed = SealedRotation::decode(sealed_bytes)?;
+        if sealed.version != ROTATION_VERSION {
+            return Err(ControlError::UnknownVersion(sealed.version));
+        }
+        if sealed.drive != self.drive {
+            return Err(ControlError::WrongDrive);
+        }
+        let delivery = open_rotation(secret, &sealed)?;
+        let id = sealed.message_id();
+        if self.suppressed.contains(&id) {
+            return Ok(RotationIngest::Duplicate);
+        }
+        if !self.seen.insert(id) {
+            return Ok(RotationIngest::Duplicate);
+        }
+        Ok(RotationIngest::Accepted { id, delivery })
     }
 }
 

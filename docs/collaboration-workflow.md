@@ -56,9 +56,9 @@ git branch --show-current && git commit -m "..."
 
 Set the PR to draft immediately after the first push. CI runs on
 `ready_for_review` only, for PRs touching the paths listed in the workflows
-under `.ngit/act/workflows/` (`rust-ci.yml` for the Rust workspace:
-`crates/**`, `Cargo.*`, `rust-toolchain.toml`, the workflow itself;
-`nix.yml` for the flake: those plus `flake.*`) — docs-only PRs run no CI,
+under `.ngit/act/workflows/` (`workflow.yml` covers `crates/**`,
+`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`, `flake.*`,
+the workflow itself, and `.ngit/scripts/*.sh`) — docs-only PRs run no CI,
 and drafts run none. The merge check below verifies the final revision is
 green.
 Work stays in draft until it is ready:
@@ -134,3 +134,23 @@ ngit issue resolved <issue> \
 
 Use `ngit issue close` for rejected, duplicate, or otherwise non-completed
 work. Use `ngit issue resolved` for work that was completed.
+
+## 7. CI trigger and identifier discipline
+
+Manual `ngit ci trigger` is retry-only: tag and branch pushes already fire
+the matching workflows, and duplicate triggers cannot be cancelled (`ci
+stop` ends all CI for the repo). Check `ngit ci status <commit>` before
+triggering anything. Signed per-job logs for failures arrive as PR comments
+and as Blossom `.asc` links; `ci status --log-tail` only embeds tails for
+non-successful jobs.
+
+Never retype a bech32 identifier (npub, nevent, naddr) from memory:
+transcription silently corrupts them. Resolve once into a variable or file
+and reuse it:
+
+```bash
+COORD=$(ngit ci status <commit> --json | python3 -c "...")
+ngit ci trigger "$COORD" <ref> --workflow <file> --json
+ngit pr list --json --offline | python3 -c "..." # stash the PR id, then
+ngit merge $(cat /tmp/prid.txt) --json
+```

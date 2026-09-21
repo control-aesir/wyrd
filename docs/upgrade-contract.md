@@ -96,15 +96,16 @@ Releases are not required to write every format they read:
 ## Verification (implemented, with two blocked halves)
 
 `wyrd-contracts` carries one named test per invariant direction
-(catalog 23-32), over fixture stores checked in under
-`tests/fixtures/stores/<release>/`. The first fixture is the `dev`
-harness-smoke store; per-release fixtures start with the next
-release. Two tests stay deliberately ignored until their blockers
-land: fact-payload replay (invariant 2's payload clause, pending
-the v0.9.0 payload-versioning issue) and the full version matrix
-(invariant 5's matrix half, pending capability negotiation). The
-list below is the acceptance set for the contract issue — one
-bullet per invariant, in the same order:
+(catalog 23-33), over fixture stores checked in under
+`tests/fixtures/stores/<release>/`. Two fixtures exist: the `dev`
+harness-smoke store and genuine `v0.1.0-alpha.1` bytes produced by
+that release's own codec; per-release fixtures continue under
+their tag with each release. Two tests stay deliberately ignored
+until their blockers land: fact-payload replay (invariant 2's
+payload clause, pending the v0.9.0 payload-versioning issue) and
+the full version matrix (invariant 5's matrix half, pending
+capability negotiation). The list below is the acceptance set for
+the contract issue — one bullet per invariant, in the same order:
 
 1. new encodings are new representations: old objects keep their
    ContentIds and stay readable, new writes use the new representation,
@@ -113,8 +114,10 @@ bullet per invariant, in the same order:
    reads previous versions, writes oldest-compatible on demand, and
    replays previous durable facts into current records (payload
    replay ignored until fact payloads are versioned)
-3. old formats remain readable for the supported window; no release
-   destructively rewrites immutable objects, snapshots, or history
+3. old formats remain readable for the supported window, proven by
+   the previous-release fixture replaying under the current build;
+   no release destructively rewrites immutable objects, snapshots,
+   or history
 4. derived indexes rebuild from previous state by replay; nothing
    authoritative is lost
 5. mixed-version peers synchronize within the documented capability matrix

@@ -101,24 +101,30 @@
 //!     2, wire half).
 //! 25. `upgrade_old_objects_stay_readable` — a reopened object store
 //!     serves what it served before, with nothing rewritten
-//!     (invariant 3).
-//! 26. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
+//!     (invariant 3, same-version form).
+//! 26. `upgrade_previous_release_store_replays` — genuine
+//!     `v0.1.0-alpha.1` bytes open and replay under the current
+//!     build, with an oldness gate on the record tags (invariant 3,
+//!     cross-release form).
+//! 27. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
 //!     recovers committed coverage by replay, stably across restarts
 //!     (invariant 4).
-//! 27. `upgrade_mixed_versions_fail_named` — a forged envelope version
+//! 28. `upgrade_mixed_versions_fail_named` — a forged envelope version
 //!     fails open with `ControlError::UnknownVersion` (invariant 5,
 //!     gate half).
-//! 28. `upgrade_reads_never_mint_authority` — open, load, and
+//! 29. `upgrade_reads_never_mint_authority` — open, load, and
 //!     projection write no history and mint no transitions
 //!     (invariant 6).
-//! 29. `upgrade_old_epoch_material_stays_decryptable` — the fixture's
+//! 30. `upgrade_old_epoch_material_stays_decryptable` — the fixture's
 //!     epoch-1..2 grant still unwraps under the current build
 //!     (invariant 7).
-//! 30. `upgrade_appends_never_rewrite` — a new commit appends; existing
+//! 31. `upgrade_appends_never_rewrite` — a new commit appends; existing
 //!     files stay byte-identical (invariant 8).
-//! 31. `upgrade_torn_write_never_visible` — stale `*.tmp` siblings are
-//!     walked past by open and load (invariant 9).
-//! 32. `upgrade_unknown_refuses_loudly` — unknown envelope and control
+//! 32. `upgrade_orphaned_temps_are_ignored` — stale `*.tmp` siblings
+//!     are walked past by open and load; the full crash boundary is
+//!     pinned in wyrd-sync's crash-matrix tests (invariant 9,
+//!     orphaned-temps form).
+//! 33. `upgrade_unknown_refuses_loudly` — unknown envelope and control
 //!     versions and a flipped commit version refuse with their names
 //!     (invariant 10).
 //!

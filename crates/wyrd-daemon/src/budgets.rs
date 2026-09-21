@@ -4,10 +4,17 @@
 //! Each boundary already had a hardcoded bound (mailbox depths, want
 //! admission, mutation queue, write buffers, engine intake); this
 //! struct gathers the daemon-side ones into one place with the legacy
-//! constants as defaults, so operators tune numbers without touching
-//! code and tests pin the defaults to the historical behavior. The
-//! sync-engine bounds (`MAX_PENDING_MESSAGES`, fetch backoff) stay
-//! constants: they are protocol-adjacent, not operational.
+//! constants as defaults, so embedders tune numbers without touching
+//! code and tests pin the defaults to the historical behavior. Two
+//! exceptions are new, not legacy: `max_admit_per_pass` (admission was
+//! previously uncapped per pass) and `max_open_handles` (the table was
+//! previously bounded only by the kernel descriptor limit) — both are
+//! intentional new bounds, sized generously (see each default). The
+//! `wyrd` binary itself takes no tuning flags today and runs defaults;
+//! these are library-level settings until a configuration surface
+//! lands. The sync-engine bounds (`MAX_PENDING_MESSAGES`, fetch
+//! backoff) stay constants: they are protocol-adjacent, not
+//! operational.
 //!
 //! The per-pass fetch admission bound deserves a note on bytes: fetch
 //! execution is single-threaded per pass, so "bytes in flight" is the

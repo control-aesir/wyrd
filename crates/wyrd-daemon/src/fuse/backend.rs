@@ -490,6 +490,22 @@ where
         Ok(FileHandle(handle))
     }
 
+    /// Best-effort admission check before operations with side
+    /// effects (budget reservations, namespace mutations): refuses
+    /// `EMFILE` while the table is at the cap, so a saturated table
+    /// never triggers pointless work downstream. This is advisory —
+    /// `insert_handle` re-enforces atomically at insert time, so a
+    /// race that fills the table between check and insert still fails
+    /// closed there (with release on the budget path and
+    /// kernel-matching create-then-`EMFILE` on the create path).
+    fn check_handle_available(&self) -> Result<(), fuser::Errno> {
+        let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
+        if files.by_handle.len() >= self.max_open_handles {
+            return Err(fuser::Errno::EMFILE);
+        }
+        Ok(())
+    }
+
     /// Insert a freshly built handle, returning its kernel handle.
     /// Past the handle cap the insert refuses `EMFILE` and the
     /// handle is dropped unregistered — the caller maps it before
@@ -696,6 +712,10 @@ where
             // unreachable but keeps the identity derivation total.
             _ => return Err(fuser::Errno::EISDIR),
         };
+        // Admission before side effects: a saturated table fails
+        // here, before the truncate reservation below marks the
+        // handle dirty in the budget.
+        self.check_handle_available()?;
         let id = self.budget.next_handle();
         let (image, dirty) = if truncate {
             self.budget
@@ -718,7 +738,15 @@ where
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
         };
+        // Release on failure covers the race the pre-check cannot:
+        // a table that fills between check and insert still fails
+        // closed, and the truncate reservation above is unwound, so
+        // failed opens never consume dirty-handle or aggregate budget.
+        // `release` is idempotent, hence unconditional.
         self.insert_handle(Handle::Write(Arc::new(Mutex::new(handle))))
+            .inspect_err(|_| {
+                self.budget.release(id);
+            })
     }
 
     /// Create the file `name` under `parent_ino` and open it for
@@ -737,6 +765,14 @@ where
         let parent_path = self.inode_path(parent_ino)?;
         let child_path = join(&parent_path, name);
         let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
+        // Admission before the namespace mutation: a saturated table
+        // fails here, before the create commits a snapshot the caller
+        // will never open. The residual race (the table filling
+        // between this check and `insert_handle`) keeps
+        // kernel-matching create-then-`EMFILE` semantics — like
+        // `open(O_CREAT)` under `EMFILE`, the file may exist — while
+        // the common saturated case creates nothing.
+        self.check_handle_available()?;
         let identity = match mutations
             .submit(MutationKind::CreateFile {
                 path: child_path.clone(),

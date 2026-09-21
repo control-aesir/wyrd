@@ -159,3 +159,64 @@ fn mkdir_through_backend_commits_and_serves() {
     drop(backend);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A create refused `EMFILE` creates nothing: the handle-cap
+/// pre-check runs before the create mutation is submitted, so a
+/// saturated table fails without a namespace side effect. (The
+/// residual check-then-insert race keeps kernel-matching
+/// create-then-`EMFILE` semantics; this pins the deterministic
+/// saturated case.)
+#[test]
+fn create_at_saturated_table_creates_nothing() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon.put_file("live.txt", b"shared").unwrap();
+    let budgets = ResourceBudgets {
+        max_open_handles: 1,
+        ..ResourceBudgets::default()
+    };
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), budgets);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let loop_handle = std::thread::spawn(move || {
+        let mut live = live;
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &LiveConfig {
+                interval: Duration::from_millis(10),
+                error_base_delay: Duration::from_millis(5),
+                error_max_delay: Duration::from_millis(20),
+                max_consecutive_errors: 10,
+                budgets: ResourceBudgets::default(),
+            },
+            &mut |_, _| {},
+        )
+    });
+
+    let reader = backend.open_at("live.txt").expect("baseline serves");
+    assert_eq!(
+        backend.create_at(1, "new.txt", libc::O_RDWR),
+        Err(fuser::Errno::EMFILE),
+        "a saturated table refuses before mutating"
+    );
+    assert!(backend.release_handle(reader).is_ok());
+    // The table drained and no file exists: absent path, not a
+    // leftover handle or a ghost create.
+    assert_eq!(
+        backend.open_at("new.txt").unwrap_err(),
+        fuser::Errno::ENOENT,
+        "the refused create left no file behind"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}

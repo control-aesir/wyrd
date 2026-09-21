@@ -427,6 +427,39 @@ fn open_handles_refuse_emfile_past_the_cap() {
     );
 }
 
+/// A truncated open refused `EMFILE` leaks no budget: the
+/// dirty-handle mark the truncate reservation took is unwound, so
+/// saturated-table failures never permanently consume write budget
+/// and turn later writes into phantom `ENOSPC`.
+#[test]
+fn failed_truncated_open_releases_its_budget_reservation() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    backend.mutations = Some(Arc::new(MutationQueue::default()));
+    backend.max_open_handles = 1;
+    let reader = backend.open_at("f.txt").unwrap();
+    assert_eq!(
+        backend.open_write("f.txt", libc::O_RDWR | libc::O_TRUNC),
+        Err(fuser::Errno::EMFILE),
+        "a saturated table refuses before reserving"
+    );
+    assert_eq!(
+        backend.budget.dirty_handles(),
+        0,
+        "no leaked dirty-handle mark"
+    );
+    assert_eq!(backend.budget.total(), 0, "no leaked aggregate bytes");
+    // Draining room restores normal opens: the refused truncate left
+    // no permanent `ENOSPC` behind. The dirty handle is dropped with
+    // the backend instead of released: releasing a dirty handle
+    // commits through the mutation channel, which has no loop here.
+    assert!(backend.release_handle(reader).is_ok());
+    let _truncated = backend
+        .open_write("f.txt", libc::O_RDWR | libc::O_TRUNC)
+        .unwrap();
+    assert_eq!(backend.budget.dirty_handles(), 1);
+    backend.destroy();
+}
+
 /// Unknown handles are EBADF, and a released handle stops
 /// serving. A duplicate release stays quiet.
 #[test]

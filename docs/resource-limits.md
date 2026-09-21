@@ -9,9 +9,14 @@ doc bounds the live process holding and moving it.
 All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-daemon/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the
 backend at composition time. Defaults are the historical hardcoded
-bounds, so default configuration behaves exactly like previous
-releases. `ResourceBudgets::default()` is the pinned contract for
-that claim.
+bounds — with two intentional new ones: the per-pass admission cap
+(admission was previously uncapped per pass) and the open-handle cap
+(the table previously relied on the kernel descriptor limit alone).
+4096 handles is far above plausible interactive use (tens of open
+descriptors) while bounding pinned-capture memory, so it does not
+regress supported workloads. `ResourceBudgets::default()` is the
+pinned contract for the legacy defaults. Tuning is library-level:
+the `wyrd` binary takes no flags for these today and runs defaults.
 
 ## Bounds
 

@@ -253,6 +253,7 @@ where
             files: Mutex::new(OpenFiles {
                 by_handle: HashMap::new(),
                 next: 1,
+                reserved: 0,
             }),
             wants: None,
             mutations: None,
@@ -281,6 +282,7 @@ where
             files: Mutex::new(OpenFiles {
                 by_handle: HashMap::new(),
                 next: 1,
+                reserved: 0,
             }),
             wants: None,
             mutations: None,
@@ -316,6 +318,7 @@ where
             files: Mutex::new(OpenFiles {
                 by_handle: HashMap::new(),
                 next: 1,
+                reserved: 0,
             }),
             wants: Some(wants),
             mutations: Some(mutations),
@@ -481,7 +484,9 @@ where
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
-        if files.by_handle.len() >= self.max_open_handles {
+        // Reservations hold room for in-progress creates: promised
+        // slots count against the cap like open ones.
+        if files.by_handle.len() + files.reserved >= self.max_open_handles {
             return Err(fuser::Errno::EMFILE);
         }
         let handle = files.next;
@@ -491,19 +496,67 @@ where
     }
 
     /// Best-effort admission check before operations with side
-    /// effects (budget reservations, namespace mutations): refuses
-    /// `EMFILE` while the table is at the cap, so a saturated table
-    /// never triggers pointless work downstream. This is advisory —
-    /// `insert_handle` re-enforces atomically at insert time, so a
-    /// race that fills the table between check and insert still fails
-    /// closed there (with release on the budget path and
-    /// kernel-matching create-then-`EMFILE` on the create path).
+    /// effects (budget reservations): refuses `EMFILE` while the
+    /// table is at the cap, so a saturated table never triggers
+    /// pointless work downstream. This is advisory —
+    /// `insert_handle` re-enforces atomically at insert time, and
+    /// the release there unwinds the budget reservation, so a race
+    /// that fills the table between check and insert still fails
+    /// closed without leaking. Namespace mutations do not use this;
+    /// they reserve a slot (below) instead.
     fn check_handle_available(&self) -> Result<(), fuser::Errno> {
         let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
-        if files.by_handle.len() >= self.max_open_handles {
+        if files.by_handle.len() + files.reserved >= self.max_open_handles {
             return Err(fuser::Errno::EMFILE);
         }
         Ok(())
+    }
+
+    /// Promise a handle slot to an in-progress create: the count
+    /// holds room across the blocking mutation submit, which must
+    /// not hold the table lock. A saturated table (open plus
+    /// promised) refuses `EMFILE` before any namespace effect.
+    /// The reservation is consumed by [`insert_reserved`](Self::insert_reserved)
+    /// or returned by [`release_slot`](Self::release_slot) on every
+    /// path — a leaked promise only shrinks future capacity, so
+    /// audit callers accordingly. `pub(super)` for the accounting
+    /// unit test; production callers go through `create_at`.
+    pub(super) fn reserve_slot(&self) -> Result<(), fuser::Errno> {
+        let Ok(mut files) = self.files.lock() else {
+            return Err(fuser::Errno::EIO);
+        };
+        if files.by_handle.len() + files.reserved >= self.max_open_handles {
+            return Err(fuser::Errno::EMFILE);
+        }
+        files.reserved += 1;
+        Ok(())
+    }
+
+    /// Return a promised slot the create abandoned (mutation refused,
+    /// handle construction failed). Idempotent by saturation: only
+    /// ever called with a slot this caller promised. `pub(super)`
+    /// for the accounting unit test alongside `reserve_slot`.
+    pub(super) fn release_slot(&self) {
+        if let Ok(mut files) = self.files.lock() {
+            files.reserved = files.reserved.saturating_sub(1);
+        }
+    }
+
+    /// Insert into a promised slot: consumes the reservation, so room
+    /// is guaranteed by the [`reserve_slot`](Self::reserve_slot)
+    /// invariant (`len + reserved <= max` held at promise time, and
+    /// only this call shrinks `reserved` without growing `len`).
+    /// Lock poison still fails `EIO` — the promise is consumed
+    /// regardless, so accounting never reports a slot twice.
+    fn insert_reserved(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
+        let Ok(mut files) = self.files.lock() else {
+            return Err(fuser::Errno::EIO);
+        };
+        files.reserved = files.reserved.saturating_sub(1);
+        let fh = files.next;
+        files.next = fh.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
+        files.by_handle.insert(fh, handle);
+        Ok(FileHandle(fh))
     }
 
     /// Insert a freshly built handle, returning its kernel handle.
@@ -514,7 +567,7 @@ where
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
-        if files.by_handle.len() >= self.max_open_handles {
+        if files.by_handle.len() + files.reserved >= self.max_open_handles {
             return Err(fuser::Errno::EMFILE);
         }
         let fh = files.next;
@@ -765,24 +818,41 @@ where
         let parent_path = self.inode_path(parent_ino)?;
         let child_path = join(&parent_path, name);
         let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
-        // Admission before the namespace mutation: a saturated table
-        // fails here, before the create commits a snapshot the caller
-        // will never open. The residual race (the table filling
-        // between this check and `insert_handle`) keeps
-        // kernel-matching create-then-`EMFILE` semantics — like
-        // `open(O_CREAT)` under `EMFILE`, the file may exist — while
-        // the common saturated case creates nothing.
-        self.check_handle_available()?;
+        // Reserve the handle slot before the namespace mutation: a
+        // saturated table fails here, before the create commits a
+        // snapshot the caller will never open, and the promise holds
+        // room across the blocking submit, so a concurrent open
+        // cannot steal the slot mid-create. Every path after this
+        // either consumes the promise (`insert_reserved`) or returns
+        // it (`release_slot`).
+        self.reserve_slot()?;
         let identity = match mutations
             .submit(MutationKind::CreateFile {
                 path: child_path.clone(),
             })
-            .map_err(|error| mutation_errno(&error))?
+            .map_err(|error| mutation_errno(&error))
         {
-            MutationOutcome::Created(identity) => identity,
-            _ => return Err(fuser::Errno::EIO),
+            Ok(MutationOutcome::Created(identity)) => identity,
+            Ok(_) => {
+                self.release_slot();
+                return Err(fuser::Errno::EIO);
+            }
+            Err(error) => {
+                self.release_slot();
+                return Err(error);
+            }
         };
-        let capture = self.capture_for(&child_path)?;
+        // The mutation committed, so the file exists from here on:
+        // remaining failures are genuine open failures with the file
+        // present (never `EMFILE` — the promise holds the slot), and
+        // each still returns its promise.
+        let capture = match self.capture_for(&child_path) {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.release_slot();
+                return Err(error);
+            }
+        };
         let id = self.budget.next_handle();
         let executable = identity.executable();
         let handle = WriteHandle {
@@ -797,7 +867,7 @@ where
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
         };
-        let fh = self.insert_handle(Handle::Write(Arc::new(Mutex::new(handle))))?;
+        let fh = self.insert_reserved(Handle::Write(Arc::new(Mutex::new(handle))))?;
         let (ino, node, _) = self.resolve_inode(&child_path)?;
         let attr = self.attr(ino, &node);
         Ok((fh, ino, attr))

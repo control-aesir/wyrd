@@ -146,9 +146,15 @@ pub(super) struct WriteHandle {
 }
 
 /// Open file captures keyed by the handle the kernel uses.
+/// `reserved` counts handle slots promised to in-progress creates:
+/// `reserved + by_handle.len()` never exceeds the backend's cap, so a
+/// reserved insert always has room. Reservations are a counter, never
+/// a held lock — a create blocks on its mutation submit while only
+/// holding the count, never the table.
 pub(super) struct OpenFiles {
     pub(super) by_handle: HashMap<u64, Handle>,
     pub(super) next: u64,
+    pub(super) reserved: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

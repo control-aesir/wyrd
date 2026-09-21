@@ -23,7 +23,7 @@ use wyrd_sync::transport::mailbox::MailboxEnvelope;
 fn dirty_handle_budget_refuses_through_the_mount() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, _ino, _) = backend.create_at(1, "d.txt", libc::O_RDWR).unwrap();
@@ -81,7 +81,7 @@ fn concurrent_readers_see_atomic_generations() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("race.txt", b"v1").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let pinned = live.projection().unwrap();
     assert_eq!(pinned.generation(), 0);
@@ -120,8 +120,7 @@ fn want_admission_publishes_without_other_changes() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("anchor.txt", b"anchor").unwrap();
-    let (mut live, _backend) =
-        daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (mut live, _backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let baseline = live.generation();
 
     // Demand content nobody holds yet; no mailbox traffic, no bulk.
@@ -211,7 +210,7 @@ fn sync_once_discards_poison_and_keeps_serving() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("steady.txt", b"steady").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let mut mailbox = QueueMailbox::new();
     mailbox.push(MailboxEnvelope {
@@ -246,7 +245,7 @@ fn sync_once_accepts_idle_bulk_source() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("fetched.txt", b"local").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let mut mailbox = NoopMailbox;
     let mut bulk = MemoryBulkSource::default();
@@ -274,7 +273,7 @@ fn open_handles_survive_sync_republication() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("stable.txt", b"v1").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let old = backend.open_at("stable.txt").expect("opens");
     // Idle and poison passes republish (or skip) the projection
@@ -318,7 +317,7 @@ fn dirty_backlog_clears_on_clean_pass() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("steady.txt", b"steady").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     live.dirty = true;
     let mut mailbox = NoopMailbox;
     live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)

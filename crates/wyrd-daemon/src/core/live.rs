@@ -83,6 +83,10 @@ pub struct LiveConfig {
     /// Resource bounds enforced at the loop and serving boundaries.
     /// Defaults are the historical hardcoded bounds, so default
     /// configuration behaves exactly like every previous release.
+    /// Read once at composition (`into_live` stores a copy for the
+    /// loop and wires the rest into the registries and backend):
+    /// compose and run with the same config value, since `run_loop`
+    /// takes it again for supervision.
     pub budgets: ResourceBudgets,
 }
 

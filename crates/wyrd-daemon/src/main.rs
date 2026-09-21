@@ -352,7 +352,7 @@ fn mount(
     // backend share this config's budgets, wired into both halves
     // by `into_live` below.
     let config = LiveConfig::default();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), config.budgets);
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &config);
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity

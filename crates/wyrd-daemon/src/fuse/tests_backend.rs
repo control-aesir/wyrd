@@ -460,6 +460,35 @@ fn failed_truncated_open_releases_its_budget_reservation() {
     backend.destroy();
 }
 
+/// A promised slot holds room like an open handle: while it is
+/// held, unreserved opens refuse, and returning it re-admits them.
+/// This is the accounting `create_at` closes its check-then-insert
+/// race with — the promise spans the blocking mutation submit.
+/// (The consuming half, `insert_reserved`, is pinned end to end by
+/// the core create tests: only a real committed create can supply
+/// the handle it inserts.)
+#[test]
+fn reserved_slots_hold_room_until_returned() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    backend.max_open_handles = 1;
+    backend.reserve_slot().unwrap();
+    assert_eq!(
+        backend.open_at("f.txt"),
+        Err(fuser::Errno::EMFILE),
+        "a promised slot counts against the cap"
+    );
+    assert_eq!(
+        backend.reserve_slot(),
+        Err(fuser::Errno::EMFILE),
+        "promises compose: no double-spend of one slot"
+    );
+    backend.release_slot();
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "returning the promise re-admits opens"
+    );
+}
+
 /// Unknown handles are EBADF, and a released handle stops
 /// serving. A duplicate release stays quiet.
 #[test]

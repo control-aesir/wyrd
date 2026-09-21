@@ -8,7 +8,7 @@ use std::sync::Arc;
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node};
 
-use crate::mutation::MutationQueue;
+use crate::mutation::{FileIdentity, MutationOutcome, MutationQueue};
 use crate::session::WriteBudget;
 
 use fuser::Filesystem as _;
@@ -487,6 +487,64 @@ fn reserved_slots_hold_room_until_returned() {
         backend.open_at("f.txt").is_ok(),
         "returning the promise re-admits opens"
     );
+}
+
+/// A resolve failure after the mutation committed inserts nothing
+/// and returns its promise: the inode table is poisoned while the
+/// create blocks in its mutation submit (the helper waits for the
+/// submission before poisoning, so the parent resolution that
+/// precedes it is unaffected), and a servicing thread completes the
+/// batch with a fabricated `Created` outcome — fault injection at
+/// the backend boundary, where only the failure handling is under
+/// test. Both opens afterwards must succeed under a cap of two: a
+/// leaked handle or promise would `EMFILE` the second.
+#[test]
+fn failed_resolve_returns_its_slot_and_inserts_nothing() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    backend.max_open_handles = 2;
+    let backend = Arc::new(backend);
+    let servicing = Arc::clone(&backend);
+    let helper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while queue.outstanding() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the create submission never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = servicing.inodes.write().unwrap();
+            panic!("poison the inode table for the resolve path");
+        }));
+        let mut batch = queue.take_batch();
+        assert_eq!(batch.len(), 1, "the create is the only submission");
+        batch.record(
+            0,
+            Ok(MutationOutcome::Created(FileIdentity::new(
+                5,
+                false,
+                Vec::new(),
+            ))),
+        );
+        batch.finish();
+    });
+    assert_eq!(
+        backend.create_at(1, "f.txt", libc::O_RDWR),
+        Err(fuser::Errno::EIO),
+        "a poisoned inode table fails the resolve"
+    );
+    helper.join().expect("the servicing thread finishes");
+    assert!(backend.open_at("f.txt").is_ok());
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "no handle leaked and no promise leaked"
+    );
+    // Plain drop: only clean read handles are open, so no commit
+    // path runs at teardown.
+    drop(backend);
 }
 
 /// Unknown handles are EBADF, and a released handle stops

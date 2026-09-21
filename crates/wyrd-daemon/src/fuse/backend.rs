@@ -545,14 +545,19 @@ where
     /// Insert into a promised slot: consumes the reservation, so room
     /// is guaranteed by the [`reserve_slot`](Self::reserve_slot)
     /// invariant (`len + reserved <= max` held at promise time, and
-    /// only this call shrinks `reserved` without growing `len`).
-    /// Lock poison still fails `EIO` — the promise is consumed
-    /// regardless, so accounting never reports a slot twice.
+    /// only this call shrinks `reserved` without growing `len`). With
+    /// no promise held the insert refuses instead of bypassing the
+    /// cap: a missing reservation is a caller bug, and failing closed
+    /// keeps it from becoming a silent over-admission. Lock poison
+    /// still fails `EIO`.
     fn insert_reserved(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
-        files.reserved = files.reserved.saturating_sub(1);
+        if files.reserved == 0 {
+            return Err(fuser::Errno::EIO);
+        }
+        files.reserved -= 1;
         let fh = files.next;
         files.next = fh.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
         files.by_handle.insert(fh, handle);
@@ -842,10 +847,20 @@ where
                 return Err(error);
             }
         };
-        // The mutation committed, so the file exists from here on:
+        // Resolve before inserting: the inode table is the last
+        // fallible step that runs while the slot is still a promise,
+        // so every failure returns it and no failed create can strand
+        // an inserted handle with no descriptor to release it by. The
+        // mutation committed, so the file exists from here on:
         // remaining failures are genuine open failures with the file
-        // present (never `EMFILE` — the promise holds the slot), and
-        // each still returns its promise.
+        // present (never `EMFILE` — the promise holds the slot).
+        let (ino, node, _) = match self.resolve_inode(&child_path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.release_slot();
+                return Err(error);
+            }
+        };
         let capture = match self.capture_for(&child_path) {
             Ok(capture) => capture,
             Err(error) => {
@@ -867,8 +882,10 @@ where
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
         };
+        // Nothing fallible follows: the inode and capture are pinned
+        // above, and `attr` is pure, so the consumed promise always
+        // becomes a served handle.
         let fh = self.insert_reserved(Handle::Write(Arc::new(Mutex::new(handle))))?;
-        let (ino, node, _) = self.resolve_inode(&child_path)?;
         let attr = self.attr(ino, &node);
         Ok((fh, ino, attr))
     }

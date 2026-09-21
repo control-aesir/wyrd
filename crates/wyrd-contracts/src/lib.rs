@@ -90,6 +90,48 @@
 //!     an owner-signed but invalid sibling is suppressed while the
 //!     genuine admission converges around it; the pusher is transport,
 //!     never authority.
+//!
+//! The upgrade contracts (`docs/upgrade-contract.md`), one per invariant:
+//!
+//! 23. `upgrade_new_encoding_is_new_representation` — re-stored content
+//!     is a no-op under the same ContentId; later writes never touch
+//!     stored objects (invariant 1).
+//! 24. `upgrade_format_versions_are_carried_on_the_wire` — the commit
+//!     envelope version rides byte 0 of every commit file (invariant
+//!     2, wire half).
+//! 25. `upgrade_old_objects_stay_readable` — a reopened object store
+//!     serves what it served before, with nothing rewritten
+//!     (invariant 3, same-version form).
+//! 26. `upgrade_previous_release_store_replays` — genuine
+//!     `v0.1.0-alpha.1` bytes open and replay under the current
+//!     build, with an oldness gate on the record tags (invariant 3,
+//!     cross-release form).
+//! 27. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
+//!     recovers committed coverage by replay, stably across restarts
+//!     (invariant 4).
+//! 28. `upgrade_mixed_versions_fail_named` — a forged envelope version
+//!     fails open with `ControlError::UnknownVersion` (invariant 5,
+//!     gate half).
+//! 29. `upgrade_reads_never_mint_authority` — open, load, and
+//!     projection write no history and mint no transitions
+//!     (invariant 6).
+//! 30. `upgrade_old_epoch_material_stays_decryptable` — the fixture's
+//!     epoch-1..2 grant still unwraps under the current build
+//!     (invariant 7).
+//! 31. `upgrade_appends_never_rewrite` — a new commit appends; existing
+//!     files stay byte-identical (invariant 8).
+//! 32. `upgrade_orphaned_temps_are_ignored` — stale `*.tmp` siblings
+//!     are walked past by open and load; the full crash boundary is
+//!     pinned in wyrd-sync's crash-matrix tests (invariant 9,
+//!     orphaned-temps form).
+//! 33. `upgrade_unknown_refuses_loudly` — unknown envelope and control
+//!     versions and a flipped commit version refuse with their names
+//!     (invariant 10).
+//!
+//! Deliberately ignored until their blockers land:
+//! `upgrade_replays_previous_fact_payload_versions` (fact-payload
+//! versioning, v0.9.0) and `upgrade_full_version_matrix_synchronizes`
+//! (capability negotiation).
 
 #[cfg(test)]
 mod fuse_contracts;
@@ -101,5 +143,7 @@ mod serving_contracts;
 mod support;
 #[cfg(test)]
 mod sync_contracts;
+#[cfg(test)]
+mod upgrade_contracts;
 #[cfg(test)]
 mod vault_contracts;

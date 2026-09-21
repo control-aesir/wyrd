@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::tests_harness::{scratch_drive, spawn_live_loop};
 
-use wyrd_format::MemoryObjectStore;
+use wyrd_format::{FsObjectStore, MemoryObjectStore};
 
 /// The whole basic lifecycle: create, write, read-your-writes,
 /// commit, release, reopen, read back. The centerpiece slice-3 test.
@@ -40,6 +40,77 @@ fn file_write_session_commits_and_reopens() {
     let reopened = backend.open_at("foo.txt").expect("reopens");
     assert_eq!(backend.read_handle(reopened, 0, 64).unwrap(), b"hello");
     backend.release_handle(reopened).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Crash boundary: buffered-but-uncommitted handle bytes are
+/// volatile. The handle is written and never committed, then the
+/// daemon is dropped without ceremony — reopening from custody must
+/// serve the committed file (empty, from create) with no trace of
+/// the uncommitted bytes. No Drop impl persists dirty handles, so
+/// this pins the commit as the exact durability line.
+#[test]
+fn uncommitted_handle_writes_die_with_the_daemon() {
+    let (engine, dir, identity) = scratch_drive();
+    {
+        let daemon = Daemon::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+        let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+        let (stop, loop_handle) = spawn_live_loop(live);
+
+        let (fh, _ino, _attr) = backend
+            .create_at(1, "volatile.txt", libc::O_RDWR)
+            .expect("create commits");
+        // The create lands through the live loop: wait until the
+        // committed empty file is visible before buffering the
+        // uncommitted bytes whose loss the crash must prove.
+        let start = std::time::Instant::now();
+        loop {
+            if backend.open_at("volatile.txt").is_ok() {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "created file never became visible"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(backend.write_handle(fh, 0, b"uncommitted").unwrap(), 11);
+        // Read-your-writes: visible on the dirty handle only.
+        assert_eq!(backend.read_handle(fh, 0, 64).unwrap(), b"uncommitted");
+
+        // Crash: the loop stops, but the handle is never committed
+        // or released — the buffered bytes die with the backend.
+        stop.store(true, Ordering::Relaxed);
+        loop_handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly");
+        drop(backend);
+    }
+
+    let reopened =
+        wyrd_sync::runtime::Engine::open_keystore(dir.clone(), "daemon-test-pass", identity)
+            .unwrap();
+    let mut daemon = Daemon::new(reopened, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (stop, loop_handle) = spawn_live_loop(live);
+    let fresh = backend
+        .open_at("volatile.txt")
+        .expect("committed file reopens");
+    assert_eq!(
+        backend.read_handle(fresh, 0, 64).unwrap(),
+        b"",
+        "uncommitted bytes never reached the vault"
+    );
+    backend.release_handle(fresh).unwrap();
 
     stop.store(true, Ordering::Relaxed);
     loop_handle

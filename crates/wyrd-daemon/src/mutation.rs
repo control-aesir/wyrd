@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use wyrd_format::ContentId;
+use wyrd_format::{ContentId, StoreFailure};
 
 /// Total admitted-but-incomplete mutations, including the one executing.
 /// Admission beyond the bound fails with [`MutationError::Saturated`]
@@ -150,9 +150,11 @@ pub enum MutationError {
     /// `EFBIG`.
     #[error("resulting size {0} exceeds the supported bound")]
     TooLarge(u64),
-    /// Object-store or tree access failed. POSIX `EIO`.
+    /// Object-store or tree access failed. A classified resource
+    /// condition keeps its errno (`ENOSPC` for a full disk, `EACCES`
+    /// for an unwritable store); everything else is POSIX `EIO`.
     #[error("object store failed")]
-    Store,
+    Store(StoreFailure),
     /// Authoring, durability, or validation failed. POSIX `EIO`.
     #[error("engine failed")]
     Engine,
@@ -166,10 +168,15 @@ pub enum MutationError {
 
 impl MutationError {
     /// Classify a format mutation failure. The structured variants map
-    /// straight through; everything else (missing tree, tree/store
-    /// failure, name/path mismatch, component errors) is an `EIO` or an
-    /// `EINVAL` at the boundary, never a silently different errno.
-    pub fn from_format<E: std::fmt::Debug>(error: wyrd_format::MutationError<E>) -> Self {
+    /// straight through; a store failure keeps its resource
+    /// classification (full and unwritable stay distinguishable at
+    /// the POSIX boundary); everything else (missing tree,
+    /// tree failure, name/path mismatch, component errors) is an
+    /// `EIO` or an `EINVAL` at the boundary, never a silently
+    /// different errno.
+    pub fn from_format<E: std::fmt::Debug + wyrd_format::StoreError>(
+        error: wyrd_format::MutationError<E>,
+    ) -> Self {
         use wyrd_format::MutationError as F;
         match error {
             F::NotADirectory(path) => MutationError::NotADirectory(path),
@@ -179,7 +186,8 @@ impl MutationError {
             F::DirectoryNotEmpty(path) => MutationError::DirectoryNotEmpty(path),
             F::InvalidRename(reason) => MutationError::InvalidRename(reason),
             F::Path(_) | F::NameMismatch { .. } => MutationError::Invalid(error.to_string()),
-            F::Store(_) | F::MissingTree(_) | F::Tree(_) => MutationError::Store,
+            F::Store(error) => MutationError::Store(error.failure()),
+            F::MissingTree(_) | F::Tree(_) => MutationError::Store(StoreFailure::Transient),
         }
     }
 }
@@ -348,7 +356,9 @@ impl Default for MutationQueue {
 
 impl MutationQueue {
     /// A queue bounded at `limit` admitted-but-incomplete requests.
-    fn with_limit(limit: usize) -> Self {
+    /// Production passes its budget at composition; tests use small
+    /// bounds to exercise saturation without thousands of threads.
+    pub(crate) fn with_limit(limit: usize) -> Self {
         MutationQueue {
             state: Mutex::new(QueueState::default()),
             work: Condvar::new(),

@@ -25,7 +25,7 @@ fn into_live_shares_view_with_backend() {
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("live.txt", b"shared").unwrap();
 
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     assert_eq!(live.generation(), 0, "the split publishes baseline zero");
     // The baseline serves before any pass runs: no empty window.
     let early = backend.open_at("live.txt").expect("baseline serves");
@@ -61,7 +61,7 @@ fn dirty_backlog_republishes_without_new_changes() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("dirty.txt", b"pending").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     live.dirty = true;
 
     let report = live
@@ -97,7 +97,7 @@ fn dirty_backlog_republishes_without_new_changes() {
 fn mkdir_through_backend_commits_and_serves() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
@@ -113,6 +113,7 @@ fn mkdir_through_backend_commits_and_serves() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
         )
@@ -148,6 +149,96 @@ fn mkdir_through_backend_commits_and_serves() {
         backend.mkdir_at(1, ""),
         Err(fuser::Errno::EINVAL),
         "an invalid name is EINVAL"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Composition stores the config it was given: there is one source
+/// of truth for resource policy, and the loop paces admission from
+/// the stored copy of the same value `run_loop` supervises with.
+#[test]
+fn into_live_stores_the_composition_config_budgets() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let config = LiveConfig {
+        budgets: ResourceBudgets {
+            max_admit_per_pass: 2,
+            max_open_handles: 7,
+            ..ResourceBudgets::default()
+        },
+        ..LiveConfig::default()
+    };
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &config);
+    assert_eq!(
+        live.budgets, config.budgets,
+        "the loop paces from the composed config, not a silent default"
+    );
+    assert_eq!(live.budgets.max_admit_per_pass, 2);
+    assert_eq!(live.budgets.max_open_handles, 7);
+    drop(live);
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A create refused `EMFILE` creates nothing: the handle-cap
+/// pre-check runs before the create mutation is submitted, so a
+/// saturated table fails without a namespace side effect. (The
+/// residual check-then-insert race keeps kernel-matching
+/// create-then-`EMFILE` semantics; this pins the deterministic
+/// saturated case.)
+#[test]
+fn create_at_saturated_table_creates_nothing() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon.put_file("live.txt", b"shared").unwrap();
+    // One config for composition and loop: the backend's handle cap
+    // and the loop's admission cap come from the same value.
+    let config = LiveConfig {
+        interval: Duration::from_millis(10),
+        error_base_delay: Duration::from_millis(5),
+        error_max_delay: Duration::from_millis(20),
+        max_consecutive_errors: 10,
+        budgets: ResourceBudgets {
+            max_open_handles: 1,
+            ..ResourceBudgets::default()
+        },
+    };
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &config);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let loop_handle = std::thread::spawn(move || {
+        let mut live = live;
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &config,
+            &mut |_, _| {},
+        )
+    });
+
+    let reader = backend.open_at("live.txt").expect("baseline serves");
+    assert_eq!(
+        backend.create_at(1, "new.txt", libc::O_RDWR),
+        Err(fuser::Errno::EMFILE),
+        "a saturated table refuses before mutating"
+    );
+    assert!(backend.release_handle(reader).is_ok());
+    // The table drained and no file exists: absent path, not a
+    // leftover handle or a ghost create.
+    assert_eq!(
+        backend.open_at("new.txt").unwrap_err(),
+        fuser::Errno::ENOENT,
+        "the refused create left no file behind"
     );
 
     stop.store(true, Ordering::Relaxed);

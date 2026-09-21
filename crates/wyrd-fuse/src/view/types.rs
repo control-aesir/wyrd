@@ -1,5 +1,5 @@
 use thiserror::Error;
-use wyrd_format::{ContentId, FetchStatus};
+use wyrd_format::{ContentId, FetchStatus, StoreFailure};
 
 pub trait Materialization {
     fn status(&self, id: &ContentId) -> FetchStatus;
@@ -77,9 +77,10 @@ pub struct OpenFile {
     pub(crate) size: u64,
 }
 
-/// Read-only failures. Store failures carry their debug string: the
-/// store seam is infallible in practice, so anything raised here is a
-/// local data-path failure.
+/// Read-only failures. Store failures carry the resource
+/// classification plus the debug string: a full or unwritable disk
+/// reads differently from a torn data path, so the classification
+/// travels with the error instead of being re-derived from text.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ViewError {
     #[error("no such path")]
@@ -103,8 +104,8 @@ pub enum ViewError {
     Unavailable,
     #[error("content failed verification; scrub and repair before surfacing")]
     Corrupt,
-    #[error("local store failure: {0}")]
-    Store(String),
+    #[error("local store failure: {1}")]
+    Store(StoreFailure, String),
 }
 
 /// Why a symlink target cannot be served to the kernel. Targets are

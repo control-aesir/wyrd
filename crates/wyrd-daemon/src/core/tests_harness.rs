@@ -100,6 +100,7 @@ pub(super) fn spawn_live_loop(
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
         )

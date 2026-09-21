@@ -21,8 +21,62 @@ use thiserror::Error;
 /// their address. Raw payload bytes are stored, not envelopes — framing is
 /// reconstructed by [`crate::envelope::Envelope`] when objects are
 /// exchanged.
+/// How a store failure limits the caller: the classification the
+/// daemon and sync layers branch on instead of matching rendered error
+/// strings. Data faults (identity mismatch, corruption) stay error
+/// variants on each store's own error type — they are sender or disk
+/// content problems, never resource conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFailure {
+    /// Anything not classified below: poisoned locks, transient I/O,
+    /// test doubles. Retried next pass, `EIO` at the mount.
+    Transient,
+    /// The disk (or quota) is full. Fails the sync pass fast and reads
+    /// as `ENOSPC` at the mount — retrying without freeing space is
+    /// pointless, so this never counts as a benign local failure.
+    StorageFull,
+    /// The store is not writable by this process. Fails the sync pass
+    /// fast and reads as `EACCES` at the mount.
+    PermissionDenied,
+}
+
+impl StoreFailure {
+    /// One classification rule for every disk-backed store: full and
+    /// unwritable classify; everything else is transient. Both the
+    /// plaintext object store and the sync vault funnel through here,
+    /// so the two disk writers can never disagree on what "full" is.
+    pub fn of_io(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+                StoreFailure::StorageFull
+            }
+            std::io::ErrorKind::PermissionDenied => StoreFailure::PermissionDenied,
+            _ => StoreFailure::Transient,
+        }
+    }
+}
+
+impl std::fmt::Display for StoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreFailure::Transient => write!(f, "transient store failure"),
+            StoreFailure::StorageFull => write!(f, "disk full"),
+            StoreFailure::PermissionDenied => write!(f, "store not writable"),
+        }
+    }
+}
+
+/// The classification half of a store error. The default is
+/// [`StoreFailure::Transient`], so in-memory and test stores implement
+/// it with an empty impl and only disk-backed stores override it.
+pub trait StoreError {
+    fn failure(&self) -> StoreFailure {
+        StoreFailure::Transient
+    }
+}
+
 pub trait ObjectStore {
-    type Error;
+    type Error: StoreError;
 
     /// Store content of the given kind; the store computes and returns its
     /// Content ID.
@@ -86,6 +140,8 @@ pub enum MemoryStoreError {
     #[error("identity mismatch: expected {expected}, derived {derived}")]
     IdentityMismatch { expected: String, derived: String },
 }
+
+impl StoreError for MemoryStoreError {}
 
 impl MemoryStoreError {
     fn mismatch(expected: &ContentId, derived: &ContentId) -> Self {
@@ -178,6 +234,18 @@ impl<S> SharedStore<S> {
 impl<S> From<Arc<RwLock<S>>> for SharedStore<S> {
     fn from(store: Arc<RwLock<S>>) -> Self {
         SharedStore { store }
+    }
+}
+
+impl<E: StoreError> StoreError for SharedStoreError<E> {
+    /// A poisoned lock is transient (the pass retries); a backing-store
+    /// failure carries the backing store's own classification, so a full
+    /// disk under a shared handle still reads as full.
+    fn failure(&self) -> StoreFailure {
+        match self {
+            SharedStoreError::Store(error) => error.failure(),
+            SharedStoreError::Lock => StoreFailure::Transient,
+        }
     }
 }
 

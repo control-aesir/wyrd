@@ -348,7 +348,11 @@ fn mount(
     eprintln!("serving over iroh: {serving_id}");
     tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
 
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    // Operational policy in one place: the loop and the serving
+    // backend share this config's budgets, wired into both halves
+    // by `into_live` below.
+    let config = LiveConfig::default();
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &config);
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity
@@ -416,7 +420,7 @@ fn mount(
         &mut mailbox,
         Some(&mut bulk),
         &SHUTDOWN,
-        &LiveConfig::default(),
+        &config,
         &mut |error, consecutive| {
             eprintln!("live sync pass failed ({consecutive} consecutive): {error}");
             tracing::warn!(stage = "sync", consecutive, error = %error, "live sync pass failed");

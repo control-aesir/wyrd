@@ -8,7 +8,7 @@ use std::sync::Arc;
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node};
 
-use crate::mutation::MutationQueue;
+use crate::mutation::{FileIdentity, MutationOutcome, MutationQueue};
 use crate::session::WriteBudget;
 
 use fuser::Filesystem as _;
@@ -401,6 +401,150 @@ fn directory_handles_pin_their_enumeration_generation() {
         .map(|(_, _, name)| name.clone())
         .collect();
     assert!(after.contains(&"new.txt".to_string()));
+}
+
+/// Past the open-handle cap, opens refuse `EMFILE` and the refused
+/// handle holds nothing — while already-open handles keep serving
+/// and a release drains room for the next open.
+#[test]
+fn open_handles_refuse_emfile_past_the_cap() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    backend.max_open_handles = 1;
+    let first = backend.open_at("f.txt").unwrap();
+    assert_eq!(
+        backend.open_at("f.txt"),
+        Err(fuser::Errno::EMFILE),
+        "a saturated handle table refuses new opens"
+    );
+    assert!(
+        backend.read_handle(first, 0, 4).is_ok(),
+        "open handles serve on"
+    );
+    assert!(backend.release_handle(first).is_ok());
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "releasing drains room for the next open"
+    );
+}
+
+/// A truncated open refused `EMFILE` leaks no budget: the
+/// dirty-handle mark the truncate reservation took is unwound, so
+/// saturated-table failures never permanently consume write budget
+/// and turn later writes into phantom `ENOSPC`.
+#[test]
+fn failed_truncated_open_releases_its_budget_reservation() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    backend.mutations = Some(Arc::new(MutationQueue::default()));
+    backend.max_open_handles = 1;
+    let reader = backend.open_at("f.txt").unwrap();
+    assert_eq!(
+        backend.open_write("f.txt", libc::O_RDWR | libc::O_TRUNC),
+        Err(fuser::Errno::EMFILE),
+        "a saturated table refuses before reserving"
+    );
+    assert_eq!(
+        backend.budget.dirty_handles(),
+        0,
+        "no leaked dirty-handle mark"
+    );
+    assert_eq!(backend.budget.total(), 0, "no leaked aggregate bytes");
+    // Draining room restores normal opens: the refused truncate left
+    // no permanent `ENOSPC` behind. The dirty handle is dropped with
+    // the backend instead of released: releasing a dirty handle
+    // commits through the mutation channel, which has no loop here.
+    assert!(backend.release_handle(reader).is_ok());
+    let _truncated = backend
+        .open_write("f.txt", libc::O_RDWR | libc::O_TRUNC)
+        .unwrap();
+    assert_eq!(backend.budget.dirty_handles(), 1);
+    backend.destroy();
+}
+
+/// A promised slot holds room like an open handle: while it is
+/// held, unreserved opens refuse, and returning it re-admits them.
+/// This is the accounting `create_at` closes its check-then-insert
+/// race with — the promise spans the blocking mutation submit.
+/// (The consuming half, `insert_reserved`, is pinned end to end by
+/// the core create tests: only a real committed create can supply
+/// the handle it inserts.)
+#[test]
+fn reserved_slots_hold_room_until_returned() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    backend.max_open_handles = 1;
+    backend.reserve_slot().unwrap();
+    assert_eq!(
+        backend.open_at("f.txt"),
+        Err(fuser::Errno::EMFILE),
+        "a promised slot counts against the cap"
+    );
+    assert_eq!(
+        backend.reserve_slot(),
+        Err(fuser::Errno::EMFILE),
+        "promises compose: no double-spend of one slot"
+    );
+    backend.release_slot();
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "returning the promise re-admits opens"
+    );
+}
+
+/// A resolve failure after the mutation committed inserts nothing
+/// and returns its promise: the inode table is poisoned while the
+/// create blocks in its mutation submit (the helper waits for the
+/// submission before poisoning, so the parent resolution that
+/// precedes it is unaffected), and a servicing thread completes the
+/// batch with a fabricated `Created` outcome — fault injection at
+/// the backend boundary, where only the failure handling is under
+/// test. Both opens afterwards must succeed under a cap of two: a
+/// leaked handle or promise would `EMFILE` the second.
+#[test]
+fn failed_resolve_returns_its_slot_and_inserts_nothing() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    backend.max_open_handles = 2;
+    let backend = Arc::new(backend);
+    let servicing = Arc::clone(&backend);
+    let helper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while queue.outstanding() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the create submission never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = servicing.inodes.write().unwrap();
+            panic!("poison the inode table for the resolve path");
+        }));
+        let mut batch = queue.take_batch();
+        assert_eq!(batch.len(), 1, "the create is the only submission");
+        batch.record(
+            0,
+            Ok(MutationOutcome::Created(FileIdentity::new(
+                5,
+                false,
+                Vec::new(),
+            ))),
+        );
+        batch.finish();
+    });
+    assert_eq!(
+        backend.create_at(1, "f.txt", libc::O_RDWR),
+        Err(fuser::Errno::EIO),
+        "a poisoned inode table fails the resolve"
+    );
+    helper.join().expect("the servicing thread finishes");
+    assert!(backend.open_at("f.txt").is_ok());
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "no handle leaked and no promise leaked"
+    );
+    // Plain drop: only clean read handles are open, so no commit
+    // path runs at teardown.
+    drop(backend);
 }
 
 /// Unknown handles are EBADF, and a released handle stops

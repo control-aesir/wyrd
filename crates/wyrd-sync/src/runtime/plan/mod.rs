@@ -80,10 +80,14 @@ pub(super) fn execute(
                                     report.snapshot_bodies += 1;
                                     engine.note_fetch_fulfilled(&body_key);
                                 }
-                                Err(_) => {
+                                Err(error) => {
+                                    // A full or unwritable disk aborts the
+                                    // pass; anything else is a local I/O
+                                    // condition that never strikes.
+                                    if let Some(fatal) = super::fetch::fatal_vault(&error) {
+                                        return Err(EngineError::Store(fatal));
+                                    }
                                     report.local_failures += 1;
-                                    // Locally refused imports never strike:
-                                    // the retry is a local I/O condition.
                                 }
                             }
                         }
@@ -101,6 +105,7 @@ pub(super) fn execute(
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,
                 FetchOutcome::Local => report.local_failures += 1,
+                FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
         for snapshot in &plan.pending_snapshots {
@@ -133,6 +138,7 @@ pub(super) fn execute(
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,
                 FetchOutcome::Local => report.local_failures += 1,
+                FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
         for (id, link) in &plan.pending_manifests {
@@ -165,6 +171,7 @@ pub(super) fn execute(
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,
                 FetchOutcome::Local => report.local_failures += 1,
+                FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
         for (content, candidates) in &plan.pending_objects {
@@ -215,6 +222,7 @@ pub(super) fn execute(
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,
                 FetchOutcome::Local => report.local_failures += 1,
+                FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
 

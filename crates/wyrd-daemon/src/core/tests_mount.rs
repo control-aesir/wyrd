@@ -17,7 +17,7 @@ use wyrd_format::MemoryObjectStore;
 fn mount_roundtrip_and_write_coherence() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let names = |backend: &FuseBackend<MemoryObjectStore, DaemonMaterialization>, fh: u64| {
@@ -96,7 +96,7 @@ fn mount_roundtrip_and_write_coherence() {
 fn append_commits_onto_the_current_end() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     // Truncate-then-append is not representable in the v0 model and
@@ -166,7 +166,7 @@ fn append_commits_onto_the_current_end() {
 fn append_handle_reads_stay_coherent_after_commit() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
@@ -214,7 +214,7 @@ fn append_handle_reads_stay_coherent_after_commit() {
 fn append_after_removal_or_kind_change_is_stale() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
@@ -261,7 +261,7 @@ fn append_after_removal_or_kind_change_is_stale() {
 fn stale_writable_handle_after_namespace_change() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     // Rename under an open handle.

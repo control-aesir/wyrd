@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use wyrd_format::{
-    Component, ContentId, EntryContent, FetchStatus, ObjectStore, Snapshot, Tree, MAX_PATH_DEPTH,
+    Component, ContentId, EntryContent, FetchStatus, ObjectStore, Snapshot, StoreError,
+    StoreFailure, Tree, MAX_PATH_DEPTH,
 };
 
 use super::grammar;
@@ -70,7 +71,7 @@ where
     pub fn store_read(&self) -> Result<RwLockReadGuard<'_, S>, ViewError> {
         self.store
             .read()
-            .map_err(|_| ViewError::Store("store lock poisoned".into()))
+            .map_err(|_| ViewError::Store(StoreFailure::Transient, "store lock poisoned".into()))
     }
 
     /// Write the backing object store. Same fail-closed poison mapping
@@ -78,7 +79,7 @@ where
     pub fn store_write(&self) -> Result<RwLockWriteGuard<'_, S>, ViewError> {
         self.store
             .write()
-            .map_err(|_| ViewError::Store("store lock poisoned".into()))
+            .map_err(|_| ViewError::Store(StoreFailure::Transient, "store lock poisoned".into()))
     }
 
     /// Replace the head set: "current" is policy over heads, and the
@@ -372,7 +373,7 @@ where
         match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Tree::decode(&bytes).map_err(|_| ViewError::Corrupt),
             Ok(None) => Err(self.absent(id)),
-            Err(error) => Err(ViewError::Store(format!("{error:?}"))),
+            Err(error) => Err(ViewError::Store(error.failure(), format!("{error:?}"))),
         }
     }
 
@@ -381,7 +382,7 @@ where
         match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Ok(bytes),
             Ok(None) => Err(self.absent(id)),
-            Err(error) => Err(ViewError::Store(format!("{error:?}"))),
+            Err(error) => Err(ViewError::Store(error.failure(), format!("{error:?}"))),
         }
     }
 

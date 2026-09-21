@@ -26,7 +26,7 @@ use crate::mutation::MutationQueue;
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
-use super::live::LiveDaemon;
+use super::live::{LiveConfig, LiveDaemon};
 
 /// The daemon's bridge from `wyrd-sync`'s verified snapshots to the
 /// view's heads: the one in-tree implementation of [`VerifiedSnapshot`],
@@ -362,21 +362,30 @@ where
     /// I/O. The composer's synchronously refreshed view is adopted as
     /// the baseline generation, so the backend never serves an empty
     /// view while the engine already has heads.
+    /// Split with explicit resource bounds: the registries and the
+    /// backend enforce their own refusals from the config's budgets,
+    /// and the loop paces admission from the stored copy of the same
+    /// value, so one [`LiveConfig`] governs every live-operation
+    /// bound. Compose and run with the same config value — `run_loop`
+    /// takes it for supervision, `into_live` for composition.
     pub fn into_live(
         self,
         open_timeout: Duration,
+        config: &LiveConfig,
     ) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
         let revision = self.engine.current();
         let store = self.view.store_handle();
         let baseline = Projection::initial(self.view, revision);
         let projection = Arc::new(RwLock::new(Arc::new(baseline)));
-        let wants = Arc::new(WantRegistry::default());
-        let mutations = Arc::new(MutationQueue::default());
+        let budgets = config.budgets;
+        let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
+        let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
         let backend = FuseBackend::shared_with_wants(
             Arc::clone(&projection),
             Arc::clone(&wants),
             Arc::clone(&mutations),
             open_timeout,
+            &budgets,
         );
         (
             LiveDaemon {
@@ -387,6 +396,7 @@ where
                 mutations,
                 published_revision: revision,
                 dirty: false,
+                budgets,
             },
             backend,
         )

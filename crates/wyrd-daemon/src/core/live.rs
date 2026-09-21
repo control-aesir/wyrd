@@ -71,19 +71,41 @@ pub enum FailureClass {
 }
 
 impl FailureClass {
+    /// The ledger slot for this class: the loop keeps one consecutive
+    /// counter and one backoff per class, indexed by this value.
+    fn index(self) -> usize {
+        match self {
+            FailureClass::Mailbox => 0,
+            FailureClass::Store => 1,
+            FailureClass::Engine => 2,
+        }
+    }
+
     /// Consecutive failures of this class absorbed before the loop
     /// aborts. Store failures are local and deterministic (a full disk
     /// does not heal on retry), so their budget is deliberately tight;
-    /// mailbox failures ride out long relay outages on a healthy
-    /// mount; engine failures keep the historical cap.
-    pub fn max_consecutive(self) -> u32 {
+    /// mailbox failures ride out long relay outages on a healthy mount;
+    /// engine failures use the configured generic cap
+    /// ([`LiveConfig::max_consecutive_errors`]), preserving the
+    /// historical behavior for everything that is not classified as a
+    /// mailbox or store failure.
+    pub fn max_consecutive(self, config: &LiveConfig) -> u32 {
         match self {
-            FailureClass::Mailbox => 60,
-            FailureClass::Store => 3,
-            FailureClass::Engine => 10,
+            FailureClass::Mailbox => MAILBOX_MAX_CONSECUTIVE_ERRORS,
+            FailureClass::Store => STORE_MAX_CONSECUTIVE_ERRORS,
+            FailureClass::Engine => config.max_consecutive_errors,
         }
     }
 }
+
+/// Consecutive mailbox-class failures absorbed before the loop aborts:
+/// long enough to ride out a relay outage on a healthy local mount.
+pub const MAILBOX_MAX_CONSECUTIVE_ERRORS: u32 = 60;
+
+/// Consecutive store-class failures absorbed before the loop aborts: a
+/// full disk or unwritable store does not heal on retry, so terminate
+/// quickly instead of spinning against a dead disk.
+pub const STORE_MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
 impl From<&LiveError> for FailureClass {
     fn from(error: &LiveError) -> Self {
@@ -140,20 +162,25 @@ pub struct LiveSummary {
 
 /// Supervision policy for [`LiveDaemon::run_loop`].
 pub struct LiveConfig {
-    /// Idle poll interval between passes. Remote updates land within
-    /// roughly one interval; sub-interval latency is future work.
+    /// Idle pacing deadline between passes: the staleness bound, not a
+    /// poll interval. Producers (mutation submissions, mailbox intake,
+    /// shutdown) wake the loop immediately, so this only bounds how
+    /// long total silence may delay a pass.
     pub interval: Duration,
-    /// Backoff slept after a failed pass before retrying; doubles per
-    /// consecutive failure up to `error_max_delay`, so the first
-    /// failure sleeps exactly this long.
+    /// Backoff slept after a failed pass before retrying; equal-jittered
+    /// and doubling per consecutive failure of the same class up to
+    /// `error_max_delay`.
     pub error_base_delay: Duration,
-    /// Backoff ceiling for consecutive failures.
+    /// Backoff ceiling for consecutive failures of one class.
     pub error_max_delay: Duration,
-    /// Consecutive failed passes retried before the loop aborts: a
-    /// value of N means N failures are absorbed and the (N+1)th
-    /// consecutive failure returns the last error. A supervisor
-    /// restarts the process; the durable engine state and seen log
-    /// make the restart pick up cleanly.
+    /// Consecutive *engine-class* failed passes retried before the loop
+    /// aborts: a value of N means N failures are absorbed and the
+    /// (N+1)th consecutive failure returns the last error. Mailbox and
+    /// store failures use their own fixed caps
+    /// ([`MAILBOX_MAX_CONSECUTIVE_ERRORS`], [`STORE_MAX_CONSECUTIVE_ERRORS`])
+    /// because their right budgets differ by orders of magnitude. A
+    /// supervisor restarts the process; the durable engine state and
+    /// seen log make the restart pick up cleanly.
     pub max_consecutive_errors: u32,
     /// Resource bounds enforced at the loop and serving boundaries.
     /// Defaults are the historical hardcoded bounds, so default
@@ -879,11 +906,12 @@ where
                     }
                 }
                 Err(error) => {
-                    let class = FailureClass::from(&error) as usize;
-                    consecutive[class] += 1;
+                    let class = FailureClass::from(&error);
+                    let index = class.index();
+                    consecutive[index] += 1;
                     summary.errors_retried += 1;
-                    observe(&error, consecutive[class]);
-                    if consecutive[class] > FailureClass::from(&error).max_consecutive() {
+                    observe(&error, consecutive[index]);
+                    if consecutive[index] > class.max_consecutive(config) {
                         // Terminal: no further pass will drain, so complete
                         // still-queued submitters now — returning first
                         // would strand every admitted caller forever.
@@ -894,11 +922,11 @@ where
                     // trip or an admitted mutation still lands mid-retry:
                     // backoff paces the failing class, it never blocks
                     // progress or shutdown.
-                    if waker.wait(stop, backoff(delay[class], config.error_max_delay)) == Wake::Stop
+                    if waker.wait(stop, backoff(delay[index], config.error_max_delay)) == Wake::Stop
                     {
                         break;
                     }
-                    delay[class] = delay[class].saturating_mul(2).min(config.error_max_delay);
+                    delay[index] = delay[index].saturating_mul(2).min(config.error_max_delay);
                 }
             }
         }

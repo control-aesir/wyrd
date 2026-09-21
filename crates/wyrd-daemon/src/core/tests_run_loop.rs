@@ -108,10 +108,14 @@ fn run_loop_aborts_after_mailbox_error_cap() {
         &mut |_, _| observed += 1,
     );
     assert!(result.is_err(), "the cap aborts the loop");
-    let class_cap = FailureClass::from(result.as_ref().err().unwrap()).max_consecutive();
+    let class_cap = FailureClass::from(result.as_ref().err().unwrap()).max_consecutive(&config);
     // Errors at consecutive counts 1..=cap+1 (the +1 trips the cap).
     assert_eq!(observed, class_cap + 1);
-    assert_eq!(class_cap, 60, "mailbox failures ride a long budget");
+    assert_eq!(class_cap, MAILBOX_MAX_CONSECUTIVE_ERRORS);
+    assert_eq!(
+        class_cap, 60,
+        "mailbox failures ride a long budget, ignoring the generic cap"
+    );
 
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
@@ -140,9 +144,20 @@ fn failure_classes_classify_and_cap_independently() {
     assert_eq!(FailureClass::from(&engine), FailureClass::Engine);
     assert_eq!(FailureClass::from(&LiveError::Lock), FailureClass::Engine);
 
-    assert_eq!(FailureClass::Mailbox.max_consecutive(), 60);
-    assert_eq!(FailureClass::Store.max_consecutive(), 3);
-    assert_eq!(FailureClass::Engine.max_consecutive(), 10);
+    assert_eq!(
+        FailureClass::Mailbox.max_consecutive(&LiveConfig::default()),
+        MAILBOX_MAX_CONSECUTIVE_ERRORS
+    );
+    assert_eq!(
+        FailureClass::Store.max_consecutive(&LiveConfig::default()),
+        STORE_MAX_CONSECUTIVE_ERRORS
+    );
+    // The engine class honors the configured generic cap.
+    let configured = LiveConfig {
+        max_consecutive_errors: 7,
+        ..LiveConfig::default()
+    };
+    assert_eq!(FailureClass::Engine.max_consecutive(&configured), 7);
 }
 
 /// Block until a mutation submission lands in pending (or fail on

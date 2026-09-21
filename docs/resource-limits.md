@@ -68,9 +68,14 @@ Raise vs count follows `error-conventions.md`: a fatal disk
 condition aborts the pass (retrying without freeing space or fixing
 permissions converges to nothing, and succeeding while nothing lands
 would stall silently), while transient refusals count per item and
-retry next pass. The run loop's backoff and consecutive-error cap
-govern the aborted pass like any other engine failure; the supervisor
-restarts the process and durable state picks up cleanly.
+retry next pass. The run loop classifies each failed pass as mailbox,
+store, or engine and supervises the classes independently, with
+equal-jittered capped backoff and a separate consecutive-failure cap
+per class: a store failure terminates the mount after a few passes (a
+dead disk does not heal on retry), a mailbox failure rides out a long
+relay outage on an otherwise healthy mount, and any other engine
+failure uses the configured generic cap. A supervisor restarts the
+process and durable state picks up cleanly.
 
 Data faults stay separate: identity mismatch and corruption are error
 variants on each store's own type, never `StoreFailure` — they are
@@ -89,8 +94,9 @@ surfaces:
   `EAGAIN`): the refusal itself is the signal, logged per request
   by the backend's request probe.
 - `LiveError::Engine(EngineError::Store(_))`: the pass-failure
-  form of a fatal disk condition, subject to the loop's backoff
-  and error cap like any engine failure.
+  form of a fatal disk condition, in the store class with its tight
+  backoff and cap, so it terminates the mount quickly rather than
+  spinning against a dead disk.
 
 ## Mailbox saturation
 

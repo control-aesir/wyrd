@@ -23,4 +23,7 @@ mod tests_sync;
 
 pub use crate::budgets::ResourceBudgets;
 pub use daemon::{Daemon, DaemonError, DaemonMaterialization, LiveHead, WriteError};
-pub use live::{FailureClass, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};
+pub use live::{
+    FailureClass, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport,
+    MAILBOX_MAX_CONSECUTIVE_ERRORS, STORE_MAX_CONSECUTIVE_ERRORS,
+};

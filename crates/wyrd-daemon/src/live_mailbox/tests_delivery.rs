@@ -1,5 +1,5 @@
 use super::tests_harness::{
-    assert_quiet, device_id, envelope, keys, live_mailbox, sender_keys, temp_path,
+    assert_quiet, device_id, envelope, keys, live_mailbox, seal_rumor, sender_keys, temp_path,
     wait_for_delivery, wait_for_health, DELIVERY_TIMEOUT, OUTAGE_TIMEOUT, RECOVERY_TIMEOUT,
 };
 use super::*;
@@ -382,4 +382,59 @@ fn empty_relay_config_connects_and_stays_idle() {
     )
     .expect("connects without relays");
     assert_quiet(&mut mailbox);
+}
+
+/// Acceptance: new mailbox work wakes intake without waiting out the
+/// pacing deadline. The drainer pokes the attached signal when it
+/// forwards an event, so a loop parked in its idle wait runs the next
+/// pass immediately instead of sleeping to the deadline.
+#[test]
+fn intake_delivery_pokes_the_attached_waker() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let relays = vec![url];
+    let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-intake-wake"));
+
+    let waker = std::sync::Arc::new(crate::lifecycle::WakeSignal::default());
+    mailbox.attach_waker(std::sync::Arc::clone(&waker));
+
+    relay.inject(seal_rumor(
+        &sender,
+        receiver.public_key(),
+        "wake-intake".to_string(),
+    ));
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        waker.wait(&stop, Duration::from_secs(10)),
+        crate::lifecycle::Wake::Signal,
+        "a forwarded delivery must poke the pacing signal"
+    );
+    // The event is genuinely deliverable, not just a spurious poke.
+    let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("mail arrives");
+    assert_eq!(delivery.envelope().ciphertext, "wake-intake");
+}
+
+/// Acceptance: shutdown cancels the mailbox tasks within a bounded
+/// deadline, and is idempotent. Without a deadline a wedged recovery
+/// episode could hold teardown open indefinitely.
+#[test]
+fn shutdown_cancels_tasks_within_the_deadline() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let receiver = keys();
+    let mut mailbox = live_mailbox(&receiver, &[url], temp_path("seen-shutdown-deadline"));
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+
+    let start = Instant::now();
+    mailbox.shutdown(Duration::from_secs(5));
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "shutdown returns within its deadline, took {:?}",
+        start.elapsed()
+    );
+    // Idempotent: a second shutdown finds no runtime and returns at once.
+    mailbox.shutdown(Duration::from_secs(5));
 }

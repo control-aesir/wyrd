@@ -158,6 +158,18 @@ jobs:
           echo "===== nextest =====" >> /tmp/rust.log
           cargo nextest run --color never --workspace 2>&1 | tee -a /tmp/rust.log
 
+      # The >10s live-relay integration tests (flood, saturation replay,
+      # outage recovery) are excluded from the default profile so local
+      # and PR runs stay fast; this master-only gate runs the `slow`
+      # profile that selects exactly them. Opt-in tests needing a public
+      # relay or kernel FUSE stay `#[ignore]`d and never run in CI.
+      - name: Slow integration tests (master)
+        if: github.ref == 'refs/heads/master'
+        run: |
+          set -o pipefail
+          echo "===== nextest (slow, master) =====" >> /tmp/rust.log
+          cargo nextest run --color never --workspace --profile slow 2>&1 | tee -a /tmp/rust.log
+
       # Nextest skips doctests; this gate keeps them validated as API
       # examples appear. Cheap while empty, load-bearing later.
       - name: Doctests

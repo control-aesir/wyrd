@@ -5,10 +5,25 @@
 # the rest of the suite keeps full parallelism.
 [test-groups]
 mailbox-flood = { max-threads = 1 }
+mailbox-slow = { max-threads = 1 }
 contracts-serial = { max-threads = 1 }
 # The whole contracts binary runs its tests one at a time (other
 # binaries keep full parallelism: groups only constrain their own
 # process). See the override below for why.
+
+# The >10s live-relay integration tests (flood, saturation replay,
+# outage recovery) are excluded from the default profile so local and
+# PR runs stay fast, and included in the `slow` profile the master CI
+# gate runs. They stay ordinary tests, not `#[ignore]`d: the ignore
+# attribute is reserved for tests that need external resources (a public
+# relay, kernel FUSE) or are blocked on future work, which must never
+# run in CI. Substrings are distinctive enough to select exactly these
+# five without a name-by-name list at each call site.
+[profile.default]
+default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down))"
+
+[profile.slow]
+default-filter = "test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down)"
 
 [[profile.default.overrides]]
 filter = 'test(flood)'
@@ -38,3 +53,10 @@ test-group = 'mailbox-flood'
 [[profile.default.overrides]]
 filter = 'package(wyrd-contracts)'
 test-group = 'contracts-serial'
+
+# The slow profile runs only the five heavy tests above; serializing the
+# whole binary keeps them from oversubscribing the machine (same reason
+# as the default-profile flood group).
+[[profile.slow.overrides]]
+filter = 'all()'
+test-group = 'mailbox-slow'

@@ -12,7 +12,7 @@ use crate::probes::combine_status;
 use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
-use wyrd_daemon::{Daemon, LiveConfig, LiveError, Supervisor};
+use wyrd_daemon::{Daemon, FailureClass, LiveConfig, LiveError, Supervisor};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
@@ -402,14 +402,13 @@ fn mount(
     #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
-    // One lifecycle supervisor owns the stop flag and the mutation
-    // queue: session end trips shutdown below, loop end settles the
-    // queue after run_loop returns. Either direction alone strands
-    // somebody — a dead session with a syncing loop, or a dead loop
-    // with blocked submitters — so both are wired.
-    // TEMPORARY (event-driven supervision WIP): into_live does not yet
-    // create the pacing signal; wire a standalone one until the loop
-    // owns it. Session end still trips the loop promptly.
+    // One lifecycle supervisor owns the stop flag, the mutation queue,
+    // and the loop's pacing signal: session end trips shutdown below,
+    // loop end settles the queue after run_loop returns. Either
+    // direction alone strands somebody — a dead session with a syncing
+    // loop, or a dead loop with blocked submitters — so both are wired.
+    // The signal is created and attached by `into_live`; sharing it
+    // here means a trip also pokes the loop out of its idle wait.
     let supervisor = Supervisor::new(
         Arc::clone(live.mutations()),
         &SHUTDOWN,
@@ -438,8 +437,20 @@ fn mount(
         &SHUTDOWN,
         &config,
         &mut |error, consecutive| {
-            eprintln!("live sync pass failed ({consecutive} consecutive): {error}");
-            tracing::warn!(stage = "sync", consecutive, error = %error, "live sync pass failed");
+            // `consecutive` counts failures of this error's class, not
+            // of every class combined: each class backs off and trips
+            // its cap independently.
+            let class = FailureClass::from(error);
+            eprintln!(
+                "live sync pass failed ({class:?} class, {consecutive} consecutive): {error}"
+            );
+            tracing::warn!(
+                stage = "sync",
+                class = ?class,
+                consecutive,
+                error = %error,
+                "live sync pass failed"
+            );
         },
     );
     // The loop returned cleanly or terminally: settle the mutation

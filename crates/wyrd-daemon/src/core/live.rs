@@ -24,31 +24,33 @@ use crate::want::WantRegistry;
 
 use super::daemon::{verified_heads, view_heads, DaemonMaterialization};
 
-/// Equal-jitter cap for backoff sleeps: the random half of an equal-
-/// jittered delay. Decorrelates retry storms across daemons without a
-/// clock dependency (no wall-time reads on the supervision path).
-const MAX_JITTER_HALF: Duration = Duration::from_millis(250);
-
-/// Draw a random duration in `[0, half)`. Entropy comes from the OS
+/// Draw a random duration in `[0, bound)`. Entropy comes from the OS
 /// CSPRNG (the approved substrate); a draw failure falls back to zero
 /// jitter — the base delay alone is still capped backoff, just less
 /// decorrelated, so a rare entropy failure degrades pacing quality,
 /// never correctness.
-fn jitter_half() -> Duration {
+fn jitter_below(bound: Duration) -> Duration {
+    let nanos = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
+    if nanos == 0 {
+        return Duration::ZERO;
+    }
     let mut buf = [0u8; 8];
     if getrandom::getrandom(&mut buf).is_err() {
         return Duration::ZERO;
     }
-    Duration::from_nanos(u64::from_le_bytes(buf) % MAX_JITTER_HALF.as_nanos() as u64)
+    Duration::from_nanos(u64::from_le_bytes(buf) % nanos)
 }
 
-/// Equal-jittered capped backoff: sleep `base/2 + [0, base/2)`, so the
-/// first failure waits about half the base delay and retry attempts
-/// across processes do not synchronize. Capped at `max`.
+/// Equal-jittered capped backoff: sleep `capped/2 + [0, capped/2)` where
+/// `capped = min(base, max)`, so the first failure waits about half the
+/// base delay and retry attempts across processes do not synchronize.
+/// The random half is drawn from the capped delay, so the full equal-
+/// jitter range holds at every rung of the ladder, not just below some
+/// fixed jitter cap.
 fn backoff(base: Duration, max: Duration) -> Duration {
     let capped = base.min(max);
     let half = capped / 2;
-    half + jitter_half().min(half)
+    half + jitter_below(half)
 }
 
 /// Which independent failure class a pass error belongs to. Classes
@@ -217,8 +219,9 @@ impl Default for LiveConfig {
 /// Concurrency: the loop is the single writer (it owns `&mut self`),
 /// backend threads are readers. Readers hold cloned generations, so a
 /// slow reader pins its own complete snapshot without blocking the
-/// next publication — staleness is bounded by the poll interval, and
-/// each generation is internally consistent by construction.
+/// next publication — staleness is bounded by the pacing deadline (and
+/// normally much shorter, since intake and mutations wake the loop),
+/// and each generation is internally consistent by construction.
 ///
 /// Crash ordering: durable commits stand independently of publication
 /// (fetch and intake are restart-safe; the store's CURRENT marker is
@@ -985,4 +988,35 @@ pub(super) fn admit_wants<E>(
     }
     registry.mark_admitted(&committed);
     Ok(committed)
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// The documented equal-jitter range holds at every rung of the
+    /// ladder: the sleep lands in `[capped/2, capped)`, with the random
+    /// half drawn from the capped delay rather than a fixed jitter cap.
+    /// Range assertions, so the random draw stays valid.
+    #[test]
+    fn backoff_stays_in_the_equal_jitter_range() {
+        for (base, max) in [
+            (Duration::from_secs(1), Duration::from_secs(30)),
+            (Duration::from_secs(16), Duration::from_secs(30)),
+            (Duration::from_secs(60), Duration::from_secs(30)),
+        ] {
+            let capped = base.min(max);
+            for _ in 0..500 {
+                let delay = backoff(base, max);
+                assert!(delay >= capped / 2, "{delay:?} below half of {capped:?}");
+                assert!(delay < capped, "{delay:?} at or above {capped:?}");
+            }
+        }
+        // A zero bound yields exactly the base half, no jitter.
+        assert_eq!(
+            backoff(Duration::ZERO, Duration::from_secs(1)),
+            Duration::ZERO
+        );
+        assert_eq!(jitter_below(Duration::ZERO), Duration::ZERO);
+    }
 }

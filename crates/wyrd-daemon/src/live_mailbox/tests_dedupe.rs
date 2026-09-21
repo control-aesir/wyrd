@@ -379,3 +379,82 @@ fn saturation_replay_due_first_then_per_cooldown() {
         now
     ));
 }
+
+/// Crash mid-compact: a fully written tmp that never renamed (plus a
+/// torn tail) is an orphan, not the log. Open loads the intact main
+/// file without looking at it, and the next compact overwrites the
+/// orphan instead of building on it.
+#[test]
+fn compact_crash_orphan_tmp_ignored() {
+    let path = temp_path("seen-orphan-tmp");
+    let id_at = |i: usize| EventId::from_hex(&format!("{i:064x}")).unwrap();
+    let mut store = SeenStore::open(&path).expect("open creates");
+    for i in 0..3 {
+        store.record(&id_at(i)).expect("record appends");
+    }
+    drop(store);
+
+    // The crashed compact wrote its tmp but never renamed it; the
+    // trailing segment simulates a torn tmp write.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{}\npartial-", id_at(99))).expect("orphan tmp planted");
+
+    let mut reopened = SeenStore::open(&path).expect("main log loads despite orphan tmp");
+    assert!(reopened.contains(&id_at(0)), "main log intact");
+    assert!(
+        !reopened.contains(&id_at(99)),
+        "unrenamed tmp ids stay invisible"
+    );
+    reopened.compact().expect("compact proceeds");
+    assert!(!tmp.exists(), "compact consumes the orphan, not the log");
+    let lines: Vec<String> = std::fs::read_to_string(&path)
+        .expect("seen log reads")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 3, "compacted log is exactly the retained set");
+    assert!(
+        lines.contains(&format!("{}", id_at(2))),
+        "retained ids survive the orphan episode"
+    );
+}
+
+/// Compaction soak at the store level: repeated fill-to-compact plus
+/// reopen cycles keep the file within twice the bound and the
+/// retained set exactly the newest window, every cycle. Ephemeral
+/// (no fsync) so the soak measures logic, not macOS sync latency —
+/// the fsync path itself is covered by the durable reopen test.
+#[test]
+fn repeated_compaction_cycles_stay_bounded() {
+    const CYCLES: usize = 5;
+    let path = temp_path("seen-compaction-cycles");
+    let id_at = |n: usize| EventId::from_hex(&format!("{n:064x}")).unwrap();
+    let mut base = 0;
+    for cycle in 0..CYCLES {
+        let mut store = SeenStore::open(&path).expect("reopen reads bounded file");
+        store.durable = false;
+        let total = base + MAX_SEEN_ENTRIES + 64;
+        for n in base..total {
+            store.record(&id_at(n)).expect("record appends");
+        }
+        base = total;
+        assert!(
+            store.seen.len() <= MAX_SEEN_ENTRIES,
+            "cycle {cycle}: retained set bounded"
+        );
+        let lines = std::fs::read_to_string(&path)
+            .expect("seen log reads")
+            .lines()
+            .count();
+        assert!(
+            lines <= MAX_SEEN_ENTRIES * 2,
+            "cycle {cycle}: file bounded, got {lines} lines"
+        );
+    }
+    let reopened = SeenStore::open(&path).expect("reopen after soak");
+    assert!(
+        reopened.contains(&id_at(base - 1)),
+        "newest ack survives the soak"
+    );
+    assert!(!reopened.contains(&id_at(0)), "oldest ack long evicted");
+}

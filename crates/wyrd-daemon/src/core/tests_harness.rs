@@ -5,7 +5,7 @@ use wyrd_sync::{runtime::Engine, transport::mailbox::Mailbox};
 use std::sync::Arc;
 use std::time::Duration;
 
-use wyrd_format::{DeviceId, DriveId, MemoryObjectStore};
+use wyrd_format::{DeviceId, DriveId, ObjectStore};
 
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
@@ -80,12 +80,15 @@ pub(super) fn scratch_drive() -> (Engine, std::path::PathBuf, DeviceIdentitySecr
 /// Spawn the live loop on its own thread and return the stop flag
 /// and join handle. The backend half stays on the test thread, so a
 /// blocking mutation submit is completed by the loop concurrently.
-pub(super) fn spawn_live_loop(
-    live: LiveDaemon<MemoryObjectStore>,
+pub(super) fn spawn_live_loop<S: ObjectStore + Send + Sync + 'static>(
+    live: LiveDaemon<S>,
 ) -> (
     Arc<std::sync::atomic::AtomicBool>,
     std::thread::JoinHandle<Result<LiveSummary, LiveError>>,
-) {
+)
+where
+    S::Error: std::fmt::Debug,
+{
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
     let handle = std::thread::spawn(move || {

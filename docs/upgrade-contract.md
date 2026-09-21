@@ -93,13 +93,26 @@ Status today: neither the upgrade contracts nor the fixture tree exist —
 the catalog in `crates/wyrd-contracts/src/lib.rs` covers the current
 protocol and format contracts only. Until the tests land, this document is
 the rulebook and the list below is the acceptance set for the contract
-issue:
+issue — one bullet per invariant, in the same order, so the suite is one
+named test per invariant direction with no gaps:
 
-- upgrade store opens in the next release; history is byte-preserved
-- next release reads previous objects; writes oldest-compatible on demand
-- next release replays previous durable facts into current records
-- interrupted upgrade reopens without recovery migration
-- derived indexes rebuild from previous state; nothing authoritative is lost
-- old-epoch objects remain decryptable; new epochs respect capabilities
-- mixed-version peers synchronize within the documented matrix, and
-  anything outside it fails with a named error
+1. new encodings are new representations: old objects keep their
+   ContentIds and stay readable, new writes use the new representation,
+   and history is byte-preserved across the upgrade
+2. every persistent format carries its explicit version; the next release
+   reads previous versions, writes oldest-compatible on demand, and
+   replays previous durable facts into current records
+3. old formats remain readable for the supported window; no release
+   destructively rewrites immutable objects, snapshots, or history
+4. derived indexes rebuild from previous state by replay; nothing
+   authoritative is lost
+5. mixed-version peers synchronize within the documented capability matrix
+6. a software upgrade never emits a membership transition; the transition
+   chain, not the binary, defines authority
+7. old-epoch objects remain decryptable; new epochs respect capabilities
+8. migrations, if any, land as ordinary snapshot-producing operations;
+   history is never rewritten into the newest representation
+9. an interrupted upgrade reopens without a separate recovery migration
+10. anything outside the matrix fails with a named error: unknown
+    envelopes, versions, and fact payloads are refused loudly at the
+    boundary

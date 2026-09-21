@@ -263,11 +263,12 @@ jobs:
       # releases use (.ngit/scripts/build.sh): capability detection
       # picks this runner's system, --ref pins the checkout commit
       # instead of a tag, and --verify unpacks each tarball and runs
-      # its binary. Full `--rebuild` reproducibility is verified at
+      # its binary. Runs on PRs as well as master so a smoke failure
+      # surfaces before merge instead of red-ing master after it.
+      # Full `--rebuild` reproducibility is verified at
       # change time (it rebuilds the whole Rust closure, too expensive
       # for every CI run); see the distFor comment in flake.nix.
       - name: Release archive smoke test
-        if: github.ref == 'refs/heads/master'
         run: |
           set -euo pipefail
           set -o pipefail

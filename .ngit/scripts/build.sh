@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build every wyrd distribution tarball this machine can produce.
 #
-# Usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [--local-only] [system...]
+# Usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [--no-remote-builders] [system...]
 #
 # With no system arguments, host capability is detected and exactly the
 # buildable combos are built: the native system always, x86_64-darwin via
@@ -9,10 +9,11 @@
 # Linux systems via remote builders. Explicit systems skip detection (and
 # fail loudly when not buildable). `--strict` (what releases use)
 # requires all four combos from release.yaml instead, since ngit rejects
-# partial platform coverage on the main channel. `--local-only` skips
-# remote-builder detection entirely: only this machine's own systems are
-# considered (CI smoke path, which must never depend on remote builders).
-# `--ref` pins the input
+# partial platform coverage on the main channel. `--no-remote-builders`
+# skips remote-builder detection entirely: only this machine's own
+# systems are considered (CI smoke path, which must never depend on
+# remote builders; local release runs omit it to reach their configured
+# builders). `--ref` pins the input
 # worktree to a git ref instead of the default `v<version>` tag (CI uses
 # HEAD); `--verify` unpacks each built tarball and runs its binary
 # (when the sole missing system library is the documented macFUSE
@@ -28,7 +29,7 @@ shift
 STRICT=false
 REF=""
 VERIFY=false
-LOCAL_ONLY=false
+NO_REMOTE_BUILDERS=false
 WANTED=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,7 +39,7 @@ while [ $# -gt 0 ]; do
       REF="${1:?--ref needs a git ref}"
       ;;
     --verify) VERIFY=true ;;
-    --local-only) LOCAL_ONLY=true ;;
+    --no-remote-builders) NO_REMOTE_BUILDERS=true ;;
     aarch64-darwin|x86_64-darwin|aarch64-linux|x86_64-linux) WANTED+=("$1") ;;
     *)
       echo "unknown argument: $1" >&2
@@ -96,7 +97,7 @@ builder_systems() {
   done | tr ',' ' '
 }
 BUILDERS=""
-if [ "$LOCAL_ONLY" = false ]; then
+if [ "$NO_REMOTE_BUILDERS" = false ]; then
   BUILDERS=$(builder_systems)
 fi
 

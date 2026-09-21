@@ -438,9 +438,18 @@ fn repeated_compaction_cycles_stay_bounded() {
             store.record(&id_at(n)).expect("record appends");
         }
         base = total;
+        assert_eq!(
+            store.seen.len(),
+            MAX_SEEN_ENTRIES,
+            "cycle {cycle}: retained set is exactly the newest window"
+        );
         assert!(
-            store.seen.len() <= MAX_SEEN_ENTRIES,
-            "cycle {cycle}: retained set bounded"
+            store.contains(&id_at(total - 1)),
+            "cycle {cycle}: newest ack retained"
+        );
+        assert!(
+            !store.contains(&id_at(total - MAX_SEEN_ENTRIES - 1)),
+            "cycle {cycle}: window edge evicted"
         );
         let lines = std::fs::read_to_string(&path)
             .expect("seen log reads")

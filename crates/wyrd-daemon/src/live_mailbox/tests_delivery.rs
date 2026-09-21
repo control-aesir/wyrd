@@ -613,7 +613,14 @@ fn soak_restart_delivers_once_across_reopens() {
                 mailbox.settle(delivery.id(), Disposition::Ack).unwrap();
                 if let Some((_, index)) = delivery.envelope().ciphertext.rsplit_once('-') {
                     if let Ok(index) = index.parse::<usize>() {
-                        covered.insert(index);
+                        assert!(
+                            index < target,
+                            "round {round}: wrap index {index} outside the expected window"
+                        );
+                        assert!(
+                            covered.insert(index),
+                            "round {round}: duplicate delivery of wrap {index}"
+                        );
                     }
                 }
             }

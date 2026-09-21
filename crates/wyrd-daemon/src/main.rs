@@ -256,6 +256,11 @@ fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
 /// may only set a flag (async-signal-safe), and the loop polls it.
 pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// How long teardown waits for the mailbox tasks to stop before
+/// aborting them: bounded so shutdown never hangs on a relay outage
+/// that never clears.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
 /// platform cannot install the handler, termination falls back to the
 /// default disposition (same as dying in `fuser::mount` today).
@@ -367,6 +372,10 @@ fn mount(
         relays.clone(),
         seen_path,
     )?;
+    // New mail wakes intake immediately: the drainer pokes the same
+    // pacing signal the loop parks on, so delivery latency is bound by
+    // the relay round trip, not the five-second idle interval.
+    mailbox.attach_waker(Arc::clone(live.waker()));
     if relays.is_empty() {
         eprintln!("warning: no --relay given; control-plane intake stays idle");
         tracing::warn!(
@@ -398,7 +407,14 @@ fn mount(
     // queue after run_loop returns. Either direction alone strands
     // somebody — a dead session with a syncing loop, or a dead loop
     // with blocked submitters — so both are wired.
-    let supervisor = Supervisor::new(Arc::clone(live.mutations()), &SHUTDOWN);
+    // TEMPORARY (event-driven supervision WIP): into_live does not yet
+    // create the pacing signal; wire a standalone one until the loop
+    // owns it. Session end still trips the loop promptly.
+    let supervisor = Supervisor::new(
+        Arc::clone(live.mutations()),
+        &SHUTDOWN,
+        Arc::clone(live.waker()),
+    );
     let session_supervisor = supervisor.clone();
     // The session loop owns the backend: log its exit immediately on
     // the thread, then trip shutdown so the live loop exits promptly
@@ -430,6 +446,12 @@ fn mount(
     // queue (run_loop already drained on exit; this is the idempotent
     // supervisor half) before tearing down serving and the bulk source.
     supervisor.note_loop_ended();
+    // Cancel the mailbox tasks within a bounded deadline: the drainer
+    // and supervisor stop, and the runtime aborts whatever has not
+    // yielded by then. Without this the tasks would run until runtime
+    // drop, and a shutdown could wait on a relay outage that never
+    // clears.
+    mailbox.shutdown(SHUTDOWN_DEADLINE);
     bulk.shutdown();
     let _ = serving.shutdown();
 

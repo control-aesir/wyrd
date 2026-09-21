@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 
 use wyrd_format::{ContentId, StoreFailure};
 
+use crate::lifecycle::WakeSignal;
+
 /// Total admitted-but-incomplete mutations, including the one executing.
 /// Admission beyond the bound fails with [`MutationError::Saturated`]
 /// (`EAGAIN` at the POSIX boundary); buffered state is memory, so the
@@ -346,6 +348,11 @@ pub struct MutationQueue {
     /// Admission bound; [`with_limit`](Self::with_limit) exists so tests
     /// can exercise saturation without thousands of blocked threads.
     limit: usize,
+    /// The loop's pacing signal, poked on every admission so a parked
+    /// loop serves a blocked syscall without waiting out its pacing
+    /// deadline. Empty until the composer attaches it; the queue works
+    /// without one (the loop then falls back to its staleness bound).
+    waker: Mutex<Option<Arc<WakeSignal>>>,
 }
 
 impl Default for MutationQueue {
@@ -364,6 +371,31 @@ impl MutationQueue {
             work: Condvar::new(),
             next_id: AtomicU64::new(0),
             limit,
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Attach the loop's pacing signal: every admission pokes it, so a
+    /// loop parked in its idle wait serves the submission without
+    /// waiting out the pacing deadline. Idempotent; the last attached
+    /// signal wins.
+    pub fn attach_waker(&self, waker: Arc<WakeSignal>) {
+        *self
+            .waker
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(waker);
+    }
+
+    /// Poke the attached pacing signal, if any. Lock state first is
+    /// unnecessary — the signal is advisory, and a poke racing
+    /// attachment only delays a pass to the staleness bound.
+    fn poke_waker(&self) {
+        let guard = self
+            .waker
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(waker) = guard.as_ref() {
+            waker.wake();
         }
     }
     /// Submit one operation and block until it commits or fails. At
@@ -391,6 +423,7 @@ impl MutationQueue {
             });
         }
         self.work.notify_one();
+        self.poke_waker();
         reply.wait()
     }
 
@@ -438,6 +471,9 @@ impl MutationQueue {
             batch.record(index, Err(MutationError::Shutdown));
         }
         batch.finish();
+        // A loop parked in its idle wait must observe the closure even
+        // if the stop flag trip races it: the poke re-checks the world.
+        self.poke_waker();
     }
 
     /// Complete one taken request: record the outcome, release its
@@ -557,6 +593,7 @@ impl Drop for MutationBatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::Wake;
 
     fn mkdir(path: &str) -> MutationKind {
         MutationKind::Mkdir {
@@ -754,5 +791,54 @@ mod tests {
             );
         }
         assert_eq!(queue.outstanding(), 0, "all slots released");
+    }
+
+    /// An admission pokes the attached pacing signal, so a loop parked
+    /// in its idle wait serves the blocked submitter without waiting
+    /// out the pacing deadline.
+    #[test]
+    fn submit_pokes_the_attached_waker() {
+        let queue = Arc::new(MutationQueue::default());
+        let waker = Arc::new(WakeSignal::default());
+        queue.attach_waker(Arc::clone(&waker));
+        let stop = AtomicBool::new(false);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("docs")))
+        };
+        // No wait_for_work: the only wakeup is the pacing signal.
+        assert_eq!(waker.wait(&stop, Duration::from_secs(5)), Wake::Signal);
+        let mut batch = queue.take_batch();
+        assert_eq!(batch.len(), 1);
+        batch.record(0, Ok(MutationOutcome::Done));
+        batch.finish();
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+    }
+
+    /// Shutdown pokes the pacing signal too: a parked loop observes
+    /// the closure even if the stop-flag trip races its wait.
+    #[test]
+    fn shutdown_pokes_the_attached_waker() {
+        let queue = MutationQueue::default();
+        let waker = Arc::new(WakeSignal::default());
+        queue.attach_waker(Arc::clone(&waker));
+        let stop = AtomicBool::new(false);
+        queue.shutdown();
+        assert_eq!(waker.wait(&stop, Duration::from_secs(5)), Wake::Signal);
+    }
+
+    /// Without an attached signal the queue works exactly as before:
+    /// attachment is a composer opt-in, not a requirement.
+    #[test]
+    fn queue_works_without_a_waker() {
+        let queue = Arc::new(MutationQueue::default());
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("docs")))
+        };
+        let mut batch = take_batch_blocking(&queue);
+        batch.record(0, Ok(MutationOutcome::Done));
+        batch.finish();
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
     }
 }

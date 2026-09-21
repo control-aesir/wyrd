@@ -133,6 +133,8 @@ use wyrd_sync::transport::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
 
+use crate::lifecycle::WakeSignal;
+
 /// Wyrd's rumor kind: an application-specific regular event (9000-9999 is
 /// the non-replaceable app range), never published to relays itself — it
 /// exists only inside the NIP-59 seal. The kind keeps unrelated software
@@ -185,7 +187,12 @@ pub(super) const MAX_RECORD_LEN: usize = 64 + 1;
 
 /// Supervisor tick: how often relay connection statuses are polled into
 /// shared health. Fast enough to surface an outage within a couple of
-/// seconds; slow enough to stay background noise.
+/// seconds; slow enough to stay background noise. Tests tick faster so
+/// outage/grace waits cost milliseconds, not seconds — the cadence is
+/// pure pacing, not a semantic bound.
+#[cfg(test)]
+const SUPERVISOR_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Minimum interval between saturation replays: each replay is a fresh
@@ -217,13 +224,24 @@ fn saturation_replay_due(last: Option<Instant>, now: Instant) -> bool {
 
 /// Drainer-recovery backoff bounds: first retry after one second, doubling
 /// per attempt, capped at thirty. See the module supervision notes for why
-/// the delay is bounded but the attempts are not.
+/// the delay is bounded but the attempts are not. Tests scale the whole
+/// ladder down so a recovery episode converges in milliseconds; the shape
+/// (base, doubling, cap) is identical.
+#[cfg(test)]
+const RECOVERY_BASE_DELAY: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
 const RECOVERY_BASE_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const RECOVERY_MAX_DELAY: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
 const RECOVERY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// Per-attempt connection wait inside a recovery episode: long enough
 /// for a live relay handshake, short enough to keep the backoff pacing
 /// supervisor-driven rather than SDK-driven.
+#[cfg(test)]
+const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Capped exponential backoff for drainer recovery: 1s, 2s, 4s, 8s, 16s,
@@ -352,7 +370,13 @@ struct Held {
 /// with [`MailboxError::Identity`] — a mailbox that receives as one device
 /// and publishes as another is a misconfiguration, never a mode.
 pub struct LiveMailbox<S> {
-    runtime: Runtime,
+    /// The mailbox task runtime, held as `Option` so [`shutdown`] can
+    /// consume it through `shutdown_timeout` — one bounded cancellation
+    /// point for the drainer and supervisor tasks instead of tracked
+    /// handles everywhere. `None` only after shutdown.
+    ///
+    /// [`shutdown`]: Self::shutdown
+    runtime: Option<Runtime>,
     client: Arc<Client>,
     signer: Arc<S>,
     /// The signer's public key, validated equal to the owner at
@@ -367,6 +391,13 @@ pub struct LiveMailbox<S> {
     /// needs it for a non-blocking `try_recv`; the guard is never held
     /// across an await.
     incoming: Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
+    /// The live loop's pacing signal, poked when the drainer forwards an
+    /// event: new mail wakes intake instead of waiting out the pacing
+    /// deadline. Shared with the drainer tasks (which read it per
+    /// forwarded event), so attaching after `connect` still takes effect.
+    /// Empty until a composer attaches one; the drainer then forwards
+    /// without pacing, exactly as before.
+    intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: Arc<SupervisorState>,
     /// Relay count registered at construction, for [`MailboxHealth`]. The
     /// set never changes after `connect`, so this needs no synchronization.
@@ -395,6 +426,20 @@ pub struct LiveMailbox<S> {
     /// decrypts again on its next receipt; restarts re-decrypt once
     /// and re-discard.
     poison: BoundedIds,
+}
+
+/// Backstop teardown: a composer that forgets [`shutdown`] still does
+/// not leak the drainer and supervisor tasks past the mailbox's drop.
+/// Non-blocking — the explicit [`shutdown`] is the bounded-deadline
+/// path, and this only fires if it was skipped.
+///
+/// [`shutdown`]: LiveMailbox::shutdown
+impl<S> Drop for LiveMailbox<S> {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl<S> LiveMailbox<S>
@@ -455,9 +500,13 @@ where
         // broadcast subscription before the REQ whose replay it has to
         // catch is sent (establish awaits the drainer's readiness), or
         // relay history racing the subscription is lost to the void.
-        let incoming = Arc::new(std::sync::Mutex::new(
-            runtime.block_on(establish_drainer(&client, &health)),
-        ));
+        let intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let incoming = Arc::new(std::sync::Mutex::new(runtime.block_on(establish_drainer(
+            &client,
+            &intake_waker,
+            &health,
+        ))));
         // Registration is local (no I/O per relay); `connect` dials every
         // registered relay concurrently, and nostr-sdk re-establishes
         // subscriptions on reconnects. With no relays there is nothing to
@@ -495,19 +544,21 @@ where
             Arc::clone(&client),
             filter,
             Arc::clone(&incoming),
+            Arc::clone(&intake_waker),
             Arc::clone(&health),
             subscription_id,
             total_relays,
         ));
 
         Ok(Self {
-            runtime,
+            runtime: Some(runtime),
             client,
             signer,
             sender_pk: signer_pk,
             open_keys,
             owner,
             incoming,
+            intake_waker,
             health,
             total_relays,
             unacked: VecDeque::new(),
@@ -531,6 +582,41 @@ where
             total_relays: self.total_relays,
             saturation_recoveries: self.health.saturation_recoveries.load(Ordering::Relaxed),
         }
+    }
+
+    /// Attach the live loop's pacing signal: the drainer pokes it when
+    /// it forwards an event, so new mail wakes intake immediately
+    /// instead of waiting out the pacing deadline. Safe to call after
+    /// `connect` — the drainer tasks read the shared slot per event.
+    pub fn attach_waker(&self, waker: Arc<WakeSignal>) {
+        *self
+            .intake_waker
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(waker);
+    }
+
+    /// Cancel the mailbox tasks within `deadline`: the drainer and the
+    /// supervisor stop, and the runtime is torn down waiting at most
+    /// `deadline` before aborting whatever has not finished. Idempotent.
+    ///
+    /// The daemon calls this after its live loop returns. Until then the
+    /// tasks keep the relay attachment alive (recovery never gives up);
+    /// shutdown is the composer's bounded backstop, not a background
+    /// policy. A later `send`/`recv` fails as transport trouble rather
+    /// than blocking: the loop that would call them is already gone.
+    pub fn shutdown(&mut self, deadline: Duration) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(deadline);
+        }
+    }
+
+    /// The task runtime. Only absent after [`shutdown`](Self::shutdown),
+    /// which no live-pass caller can race (the composer shuts down only
+    /// after the loop that drives the mailbox has returned).
+    fn rt(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("mailbox runtime is present until shutdown")
     }
 
     /// Pull the next gift-wrap candidate event from the relay stream.
@@ -653,6 +739,7 @@ where
 async fn drain_notifications(
     client: Arc<Client>,
     sender: tokio_mpsc::Sender<Event>,
+    intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: Arc<SupervisorState>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) {
@@ -689,18 +776,31 @@ async fn drain_notifications(
             ClientNotification::Shutdown => None,
         };
         if let Some(event) = event {
-            match sender.try_send(*event) {
-                Ok(()) => {}
+            let forwarded = match sender.try_send(*event) {
+                Ok(()) => true,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
                     // Bounded handover: the mailbox is saturated, so park
                     // here (backpressure) and flag a replay — the SDK
                     // broadcast may drop events its lag hides while parked.
                     health.saturated.store(true, Ordering::Relaxed);
-                    if sender.send(event).await.is_err() {
-                        break;
-                    }
+                    sender.send(event).await.is_ok()
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            };
+            if forwarded {
+                // New mail is a pacing event: wake the live loop so intake
+                // runs now instead of waiting out the staleness deadline.
+                // The waker slot is read per event, so attaching after the
+                // drainer spawned still takes effect.
+                if let Some(waker) = intake_waker
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                {
+                    waker.wake();
+                }
+            } else {
+                break;
             }
         }
     }
@@ -716,6 +816,7 @@ async fn drain_notifications(
 /// its first fallible operation.
 async fn establish_drainer(
     client: &Arc<Client>,
+    intake_waker: &Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: &Arc<SupervisorState>,
 ) -> tokio_mpsc::Receiver<Event> {
     let (sender, receiver) = tokio_mpsc::channel(INCOMING_CAPACITY);
@@ -723,6 +824,7 @@ async fn establish_drainer(
     tokio::spawn(drain_notifications(
         Arc::clone(client),
         sender,
+        Arc::clone(intake_waker),
         Arc::clone(health),
         ready_tx,
     ));
@@ -788,6 +890,7 @@ async fn supervise(
     client: Arc<Client>,
     filter: Filter,
     incoming: Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
+    intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: Arc<SupervisorState>,
     subscription_id: SubscriptionId,
     total_relays: usize,
@@ -825,7 +928,15 @@ async fn supervise(
         if !health.stream_alive.load(Ordering::Relaxed) {
             // A poisoned swap fails the tick, not the process: the
             // stream stays flagged down and recovery retries next tick.
-            let _ = recover_stream(&client, &filter, &incoming, &health, &subscription_id).await;
+            let _ = recover_stream(
+                &client,
+                &filter,
+                &incoming,
+                &intake_waker,
+                &health,
+                &subscription_id,
+            )
+            .await;
             refresh(&client, &health).await;
             down_ticks = 0;
         }
@@ -860,10 +971,11 @@ async fn recover_stream(
     client: &Arc<Client>,
     filter: &Filter,
     incoming: &Arc<std::sync::Mutex<tokio_mpsc::Receiver<Event>>>,
+    intake_waker: &Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: &Arc<SupervisorState>,
     subscription_id: &SubscriptionId,
 ) -> Result<(), MailboxError> {
-    let receiver = establish_drainer(client, health).await;
+    let receiver = establish_drainer(client, intake_waker, health).await;
     let mut attempt: u32 = 0;
     loop {
         client.connect().await;
@@ -933,10 +1045,10 @@ where
             )))
             .finalize_unsigned(self.sender_pk);
         let wrap = self
-            .runtime
+            .rt()
             .block_on(GiftWrapBuilder::new(recipient, rumor).finalize_async(&*self.signer))
             .map_err(|error| MailboxError::Transport(error.to_string()))?;
-        self.runtime
+        self.rt()
             .block_on(async { self.client.send_event(&wrap).await })
             .map(|_| ())
             .map_err(|error| MailboxError::Transport(error.to_string()))

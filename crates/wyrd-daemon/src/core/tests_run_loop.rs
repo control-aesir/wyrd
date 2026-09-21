@@ -78,10 +78,13 @@ fn run_loop_runs_until_stopped() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A permanently failing drain aborts once the consecutive-error
-/// cap trips, and every absorbed failure is observed.
+/// A permanently failing mailbox settlement aborts once the mailbox
+/// class's consecutive-error cap trips, and every absorbed failure is
+/// observed. Mailbox failures ride a long retry budget (a relay
+/// outage must not kill a healthy mount), so the cap is the class's,
+/// not the config's generic one.
 #[test]
-fn run_loop_aborts_after_error_cap() {
+fn run_loop_aborts_after_mailbox_error_cap() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
@@ -105,11 +108,41 @@ fn run_loop_aborts_after_error_cap() {
         &mut |_, _| observed += 1,
     );
     assert!(result.is_err(), "the cap aborts the loop");
-    // Errors at consecutive counts 1, 2, and 3 (which trips the cap).
-    assert_eq!(observed, 3);
+    let class_cap = FailureClass::from(result.as_ref().err().unwrap()).max_consecutive();
+    // Errors at consecutive counts 1..=cap+1 (the +1 trips the cap).
+    assert_eq!(observed, class_cap + 1);
+    assert_eq!(class_cap, 60, "mailbox failures ride a long budget");
 
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Classification is the contract the loop's ledgers rely on: mailbox
+/// trouble rides a long budget, store trouble trips fast, and engine
+/// trouble keeps the historical generic budget. Pure-function tests —
+/// driving a real store failure through the loop would need an
+/// unfaithful harness, and the loop code is shared across classes.
+#[test]
+fn failure_classes_classify_and_cap_independently() {
+    use wyrd_format::StoreFailure;
+    use wyrd_sync::durable::DurableError;
+    use wyrd_sync::runtime::EngineError;
+    use wyrd_sync::transport::mailbox::MailboxError;
+
+    let mailbox = LiveError::Engine(EngineError::Mailbox(MailboxError::Crypto));
+    let store = LiveError::Engine(EngineError::Store(StoreFailure::Transient));
+    let durable = LiveError::Engine(EngineError::Durable(DurableError::StoreLocked));
+    let engine = LiveError::Engine(EngineError::NotAMember);
+
+    assert_eq!(FailureClass::from(&mailbox), FailureClass::Mailbox);
+    assert_eq!(FailureClass::from(&store), FailureClass::Store);
+    assert_eq!(FailureClass::from(&durable), FailureClass::Store);
+    assert_eq!(FailureClass::from(&engine), FailureClass::Engine);
+    assert_eq!(FailureClass::from(&LiveError::Lock), FailureClass::Engine);
+
+    assert_eq!(FailureClass::Mailbox.max_consecutive(), 60);
+    assert_eq!(FailureClass::Store.max_consecutive(), 3);
+    assert_eq!(FailureClass::Engine.max_consecutive(), 10);
 }
 
 /// Block until a mutation submission lands in pending (or fail on

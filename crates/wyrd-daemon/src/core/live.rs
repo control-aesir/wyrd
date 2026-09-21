@@ -17,11 +17,86 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
+use crate::lifecycle::{Wake, WakeSignal};
 use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
 use super::daemon::{verified_heads, view_heads, DaemonMaterialization};
+
+/// Equal-jitter cap for backoff sleeps: the random half of an equal-
+/// jittered delay. Decorrelates retry storms across daemons without a
+/// clock dependency (no wall-time reads on the supervision path).
+const MAX_JITTER_HALF: Duration = Duration::from_millis(250);
+
+/// Draw a random duration in `[0, half)`. Entropy comes from the OS
+/// CSPRNG (the approved substrate); a draw failure falls back to zero
+/// jitter — the base delay alone is still capped backoff, just less
+/// decorrelated, so a rare entropy failure degrades pacing quality,
+/// never correctness.
+fn jitter_half() -> Duration {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(u64::from_le_bytes(buf) % MAX_JITTER_HALF.as_nanos() as u64)
+}
+
+/// Equal-jittered capped backoff: sleep `base/2 + [0, base/2)`, so the
+/// first failure waits about half the base delay and retry attempts
+/// across processes do not synchronize. Capped at `max`.
+fn backoff(base: Duration, max: Duration) -> Duration {
+    let capped = base.min(max);
+    let half = capped / 2;
+    half + jitter_half().min(half)
+}
+
+/// Which independent failure class a pass error belongs to. Classes
+/// back off and trip their caps separately: a relay outage must not
+/// poison the ledger that bounds a failing disk, and vice versa — the
+/// single generic cap conflated them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Mailbox transport failed (relay outage, settlement trouble).
+    /// The local drive keeps serving; the class retries with backoff.
+    Mailbox,
+    /// Durable commit or object-store I/O failed: ENOSPC, EACCES, or a
+    /// damaged store. Local and serious: the class's cap trips sooner,
+    /// terminating the mount instead of spinning against a dead disk.
+    Store,
+    /// Anything else (engine-internal, closure, crypto): configuration
+    /// or integrity trouble that a retry cannot fix, bounded by the
+    /// generic cap as before.
+    Engine,
+}
+
+impl FailureClass {
+    /// Consecutive failures of this class absorbed before the loop
+    /// aborts. Store failures are local and deterministic (a full disk
+    /// does not heal on retry), so their budget is deliberately tight;
+    /// mailbox failures ride out long relay outages on a healthy
+    /// mount; engine failures keep the historical cap.
+    pub fn max_consecutive(self) -> u32 {
+        match self {
+            FailureClass::Mailbox => 60,
+            FailureClass::Store => 3,
+            FailureClass::Engine => 10,
+        }
+    }
+}
+
+impl From<&LiveError> for FailureClass {
+    fn from(error: &LiveError) -> Self {
+        match error {
+            LiveError::Engine(EngineError::Mailbox(_)) => FailureClass::Mailbox,
+            LiveError::Engine(EngineError::Store(_)) => FailureClass::Store,
+            LiveError::Engine(EngineError::Durable(_)) => FailureClass::Store,
+            LiveError::Engine(EngineError::ObjectStore(_)) => FailureClass::Store,
+            LiveError::Engine(_) => FailureClass::Engine,
+            LiveError::Lock => FailureClass::Engine,
+        }
+    }
+}
 
 /// Why a live sync pass failed. Engine failures (intake, fetch,
 /// projection) surface unchanged; a poisoned view lock is a local
@@ -157,6 +232,11 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// The admission cap paces demand; the registries and backend
     /// hold their own copies for their own refusals.
     pub(super) budgets: ResourceBudgets,
+    /// The loop's pacing signal, created at composition and attached to
+    /// the mutation queue there. The composer shares this same signal
+    /// with the mailbox adapter so new mail wakes intake too: one
+    /// signal, every producer.
+    pub(super) waker: Arc<WakeSignal>,
 }
 
 impl<S: ObjectStore> LiveDaemon<S>
@@ -737,14 +817,22 @@ where
             .map_err(|_| LiveError::Lock)
     }
 
-    /// Drive sync passes until `stop` is set: poll on `interval`,
-    /// absorbing transient failures with capped exponential backoff and
-    /// reporting each through `observe` (the loop itself stays free of
-    /// logging dependencies; the caller decides what to print). Returns
-    /// the run summary once stopped, or the last error once the
-    /// consecutive-failure cap trips. `stop` is a pure cancellation
-    /// flag — it publishes no data, so `Relaxed` ordering is the honest
-    /// level and must stay that way.
+    /// Drive sync passes until `stop` is set. The idle wait is
+    /// event-driven: a mutation submission, a mailbox-queue producer,
+    /// or a shutdown trip wakes the loop immediately, and the pacing
+    /// deadline (`config.interval`) is only the staleness bound that
+    /// guarantees a pass even in total silence — a missed poke delays
+    /// a pass, never drops work. Transient failures are absorbed with
+    /// equal-jittered capped backoff and reported per class through
+    /// `observe` (the loop itself stays free of logging dependencies;
+    /// the caller decides what to print). Failure classes back off and
+    /// trip their caps independently ([`FailureClass`]): a relay
+    /// outage must not terminate a healthy mount, while a failing
+    /// local disk terminates it quickly. Returns the run summary once
+    /// stopped, or the last error once a class's consecutive-failure
+    /// cap trips. `stop` is a pure cancellation flag — it publishes no
+    /// data, so `Relaxed` ordering is the honest level and must stay
+    /// that way.
     ///
     /// No admitted mutation submitter outlives the loop: every return
     /// path completes still-queued requests with
@@ -756,11 +844,12 @@ where
     /// guard's drop.
     ///
     /// Backlog behavior under sustained traffic: each pass drains what
-    /// the mailbox currently holds, so a flood costs latency (poll
-    /// intervals), never loss. Overflow backpressures into the relay,
-    /// which retains everything; replayed history collapses through
-    /// the durable seen log. Relay reconnect supervision itself is a
-    /// separately tracked issue.
+    /// the mailbox currently holds, so a flood costs latency (intake
+    /// waits for the next pass), never loss. Overflow backpressures
+    /// into the relay, which retains everything; replayed history
+    /// collapses through the durable seen log. Relay reconnect
+    /// supervision is the mailbox's own ([`FailureClass::Mailbox`]
+    /// backoff rides out an outage in the meantime).
     pub fn run_loop<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
@@ -769,34 +858,47 @@ where
         config: &LiveConfig,
         observe: &mut dyn FnMut(&LiveError, u32),
     ) -> Result<LiveSummary, LiveError> {
+        let waker = Arc::clone(&self.waker);
         let mut summary = LiveSummary {
             passes: 0,
             errors_retried: 0,
         };
-        let mut consecutive: u32 = 0;
-        let mut delay = config.error_base_delay;
+        // Per-class consecutive-failure counts and backoff bases: the
+        // classes are independent ledgers (see `FailureClass`).
+        let mut consecutive = [0u32; 3];
+        let mut delay = [config.error_base_delay; 3];
         while !stop.load(Ordering::Relaxed) {
             let bulk_ref = bulk.as_deref_mut();
             match self.sync_once(mailbox, bulk_ref) {
                 Ok(_) => {
-                    consecutive = 0;
-                    delay = config.error_base_delay;
+                    consecutive = [0; 3];
+                    delay = [config.error_base_delay; 3];
                     summary.passes += 1;
-                    self.mutations.wait_for_work(stop, config.interval);
+                    if waker.wait(stop, config.interval) == Wake::Stop {
+                        break;
+                    }
                 }
                 Err(error) => {
-                    consecutive += 1;
+                    let class = FailureClass::from(&error) as usize;
+                    consecutive[class] += 1;
                     summary.errors_retried += 1;
-                    observe(&error, consecutive);
-                    if consecutive > config.max_consecutive_errors {
+                    observe(&error, consecutive[class]);
+                    if consecutive[class] > FailureClass::from(&error).max_consecutive() {
                         // Terminal: no further pass will drain, so complete
                         // still-queued submitters now — returning first
                         // would strand every admitted caller forever.
                         self.mutations.shutdown();
                         return Err(error);
                     }
-                    self.mutations.wait_for_work(stop, delay);
-                    delay = delay.saturating_mul(2).min(config.error_max_delay);
+                    // The backoff sleeps on the pacing signal, so a stop
+                    // trip or an admitted mutation still lands mid-retry:
+                    // backoff paces the failing class, it never blocks
+                    // progress or shutdown.
+                    if waker.wait(stop, backoff(delay[class], config.error_max_delay)) == Wake::Stop
+                    {
+                        break;
+                    }
+                    delay[class] = delay[class].saturating_mul(2).min(config.error_max_delay);
                 }
             }
         }
@@ -811,6 +913,13 @@ where
     /// the loop polls; loop end completes the queue this returns).
     pub fn mutations(&self) -> &Arc<MutationQueue> {
         &self.mutations
+    }
+
+    /// The loop's pacing signal, shared so the composer can attach the
+    /// same signal to other producers (mailbox intake) and trip the
+    /// same cancellation path. Already attached to the mutation queue.
+    pub fn waker(&self) -> &Arc<WakeSignal> {
+        &self.waker
     }
 }
 

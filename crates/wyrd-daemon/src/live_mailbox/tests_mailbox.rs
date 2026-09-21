@@ -37,30 +37,35 @@ fn exhausted_delivery_ids_fail() {
 }
 
 #[test]
-fn recovery_backoff_doubles_to_a_thirty_second_cap() {
-    let delays = [
-        recovery_delay(0),
-        recovery_delay(1),
-        recovery_delay(2),
-        recovery_delay(3),
-        recovery_delay(4),
-        recovery_delay(5),
-        recovery_delay(6),
-        recovery_delay(u32::MAX),
-    ];
+fn recovery_backoff_doubles_to_its_cap() {
+    // The contract is the shape (base, doubling, cap), not literal
+    // seconds: test builds scale the ladder down to keep recovery
+    // episodes fast, so the test derives its expectation from the
+    // constants instead of pinning production values.
+    assert_eq!(recovery_delay(0), RECOVERY_BASE_DELAY);
     assert_eq!(
-        delays,
-        [
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(16),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        ]
+        recovery_delay(1),
+        (RECOVERY_BASE_DELAY * 2).min(RECOVERY_MAX_DELAY)
     );
+    assert_eq!(
+        recovery_delay(2),
+        (RECOVERY_BASE_DELAY * 4).min(RECOVERY_MAX_DELAY)
+    );
+    assert_eq!(
+        recovery_delay(3),
+        (RECOVERY_BASE_DELAY * 8).min(RECOVERY_MAX_DELAY)
+    );
+    assert_eq!(
+        recovery_delay(4),
+        (RECOVERY_BASE_DELAY * 16).min(RECOVERY_MAX_DELAY)
+    );
+    // Attempt 5 and every later attempt are pinned at the cap.
+    assert_eq!(recovery_delay(5), RECOVERY_MAX_DELAY);
+    assert_eq!(recovery_delay(6), RECOVERY_MAX_DELAY);
+    assert_eq!(recovery_delay(u32::MAX), RECOVERY_MAX_DELAY);
+    // The cap is reachable: the 16x rung sits at or below it, so the
+    // ladder doubles before it flattens.
+    assert!(RECOVERY_BASE_DELAY * 16 <= RECOVERY_MAX_DELAY);
 }
 
 #[test]

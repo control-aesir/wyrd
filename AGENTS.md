@@ -55,6 +55,9 @@ to. The README carries the vision; `docs/` carries the current design contract.
 cargo check                 # workspace build/validation
 cargo nextest run           # workspace tests (unit + integration)
 cargo test --workspace --doc  # doctests; nextest skips these
+cargo nextest run --profile slow
+                            # >10s live-relay tests; excluded from
+                            # regular runs, gated on master CI
 devenv shell                # enter the dev environment (rust, git-hooks)
 ```
 

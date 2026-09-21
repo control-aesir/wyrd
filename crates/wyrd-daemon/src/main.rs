@@ -12,7 +12,7 @@ use crate::probes::combine_status;
 use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
-use wyrd_daemon::{Daemon, LiveConfig, LiveError, Supervisor};
+use wyrd_daemon::{Daemon, FailureClass, LiveConfig, LiveError, Supervisor};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
@@ -256,6 +256,11 @@ fn read_identity(path: &Path) -> Result<DeviceIdentitySecret, CliError> {
 /// may only set a flag (async-signal-safe), and the loop polls it.
 pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// How long teardown waits for the mailbox tasks to stop before
+/// aborting them: bounded so shutdown never hangs on a relay outage
+/// that never clears.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
 /// platform cannot install the handler, termination falls back to the
 /// default disposition (same as dying in `fuser::mount` today).
@@ -367,6 +372,10 @@ fn mount(
         relays.clone(),
         seen_path,
     )?;
+    // New mail wakes intake immediately: the drainer pokes the same
+    // pacing signal the loop parks on, so delivery latency is bound by
+    // the relay round trip, not the five-second idle interval.
+    mailbox.attach_waker(Arc::clone(live.waker()));
     if relays.is_empty() {
         eprintln!("warning: no --relay given; control-plane intake stays idle");
         tracing::warn!(
@@ -393,12 +402,18 @@ fn mount(
     #[cfg(not(target_os = "macos"))]
     let mut session = fuser::Session::new(backend, &mountpoint, &session_config())?;
     let mut unmounter = session.unmount_callable();
-    // One lifecycle supervisor owns the stop flag and the mutation
-    // queue: session end trips shutdown below, loop end settles the
-    // queue after run_loop returns. Either direction alone strands
-    // somebody — a dead session with a syncing loop, or a dead loop
-    // with blocked submitters — so both are wired.
-    let supervisor = Supervisor::new(Arc::clone(live.mutations()), &SHUTDOWN);
+    // One lifecycle supervisor owns the stop flag, the mutation queue,
+    // and the loop's pacing signal: session end trips shutdown below,
+    // loop end settles the queue after run_loop returns. Either
+    // direction alone strands somebody — a dead session with a syncing
+    // loop, or a dead loop with blocked submitters — so both are wired.
+    // The signal is created and attached by `into_live`; sharing it
+    // here means a trip also pokes the loop out of its idle wait.
+    let supervisor = Supervisor::new(
+        Arc::clone(live.mutations()),
+        &SHUTDOWN,
+        Arc::clone(live.waker()),
+    );
     let session_supervisor = supervisor.clone();
     // The session loop owns the backend: log its exit immediately on
     // the thread, then trip shutdown so the live loop exits promptly
@@ -422,14 +437,32 @@ fn mount(
         &SHUTDOWN,
         &config,
         &mut |error, consecutive| {
-            eprintln!("live sync pass failed ({consecutive} consecutive): {error}");
-            tracing::warn!(stage = "sync", consecutive, error = %error, "live sync pass failed");
+            // `consecutive` counts failures of this error's class, not
+            // of every class combined: each class backs off and trips
+            // its cap independently.
+            let class = FailureClass::from(error);
+            eprintln!(
+                "live sync pass failed ({class:?} class, {consecutive} consecutive): {error}"
+            );
+            tracing::warn!(
+                stage = "sync",
+                class = ?class,
+                consecutive,
+                error = %error,
+                "live sync pass failed"
+            );
         },
     );
     // The loop returned cleanly or terminally: settle the mutation
     // queue (run_loop already drained on exit; this is the idempotent
     // supervisor half) before tearing down serving and the bulk source.
     supervisor.note_loop_ended();
+    // Cancel the mailbox tasks within a bounded deadline: the drainer
+    // and supervisor stop, and the runtime aborts whatever has not
+    // yielded by then. Without this the tasks would run until runtime
+    // drop, and a shutdown could wait on a relay outage that never
+    // clears.
+    mailbox.shutdown(SHUTDOWN_DEADLINE);
     bulk.shutdown();
     let _ = serving.shutdown();
 

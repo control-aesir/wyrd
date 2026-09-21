@@ -22,6 +22,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::fuse::FuseBackend;
+use crate::lifecycle::WakeSignal;
 use crate::mutation::MutationQueue;
 use crate::projection::Projection;
 use crate::want::WantRegistry;
@@ -380,6 +381,11 @@ where
         let budgets = config.budgets;
         let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
         let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
+        // One pacing signal for the whole live session: created here,
+        // attached to the queue now, and shared with the backend's
+        // callers (mailbox intake) so every producer wakes the loop.
+        let waker = Arc::new(WakeSignal::default());
+        mutations.attach_waker(Arc::clone(&waker));
         let backend = FuseBackend::shared_with_wants(
             Arc::clone(&projection),
             Arc::clone(&wants),
@@ -397,6 +403,7 @@ where
                 published_revision: revision,
                 dirty: false,
                 budgets,
+                waker,
             },
             backend,
         )

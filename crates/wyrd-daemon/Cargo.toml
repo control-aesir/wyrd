@@ -15,6 +15,9 @@ wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
 fuser = "0.18"
 futures-util.workspace = true
+# Jitter entropy for supervision backoff (equal-jitter decorrelation of
+# retry storms; the same approved CSPRNG substrate wyrd-sync builds on)
+getrandom.workspace = true
 hex.workspace = true
 libc.workspace = true
 clap.workspace = true

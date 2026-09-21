@@ -25,8 +25,10 @@ pub mod want;
 pub(crate) mod mini_relay;
 
 pub use budgets::ResourceBudgets;
-pub use core::{Daemon, DaemonError, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};
-pub use lifecycle::Supervisor;
+pub use core::{
+    Daemon, DaemonError, FailureClass, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport,
+};
+pub use lifecycle::{Supervisor, Wake, WakeSignal};
 pub use mutation::{
     FileIdentity, MutationError, MutationId, MutationKind, MutationOutcome, MutationQueue,
     MutationRequest,

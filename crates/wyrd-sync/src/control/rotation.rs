@@ -31,7 +31,11 @@
 //! ‖ AEAD ciphertext
 //! ```
 //!
-//! The AAD is the header minus the nonce; the plaintext repeats
+//! The AAD is the domain tag, the version byte, and the header
+//! fields the machines act on: drive, recipient, encryption key and
+//! epoch. The ephemeral key is bound by construction — change it and
+//! the ECDH yields a different AEAD key — and the nonce is the AEAD's
+//! own input. The plaintext repeats
 //! `drive ‖ device ‖ epoch` ahead of the payload, then the counted
 //! transition bytes the membership machine verifies and the counted
 //! wrapped-capability bytes. The transition rides along so one drain
@@ -73,7 +77,7 @@ pub const ROTATION_VERSION: u8 = 0x01;
 /// recipient (32) + encryption key (32) + epoch (8) + nonce (24).
 pub const ROTATION_HEADER_LEN: usize = 161;
 
-/// AAD domain tag: domain ‖ drive ‖ recipient ‖ encryption key ‖ epoch.
+/// AAD domain tag: domain ‖ version ‖ drive ‖ recipient ‖ encryption key ‖ epoch.
 pub(crate) const ROTATION_AAD_DOMAIN: &[u8] = b"wyrd rotation delivery v1";
 
 /// HKDF info context for the rotation AEAD key: distinct from the
@@ -181,13 +185,17 @@ pub(crate) fn hkdf_rotation_key(shared: &Zeroizing<[u8; 32]>) -> Zeroizing<[u8; 
 }
 
 fn rotation_aad(
+    version: u8,
     drive: &DriveId,
     recipient: &DeviceId,
     encryption_key: &DeviceEncryptionKey,
     epoch: u64,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(ROTATION_AAD_DOMAIN.len() + 72);
+    let mut aad = Vec::with_capacity(ROTATION_AAD_DOMAIN.len() + 73);
     aad.extend_from_slice(ROTATION_AAD_DOMAIN);
+    // The version leads, as in `control_aad`: intake dispatches on this
+    // byte before either framing decodes, so it must not be malleable.
+    aad.push(version);
     aad.extend_from_slice(drive.as_bytes());
     aad.extend_from_slice(recipient.as_bytes());
     aad.extend_from_slice(encryption_key.as_bytes());
@@ -228,7 +236,7 @@ pub fn seal_rotation(
     push_blob(&mut plaintext, wrapped);
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
-    let aad = rotation_aad(drive, &recipient, encryption_key, epoch);
+    let aad = rotation_aad(ROTATION_VERSION, drive, &recipient, encryption_key, epoch);
     let ciphertext = crate::keys::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad)?;
     Ok(SealedRotation {
         version: ROTATION_VERSION,
@@ -261,6 +269,7 @@ pub fn open_rotation(
     let shared = ecdh_shared(&encryption_secret.secret_key(), &ephemeral_pk)?;
     let aead_key = hkdf_rotation_key(&shared);
     let aad = rotation_aad(
+        sealed.version,
         &sealed.drive,
         &sealed.recipient,
         &sealed.encryption_key,
@@ -418,6 +427,75 @@ mod tests {
         forged[129] ^= 0x01;
         let parsed = SealedRotation::decode(&forged).unwrap();
         assert!(open_rotation(&enc_secret, &parsed).is_err());
+    }
+
+    /// The version byte must ride INSIDE the tag. It did not: the AAD
+    /// was `domain ‖ drive ‖ recipient ‖ key ‖ epoch`, so flipping byte 0
+    /// left the tag valid, and intake dispatches on exactly that byte
+    /// before either framing decodes. Now the AAD carries it, computed
+    /// from the *received* value the way `control_aad` already does.
+    #[test]
+    fn version_byte_is_covered_by_the_tag() {
+        let (enc_key, transition, wrapped) = delivery_parts();
+        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let (enc_secret, _) = enc_pair(0x40);
+
+        // Reproduce exactly what `open_rotation` authenticates.
+        let eph = XOnlyPublicKey::from_slice(&sealed.ephemeral).unwrap();
+        let shared = ecdh_shared(&enc_secret.secret_key(), &eph).unwrap();
+        let key = hkdf_rotation_key(&shared);
+
+        // Flip the version to the epoch-sealed framing's value.
+        let mut forged = sealed.clone();
+        forged.version = 0x00;
+
+        let aad_sealed = rotation_aad(
+            sealed.version,
+            &sealed.drive,
+            &sealed.recipient,
+            &sealed.encryption_key,
+            sealed.epoch,
+        );
+        let aad_forged = rotation_aad(
+            forged.version,
+            &forged.drive,
+            &forged.recipient,
+            &forged.encryption_key,
+            forged.epoch,
+        );
+        assert_ne!(
+            aad_sealed, aad_forged,
+            "the AAD must distinguish the two versions"
+        );
+        // POSITIVE control: the untouched AAD still opens the same bytes,
+        // so the failure below is the flip and not a broken fixture.
+        assert!(crate::keys::aead::open(
+            key.as_slice(),
+            &sealed.nonce,
+            &sealed.ciphertext,
+            &aad_sealed
+        )
+        .is_ok());
+        assert!(
+            crate::keys::aead::open(key.as_slice(), &forged.nonce, &forged.ciphertext, &aad_forged)
+                .is_err(),
+            "a flipped version byte must break the tag"
+        );
+        // And the whole path rejects it rather than routing it onward.
+        assert!(open_rotation(&enc_secret, &forged).is_err());
+    }
+
+    /// Two-sided control on the comparison above: the epoch-sealed
+    /// framing already bound its version, so the same flip moves its AAD
+    /// too. If this ever stops holding, the asymmetry this test series
+    /// was written about has moved and the other test proves nothing.
+    #[test]
+    fn the_epoch_sealed_framing_binds_its_version() {
+        use super::super::{control_aad, ControlKind};
+        assert_ne!(
+            control_aad(0x00, &drive(), ControlKind::KeyRotation, 3),
+            control_aad(0x01, &drive(), ControlKind::KeyRotation, 3)
+        );
     }
 
     #[test]

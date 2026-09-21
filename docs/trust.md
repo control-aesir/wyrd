@@ -375,8 +375,9 @@ version (1) ‖ drive (32) ‖ ephemeral pk (32) ‖ recipient DeviceId (32)
 ‖ AEAD ciphertext
 ```
 
-AAD is the header minus the nonce (`"wyrd rotation delivery v1"` ‖
-drive ‖ recipient ‖ encryption key ‖ epoch); the plaintext repeats
+AAD is the domain tag, the version byte, and the header minus the
+nonce (`"wyrd rotation delivery v1"` ‖ version ‖ drive ‖ recipient ‖
+encryption key ‖ epoch); the plaintext repeats
 `drive ‖ device ‖ epoch`, then the counted transition bytes the
 membership machine verifies and the counted wrapped-capability bytes.
 The AEAD key derives under `"wyrd rotation delivery key v1"` — a

@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use wyrd_format::{DeviceId, MembershipTransition, SnapshotId};
+use wyrd_format::{DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use zeroize::Zeroizing;
 
-use super::engine::{DrainReport, Engine, EngineError};
+use super::engine::{DeferredWait, DrainReport, Engine, EngineError, PendingEntry};
 use crate::control::{
-    verify_announcement, AnnouncementUpdate, ControlError, ControlMessageId, IngestReport, Message,
-    SealedControl, SnapshotAnnouncement,
+    verify_announcement, AnnouncementUpdate, CapabilityPayload, ControlError, ControlMessageId,
+    IngestReport, Message, SealedControl, SnapshotAnnouncement,
 };
 use crate::control::{RotationDelivery, RotationIngest, ROTATION_VERSION};
 use crate::durable::{AuthorizedCapability, Fact};
@@ -27,7 +27,9 @@ enum Action {
     /// messages cannot grow state. Redelivery revalidates to the same
     /// outcome after eviction or restart.
     Suppress,
-    Defer,
+    /// Not yet processable, held with the dependency that unblocks it
+    /// (see [`DeferredWait`]).
+    Defer(DeferredWait),
 }
 
 enum Outcome {
@@ -131,12 +133,14 @@ fn accept_envelope(
         Err(_) => Ok(Outcome::Discarded),
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
             Some(id) => match engine.take_pending(&id) {
-                Some(message) => commit_action(engine, &id, &message, false),
+                Some(entry) => commit_action(engine, &id, &entry.message, false, Some(entry.wait)),
                 None => Ok(Outcome::Duplicate),
             },
             None => Ok(Outcome::Duplicate),
         },
-        Ok(IngestReport::Accepted { id, message }) => commit_action(engine, &id, &message, true),
+        Ok(IngestReport::Accepted { id, message }) => {
+            commit_action(engine, &id, &message, true, None)
+        }
     }
 }
 
@@ -145,6 +149,7 @@ fn commit_action(
     id: &ControlMessageId,
     message: &Message,
     is_new: bool,
+    held: Option<DeferredWait>,
 ) -> Result<Outcome, EngineError> {
     // Announcements this pass would commit, validated against each other
     // as well as the hydrated projection: a transition landing may flush
@@ -157,7 +162,7 @@ fn commit_action(
             engine.inbox.suppress(id);
             return Ok(Outcome::Accepted);
         }
-        Ok(Action::Defer) if engine.pending.len() >= MAX_PENDING_MESSAGES => {
+        Ok(Action::Defer(_)) if engine.pending.len() >= MAX_PENDING_MESSAGES => {
             // Shed without consuming: the bound protects memory, but a
             // resource decision must never write a semantic fact. The
             // relay retains the envelope (the drain settles `Retry`),
@@ -167,20 +172,21 @@ fn commit_action(
             engine.inbox.forget(id);
             return Ok(Outcome::RelayHeld);
         }
-        Ok(Action::Defer) => {
-            engine.hold_pending(*id, message.clone());
+        Ok(Action::Defer(wait)) => {
+            engine.hold_pending(*id, message.clone(), wait);
             return Ok(Outcome::Deferred);
         }
         Err(error) => {
             // The pass fails after volatile writes: the transition (if
             // any) is observed in the log, but no fact committed. A
-            // message taken from pending on redelivery is re-held so
-            // its slot survives; a fresh message rides relay redelivery
-            // (its handover was never settled). Either way resync drops
-            // the uncommitted observations and suppress verdicts,
-            // restoring the durable baseline before the error surfaces.
-            if !is_new {
-                engine.hold_pending(*id, message.clone());
+            // message taken from pending on redelivery is re-held under
+            // its previous dependency so its slot survives; a fresh
+            // message rides relay redelivery (its handover was never
+            // settled). Either way resync drops the uncommitted
+            // observations and suppress verdicts, restoring the durable
+            // baseline before the error surfaces.
+            if let Some(wait) = held {
+                engine.hold_pending(*id, message.clone(), wait);
             }
             let _ = engine.resync();
             return Err(error);
@@ -191,10 +197,12 @@ fn commit_action(
         staged.clear();
     }
     if matches!(message, Message::MembershipTransition(_)) {
-        // A newly committed transition flushes volatile pending like
-        // every transition commit, whether the transition arrived
-        // epoch-sealed or carried by a rotation delivery.
-        match flush_pending(engine, &mut staged) {
+        // A newly committed transition flushes the volatile pending
+        // entries waiting on it — whether the transition arrived
+        // epoch-sealed or carried by a rotation delivery. Entries held
+        // on other unseen transitions stay parked without re-drive.
+        let committed = committed_transition(message);
+        match flush_pending(engine, &mut staged, committed) {
             Ok(more) => facts.extend(more),
             Err(error) => {
                 let _ = engine.resync();
@@ -218,48 +226,72 @@ fn commit_action(
     Ok(Outcome::Accepted)
 }
 
-/// Walk the volatile pending queue in arrival order (see
-/// `Engine::hold_pending`), re-driving every held message against the
-/// newly committed state: staged announcement compatibility and the
-/// durable fact order stay deterministic. Shared by the transition arm
+/// The transition id a committed [`Message::MembershipTransition`]
+/// carries. `message_action` decoded the same bytes above, so `None`
+/// is unreachable through the intake paths; callers fall back to
+/// waking every held entry rather than stranding one on a decoding
+/// disagreement.
+fn committed_transition(message: &Message) -> Option<TransitionId> {
+    let Message::MembershipTransition(payload) = message else {
+        return None;
+    };
+    MembershipTransition::from_canonical_bytes(&payload.transition)
+        .ok()
+        .map(|transition| transition.transition_id())
+}
+
+/// Re-drive the pending entries the newly committed transition
+/// unblocks, in arrival order (see [`PendingQueue::wake_seqs`]):
+/// entries held on its id, plus every status-blocked entry (their
+/// standing reads the global membership analysis, so any commit can
+/// change it). Entries held on other unseen transitions are never
+/// visited — neither traversed nor cloned — so flush work stays
+/// proportional to the woken set, never the parked queue. Staged
+/// announcement compatibility and the durable fact order stay
+/// deterministic over the woken order. Shared by the transition arm
 /// and the rotation path — a newly observed transition flushes pending
 /// no matter which framing carried it.
 ///
-/// On failure the in-flight message and the unprocessed remainder are
-/// restored in arrival order (every id here is disjoint from the
-/// re-held ones, so `hold_pending` appends without clobbering) and the
-/// error returns for the caller to resync: suppressed and
-/// fact-consumed prefixes redeliver via the relay (never settled), and
-/// the observations and verdicts they left behind go away with the
-/// caller's resync, which must run after the restore — resync rebuilds
-/// from durable facts and never touches the volatile queue.
+/// Each entry leaves the queue before it re-drives and returns to its
+/// original slot when it defers again, so arrival order never shifts
+/// under a commit that does not consume the entry. On failure the
+/// failed entry is restored to its slot and the error returns for the
+/// caller to resync: entries already consumed redeliver via the relay
+/// (never settled), entries never visited are untouched, and the
+/// observations and verdicts left behind go away with the caller's
+/// resync, which must run after the restore — resync rebuilds from
+/// durable facts and never touches the volatile queue.
 fn flush_pending(
     engine: &mut Engine,
     staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
+    committed: Option<TransitionId>,
 ) -> Result<Vec<Fact>, EngineError> {
-    let taken = std::mem::take(&mut engine.pending);
+    // Snapshot the wake set up front: the index, not a full queue
+    // walk. Later re-drives in this loop only reinsert, never remove
+    // unvisited entries, so these sequences stay valid throughout.
+    let wake = engine.pending.wake_seqs(committed);
     let mut facts = Vec::new();
-    let mut failed_at: Option<(usize, EngineError)> = None;
-    for (index, (pending_id, pending_message)) in taken.iter().enumerate() {
-        match message_action(engine, pending_id, pending_message, staged) {
+    for seq in wake {
+        let Some(entry) = engine.pending.remove_seq(seq) else {
+            continue;
+        };
+        match message_action(engine, &entry.id, &entry.message, staged) {
             Ok(Action::Commit(more)) => facts.extend(more),
             Ok(Action::Suppress) => {
-                engine.inbox.suppress(pending_id);
+                engine.inbox.suppress(&entry.id);
             }
-            Ok(Action::Defer) => {
-                engine.hold_pending(*pending_id, pending_message.clone());
+            Ok(Action::Defer(wait)) => {
+                let id = entry.id;
+                let message = entry.message;
+                engine
+                    .pending
+                    .restore(seq, PendingEntry { id, message, wait });
             }
             Err(error) => {
-                failed_at = Some((index, error));
-                break;
+                engine.pending.restore(seq, entry);
+                return Err(error);
             }
         }
-    }
-    if let Some((index, error)) = failed_at {
-        for (id, message) in taken.into_iter().skip(index) {
-            engine.hold_pending(id, message);
-        }
-        return Err(error);
     }
     Ok(facts)
 }
@@ -329,7 +361,8 @@ fn message_action(
                 return Ok(Action::Suppress);
             }
             match engine.log.transition(&announcement.membership) {
-                None => Ok(Action::Defer),
+                // Unseen: only the arrival of this transition unblocks.
+                None => Ok(Action::Defer(DeferredWait::Unseen(announcement.membership))),
                 Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
                 Some(_) => match engine.log.status(&announcement.membership) {
                     Some(TransitionStatus::Canonical) => {
@@ -371,7 +404,9 @@ fn message_action(
                         | TransitionStatus::Voided
                         | TransitionStatus::Orphaned
                         | TransitionStatus::Pending,
-                    ) => Ok(Action::Defer),
+                    ) => Ok(Action::Defer(DeferredWait::StatusBlocked(
+                        announcement.membership,
+                    ))),
                     // Observed a moment ago via transition(), but the
                     // fresh analysis classifies nothing for it: an
                     // internal disagreement, not sender data. Fail the
@@ -391,14 +426,15 @@ fn message_action(
         // becomes a commit or a deferral; until then no durable record
         // distinguishes consumed from never-recorded (see trust.md).
         Message::KeyRotation(_) => Ok(Action::Suppress),
-        Message::Capability(_) => Ok(capability_action(engine, id, message)),
+        Message::Capability(payload) => Ok(capability_action(engine, id, payload)),
     }
 }
 
-fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) -> Action {
-    let Message::Capability(payload) = message else {
-        return Action::Defer;
-    };
+fn capability_action(
+    engine: &Engine,
+    id: &ControlMessageId,
+    payload: &CapabilityPayload,
+) -> Action {
     let capability = match WrappedCapability::from_bytes(payload.wrapped.clone())
         .unwrap(&engine.encryption_secret)
     {
@@ -426,7 +462,16 @@ fn capability_action(engine: &Engine, id: &ControlMessageId, message: &Message) 
             Fact::Capability(authorized),
             Fact::ControlMessage(*id),
         ]),
-        Err(CapabilityError::UnknownTransition(_)) => Action::Defer,
+        // Unseen or gap-pending history may still arrive or resolve:
+        // hold on the transition with the matching wake rule (exact
+        // for unseen, every-commit for observed-but-blocked).
+        Err(CapabilityError::UnknownTransition(waited)) => {
+            if engine.log.contains(&waited) {
+                Action::Defer(DeferredWait::StatusBlocked(waited))
+            } else {
+                Action::Defer(DeferredWait::Unseen(waited))
+            }
+        }
         Err(_) => Action::Suppress,
     }
 }
@@ -585,7 +630,7 @@ fn rotation_commit(
         Fact::Capability(authorized),
         Fact::ControlMessage(*id),
     ];
-    match flush_pending(engine, &mut staged) {
+    match flush_pending(engine, &mut staged, Some(transition_id)) {
         Ok(more) => facts.extend(more),
         Err(error) => {
             let _ = engine.resync();
@@ -612,6 +657,8 @@ fn rotation_commit(
 mod tests_announcement;
 #[cfg(test)]
 mod tests_capability;
+#[cfg(test)]
+mod tests_deferred;
 #[cfg(test)]
 mod tests_harness;
 #[cfg(test)]

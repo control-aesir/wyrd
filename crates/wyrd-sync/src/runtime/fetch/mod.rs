@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use wyrd_format::{
     BaoRoot, ChildManifest, ContentId, DriveId, FetchStatus, ManifestEntry, ObjectKind,
-    ObjectStore, Snapshot, SnapshotId, StorageId,
+    ObjectStore, Snapshot, SnapshotId, StorageId, StoreError, StoreFailure,
 };
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
@@ -33,6 +33,36 @@ pub(super) enum FetchOutcome<T> {
     Transport,
     /// Verified bytes the local store refused.
     Local,
+    /// The local disk cannot take more bytes (full) or this process
+    /// may not write to it. Unlike [`FetchOutcome::Local`], which the
+    /// plan layer counts and retries next run, this aborts the pass:
+    /// retrying without freeing space or fixing permissions converges
+    /// to nothing, so the failure surfaces instead of stalling as
+    /// ever-growing `local_failures`.
+    Store(StoreFailure),
+}
+
+/// A vault import failure that must abort the pass rather than count
+/// as a benign local refusal: a full or unwritable disk. Anything
+/// else stays `None` and the caller falls back to
+/// [`FetchOutcome::Local`].
+pub(super) fn fatal_vault(error: &crate::serving::VaultError) -> Option<StoreFailure> {
+    match error {
+        crate::serving::VaultError::Io(io) => match StoreFailure::of_io(io) {
+            StoreFailure::Transient => None,
+            fatal => Some(fatal),
+        },
+    }
+}
+
+/// A plaintext-store refusal that must abort the pass. Transient
+/// refusals (poisoned locks, test doubles) stay `None` for the
+/// [`FetchOutcome::Local`] path.
+fn fatal_store<E: StoreError>(error: &E) -> Option<StoreFailure> {
+    match error.failure() {
+        StoreFailure::Transient => None,
+        fatal => Some(fatal),
+    }
 }
 
 /// Fetch and validate a pending root manifest.
@@ -107,7 +137,7 @@ pub(super) fn root(
     // import failure is a local refusal, never a committed advertisement.
     match vault.import(&served.sealed) {
         Ok(_) => FetchOutcome::Fulfilled(record),
-        Err(_) => FetchOutcome::Local,
+        Err(error) => fatal_vault(&error).map_or(FetchOutcome::Local, FetchOutcome::Store),
     }
 }
 
@@ -196,7 +226,7 @@ pub(super) fn child(
     // Residency precedes the record, as in root().
     match vault.import(&sealed) {
         Ok(_) => FetchOutcome::Fulfilled(record),
-        Err(_) => FetchOutcome::Local,
+        Err(error) => fatal_vault(&error).map_or(FetchOutcome::Local, FetchOutcome::Store),
     }
 }
 
@@ -333,20 +363,38 @@ pub(super) fn object(
         };
         // Residency precedes the record (as in root and child): the
         // verified ciphertext lands in the serving vault before the
-        // plaintext consequence, and a refusal is a local failure.
-        if vault.import(&sealed).is_err() {
+        // plaintext consequence, and a refusal is a local failure. A
+        // full or unwritable disk returns immediately: every further
+        // candidate would refuse identically, and the pass must abort
+        // rather than count one `Local` per candidate.
+        if let Err(error) = vault.import(&sealed) {
+            if let Some(fatal) = fatal_vault(&error) {
+                return ObjectAttempt {
+                    aggregate: FetchOutcome::Store(fatal),
+                    invalid,
+                    fulfilled: None,
+                };
+            }
             aggregate = worse(aggregate, FetchOutcome::Local);
             continue;
         }
-        if objects
-            .insert_verified(candidate.kind, content, &plaintext)
-            .is_ok()
-        {
-            return ObjectAttempt {
-                aggregate: FetchOutcome::Fulfilled(()),
-                invalid,
-                fulfilled: Some(candidate.storage_id),
-            };
+        match objects.insert_verified(candidate.kind, content, &plaintext) {
+            Ok(()) => {
+                return ObjectAttempt {
+                    aggregate: FetchOutcome::Fulfilled(()),
+                    invalid,
+                    fulfilled: Some(candidate.storage_id),
+                };
+            }
+            Err(error) => {
+                if let Some(fatal) = fatal_store(&error) {
+                    return ObjectAttempt {
+                        aggregate: FetchOutcome::Store(fatal),
+                        invalid,
+                        fulfilled: None,
+                    };
+                }
+            }
         }
         aggregate = worse(aggregate, FetchOutcome::Local);
     }
@@ -358,7 +406,9 @@ pub(super) fn object(
 }
 
 /// The more actionable of two fetch failures, by the documented
-/// transport > local > invalid > missing-key > absence order.
+/// store-fatal > transport > local > invalid > missing-key > absence
+/// order. A fatal store condition outranks everything: it aborts the
+/// pass, so it must survive aggregation even beside a transport error.
 fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> {
     fn rank(outcome: &FetchOutcome<()>) -> u8 {
         match outcome {
@@ -368,6 +418,7 @@ fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> 
             FetchOutcome::Invalid => 2,
             FetchOutcome::Local => 3,
             FetchOutcome::Transport => 4,
+            FetchOutcome::Store(_) => 5,
         }
     }
     if rank(&second) > rank(&first) {
@@ -380,10 +431,12 @@ fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> 
 impl<T> FetchOutcome<T> {
     /// Settle one finished attempt into fetch status for FUSE
     /// consumption. Benign failures (absence, missing key, transport)
-    /// stay retryable; verification failures need scrub/repair before
-    /// they ever surface. A refused local import maps to corrupt: the
-    /// bytes verified, so retrying the network cannot help — the data
-    /// path itself needs repair.
+    /// stay retryable, as does a fatal store condition — retrying
+    /// makes sense once space is freed or permissions fixed;
+    /// verification failures need scrub/repair before they ever
+    /// surface. A refused local import maps to corrupt: the bytes
+    /// verified, so retrying the network cannot help — the data path
+    /// itself needs repair.
     ///
     /// No production caller yet: the daemon composing sync with the
     /// FUSE view settles attempts through here once in-flight fetch
@@ -392,9 +445,10 @@ impl<T> FetchOutcome<T> {
     pub(super) fn settled(&self) -> FetchStatus {
         match self {
             FetchOutcome::Fulfilled(_) => FetchStatus::Available,
-            FetchOutcome::Missing | FetchOutcome::UnavailableKey | FetchOutcome::Transport => {
-                FetchStatus::Unavailable
-            }
+            FetchOutcome::Missing
+            | FetchOutcome::UnavailableKey
+            | FetchOutcome::Transport
+            | FetchOutcome::Store(_) => FetchStatus::Unavailable,
             FetchOutcome::Invalid | FetchOutcome::Local => FetchStatus::Corrupt,
         }
     }

@@ -1,4 +1,6 @@
-use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, Tree};
+use wyrd_format::{
+    chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, StoreError, StoreFailure, Tree,
+};
 use wyrd_fuse::{DriveView, Node};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
@@ -14,6 +16,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::budgets::ResourceBudgets;
 use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::Projection;
 use crate::want::WantRegistry;
@@ -77,6 +80,10 @@ pub struct LiveConfig {
     /// restarts the process; the durable engine state and seen log
     /// make the restart pick up cleanly.
     pub max_consecutive_errors: u32,
+    /// Resource bounds enforced at the loop and serving boundaries.
+    /// Defaults are the historical hardcoded bounds, so default
+    /// configuration behaves exactly like every previous release.
+    pub budgets: ResourceBudgets,
 }
 
 impl Default for LiveConfig {
@@ -86,6 +93,7 @@ impl Default for LiveConfig {
             error_base_delay: Duration::from_secs(1),
             error_max_delay: Duration::from_secs(30),
             max_consecutive_errors: 10,
+            budgets: ResourceBudgets::default(),
         }
     }
 }
@@ -141,6 +149,10 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// failed after committing): the next pass republishes regardless
     /// of the revision gate, so recovery never waits for new changes.
     pub(super) dirty: bool,
+    /// Resource bounds for this live session, fixed at composition.
+    /// The admission cap paces demand; the registries and backend
+    /// hold their own copies for their own refusals.
+    pub(super) budgets: ResourceBudgets,
 }
 
 impl<S: ObjectStore> LiveDaemon<S>
@@ -203,8 +215,10 @@ where
         // from the registry's perspective: only durably committed
         // identities are marked admitted, so a failing commit leaves
         // the rest pending for the next pass and no waiter ever
-        // coalesces onto an unadmitted fetch.
-        admit_wants(&self.wants, &mut |want| {
+        // coalesces onto an unadmitted fetch. The per-pass cap paces
+        // a demand flood: leftover pending demand is not dropped, it
+        // waits for the next pass.
+        admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
             self.engine
                 .set_materialization(want, MaterializationState::Cached)
         })?;
@@ -314,9 +328,9 @@ where
                 let base = match base {
                     Some(tree) => tree,
                     None => Tree::from_entries(Vec::new())
-                        .map_err(|_| MutationError::Store)?
+                        .map_err(|_| MutationError::Store(StoreFailure::Transient))?
                         .insert_into(&mut *store)
-                        .map_err(|_| MutationError::Store)?,
+                        .map_err(|error| MutationError::Store(error.failure()))?,
                 };
                 let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
                     .map_err(MutationError::from_format)?;
@@ -344,9 +358,9 @@ where
                 let base = match base {
                     Some(tree) => tree,
                     None => Tree::from_entries(Vec::new())
-                        .map_err(|_| MutationError::Store)?
+                        .map_err(|_| MutationError::Store(StoreFailure::Transient))?
                         .insert_into(&mut *store)
-                        .map_err(|_| MutationError::Store)?,
+                        .map_err(|error| MutationError::Store(error.failure()))?,
                 };
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, 0, false, Vec::new())
@@ -394,8 +408,8 @@ where
                     _ => return Err(MutationError::Stale(path.clone())),
                 }
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let chunks =
-                    chunk::insert_chunks(&mut *store, content).map_err(|_| MutationError::Store)?;
+                let chunks = chunk::insert_chunks(&mut *store, content)
+                    .map_err(|error| MutationError::Store(error.failure()))?;
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, content.len() as u64, *executable, chunks.clone())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
@@ -443,8 +457,8 @@ where
                 )?;
                 image.extend_from_slice(content);
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let chunks =
-                    chunk::insert_chunks(&mut *store, &image).map_err(|_| MutationError::Store)?;
+                let chunks = chunk::insert_chunks(&mut *store, &image)
+                    .map_err(|error| MutationError::Store(error.failure()))?;
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, image.len() as u64, executable, chunks.clone())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
@@ -572,7 +586,7 @@ where
                         image.resize(target, 0);
                         let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                         chunk::insert_chunks(&mut *store, &image)
-                            .map_err(|_| MutationError::Store)?
+                            .map_err(|error| MutationError::Store(error.failure()))?
                     }
                 };
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
@@ -651,7 +665,12 @@ where
         };
         let len = size.min(max_len);
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
-            .map_err(|_| MutationError::Store)
+            .map_err(|error| match error {
+                // A classified store failure keeps its errno; every
+                // other view failure stays the opaque EIO it is today.
+                wyrd_fuse::ViewError::Store(failure, _) => MutationError::Store(failure),
+                _ => MutationError::Store(StoreFailure::Transient),
+            })
     }
 
     /// Resolve `path` against the current heads' merged view, for the
@@ -800,13 +819,20 @@ where
 /// engine's durable sequence, which is what the publication gate
 /// observes — the returned identities are for callers that need the
 /// admitted set itself.
+///
+/// At most `limit` identities commit per call: the registry's peek is
+/// oldest-first, so capping paces a flood deterministically while the
+/// remainder waits for the next pass. A zero limit admits nothing and
+/// still reports the empty set.
 pub(super) fn admit_wants<E>(
     registry: &WantRegistry,
+    limit: usize,
     commit: &mut dyn FnMut(ContentId) -> Result<(), E>,
 ) -> Result<Vec<ContentId>, E> {
     let pending = registry.peek_pending();
-    let mut committed = Vec::with_capacity(pending.len());
-    for want in pending {
+    let take = pending.len().min(limit);
+    let mut committed = Vec::with_capacity(take);
+    for want in pending.into_iter().take(take) {
         match commit(want) {
             Ok(()) => committed.push(want),
             Err(error) => {

@@ -5,13 +5,14 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use wyrd_format::ObjectStore;
+use wyrd_format::{ObjectStore, StoreFailure};
 use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
 use super::inode::{
     statfs_capacity, DirectoryEntries, DirectoryState, Handle, InodeError, InodeTable, OpenDir,
     OpenFiles, WriteHandle, MOUNT_TIME, TTL,
 };
+use crate::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
 use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::Projection;
 use crate::session::WriteBudget;
@@ -49,6 +50,13 @@ where
     /// The session's write budget: bounds the buffered logical images of
     /// writable handles. Independent of the projection and store locks.
     pub(super) budget: Arc<WriteBudget>,
+    /// Most open file handles at once: read captures pin their
+    /// open-time version and writable images pin buffered bytes, so
+    /// the table is memory. Past the bound opens fail `EMFILE` — the
+    /// table is per-process, like the descriptor table the errno
+    /// names — and already-open handles are unaffected. Releases
+    /// always succeed, so a saturated table drains.
+    pub(super) max_open_handles: usize,
     /// How long `open`/`read` may block on demand before `EIO`.
     open_timeout: Duration,
     /// The mounting user's ids, presented as synthetic ownership so
@@ -88,10 +96,12 @@ pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
         MutationError::AlreadyExists(_) => fuser::Errno::EEXIST,
         MutationError::DirectoryNotEmpty(_) => fuser::Errno::ENOTEMPTY,
         MutationError::TooLarge(_) => fuser::Errno::EFBIG,
+        MutationError::Store(StoreFailure::StorageFull) => fuser::Errno::ENOSPC,
+        MutationError::Store(StoreFailure::PermissionDenied) => fuser::Errno::EACCES,
         MutationError::Conflicted { .. }
         | MutationError::Stale(_)
         | MutationError::Lock
-        | MutationError::Store
+        | MutationError::Store(_)
         | MutationError::Shutdown
         | MutationError::Engine => fuser::Errno::EIO,
     }
@@ -163,17 +173,23 @@ fn unsupported_open_flags(_flags: i32) -> bool {
 }
 
 /// The POSIX error the kernel boundary documents for each view failure.
+/// A classified store failure keeps its meaning across the boundary: a
+/// full disk is `ENOSPC` and an unwritable store is `EACCES`, so
+/// operators and scripts see the resource condition, not a generic
+/// data-path failure. Everything else unclassified stays `EIO`.
 pub(super) fn errno_of(error: &ViewError) -> fuser::Errno {
     match error {
         ViewError::NotFound => fuser::Errno::ENOENT,
         ViewError::InvalidPath => fuser::Errno::EINVAL,
         ViewError::NotADirectory => fuser::Errno::ENOTDIR,
         ViewError::NotAFile => fuser::Errno::EISDIR,
+        ViewError::Store(StoreFailure::StorageFull, _) => fuser::Errno::ENOSPC,
+        ViewError::Store(StoreFailure::PermissionDenied, _) => fuser::Errno::EACCES,
         ViewError::Conflict
         | ViewError::NotMaterialized { .. }
         | ViewError::Unavailable
         | ViewError::Corrupt
-        | ViewError::Store(_) => fuser::Errno::EIO,
+        | ViewError::Store(_, _) => fuser::Errno::EIO,
     }
 }
 
@@ -241,6 +257,7 @@ where
             wants: None,
             mutations: None,
             budget: Arc::new(WriteBudget::default()),
+            max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             open_timeout: Duration::ZERO,
             uid,
             gid,
@@ -268,6 +285,7 @@ where
             wants: None,
             mutations: None,
             budget: Arc::new(WriteBudget::default()),
+            max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             open_timeout: Duration::ZERO,
             uid,
             gid,
@@ -277,12 +295,15 @@ where
     /// The live daemon's half: the same published projection plus the
     /// demand registry and the mutation channel, so `open`/`read` on
     /// non-local content can block bounded on a want and mutating
-    /// callbacks submit to the loop.
+    /// callbacks submit to the loop. The write budget and the handle
+    /// cap come from the same [`ResourceBudgets`] the loop paces
+    /// admission from, so one struct governs both halves.
     pub fn shared_with_wants(
         projection: Arc<RwLock<Arc<Projection<S, M>>>>,
         wants: Arc<WantRegistry>,
         mutations: Arc<MutationQueue>,
         open_timeout: Duration,
+        budgets: &ResourceBudgets,
     ) -> Self {
         let (uid, gid) = current_owner();
         FuseBackend {
@@ -298,7 +319,12 @@ where
             }),
             wants: Some(wants),
             mutations: Some(mutations),
-            budget: Arc::new(WriteBudget::default()),
+            budget: Arc::new(WriteBudget::with_limits(
+                budgets.write_per_handle_bytes,
+                budgets.write_aggregate_bytes,
+                budgets.write_dirty_handles,
+            )),
+            max_open_handles: budgets.max_open_handles,
             open_timeout,
             uid,
             gid,
@@ -437,9 +463,12 @@ where
     pub fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
         let attempt = |this: &Self| {
             Result::<_, (ViewError, fuser::Errno)>::Ok({
-                let projection = this
-                    .projection()
-                    .map_err(|error| (ViewError::Store("projection lock".into()), error))?;
+                let projection = this.projection().map_err(|error| {
+                    (
+                        ViewError::Store(StoreFailure::Transient, "projection lock".into()),
+                        error,
+                    )
+                })?;
                 let view = projection.view();
                 let node = view
                     .lookup(path)
@@ -452,6 +481,9 @@ where
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
+        if files.by_handle.len() >= self.max_open_handles {
+            return Err(fuser::Errno::EMFILE);
+        }
         let handle = files.next;
         files.next = handle.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
         files.by_handle.insert(handle, Handle::Read(file));
@@ -459,10 +491,16 @@ where
     }
 
     /// Insert a freshly built handle, returning its kernel handle.
+    /// Past the handle cap the insert refuses `EMFILE` and the
+    /// handle is dropped unregistered — the caller maps it before
+    /// any kernel reply, so no half-open descriptor escapes.
     fn insert_handle(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
+        if files.by_handle.len() >= self.max_open_handles {
+            return Err(fuser::Errno::EMFILE);
+        }
         let fh = files.next;
         files.next = fh.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
         files.by_handle.insert(fh, handle);
@@ -571,9 +609,12 @@ where
     ) -> Result<Vec<u8>, fuser::Errno> {
         let attempt = |this: &Self| {
             Result::<Vec<u8>, (ViewError, fuser::Errno)>::Ok({
-                let projection = this
-                    .projection()
-                    .map_err(|error| (ViewError::Store("projection lock".into()), error))?;
+                let projection = this.projection().map_err(|error| {
+                    (
+                        ViewError::Store(StoreFailure::Transient, "projection lock".into()),
+                        error,
+                    )
+                })?;
                 projection
                     .view()
                     .read(file, offset, size as usize)

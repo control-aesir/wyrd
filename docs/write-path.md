@@ -494,25 +494,24 @@ heads.
 
 ## Resource bounds
 
-New local resources need explicit bounds, matching the ingest and demand
-limits elsewhere:
+All live-operation bounds (write budgets, mutation queue, open
+handles, demand admission, disk classification) are normative in
+`resource-limits.md`; this section keeps only the write-path summary:
 
 | Bound | Exceeded → |
 |---|---|
-| `MAX_WRITE_BUFFER_BYTES` per dirty handle | `ENOSPC` |
-| `MAX_BUFFERED_BYTES` aggregate across handles | `ENOSPC` |
-| `MAX_DIRTY_HANDLES` | `ENOSPC` |
-| `MAX_PENDING_MUTATIONS` (including the executing one) | `EAGAIN` |
+| `write_per_handle_bytes` per dirty handle (default 64 MiB) | `ENOSPC` |
+| `write_aggregate_bytes` aggregate across handles (default 256 MiB) | `ENOSPC` |
+| `write_dirty_handles` (default 64) | `ENOSPC` |
+| `max_pending_mutations` (default 4096, including the executing one) | `EAGAIN` |
 
 Buffered state is memory, so these are daemon-write budgets; overflow
-fails closed rather than allocating without limit.
+fails closed rather than allocating without limit. Total open handles
+are additionally capped (`max_open_handles`, default 4096,
+`EMFILE` past it) — read captures pin their open-time version, so
+the table is memory too.
 
-Total open handles are bounded by the mount/runtime's existing
-descriptor limit (the kernel/FUSE layer already caps them); the
-write-specific limits above bound only the *dirty* subset and its bytes.
-This section does not claim to bound total descriptors.
-
-These budgets are new and local; they are independent of the **protocol
+These budgets are local; they are independent of the **protocol
 ingest limits** (`Limits::V0`), which still bound every committed object.
 A mutation whose resulting file, tree, or manifest exceeds an ingest
 ceiling is refused at the commit boundary (`EFBIG`), never committed as
@@ -536,6 +535,8 @@ and ignored (the format does not represent them). There are no ACLs.
 | Condition | errno |
 |---|---|
 | store, authoring, commit, or durability failure | `EIO` |
+| store full (disk or quota) | `ENOSPC` |
+| store not writable | `EACCES` |
 | stale handle, conflicted heads | `EIO` |
 | unsupported feature operation (symlink/link/xattr) | `EOPNOTSUPP` |
 | name exists | `EEXIST` |

@@ -3,7 +3,8 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
-    BaoRoot, ContentId, Manifest, MemoryObjectStore, ObjectKind, SnapshotId, StorageId,
+    BaoRoot, ContentId, Manifest, MemoryObjectStore, ObjectKind, SnapshotId, StorageId, StoreError,
+    StoreFailure,
 };
 
 use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
@@ -260,10 +261,53 @@ impl BulkSource for FailingTransport {
 
 /// A store that refuses every import: even verified bytes fail
 /// locally, exercising the Local failure class. Fail-closed by
-/// construction — nothing is ever retained.
+/// construction — nothing is ever retained. The refusal stays
+/// transient (never full or unwritable), so existing tests keep
+/// counting `local_failures` instead of aborting the pass.
 struct RefusingStore;
 #[derive(Debug)]
 struct RefusingStoreError;
+
+impl wyrd_format::StoreError for RefusingStoreError {}
+
+/// A store whose disk is full: every import refuses with a
+/// [`StoreFailure::StorageFull`] classification, exercising the
+/// pass-abort path. Unlike [`RefusingStore`], nothing here is
+/// countable or retryable — the pass must fail, not stall.
+struct FullStore;
+#[derive(Debug)]
+struct FullStoreError;
+
+impl StoreError for FullStoreError {
+    fn failure(&self) -> StoreFailure {
+        StoreFailure::StorageFull
+    }
+}
+
+impl ObjectStore for FullStore {
+    type Error = FullStoreError;
+
+    fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, Self::Error> {
+        Err(FullStoreError)
+    }
+
+    fn insert_verified(
+        &mut self,
+        _kind: ObjectKind,
+        _expected: &ContentId,
+        _data: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err(FullStoreError)
+    }
+
+    fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
 
 impl ObjectStore for RefusingStore {
     type Error = RefusingStoreError;
@@ -511,6 +555,59 @@ fn plan_counts_refused_imports_as_local_failures() {
     assert_eq!(report.invalid, 0);
     assert_eq!(report.unavailable_keys, 0);
     assert_eq!(report.transport_errors, 0);
+}
+
+#[test]
+fn plan_aborts_on_full_disk_instead_of_stalling() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"full disk bytes",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = FullStore;
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+
+    // A full disk is not a countable local failure: the pass aborts
+    // with the classification instead of succeeding while nothing
+    // lands, and the content is never marked local.
+    let error = fixture
+        .engine
+        .execute_plan(&mut bulk.clone(), &mut objects)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::runtime::EngineError::Store(StoreFailure::StorageFull)
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert!(!objects.has(&published.content).unwrap());
 }
 
 #[test]

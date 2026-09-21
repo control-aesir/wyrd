@@ -7,7 +7,7 @@ use wyrd_fuse::ViewError;
 
 use crate::mutation::MutationError;
 
-use wyrd_format::ContentId;
+use wyrd_format::{ContentId, StoreFailure};
 
 /// The errno mapping is the POSIX contract at the mount boundary:
 /// pinned variant by variant.
@@ -28,8 +28,21 @@ fn view_errors_map_to_posix_errors() {
         assert_eq!(errno_of(&corruption), fuser::Errno::EIO);
     }
     assert_eq!(
-        errno_of(&ViewError::Store("disk".into())),
+        errno_of(&ViewError::Store(StoreFailure::Transient, "disk".into())),
         fuser::Errno::EIO
+    );
+    // Classified store failures keep their meaning across the
+    // boundary: full reads as no-space, unwritable as denied.
+    assert_eq!(
+        errno_of(&ViewError::Store(StoreFailure::StorageFull, "disk".into())),
+        fuser::Errno::ENOSPC
+    );
+    assert_eq!(
+        errno_of(&ViewError::Store(
+            StoreFailure::PermissionDenied,
+            "disk".into()
+        )),
+        fuser::Errno::EACCES
     );
 }
 
@@ -54,12 +67,22 @@ fn mutation_errors_map_to_posix_errors() {
         MutationError::Conflicted { heads: 2 },
         MutationError::Stale("x".into()),
         MutationError::Lock,
-        MutationError::Store,
+        MutationError::Store(StoreFailure::Transient),
         MutationError::Engine,
         MutationError::Shutdown,
     ] {
         assert_eq!(mutation_errno(&fatal), fuser::Errno::EIO);
     }
+    // A classified store failure keeps its errno on the mutation
+    // path too: full reads as no-space, unwritable as denied.
+    assert_eq!(
+        mutation_errno(&MutationError::Store(StoreFailure::StorageFull)),
+        fuser::Errno::ENOSPC
+    );
+    assert_eq!(
+        mutation_errno(&MutationError::Store(StoreFailure::PermissionDenied)),
+        fuser::Errno::EACCES
+    );
 }
 
 /// The request probe records the reply errno inline and passes it

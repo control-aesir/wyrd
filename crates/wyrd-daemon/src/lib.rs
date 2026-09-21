@@ -10,6 +10,7 @@
 //! platform errors instead of POSIX ones. The FUSE adapter ([`fuse`])
 //! is the first such backend, not a property of the core.
 
+pub mod budgets;
 pub mod core;
 pub mod fuse;
 pub mod lifecycle;
@@ -23,6 +24,7 @@ pub mod want;
 #[cfg(test)]
 pub(crate) mod mini_relay;
 
+pub use budgets::ResourceBudgets;
 pub use core::{Daemon, DaemonError, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};
 pub use lifecycle::Supervisor;
 pub use mutation::{

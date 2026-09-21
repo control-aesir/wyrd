@@ -37,5 +37,8 @@ pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_
 pub use membership::{Change, MembershipError, MembershipTransition};
 pub use mutation::{mkdir, put, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH};
 pub use snapshot::{Snapshot, SnapshotError};
-pub use store::{FetchStatus, MemoryObjectStore, ObjectStore, SharedStore, SharedStoreError};
+pub use store::{
+    FetchStatus, MemoryObjectStore, MemoryStoreError, ObjectStore, SharedStore, SharedStoreError,
+    StoreError, StoreFailure,
+};
 pub use tree::{Component, Entry, EntryContent, Tree};

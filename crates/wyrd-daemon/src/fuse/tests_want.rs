@@ -7,6 +7,7 @@ use std::time::Duration;
 use wyrd_format::ObjectStore;
 use wyrd_fuse::DriveView;
 
+use crate::budgets::ResourceBudgets;
 use crate::mutation::MutationQueue;
 use crate::projection::Projection;
 use crate::want::WantRegistry;
@@ -44,6 +45,7 @@ fn withheld_backend(open_timeout: Duration) -> WithheldFixture {
         Arc::clone(&registry),
         Arc::new(MutationQueue::default()),
         open_timeout,
+        &ResourceBudgets::default(),
     );
     (backend, store, registry, chunk)
 }

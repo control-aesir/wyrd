@@ -35,23 +35,53 @@ use thiserror::Error;
 
 use crate::durable::{Durability, PublishError};
 use crate::identity::{ContentId, ObjectKind};
-use crate::store::ObjectStore;
+use crate::store::{ObjectStore, StoreError, StoreFailure};
 
 /// Filesystem store failures: I/O plus the identity violations the
 /// [`ObjectStore`] contract makes the store's job to catch.
+///
+/// Resource conditions are their own variants, never strings inside
+/// [`FsStoreError::Io`]: callers branch on them (fail the sync pass
+/// fast, `ENOSPC`/`EACCES` at the mount) instead of matching rendered
+/// error text. Classification happens once, in [`FsStoreError::io`],
+/// so every call site inherits it.
 #[derive(Debug, Error)]
 pub enum FsStoreError {
     #[error("filesystem error: {0}")]
     Io(String),
+    /// The disk (or quota) is full: [`std::io::ErrorKind::StorageFull`]
+    /// or `QuotaExceeded`.
+    #[error("disk full: {0}")]
+    StorageFull(String),
+    /// The store is not writable by this process.
+    #[error("store not writable: {0}")]
+    PermissionDenied(String),
     #[error("identity mismatch: expected {expected}, derived {derived}")]
     IdentityMismatch { expected: String, derived: String },
     #[error("stored bytes do not hash back to their address {expected}")]
     Corrupt { expected: String },
 }
 
+impl StoreError for FsStoreError {
+    fn failure(&self) -> StoreFailure {
+        match self {
+            FsStoreError::StorageFull(_) => StoreFailure::StorageFull,
+            FsStoreError::PermissionDenied(_) => StoreFailure::PermissionDenied,
+            FsStoreError::Io(_)
+            | FsStoreError::IdentityMismatch { .. }
+            | FsStoreError::Corrupt { .. } => StoreFailure::Transient,
+        }
+    }
+}
+
 impl FsStoreError {
     fn io(error: std::io::Error) -> Self {
-        FsStoreError::Io(error.to_string())
+        let detail = error.to_string();
+        match StoreFailure::of_io(&error) {
+            StoreFailure::StorageFull => FsStoreError::StorageFull(detail),
+            StoreFailure::PermissionDenied => FsStoreError::PermissionDenied(detail),
+            StoreFailure::Transient => FsStoreError::Io(detail),
+        }
     }
 
     fn mismatch(expected: &ContentId, derived: &ContentId) -> Self {
@@ -344,6 +374,42 @@ mod tests {
         assert_eq!(id, again);
         assert!(temp_files(&dir).is_empty());
         remove_scratch(&dir);
+    }
+
+    /// Resource conditions classify at construction: callers branch
+    /// on the variant, never on rendered I/O text.
+    #[test]
+    fn io_errors_classify_by_kind() {
+        use crate::store::StoreError as _;
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(
+            FsStoreError::io(Error::new(ErrorKind::StorageFull, "no space")),
+            FsStoreError::StorageFull(_)
+        ));
+        assert!(matches!(
+            FsStoreError::io(Error::new(ErrorKind::QuotaExceeded, "quota")),
+            FsStoreError::StorageFull(_)
+        ));
+        assert!(matches!(
+            FsStoreError::io(Error::new(ErrorKind::PermissionDenied, "denied")),
+            FsStoreError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            FsStoreError::io(Error::other("boom")),
+            FsStoreError::Io(_)
+        ));
+        assert_eq!(
+            FsStoreError::StorageFull("x".into()).failure(),
+            StoreFailure::StorageFull
+        );
+        assert_eq!(
+            FsStoreError::PermissionDenied("x".into()).failure(),
+            StoreFailure::PermissionDenied
+        );
+        assert_eq!(
+            FsStoreError::Io("x".into()).failure(),
+            StoreFailure::Transient
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use wyrd_format::MemoryObjectStore;
 fn file_write_session_commits_and_reopens() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, _ino, attr) = backend
@@ -58,7 +58,7 @@ fn concurrent_handles_isolate_and_second_commit_is_stale() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("c.txt", b"AAAA").unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let first = backend.open_write("c.txt", libc::O_RDWR).unwrap();
@@ -101,7 +101,7 @@ fn o_trunc_without_writes_commits_an_empty_file() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("t.txt", b"hello").unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let fh = backend
@@ -129,7 +129,7 @@ fn o_trunc_without_writes_commits_an_empty_file() {
 fn o_sync_commits_each_write() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, _ino, _) = backend
@@ -177,7 +177,7 @@ fn zero_length_write_is_a_noop() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("z.txt", b"data").unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let before = backend.generation().unwrap();
@@ -227,7 +227,7 @@ fn zero_length_write_is_a_noop() {
 fn namespace_operations_commit_and_serve() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
@@ -266,7 +266,7 @@ fn namespace_operations_commit_and_serve() {
 fn namespace_operations_reject_invalid_targets() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (d1, _) = backend.mkdir_at(1, "d1").unwrap();
@@ -315,7 +315,7 @@ fn namespace_operations_reject_invalid_targets() {
 fn setattr_truncates_and_toggles_exec() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, ino, _) = backend.create_at(1, "t.txt", libc::O_RDWR).unwrap();
@@ -417,7 +417,7 @@ fn path_truncate_reads_only_the_kept_prefix() {
     engine.author_snapshot(&store, root).unwrap();
     let mut daemon = Daemon::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let ino = backend.attr_at("big").unwrap().ino.0;
@@ -442,7 +442,7 @@ fn path_truncate_reads_only_the_kept_prefix() {
 fn handle_mode_change_preserves_content() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     let (stop, loop_handle) = spawn_live_loop(live);
 
     let (fh, ino, _) = backend.create_at(1, "m.txt", libc::O_RDWR).unwrap();

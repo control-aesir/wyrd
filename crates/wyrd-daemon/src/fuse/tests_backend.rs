@@ -403,6 +403,30 @@ fn directory_handles_pin_their_enumeration_generation() {
     assert!(after.contains(&"new.txt".to_string()));
 }
 
+/// Past the open-handle cap, opens refuse `EMFILE` and the refused
+/// handle holds nothing — while already-open handles keep serving
+/// and a release drains room for the next open.
+#[test]
+fn open_handles_refuse_emfile_past_the_cap() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    backend.max_open_handles = 1;
+    let first = backend.open_at("f.txt").unwrap();
+    assert_eq!(
+        backend.open_at("f.txt"),
+        Err(fuser::Errno::EMFILE),
+        "a saturated handle table refuses new opens"
+    );
+    assert!(
+        backend.read_handle(first, 0, 4).is_ok(),
+        "open handles serve on"
+    );
+    assert!(backend.release_handle(first).is_ok());
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "releasing drains room for the next open"
+    );
+}
+
 /// Unknown handles are EBADF, and a released handle stops
 /// serving. A duplicate release stays quiet.
 #[test]

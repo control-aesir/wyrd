@@ -1,7 +1,7 @@
 //! The sync-facing contracts: verified heads, queue pressure, and
 //! bounded bulk.
 
-use wyrd_daemon::core::{Daemon, LiveError};
+use wyrd_daemon::core::{Daemon, LiveError, ResourceBudgets};
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
     BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, Manifest, ManifestEntry,
@@ -219,7 +219,10 @@ fn failed_pass_recovers_serving_on_retry() {
 
     let engine = loaded.rig.take_engine();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(std::time::Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(
+        std::time::Duration::from_secs(30),
+        ResourceBudgets::default(),
+    );
     for id in &loaded.content.content_ids {
         live.want(*id).unwrap();
     }
@@ -406,7 +409,10 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
     daemon.refresh_live_heads().unwrap();
-    let (mut live, backend) = daemon.into_live(std::time::Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(
+        std::time::Duration::from_secs(30),
+        ResourceBudgets::default(),
+    );
     assert_eq!(live.generation(), 0, "the split publishes baseline zero");
     let handle = backend.open_at("keeper.txt").expect("baseline serves");
     assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
@@ -644,7 +650,10 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
     rig.enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
     let daemon_b = Daemon::new(engine_b, MemoryObjectStore::default()).unwrap();
-    let (mut live_b, backend_b) = daemon_b.into_live(std::time::Duration::from_secs(30));
+    let (mut live_b, backend_b) = daemon_b.into_live(
+        std::time::Duration::from_secs(30),
+        ResourceBudgets::default(),
+    );
 
     // The first announcement never leaves the author — and the local
     // write stands: only delivery failed, nothing was rolled back.
@@ -1176,7 +1185,7 @@ fn conflicted_drive_rejects_mounted_writes() {
     assert!(names.contains(&"a.txt".to_string()), "{names:?}");
     assert!(names.contains(&"b.txt".to_string()), "{names:?}");
 
-    let (live, backend) = daemon.into_live(Duration::from_secs(5));
+    let (live, backend) = daemon.into_live(Duration::from_secs(5), ResourceBudgets::default());
     let stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
     let handle = std::thread::spawn(move || {
@@ -1191,6 +1200,7 @@ fn conflicted_drive_rejects_mounted_writes() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
         )

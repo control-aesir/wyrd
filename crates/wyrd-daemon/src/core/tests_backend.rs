@@ -25,7 +25,7 @@ fn into_live_shares_view_with_backend() {
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("live.txt", b"shared").unwrap();
 
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     assert_eq!(live.generation(), 0, "the split publishes baseline zero");
     // The baseline serves before any pass runs: no empty window.
     let early = backend.open_at("live.txt").expect("baseline serves");
@@ -61,7 +61,7 @@ fn dirty_backlog_republishes_without_new_changes() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("dirty.txt", b"pending").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     live.dirty = true;
 
     let report = live
@@ -97,7 +97,7 @@ fn dirty_backlog_republishes_without_new_changes() {
 fn mkdir_through_backend_commits_and_serves() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
@@ -113,6 +113,7 @@ fn mkdir_through_backend_commits_and_serves() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
         )

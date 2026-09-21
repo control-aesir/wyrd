@@ -115,6 +115,12 @@ pub enum EngineError {
     Closure(#[from] crate::closure::ClosureError),
     #[error("vault write failed: {0}")]
     Vault(#[from] crate::serving::VaultError),
+    /// A fetch refused by the local disk — full or not writable. Fails
+    /// the pass (via the run loop's backoff and error cap) instead of
+    /// counting as a benign local failure: retrying without freeing
+    /// space or fixing permissions converges to nothing.
+    #[error("local store unavailable: {0}")]
+    Store(wyrd_format::StoreFailure),
     #[error("chunk {0} is neither locally sealed nor covered by a held recorded mapping")]
     ChunkUnavailable(ContentId),
     #[error("authored manifest {0} holds no sealed representation to link")]

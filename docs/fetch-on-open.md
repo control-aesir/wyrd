@@ -157,12 +157,15 @@ Decided properties:
    tracked pending entry, or fails. A demand is never dropped
    silently — the pre-alpha mailbox lesson, not repeated here.
 3. **Bounded admission.** The registry holds at most
-   `MAX_PENDING_WANTS` distinct identities. A registration beyond the
-   bound fails and the caller gets `EIO` (same POSIX surface as a
-   timeout; distinguished in daemon diagnostics only). Identical
-   outstanding wants coalesce: N registrations for identity X produce
-   one in-flight materialization and N waiter wakeups on success or
-   terminal failure.
+   `max_pending_wants` distinct identities (default 4096). A
+   registration beyond the bound fails and the caller gets `EIO`
+   (same POSIX surface as a timeout; distinguished in daemon
+   diagnostics only). Identical outstanding wants coalesce: N
+   registrations for identity X produce one in-flight
+   materialization and N waiter wakeups on success or terminal
+   failure. Admission itself is paced per pass
+   (`max_admit_per_pass`); all bounds are normative in
+   `resource-limits.md`.
 4. **The channel may lose wakeups; the registry may not lose wants.**
    The loop drains the registry every pass regardless of the channel,
    so a dropped wakeup costs latency, never demand. Losing the

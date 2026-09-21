@@ -21,6 +21,7 @@ use wyrd_sync::{
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::budgets::ResourceBudgets;
 use crate::fuse::FuseBackend;
 use crate::mutation::MutationQueue;
 use crate::projection::Projection;
@@ -362,21 +363,27 @@ where
     /// I/O. The composer's synchronously refreshed view is adopted as
     /// the baseline generation, so the backend never serves an empty
     /// view while the engine already has heads.
+    /// Split with explicit resource bounds: the registries and the
+    /// backend enforce their own refusals from `budgets`, and the loop
+    /// paces admission from the same copy, so one struct governs every
+    /// live-operation bound.
     pub fn into_live(
         self,
         open_timeout: Duration,
+        budgets: ResourceBudgets,
     ) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
         let revision = self.engine.current();
         let store = self.view.store_handle();
         let baseline = Projection::initial(self.view, revision);
         let projection = Arc::new(RwLock::new(Arc::new(baseline)));
-        let wants = Arc::new(WantRegistry::default());
-        let mutations = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
+        let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
         let backend = FuseBackend::shared_with_wants(
             Arc::clone(&projection),
             Arc::clone(&wants),
             Arc::clone(&mutations),
             open_timeout,
+            &budgets,
         );
         (
             LiveDaemon {
@@ -387,6 +394,7 @@ where
                 mutations,
                 published_revision: revision,
                 dirty: false,
+                budgets,
             },
             backend,
         )

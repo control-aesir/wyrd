@@ -21,5 +21,6 @@ mod tests_run_loop;
 #[cfg(test)]
 mod tests_sync;
 
+pub use crate::budgets::ResourceBudgets;
 pub use daemon::{Daemon, DaemonError, DaemonMaterialization, LiveHead, WriteError};
 pub use live::{LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport};

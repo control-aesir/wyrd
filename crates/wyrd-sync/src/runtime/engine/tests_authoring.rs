@@ -228,8 +228,15 @@ struct LyingStore {
     bytes: Vec<u8>,
 }
 
+/// The lying store never fails: every method that could fail is
+/// unreachable or infallible, so the classification is moot.
+#[derive(Debug)]
+struct LyingStoreError;
+
+impl wyrd_format::StoreError for LyingStoreError {}
+
 impl ObjectStore for LyingStore {
-    type Error = std::convert::Infallible;
+    type Error = LyingStoreError;
 
     fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, Self::Error> {
         unreachable!("the lying store is read-only")

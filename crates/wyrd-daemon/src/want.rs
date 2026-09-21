@@ -75,20 +75,37 @@ struct RegistryState {
 impl RegistryState {
     /// A new registration beyond the bound fails; outstanding
     /// identities (pending or admitted) count toward it.
-    fn saturated(&self) -> bool {
-        self.pending.len() + self.admitted.len() >= MAX_PENDING_WANTS
+    fn saturated(&self, limit: usize) -> bool {
+        self.pending.len() + self.admitted.len() >= limit
     }
 }
 
 /// Shared demand registry: FUSE registers and waits, the daemon loop
 /// drains, the engine stays the only synchronization authority. Own
 /// lock, never the view's or the store's.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WantRegistry {
     state: Mutex<RegistryState>,
+    /// Distinct identities carried at once (pending or admitted).
+    /// Production passes its budget at composition; tests use small
+    /// bounds to exercise saturation without thousands of entries.
+    limit: usize,
+}
+
+impl Default for WantRegistry {
+    fn default() -> Self {
+        WantRegistry::with_limit(MAX_PENDING_WANTS)
+    }
 }
 
 impl WantRegistry {
+    /// A registry bounded at `limit` outstanding identities.
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        WantRegistry {
+            state: Mutex::new(RegistryState::default()),
+            limit,
+        }
+    }
     /// Register a demand for `content`. Identical outstanding wants
     /// coalesce: an identity that is pending (awaiting admission) or
     /// admitted (fetch in flight) merely gains a waiter, so a second
@@ -100,7 +117,7 @@ impl WantRegistry {
         let outstanding = state.pending.contains(&content) || state.admitted.contains(&content);
         if !outstanding {
             // Admit nothing new past the bound.
-            if state.saturated() {
+            if state.saturated(self.limit) {
                 return Err(WantError::Saturated);
             }
             state.pending.insert(content);

@@ -19,7 +19,7 @@ use wyrd_sync::bulk::MemoryBulkSource;
 fn run_loop_stops_immediately() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
 
     let stop = std::sync::atomic::AtomicBool::new(true);
     let mut mailbox = NoopMailbox;
@@ -47,7 +47,7 @@ fn run_loop_stops_immediately() {
 fn run_loop_runs_until_stopped() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     drop(backend);
 
     let stop = std::sync::atomic::AtomicBool::new(false);
@@ -84,7 +84,7 @@ fn run_loop_runs_until_stopped() {
 fn run_loop_aborts_after_error_cap() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     drop(backend);
 
     let stop = std::sync::atomic::AtomicBool::new(false);
@@ -93,6 +93,7 @@ fn run_loop_aborts_after_error_cap() {
         error_base_delay: Duration::from_millis(1),
         error_max_delay: Duration::from_millis(5),
         max_consecutive_errors: 2,
+        budgets: ResourceBudgets::default(),
     };
     let mut observed = 0u32;
     let mut mailbox = SettlementFailingMailbox;
@@ -134,7 +135,7 @@ fn await_pending(queue: &std::sync::Arc<crate::mutation::MutationQueue>) {
 fn terminal_loop_error_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     drop(backend);
     let queue = Arc::clone(&live.mutations);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -154,6 +155,7 @@ fn terminal_loop_error_completes_blocked_submitters() {
         error_base_delay: Duration::from_millis(1),
         error_max_delay: Duration::from_millis(5),
         max_consecutive_errors: 2,
+        budgets: ResourceBudgets::default(),
     };
     let mut mailbox = SettlementFailingMailbox;
     let result = live.run_loop(
@@ -179,7 +181,7 @@ fn terminal_loop_error_completes_blocked_submitters() {
 fn clean_stop_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30));
+    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), ResourceBudgets::default());
     drop(backend);
     let queue = Arc::clone(&live.mutations);
     let (tx, rx) = std::sync::mpsc::channel();

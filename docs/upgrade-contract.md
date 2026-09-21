@@ -69,11 +69,16 @@ Releases are not required to write every format they read:
 9. **Interrupted upgrades reopen.** Commits land temp + fsync + rename, so
    a torn write never becomes visible; a node opens its store after an
    interrupted upgrade without a separate recovery migration.
-10. **Fail closed on the unknown.** Envelopes, control versions, and fact
-    payloads a build does not understand are refused loudly at the
-    boundary — never silently reinterpreted. (This is also the pre-v1
-    contract: until the format freezes, every alpha may break
-    compatibility, and the breakage announces itself.)
+10. **Fail closed on the unknown.** Each boundary names its behavior
+    for what the build does not understand: an unknown envelope
+    version refuses (`EnvelopeError::UnknownVersion`), an unknown
+    control version refuses (`ControlError::UnknownVersion`), an
+    unknown record tag is skipped for forward compatibility, and a
+    known tag with an unparsable payload poisons the commit file so
+    open and resync refuse it. Skipped is not reinterpreted: unknown
+    bytes are never silently read as something else. (This is also
+    the pre-v1 contract: until the format freezes, every alpha may
+    break compatibility, and the breakage announces itself.)
 
 ## What this forbids
 
@@ -114,5 +119,5 @@ named test per invariant direction with no gaps:
    history is never rewritten into the newest representation
 9. an interrupted upgrade reopens without a separate recovery migration
 10. anything outside the matrix fails with a named error: unknown
-    envelopes, versions, and fact payloads are refused loudly at the
-    boundary
+    envelope and control versions refuse loudly, unknown record tags
+    skip, and unparsable known-tag payloads poison the commit

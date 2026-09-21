@@ -222,6 +222,48 @@ pub struct ExecuteReport {
     pub local_failures: usize,
 }
 
+/// What one held (deferred) message waits on: the membership
+/// transition whose arrival — or whose changed standing — can
+/// unblock it. The flush after each committed transition wakes only
+/// the entries waiting on that transition, instead of rescanning the
+/// whole queue, so deferred work stays proportional to the messages
+/// a transition actually unblocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeferredWait {
+    /// The awaited transition is unobserved: only its own arrival can
+    /// observe it, so only its commit wakes the entry. Gap fills and
+    /// resolutions under other ids cannot make an unobserved id
+    /// observed.
+    Unseen(TransitionId),
+    /// The awaited transition is observed but not yet
+    /// authorizing/committable (pending gap, contest): the membership
+    /// analysis is global, so any new transition can change its
+    /// standing — the entry re-drives on every commit.
+    StatusBlocked(TransitionId),
+}
+
+impl DeferredWait {
+    /// Whether the entry re-drives after the commit of `observed`: only
+    /// the awaited unseen id wakes an unseen entry; a status-blocked
+    /// entry wakes on every commit.
+    pub(super) fn wake_on(&self, observed: &TransitionId) -> bool {
+        match *self {
+            DeferredWait::Unseen(id) => id == *observed,
+            DeferredWait::StatusBlocked(_) => true,
+        }
+    }
+}
+
+/// One held (deferred) control message with its unblocking
+/// dependency. Entries keep arrival order (see
+/// [`Engine::hold_pending`]).
+#[derive(Debug, Clone)]
+pub(super) struct PendingEntry {
+    pub(super) id: ControlMessageId,
+    pub(super) message: Message,
+    pub(super) wait: DeferredWait,
+}
+
 /// Cap on held messages: without one, distinct never-authorizable
 /// deliveries accumulate without bound, each owning its full sealed
 /// payload. Over-limit deferrals shed without consuming instead (no
@@ -282,12 +324,13 @@ pub struct Engine {
     /// forks never become facts — so replay never encounters a conflict
     /// intake could have detected.
     pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
-    /// Held (deferred) control messages, in arrival order: a flush
-    /// batch emits them in the order they were deferred, so staged
-    /// announcement compatibility and durable fact order are
-    /// deterministic. In-memory fast path only — the relay retains
-    /// unacked envelopes, so a crash loses nothing but latency.
-    pub(super) pending: Vec<(ControlMessageId, Message)>,
+    /// Held (deferred) control messages with their unblocking
+    /// dependencies, in arrival order: a flush batch emits the woken
+    /// ones in the order they were deferred, so staged announcement
+    /// compatibility and durable fact order are deterministic.
+    /// In-memory fast path only — the relay retains unacked
+    /// envelopes, so a crash loses nothing but latency.
+    pub(super) pending: Vec<PendingEntry>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
     /// happened, per-representation strike counts with the run they were
     /// last struck (one strike per run — a call's convergence passes
@@ -494,18 +537,28 @@ impl Engine {
 
     /// Hold a deferred message pending, in arrival order. An id already
     /// held is replaced in place (it keeps its arrival slot; there is
-    /// only ever one copy of a message id).
-    pub(super) fn hold_pending(&mut self, id: ControlMessageId, message: Message) {
-        match self.pending.iter_mut().find(|(held, _)| held == &id) {
-            Some(slot) => slot.1 = message,
-            None => self.pending.push((id, message)),
+    /// only ever one copy of a message id), with its dependency
+    /// metadata refreshed to the latest evaluation.
+    pub(super) fn hold_pending(
+        &mut self,
+        id: ControlMessageId,
+        message: Message,
+        wait: DeferredWait,
+    ) {
+        match self.pending.iter_mut().find(|entry| entry.id == id) {
+            Some(slot) => {
+                slot.message = message;
+                slot.wait = wait;
+            }
+            None => self.pending.push(PendingEntry { id, message, wait }),
         }
     }
 
-    /// Take a held message by id (a duplicate delivery resolving it).
-    pub(super) fn take_pending(&mut self, id: &ControlMessageId) -> Option<Message> {
-        let pos = self.pending.iter().position(|(held, _)| held == id)?;
-        Some(self.pending.remove(pos).1)
+    /// Take a held message by id (a duplicate delivery resolving it),
+    /// with the dependency it was held under.
+    pub(super) fn take_pending(&mut self, id: &ControlMessageId) -> Option<PendingEntry> {
+        let pos = self.pending.iter().position(|entry| entry.id == *id)?;
+        Some(self.pending.remove(pos))
     }
 
     /// Rebuild the inbox dedupe set and membership log from committed

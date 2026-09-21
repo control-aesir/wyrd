@@ -154,7 +154,8 @@ pub struct SyncReport {
 /// How far a [`LiveDaemon::run_loop`] run got before stopping or
 /// aborting: completed passes and swallowed transient errors.
 pub struct LiveSummary {
-    /// Sync passes completed (idle passes count: the loop polls).
+    /// Sync passes completed. Idle passes count too: the loop wakes on
+    /// the pacing deadline even when no producer signals.
     pub passes: u64,
     /// Transient pass failures absorbed under the error cap.
     pub errors_retried: u64,

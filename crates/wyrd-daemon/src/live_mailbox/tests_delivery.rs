@@ -614,7 +614,7 @@ fn soak_restart_delivers_once_across_reopens() {
                 if let Some((_, index)) = delivery.envelope().ciphertext.rsplit_once('-') {
                     if let Ok(index) = index.parse::<usize>() {
                         assert!(
-                            index < target,
+                            round * PER_ROUND <= index && index < target,
                             "round {round}: wrap index {index} outside the expected window"
                         );
                         assert!(

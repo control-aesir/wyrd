@@ -477,8 +477,13 @@ mod tests {
         )
         .is_ok());
         assert!(
-            crate::keys::aead::open(key.as_slice(), &forged.nonce, &forged.ciphertext, &aad_forged)
-                .is_err(),
+            crate::keys::aead::open(
+                key.as_slice(),
+                &forged.nonce,
+                &forged.ciphertext,
+                &aad_forged
+            )
+            .is_err(),
             "a flipped version byte must break the tag"
         );
         // And the whole path rejects it rather than routing it onward.

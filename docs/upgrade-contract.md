@@ -40,9 +40,12 @@ Releases are not required to write every format they read:
    ContentIds and stay readable. New writes use the new representation.
 2. **Every persistent format has an explicit version.** Envelopes carry
    `wyrd_format::envelope::VERSION`; commit envelopes carry
-   `COMMIT_VERSION`; control messages carry `CONTROL_VERSION`. Durable
-   fact payloads are versioned before the v1 freeze (open issue), so
-   replay can normalize `v1`/`v2` payloads into the current record.
+   `COMMIT_VERSION`; control messages carry `CONTROL_VERSION`.
+   Documented exception: durable fact *payloads* are versioned
+   before the v1 freeze (open issue, v0.9.0 milestone), so until
+   then replay normalizes only the envelope layer and the payload
+   clause of this invariant is acceptance-tested as ignored, not
+   as passing.
 3. **Old formats remain readable for the supported window** (read rule
    above). No release performs destructive in-place rewriting of
    immutable objects, snapshots, or history.
@@ -69,16 +72,16 @@ Releases are not required to write every format they read:
 9. **Interrupted upgrades reopen.** Commits land temp + fsync + rename, so
    a torn write never becomes visible; a node opens its store after an
    interrupted upgrade without a separate recovery migration.
-10. **Fail closed on the unknown.** Each boundary names its behavior
-    for what the build does not understand: an unknown envelope
-    version refuses (`EnvelopeError::UnknownVersion`), an unknown
-    control version refuses (`ControlError::UnknownVersion`), an
-    unknown record tag is skipped for forward compatibility, and a
-    known tag with an unparsable payload poisons the commit file so
-    open and resync refuse it. Skipped is not reinterpreted: unknown
-    bytes are never silently read as something else. (This is also
-    the pre-v1 contract: until the format freezes, every alpha may
-    break compatibility, and the breakage announces itself.)
+10. **Fail closed on the unknown, with one intentional exception.**
+    Unknown envelope versions refuse (`EnvelopeError::UnknownVersion`)
+    and unknown control versions refuse (`ControlError::UnknownVersion`);
+    a known record tag with an unparsable payload poisons the commit
+    file so open and resync refuse it. The exception is unknown record
+    tags, which are skipped: a deliberate, bounded forward-compatibility
+    rule (skip, never reinterpret — unknown bytes are never silently
+    read as something else). (This is also the pre-v1 contract: until
+    the format freezes, every alpha may break compatibility, and the
+    breakage announces itself.)
 
 ## What this forbids
 
@@ -90,23 +93,26 @@ Releases are not required to write every format they read:
   software release supports many protocol versions; the numbers stay
   decoupled.
 
-## Verification (planned, not yet implemented)
+## Verification (implemented, with two blocked halves)
 
-`wyrd-contracts` will carry one named test per invariant direction, over
-fixture stores checked in under `tests/fixtures/stores/<version>/`.
-Status today: neither the upgrade contracts nor the fixture tree exist —
-the catalog in `crates/wyrd-contracts/src/lib.rs` covers the current
-protocol and format contracts only. Until the tests land, this document is
-the rulebook and the list below is the acceptance set for the contract
-issue — one bullet per invariant, in the same order, so the suite is one
-named test per invariant direction with no gaps:
+`wyrd-contracts` carries one named test per invariant direction
+(catalog 23-32), over fixture stores checked in under
+`tests/fixtures/stores/<release>/`. The first fixture is the `dev`
+harness-smoke store; per-release fixtures start with the next
+release. Two tests stay deliberately ignored until their blockers
+land: fact-payload replay (invariant 2's payload clause, pending
+the v0.9.0 payload-versioning issue) and the full version matrix
+(invariant 5's matrix half, pending capability negotiation). The
+list below is the acceptance set for the contract issue — one
+bullet per invariant, in the same order:
 
 1. new encodings are new representations: old objects keep their
    ContentIds and stay readable, new writes use the new representation,
    and history is byte-preserved across the upgrade
 2. every persistent format carries its explicit version; the next release
    reads previous versions, writes oldest-compatible on demand, and
-   replays previous durable facts into current records
+   replays previous durable facts into current records (payload
+   replay ignored until fact payloads are versioned)
 3. old formats remain readable for the supported window; no release
    destructively rewrites immutable objects, snapshots, or history
 4. derived indexes rebuild from previous state by replay; nothing
@@ -118,6 +124,6 @@ named test per invariant direction with no gaps:
 8. migrations, if any, land as ordinary snapshot-producing operations;
    history is never rewritten into the newest representation
 9. an interrupted upgrade reopens without a separate recovery migration
-10. anything outside the matrix fails with a named error: unknown
-    envelope and control versions refuse loudly, unknown record tags
-    skip, and unparsable known-tag payloads poison the commit
+10. unknown envelope and control versions and unparsable known-tag
+    payloads refuse loudly with their names; unknown record tags skip
+    as the one intentional forward-compatibility exception

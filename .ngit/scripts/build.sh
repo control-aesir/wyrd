@@ -74,7 +74,19 @@ builder_systems() {
   # shellcheck disable=SC2013
   printf '%s\n' "$config" | sed -n 's/^builders = //p' | tr ' ' '\n' | while read -r TOKEN; do
     case "$TOKEN" in
-      @*) awk '$1 !~ /^#/ {print $2}' "${TOKEN#@}" 2>/dev/null ;;
+      @*)
+        # A stale builders entry must never fail the run silently: awk
+        # exits 2 on an unreadable machines file, so an unguarded read
+        # aborts the script under set -e with no diagnostic (this muted
+        # the release smoke test on every master merge). Name the file
+        # and skip its remote systems instead; awk itself stays loud so
+        # a genuine parse failure still says which probe failed.
+        if [ -r "${TOKEN#@}" ]; then
+          awk '$1 !~ /^#/ {print $2}' "${TOKEN#@}"
+        else
+          echo "build.sh: builders file '${TOKEN#@}' missing or unreadable, ignoring its remote systems" >&2
+        fi
+        ;;
     esac
   done | tr ',' ' '
 }

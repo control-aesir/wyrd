@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Build every wyrd distribution tarball this machine can produce.
 #
-# Usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [system...]
+# Usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [--remote-builders] [system...]
 #
 # With no system arguments, host capability is detected and exactly the
 # buildable combos are built: the native system always, x86_64-darwin via
-# Rosetta on Apple Silicon (iff nix accepts the platform), and foreign
-# Linux systems via remote builders. Explicit systems skip detection (and
-# fail loudly when not buildable). `--strict` (what releases use)
-# requires all four combos from release.yaml instead, since ngit rejects
-# partial platform coverage on the main channel. `--ref` pins the input
+# Rosetta on Apple Silicon (iff nix accepts the platform), and -- only
+# with `--remote-builders` -- foreign Linux systems via remote builders.
+# Explicit systems skip detection (and fail loudly when not buildable).
+# `--strict` (what releases use) requires all four combos from
+# release.yaml instead, since ngit rejects partial platform coverage on
+# the main channel. `--remote-builders` enables remote-builder detection
+# (local release runs reaching their configured builders); without it
+# only this machine's own systems are considered, so CI smoke runs never
+# depend on the runner's builders config. `--ref` pins the input
 # worktree to a git ref instead of the default `v<version>` tag (CI uses
 # HEAD); `--verify` unpacks each built tarball and runs its binary
 # (when the sole missing system library is the documented macFUSE
@@ -20,11 +24,12 @@
 # dirty tree cannot bake into a release tarball.
 set -euo pipefail
 
-VERSION="${1:?usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [system...] (e.g. 0.1.0-alpha.1 --strict)}"
+VERSION="${1:?usage: build.sh <version> [--strict] [--ref <git-ref>] [--verify] [--remote-builders] [system...] (e.g. 0.1.0-alpha.1 --strict)}"
 shift
 STRICT=false
 REF=""
 VERIFY=false
+REMOTE_BUILDERS=false
 WANTED=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,6 +39,7 @@ while [ $# -gt 0 ]; do
       REF="${1:?--ref needs a git ref}"
       ;;
     --verify) VERIFY=true ;;
+    --remote-builders) REMOTE_BUILDERS=true ;;
     aarch64-darwin|x86_64-darwin|aarch64-linux|x86_64-linux) WANTED+=("$1") ;;
     *)
       echo "unknown argument: $1" >&2
@@ -74,11 +80,26 @@ builder_systems() {
   # shellcheck disable=SC2013
   printf '%s\n' "$config" | sed -n 's/^builders = //p' | tr ' ' '\n' | while read -r TOKEN; do
     case "$TOKEN" in
-      @*) awk '$1 !~ /^#/ {print $2}' "${TOKEN#@}" 2>/dev/null ;;
+      @*)
+        # A stale builders entry must never fail the run silently: awk
+        # exits 2 on an unreadable machines file, so an unguarded read
+        # aborts the script under set -e with no diagnostic (this muted
+        # the release smoke test on every master merge). Name the file
+        # and skip its remote systems instead; awk itself stays loud so
+        # a genuine parse failure still says which probe failed.
+        if [ -r "${TOKEN#@}" ]; then
+          awk '$1 !~ /^#/ {print $2}' "${TOKEN#@}"
+        else
+          echo "build.sh: builders file '${TOKEN#@}' missing or unreadable, ignoring its remote systems" >&2
+        fi
+        ;;
     esac
   done | tr ',' ' '
 }
-BUILDERS=$(builder_systems)
+BUILDERS=""
+if [ "$REMOTE_BUILDERS" = true ]; then
+  BUILDERS=$(builder_systems)
+fi
 
 # Whether a combo can build here: natively, via Rosetta (Intel macOS
 # binaries on Apple Silicon, iff nix accepts the platform), or via a

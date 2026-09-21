@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use wyrd_format::{DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use zeroize::Zeroizing;
 
-use super::engine::{DeferredWait, DrainReport, Engine, EngineError};
+use super::engine::{DeferredWait, DrainReport, Engine, EngineError, PendingEntry};
 use crate::control::{
     verify_announcement, AnnouncementUpdate, CapabilityPayload, ControlError, ControlMessageId,
     IngestReport, Message, SealedControl, SnapshotAnnouncement,
@@ -240,60 +240,58 @@ fn committed_transition(message: &Message) -> Option<TransitionId> {
         .map(|transition| transition.transition_id())
 }
 
-/// Walk the volatile pending queue in arrival order (see
-/// `Engine::hold_pending`), re-driving the entries the newly
-/// committed transition unblocks: entries held on its id, plus every
-/// status-blocked entry (their standing reads the global membership
-/// analysis, so any commit can change it). Entries held on other
-/// unseen transitions stay parked — their awaited id is still
-/// unobserved, so re-driving them could change nothing. Staged
+/// Re-drive the pending entries the newly committed transition
+/// unblocks, in arrival order (see [`PendingQueue::wake_seqs`]):
+/// entries held on its id, plus every status-blocked entry (their
+/// standing reads the global membership analysis, so any commit can
+/// change it). Entries held on other unseen transitions are never
+/// visited — neither traversed nor cloned — so flush work stays
+/// proportional to the woken set, never the parked queue. Staged
 /// announcement compatibility and the durable fact order stay
-/// deterministic over the woken prefix. Shared by the transition arm
+/// deterministic over the woken order. Shared by the transition arm
 /// and the rotation path — a newly observed transition flushes pending
 /// no matter which framing carried it.
 ///
-/// On failure the in-flight message and the unprocessed remainder are
-/// restored in arrival order (every id here is disjoint from the
-/// re-held ones, so `hold_pending` appends without clobbering) and the
-/// error returns for the caller to resync: suppressed and
-/// fact-consumed prefixes redeliver via the relay (never settled), and
-/// the observations and verdicts they left behind go away with the
-/// caller's resync, which must run after the restore — resync rebuilds
-/// from durable facts and never touches the volatile queue.
+/// Each entry leaves the queue before it re-drives and returns to its
+/// original slot when it defers again, so arrival order never shifts
+/// under a commit that does not consume the entry. On failure the
+/// failed entry is restored to its slot and the error returns for the
+/// caller to resync: entries already consumed redeliver via the relay
+/// (never settled), entries never visited are untouched, and the
+/// observations and verdicts left behind go away with the caller's
+/// resync, which must run after the restore — resync rebuilds from
+/// durable facts and never touches the volatile queue.
 fn flush_pending(
     engine: &mut Engine,
     staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
     committed: Option<TransitionId>,
 ) -> Result<Vec<Fact>, EngineError> {
-    let taken = std::mem::take(&mut engine.pending);
+    // Snapshot the wake set up front: the index, not a full queue
+    // walk. Later re-drives in this loop only reinsert, never remove
+    // unvisited entries, so these sequences stay valid throughout.
+    let wake = engine.pending.wake_seqs(committed);
     let mut facts = Vec::new();
-    let mut failed_at: Option<(usize, EngineError)> = None;
-    for (index, entry) in taken.iter().enumerate() {
-        // Parked on another unseen transition: the commit cannot have
-        // unblocked it — hold it back without re-drive.
-        if committed.is_some_and(|id| !entry.wait.wake_on(&id)) {
-            engine.hold_pending(entry.id, entry.message.clone(), entry.wait);
+    for seq in wake {
+        let Some(entry) = engine.pending.remove_seq(seq) else {
             continue;
-        }
+        };
         match message_action(engine, &entry.id, &entry.message, staged) {
             Ok(Action::Commit(more)) => facts.extend(more),
             Ok(Action::Suppress) => {
                 engine.inbox.suppress(&entry.id);
             }
             Ok(Action::Defer(wait)) => {
-                engine.hold_pending(entry.id, entry.message.clone(), wait);
+                let id = entry.id;
+                let message = entry.message;
+                engine
+                    .pending
+                    .restore(seq, PendingEntry { id, message, wait });
             }
             Err(error) => {
-                failed_at = Some((index, error));
-                break;
+                engine.pending.restore(seq, entry);
+                return Err(error);
             }
         }
-    }
-    if let Some((index, error)) = failed_at {
-        for entry in taken.into_iter().skip(index) {
-            engine.hold_pending(entry.id, entry.message, entry.wait);
-        }
-        return Err(error);
     }
     Ok(facts)
 }

@@ -51,7 +51,7 @@
 //! [`MembershipLog`]: crate::membership::MembershipLog
 //! [`DurableStore`]: crate::durable::DurableStore
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -224,10 +224,9 @@ pub struct ExecuteReport {
 
 /// What one held (deferred) message waits on: the membership
 /// transition whose arrival — or whose changed standing — can
-/// unblock it. The flush after each committed transition wakes only
-/// the entries waiting on that transition, instead of rescanning the
-/// whole queue, so deferred work stays proportional to the messages
-/// a transition actually unblocks.
+/// unblock it. The index wakes only the entries a committed transition
+/// can unblock, so deferred work stays proportional to the woken set,
+/// never the parked queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeferredWait {
     /// The awaited transition is unobserved: only its own arrival can
@@ -242,26 +241,168 @@ pub(super) enum DeferredWait {
     StatusBlocked(TransitionId),
 }
 
-impl DeferredWait {
-    /// Whether the entry re-drives after the commit of `observed`: only
-    /// the awaited unseen id wakes an unseen entry; a status-blocked
-    /// entry wakes on every commit.
-    pub(super) fn wake_on(&self, observed: &TransitionId) -> bool {
-        match *self {
-            DeferredWait::Unseen(id) => id == *observed,
-            DeferredWait::StatusBlocked(_) => true,
-        }
-    }
-}
-
 /// One held (deferred) control message with its unblocking
-/// dependency. Entries keep arrival order (see
-/// [`Engine::hold_pending`]).
+/// dependency. Entries keep arrival order (see [`PendingQueue`]).
 #[derive(Debug, Clone)]
 pub(super) struct PendingEntry {
     pub(super) id: ControlMessageId,
     pub(super) message: Message,
     pub(super) wait: DeferredWait,
+}
+
+/// The held-message queue: arrival-ordered entries plus an index from
+/// each dependency to its waiters, so a transition commit visits only
+/// the entries it can unblock instead of scanning the whole queue.
+///
+/// Arrival order is the commit-order contract (staged announcement
+/// compatibility and durable fact order are deterministic over it), so
+/// positions are stable sequence numbers — never `Vec` indices, which
+/// would shift under removal. All mutations keep the order map and
+/// the indexes in lockstep.
+#[derive(Debug, Default)]
+pub(super) struct PendingQueue {
+    next_seq: u64,
+    /// Entries in arrival order: the source of truth for order; the
+    /// indexes below point into it.
+    by_seq: BTreeMap<u64, PendingEntry>,
+    by_id: HashMap<ControlMessageId, u64>,
+    /// Unseen dependencies to their waiters: only the awaited
+    /// transition's own commit can observe it.
+    unseen: HashMap<TransitionId, HashSet<ControlMessageId>>,
+    /// Observed-but-blocked waiters: the membership analysis is
+    /// global, so every commit re-drives them.
+    status_blocked: HashSet<ControlMessageId>,
+}
+
+impl PendingQueue {
+    /// Number of held entries (the queue bound counts these).
+    pub(super) fn len(&self) -> usize {
+        self.by_seq.len()
+    }
+
+    /// Hold an entry, in arrival order: a new id takes the next
+    /// sequence slot; a known id is replaced in place and keeps its
+    /// slot, with its dependency bucket refreshed.
+    pub(super) fn insert(&mut self, id: ControlMessageId, message: Message, wait: DeferredWait) {
+        if let Some(seq) = self.by_id.get(&id).copied() {
+            if let Some(entry) = self.by_seq.get_mut(&seq) {
+                let old = entry.wait;
+                entry.message = message;
+                entry.wait = wait;
+                if old != wait {
+                    self.unindex(&id, old);
+                    self.index(id, wait);
+                }
+                return;
+            }
+            // Unreachable: the maps move together, so a known id
+            // always has its slot. Drop the dangling pointer and
+            // reinsert fresh rather than strand the entry.
+            self.by_id.remove(&id);
+        }
+        // Test-only counter shape, mirrored from the relay fake:
+        // exhausting u64 is unreachable, but wrapping would silently
+        // violate the order contract, so fail loudly instead.
+        let seq = self.next_seq;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .expect("pending sequence space exhausted");
+        self.by_seq.insert(seq, PendingEntry { id, message, wait });
+        self.by_id.insert(id, seq);
+        self.index(id, wait);
+    }
+
+    /// Take a held entry by id (a duplicate delivery resolving it),
+    /// with the dependency it was held under.
+    pub(super) fn remove(&mut self, id: &ControlMessageId) -> Option<PendingEntry> {
+        let seq = self.by_id.remove(id)?;
+        // Unreachable-None: the maps move together. The id is already
+        // forgotten above, so treat a disagreement as absent.
+        let entry = self.by_seq.remove(&seq)?;
+        self.unindex(id, entry.wait);
+        Some(entry)
+    }
+
+    /// Take a held entry by arrival sequence (flush visiting its wake
+    /// set). Missing sequences are skipped by the caller.
+    pub(super) fn remove_seq(&mut self, seq: u64) -> Option<PendingEntry> {
+        let entry = self.by_seq.remove(&seq)?;
+        self.by_id.remove(&entry.id);
+        self.unindex(&entry.id, entry.wait);
+        Some(entry)
+    }
+
+    /// Reinsert a just-removed entry at its original slot (flush
+    /// re-drive and error paths): arrival order never shifts under a
+    /// commit that does not consume the entry.
+    pub(super) fn restore(&mut self, seq: u64, entry: PendingEntry) {
+        debug_assert!(
+            !self.by_id.contains_key(&entry.id),
+            "restore follows remove: the id must be absent"
+        );
+        let (id, wait) = (entry.id, entry.wait);
+        self.by_seq.insert(seq, entry);
+        self.by_id.insert(id, seq);
+        self.index(id, wait);
+    }
+
+    /// Arrival sequences the commit of `committed` unblocks, in
+    /// arrival order: the exact unseen bucket plus every
+    /// status-blocked entry. Visiting only these keeps flush work
+    /// proportional to the woken set, never the parked queue. `None`
+    /// (the undecodable-trigger fallback) wakes everything rather
+    /// than stranding entries.
+    pub(super) fn wake_seqs(&self, committed: Option<TransitionId>) -> Vec<u64> {
+        let Some(target) = committed else {
+            return self.by_seq.keys().copied().collect();
+        };
+        let mut seqs = Vec::new();
+        if let Some(waiters) = self.unseen.get(&target) {
+            seqs.extend(waiters.iter().filter_map(|id| self.by_id.get(id).copied()));
+        }
+        seqs.extend(
+            self.status_blocked
+                .iter()
+                .filter_map(|id| self.by_id.get(id).copied()),
+        );
+        seqs.sort_unstable();
+        seqs
+    }
+
+    /// Every held dependency in arrival order (test seam: pins the
+    /// index selection without driving the queue).
+    #[cfg(test)]
+    pub(super) fn waits_in_order(&self) -> Vec<DeferredWait> {
+        self.by_seq.values().map(|entry| entry.wait).collect()
+    }
+
+    fn index(&mut self, id: ControlMessageId, wait: DeferredWait) {
+        match wait {
+            DeferredWait::Unseen(dependency) => {
+                self.unseen.entry(dependency).or_default().insert(id);
+            }
+            DeferredWait::StatusBlocked(_) => {
+                self.status_blocked.insert(id);
+            }
+        }
+    }
+
+    fn unindex(&mut self, id: &ControlMessageId, wait: DeferredWait) {
+        match wait {
+            DeferredWait::Unseen(dependency) => {
+                if let Some(waiters) = self.unseen.get_mut(&dependency) {
+                    waiters.remove(id);
+                    if waiters.is_empty() {
+                        self.unseen.remove(&dependency);
+                    }
+                }
+            }
+            DeferredWait::StatusBlocked(_) => {
+                self.status_blocked.remove(id);
+            }
+        }
+    }
 }
 
 /// Cap on held messages: without one, distinct never-authorizable
@@ -325,12 +466,13 @@ pub struct Engine {
     /// intake could have detected.
     pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
     /// Held (deferred) control messages with their unblocking
-    /// dependencies, in arrival order: a flush batch emits the woken
-    /// ones in the order they were deferred, so staged announcement
+    /// dependencies: arrival order plus a dependency index (see
+    /// [`PendingQueue`]). A flush batch emits the woken entries in
+    /// the order they were deferred, so staged announcement
     /// compatibility and durable fact order are deterministic.
     /// In-memory fast path only — the relay retains unacked
     /// envelopes, so a crash loses nothing but latency.
-    pub(super) pending: Vec<PendingEntry>,
+    pub(super) pending: PendingQueue,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
     /// happened, per-representation strike counts with the run they were
     /// last struck (one strike per run — a call's convergence passes
@@ -386,7 +528,7 @@ impl Engine {
             epoch_keys: BTreeMap::new(),
             log: MembershipLog::new(drive),
             announcements: BTreeMap::new(),
-            pending: Vec::new(),
+            pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
             fetch_cool_until: BTreeMap::new(),
@@ -545,20 +687,13 @@ impl Engine {
         message: Message,
         wait: DeferredWait,
     ) {
-        match self.pending.iter_mut().find(|entry| entry.id == id) {
-            Some(slot) => {
-                slot.message = message;
-                slot.wait = wait;
-            }
-            None => self.pending.push(PendingEntry { id, message, wait }),
-        }
+        self.pending.insert(id, message, wait);
     }
 
     /// Take a held message by id (a duplicate delivery resolving it),
     /// with the dependency it was held under.
     pub(super) fn take_pending(&mut self, id: &ControlMessageId) -> Option<PendingEntry> {
-        let pos = self.pending.iter().position(|entry| entry.id == *id)?;
-        Some(self.pending.remove(pos))
+        self.pending.remove(id)
     }
 
     /// Rebuild the inbox dedupe set and membership log from committed

@@ -49,12 +49,7 @@ fn selective_wake_only_unblocks_matching_dependency() {
     let report = drain(&mut fixture);
     assert_eq!(report.deferred, 2);
     assert_eq!(fixture.engine.pending_count(), 2);
-    let waits: Vec<DeferredWait> = fixture
-        .engine
-        .pending
-        .iter()
-        .map(|entry| entry.wait)
-        .collect();
+    let waits = fixture.engine.pending.waits_in_order();
     assert_eq!(
         waits,
         vec![
@@ -77,8 +72,8 @@ fn selective_wake_only_unblocks_matching_dependency() {
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.announcements.len(), 1);
     assert_eq!(
-        fixture.engine.pending[0].wait,
-        DeferredWait::Unseen(child_b.transition_id())
+        fixture.engine.pending.waits_in_order(),
+        vec![DeferredWait::Unseen(child_b.transition_id())]
     );
 
     // Child B lands: Y wakes and commits. Arrival order across the
@@ -160,8 +155,8 @@ fn status_blocked_wakes_on_any_transition() {
     queue(&mut fixture, mail);
     assert_eq!(drain(&mut fixture).deferred, 1);
     assert_eq!(
-        fixture.engine.pending[0].wait,
-        DeferredWait::StatusBlocked(child.transition_id())
+        fixture.engine.pending.waits_in_order(),
+        vec![DeferredWait::StatusBlocked(child.transition_id())]
     );
 
     // Genesis fills the gap under its own id: the held message
@@ -173,4 +168,69 @@ fn status_blocked_wakes_on_any_transition() {
     assert_eq!(fixture.engine.pending_count(), 0);
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.announcements.len(), 1);
+}
+
+/// The index selects exactly the entries a commit can unblock: the
+/// unseen bucket for the committed id plus every status-blocked
+/// entry. Parked entries on other unseen ids are never visited.
+#[test]
+fn wake_index_selects_only_unblockable_entries() {
+    let mut fixture = fixture();
+    fixture
+        .engine
+        .add_epoch_key(3, Zeroizing::new(control_key(3)));
+    let (mut builder, genesis) = Builder::genesis(10);
+    let child_a = builder.child(vec![Change::Rotate]);
+    let child_b = builder.child(vec![Change::Rotate]);
+
+    // Child A lands before its parent: observed but Pending. Its
+    // announcement holds status-blocked; an announcement for the
+    // still-unseen child B holds on its exact id.
+    let mail = vec![deliver(&fixture, 1, &transition_message(&child_a))];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 1);
+    let blocked = announcement_for(2, child_a.transition_id());
+    let unseen = announcement_for(3, child_b.transition_id());
+    let mail = vec![
+        deliver(&fixture, 2, &blocked),
+        deliver(&fixture, 3, &unseen),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).deferred, 2);
+    assert_eq!(fixture.engine.pending_count(), 2);
+
+    // Genesis unblocks only the status-blocked entry: the B-waiter
+    // stays parked. B's own commit wakes both.
+    assert_eq!(
+        fixture
+            .engine
+            .pending
+            .wake_seqs(Some(genesis.transition_id()))
+            .len(),
+        1,
+        "only the status-blocked entry wakes on an unrelated commit"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .pending
+            .wake_seqs(Some(child_b.transition_id()))
+            .len(),
+        2,
+        "the exact bucket plus status-blocked wake together"
+    );
+    assert_eq!(
+        fixture.engine.pending.wake_seqs(None).len(),
+        2,
+        "the fallback wakes everything"
+    );
+
+    let mail = vec![deliver(&fixture, 1, &transition_message(&genesis))];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 1);
+    assert_eq!(fixture.engine.pending_count(), 1);
+    assert_eq!(
+        fixture.engine.pending.waits_in_order(),
+        vec![DeferredWait::Unseen(child_b.transition_id())]
+    );
 }

@@ -17,7 +17,7 @@
 #      (`ci stop` ends all CI), so check `ci status` before any manual
 #      trigger, and trigger only to retry a failed run.
 #   4. Build the three local legs with explicit systems plus the gate:
-#      `build <version> --strict aarch64-darwin x86_64-darwin aarch64-linux`
+#      `build <version> --strict --remote-builders aarch64-darwin x86_64-darwin aarch64-linux`
 #      in the devenv shell (native, Rosetta, remote builder). A bare
 #      `--strict` re-attempts linux-x86_64 locally and fails without an x86
 #      builder, so name the systems. Input is pinned to the release tag in

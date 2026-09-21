@@ -263,9 +263,9 @@ jobs:
       # releases use (.ngit/scripts/build.sh): capability detection
       # picks this runner's system, --ref pins the checkout commit
       # instead of a tag, and --verify unpacks each tarball and runs
-      # its binary. --no-remote-builders keeps remote-builder detection
-      # out of CI: the smoke runner proves its own system, remote legs
-      # belong to local release runs. Full `--rebuild` reproducibility is verified at
+      # its binary. Remote-builder detection is opt-in (--remote-builders
+      # on local release runs), so the smoke runner proves its own system
+      # and never depends on the runner's builders config. Full `--rebuild` reproducibility is verified at
       # change time (it rebuilds the whole Rust closure, too expensive
       # for every CI run); see the distFor comment in flake.nix.
       - name: Release archive smoke test
@@ -276,7 +276,7 @@ jobs:
           echo "===== archive smoke test =====" >> /tmp/nix.log
           {
             version=$(nix eval --raw .#wyrd.version)
-            .ngit/scripts/build.sh "$version" --ref HEAD --verify --no-remote-builders
+            .ngit/scripts/build.sh "$version" --ref HEAD --verify
           } 2>&1 | tee -a /tmp/nix.log
 
       # Upload all logs — runs even when a step above failed, so you get the

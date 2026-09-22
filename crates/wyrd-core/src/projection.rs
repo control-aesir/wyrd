@@ -25,6 +25,11 @@ use std::sync::{Arc, RwLock};
 
 use crate::view::{Head, NamespaceView};
 
+/// The shared publication slot every serving backend reads: one
+/// alias for the nested lock shape, so the loop, the split parts, the
+/// backend construction, and observation name one type.
+pub type SharedProjection<V> = Arc<RwLock<Arc<Projection<V>>>>;
+
 /// One published generation: the serving view plus the versions that
 /// produced it. Immutable after construction; the loop publishes by
 /// replacing the whole value, never by mutating it.

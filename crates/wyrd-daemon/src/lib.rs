@@ -31,7 +31,8 @@ pub(crate) mod mini_relay;
 
 pub use budgets::ResourceBudgets;
 pub use core::{
-    Daemon, DaemonError, FailureClass, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport,
+    Daemon, DaemonError, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary,
+    SyncReport,
 };
 pub use lifecycle::{Supervisor, Wake, WakeSignal};
 pub use mutation::{

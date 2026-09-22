@@ -344,7 +344,7 @@ where
     /// file descriptors keep serving their open-time capture: they
     /// never consult heads again. This is the test/simulation
     /// publication path — production publication goes through
-    /// [`LiveDaemon`](crate::core::LiveDaemon), which advances the
+    /// [`LiveNode`](wyrd_core::live::LiveNode), which advances the
     /// durable revision alongside the generation. The name is the
     /// warning: a generation published here corresponds to no engine
     /// commit, so production callers must never use it.

@@ -8,6 +8,7 @@ description = "Wyrd's embeddable local node: namespace, snapshots, mutations, ma
 [dependencies]
 wyrd-format.workspace = true
 wyrd-sync.workspace = true
+getrandom.workspace = true
 thiserror.workspace = true
 
 [lints]

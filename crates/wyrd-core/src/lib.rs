@@ -11,6 +11,7 @@
 //! never its definition.
 
 pub mod budgets;
+pub mod live;
 pub mod mutation;
 pub mod projection;
 pub mod session;

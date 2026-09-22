@@ -1,8 +1,14 @@
-use wyrd_core::view::RuntimeMaterialization;
+//! The live sync loop: one drive's engine plus the published
+//! projection its serving backends read, generic over the namespace
+//! view so any provider (FUSE now, mobile surfaces later) composes the
+//! same node. Intake and fetch touch only the engine, the durable
+//! store, and the shared store handle — never the publication lock —
+//! so bulk I/O never stalls serving; publication swaps in a whole new
+//! immutable generation under a short write lock.
+
 use wyrd_format::{
     chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, StoreError, StoreFailure, Tree,
 };
-use wyrd_fuse::{DriveView, Node};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{
@@ -18,12 +24,11 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
-use crate::lifecycle::{Wake, WakeSignal};
 use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
-use crate::projection::Projection;
+use crate::projection::{Projection, SharedProjection};
+use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
+use crate::wake::{Wake, WakeSignal};
 use crate::want::WantRegistry;
-
-use super::daemon::{verified_heads, view_heads, view_heads_legacy};
 
 /// Draw a random duration in `[0, bound)`. Entropy comes from the OS
 /// CSPRNG (the approved substrate); a draw failure falls back to zero
@@ -136,7 +141,7 @@ pub enum LiveError {
     Lock,
 }
 
-/// What one [`LiveDaemon::sync_once`] pass did: the intake report plus
+/// What one [`LiveNode::sync_once`] pass did: the intake report plus
 /// the fetch report (`Default` — all zeros — when no bulk source was
 /// provided and nothing could be fetched), plus whether the pass
 /// published a new serving generation.
@@ -154,7 +159,7 @@ pub struct SyncReport {
     pub generation: u64,
 }
 
-/// How far a [`LiveDaemon::run_loop`] run got before stopping or
+/// How far a [`LiveNode::run_loop`] run got before stopping or
 /// aborting: completed passes and swallowed transient errors.
 pub struct LiveSummary {
     /// Sync passes completed. Idle passes count too: the loop wakes on
@@ -164,7 +169,7 @@ pub struct LiveSummary {
     pub errors_retried: u64,
 }
 
-/// Supervision policy for [`LiveDaemon::run_loop`].
+/// Supervision policy for [`LiveNode::run_loop`].
 pub struct LiveConfig {
     /// Idle pacing deadline between passes: the staleness bound, not a
     /// poll interval. Producers (mutation submissions, mailbox intake,
@@ -208,14 +213,21 @@ impl Default for LiveConfig {
     }
 }
 
-/// A live-mounted drive: the engine plus the published projection the
-/// serving backend reads. The sync loop owns this value; the FUSE
-/// session thread owns the backend half from [`Daemon::into_live`].
+/// A live drive: the engine plus the published projection the
+/// serving backends read. The sync loop owns this value; each
+/// presentation backend owns its half from [`LiveNode::split`].
 /// Intake and fetch touch only the engine, the durable store, and the
 /// shared store handle — never the publication lock — so bulk I/O
 /// never stalls serving; publication swaps in a whole new immutable
 /// generation under a short write lock that serving threads only ever
 /// take to clone the current [`Arc`](std::sync::Arc).
+///
+/// Generic over the namespace view: the loop programs against
+/// [`NamespaceView`], never any one presentation's view type, so the
+/// same passes drive FUSE mounts and future providers alike. The view
+/// must share the loop's store type and the node's
+/// [`RuntimeMaterialization`]: residency is a function of engine
+/// state, identical for every provider serving the same drive.
 ///
 /// Concurrency: the loop is the single writer (it owns `&mut self`),
 /// backend threads are readers. Readers hold cloned generations, so a
@@ -231,16 +243,16 @@ impl Default for LiveConfig {
 /// daemon dirty, so the next pass republishes even with zero new
 /// changes. A panic during publication poisons the slot and serving
 /// fails closed (EIO), exactly like the old view-lock discipline.
-pub struct LiveDaemon<S: ObjectStore> {
+pub struct LiveNode<V: NamespaceView> {
     pub(super) engine: Engine,
     /// The object store handle shared with the serving view: fetch
     /// writes bytes through this without taking the publication lock.
-    pub(super) store: Arc<RwLock<S>>,
+    pub(super) store: Arc<RwLock<V::Store>>,
     /// The published serving generations, shared with the backend.
     /// The loop replaces the whole [`Arc`](std::sync::Arc) on every
     /// publish; it never mutates a published value.
-    pub(super) projection: super::daemon::SharedProjection<S>,
-    /// FUSE demand: the backend registers wants, the loop admits them
+    pub(super) projection: SharedProjection<V>,
+    /// Backend demand: backends register wants, the loop admits them
     /// into the engine each pass and lets completion surface through
     /// the view. The registry's lock is its own (never the
     /// publication's or the store's).
@@ -271,13 +283,118 @@ pub struct LiveDaemon<S: ObjectStore> {
     pub(super) waker: Arc<WakeSignal>,
 }
 
-impl<S: ObjectStore> LiveDaemon<S>
+/// The live half of a split node: everything a presentation
+/// backend needs, with no presentation type in the signatures. The
+/// composer builds its backend from these parts (the FUSE adapter via
+/// `FuseBackend::shared_with_wants`); the node itself never names the
+/// backend.
+pub struct LiveParts<V: NamespaceView> {
+    /// The published serving generations, shared with the backend.
+    pub projection: SharedProjection<V>,
+    /// Demand the backend registers; the loop admits it each pass.
+    pub wants: Arc<WantRegistry>,
+    /// Mounted mutations: the backend submits and blocks, the loop
+    /// drains and applies them serially each pass.
+    pub mutations: Arc<MutationQueue>,
+    /// Resource bounds for this live session, fixed at composition.
+    pub budgets: ResourceBudgets,
+    /// How long a backend `open` blocks for demand before failing.
+    pub open_timeout: Duration,
+}
+
+/// All-or-nothing closure gate shared by the direct refresh and the live
+/// sync pass: every eligible head must verify, or the caller installs
+/// nothing. Returns the heads unchanged for installation; any failure
+/// surfaces the closure error before any publication happens, so the two
+/// production paths cannot diverge on partial head sets again.
+pub(super) fn verified_heads<S>(
+    runtime: &wyrd_sync::runtime::RuntimeState,
+    heads: Vec<AuthorizedSnapshot>,
+    store: &S,
+) -> Result<Vec<AuthorizedSnapshot>, wyrd_sync::closure::ClosureError>
 where
+    S: ObjectStore,
     S::Error: std::fmt::Debug,
 {
+    for head in &heads {
+        wyrd_sync::closure::verify_head_closure(
+            runtime,
+            head.snapshot(),
+            store,
+            &wyrd_sync::ingest::Limits::V0,
+        )?;
+    }
+    Ok(heads)
+}
+
+impl<V> LiveNode<V>
+where
+    V: NamespaceView<Materialization = RuntimeMaterialization>,
+    V::Store: ObjectStore,
+    <V::Store as ObjectStore>::Error: std::fmt::Debug,
+{
+    /// Split a composed node for live serving: the engine and the
+    /// store stay with the sync loop while the backend parts move to
+    /// the composer, which builds its presentation backend from them.
+    /// Both halves share one projection slot, one mutation channel,
+    /// and one store handle for bytes: intake, fetch, and local
+    /// mutations mutate durable state and the store with no
+    /// publication lock held, and each pass publishes a whole new
+    /// generation under one short write lock — serving never observes
+    /// a half-published projection and never stalls on bulk I/O. The
+    /// composer's synchronously refreshed view is adopted as the
+    /// baseline generation, so the backend never serves an empty view
+    /// while the engine already has heads.
+    ///
+    /// Split with explicit resource bounds: the registries and the
+    /// backend enforce their own refusals from the config's budgets,
+    /// and the loop paces admission from the stored copy of the same
+    /// value, so one [`LiveConfig`] governs every live-operation
+    /// bound. Compose and run with the same config value — `run_loop`
+    /// takes it for supervision, `split` for composition.
+    pub fn split(
+        engine: Engine,
+        store: Arc<RwLock<V::Store>>,
+        baseline: V,
+        revision: u64,
+        open_timeout: Duration,
+        config: &LiveConfig,
+    ) -> (Self, LiveParts<V>) {
+        let baseline = Projection::initial(baseline, revision);
+        let projection = Arc::new(RwLock::new(Arc::new(baseline)));
+        let budgets = config.budgets;
+        let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
+        let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
+        // One pacing signal for the whole live session: created here,
+        // attached to the queue now, and shared with the backend's
+        // callers (mailbox intake) so every producer wakes the loop.
+        let waker = Arc::new(WakeSignal::default());
+        mutations.attach_waker(Arc::clone(&waker));
+        let parts = LiveParts {
+            projection: Arc::clone(&projection),
+            wants: Arc::clone(&wants),
+            mutations: Arc::clone(&mutations),
+            budgets,
+            open_timeout,
+        };
+        (
+            LiveNode {
+                engine,
+                store,
+                projection,
+                wants,
+                mutations,
+                published_revision: revision,
+                dirty: false,
+                budgets,
+                waker,
+            },
+            parts,
+        )
+    }
     /// Mark content wanted locally (`Cached`) so fetch plans retrieve
     /// it: the composer's manual fetch-policy lever on top of the
-    /// want registry (FUSE registers demand; the loop admits it).
+    /// want registry (backends register demand; the loop admits it).
     /// `RemoteOnly` content is never fetched without either path.
     pub fn want(&mut self, content: ContentId) -> Result<(), LiveError> {
         self.engine
@@ -320,14 +437,14 @@ where
 
     /// One pass body: intake, fetch, then conditional republication.
     /// Republication clears the dirty backlog; every failure path
-    /// leaves it set (via the [`LiveDaemon::sync_once`] wrapper).
+    /// leaves it set (via the [`LiveNode::sync_once`] wrapper).
     fn sync_pass<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
-        // Admit outstanding FUSE demand ahead of fetching, atomically
+        // Admit outstanding backend demand ahead of fetching, atomically
         // from the registry's perspective: only durably committed
         // identities are marked admitted, so a failing commit leaves
         // the rest pending for the next pass and no waiter ever
@@ -408,7 +525,7 @@ where
             RuntimeMaterialization {
                 runtime: completed_runtime,
             },
-            view_heads(heads),
+            heads.into_iter().map(Head::new).collect(),
             generation + 1,
             revision,
         );
@@ -738,19 +855,18 @@ where
     }
 
     /// A transient view over the current heads, for kind/stale checks and
-    /// reading a file's bytes to rebuild it (truncate).
-    fn view_for(
-        &self,
-        heads: &[AuthorizedSnapshot],
-    ) -> Result<DriveView<S, RuntimeMaterialization>, MutationError> {
+    /// reading a file's bytes to rebuild it (truncate). Built through
+    /// the provider-neutral surface: the same verified bytes and the
+    /// same [`Head`]s cross here as at publication.
+    fn view_for(&self, heads: &[AuthorizedSnapshot]) -> Result<V, MutationError> {
         let runtime = self
             .engine
             .runtime_state()
             .map_err(|_| MutationError::Engine)?;
-        Ok(DriveView::shared(
+        Ok(V::open_shared(
             Arc::clone(&self.store),
             RuntimeMaterialization { runtime },
-            view_heads_legacy(heads.iter().cloned()),
+            heads.iter().cloned().map(Head::new).collect(),
         ))
     }
 
@@ -773,7 +889,7 @@ where
             .lookup(path)
             .map_err(|_| MutationError::NotFound(path.to_string()))?;
         let file = view
-            .open(&node)
+            .open_file(&node)
             .map_err(|_| MutationError::IsDirectory(path.to_string()))?;
         let size = match node {
             Node::File { size, .. } => size,
@@ -784,7 +900,7 @@ where
             .map_err(|error| match error {
                 // A classified store failure keeps its errno; every
                 // other view failure stays the opaque EIO it is today.
-                wyrd_fuse::ViewError::Store(failure, _) => MutationError::Store(failure),
+                ViewError::Store(failure, _) => MutationError::Store(failure),
                 _ => MutationError::Store(StoreFailure::Transient),
             })
     }
@@ -801,14 +917,14 @@ where
             .engine
             .runtime_state()
             .map_err(|_| MutationError::Engine)?;
-        let view = DriveView::shared(
+        let view = V::open_shared(
             Arc::clone(&self.store),
             RuntimeMaterialization { runtime },
-            view_heads_legacy(heads.iter().cloned()),
+            heads.iter().cloned().map(Head::new).collect(),
         );
         match view.lookup(path) {
             Ok(node) => Ok(Some(node)),
-            Err(wyrd_fuse::ViewError::NotFound) => Ok(None),
+            Err(ViewError::NotFound) => Ok(None),
             Err(_) => Err(MutationError::Engine),
         }
     }
@@ -840,11 +956,9 @@ where
 
     /// A shared borrow of the current published generation: the
     /// read-side handle for supervisors and tests. Serving backends
-    /// hold the same slot through the FUSE adapter. Poison fails
+    /// hold the same slot through their adapter. Poison fails
     /// closed like every other lock failure on this path.
-    pub fn projection(
-        &self,
-    ) -> Result<Arc<Projection<DriveView<S, RuntimeMaterialization>>>, LiveError> {
+    pub fn projection(&self) -> Result<Arc<Projection<V>>, LiveError> {
         self.projection
             .read()
             .map(|slot| Arc::clone(&slot))
@@ -950,6 +1064,22 @@ where
         &self.mutations
     }
 
+    /// The demand registry backends register through: the loop
+    /// admits pending wants into durable `Cached` facts each pass.
+    /// Backends normally hold their own clone from the split parts;
+    /// this is the loop's handle for supervisors and tests.
+    pub fn wants(&self) -> &Arc<WantRegistry> {
+        &self.wants
+    }
+
+    /// The resource bounds this session was composed with: the loop
+    /// paces admission from this copy while the registries and the
+    /// backend enforce their own refusals from theirs. Read-only
+    /// observability for supervisors and composition tests.
+    pub fn budgets(&self) -> ResourceBudgets {
+        self.budgets
+    }
+
     /// The loop's pacing signal, shared so the composer can attach the
     /// same signal to other producers (mailbox intake) and trip the
     /// same cancellation path. Already attached to the mutation queue.
@@ -972,7 +1102,10 @@ where
 /// oldest-first, so capping paces a flood deterministically while the
 /// remainder waits for the next pass. A zero limit admits nothing and
 /// still reports the empty set.
-pub(super) fn admit_wants<E>(
+///
+/// Public because host-side tests pin the admission atomicity directly;
+/// the loop is the only production caller.
+pub fn admit_wants<E>(
     registry: &WantRegistry,
     limit: usize,
     commit: &mut dyn FnMut(ContentId) -> Result<(), E>,

@@ -185,7 +185,7 @@ fn terminal_loop_error_completes_blocked_submitters() {
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     drop(parts);
-    let queue = Arc::clone(&live.mutations);
+    let queue = Arc::clone(live.mutations());
     let (tx, rx) = std::sync::mpsc::channel();
     let submitter = Arc::clone(&queue);
     std::thread::spawn(move || {
@@ -231,7 +231,7 @@ fn clean_stop_completes_blocked_submitters() {
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     drop(parts);
-    let queue = Arc::clone(&live.mutations);
+    let queue = Arc::clone(live.mutations());
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {

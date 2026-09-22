@@ -10,42 +10,26 @@
 //! mobile file surfaces later) consume the view and map errors at their
 //! own boundary.
 
-use wyrd_core::projection::Projection;
 use wyrd_core::view::{Head, NamespaceView, RuntimeMaterialization};
 use wyrd_format::{chunk, ContentId, Entry, ObjectStore, Tree};
-use wyrd_fuse::{DriveView, ViewHead};
+use wyrd_fuse::DriveView;
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{Engine, RoutePublishing},
     transport::mailbox::Mailbox,
 };
 
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::budgets::ResourceBudgets;
-use crate::lifecycle::WakeSignal;
-use crate::mutation::MutationQueue;
-use crate::want::WantRegistry;
-
-use super::live::{LiveConfig, LiveDaemon};
+use wyrd_core::live::{LiveConfig, LiveNode, LiveParts};
 
 /// Bridge authorized snapshots into verified view heads. In safe code
 /// this is the only path from the sync layer's verified bodies to the
-/// view: [`Head`] is constructible only from an `AuthorizedSnapshot`,
-/// and only sync's verification produces one of those.
+/// view: [`Head`](wyrd_core::view::Head) is constructible only from an
+/// `AuthorizedSnapshot`, and only sync's verification produces one of
+/// those.
 pub(super) fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<Head> {
     heads.into_iter().map(Head::new).collect()
-}
-
-/// The loop's ephemeral views still build through the view's own
-/// admission ticket until Phase 3 makes the loop generic over
-/// [`NamespaceView`]: same verified bytes, same Heads, converted at
-/// the view boundary.
-pub(super) fn view_heads_legacy(
-    heads: impl IntoIterator<Item = AuthorizedSnapshot>,
-) -> Vec<ViewHead> {
-    view_heads(heads).into_iter().map(ViewHead::new).collect()
 }
 
 /// All-or-nothing closure gate shared by the direct refresh and the live
@@ -120,29 +104,12 @@ pub enum DaemonError {
     Runtime(#[from] wyrd_sync::runtime::EngineError),
 }
 
-/// The shared publication slot every serving backend reads: one
-/// alias for the nested lock shape, so the four holders (loop,
-/// parts, backend construction, observation) name one type.
-pub type SharedProjection<S> = Arc<RwLock<Arc<Projection<DriveView<S, RuntimeMaterialization>>>>>;
-
-/// The live half of a split daemon: everything a presentation
-/// backend needs, with no presentation type in the signatures. The
-/// composer builds its backend from these parts (the FUSE adapter via
-/// `FuseBackend::shared_with_wants`); the node itself never names the
-/// backend.
-pub struct LiveParts<S: ObjectStore> {
-    /// The published serving generations, shared with the backend.
-    pub projection: SharedProjection<S>,
-    /// Demand the backend registers; the loop admits it each pass.
-    pub wants: Arc<WantRegistry>,
-    /// Mounted mutations: the backend submits and blocks, the loop
-    /// drains and applies them serially each pass.
-    pub mutations: Arc<MutationQueue>,
-    /// Resource bounds for this live session, fixed at composition.
-    pub budgets: ResourceBudgets,
-    /// How long a backend `open` blocks for demand before failing.
-    pub open_timeout: Duration,
-}
+/// The node's side and the backend's side of one split drive: the
+/// loop owner plus the parts the composer builds its backend from.
+type LiveSplit<S> = (
+    LiveNode<DriveView<S, RuntimeMaterialization>>,
+    LiveParts<DriveView<S, RuntimeMaterialization>>,
+);
 
 impl<S: ObjectStore> Daemon<S>
 where
@@ -341,58 +308,20 @@ where
     /// Split the composed daemon for live serving: the engine and the
     /// store stay with the sync loop while the backend parts move to
     /// the composer, which builds its presentation backend from them.
-    /// Both halves share one projection slot, one mutation channel,
-    /// and one store handle for bytes: intake, fetch, and local
-    /// mutations mutate durable state and the store with no
-    /// publication lock held, and each pass publishes a whole new
-    /// generation under one short write lock — serving never observes
-    /// a half-published projection and never stalls on bulk I/O. The
-    /// composer's synchronously refreshed view is adopted as the
-    /// baseline generation, so the backend never serves an empty view
-    /// while the engine already has heads.
-    /// Split with explicit resource bounds: the registries and the
-    /// backend enforce their own refusals from the config's budgets,
-    /// and the loop paces admission from the stored copy of the same
-    /// value, so one [`LiveConfig`] governs every live-operation
-    /// bound. Compose and run with the same config value — `run_loop`
-    /// takes it for supervision, `into_live` for composition.
-    pub fn into_live(
-        self,
-        open_timeout: Duration,
-        config: &LiveConfig,
-    ) -> (LiveDaemon<S>, LiveParts<S>) {
+    /// Composition itself runs in the node
+    /// ([`LiveNode::split`](wyrd_core::live::LiveNode::split)); this
+    /// unwraps the daemon's view into the split inputs (store handle,
+    /// baseline view, revision) and adopts the result.
+    pub fn into_live(self, open_timeout: Duration, config: &LiveConfig) -> LiveSplit<S> {
         let revision = self.engine.current();
         let store = self.view.store_handle();
-        let baseline = Projection::initial(self.view, revision);
-        let projection = Arc::new(RwLock::new(Arc::new(baseline)));
-        let budgets = config.budgets;
-        let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
-        let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
-        // One pacing signal for the whole live session: created here,
-        // attached to the queue now, and shared with the backend's
-        // callers (mailbox intake) so every producer wakes the loop.
-        let waker = Arc::new(WakeSignal::default());
-        mutations.attach_waker(Arc::clone(&waker));
-        let parts = LiveParts {
-            projection: Arc::clone(&projection),
-            wants: Arc::clone(&wants),
-            mutations: Arc::clone(&mutations),
-            budgets,
+        LiveNode::split(
+            self.engine,
+            store,
+            self.view,
+            revision,
             open_timeout,
-        };
-        (
-            LiveDaemon {
-                engine: self.engine,
-                store,
-                projection,
-                wants,
-                mutations,
-                published_revision: revision,
-                dirty: false,
-                budgets,
-                waker,
-            },
-            parts,
+            config,
         )
     }
 }

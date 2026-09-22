@@ -14,7 +14,7 @@
 //!   so no admitted caller waits forever.
 //!
 //! The loop itself drains on exit too
-//! ([`LiveDaemon::run_loop`](crate::core::LiveDaemon::run_loop)), so the
+//! ([`LiveNode::run_loop`](wyrd_core::live::LiveNode::run_loop)), so the
 //! supervisor's drain is an idempotent no-op in the ordinary case —
 //! belt and braces for composers that drive the queue past the loop.
 //! Join sequencing (unmount, reap the session thread) stays with the

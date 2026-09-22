@@ -5214,6 +5214,7 @@ dependencies = [
 name = "wyrd-core"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "getrandom 0.2.17",
  "thiserror 2.0.20",
  "wyrd-format",
  "wyrd-sync",

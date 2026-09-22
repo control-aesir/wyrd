@@ -117,6 +117,111 @@ fn remove_then_admit_same_device_is_invalid() {
 }
 
 #[test]
+fn retired_device_readmission_is_invalid() {
+    // Device identity is single-use within a membership chain
+    // (epochs.md): re-admitting a removed device under the same key is
+    // invalid even across transitions — replacing a device means a new
+    // identity. A fresh key admits fine. Separate logs: two epoch-4
+    // children of the same predecessor would conflict.
+    let (mut b, genesis) = Builder::genesis(1);
+    let owner = *b.owners.iter().next().unwrap();
+    let (_sk2, m) = key(2);
+    let (_sk3, fresh) = key(3);
+    let admitted = b.child(vec![admit(m)]); // valid epoch 2
+    let removed = b.child(vec![Change::Remove(m)]); // valid epoch 3
+    let readmit = signed(
+        &b,
+        4,
+        Some(removed.transition_id()),
+        Vec::new(),
+        vec![admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&genesis, &admitted, &removed, &readmit]);
+    assert_eq!(
+        log.status(&readmit.transition_id()),
+        Some(TransitionStatus::Invalid(InvalidReason::AdmitRetiredDevice))
+    );
+
+    let admit_fresh = signed(
+        &b,
+        4,
+        Some(removed.transition_id()),
+        Vec::new(),
+        vec![admit(fresh)],
+        &[owner, fresh],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&genesis, &admitted, &removed, &admit_fresh]);
+    assert_eq!(
+        log.status(&admit_fresh.transition_id()),
+        Some(TransitionStatus::Canonical)
+    );
+}
+
+#[test]
+fn retirement_is_chain_local() {
+    // Retirement follows the predecessor chain, never the whole
+    // observed set: a device retired on one branch stays admittable on
+    // a sibling branch that never admitted it. A2 admits m and A3
+    // removes it; B2 rotates past genesis and B3 admits m on a history
+    // that never saw it. A2/B2 conflict at epoch 2, so both branches
+    // freeze — but B3 must be contested-or-better, never invalid for
+    // retirement: a voided branch must not poison its sibling.
+    let (b, genesis) = Builder::genesis(1);
+    let owner = *b.owners.iter().next().unwrap();
+    let (_sk2, m) = key(2);
+    let a2 = signed(
+        &b,
+        2,
+        Some(genesis.transition_id()),
+        Vec::new(),
+        vec![admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let b2 = signed(
+        &b,
+        2,
+        Some(genesis.transition_id()),
+        Vec::new(),
+        vec![Change::Rotate],
+        &[owner],
+        &[owner],
+    );
+    let a3 = signed(
+        &b,
+        3,
+        Some(a2.transition_id()),
+        Vec::new(),
+        vec![Change::Remove(m)],
+        &[owner],
+        &[owner],
+    );
+    let b3 = signed(
+        &b,
+        3,
+        Some(b2.transition_id()),
+        Vec::new(),
+        vec![admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&genesis, &a2, &b2, &a3, &b3]);
+    assert!(
+        !matches!(
+            log.status(&b3.transition_id()),
+            Some(TransitionStatus::Invalid(_))
+        ),
+        "admission on a history that never retired the device stays valid"
+    );
+}
+
+#[test]
 fn removal_of_unknown_member_is_invalid() {
     let (b, genesis) = Builder::genesis(1);
     let owner = *b.owners.iter().next().unwrap();

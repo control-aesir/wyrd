@@ -81,7 +81,12 @@ order, duplicates removed (object-model.md, decision 18).
 Change application (`apply(state, changes)`), pinned semantics:
 
 - `Admit(d, k)` requires `d ∉ members` and registers `k` as the device's
-  delivery encryption key. `Remove(d)` requires `d ∈ members`
+  delivery encryption key. A device identity is **single-use within a
+  membership chain**: `d` must never have been admitted before on the
+  predecessor chain — a removed device cannot be re-admitted under the
+  same key (chain-level `AdmitRetiredDevice`; retirement is chain-local
+  historical state, so a sibling branch that never admitted `d` is
+  unaffected). `Remove(d)` requires `d ∈ members`
   and removes `d` from **members**; removing a device who is an owner is
   allowed only when they are the **sole owner** — the owner set empties
   with them (valid and terminal, per the terminal-state rule below). An
@@ -89,7 +94,8 @@ Change application (`apply(state, changes)`), pinned semantics:
   re-admitting the same device in the same transition is invalid**
   (encryption-key rotation is not expressible this way): the previous
   registration and its delivery key leave membership cleanly; replacing
-  a device means a removal transition followed by a later admission.
+  a device means a removal transition followed by a later admission
+  **under a fresh device identity**.
 - `SetOwners(D)` requires `|D| == 1` in **v0** and replaces the owner set
   wholesale; the final invariant `owners ⊆ members` is enforced after all
   changes as the backstop against dangling owners (e.g. `SetOwners` of a
@@ -109,7 +115,8 @@ A transition is **valid** iff:
 2. `apply(state(prev), changes) == (members_root, owners_root)` — the
    resulting roots are **derived, not independently authoritative**; the
    verifier recomputes them. Change rules:
-   - `Admit(d, k)` requires `d ∉ members` and registers `k` as the
+   - `Admit(d, k)` requires `d ∉ members`, `d` never admitted before on
+     this chain (retired identities are single-use), and registers `k` as the
      device's delivery encryption key; `Remove(d)` requires `d ∈ members`.
    - `SetOwners(D)` requires `|D| == 1` in **v0** (singleton ownership;
      multi-owner is a later extension that relaxes exactly this rule) and
@@ -431,7 +438,11 @@ single sanctioned remedy.
 ## Edge cases
 
 - **Removed then re-admitted (new Nostr key):** a new device with a fresh
-  capability; nothing special.
+  capability; nothing special. Re-admission under the **same** key is
+  invalid at any later epoch (`AdmitRetiredDevice`) — retirement is
+  permanent on that chain, and it is chain-local: a sibling branch whose
+  history never admitted the device may still admit it, with conflict
+  semantics deciding between the branches.
 - **Capability lost / fresh device restore:** re-pair via a new owner
   bootstrap invitation (genesis plus wrapped capability, sealed to the
   device encryption key; new epoch not required for mere re-delivery of
@@ -489,7 +500,9 @@ invalid genesis `prev`; epoch gap; wrong predecessor; wrong author; author
 owner *before* the transition (valid) vs author made owner *by* the
 transition (invalid); author removed by the transition (invalid); remove
 last owner (valid, terminal); invalid `SetOwners` (non-member, multiple
-owners in v0); duplicate admission; duplicate removal; empty changes; valid
+owners in v0); duplicate admission; re-admission of a retired device
+(same key after removal, invalid); retirement chain-locality (sibling
+branch admission unaffected); duplicate removal; empty changes; valid
 `Rotate`; rotation produces a distinct epoch secret; non-empty `resolves`
 with no active conflict (invalid); conflicting transitions with same
 predecessor (conflict); conflicting transitions with different predecessors

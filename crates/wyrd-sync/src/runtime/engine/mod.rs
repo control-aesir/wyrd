@@ -56,8 +56,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 use wyrd_format::{
-    ContentId, DeviceEncryptionKey, DeviceId, DriveId, ObjectStore, SnapshotId, StorageId,
-    TransitionId,
+    ContentId, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, ObjectStore,
+    SnapshotId, StorageId, TransitionId,
 };
 use zeroize::Zeroizing;
 
@@ -99,6 +99,12 @@ pub enum EngineError {
     NotOwner,
     #[error("device is already a member")]
     AlreadyMember,
+    #[error("device is not a member of the canonical membership state")]
+    NotMember,
+    #[error("an owner with co-owners can only leave via SetOwners")]
+    RemovingOwner,
+    #[error("device identity was previously removed and cannot be re-admitted; use a new device identity")]
+    RetiredDevice,
     #[error("no held epoch secret for epoch {0}")]
     MissingEpochSecret(u64),
     #[error("the epoch number space is exhausted at u64::MAX")]
@@ -617,6 +623,36 @@ impl Engine {
         super::author::admit_device(self, device, encryption_key)
     }
 
+    /// Remove a device from the drive: author, sign, and commit the
+    /// removal transition (exactly one new epoch), install the new
+    /// epoch's self capability when this device remains a member, and
+    /// queue catch-up for the remaining members. The removed device
+    /// receives no new-epoch material. Only an owner removes; removing
+    /// the sole owner is valid but terminal. See
+    /// [`super::author::remove_device`].
+    pub fn remove_device(&mut self, device: DeviceId) -> Result<MembershipTransition, EngineError> {
+        super::author::remove_device(self, device)
+    }
+
+    /// Force a fresh epoch secret: author, sign, and commit the
+    /// rotation transition (exactly one new epoch), reinstall the new
+    /// epoch's self capability, and queue catch-up for every member.
+    /// Membership is unchanged. Only an owner rotates. See
+    /// [`super::author::rotate_epoch`].
+    pub fn rotate_epoch(&mut self) -> Result<MembershipTransition, EngineError> {
+        super::author::rotate_epoch(self)
+    }
+
+    /// Hand ownership to another member: author, sign, and commit the
+    /// owner-set transition (exactly one new epoch), install the new
+    /// epoch's self capability when this device remains a member, and
+    /// queue catch-up for the remaining members. v0 ownership is a
+    /// singleton. Only the current owner hands over, and only to a
+    /// member. See [`super::author::set_owners`].
+    pub fn set_owners(&mut self, new_owner: DeviceId) -> Result<MembershipTransition, EngineError> {
+        super::author::set_owners(self, new_owner)
+    }
+
     /// Send every undischarged transition- and capability-delivery
     /// obligation, returning the number of envelopes sent this call.
     /// Transitions go before capabilities; a mid-loop transport
@@ -665,6 +701,30 @@ impl Engine {
     /// The drive this engine serves.
     pub fn drive(&self) -> DriveId {
         self.drive
+    }
+
+    /// The observed membership log: the read surface for
+    /// administration (member list/log/status) and for any consumer
+    /// that classifies without authoring. Mutations stay behind the
+    /// authoring methods below.
+    pub fn membership_log(&self) -> &MembershipLog {
+        &self.log
+    }
+
+    /// Epochs this device holds secrets for, ascending: the
+    /// decryption half of the known-vs-held distinction (epochs.md).
+    /// Probed from the durable keyring through the known tip, so a
+    /// missing epoch the tip requires reads as absent, never as an
+    /// error.
+    pub fn held_epochs(&self) -> Result<Vec<u64>, EngineError> {
+        let tip = self
+            .log
+            .known_state()
+            .ok_or(EngineError::NoCanonicalMembership)?;
+        let rebuilt = self.store.rebuild(self.device)?;
+        Ok((1..=tip.epoch)
+            .filter(|epoch| rebuilt.keyring.secret(*epoch).is_some())
+            .collect())
     }
 
     /// The local device id.

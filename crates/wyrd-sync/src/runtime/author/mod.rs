@@ -21,11 +21,25 @@
 
 mod admission;
 mod announce;
+mod common;
 mod deliver;
+mod remove_device;
+mod rotate_epoch;
+mod set_owners;
 mod snapshot;
 
 #[cfg(test)]
 mod tests_admission;
+#[cfg(test)]
+mod tests_harness;
+#[cfg(test)]
+mod tests_lifecycle;
+#[cfg(test)]
+mod tests_removal;
+#[cfg(test)]
+mod tests_rotation;
+#[cfg(test)]
+mod tests_set_owners;
 #[cfg(test)]
 mod tests_snapshot;
 
@@ -33,4 +47,7 @@ pub(super) use admission::admit_device;
 pub use admission::AdmitOutcome;
 pub(super) use announce::{announce, announce_pending};
 pub(super) use deliver::deliver_pending;
+pub(super) use remove_device::remove_device;
+pub(super) use rotate_epoch::rotate_epoch;
+pub(super) use set_owners::set_owners;
 pub(super) use snapshot::author;

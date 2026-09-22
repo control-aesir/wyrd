@@ -50,6 +50,13 @@ pub(crate) fn admit_device(
     if pre.members.contains(&device) {
         return Err(EngineError::AlreadyMember);
     }
+    if engine.log.is_retired(&device) {
+        // Retired identities are single-use within the chain: a
+        // removed device returns only under a fresh identity. The
+        // chain rule stays authoritative; this refuses early with a
+        // renderable error instead of authoring a doomed transition.
+        return Err(EngineError::RetiredDevice);
+    }
     let epoch = next_epoch(tip.epoch)?;
     let secret = EpochSecret::generate()?;
     let mut members: Vec<DeviceId> = pre.members.iter().copied().collect();
@@ -174,18 +181,21 @@ pub(super) fn next_epoch(tip_epoch: u64) -> Result<u64, EngineError> {
     tip_epoch.checked_add(1).ok_or(EngineError::EpochExhausted)
 }
 
-/// The canonical genesis bytes the invitation anchors to: epoch 1 with
-/// no predecessor. The tip's chain is fully observed whenever a
-/// canonical tip exists (rootedness), so exactly one candidate qualifies
-/// outside a genesis conflict — and a genesis conflict leaves no known
-/// state, so callers never reach here without one.
+/// The canonical genesis bytes the invitation anchors to, from the
+/// membership analysis — never by shape. The observed set can hold
+/// an invalid epoch-1 transition (intake persists any structurally
+/// bounded transition as evidence), and its id can sort before the
+/// valid genesis; anchoring to it would seal an invitation the
+/// newcomer rejects with `BadGenesis` after the owner's transition
+/// is already durable.
 fn genesis_bytes(engine: &Engine) -> Result<Vec<u8>, EngineError> {
+    let genesis = engine
+        .log
+        .canonical_genesis()
+        .ok_or(EngineError::BadGenesis)?;
     engine
         .log
-        .observed_ids()
-        .into_iter()
-        .filter_map(|id| engine.log.transition(&id))
-        .find(|t| t.epoch == 1 && t.prev.is_none())
+        .transition(&genesis)
         .map(MembershipTransition::canonical_bytes)
         .ok_or(EngineError::BadGenesis)
 }

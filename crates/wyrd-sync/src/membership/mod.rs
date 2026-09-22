@@ -25,7 +25,7 @@ mod conformance;
 mod properties;
 
 use std::collections::{BTreeSet, HashMap};
-use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
+use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId};
 
 pub use state::{apply, ApplyError, MembershipState};
 pub(crate) use validate::sign_transition;
@@ -88,6 +88,11 @@ pub enum InvalidReason {
     /// The changes fail to apply (dangling owners, duplicate
     /// admits/removes, `SetOwners` rules).
     BadChanges,
+    /// An `Admit` names a retired device identity: the device was
+    /// admitted before on this predecessor chain. Device identity is
+    /// single-use within a membership chain; replacing a device means
+    /// admitting a fresh `DeviceId`.
+    AdmitRetiredDevice,
     /// The declared set roots differ from the derived ones.
     RootMismatch,
     /// Genesis does not end with exactly one member who is the owner.
@@ -288,6 +293,39 @@ impl MembershipLog {
     /// The owner set of a valid transition.
     pub fn owners_of(&self, id: &TransitionId) -> Option<BTreeSet<DeviceId>> {
         self.state_of(id).map(|s| s.owners)
+    }
+
+    /// The canonical chain's genesis, or `None` while the log has
+    /// no unique canonical chain (e.g. a genesis conflict). Genesis
+    /// selection must go through here: the observed set can hold
+    /// invalid epoch-1 transitions (intake persists any structurally
+    /// bounded transition as evidence), so selecting by shape alone
+    /// can anchor to bytes no invitee accepts.
+    pub fn canonical_genesis(&self) -> Option<TransitionId> {
+        chain::analyse(self).canonical.first().copied()
+    }
+
+    /// Whether the device was ever admitted on the canonical chain:
+    /// retired identities are single-use and cannot be re-admitted,
+    /// even after removal. Follows predecessor links from the known
+    /// tip, so history is chain-local like validation itself. Used by
+    /// authoring to refuse retired re-admits before signing; the chain
+    /// rule stays authoritative for anything authored elsewhere.
+    pub fn is_retired(&self, device: &DeviceId) -> bool {
+        let mut cursor = self.known_state().map(|known| known.transition_id);
+        while let Some(id) = cursor {
+            let Some(t) = self.transitions.get(&id) else {
+                break;
+            };
+            if t.changes()
+                .iter()
+                .any(|change| matches!(change, Change::Admit(a) if a.device == *device))
+            {
+                return true;
+            }
+            cursor = t.prev;
+        }
+        false
     }
 
     /// Number of observed transitions.

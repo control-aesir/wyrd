@@ -16,7 +16,7 @@ use wyrd_format::Snapshot;
 /// private body cannot be shared between crates at all. Every
 /// `unsafe impl` is a visible, greppable claim that the implementing
 /// type's construction is owned by the verification authority. In-tree
-/// the production impl is exactly one: the daemon's `LiveHead`, whose
+/// the production impl is exactly one: `wyrd_core::view::Head`, whose
 /// inner `AuthorizedSnapshot` can only be produced by sync's BIP-340
 /// verification; every other in-tree impl is a deliberately forged
 /// test fixture documented as asserting nothing real.

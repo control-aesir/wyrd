@@ -1,5 +1,6 @@
-//! Read-only drive view: lookup, readdir, open, read, and stat over the
-//! format layer, with remote-only content mapped through [`wyrd_format::FetchStatus`].
+//! Read-only drive view: lookup, readdir, open, read, and stat over
+//! the format layer and `wyrd-core`'s namespace value model, with
+//! remote-only content mapped through [`wyrd_format::FetchStatus`].
 //!
 //! This is the first FUSE slice: it proves the protocol/runtime boundary
 //! can be exposed as a filesystem surface without mounting anything. It

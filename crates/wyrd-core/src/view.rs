@@ -271,3 +271,54 @@ pub trait NamespaceView: Sized {
     /// the same windowed integrity the view documents.
     fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError>;
 }
+
+/// Why a symlink target cannot leave the drive. Targets are
+/// member-authored and untrusted; any backend that materializes a
+/// link — the kernel via `readlink`, `wyrd export` onto a plain
+/// filesystem, a future mobile provider — would otherwise resolve
+/// bytes outside the drive. The check is namespace policy, so it
+/// lives with the namespace model; each backend keeps its own
+/// refusal mapping (EACCES at the FUSE boundary, a typed export
+/// error) but shares this decision.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfinementError {
+    #[error("symlink target is absolute; absolute targets resolve in the host namespace")]
+    Absolute,
+    #[error("symlink target escapes the drive root")]
+    EscapesRoot,
+}
+
+/// Confine a symlink target to the drive namespace: the v0 policy for
+/// untrusted member-authored targets. `link_path` is the symlink's own
+/// drive path (`""`-joined components); `target` is the stored target
+/// bytes.
+///
+/// Absolute targets are refused outright. Relative targets resolve
+/// lexically against the link's parent directory — `.` and empty
+/// segments are skipped, `..` pops — and a `..` that pops above the
+/// drive root is refused. Anything else passes unchanged: a confined
+/// backend resolves it inside the drive, so materializing it verbatim
+/// is safe.
+///
+/// There is no trusted-drive opt-out in v0: confinement is always on.
+pub fn confine_symlink_target(link_path: &str, target: &str) -> Result<(), ConfinementError> {
+    if target.starts_with('/') {
+        return Err(ConfinementError::Absolute);
+    }
+    // The parent directory's depth: every component but the link's own
+    // name. Callers pass drive paths the view itself resolved, so a
+    // defensive split suffices.
+    let mut depth = link_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+        .saturating_sub(1);
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => depth = depth.checked_sub(1).ok_or(ConfinementError::EscapesRoot)?,
+            _ => depth += 1,
+        }
+    }
+    Ok(())
+}

@@ -47,7 +47,7 @@ Objects are encrypted client-side before they ever leave the device—in transit
 When concurrent modifications occur across peers, Wyrd keeps both heads reachable and retains both versions as separate immutable objects. Conflicts are surfaced in the filesystem/UI for user resolution rather than automatically merged or overwritten.
 
 ### 7. No Data Lock-In
-The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing a chosen snapshot into a standard directory tree on a conventional filesystem (no wyrd export CLI yet; the view API supports this).
+The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing a chosen snapshot into a standard directory tree on a conventional filesystem (`wyrd export`; see `docs/cli.md`).
 
 ---
 
@@ -125,7 +125,7 @@ Wyrd's bet is that these are one system: git's object model, Syncthing's replica
 | `crates/wyrd-sync` | Peer replication on iroh: snapshot announcements, encrypted manifests, roles × materialization, two-phase content, zero-trust encryption |
 | `crates/wyrd-fuse` | The drive as a filesystem: live view, time travel, visible conflicts |
 | `crates/wyrd-daemon` | Composition library: engine + view + presentation backends (read-write FUSE today) |
-| `crates/wyrd-cli` | The `wyrd` process host: `init`, `mount`, diagnostics, exit codes over the daemon's surface |
+| `crates/wyrd-cli` | The `wyrd` process host: `init`, `mount`, `export`, diagnostics, exit codes over the daemon's surface |
 | `crates/wyrd-contracts` | Cross-crate architectural contract suite: one named test per review contract, composed end to end |
 
 Design docs live in `docs/` (`architecture.md` is the one-page entry point);
@@ -200,6 +200,12 @@ wyrd init ./mydrive --identity-file ./identity.bin --passphrase-file ./passphras
 mkdir -p ./mnt
 wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./passphrase.txt
 # Stop with Ctrl-C (SIGINT/SIGTERM shuts down cleanly: flush, unmount, exit).
+
+# 4. Export a plain copy any time: files, directories, symlinks, and the
+#    executable bit land as an ordinary tree that needs no wyrd software
+#    to read. Conflicts export as `name@N` siblings. Offline, and the
+#    destination must not exist or must be empty.
+wyrd export ./mydrive ./plain-copy --identity-file ./identity.bin --passphrase-file ./passphrase.txt
 ```
 
 Mounting needs system FUSE (macFUSE on macOS, libfuse on Linux — see the
@@ -216,6 +222,6 @@ peers can fetch from.
 What it is not: peer sync is not hardened (signer-session wiring and
 multi-relay supervision are still open), there is no garbage collection
 (the store grows forever), writes are whole-file (append/truncate flags
-are refused), there is no export command and no auto-update, and drives
+are refused), there is no auto-update, and drives
 created by one alpha may not open under the next. Bugs go to the
 repository's ngit issues.

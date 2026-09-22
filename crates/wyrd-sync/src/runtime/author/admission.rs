@@ -182,19 +182,39 @@ pub(super) fn next_epoch(tip_epoch: u64) -> Result<u64, EngineError> {
 }
 
 /// Reissue a device's sealed invitation from durable state: finds the
-/// device's admission in valid history, re-mints its grant from the
-/// held epoch secrets, and reseals it. The recovery path for an
-/// admission whose invitation never reached a file (process death
-/// between commit and publication): nothing here authors, so it runs
-/// repeatedly and from any process holding the secrets. The reseal
-/// uses fresh randomness, so the bytes differ from the original —
+/// device's canonical admission, re-mints its grant from the held
+/// epoch secrets, and reseals it. The recovery path for an admission
+/// whose invitation never reached a file (process death between
+/// commit and publication): nothing here authors, so it runs
+/// repeatedly from any process holding the secrets. The reseal uses
+/// fresh randomness, so the bytes differ from the original —
 /// equivalence is functional (the invitee joins), never byte
 /// equality.
+///
+/// Authority mirrors admission: only a current canonical owner
+/// reissues, and only for an active canonical member. Revocation
+/// bounds acquisition — a removed device's lost invitation stays
+/// lost — and a valid-but-noncanonical branch never anchors a
+/// grant, since the durable authorization path would not accept it.
 pub(crate) fn reissue_invitation(
     engine: &Engine,
     device: DeviceId,
 ) -> Result<SealedBootstrap, EngineError> {
-    let (epoch, id) = admission_of(engine, &device)?;
+    let tip = engine
+        .log
+        .known_state()
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let current = engine
+        .log
+        .state_of(&tip.transition_id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    if !current.owners.contains(&engine.device) {
+        return Err(EngineError::NotOwner);
+    }
+    if !current.members.contains(&device) {
+        return Err(EngineError::NotMember);
+    }
+    let (epoch, id) = canonical_admission_of(engine, &device)?;
     let transition = engine
         .log
         .transition(&id)
@@ -237,39 +257,32 @@ pub(crate) fn reissue_invitation(
     )?)
 }
 
-/// The device's admission in valid history, canonical first: at most
-/// one admission per device can be valid (a second admit is refused
-/// while the first holds membership, and retirement forbids return),
-/// but forks can carry rival histories, so prefer the canonical one
-/// and otherwise take the lowest epoch. Anything without a derived
-/// state never authorized and cannot anchor a grant.
-fn admission_of(engine: &Engine, device: &DeviceId) -> Result<(u64, TransitionId), EngineError> {
+/// The device's admission on the canonical chain. At most one per
+/// device: a second admit is refused while the first holds
+/// membership, and retirement forbids return. Anything off the
+/// canonical chain — contested, voided, or invalid — never anchors
+/// a grant; with no canonical admission the reissue fails closed.
+fn canonical_admission_of(
+    engine: &Engine,
+    device: &DeviceId,
+) -> Result<(u64, TransitionId), EngineError> {
     let statuses = engine.log.statuses();
-    let mut candidates: Vec<(bool, u64, TransitionId)> = engine
+    engine
         .log
         .observed_ids()
         .into_iter()
         .filter_map(|id| {
-            let found = engine
-                .log
-                .transition(&id)?
+            if !matches!(statuses.get(&id), Some(TransitionStatus::Canonical)) {
+                return None;
+            }
+            let transition = engine.log.transition(&id)?;
+            let admits = transition
                 .changes()
                 .iter()
                 .any(|change| matches!(change, Change::Admit(a) if a.device == *device));
-            if !found {
-                return None;
-            }
-            engine.log.state_of(&id)?;
-            let transition = engine.log.transition(&id)?;
-            let canonical = matches!(statuses.get(&id), Some(TransitionStatus::Canonical));
-            Some((canonical, transition.epoch, id))
+            admits.then_some((transition.epoch, id))
         })
-        .collect();
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    candidates
-        .into_iter()
-        .next()
-        .map(|(_, epoch, id)| (epoch, id))
+        .min_by_key(|(epoch, _)| *epoch)
         .ok_or(EngineError::NotMember)
 }
 

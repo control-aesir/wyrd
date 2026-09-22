@@ -314,6 +314,27 @@ fn non_owner_invite_refuses() {
 }
 
 #[test]
+fn non_owner_reissue_refuses() {
+    let pair = Pair::new();
+    pair.pair_and_join();
+    // The newcomer holds genesis only: it is no owner anywhere, so
+    // its reissue authors nothing — the engine owns the policy.
+    let third = device_id_of(&[0x44; 32]);
+    let out = pair._temp.0.join("newcomer-reissue");
+    let error = command(pair.newcomer_member(vec![
+        "reissue-invitation".into(),
+        third.to_string(),
+        out.display().to_string(),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::NotOwner)),
+        "member reissue is owner-enforced by the engine: {error:?}"
+    );
+    assert!(!out.exists(), "a refused reissue writes no file");
+}
+
+#[test]
 fn double_invite_refuses() {
     let pair = Pair::new();
     let (newcomer, newcomer_key) = pair.pair_and_join();

@@ -122,7 +122,11 @@ characters (x-only pubkeys).
 - `reissue-invitation <device> <out>`: reseal a device's invitation
   from durable state, for an admission whose invitation never
   reached a file. Authors nothing; the reseal opens identically,
-  with fresh randomness. Same destination policy as `invite`.
+  with fresh randomness. Owner-only, like admission, and only for
+  an active canonical member: revocation bounds acquisition, so a
+  removed device's lost invitation stays lost, and a
+  valid-but-noncanonical branch never anchors a grant. Same
+  destination policy as `invite`.
 
 Membership state beyond the CLI: device identity is single-use
 within a membership chain — a removed device returns only under a

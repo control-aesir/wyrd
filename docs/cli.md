@@ -68,12 +68,14 @@ any format break.
   into a populated tree. The walk lands in a uniquely named staging
   sibling and renames it into place only after the whole tree
   succeeds, so a failed export leaves no partial tree behind. Each
-  run heartbeats its staging; a later export sweeps staging whose
-  heartbeat is older than an hour (crashed runs) and leaves live
-  ones alone. Concurrent exports to the same destination race to
-  publish: the first rename wins and later ones fail with a
-  populated destination — the destination always holds one complete
-  tree, never a mix.
+  run heartbeats its staging; a later export sweeps staging that
+  proves exporter ownership (exact generated name plus a valid
+  heartbeat marker) with a heartbeat older than an hour, and leaves
+  everything else — live runs, user directories, marker-less
+  leftovers — alone or for manual cleanup. Concurrent exports to
+  the same destination race to publish: the first rename wins and
+  later ones fail with a populated destination — the destination
+  always holds one complete tree, never a mix.
 
 ## Credential files
 

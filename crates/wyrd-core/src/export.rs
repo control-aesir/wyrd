@@ -206,8 +206,18 @@ fn is_populated(dest: &Path) -> bool {
 /// with everything else — and it is written by exactly one owner, so
 /// no coordination beyond the filesystem is needed.
 ///
+/// The marker carries a magic value plus the timestamp, and staging
+/// names follow an exact generated shape (see [`staging_shape`]):
+/// the sweep deletes only directories proving exporter ownership.
+/// A user directory that merely looks reserved, or a staging
+/// directory whose marker is missing or malformed, is left for
+/// manual cleanup — `remove_dir_all` on user-selected turf without
+/// proof of ownership is not a tradeoff the sweep may make. The one
+/// accepted leak is a crash between staging creation and the first
+/// marker write (microseconds, before any walk output exists).
+///
 /// Updates are atomic (write-then-rename), never truncate-in-place:
-/// a concurrent reader sees the old complete timestamp or the new
+/// a concurrent reader sees the old complete marker or the new
 /// complete one, never a torn file. Without that, a sweeper reading
 /// mid-rewrite would misread a live run as marker-less.
 const HEARTBEAT_FILE: &str = ".wyrd-heartbeat";
@@ -219,6 +229,30 @@ const HEARTBEAT_FILE: &str = ".wyrd-heartbeat";
 /// days. Future timestamps (clock skew) are never stale — leaving a
 /// live export alone is always the safe direction.
 const STALE_AFTER: Duration = Duration::from_secs(3600);
+
+/// Magic opening the heartbeat marker: the sweep deletes only
+/// staging whose marker opens with exactly this line. Anything else
+/// — a user directory, a foreign tool's output, tampering — is not
+/// provably ours and is left alone.
+const HEARTBEAT_MAGIC: &str = "WYRD-EXPORT-HEARTBEAT-v1";
+
+/// Whether `remainder` (a staging name with the `<stem>.wyrd-export.`
+/// prefix stripped) has the exact generated shape:
+/// `<digits>.<digits>`. Shape alone never authorizes deletion (the
+/// marker does that); it only keeps obvious non-candidates out of
+/// marker parsing.
+fn staging_shape(remainder: &str) -> bool {
+    match remainder.split_once('.') {
+        Some((first, second)) => {
+            !first.is_empty()
+                && !second.is_empty()
+                && !second.contains('.')
+                && first.bytes().all(|byte| byte.is_ascii_digit())
+                && second.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => false,
+    }
+}
 
 /// Claim a staging directory for one export invocation: a uniquely
 /// named sibling of `dest` (`<name>.wyrd-export.<pid>.<nanos>`), so
@@ -274,12 +308,13 @@ fn staging_parts(dest: &Path) -> (String, PathBuf) {
     (stem, parent)
 }
 
-/// Remove crashed runs' staging siblings of `dest`: entries matching
-/// `<stem>.wyrd-export.` whose heartbeat is stale (see
-/// [`is_stale`]). Fresh staging — a live concurrent export, or clock
-/// skew reading future — is always left alone. A missing parent
-/// means there is nothing to sweep; anything else failing here fails
-/// the export, fail-closed.
+/// Remove crashed runs' staging siblings of `dest`: entries with
+/// the exact generated shape whose marker proves exporter ownership
+/// and whose heartbeat is stale (see [`is_stale`]). Deletion needs
+/// both — shape without a valid marker, or a valid marker that is
+/// fresh, is always left alone. A missing parent means there is
+/// nothing to sweep; anything else failing here fails the export,
+/// fail-closed.
 fn sweep_stale_staging(dest: &Path, now: SystemTime) -> Result<(), ExportError> {
     sweep_staging_with_probe(dest, now, &mut |_| {})
 }
@@ -323,6 +358,14 @@ fn sweep_staging_with_probe(
         if !name.starts_with(&prefix) {
             continue;
         }
+        // Ownership proof before anything destructive: the exact
+        // generated shape, then a valid exporter marker. A
+        // same-prefixed user directory fails the shape; a pre-marker
+        // crashed run, or tampering, fails the marker — both are left
+        // for manual cleanup, never auto-deleted.
+        if !staging_shape(&name[prefix.len()..]) {
+            continue;
+        }
         if !is_stale(&path, now) {
             continue;
         }
@@ -350,27 +393,40 @@ fn sweep_staging_with_probe(
     Ok(())
 }
 
-/// Whether a staging sibling belongs to a crashed run: its heartbeat
-/// timestamp is older than [`STALE_AFTER`]. Heartbeat updates are
-/// atomic renames, so a reader never sees a torn marker — only
-/// complete old or new timestamps. A missing or unparsable marker
-/// falls back to the directory mtime, so a crash before the first
-/// heartbeat still ages out; a missing mtime reads as live. Every
-/// fallback points at leaving the directory alone — deleting a live
-/// export is the one outcome this predicate must never produce.
+/// Whether a staging sibling belongs to a crashed run: it carries a
+/// valid exporter marker (see [`HEARTBEAT_MAGIC`]) whose timestamp is
+/// older than [`STALE_AFTER`].
+///
+/// The guarantee is scoped, and the scope is the point: this
+/// predicate must never produce deletion of a run progressing
+/// within the lease — heartbeats flow per window and entry, so a
+/// healthy run's marker is always fresh at every recheck. It does
+/// not, and cannot, distinguish a run stalled past the lease that
+/// resumes in the recheck-to-removal window; that run fails loudly
+/// on its next filesystem op instead. Marker-less or malformed
+/// directories are never stale here, whatever their age: without
+/// proof of ownership there is nothing to prove them crashed.
+/// Heartbeat updates are atomic renames, so a reader never sees a
+/// torn marker — only complete old or new timestamps.
 fn is_stale(staging: &Path, now: SystemTime) -> bool {
-    if let Some(beat) = fs::read_to_string(staging.join(HEARTBEAT_FILE))
+    let beat = fs::read_to_string(staging.join(HEARTBEAT_FILE))
         .ok()
-        .and_then(|text| text.trim().parse::<u128>().ok())
-    {
-        return now_nanos(now).saturating_sub(beat) > STALE_AFTER.as_nanos();
+        .and_then(|text| read_marker(&text));
+    match beat {
+        Some(beat) => now_nanos(now).saturating_sub(beat) > STALE_AFTER.as_nanos(),
+        None => false,
     }
-    staging
-        .metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| now.duration_since(modified).ok())
-        .is_some_and(|age| age > STALE_AFTER)
+}
+
+/// Parse a heartbeat marker: exactly the magic line plus a timestamp
+/// line. Anything else — empty, torn, foreign, tampered — parses as
+/// absent, and absent markers are never stale.
+fn read_marker(text: &str) -> Option<u128> {
+    let (magic, rest) = text.split_once('\n')?;
+    if magic != HEARTBEAT_MAGIC {
+        return None;
+    }
+    rest.trim().parse::<u128>().ok()
 }
 
 /// Nanoseconds since the epoch for heartbeat timestamps. Unreadable
@@ -382,25 +438,34 @@ fn now_nanos(now: SystemTime) -> u128 {
         .unwrap_or(0)
 }
 
-/// One run's heartbeat writer: rewrites the timestamp file as the
+/// One run's heartbeat writer: rewrites the timestamp marker as the
 /// walk progresses, atomically (write a sibling, rename over the
-/// marker) so concurrent readers never see a torn value. Write
+/// marker) so concurrent readers never see a torn value. Beats are
+/// throttled to every 64th call: the lease is an hour, so per-window
+/// markers would buy nothing but metadata traffic on large trees,
+/// while the claim-time beat covers short runs outright. Write
 /// failures surface as I/O errors, which is also what a run
 /// observes when its staging disappears underneath it — either way
 /// the export fails loudly instead of publishing from a tree it no
 /// longer owns.
 struct Heartbeat {
     path: PathBuf,
+    calls: u64,
 }
 
 impl Heartbeat {
     fn new(path: PathBuf) -> Self {
-        Heartbeat { path }
+        Heartbeat { path, calls: 0 }
     }
 
     fn beat(&mut self) -> std::io::Result<()> {
+        self.calls += 1;
+        if self.calls % 64 != 1 {
+            return Ok(());
+        }
         let pending = self.path.with_extension("tmp");
-        fs::write(&pending, now_nanos(SystemTime::now()).to_string())?;
+        let marker = format!("{HEARTBEAT_MAGIC}\n{}\n", now_nanos(SystemTime::now()));
+        fs::write(&pending, marker)?;
         fs::rename(&pending, &self.path)?;
         Ok(())
     }
@@ -1131,11 +1196,16 @@ mod tests {
         let (view, expected) = drive();
         let dest = tmp();
         let out = dest.join("out");
-        // A crashed predecessor's staging: an ancient heartbeat, plus
-        // junk that must never merge into the published tree.
+        // A crashed predecessor's staging: a valid exporter marker
+        // with an ancient heartbeat, plus junk that must never merge
+        // into the published tree.
         let staging = out.with_file_name("out.wyrd-export.1.1");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join(HEARTBEAT_FILE), b"1").unwrap();
+        std::fs::write(
+            staging.join(HEARTBEAT_FILE),
+            format!("{HEARTBEAT_MAGIC}\n1\n"),
+        )
+        .unwrap();
         std::fs::write(staging.join("junk.txt"), b"stale").unwrap();
 
         let report = export_tree(&view, &out).unwrap();
@@ -1170,7 +1240,7 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         std::fs::write(
             live.join(HEARTBEAT_FILE),
-            now_nanos(SystemTime::now()).to_string(),
+            format!("{HEARTBEAT_MAGIC}\n{}\n", now_nanos(SystemTime::now())),
         )
         .unwrap();
 
@@ -1192,13 +1262,17 @@ mod tests {
         let out = dest.join("out");
         let staging = out.with_file_name("out.wyrd-export.3.3");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join(HEARTBEAT_FILE), b"1").unwrap();
+        std::fs::write(
+            staging.join(HEARTBEAT_FILE),
+            format!("{HEARTBEAT_MAGIC}\n1\n"),
+        )
+        .unwrap();
 
         sweep_staging_with_probe(&out, SystemTime::now(), &mut |path| {
             assert_eq!(path, staging);
             std::fs::write(
                 staging.join(HEARTBEAT_FILE),
-                now_nanos(SystemTime::now()).to_string(),
+                format!("{HEARTBEAT_MAGIC}\n{}\n", now_nanos(SystemTime::now())),
             )
             .unwrap();
         })
@@ -1211,9 +1285,8 @@ mod tests {
     #[test]
     fn unparsable_heartbeat_with_fresh_dir_survives() {
         // A torn or foreign marker must never read as stale on its
-        // own: with atomic heartbeat renames our own markers are
-        // always complete, so garbage falls back to the directory
-        // mtime — fresh here — and the directory is left alone.
+        // own: only a valid exporter marker authorizes deletion, and
+        // marker-less directories are left for manual cleanup.
         let dest = tmp();
         let out = dest.join("out");
         let staging = out.with_file_name("out.wyrd-export.4.4");
@@ -1223,6 +1296,44 @@ mod tests {
         sweep_stale_staging(&out, SystemTime::now()).unwrap();
 
         assert!(staging.is_dir(), "garbage marker alone sweeps nothing");
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn same_prefixed_user_directories_survive() {
+        // Ownership proof needs the exact generated shape: a
+        // same-prefixed user directory survives even holding a valid
+        // exporter marker with an ancient heartbeat — prefix without
+        // the generated shape is not proof of ownership.
+        let dest = tmp();
+        let out = dest.join("out");
+        let user = out.with_file_name("out.wyrd-export.backup");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join(HEARTBEAT_FILE), format!("{HEARTBEAT_MAGIC}\n1\n")).unwrap();
+        std::fs::write(user.join("mine.txt"), b"not yours").unwrap();
+
+        sweep_stale_staging(&out, SystemTime::now()).unwrap();
+
+        assert!(user.is_dir(), "user directories are never swept");
+        assert_eq!(std::fs::read(user.join("mine.txt")).unwrap(), b"not yours");
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn markerless_shaped_directories_are_left_for_manual_cleanup() {
+        // A crash between staging creation and the first marker write
+        // leaves a shaped directory with no marker at all: without
+        // proof of ownership the sweep must leave it, whatever its
+        // age. (Un-ageable in-test without filetime; the rule is the
+        // marker requirement itself — no marker, no deletion, ever.)
+        let dest = tmp();
+        let out = dest.join("out");
+        let orphan = out.with_file_name("out.wyrd-export.9.9");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        sweep_stale_staging(&out, SystemTime::now()).unwrap();
+
+        assert!(orphan.is_dir(), "markerless dirs need a human");
         std::fs::remove_dir_all(dest).unwrap();
     }
 

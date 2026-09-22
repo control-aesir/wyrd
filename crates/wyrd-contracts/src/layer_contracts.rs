@@ -21,8 +21,11 @@
 //! `nostr` use inside `wyrd-core` must stay inside one subsystem
 //! directory (the mailbox decision), because manifests cannot scope a
 //! dependency to a module. The scanner matches `use nostr`, bare
-//! `nostr::` paths, and `extern crate nostr` outside comments and
-//! string literals — a documented source convention, not a parser.
+//! `nostr::` paths, and `extern crate nostr` as seen through a small
+//! comment/string-stripping lexer (line and nestable block comments,
+//! cooked, byte, and raw strings, char literals) — enough grammar for
+//! a convention check, with the residual edge cases named at
+//! `code_text`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -242,53 +245,137 @@ fn workspace_dep_table(root_manifest: &toml::Table) -> toml::Table {
         .unwrap_or_default()
 }
 
-/// Strip `"..."` spans (with `\"` escapes) and then a `//` line
-/// comment, where the slashes start the line or follow whitespace
-/// (`http://` outside strings keeps its `:`-preceded slashes, but URLs
-/// belong in strings, which are gone by then). A documented
-/// approximation, not a lexer: the scanner below is a convention check.
-fn code_part(line: &str) -> String {
-    let mut code = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    let mut in_string = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            if c == '\\' {
-                chars.next();
-            } else if c == '"' {
-                in_string = false;
+/// Strip comments and string/char literals from whole file text,
+/// preserving newlines so per-line matching below stays meaningful.
+/// Handles `//` anywhere outside literals, nestable `/* */` block
+/// comments, `"..."` with escapes, `b"..."`, raw `r"..."`/`r#"..."#`
+/// forms, and `'x'` char literals (a `'` skips to its line's closing
+/// quote; lifetimes without one pass through untouched). A small lexer
+/// for a convention check, not a grammar: pathological nesting of
+/// quotes inside lifetimes is out of scope.
+fn code_text(text: &str) -> String {
+    let mut code = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Line comment: `//` in normal state runs to (not past) `\n`.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                code.push(' ');
+                i += 1;
             }
             continue;
         }
-        if c == '"' {
-            in_string = true;
+        // Block comment, nestable per the Rust grammar.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let mut depth = 0;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 1;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                if chars[i] == '\n' {
+                    code.push('\n');
+                } else {
+                    code.push(' ');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Raw string: `r"..."`, `r#"..."#`, ... (and `br` variants).
+        if (c == 'r' || (c == 'b' && chars.get(i + 1) == Some(&'r'))) && {
+            let mut j = if c == 'b' { i + 1 } else { i };
+            j += 1;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            chars.get(j) == Some(&'"')
+        } {
+            let mut hashes = 0;
+            let mut j = if c == 'b' { i + 2 } else { i + 1 };
+            while chars.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            j += 1; // opening quote
+            loop {
+                if j >= chars.len() {
+                    i = j;
+                    break;
+                }
+                if chars[j] == '"' {
+                    let mut k = j + 1;
+                    let mut seen = 0;
+                    while seen < hashes && chars.get(k) == Some(&'#') {
+                        seen += 1;
+                        k += 1;
+                    }
+                    if seen == hashes {
+                        j = k;
+                        i = j;
+                        break;
+                    }
+                }
+                if chars[j] == '\n' {
+                    code.push('\n');
+                }
+                j += 1;
+            }
+            continue;
+        }
+        // Ordinary or byte string.
+        if c == '"' || (c == 'b' && chars.get(i + 1) == Some(&'"')) {
+            i += if c == 'b' { 2 } else { 1 };
+            while i < chars.len() && chars[i] != '"' && chars[i] != '\n' {
+                if chars[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += usize::from(i < chars.len() && chars[i] == '"');
+            continue;
+        }
+        // Char literal: skip to the line's closing quote when there is
+        // one; otherwise this is a lifetime tick, pass it through.
+        if c == '\'' {
+            let rest: String = chars[i + 1..].iter().collect();
+            let closes = rest.find('\'').is_some_and(|p| !rest[..p].contains('\n'));
+            if closes {
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            code.push(c);
+            i += 1;
             continue;
         }
         code.push(c);
-    }
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            let preceded_by_space = i == 0 || bytes[i - 1].is_ascii_whitespace();
-            if preceded_by_space {
-                code.truncate(i);
-                break;
-            }
-        }
         i += 1;
     }
     code
 }
 
-/// Does one source line use a `nostr*` crate outside comments and
-/// string literals.
+/// Does one stripped source line use a `nostr*` crate.
 fn line_uses_nostr(line: &str) -> bool {
-    let code = code_part(line);
-    let trimmed = code.trim_start();
+    let trimmed = line.trim_start();
     trimmed.starts_with("use nostr")
         || trimmed.starts_with("extern crate nostr")
-        || code.contains("nostr::")
+        || line.contains("nostr::")
 }
 
 /// Subsystem directories (top-level `src/` children) holding `nostr*`
@@ -297,7 +384,7 @@ fn line_uses_nostr(line: &str) -> bool {
 fn nostr_holding_subsystems(files: &[(&str, &str)]) -> BTreeSet<String> {
     files
         .iter()
-        .filter(|(_, text)| text.lines().any(line_uses_nostr))
+        .filter(|(_, text)| code_text(text).lines().any(line_uses_nostr))
         .filter_map(|(path, _)| {
             Path::new(path)
                 .components()
@@ -564,10 +651,38 @@ mod policy_tests {
     #[test]
     fn nostr_scope_ignores_comments_and_urls() {
         let files = [
-            ("src/session.rs", "// see nostr:: docs for the framing"),
-            ("src/node.rs", "let url = \"http://relay/nostr::x\";"),
-            ("src/node.rs", "use std::io;"),
+            ("src/session/mod.rs", "// see nostr:: docs for the framing"),
+            (
+                "src/session/mod.rs",
+                "let x = 1;// attached nostr:: comment",
+            ),
+            (
+                "src/session/mod.rs",
+                "/* block nostr:: mention\nspanning lines, /* nested */ done */",
+            ),
+            ("src/node/mod.rs", "let url = \"http://relay/nostr::x\";"),
+            ("src/node/mod.rs", "let raw = r#\"nostr:: in raw\"#;"),
+            ("src/node/mod.rs", "let tick = &'static str;"),
+            ("src/node/mod.rs", "use std::io;"),
         ];
         assert!(nostr_holding_subsystems(&files).is_empty());
+    }
+
+    #[test]
+    fn nostr_scope_still_detects_real_use_beside_noise() {
+        let files = [
+            (
+                "src/live_mailbox/mod.rs",
+                "/* nostr:: in a comment */\nuse nostr_sdk::prelude::Client;",
+            ),
+            (
+                "src/live_mailbox/seen_store.rs",
+                "let doc = \"nostr:: in a string\";\nlet id = nostr::event::EventId::new();",
+            ),
+        ];
+        assert_eq!(
+            nostr_holding_subsystems(&files),
+            BTreeSet::from(["live_mailbox".to_owned()])
+        );
     }
 }

@@ -113,7 +113,11 @@ characters (x-only pubkeys).
 - `invite <device> <encryption-key> <out>`: admit a device and write
   its sealed invitation to `<out>` for out-of-band delivery. The
   transition commits with the usual catch-up obligations; the
-  newcomer joins from the invitation file.
+  newcomer joins from the invitation file. The destination is
+  claimed before the commit: an existing file is refused, and an
+  uncreatable path fails with no transition authored. A write
+  failure past the commit leaves the admission standing (the error
+  says so) — retrying the same invite then reports `AlreadyMember`.
 
 Membership state beyond the CLI: device identity is single-use
 within a membership chain — a removed device returns only under a
@@ -139,7 +143,10 @@ next mounted sync, not here.
   Member custody persists before the accept commits, so the device
   reopens afterwards. A pairing for another key, a truncated or
   forged invitation, or a join without pairing all fail closed, and
-  a refused join writes nothing.
+  a refused join writes nothing. Join never targets an owner's
+  drive home or another device's member directory: an owner record
+  refuses outright, and a member record for another device refuses
+  rather than stranding it.
 
 The pairing flow, end to end:
 

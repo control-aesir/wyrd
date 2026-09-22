@@ -106,10 +106,23 @@ impl Pair {
         args
     }
 
-    /// The full pairing flow through the real command surface: stage
-    /// pairing, admit plus invitation file, join. Returns the
-    /// newcomer's (device, encryption key) for caller assertions.
-    fn pair_and_join(&self) -> (DeviceId, wyrd_format::DeviceEncryptionKey) {
+    /// The owner's canonical tip epoch, read straight from the
+    /// keystore: proves whether an invite path committed anything.
+    fn owner_tip_epoch(&self) -> u64 {
+        Engine::open_keystore(
+            self.owner_drive.clone(),
+            "owner-pass",
+            read_identity(&self.owner_identity).unwrap(),
+        )
+        .unwrap()
+        .membership_log()
+        .known_state()
+        .expect("owner tip")
+        .epoch
+    }
+    /// Stage pairing and return the public (device, encryption key)
+    /// hex pair the owner invites with.
+    fn stage_pairing(&self) -> (String, String) {
         command(self.newcomer_device(vec![
             "pairing-request".into(),
             self.pairing_file.display().to_string(),
@@ -120,15 +133,25 @@ impl Pair {
         let device = lines
             .next()
             .and_then(|line| line.strip_prefix("device "))
-            .expect("pairing names the device");
+            .expect("pairing names the device")
+            .to_owned();
         let key = lines
             .next()
             .and_then(|line| line.strip_prefix("encryption-key "))
-            .expect("pairing names the encryption key");
+            .expect("pairing names the encryption key")
+            .to_owned();
+        (device, key)
+    }
+
+    /// The full pairing flow through the real command surface: stage
+    /// pairing, admit plus invitation file, join. Returns the
+    /// newcomer's (device, encryption key) for caller assertions.
+    fn pair_and_join(&self) -> (DeviceId, wyrd_format::DeviceEncryptionKey) {
+        let (device, key) = self.stage_pairing();
         command(self.owner_member(vec![
             "invite".into(),
-            device.into(),
-            key.into(),
+            device.clone(),
+            key.clone(),
             self.invitation_file.display().to_string(),
         ]))
         .unwrap();
@@ -138,8 +161,8 @@ impl Pair {
         ]))
         .unwrap();
         (
-            parse_device_id(device).unwrap(),
-            parse_encryption_key(key).unwrap(),
+            parse_device_id(&device).unwrap(),
+            parse_encryption_key(&key).unwrap(),
         )
     }
 }
@@ -305,5 +328,52 @@ fn double_invite_refuses() {
     assert!(
         matches!(error, CliError::Engine(EngineError::AlreadyMember)),
         "second invite names the existing membership: {error:?}"
+    );
+}
+
+#[test]
+fn invite_to_existing_destination_refuses_before_committing() {
+    let pair = Pair::new();
+    let (device, key) = pair.stage_pairing();
+    fs::write(&pair.invitation_file, b"occupied").unwrap();
+    let error = command(pair.owner_member(vec![
+        "invite".into(),
+        device,
+        key,
+        pair.invitation_file.display().to_string(),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "existing destination is refused, not overwritten: {error:?}"
+    );
+    assert_eq!(
+        pair.owner_tip_epoch(),
+        1,
+        "no transition commits when the destination is refused"
+    );
+}
+
+#[test]
+fn invite_to_missing_parent_refuses_before_committing() {
+    let pair = Pair::new();
+    let (device, key) = pair.stage_pairing();
+    let out = pair._temp.0.join("no-such-dir").join("invitation");
+    let error = command(pair.owner_member(vec![
+        "invite".into(),
+        device,
+        key,
+        out.display().to_string(),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "uncreatable destination fails before any commit: {error:?}"
+    );
+    assert!(!out.exists(), "no claim file left behind");
+    assert_eq!(
+        pair.owner_tip_epoch(),
+        1,
+        "no transition commits when the destination is uncreatable"
     );
 }

@@ -156,6 +156,8 @@ pub enum EngineError {
     OwnerMismatch,
     #[error("the supplied identity does not match this drive's member custody record")]
     DeviceMismatch,
+    #[error("this directory already holds owner custody: join into a fresh directory, never into an owner's drive home")]
+    OwnerCustodyExists,
     #[error("no staged pairing secret in this directory: run pairing-request first")]
     MissingPairingSecret,
     #[error("bootstrap invitation failed to open: {0}")]

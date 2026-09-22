@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -349,7 +349,7 @@ fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CliError> {
         }
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|source| CliError::Io {
@@ -726,11 +726,51 @@ fn member(
         } => {
             let device = parse_device_id(&device)?;
             let encryption_key = parse_encryption_key(&encryption_key)?;
-            let outcome = engine.admit_device(device, encryption_key)?;
-            fs::write(&out, outcome.invitation.encode()).map_err(|source| CliError::Io {
-                path: out.clone(),
-                source,
-            })?;
+            // Claim the destination before the irreversible commit: an
+            // existing file is refused outright (no silent overwrite
+            // after a membership change), and an uncreatable path fails
+            // here with no transition authored. On admit failure the
+            // claim is removed so a retry starts clean; on write
+            // failure past the commit the admission stands and the
+            // error says so.
+            if out.exists() {
+                return Err(CliError::Usage(
+                    "invitation destination already exists; remove it or choose another path"
+                        .into(),
+                ));
+            }
+            if let Some(parent) = out.parent() {
+                if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                    return Err(CliError::Usage(
+                        "invitation destination's parent directory does not exist".into(),
+                    ));
+                }
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+                .map_err(|source| CliError::Io {
+                    path: out.clone(),
+                    source,
+                })?;
+            let outcome = match engine.admit_device(device, encryption_key) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = fs::remove_file(&out);
+                    return Err(error.into());
+                }
+            };
+            if let Err(source) = file
+                .write_all(&outcome.invitation.encode())
+                .and_then(|()| file.sync_all())
+            {
+                let _ = fs::remove_file(&out);
+                return Err(CliError::Io {
+                    path: out.clone(),
+                    source,
+                });
+            }
             println!(
                 "invited {device} at epoch {} -> {}",
                 outcome.transition.epoch,
@@ -805,7 +845,7 @@ fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, CliError> {
         source,
     })?;
     let mut bytes = Vec::new();
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take((max + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|source| CliError::Io {

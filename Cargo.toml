@@ -92,3 +92,7 @@ nostr-sdk = { version = "0.45.2", default-features = false, features = ["rustls-
 # property testing (dev-only: generated-sequence suites for the state
 # machines; never a production dependency)
 proptest = "1"
+
+# manifest parsing for the dependency-DAG layer contract (test-only: the
+# checker reads member Cargo.tomls; never a production dependency)
+toml = "1"

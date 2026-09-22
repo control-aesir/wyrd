@@ -2,6 +2,8 @@
 
 **Status:** Design plan. Not yet normative. Nothing in this document is a contract: normative behavior lives in `docs/object-model.md`, `docs/trust.md`, `docs/epochs.md`, and `docs/write-path.md` until a tracked issue explicitly adopts a section here.
 
+**Extraction status (2026-09):** the Phase 1 split below is done — `wyrd-core` holds `WyrdNode`, `LiveNode`/`LiveParts`, the mutation/session/projection machinery, and the relay mailbox; `wyrd-daemon` is the desktop composition library; `wyrd-cli` is the `wyrd` process host. Two deliberate deviations from the plan as written: `DriveView` stayed in `wyrd-fuse` (providers program against the `NamespaceView` trait in `wyrd-core` instead), and the moved types were renamed (`Daemon` → `WyrdNode`, `LiveDaemon` → `LiveNode`). Read `Daemon`/`LiveDaemon`/`DriveView` below as their current names; the remaining sections are future mobile work to be re-validated, not descriptions of today.
+
 ## Purpose
 
 Wyrd currently exposes a drive through a FUSE mount on desktop. Mobile platforms such as Android and iOS cannot use FUSE and have different process and filesystem integration models.
@@ -136,14 +138,14 @@ wyrd-daemon     wyrd-mobile
 
 ## 2.1 `wyrd-core`
 
-New platform-independent crate.
+Platform-independent crate (extracted; see the status note above).
 
 Responsibilities:
 
 * daemon composition;
-* `Daemon`;
-* `LiveDaemon`;
-* `DriveView`;
+* `WyrdNode` (planned here as `Daemon`);
+* `LiveNode` (planned here as `LiveDaemon`);
+* `NamespaceView` trait (`DriveView` stayed in `wyrd-fuse` as its first implementation);
 * projection state;
 * projection generations;
 * open file handles;
@@ -206,9 +208,9 @@ Android and iOS may ultimately use separate platform crates or native bridges if
 
 ---
 
-# 3. `DriveView` contract
+# 3. `NamespaceView` contract (`DriveView` is its first implementation)
 
-`DriveView` is the common projection interface consumed by all file surfaces.
+`NamespaceView` is the common projection interface consumed by all file surfaces; `DriveView` implements it today.
 
 It is responsible for:
 
@@ -848,7 +850,7 @@ The mobile implementation should extend existing Wyrd contract tests rather than
 | -------------------------------------------------- | ------ | ------------------------------ |
 | unverified snapshots never become live heads       | ✓      | Core invariant                 |
 | ContentIds never appear in vault transport records | ✓      | Core crypto invariant          |
-| open FDs remain stable across head advancement     | ✓      | Existing `LiveDaemon` coverage |
+| open FDs remain stable across head advancement     | ✓      | Existing `LiveNode` coverage |
 
 ## DriveView contracts
 
@@ -897,10 +899,10 @@ The mobile implementation should extend existing Wyrd contract tests rather than
 
 This extraction builds on the tracked composition seam — `refactor(daemon): make runtime ownership and projection publication explicit` (`nostr:nevent1qqsqcuw0w8sltgu77458ckwyepf4xjfh976yryek4c4mjcer8kun67spz9mhxue69uhkwunpwdczuap49eehgwadcsl`) — which establishes single-owner runtime mutation and generation-tagged projection publication. The `wyrd-core` split packages that seam for embedding; it must not redesign it.
 
-* Extract `wyrd-core`.
-* Move `Daemon` and `LiveDaemon` into the new crate.
-* Move `DriveView` into the new crate if it does not already live at an appropriate platform-independent boundary.
-* Move writable-handle and mutation-queue infrastructure into the core as the write path lands.
+* Extract `wyrd-core`. ✅ done (node extraction, contracts 34–36).
+* Move `Daemon` and `LiveDaemon` into the new crate. ✅ done as `WyrdNode` and `LiveNode`.
+* Move `DriveView` into the new crate if it does not already live at an appropriate platform-independent boundary. ✅ resolved the other way: `DriveView` stayed in `wyrd-fuse`; providers program against the `NamespaceView` trait.
+* Move writable-handle and mutation-queue infrastructure into the core as the write path lands. ✅ done.
 * Ensure the core has no FUSE or Unix-specific dependencies.
 * Retain `wyrd-daemon` as the desktop composition layer.
 * Keep FUSE behavior unchanged during the extraction.

@@ -12,11 +12,13 @@ use super::inode::{
     statfs_capacity, DirectoryEntries, DirectoryState, Handle, InodeError, InodeTable, OpenDir,
     OpenFiles, WriteHandle, MOUNT_TIME, TTL,
 };
-use crate::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
-use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
-use crate::projection::Projection;
-use crate::session::WriteBudget;
-use crate::want::{wait_for_materialization, WantRegistry};
+use wyrd_core::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
+use wyrd_core::mutation::{
+    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
+};
+use wyrd_core::projection::Projection;
+use wyrd_core::session::WriteBudget;
+use wyrd_core::want::{wait_for_materialization, WantRegistry};
 
 /// The FUSE backend over one drive's published projection: read-write
 /// when the live daemon's mutation channel is wired, read-only without
@@ -1496,7 +1498,7 @@ where
         size: u64,
     ) -> Result<(), fuser::Errno> {
         let target = usize::try_from(size).map_err(|_| fuser::Errno::EFBIG)?;
-        if target > crate::session::MAX_WRITE_BUFFER_BYTES {
+        if target > wyrd_core::session::MAX_WRITE_BUFFER_BYTES {
             return Err(fuser::Errno::EFBIG);
         }
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;

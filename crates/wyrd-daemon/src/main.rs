@@ -12,9 +12,10 @@ use crate::probes::combine_status;
 use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
-use wyrd_daemon::fuse::FuseBackend;
+use wyrd_core::mailbox::LiveMailbox;
 #[cfg(test)]
-use wyrd_daemon::RuntimeMaterialization;
+use wyrd_daemon::core::RuntimeMaterialization;
+use wyrd_daemon::fuse::FuseBackend;
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -378,7 +379,7 @@ fn mount(
     let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
         .map_err(|_| CliError::IdentityFormat)?;
     let seen_path = drive_dir.join("mailbox.seen");
-    let mut mailbox = wyrd_daemon::mailbox::LiveMailbox::connect(
+    let mut mailbox = LiveMailbox::connect(
         nostr::key::Keys::new(nostr_secret.clone()),
         nostr_secret,
         relays.clone(),

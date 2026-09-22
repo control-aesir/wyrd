@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use crate::mutation::{MutationError, MutationKind};
+use wyrd_core::mutation::{MutationError, MutationKind};
 
 use super::tests_harness::{scratch_drive, NoopMailbox, SettlementFailingMailbox};
 
@@ -168,7 +168,7 @@ fn failure_classes_classify_and_cap_independently() {
 /// Block until a mutation submission lands in pending (or fail on
 /// timeout): faster and less flaky than a fixed sleep, and it fails
 /// the test instead of hanging the suite.
-fn await_pending(queue: &std::sync::Arc<crate::mutation::MutationQueue>) {
+fn await_pending(queue: &std::sync::Arc<wyrd_core::mutation::MutationQueue>) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while queue.outstanding() == 0 {
         assert!(

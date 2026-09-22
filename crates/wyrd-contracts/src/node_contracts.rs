@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use wyrd_core::mutation::{MutationKind, MutationOutcome};
 use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::{LiveConfig, RuntimeMaterialization, WyrdNode};
-use wyrd_daemon::{MutationKind, MutationOutcome};
 use wyrd_format::MemoryObjectStore;
 use wyrd_fuse::DriveView;
 use wyrd_sync::bulk::MemoryBulkSource;

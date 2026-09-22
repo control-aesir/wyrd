@@ -8,8 +8,8 @@ use std::sync::Arc;
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node};
 
-use crate::mutation::{FileIdentity, MutationOutcome, MutationQueue};
-use crate::session::WriteBudget;
+use wyrd_core::mutation::{FileIdentity, MutationOutcome, MutationQueue};
+use wyrd_core::session::WriteBudget;
 
 use fuser::Filesystem as _;
 use wyrd_format::{ContentId, Entry, MemoryObjectStore, ObjectKind, Snapshot, Tree};

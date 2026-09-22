@@ -5,7 +5,7 @@ use fuser::FileHandle;
 
 use wyrd_fuse::ViewError;
 
-use crate::mutation::MutationError;
+use wyrd_core::mutation::MutationError;
 
 use wyrd_format::{ContentId, StoreFailure};
 

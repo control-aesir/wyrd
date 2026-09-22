@@ -1,9 +1,9 @@
 //! The sync-facing contracts: verified heads, queue pressure, and
 //! bounded bulk.
 
+use wyrd_core::budgets::ResourceBudgets;
 use wyrd_daemon::core::{LiveConfig, LiveError, RuntimeMaterialization, WyrdNode};
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_daemon::ResourceBudgets;
 use wyrd_format::{
     BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, Manifest, ManifestEntry,
     MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId, StorageId, Tree,

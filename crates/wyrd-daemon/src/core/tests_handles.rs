@@ -446,7 +446,7 @@ fn setattr_truncates_and_toggles_exec() {
     backend.release_handle(read_only).unwrap();
 
     // An over-budget target fails closed before materializing.
-    let too_big = crate::session::MAX_WRITE_BUFFER_BYTES as u64 + 1;
+    let too_big = wyrd_core::session::MAX_WRITE_BUFFER_BYTES as u64 + 1;
     assert_eq!(backend.set_size_at(ino, too_big), Err(fuser::Errno::EFBIG));
 
     // A writable handle cannot combine a buffered truncate with a
@@ -489,7 +489,7 @@ fn path_truncate_reads_only_the_kept_prefix() {
     // a one-byte shrink must succeed.
     let root = wyrd_format::Tree::from_entries(vec![wyrd_format::Entry::file(
         "big",
-        crate::session::MAX_WRITE_BUFFER_BYTES as u64 + 1,
+        wyrd_core::session::MAX_WRITE_BUFFER_BYTES as u64 + 1,
         false,
         vec![chunk],
     )

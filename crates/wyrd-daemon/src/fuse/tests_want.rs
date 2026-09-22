@@ -7,10 +7,10 @@ use std::time::Duration;
 use wyrd_format::ObjectStore;
 use wyrd_fuse::DriveView;
 
-use crate::budgets::ResourceBudgets;
-use crate::mutation::MutationQueue;
-use crate::projection::Projection;
-use crate::want::WantRegistry;
+use wyrd_core::budgets::ResourceBudgets;
+use wyrd_core::mutation::MutationQueue;
+use wyrd_core::projection::Projection;
+use wyrd_core::want::WantRegistry;
 
 use wyrd_format::{ContentId, Entry, MemoryObjectStore, ObjectKind, SharedStore, Tree};
 

@@ -20,7 +20,7 @@ mod tests_run_loop;
 #[cfg(test)]
 mod tests_sync;
 
-pub use crate::budgets::ResourceBudgets;
+pub use wyrd_core::budgets::ResourceBudgets;
 pub use wyrd_core::live::{
     admit_wants, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, SyncReport,
     MAILBOX_MAX_CONSECUTIVE_ERRORS, STORE_MAX_CONSECUTIVE_ERRORS,

@@ -7,7 +7,7 @@ use wyrd_sync::transport::mailbox::Mailbox;
 
 use std::sync::atomic::Ordering;
 
-use crate::want::WantRegistry;
+use wyrd_core::want::WantRegistry;
 
 use super::tests_harness::{
     live_backend, scratch_drive, spawn_live_loop, NoopMailbox, QueueMailbox,
@@ -37,7 +37,7 @@ fn dirty_handle_budget_refuses_through_the_mount() {
     backend.release_handle(fh).unwrap();
 
     let mut handles = Vec::new();
-    for _ in 0..crate::session::MAX_DIRTY_HANDLES {
+    for _ in 0..wyrd_core::session::MAX_DIRTY_HANDLES {
         let handle = backend.open_write("d.txt", libc::O_RDWR).unwrap();
         backend.write_handle(handle, 1, b"y").unwrap();
         handles.push(handle);

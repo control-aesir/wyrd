@@ -164,6 +164,8 @@ mod layer_contracts;
 #[cfg(test)]
 mod node_contracts;
 #[cfg(test)]
+mod removal_contracts;
+#[cfg(test)]
 mod serving_contracts;
 #[cfg(test)]
 mod support;

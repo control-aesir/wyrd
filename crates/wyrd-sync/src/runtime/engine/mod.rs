@@ -703,6 +703,30 @@ impl Engine {
         self.drive
     }
 
+    /// The observed membership log: the read surface for
+    /// administration (member list/log/status) and for any consumer
+    /// that classifies without authoring. Mutations stay behind the
+    /// authoring methods below.
+    pub fn membership_log(&self) -> &MembershipLog {
+        &self.log
+    }
+
+    /// Epochs this device holds secrets for, ascending: the
+    /// decryption half of the known-vs-held distinction (epochs.md).
+    /// Probed from the durable keyring through the known tip, so a
+    /// missing epoch the tip requires reads as absent, never as an
+    /// error.
+    pub fn held_epochs(&self) -> Result<Vec<u64>, EngineError> {
+        let tip = self
+            .log
+            .known_state()
+            .ok_or(EngineError::NoCanonicalMembership)?;
+        let rebuilt = self.store.rebuild(self.device)?;
+        Ok((1..=tip.epoch)
+            .filter(|epoch| rebuilt.keyring.secret(*epoch).is_some())
+            .collect())
+    }
+
     /// The local device id.
     pub fn device(&self) -> DeviceId {
         self.device

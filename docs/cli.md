@@ -16,6 +16,8 @@ wyrd mount <drive_dir> <mountpoint> [--relay <url>...] [--verbose] \
     --identity-file <path> --passphrase-file <path>
 wyrd export <drive_dir> <out_dir> \
     --identity-file <path> --passphrase-file <path>
+wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device>) \
+    --identity-file <path> --passphrase-file <path>
 ```
 
 ### `init` — create a drive
@@ -77,9 +79,43 @@ any format break.
   later ones fail with a populated destination — the destination
   always holds one complete tree, never a mix.
 
+### `member` — administer drive membership
+
+Reads project the membership log offline over the keystore; writes
+author one transition plus catch-up obligations through the engine,
+which enforces owner-only — the CLI never decides authorization
+itself. Catch-up delivery to other devices happens on the next
+mounted sync via the mailbox, not here. Devices are 64 hex
+characters (x-only pubkeys).
+
+- `list`: members and owners at the canonical tip, one identity per
+  line under an `epoch <n> tip <id>` header.
+- `log`: every observed transition in epoch order with its
+  canonical status (`canonical`, `contested`, `voided`, `orphaned`,
+  `pending`, `invalid:<reason>`) and author; frozen conflict epochs
+  are marked.
+- `status`: known tip epoch and id, member/owner counts, frozen
+  state, and held epoch secrets. Knowledge is not possession: a
+  known epoch without its secret authorizes nothing until the
+  capability arrives.
+- `remove <device>`: author a removal transition. The removed device
+  receives no new-epoch material; its acquisition ends at the
+  removal boundary while its history stays valid. Removing the sole
+  owner is valid but terminal — it empties the owner set and no
+  future transition can be authorized — so it requires `--yes`.
+- `rotate`: force a fresh epoch secret. Membership unchanged; every
+  current member is owed the new-epoch wrap.
+- `set-owner <device>`: hand ownership to a member (v0 ownership is
+  a singleton). Authority comes from the pre-transition owner set,
+  so the current owner signs the handover.
+
+Membership state beyond the CLI: device identity is single-use
+within a membership chain — a removed device returns only under a
+fresh identity (`docs/epochs.md`).
+
 ## Credential files
 
-All three subcommands take `--identity-file` and `--passphrase-file`.
+All subcommands take `--identity-file` and `--passphrase-file`.
 Both are read and hardened by wyrd code, never by clap:
 
 - The identity file holds exactly 32 raw bytes or 64 hex characters
@@ -96,7 +132,7 @@ Both are read and hardened by wyrd code, never by clap:
 
 - `mount` initializes structured diagnostics first: events to stderr
   plus `drive_dir/mount.log`, truncated per mount (one mount, one
-  log — no rotation code). Init and export log nothing to disk.
+  log — no rotation code). Init, export, and member log nothing to disk.
 - `--help` and `--version` print and exit successfully.
 - Exit `0` on success; exit `2` on any failure, with the reason on
   stderr (`error: ...`). Usage errors (bad flags, missing options)

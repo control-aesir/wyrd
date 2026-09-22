@@ -18,13 +18,15 @@ use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
+use wyrd_format::{DeviceId, TransitionId};
 use wyrd_sync::keys::DeviceIdentitySecret;
+use wyrd_sync::membership::TransitionStatus;
 use wyrd_sync::runtime::Engine;
 use zeroize::Zeroizing;
 
-/// The `wyrd` binary: create a drive, mount its live projection, or
-/// export its namespace to a plain directory tree. All three
-/// subcommands need the credential files (read and hardened by wyrd
+/// The `wyrd` binary: create a drive, mount its live projection,
+/// export its namespace to a plain directory tree, or administer its
+/// membership. All subcommands need the credential files (read and hardened by wyrd
 /// code, never by clap); `--relay` is mount-only deployment state —
 /// nothing in the keystore names relays, so they arrive as flags.
 /// Export is offline by construction: no relays, no serving, no FUSE.
@@ -86,6 +88,49 @@ enum Command {
         out_dir: PathBuf,
         #[command(flatten)]
         credentials: Credentials,
+    },
+    /// Administer drive membership: list members, inspect the log, or
+    /// author remove/rotate/set-owner transitions. Reads are offline
+    /// projections of the keystore; writes commit one transition plus
+    /// catch-up obligations, delivered on the next mounted sync.
+    Member {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: MemberAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+}
+
+/// One membership administration action. Only an owner authors
+/// transitions; the engine enforces that, never the CLI.
+#[derive(Debug, Subcommand)]
+enum MemberAction {
+    /// List members and owners at the canonical tip.
+    List,
+    /// Show the membership log: every observed transition with its
+    /// canonical status.
+    Log,
+    /// Show membership status: known tip, frozen conflicts, and held
+    /// epoch secrets (knowledge is not possession).
+    Status,
+    /// Remove a device (owner-only). Removing the sole owner is valid
+    /// but terminal and requires `--yes`.
+    Remove {
+        /// Device to remove, 64 hex characters.
+        device: String,
+        /// Confirm a last-owner removal.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Force a fresh epoch secret (owner-only). Membership unchanged.
+    Rotate,
+    /// Hand ownership to a member (owner-only). v0 ownership is a
+    /// singleton.
+    SetOwner {
+        /// The new owner, 64 hex characters.
+        device: String,
     },
 }
 
@@ -156,6 +201,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Init { credentials, .. } => read_credentials(credentials)?,
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
+        Command::Member { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
@@ -173,6 +219,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Export {
             drive_dir, out_dir, ..
         } => export(drive_dir, out_dir, &passphrase, identity),
+        Command::Member {
+            drive_dir, action, ..
+        } => member(drive_dir, action, &passphrase, identity),
     }
 }
 
@@ -566,6 +615,187 @@ fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
     wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Bulk)
 }
 
+/// Administer drive membership offline over the keystore: reads
+/// project the membership log, writes author one transition plus
+/// catch-up obligations through the engine (which enforces
+/// owner-only). Catch-up delivery to other devices happens on the
+/// next mounted sync via the mailbox, not here.
+fn member(
+    drive_dir: PathBuf,
+    action: MemberAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let mut engine = Engine::open_keystore(drive_dir, passphrase, identity)?;
+    match action {
+        MemberAction::List => {
+            print!("{}", member_list_report(&engine)?);
+            Ok(())
+        }
+        MemberAction::Log => {
+            print!("{}", member_log_report(&engine)?);
+            Ok(())
+        }
+        MemberAction::Status => {
+            print!("{}", member_status_report(&engine)?);
+            Ok(())
+        }
+        MemberAction::Remove { device, yes } => {
+            let device = parse_device_id(&device)?;
+            require_last_owner_confirmation(&engine, &device, yes)?;
+            let transition = engine.remove_device(device)?;
+            println!("removed {device} at epoch {}", transition.epoch);
+            Ok(())
+        }
+        MemberAction::Rotate => {
+            let transition = engine.rotate_epoch()?;
+            println!("rotated to epoch {}", transition.epoch);
+            Ok(())
+        }
+        MemberAction::SetOwner { device } => {
+            let device = parse_device_id(&device)?;
+            let transition = engine.set_owners(device)?;
+            println!("owner is now {device} at epoch {}", transition.epoch);
+            Ok(())
+        }
+    }
+}
+
+/// Parse a device identity from 64 hex characters (x-only pubkey).
+fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage("device must be 64 hex characters naming an x-only pubkey".into())
+        })?;
+    Ok(DeviceId::from_bytes(bytes))
+}
+
+/// Removing the sole owner is valid but terminal (epochs.md): it
+/// empties the owner set and no future transition can be authorized.
+/// Refuse without explicit confirmation; the protocol stays
+/// authoritative and would accept the transition either way.
+fn require_last_owner_confirmation(
+    engine: &Engine,
+    device: &DeviceId,
+    yes: bool,
+) -> Result<(), CliError> {
+    let Some(tip) = engine.membership_log().known_state() else {
+        return Ok(());
+    };
+    let Some(owners) = engine.membership_log().owners_of(&tip.transition_id) else {
+        return Ok(());
+    };
+    if owners.len() == 1 && owners.contains(device) && !yes {
+        return Err(CliError::Usage(
+            "removing the sole owner permanently ends owner-authorized evolution; pass --yes to confirm"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Members and owners at the canonical tip, one identity per line.
+/// Built as a string (not printed) so tests assert the rendering
+/// without capturing stdout.
+fn member_list_report(engine: &Engine) -> Result<String, CliError> {
+    let log = engine.membership_log();
+    let Some(tip) = log.known_state() else {
+        return Err(CliError::Engine(
+            wyrd_sync::runtime::EngineError::NoCanonicalMembership,
+        ));
+    };
+    let members = log.members_of(&tip.transition_id).unwrap_or_default();
+    let owners = log.owners_of(&tip.transition_id).unwrap_or_default();
+    let mut out = format!("epoch {} tip {}\n", tip.epoch, tip.transition_id);
+    for owner in &owners {
+        out.push_str(&format!("owner {owner}\n"));
+    }
+    for member in &members {
+        if !owners.contains(member) {
+            out.push_str(&format!("member {member}\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// Every observed transition in epoch order with its canonical
+/// status; frozen conflict epochs are marked. Built as a string so
+/// tests assert the rendering without capturing stdout.
+fn member_log_report(engine: &Engine) -> Result<String, CliError> {
+    let log = engine.membership_log();
+    let statuses = log.statuses();
+    let frozen = log.frozen_at();
+    let mut entries: Vec<(u64, TransitionId)> = statuses
+        .keys()
+        .filter_map(|id| log.transition(id).map(|t| (t.epoch, *id)))
+        .collect();
+    entries.sort();
+    let mut out = String::new();
+    for (epoch, id) in entries {
+        let status = statuses.get(&id).expect("statused above");
+        let author = log
+            .transition(&id)
+            .map(|t| t.author.to_string())
+            .unwrap_or_else(|| "?".into());
+        let frozen_marker = match frozen {
+            Some(frozen_epoch) if frozen_epoch == epoch => " frozen",
+            _ => "",
+        };
+        out.push_str(&format!(
+            "epoch {epoch} {id} {} author {author}{frozen_marker}\n",
+            render_status(status)
+        ));
+    }
+    Ok(out)
+}
+
+/// Known tip, frozen conflicts, and held epoch secrets. Knowledge is
+/// not possession: a known epoch without its secret authorizes
+/// nothing until the capability arrives. Built as a string so tests
+/// assert the rendering without capturing stdout.
+fn member_status_report(engine: &Engine) -> Result<String, CliError> {
+    let log = engine.membership_log();
+    let Some(tip) = log.known_state() else {
+        return Err(CliError::Engine(
+            wyrd_sync::runtime::EngineError::NoCanonicalMembership,
+        ));
+    };
+    let members = log.members_of(&tip.transition_id).unwrap_or_default();
+    let owners = log.owners_of(&tip.transition_id).unwrap_or_default();
+    let held = engine.held_epochs().map_err(CliError::Engine)?;
+    let held_list = held
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let frozen_line = match log.frozen_at() {
+        Some(epoch) => format!("frozen at epoch {epoch}"),
+        None => "frozen: no".into(),
+    };
+    Ok(format!(
+        "epoch {} tip {}\nmembers {} owners {}\n{frozen_line}\nheld secrets: {held_list}\n",
+        tip.epoch,
+        tip.transition_id,
+        members.len(),
+        owners.len(),
+    ))
+}
+
+/// One-word canonical status for the log view; invalid transitions
+/// carry their machine reason.
+fn render_status(status: &TransitionStatus) -> String {
+    match status {
+        TransitionStatus::Canonical => "canonical".into(),
+        TransitionStatus::Contested => "contested".into(),
+        TransitionStatus::Voided => "voided".into(),
+        TransitionStatus::Orphaned => "orphaned".into(),
+        TransitionStatus::Pending => "pending".into(),
+        TransitionStatus::Invalid(reason) => format!("invalid:{reason:?}"),
+    }
+}
+
 /// macOS mount-failure checklist, printed next to the raw error.
 /// macFUSE's libfuse2 mount can return -1 without setting errno, so
 /// the errno in the error line may be stale (observed: EOPNOTSUPP
@@ -614,6 +844,8 @@ mod tests_cli;
 mod tests_export;
 #[cfg(test)]
 mod tests_harness;
+#[cfg(test)]
+mod tests_member;
 #[cfg(test)]
 mod tests_mount;
 #[cfg(test)]

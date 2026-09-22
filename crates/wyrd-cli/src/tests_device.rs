@@ -377,3 +377,55 @@ fn invite_to_missing_parent_refuses_before_committing() {
         "no transition commits when the destination is uncreatable"
     );
 }
+
+#[test]
+fn reissue_recovers_lost_invitation_through_the_surface() {
+    let pair = Pair::new();
+    let (device, key) = pair.stage_pairing();
+    // Invite, then lose the file: the admission stands with no
+    // published invitation, like a death between commit and write.
+    command(pair.owner_member(vec![
+        "invite".into(),
+        device.clone(),
+        key,
+        pair.invitation_file.display().to_string(),
+    ]))
+    .unwrap();
+    fs::remove_file(&pair.invitation_file).unwrap();
+    // Reissue to a fresh path and join from it: recovery without
+    // re-admission.
+    let reissued = pair._temp.0.join("reissued-invitation");
+    command(pair.owner_member(vec![
+        "reissue-invitation".into(),
+        device,
+        reissued.display().to_string(),
+    ]))
+    .unwrap();
+    command(pair.newcomer_device(vec!["join".into(), reissued.display().to_string()])).unwrap();
+    // Membership reads work over the recovered join.
+    command(pair.newcomer_member(vec!["list".into()])).unwrap();
+    // Nothing to reissue for a stranger, and no silent overwrite of
+    // an existing destination.
+    let stranger = device_id_of(&[0x44; 32]);
+    let error = command(pair.owner_member(vec![
+        "reissue-invitation".into(),
+        stranger.to_string(),
+        reissued.display().to_string(),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "existing destination refuses before any lookup: {error:?}"
+    );
+    let elsewhere = pair._temp.0.join("elsewhere-invitation");
+    let error = command(pair.owner_member(vec![
+        "reissue-invitation".into(),
+        stranger.to_string(),
+        elsewhere.display().to_string(),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::NotMember)),
+        "unknown device has no invitation: {error:?}"
+    );
+}

@@ -149,14 +149,23 @@ enum MemberAction {
     },
     /// Admit a device (owner-only) and write its sealed invitation to
     /// a file for out-of-band delivery. The transition commits with
-    /// the usual catch-up obligations; the invitation itself travels
-    /// outside wyrd, and the newcomer joins from it.
+    /// the usual catch-up obligations; the newcomer joins from the
+    /// invitation file.
     Invite {
         /// Device to admit, 64 hex characters.
         device: String,
         /// Its encryption key, 64 hex characters (from its
         /// pairing-request output).
         encryption_key: String,
+        /// Where to write the sealed invitation.
+        out: PathBuf,
+    },
+    /// Reissue a device's sealed invitation from durable state, for
+    /// an admission whose invitation never reached a file. Authors
+    /// nothing; the reseal opens identically, with fresh randomness.
+    ReissueInvitation {
+        /// Device whose invitation to reissue, 64 hex characters.
+        device: String,
         /// Where to write the sealed invitation.
         out: PathBuf,
     },
@@ -726,34 +735,10 @@ fn member(
         } => {
             let device = parse_device_id(&device)?;
             let encryption_key = parse_encryption_key(&encryption_key)?;
-            // Claim the destination before the irreversible commit: an
-            // existing file is refused outright (no silent overwrite
-            // after a membership change), and an uncreatable path fails
-            // here with no transition authored. On admit failure the
-            // claim is removed so a retry starts clean; on write
-            // failure past the commit the admission stands and the
-            // error says so.
-            if out.exists() {
-                return Err(CliError::Usage(
-                    "invitation destination already exists; remove it or choose another path"
-                        .into(),
-                ));
-            }
-            if let Some(parent) = out.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    return Err(CliError::Usage(
-                        "invitation destination's parent directory does not exist".into(),
-                    ));
-                }
-            }
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&out)
-                .map_err(|source| CliError::Io {
-                    path: out.clone(),
-                    source,
-                })?;
+            // Claim the destination before the irreversible commit; on
+            // admit failure the claim is removed so a retry starts
+            // clean. See claim_out for the policy.
+            let mut file = claim_out(&out)?;
             let outcome = match engine.admit_device(device, encryption_key) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -761,16 +746,7 @@ fn member(
                     return Err(error.into());
                 }
             };
-            if let Err(source) = file
-                .write_all(&outcome.invitation.encode())
-                .and_then(|()| file.sync_all())
-            {
-                let _ = fs::remove_file(&out);
-                return Err(CliError::Io {
-                    path: out.clone(),
-                    source,
-                });
-            }
+            write_invitation(&out, &mut file, &outcome.invitation.encode())?;
             println!(
                 "invited {device} at epoch {} -> {}",
                 outcome.transition.epoch,
@@ -778,7 +754,67 @@ fn member(
             );
             Ok(())
         }
+        MemberAction::ReissueInvitation { device, out } => {
+            let device = parse_device_id(&device)?;
+            // Same destination policy as invite: the reseal is new
+            // bytes for an old admission, and an existing file is
+            // refused rather than silently replaced.
+            let mut file = claim_out(&out)?;
+            let invitation = match engine.reissue_invitation(device) {
+                Ok(invitation) => invitation,
+                Err(error) => {
+                    let _ = fs::remove_file(&out);
+                    return Err(error.into());
+                }
+            };
+            write_invitation(&out, &mut file, &invitation.encode())?;
+            println!("reissued invitation for {device} -> {}", out.display());
+            Ok(())
+        }
     }
+}
+
+/// Claim an invitation destination before any irreversible step: an
+/// existing file is refused outright (no silent overwrite after a
+/// membership change), and an uncreatable path fails here with
+/// nothing authored. Callers remove the claim when their fallible
+/// step fails so a retry starts clean.
+fn claim_out(out: &Path) -> Result<fs::File, CliError> {
+    if out.exists() {
+        return Err(CliError::Usage(
+            "invitation destination already exists; remove it or choose another path".into(),
+        ));
+    }
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return Err(CliError::Usage(
+                "invitation destination's parent directory does not exist".into(),
+            ));
+        }
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .map_err(|source| CliError::Io {
+            path: out.to_path_buf(),
+            source,
+        })
+}
+
+/// Publish a sealed invitation through a claimed file. A write
+/// failure past the commit removes the claim and reports the
+/// standing state (for invite, the admission; for reissue, nothing
+/// changed at all).
+fn write_invitation(out: &Path, file: &mut fs::File, bytes: &[u8]) -> Result<(), CliError> {
+    if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(out);
+        return Err(CliError::Io {
+            path: out.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
 }
 
 /// Pair this device with a drive over the keystore: identify it,

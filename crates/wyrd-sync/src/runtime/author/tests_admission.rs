@@ -495,3 +495,43 @@ fn admission_anchors_to_canonical_genesis_despite_invalid_rival() {
         "invitee accepts the anchored invitation"
     );
 }
+
+#[test]
+fn reissue_recovers_admission_whose_invitation_never_published() {
+    let dir = TestDir::new("reissue-invitation");
+    let owner = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    // The admission commits, but the invitation never reaches a
+    // file: drop it on the floor like a process death between
+    // commit and publication.
+    engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    // A fresh process reopens from durable state alone and reissues:
+    // the reseal is functionally equivalent, never byte-equal.
+    drop(engine);
+    let engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
+    let sealed = engine.reissue_invitation(newcomer_id).unwrap();
+    let join_dir = TestDir::new("reissue-invitation-join");
+    let joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+        &sealed,
+    )
+    .unwrap();
+    assert!(
+        joined.log.known_state().is_some(),
+        "the reissued invitation joins"
+    );
+    // A device that was never admitted has no invitation to reissue.
+    let stranger = DeviceIdentitySecret::generate().unwrap();
+    assert!(matches!(
+        engine.reissue_invitation(device_of(&stranger)),
+        Err(EngineError::NotMember)
+    ));
+}

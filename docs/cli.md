@@ -16,7 +16,7 @@ wyrd mount <drive_dir> <mountpoint> [--relay <url>...] [--verbose] \
     --identity-file <path> --passphrase-file <path>
 wyrd export <drive_dir> <out_dir> \
     --identity-file <path> --passphrase-file <path>
-wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out>) \
+wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> | reissue-invitation <device> <out>) \
     --identity-file <path> --passphrase-file <path>
 wyrd device <drive_dir> (id | pairing-request <out> | join <invitation>) \
     --identity-file <path> --passphrase-file <path>
@@ -116,8 +116,13 @@ characters (x-only pubkeys).
   newcomer joins from the invitation file. The destination is
   claimed before the commit: an existing file is refused, and an
   uncreatable path fails with no transition authored. A write
-  failure past the commit leaves the admission standing (the error
-  says so) — retrying the same invite then reports `AlreadyMember`.
+  failure past the commit leaves the admission standing — recover
+  with `reissue-invitation` below instead of re-inviting (which
+  reports `AlreadyMember`).
+- `reissue-invitation <device> <out>`: reseal a device's invitation
+  from durable state, for an admission whose invitation never
+  reached a file. Authors nothing; the reseal opens identically,
+  with fresh randomness. Same destination policy as `invite`.
 
 Membership state beyond the CLI: device identity is single-use
 within a membership chain — a removed device returns only under a

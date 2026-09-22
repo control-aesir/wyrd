@@ -1,11 +1,11 @@
 use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition};
+use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
 use crate::keys::EpochSecret;
-use crate::membership::sign_transition;
+use crate::membership::{sign_transition, TransitionStatus};
 use crate::runtime::engine::{Engine, EngineError};
 use zeroize::Zeroizing;
 
@@ -179,6 +179,98 @@ pub(crate) fn admit_device(
 /// `u64` protocol field with the same boundary.
 pub(super) fn next_epoch(tip_epoch: u64) -> Result<u64, EngineError> {
     tip_epoch.checked_add(1).ok_or(EngineError::EpochExhausted)
+}
+
+/// Reissue a device's sealed invitation from durable state: finds the
+/// device's admission in valid history, re-mints its grant from the
+/// held epoch secrets, and reseals it. The recovery path for an
+/// admission whose invitation never reached a file (process death
+/// between commit and publication): nothing here authors, so it runs
+/// repeatedly and from any process holding the secrets. The reseal
+/// uses fresh randomness, so the bytes differ from the original —
+/// equivalence is functional (the invitee joins), never byte
+/// equality.
+pub(crate) fn reissue_invitation(
+    engine: &Engine,
+    device: DeviceId,
+) -> Result<SealedBootstrap, EngineError> {
+    let (epoch, id) = admission_of(engine, &device)?;
+    let transition = engine
+        .log
+        .transition(&id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let post = engine
+        .log
+        .state_of(&id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let encryption_key = transition
+        .changes()
+        .iter()
+        .find_map(|change| match change {
+            Change::Admit(admission) if admission.device == device => {
+                Some(admission.encryption_key)
+            }
+            _ => None,
+        })
+        .ok_or(EngineError::NotMember)?;
+    // Secrets `1..=epoch`, as at admission: the keyring holds every
+    // past epoch from an authorized capability each.
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let mut secrets = Vec::with_capacity(epoch as usize);
+    for past in 1..=epoch {
+        secrets.push(
+            rebuilt
+                .keyring
+                .secret(past)
+                .cloned()
+                .ok_or(EngineError::MissingEpochSecret(past))?,
+        );
+    }
+    let grant = Capability::mint(engine.drive, device, &post, transition, secrets)?;
+    Ok(seal_bootstrap(
+        &engine.identity_secret,
+        &engine.drive,
+        device,
+        &encryption_key,
+        &genesis_bytes(engine)?,
+        grant.wrap()?.as_bytes(),
+    )?)
+}
+
+/// The device's admission in valid history, canonical first: at most
+/// one admission per device can be valid (a second admit is refused
+/// while the first holds membership, and retirement forbids return),
+/// but forks can carry rival histories, so prefer the canonical one
+/// and otherwise take the lowest epoch. Anything without a derived
+/// state never authorized and cannot anchor a grant.
+fn admission_of(engine: &Engine, device: &DeviceId) -> Result<(u64, TransitionId), EngineError> {
+    let statuses = engine.log.statuses();
+    let mut candidates: Vec<(bool, u64, TransitionId)> = engine
+        .log
+        .observed_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let found = engine
+                .log
+                .transition(&id)?
+                .changes()
+                .iter()
+                .any(|change| matches!(change, Change::Admit(a) if a.device == *device));
+            if !found {
+                return None;
+            }
+            engine.log.state_of(&id)?;
+            let transition = engine.log.transition(&id)?;
+            let canonical = matches!(statuses.get(&id), Some(TransitionStatus::Canonical));
+            Some((canonical, transition.epoch, id))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, epoch, id)| (epoch, id))
+        .ok_or(EngineError::NotMember)
 }
 
 /// The canonical genesis bytes the invitation anchors to, from the

@@ -642,6 +642,17 @@ impl Engine {
         super::bootstrap::join(dir, passphrase, identity, sealed)
     }
 
+    /// Reissue a device's sealed invitation from durable state: the
+    /// recovery path for an admission whose invitation never reached
+    /// a file. Authors nothing; see
+    /// [`super::author::reissue_invitation`].
+    pub fn reissue_invitation(
+        &self,
+        device: DeviceId,
+    ) -> Result<crate::control::SealedBootstrap, EngineError> {
+        super::author::reissue_invitation(self, device)
+    }
+
     /// Admit a device to the drive: author, sign, and commit the
     /// admission transition (exactly one new epoch), install the new
     /// epoch's self capability, and return the signed transition plus

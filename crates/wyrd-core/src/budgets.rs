@@ -3,7 +3,7 @@
 //!
 //! Each boundary already had a hardcoded bound (mailbox depths, want
 //! admission, mutation queue, write buffers, engine intake); this
-//! struct gathers the daemon-side ones into one place with the legacy
+//! struct gathers the node-side ones into one place with the legacy
 //! constants as defaults, so embedders tune numbers without touching
 //! code and tests pin the defaults to the historical behavior. Two
 //! exceptions are new, not legacy: `max_admit_per_pass` (admission was

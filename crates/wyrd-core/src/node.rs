@@ -1,79 +1,28 @@
-//! The presentation-agnostic daemon core: one drive's engine wired to
-//! one read-only [`DriveView`] whose heads come from the engine's classified
-//! live-head projection — the eligible-head projection of the observed DAG,
-//! never the raw announcement set, which is retained history (`docs/epochs.md`).
+//! The embeddable node: one drive's engine wired to one read-only
+//! namespace view whose heads come from the engine's classified
+//! live-head projection — the eligible-head projection of the observed
+//! DAG, never the raw announcement set, which is retained history
+//! (`docs/epochs.md`).
 //!
-//! This is the composition the architecture docs assign to the daemon:
-//! sync supplies durable state, keys, and fetch semantics; the view
-//! supplies the filesystem-shaped read surface; neither learns about the
-//! other's transport or presentation. Presentation backends (FUSE now,
-//! mobile file surfaces later) consume the view and map errors at their
-//! own boundary.
+//! The node is presentation-agnostic: sync supplies durable state,
+//! keys, and fetch semantics; the view supplies the read surface;
+//! neither learns about the other's transport or presentation. Hosts
+//! (the daemon's FUSE adapter now, mobile file surfaces later)
+//! compose a concrete view, build backends from the split parts, and
+//! map errors at their own boundary.
 
-use wyrd_core::projection::Projection;
-use wyrd_core::view::{Head, MaterializationPolicy, NamespaceView};
-use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, Tree};
-use wyrd_fuse::{DriveView, ViewHead};
+use crate::live::{verified_heads, LiveConfig, LiveNode, LiveParts};
+use crate::view::{Head, NamespaceView, RuntimeMaterialization};
+use wyrd_format::{chunk, ContentId, Entry, ObjectStore, Tree};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{Engine, RoutePublishing},
     transport::mailbox::Mailbox,
 };
 
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::budgets::ResourceBudgets;
-use crate::lifecycle::WakeSignal;
-use crate::mutation::MutationQueue;
-use crate::want::WantRegistry;
-
-use super::live::{LiveConfig, LiveDaemon};
-
-/// Bridge authorized snapshots into verified view heads. In safe code
-/// this is the only path from the sync layer's verified bodies to the
-/// view: [`Head`] is constructible only from an `AuthorizedSnapshot`,
-/// and only sync's verification produces one of those.
-pub(super) fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<Head> {
-    heads.into_iter().map(Head::new).collect()
-}
-
-/// The loop's ephemeral views still build through the view's own
-/// admission ticket until Phase 3 makes the loop generic over
-/// [`NamespaceView`]: same verified bytes, same Heads, converted at
-/// the view boundary.
-pub(super) fn view_heads_legacy(
-    heads: impl IntoIterator<Item = AuthorizedSnapshot>,
-) -> Vec<ViewHead> {
-    view_heads(heads).into_iter().map(ViewHead::new).collect()
-}
-
-/// All-or-nothing closure gate shared by the direct refresh and the live
-/// sync pass: every eligible head must verify, or the caller installs
-/// nothing. Returns the heads unchanged for installation; any failure
-/// surfaces the closure error before any publication happens, so the two
-/// production paths cannot diverge on partial head sets again.
-pub(super) fn verified_heads<S>(
-    runtime: &wyrd_sync::runtime::RuntimeState,
-    heads: Vec<AuthorizedSnapshot>,
-    store: &S,
-) -> Result<Vec<AuthorizedSnapshot>, wyrd_sync::closure::ClosureError>
-where
-    S: ObjectStore,
-    S::Error: std::fmt::Debug,
-{
-    for head in &heads {
-        wyrd_sync::closure::verify_head_closure(
-            runtime,
-            head.snapshot(),
-            store,
-            &wyrd_sync::ingest::Limits::V0,
-        )?;
-    }
-    Ok(heads)
-}
-
-/// Why a daemon write failed. Store and mutation errors keep the
+/// Why a node write failed. Store and mutation errors keep the
 /// store's own error type; engine errors (membership, authoring) surface
 /// unchanged so callers can match on them.
 #[derive(Debug, thiserror::Error)]
@@ -105,74 +54,39 @@ pub enum WriteError<E: std::fmt::Debug> {
     Engine(#[from] wyrd_sync::runtime::EngineError),
 }
 
-/// How the daemon reports fetch status for content the local store
-/// does not hold. Manifest-recorded content the store lacks is
-/// `RemoteOnly`; the fetch state machine wiring (tracked separately)
-/// will refine this into fetch-on-open behavior.
-pub struct DaemonMaterialization {
-    pub(super) runtime: wyrd_sync::runtime::RuntimeState,
+/// One drive's node: the engine (durable membership, keys, intake)
+/// plus the read view over the shared object store. Hosts compose a
+/// concrete view for their provider; every backend reads through
+/// [`WyrdNode::view`].
+pub struct WyrdNode<V: NamespaceView> {
+    engine: Engine,
+    view: V,
 }
 
-impl MaterializationPolicy for DaemonMaterialization {
-    fn status(&self, id: &ContentId) -> FetchStatus {
-        self.runtime.status(id)
-    }
-}
-
-/// One mounted drive: the engine (durable membership, keys, intake) plus
-/// the read view over the shared object store. Every backend reads
-/// through [`Daemon::view`].
-pub struct Daemon<S: ObjectStore> {
-    pub(super) engine: Engine,
-    view: DriveView<S, DaemonMaterialization>,
-}
-
-/// Failure while composing the engine with a presentation view.
+/// Failure while composing the engine with a namespace view.
 #[derive(Debug, thiserror::Error)]
-pub enum DaemonError {
+pub enum NodeError {
     #[error("runtime state could not be reconstructed: {0}")]
     Runtime(#[from] wyrd_sync::runtime::EngineError),
 }
 
-/// The shared publication slot every serving backend reads: one
-/// alias for the nested lock shape, so the four holders (loop,
-/// parts, backend construction, observation) name one type.
-pub type SharedProjection<S> = Arc<RwLock<Arc<Projection<DriveView<S, DaemonMaterialization>>>>>;
-
-/// The live half of a split daemon: everything a presentation
-/// backend needs, with no presentation type in the signatures. The
-/// composer builds its backend from these parts (the FUSE adapter via
-/// `FuseBackend::shared_with_wants`); the node itself never names the
-/// backend.
-pub struct LiveParts<S: ObjectStore> {
-    /// The published serving generations, shared with the backend.
-    pub projection: SharedProjection<S>,
-    /// Demand the backend registers; the loop admits it each pass.
-    pub wants: Arc<WantRegistry>,
-    /// Mounted mutations: the backend submits and blocks, the loop
-    /// drains and applies them serially each pass.
-    pub mutations: Arc<MutationQueue>,
-    /// Resource bounds for this live session, fixed at composition.
-    pub budgets: ResourceBudgets,
-    /// How long a backend `open` blocks for demand before failing.
-    pub open_timeout: Duration,
-}
-
-impl<S: ObjectStore> Daemon<S>
+impl<V> WyrdNode<V>
 where
-    S::Error: std::fmt::Debug,
+    V: NamespaceView<Materialization = RuntimeMaterialization>,
+    V::Store: ObjectStore,
+    <V::Store as ObjectStore>::Error: std::fmt::Debug,
 {
-    /// Compose the daemon from a running engine and the store it
+    /// Compose the node from a running engine and the store it
     /// imports through. The store is shared: the engine imports
     /// verified bytes, the view serves them.
-    pub fn new(engine: Engine, store: S) -> Result<Self, DaemonError> {
+    pub fn new(engine: Engine, store: V::Store) -> Result<Self, NodeError> {
         let runtime = engine.runtime_state()?;
-        let view = DriveView::new(store, DaemonMaterialization { runtime }, Vec::new());
-        Ok(Daemon { engine, view })
+        let view = V::open(store, RuntimeMaterialization { runtime }, Vec::new());
+        Ok(WyrdNode { engine, view })
     }
 
-    /// The read-only drive view backends present.
-    pub fn view(&self) -> &DriveView<S, DaemonMaterialization> {
+    /// The read-only namespace view backends present.
+    pub fn view(&self) -> &V {
         &self.view
     }
 
@@ -189,7 +103,7 @@ where
     /// Refresh materialization facts after intake or fetch execution. Snapshot
     /// heads are supplied separately because announcements do not carry trees.
     pub fn refresh_materialization(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
-        self.view.set_materialization(DaemonMaterialization {
+        self.view.set_materialization(RuntimeMaterialization {
             runtime: self.engine.runtime_state()?,
         });
         Ok(())
@@ -197,7 +111,7 @@ where
 
     /// Fetch verified manifests and objects, then refresh the view's local
     /// residency facts. Heads advance separately via
-    /// [`Daemon::refresh_live_heads`].
+    /// [`WyrdNode::refresh_live_heads`].
     pub fn execute_plan<B: RoutePublishing>(
         &mut self,
         bulk: &mut B,
@@ -232,7 +146,7 @@ where
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
             verified_heads(&runtime, heads, &*store)?
         };
-        NamespaceView::set_heads(&mut self.view, view_heads(heads));
+        NamespaceView::set_heads(&mut self.view, heads.into_iter().map(Head::new).collect());
         Ok(())
     }
 
@@ -269,7 +183,7 @@ where
     }
 
     /// Announce an authored local snapshot through the control plane. The
-    /// snapshot returned by [`Daemon::put_file`] or [`Daemon::remove`] is
+    /// snapshot returned by [`WyrdNode::put_file`] or [`WyrdNode::remove`] is
     /// already durable, and its announcement obligation was queued with
     /// it; announcement failure therefore leaves the remaining
     /// recipients pending in the engine's durable outbox for a later
@@ -299,7 +213,7 @@ where
     /// entries from any head; explicit resolution is a separate API
     /// concern. A headless drive returns `None` so `put_file` can create
     /// its initial empty tree.
-    fn live_base(&self) -> Result<Option<ContentId>, WriteError<S::Error>> {
+    fn live_base(&self) -> Result<Option<ContentId>, WriteError<<V::Store as ObjectStore>::Error>> {
         let heads = self.engine.live_heads()?;
         match heads.as_slice() {
             [] => Ok(None),
@@ -318,7 +232,7 @@ where
         &mut self,
         path: &str,
         data: &[u8],
-    ) -> Result<AuthorizedSnapshot, WriteError<S::Error>> {
+    ) -> Result<AuthorizedSnapshot, WriteError<<V::Store as ObjectStore>::Error>> {
         let file_name = path.rsplit('/').next().unwrap_or(path).to_string();
         let mut store = self.view.store_write().map_err(|_| WriteError::Lock)?;
         let base = match self.live_base()? {
@@ -342,7 +256,10 @@ where
     /// removed bytes stay in the store (append-only until GC); the path
     /// simply stops resolving. Directories left empty are kept, matching
     /// the mutation layer. Returns the authored snapshot.
-    pub fn remove(&mut self, path: &str) -> Result<AuthorizedSnapshot, WriteError<S::Error>> {
+    pub fn remove(
+        &mut self,
+        path: &str,
+    ) -> Result<AuthorizedSnapshot, WriteError<<V::Store as ObjectStore>::Error>> {
         let base = self.live_base()?.ok_or(WriteError::EmptyDrive)?;
         let mut store = self.view.store_write().map_err(|_| WriteError::Lock)?;
         let root = wyrd_format::mutation::remove(&mut *store, base, path)?;
@@ -352,61 +269,27 @@ where
         Ok(authorized)
     }
 
-    /// Split the composed daemon for live serving: the engine and the
+    /// Split the composed node for live serving: the engine and the
     /// store stay with the sync loop while the backend parts move to
     /// the composer, which builds its presentation backend from them.
-    /// Both halves share one projection slot, one mutation channel,
-    /// and one store handle for bytes: intake, fetch, and local
-    /// mutations mutate durable state and the store with no
-    /// publication lock held, and each pass publishes a whole new
-    /// generation under one short write lock — serving never observes
-    /// a half-published projection and never stalls on bulk I/O. The
-    /// composer's synchronously refreshed view is adopted as the
-    /// baseline generation, so the backend never serves an empty view
-    /// while the engine already has heads.
-    /// Split with explicit resource bounds: the registries and the
-    /// backend enforce their own refusals from the config's budgets,
-    /// and the loop paces admission from the stored copy of the same
-    /// value, so one [`LiveConfig`] governs every live-operation
-    /// bound. Compose and run with the same config value — `run_loop`
-    /// takes it for supervision, `into_live` for composition.
+    /// Composition itself runs in the node
+    /// ([`LiveNode::split`](crate::live::LiveNode::split)); this
+    /// unwraps the node's view into the split inputs (store handle,
+    /// baseline view, revision) and adopts the result.
     pub fn into_live(
         self,
         open_timeout: Duration,
         config: &LiveConfig,
-    ) -> (LiveDaemon<S>, LiveParts<S>) {
+    ) -> (LiveNode<V>, LiveParts<V>) {
         let revision = self.engine.current();
         let store = self.view.store_handle();
-        let baseline = Projection::initial(self.view, revision);
-        let projection = Arc::new(RwLock::new(Arc::new(baseline)));
-        let budgets = config.budgets;
-        let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
-        let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
-        // One pacing signal for the whole live session: created here,
-        // attached to the queue now, and shared with the backend's
-        // callers (mailbox intake) so every producer wakes the loop.
-        let waker = Arc::new(WakeSignal::default());
-        mutations.attach_waker(Arc::clone(&waker));
-        let parts = LiveParts {
-            projection: Arc::clone(&projection),
-            wants: Arc::clone(&wants),
-            mutations: Arc::clone(&mutations),
-            budgets,
+        LiveNode::split(
+            self.engine,
+            store,
+            self.view,
+            revision,
             open_timeout,
-        };
-        (
-            LiveDaemon {
-                engine: self.engine,
-                store,
-                projection,
-                wants,
-                mutations,
-                published_revision: revision,
-                dirty: false,
-                budgets,
-                waker,
-            },
-            parts,
+            config,
         )
     }
 }

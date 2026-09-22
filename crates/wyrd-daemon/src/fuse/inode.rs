@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wyrd_fuse::OpenFile;
 
-use crate::mutation::FileIdentity;
-use crate::session::HandleId;
+use wyrd_core::mutation::FileIdentity;
+use wyrd_core::session::HandleId;
 
 /// The attribute time-to-limit served to the kernel: short, since
 /// heads (and thus names and sizes) can advance at any drain.

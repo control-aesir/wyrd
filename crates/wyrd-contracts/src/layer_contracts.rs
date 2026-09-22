@@ -626,25 +626,25 @@ mod policy_tests {
     #[test]
     fn nostr_scope_pins_to_one_subsystem() {
         let single = [
-            ("src/live_mailbox/mod.rs", "use nostr_sdk::prelude::Client;"),
+            ("src/mailbox/mod.rs", "use nostr_sdk::prelude::Client;"),
             (
-                "src/live_mailbox/seen_store.rs",
+                "src/mailbox/seen_store.rs",
                 "let id = nostr::event::EventId::new();",
             ),
             ("src/session.rs", "use std::collections::BTreeMap;"),
         ];
         assert_eq!(
             nostr_holding_subsystems(&single),
-            BTreeSet::from(["live_mailbox".to_owned()])
+            BTreeSet::from(["mailbox".to_owned()])
         );
 
         let spread = [
-            ("src/live_mailbox/mod.rs", "use nostr_sdk::prelude::Client;"),
+            ("src/mailbox/mod.rs", "use nostr_sdk::prelude::Client;"),
             ("src/session/mod.rs", "extern crate nostr;"),
         ];
         assert_eq!(
             nostr_holding_subsystems(&spread),
-            BTreeSet::from(["live_mailbox".to_owned(), "session".to_owned()])
+            BTreeSet::from(["mailbox".to_owned(), "session".to_owned()])
         );
     }
 
@@ -672,17 +672,17 @@ mod policy_tests {
     fn nostr_scope_still_detects_real_use_beside_noise() {
         let files = [
             (
-                "src/live_mailbox/mod.rs",
+                "src/mailbox/mod.rs",
                 "/* nostr:: in a comment */\nuse nostr_sdk::prelude::Client;",
             ),
             (
-                "src/live_mailbox/seen_store.rs",
+                "src/mailbox/seen_store.rs",
                 "let doc = \"nostr:: in a string\";\nlet id = nostr::event::EventId::new();",
             ),
         ];
         assert_eq!(
             nostr_holding_subsystems(&files),
-            BTreeSet::from(["live_mailbox".to_owned()])
+            BTreeSet::from(["mailbox".to_owned()])
         );
     }
 }

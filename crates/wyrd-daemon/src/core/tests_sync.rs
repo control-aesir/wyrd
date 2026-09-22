@@ -1,16 +1,19 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 use wyrd_format::{ContentId, FetchStatus};
 use wyrd_sync::transport::mailbox::Mailbox;
 
 use std::sync::atomic::Ordering;
 
-use crate::want::WantRegistry;
+use wyrd_core::want::WantRegistry;
 
-use super::live::admit_wants;
 use super::tests_harness::{
     live_backend, scratch_drive, spawn_live_loop, NoopMailbox, QueueMailbox,
+    SettlementFailingMailbox,
 };
+use wyrd_core::live::admit_wants;
 
 use wyrd_format::{DeviceId, MemoryObjectStore};
 
@@ -23,7 +26,8 @@ use wyrd_sync::transport::mailbox::MailboxEnvelope;
 #[test]
 fn dirty_handle_budget_refuses_through_the_mount() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -33,7 +37,7 @@ fn dirty_handle_budget_refuses_through_the_mount() {
     backend.release_handle(fh).unwrap();
 
     let mut handles = Vec::new();
-    for _ in 0..crate::session::MAX_DIRTY_HANDLES {
+    for _ in 0..wyrd_core::session::MAX_DIRTY_HANDLES {
         let handle = backend.open_write("d.txt", libc::O_RDWR).unwrap();
         backend.write_handle(handle, 1, b"y").unwrap();
         handles.push(handle);
@@ -80,7 +84,8 @@ fn dirty_handle_budget_refuses_through_the_mount() {
 #[test]
 fn concurrent_readers_see_atomic_generations() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("race.txt", b"v1").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -90,9 +95,12 @@ fn concurrent_readers_see_atomic_generations() {
     let file = pinned.view().open(&node).unwrap();
     assert_eq!(pinned.view().read(&file, 0, 64).unwrap(), b"v1");
 
-    // Publish around the pinned reader: the old generation stays
-    // complete and self-consistent throughout.
-    live.dirty = true;
+    // Publish around the pinned reader: fail one pass through the
+    // public path (the sync_once wrapper marks the backlog on any
+    // pass error), then recover — the old generation stays complete
+    // and self-consistent throughout.
+    let failed = live.sync_once(&mut SettlementFailingMailbox, None::<&mut MemoryBulkSource>);
+    assert!(failed.is_err(), "settle failure fails the pass");
     let report = live
         .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
         .unwrap();
@@ -119,14 +127,15 @@ fn concurrent_readers_see_atomic_generations() {
 #[test]
 fn want_admission_publishes_without_other_changes() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("anchor.txt", b"anchor").unwrap();
     let (mut live, _backend) = live_backend(daemon);
     let baseline = live.generation();
 
     // Demand content nobody holds yet; no mailbox traffic, no bulk.
     let missing = ContentId::from_bytes([0xEE; 32]);
-    live.wants.register(missing).unwrap();
+    live.wants().register(missing).unwrap();
     let report = live
         .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
         .unwrap();
@@ -139,7 +148,7 @@ fn want_admission_publishes_without_other_changes() {
         "want admission must publish even with no other pass changes"
     );
     // The sweep left the still-unfulfilled want in flight.
-    assert!(live.wants.is_admitted(&missing));
+    assert!(live.wants().is_admitted(&missing));
 
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
@@ -209,7 +218,8 @@ fn want_admission_cap_paces_floods_across_passes() {
 #[test]
 fn sync_once_discards_poison_and_keeps_serving() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("steady.txt", b"steady").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -244,7 +254,8 @@ fn sync_once_discards_poison_and_keeps_serving() {
 #[test]
 fn sync_once_accepts_idle_bulk_source() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("fetched.txt", b"local").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -272,7 +283,8 @@ fn sync_once_accepts_idle_bulk_source() {
 #[test]
 fn open_handles_survive_sync_republication() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("stable.txt", b"v1").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -310,20 +322,22 @@ fn open_handles_survive_sync_republication() {
 /// A backlog from a failed pass forces republication on the next
 /// clean pass even when it reports zero new changes, then clears.
 /// Whether republication becomes visible depends on durable state
-/// (heads need bodies); the flag transition itself is the
-/// mechanism under test here, with end-to-end recovery covered by
-/// the contracts suite.
+/// (heads need bodies); the recovery is pinned end to end here, with
+/// broader coverage in the contracts suite.
 #[test]
 fn dirty_backlog_clears_on_clean_pass() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("steady.txt", b"steady").unwrap();
     let (mut live, backend) = live_backend(daemon);
-    live.dirty = true;
+    let failed = live.sync_once(&mut SettlementFailingMailbox, None::<&mut MemoryBulkSource>);
+    assert!(failed.is_err(), "settle failure fails the pass");
     let mut mailbox = NoopMailbox;
-    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
         .unwrap();
-    assert!(!live.dirty, "republication clears the backlog");
+    assert!(report.published, "the backlog forces republication");
     let handle = backend.open_at("steady.txt").expect("still serves");
     let bytes = backend.read_handle(handle, 0, 1024).expect("still reads");
     assert_eq!(bytes, b"steady");

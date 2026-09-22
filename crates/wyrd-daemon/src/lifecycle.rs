@@ -10,11 +10,11 @@
 //!   syncing and serving behind a dead surface;
 //! - the live loop returns (any outcome) → [`Supervisor::note_loop_ended`]
 //!   trips the stop flag and completes every still-queued mutation with
-//!   [`MutationError::Shutdown`](crate::mutation::MutationError::Shutdown),
+//!   [`MutationError::Shutdown`](wyrd_core::mutation::MutationError::Shutdown),
 //!   so no admitted caller waits forever.
 //!
 //! The loop itself drains on exit too
-//! ([`LiveDaemon::run_loop`](crate::core::LiveDaemon::run_loop)), so the
+//! ([`LiveNode::run_loop`](wyrd_core::live::LiveNode::run_loop)), so the
 //! supervisor's drain is an idempotent no-op in the ordinary case —
 //! belt and braces for composers that drive the queue past the loop.
 //! Join sequencing (unmount, reap the session thread) stays with the
@@ -22,7 +22,7 @@
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
-use crate::mutation::MutationQueue;
+use wyrd_core::mutation::MutationQueue;
 
 // Pacing primitives live in wyrd-core (runtime sync, not process
 // policy); re-exported here until the Phase 3 shim removal.
@@ -76,9 +76,9 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mutation::MutationError;
-    use crate::mutation::MutationKind;
     use std::time::Duration;
+    use wyrd_core::mutation::MutationError;
+    use wyrd_core::mutation::MutationKind;
 
     /// A per-test stop flag: tests run in parallel, so a shared static
     /// would let one test observe another's reset/store.
@@ -112,7 +112,8 @@ mod tests {
 
     fn submit_blocking(
         queue: Arc<MutationQueue>,
-    ) -> std::sync::mpsc::Receiver<Result<crate::mutation::MutationOutcome, MutationError>> {
+    ) -> std::sync::mpsc::Receiver<Result<wyrd_core::mutation::MutationOutcome, MutationError>>
+    {
         let (tx, rx) = std::sync::mpsc::channel();
         let submitter = Arc::clone(&queue);
         std::thread::spawn(move || {

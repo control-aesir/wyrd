@@ -27,6 +27,25 @@ pub trait MaterializationPolicy {
     fn status(&self, id: &ContentId) -> FetchStatus;
 }
 
+/// How the node reports fetch status for content the local store
+/// does not hold. Manifest-recorded content the store lacks is
+/// `RemoteOnly`; the fetch loop refines this into fetch-on-demand
+/// behavior. Built from the engine's runtime state, so every provider
+/// serving through the node reports the same residency — the policy
+/// is a function of engine state, not of presentation.
+pub struct RuntimeMaterialization {
+    /// Fresh runtime state per construction: callers rebuild after
+    /// engine work (intake, fetch, mutation) rather than holding a
+    /// stale copy.
+    pub runtime: wyrd_sync::runtime::RuntimeState,
+}
+
+impl MaterializationPolicy for RuntimeMaterialization {
+    fn status(&self, id: &ContentId) -> FetchStatus {
+        self.runtime.status(id)
+    }
+}
+
 /// One installed head: a snapshot that crossed from sync to the
 /// namespace layer only through verification. The body is unreachable
 /// except through these accessors, so a head cannot be unwrapped and

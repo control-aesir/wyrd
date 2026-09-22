@@ -1,5 +1,7 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 use std::sync::atomic::Ordering;
 
 use crate::fuse::FuseBackend;
@@ -15,11 +17,12 @@ use wyrd_format::MemoryObjectStore;
 #[test]
 fn mount_roundtrip_and_write_coherence() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
-    let names = |backend: &FuseBackend<MemoryObjectStore, DaemonMaterialization>, fh: u64| {
+    let names = |backend: &FuseBackend<MemoryObjectStore, RuntimeMaterialization>, fh: u64| {
         backend
             .dir_entries(fh)
             .unwrap()
@@ -94,7 +97,8 @@ fn mount_roundtrip_and_write_coherence() {
 #[test]
 fn append_commits_onto_the_current_end() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -164,7 +168,8 @@ fn append_commits_onto_the_current_end() {
 #[test]
 fn append_handle_reads_stay_coherent_after_commit() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -212,7 +217,8 @@ fn append_handle_reads_stay_coherent_after_commit() {
 #[test]
 fn append_after_removal_or_kind_change_is_stale() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -259,7 +265,8 @@ fn append_after_removal_or_kind_change_is_stale() {
 #[test]
 fn stale_writable_handle_after_namespace_change() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 

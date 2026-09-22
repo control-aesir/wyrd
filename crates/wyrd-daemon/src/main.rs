@@ -12,8 +12,11 @@ use crate::probes::combine_status;
 use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
+use wyrd_core::mailbox::LiveMailbox;
+#[cfg(test)]
+use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_daemon::{Daemon, FailureClass, LiveConfig, LiveError, Supervisor};
+use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
@@ -98,7 +101,7 @@ pub(crate) enum CliError {
     #[error("engine failed: {0}")]
     Engine(#[from] wyrd_sync::runtime::EngineError),
     #[error("daemon construction failed: {0}")]
-    Daemon(#[from] wyrd_daemon::DaemonError),
+    WyrdNode(#[from] wyrd_daemon::NodeError),
     #[error("object store failed: {0}")]
     Store(String),
     #[error("mailbox failed: {0}")]
@@ -323,7 +326,7 @@ fn mount(
     tracing::info!(stage = "start", log = %log_path.display(), "mount diagnostics initialized");
 
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
-    let mut daemon = Daemon::new(
+    let mut daemon = WyrdNode::new(
         engine,
         FsObjectStore::open(drive_dir.clone())
             .map_err(|error| CliError::Store(error.to_string()))?,
@@ -376,7 +379,7 @@ fn mount(
     let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
         .map_err(|_| CliError::IdentityFormat)?;
     let seen_path = drive_dir.join("mailbox.seen");
-    let mut mailbox = wyrd_daemon::live_mailbox::LiveMailbox::connect(
+    let mut mailbox = LiveMailbox::connect(
         nostr::key::Keys::new(nostr_secret.clone()),
         nostr_secret,
         relays.clone(),

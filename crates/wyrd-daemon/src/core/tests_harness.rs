@@ -1,5 +1,6 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
 use wyrd_sync::{runtime::Engine, transport::mailbox::Mailbox};
 
 use std::sync::Arc;
@@ -81,7 +82,7 @@ pub(super) fn scratch_drive() -> (Engine, std::path::PathBuf, DeviceIdentitySecr
 /// and join handle. The backend half stays on the test thread, so a
 /// blocking mutation submit is completed by the loop concurrently.
 pub(super) fn spawn_live_loop<S: ObjectStore + Send + Sync + 'static>(
-    live: LiveDaemon<S>,
+    live: LiveNode<DriveView<S, RuntimeMaterialization>>,
 ) -> (
     Arc<std::sync::atomic::AtomicBool>,
     std::thread::JoinHandle<Result<LiveSummary, LiveError>>,
@@ -115,10 +116,10 @@ where
 /// tests take the composer role `main.rs` plays in production — the
 /// backend is built from the live parts, never handed out by the node.
 pub(super) fn live_backend<S: ObjectStore + Send + Sync + 'static>(
-    daemon: Daemon<S>,
+    daemon: WyrdNode<DriveView<S, RuntimeMaterialization>>,
 ) -> (
-    LiveDaemon<S>,
-    crate::fuse::FuseBackend<S, DaemonMaterialization>,
+    LiveNode<DriveView<S, RuntimeMaterialization>>,
+    crate::fuse::FuseBackend<S, RuntimeMaterialization>,
 )
 where
     S::Error: std::fmt::Debug,

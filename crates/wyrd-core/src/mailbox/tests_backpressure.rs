@@ -1,9 +1,9 @@
+use super::mini_relay::MiniRelay;
 use super::tests_harness::{
     drain_to, keys, live_mailbox, seal_rumor, sender_keys, temp_path, wait_for_delivery,
     DELIVERY_TIMEOUT,
 };
 use super::*;
-use crate::mini_relay::MiniRelay;
 use nostr::event::FinalizeEvent;
 
 use std::time::{Duration, Instant};

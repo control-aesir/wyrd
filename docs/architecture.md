@@ -56,9 +56,10 @@ errno mapping, or process supervision), `wyrd-daemon` (process
 lifecycle, supervision, services, platform providers), and `wyrd-cli`
 (thin parsing over the node API). `wyrd-daemon` depends on `wyrd-core`,
 never the reverse; CLI and providers consume public surfaces only. The
-DAG is machine-enforced by contract 34 (`layer_contracts.rs`) before
-any code moves, so each extraction phase lands against an invariant
-rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
+DAG is machine-enforced by contract 34 (`layer_contracts.rs`) for the
+members present today, with the `wyrd-core`/`wyrd-cli` clauses
+activating when those crates join the workspace — each extraction
+phase lands against an invariant rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
 to the mailbox subsystem by the same contract: control-plane framing
 lives with sync control, never ambient across the node.
 

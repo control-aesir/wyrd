@@ -118,7 +118,7 @@ pub(super) fn live_backend<S: ObjectStore + Send + Sync + 'static>(
     daemon: Daemon<S>,
 ) -> (
     LiveDaemon<S>,
-    crate::fuse::FuseBackend<S, DaemonMaterialization>,
+    crate::fuse::FuseBackend<S, RuntimeMaterialization>,
 )
 where
     S::Error: std::fmt::Debug,

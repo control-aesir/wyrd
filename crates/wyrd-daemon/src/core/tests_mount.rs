@@ -19,7 +19,7 @@ fn mount_roundtrip_and_write_coherence() {
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
-    let names = |backend: &FuseBackend<MemoryObjectStore, DaemonMaterialization>, fh: u64| {
+    let names = |backend: &FuseBackend<MemoryObjectStore, RuntimeMaterialization>, fh: u64| {
         backend
             .dir_entries(fh)
             .unwrap()

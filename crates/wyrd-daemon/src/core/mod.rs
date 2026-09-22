@@ -22,8 +22,9 @@ mod tests_run_loop;
 mod tests_sync;
 
 pub use crate::budgets::ResourceBudgets;
-pub use daemon::{Daemon, DaemonError, DaemonMaterialization, LiveParts, WriteError};
+pub use daemon::{Daemon, DaemonError, LiveParts, WriteError};
 pub use live::{
     FailureClass, LiveConfig, LiveDaemon, LiveError, LiveSummary, SyncReport,
     MAILBOX_MAX_CONSECUTIVE_ERRORS, STORE_MAX_CONSECUTIVE_ERRORS,
 };
+pub use wyrd_core::view::RuntimeMaterialization;

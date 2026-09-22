@@ -11,8 +11,8 @@
 //! own boundary.
 
 use wyrd_core::projection::Projection;
-use wyrd_core::view::{Head, MaterializationPolicy, NamespaceView};
-use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, Tree};
+use wyrd_core::view::{Head, NamespaceView, RuntimeMaterialization};
+use wyrd_format::{chunk, ContentId, Entry, ObjectStore, Tree};
 use wyrd_fuse::{DriveView, ViewHead};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
@@ -105,26 +105,12 @@ pub enum WriteError<E: std::fmt::Debug> {
     Engine(#[from] wyrd_sync::runtime::EngineError),
 }
 
-/// How the daemon reports fetch status for content the local store
-/// does not hold. Manifest-recorded content the store lacks is
-/// `RemoteOnly`; the fetch state machine wiring (tracked separately)
-/// will refine this into fetch-on-open behavior.
-pub struct DaemonMaterialization {
-    pub(super) runtime: wyrd_sync::runtime::RuntimeState,
-}
-
-impl MaterializationPolicy for DaemonMaterialization {
-    fn status(&self, id: &ContentId) -> FetchStatus {
-        self.runtime.status(id)
-    }
-}
-
 /// One mounted drive: the engine (durable membership, keys, intake) plus
 /// the read view over the shared object store. Every backend reads
 /// through [`Daemon::view`].
 pub struct Daemon<S: ObjectStore> {
     pub(super) engine: Engine,
-    view: DriveView<S, DaemonMaterialization>,
+    view: DriveView<S, RuntimeMaterialization>,
 }
 
 /// Failure while composing the engine with a presentation view.
@@ -137,7 +123,7 @@ pub enum DaemonError {
 /// The shared publication slot every serving backend reads: one
 /// alias for the nested lock shape, so the four holders (loop,
 /// parts, backend construction, observation) name one type.
-pub type SharedProjection<S> = Arc<RwLock<Arc<Projection<DriveView<S, DaemonMaterialization>>>>>;
+pub type SharedProjection<S> = Arc<RwLock<Arc<Projection<DriveView<S, RuntimeMaterialization>>>>>;
 
 /// The live half of a split daemon: everything a presentation
 /// backend needs, with no presentation type in the signatures. The
@@ -167,12 +153,12 @@ where
     /// verified bytes, the view serves them.
     pub fn new(engine: Engine, store: S) -> Result<Self, DaemonError> {
         let runtime = engine.runtime_state()?;
-        let view = DriveView::new(store, DaemonMaterialization { runtime }, Vec::new());
+        let view = DriveView::new(store, RuntimeMaterialization { runtime }, Vec::new());
         Ok(Daemon { engine, view })
     }
 
     /// The read-only drive view backends present.
-    pub fn view(&self) -> &DriveView<S, DaemonMaterialization> {
+    pub fn view(&self) -> &DriveView<S, RuntimeMaterialization> {
         &self.view
     }
 
@@ -189,7 +175,7 @@ where
     /// Refresh materialization facts after intake or fetch execution. Snapshot
     /// heads are supplied separately because announcements do not carry trees.
     pub fn refresh_materialization(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
-        self.view.set_materialization(DaemonMaterialization {
+        self.view.set_materialization(RuntimeMaterialization {
             runtime: self.engine.runtime_state()?,
         });
         Ok(())

@@ -1,3 +1,4 @@
+use wyrd_core::view::RuntimeMaterialization;
 use wyrd_format::{
     chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, StoreError, StoreFailure, Tree,
 };
@@ -22,7 +23,7 @@ use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
-use super::daemon::{verified_heads, view_heads, view_heads_legacy, DaemonMaterialization};
+use super::daemon::{verified_heads, view_heads, view_heads_legacy};
 
 /// Draw a random duration in `[0, bound)`. Entropy comes from the OS
 /// CSPRNG (the approved substrate); a draw failure falls back to zero
@@ -404,7 +405,7 @@ where
         };
         let next = Projection::new(
             Arc::clone(&self.store),
-            DaemonMaterialization {
+            RuntimeMaterialization {
                 runtime: completed_runtime,
             },
             view_heads(heads),
@@ -741,14 +742,14 @@ where
     fn view_for(
         &self,
         heads: &[AuthorizedSnapshot],
-    ) -> Result<DriveView<S, DaemonMaterialization>, MutationError> {
+    ) -> Result<DriveView<S, RuntimeMaterialization>, MutationError> {
         let runtime = self
             .engine
             .runtime_state()
             .map_err(|_| MutationError::Engine)?;
         Ok(DriveView::shared(
             Arc::clone(&self.store),
-            DaemonMaterialization { runtime },
+            RuntimeMaterialization { runtime },
             view_heads_legacy(heads.iter().cloned()),
         ))
     }
@@ -802,7 +803,7 @@ where
             .map_err(|_| MutationError::Engine)?;
         let view = DriveView::shared(
             Arc::clone(&self.store),
-            DaemonMaterialization { runtime },
+            RuntimeMaterialization { runtime },
             view_heads_legacy(heads.iter().cloned()),
         );
         match view.lookup(path) {
@@ -843,7 +844,7 @@ where
     /// closed like every other lock failure on this path.
     pub fn projection(
         &self,
-    ) -> Result<Arc<Projection<DriveView<S, DaemonMaterialization>>>, LiveError> {
+    ) -> Result<Arc<Projection<DriveView<S, RuntimeMaterialization>>>, LiveError> {
         self.projection
             .read()
             .map(|slot| Arc::clone(&slot))

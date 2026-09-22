@@ -17,7 +17,8 @@ pub mod lifecycle;
 pub mod live_mailbox;
 pub mod mutation;
 pub mod projection;
-pub mod session;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::session;
 pub mod want;
 
 /// Test-only minimal relay for live-mailbox integration tests.

@@ -9,3 +9,5 @@
 //! errno mapping (libc), or process supervision. `nostr` use stays
 //! inside the mailbox subsystem. The daemon is one host for the node,
 //! never its definition.
+
+pub mod session;

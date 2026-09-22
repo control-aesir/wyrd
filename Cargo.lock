@@ -5202,6 +5202,7 @@ dependencies = [
  "secp256k1",
  "tokio",
  "toml",
+ "wyrd-core",
  "wyrd-daemon",
  "wyrd-format",
  "wyrd-fuse",
@@ -5215,6 +5216,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "thiserror 2.0.20",
  "wyrd-format",
+ "wyrd-sync",
 ]
 
 [[package]]
@@ -5259,6 +5261,7 @@ name = "wyrd-fuse"
 version = "0.1.0-alpha.1"
 dependencies = [
  "thiserror 2.0.20",
+ "wyrd-core",
  "wyrd-format",
 ]
 

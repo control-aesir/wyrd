@@ -30,6 +30,24 @@ use crate::support::{
 };
 use zeroize::Zeroizing;
 
+/// Compose a serving backend from the node's live parts: contracts
+/// take the composer role production gives `main.rs` — the backend is
+/// built from the parts, never handed out by the node.
+fn serving_backend<S: ObjectStore>(
+    parts: wyrd_daemon::core::LiveParts<S>,
+) -> FuseBackend<S, wyrd_daemon::core::DaemonMaterialization>
+where
+    S::Error: std::fmt::Debug,
+{
+    FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    )
+}
+
 /// One head per verified body; a broken signature never becomes
 /// durable, never classified, and never mounts (architecture.md
 /// invariant 3). Possession alone mounts nothing: with no installed
@@ -220,8 +238,9 @@ fn failed_pass_recovers_serving_on_retry() {
 
     let engine = loaded.rig.take_engine();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) =
+    let (mut live, parts) =
         daemon.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
+    let backend = serving_backend(parts);
     for id in &loaded.content.content_ids {
         live.want(*id).unwrap();
     }
@@ -408,8 +427,9 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
     daemon.refresh_live_heads().unwrap();
-    let (mut live, backend) =
+    let (mut live, parts) =
         daemon.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
+    let backend = serving_backend(parts);
     assert_eq!(live.generation(), 0, "the split publishes baseline zero");
     let handle = backend.open_at("keeper.txt").expect("baseline serves");
     assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
@@ -647,8 +667,9 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
     rig.enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
     let daemon_b = Daemon::new(engine_b, MemoryObjectStore::default()).unwrap();
-    let (mut live_b, backend_b) =
+    let (mut live_b, parts_b) =
         daemon_b.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
+    let backend_b = serving_backend(parts_b);
 
     // The first announcement never leaves the author — and the local
     // write stands: only delivery failed, nothing was rolled back.
@@ -1179,7 +1200,8 @@ fn conflicted_drive_rejects_mounted_writes() {
     assert!(names.contains(&"a.txt".to_string()), "{names:?}");
     assert!(names.contains(&"b.txt".to_string()), "{names:?}");
 
-    let (live, backend) = daemon.into_live(Duration::from_secs(5), &LiveConfig::default());
+    let (live, parts) = daemon.into_live(Duration::from_secs(5), &LiveConfig::default());
+    let backend = serving_backend(parts);
     let stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
     let handle = std::thread::spawn(move || {

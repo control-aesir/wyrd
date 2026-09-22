@@ -12,6 +12,7 @@ use crate::probes::combine_status;
 use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
+use wyrd_daemon::fuse::FuseBackend;
 use wyrd_daemon::{Daemon, FailureClass, LiveConfig, LiveError, Supervisor};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -357,7 +358,16 @@ fn mount(
     // backend share this config's budgets, wired into both halves
     // by `into_live` below.
     let config = LiveConfig::default();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &config);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config);
+    // The composer builds its presentation backend from the node's
+    // live parts; the node itself never names the backend type.
+    let backend = FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity

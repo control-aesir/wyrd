@@ -30,11 +30,15 @@ use crate::want::{wait_for_materialization, WantRegistry};
 /// lock is reference-counted so a live daemon loop can publish the same
 /// projection the session serves: both sides take the lock, swap or
 /// clone, and drop — never held across a kernel callback.
+/// The shared publication slot the backend serves from: one alias so
+/// the field, constructors, and observation name one type.
+type BackendProjection<S, M> = Arc<RwLock<Arc<Projection<DriveView<S, M>>>>>;
+
 pub struct FuseBackend<S: ObjectStore, M: Materialization>
 where
     S::Error: std::fmt::Debug,
 {
-    projection: Arc<RwLock<Arc<Projection<S, M>>>>,
+    projection: BackendProjection<S, M>,
     pub(super) inodes: RwLock<InodeTable>,
     pub(super) directories: RwLock<DirectoryState>,
     pub(super) files: Mutex<OpenFiles>,
@@ -270,7 +274,7 @@ where
     /// rather than copying the view, so new generations land without
     /// remounting. Each backend keeps its own inode tables; construct
     /// once per session.
-    pub fn shared(projection: Arc<RwLock<Arc<Projection<S, M>>>>) -> Self {
+    pub fn shared(projection: BackendProjection<S, M>) -> Self {
         let (uid, gid) = current_owner();
         FuseBackend {
             projection,
@@ -301,7 +305,7 @@ where
     /// cap come from the same [`ResourceBudgets`] the loop paces
     /// admission from, so one struct governs both halves.
     pub fn shared_with_wants(
-        projection: Arc<RwLock<Arc<Projection<S, M>>>>,
+        projection: BackendProjection<S, M>,
         wants: Arc<WantRegistry>,
         mutations: Arc<MutationQueue>,
         open_timeout: Duration,
@@ -446,7 +450,7 @@ where
     /// served lock-free after the guard drops, so callers hold an
     /// immutable snapshot, never the publication slot. Poison maps to
     /// EIO like every other lock failure.
-    fn projection(&self) -> Result<Arc<Projection<S, M>>, fuser::Errno> {
+    fn projection(&self) -> Result<Arc<Projection<DriveView<S, M>>>, fuser::Errno> {
         self.projection
             .read()
             .map_err(|_| fuser::Errno::EIO)

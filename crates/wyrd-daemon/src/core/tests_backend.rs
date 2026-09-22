@@ -3,7 +3,9 @@ use super::*;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
 
-use super::tests_harness::{scratch_drive, NoopMailbox};
+use super::tests_harness::{live_backend, scratch_drive, NoopMailbox};
+
+use crate::fuse::FuseBackend;
 
 use wyrd_format::MemoryObjectStore;
 
@@ -25,7 +27,7 @@ fn into_live_shares_view_with_backend() {
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("live.txt", b"shared").unwrap();
 
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (mut live, backend) = live_backend(daemon);
     assert_eq!(live.generation(), 0, "the split publishes baseline zero");
     // The baseline serves before any pass runs: no empty window.
     let early = backend.open_at("live.txt").expect("baseline serves");
@@ -61,7 +63,7 @@ fn dirty_backlog_republishes_without_new_changes() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("dirty.txt", b"pending").unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (mut live, backend) = live_backend(daemon);
     live.dirty = true;
 
     let report = live
@@ -97,7 +99,16 @@ fn dirty_backlog_republishes_without_new_changes() {
 fn mkdir_through_backend_commits_and_serves() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    // The test takes the composer role: the backend is built from the
+    // node's live parts, never handed out by the node.
+    let backend = FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
@@ -175,7 +186,7 @@ fn into_live_stores_the_composition_config_budgets() {
         },
         ..LiveConfig::default()
     };
-    let (live, backend) = daemon.into_live(Duration::from_secs(30), &config);
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config);
     assert_eq!(
         live.budgets, config.budgets,
         "the loop paces from the composed config, not a silent default"
@@ -183,7 +194,7 @@ fn into_live_stores_the_composition_config_budgets() {
     assert_eq!(live.budgets.max_admit_per_pass, 2);
     assert_eq!(live.budgets.max_open_handles, 7);
     drop(live);
-    drop(backend);
+    drop(parts);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -210,7 +221,16 @@ fn create_at_saturated_table_creates_nothing() {
             ..ResourceBudgets::default()
         },
     };
-    let (live, backend) = daemon.into_live(Duration::from_secs(30), &config);
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config);
+    // The test takes the composer role: the backend is built from the
+    // node's live parts, never handed out by the node.
+    let backend = FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);

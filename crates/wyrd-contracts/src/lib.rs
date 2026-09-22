@@ -99,6 +99,13 @@
 //!     policy fails closed on unknown crates or edges
 //!     (`docs/architecture.md`, crate map).
 //!
+//! The node contracts (provider-neutral boundary):
+//!
+//! 35. `node_composes_and_serves_without_a_presentation_backend` —
+//!     the composed node runs, mutates, and serves with no backend in
+//!     the path, asserting through the `NamespaceView` surface
+//!     (`docs/architecture.md`, layer target).
+//!
 //! The upgrade contracts (`docs/upgrade-contract.md`), one per invariant:
 //!
 //! 23. `upgrade_new_encoding_is_new_representation` — re-stored content
@@ -147,6 +154,8 @@ mod fuse_contracts;
 mod join_contracts;
 #[cfg(test)]
 mod layer_contracts;
+#[cfg(test)]
+mod node_contracts;
 #[cfg(test)]
 mod serving_contracts;
 #[cfg(test)]

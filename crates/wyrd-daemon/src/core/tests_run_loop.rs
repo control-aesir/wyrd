@@ -19,7 +19,7 @@ use wyrd_sync::bulk::MemoryBulkSource;
 fn run_loop_stops_immediately() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let stop = std::sync::atomic::AtomicBool::new(true);
     let mut mailbox = NoopMailbox;
@@ -37,7 +37,7 @@ fn run_loop_stops_immediately() {
     assert_eq!(observed, 0, "no pass means no observation");
 
     drop(live);
-    drop(backend);
+    drop(parts);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -47,8 +47,8 @@ fn run_loop_stops_immediately() {
 fn run_loop_runs_until_stopped() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
-    drop(backend);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    drop(parts);
 
     let stop = std::sync::atomic::AtomicBool::new(false);
     let config = LiveConfig {
@@ -87,8 +87,8 @@ fn run_loop_runs_until_stopped() {
 fn run_loop_aborts_after_mailbox_error_cap() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
-    drop(backend);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    drop(parts);
 
     let stop = std::sync::atomic::AtomicBool::new(false);
     let config = LiveConfig {
@@ -183,8 +183,8 @@ fn await_pending(queue: &std::sync::Arc<crate::mutation::MutationQueue>) {
 fn terminal_loop_error_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
-    drop(backend);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    drop(parts);
     let queue = Arc::clone(&live.mutations);
     let (tx, rx) = std::sync::mpsc::channel();
     let submitter = Arc::clone(&queue);
@@ -229,8 +229,8 @@ fn terminal_loop_error_completes_blocked_submitters() {
 fn clean_stop_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
     let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, backend) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
-    drop(backend);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    drop(parts);
     let queue = Arc::clone(&live.mutations);
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = AtomicBool::new(false);

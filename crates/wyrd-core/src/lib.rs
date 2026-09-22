@@ -12,6 +12,8 @@
 
 pub mod budgets;
 pub mod mutation;
+pub mod projection;
 pub mod session;
+pub mod view;
 pub mod wake;
 pub mod want;

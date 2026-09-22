@@ -22,7 +22,7 @@ use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome
 use crate::projection::Projection;
 use crate::want::WantRegistry;
 
-use super::daemon::{verified_heads, view_heads, DaemonMaterialization};
+use super::daemon::{verified_heads, view_heads, view_heads_legacy, DaemonMaterialization};
 
 /// Draw a random duration in `[0, bound)`. Entropy comes from the OS
 /// CSPRNG (the approved substrate); a draw failure falls back to zero
@@ -238,7 +238,7 @@ pub struct LiveDaemon<S: ObjectStore> {
     /// The published serving generations, shared with the backend.
     /// The loop replaces the whole [`Arc`](std::sync::Arc) on every
     /// publish; it never mutates a published value.
-    pub(super) projection: Arc<RwLock<Arc<Projection<S, DaemonMaterialization>>>>,
+    pub(super) projection: super::daemon::SharedProjection<S>,
     /// FUSE demand: the backend registers wants, the loop admits them
     /// into the engine each pass and lets completion surface through
     /// the view. The registry's lock is its own (never the
@@ -749,7 +749,7 @@ where
         Ok(DriveView::shared(
             Arc::clone(&self.store),
             DaemonMaterialization { runtime },
-            view_heads(heads.iter().cloned()),
+            view_heads_legacy(heads.iter().cloned()),
         ))
     }
 
@@ -803,7 +803,7 @@ where
         let view = DriveView::shared(
             Arc::clone(&self.store),
             DaemonMaterialization { runtime },
-            view_heads(heads.iter().cloned()),
+            view_heads_legacy(heads.iter().cloned()),
         );
         match view.lookup(path) {
             Ok(node) => Ok(Some(node)),
@@ -841,7 +841,9 @@ where
     /// read-side handle for supervisors and tests. Serving backends
     /// hold the same slot through the FUSE adapter. Poison fails
     /// closed like every other lock failure on this path.
-    pub fn projection(&self) -> Result<Arc<Projection<S, DaemonMaterialization>>, LiveError> {
+    pub fn projection(
+        &self,
+    ) -> Result<Arc<Projection<DriveView<S, DaemonMaterialization>>>, LiveError> {
         self.projection
             .read()
             .map(|slot| Arc::clone(&slot))

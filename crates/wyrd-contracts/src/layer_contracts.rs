@@ -451,6 +451,58 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
     }
 }
 
+/// Contract 34 (packaging half): the distribution build compiles the
+/// user-facing binary from `wyrd-cli`. The Phase 4 move broke this
+/// once (the flake built `-p wyrd-daemon`, which installs no binary,
+/// and `wyrd-dist` failed packing `bin/wyrd`), so the source package
+/// is pinned here rather than in review vigilance.
+#[test]
+fn flake_builds_the_binary_from_wyrd_cli() {
+    let text =
+        fs::read_to_string(workspace_root().join("flake.nix")).expect("flake.nix is readable");
+    let args = text
+        .lines()
+        .find(|line| line.contains("cargoExtraArgs"))
+        .expect("flake names the binary source package");
+    assert!(
+        args.contains("-p wyrd-cli"),
+        "distribution must build the binary from wyrd-cli, found: {args}"
+    );
+}
+
+/// Contract 34 (membership half): the workspace member set is exact.
+/// Additions fail closed through the unknown-member policy; removals
+/// would silently narrow every member-wide check, so the list itself
+/// is pinned.
+#[test]
+fn workspace_members_are_exact() {
+    let root_manifest = read_manifest(&workspace_root());
+    let members: Vec<String> = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("workspace members list")
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            "crates/wyrd-format",
+            "crates/wyrd-sync",
+            "crates/wyrd-fuse",
+            "crates/wyrd-core",
+            "crates/wyrd-daemon",
+            "crates/wyrd-cli",
+            "crates/wyrd-contracts",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>(),
+        "workspace membership drifted: add or remove the member deliberately here"
+    );
+}
+
 /// Contract 34: workspace dependency edges point downward along the
 /// declared layering, and the policy fails closed on unknown crates,
 /// edges, and third-party additions. The `wyrd-core`/`wyrd-cli`

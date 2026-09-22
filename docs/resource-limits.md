@@ -6,7 +6,7 @@ protocol ingest ceilings (`Limits::V0`, bounding every committed
 object) are not in scope here — they bound committed data, while this
 doc bounds the live process holding and moving it.
 
-All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-daemon/src/budgets.rs),
+All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-core/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the
 backend at composition time. Defaults are the historical hardcoded
 bounds — with two intentional new ones: the per-pass admission cap
@@ -108,4 +108,4 @@ consumed-and-dropped, because the live stream has no cursor and a
 dropped event would wait for a resubscribe that may never come. The
 bounded seen-id log (65,536 acks) and poison cache (4096 entries)
 bound the durable and in-memory dedupe state. Proven by the
-`live_mailbox::tests_backpressure` suite.
+`mailbox::tests_backpressure` suite.

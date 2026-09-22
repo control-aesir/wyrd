@@ -32,7 +32,7 @@ engine, driven by the daemon loop.
         materialization fact → DriveView publish
                                 ▲
                                 │
-FUSE open/read ── WantRegistry ─► LiveDaemon loop ─► engine plan
+FUSE open/read ── WantRegistry ─► LiveNode loop ─► engine plan
       (waiter)     (wakeup channel)
 ```
 
@@ -104,10 +104,10 @@ The iroh-blobs serving `Router` lives in `wyrd-sync`'s transport layer
 (`serving::ServingEndpoint`), beside its client half
 (`bulk::IrohBulkSource`): both halves are the same iroh transport seam,
 and co-locating them keeps a single implementation of endpoint, store,
-and address handling that the contract suite exercises. The composition
-layer (`wyrd-daemon`) owns that endpoint's lifecycle — `Daemon::open_serving`
-creates it and the live loop drives it — so a different composer can
-choose lifecycle without reimplementing transport. The engine itself
+and address handling that the contract suite exercises. The node
+creates the endpoint (`WyrdNode::open_serving` in `wyrd-core`) and the
+live loop drives it; the composer owns its lifecycle, so a different
+composer can choose lifecycle without reimplementing transport. The engine itself
 never learns iroh exists: route interpretation consumes the engine's
 plain-data `RuntimeState` in the transport layer
 (`transport::publish_recorded_routes`), and no engine API names an iroh

@@ -43,15 +43,15 @@ arbitrary subsets of that drive locally.
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
 async, or FUSE dependency. `wyrd-fuse` must never know that iroh exists — the
-daemon composes sync and fuse. `wyrd-daemon` is that composer: its core is
-presentation-agnostic (mobile platforms cannot use FUSE, so the platform
-surface is a pluggable backend over the same view); the FUSE adapter is the
-first backend, not a property of the core.
+daemon composes sync and fuse. `wyrd-daemon` is that composer: the node in
+`wyrd-core` is presentation-agnostic (mobile platforms cannot use FUSE, so the
+platform surface is a pluggable backend over the same view); the FUSE adapter
+is the first backend, not a property of the node.
 
-## Layer target (node extraction in progress)
+## Layer target (node extraction complete)
 
-The daemon conflates "the Wyrd local node" with "the process that runs
-the node", so it splits along the dependency direction it already has:
+The daemon conflated "the Wyrd local node" with "the process that runs
+the node", so it split along the dependency direction it already had:
 `wyrd-core` (the embeddable node: namespace, snapshots, mutations,
 materialization, sync control — never FUSE, argument parsing, POSIX
 errno mapping, or process supervision), `wyrd-daemon` (composition
@@ -61,7 +61,7 @@ parsing, credential files, mount orchestration, diagnostics, exit
 codes over the daemon's public surface). `wyrd-daemon` depends on
 `wyrd-core`, never the reverse; CLI and providers consume public
 surfaces only. The DAG is machine-enforced by contract 34
-(`layer_contracts.rs`) for every member — each extraction phase lands
+(`layer_contracts.rs`) for every member — each extraction phase landed
 against an invariant rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
 to the mailbox subsystem by the same contract: control-plane framing
 lives with sync control, never ambient across the node.

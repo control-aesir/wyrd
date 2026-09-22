@@ -10,11 +10,14 @@
 //! [`ViewError::NotMaterialized`](crate::view::ViewError::NotMaterialized)
 //! content fails the export closed instead of fetching.
 //!
-//! Failure is atomic: the walk lands in a uniquely named staging
-//! sibling and renames it into place only after the whole tree
-//! succeeds, so a failed export leaves no partial tree behind —
+//! Failure is atomic: the walk lands in a deterministically named
+//! staging sibling and renames it into place only after the whole
+//! tree succeeds, so a failed export leaves no partial tree behind —
 //! neither a retry-blocking `DestinationNotEmpty` nor a tree that
-//! looks complete but silently dropped files.
+//! looks complete but silently dropped files. Determinism (not a
+//! unique suffix) is what lets the next export find and clear a
+//! crashed run's leftovers; atomic claiming is what keeps concurrent
+//! same-destination exports from sharing staging.
 //!
 //! Symlinks pass the same confinement policy as the mount
 //! ([`confine_symlink_target`](crate::view::confine_symlink_target)):
@@ -88,11 +91,18 @@ pub enum ExportError {
 /// landed. `dest` must not exist or must be empty — export never
 /// merges into a populated tree.
 ///
-/// The walk lands in a staging sibling and renames it into place on
-/// success; a failed export removes the staging directory, so `dest`
-/// is either the complete tree or untouched. Remote-only content
-/// fails the whole export: a partial tree that silently drops files
-/// is worse than no tree.
+/// The walk lands in `<dest>.wyrd-export-staging`, claimed atomically
+/// (see [`claim_staging`]), and renames it into place on success. A
+/// failed export removes the staging directory, so `dest` is either
+/// the complete tree or untouched — every error after the claim,
+/// from the root lookup to the final rename, funnels through the one
+/// cleanup below. Remote-only content fails the whole export: a
+/// partial tree that silently drops files is worse than no tree.
+///
+/// Same-destination concurrent exports are not supported: the atomic
+/// claim means at most one proceeds, and any export whose staging is
+/// pulled out from under it fails closed with I/O errors — loudly,
+/// never as a partial `dest`.
 pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportReport, ExportError> {
     if dest.exists() {
         let empty = dest
@@ -107,34 +117,9 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
             return Err(ExportError::DestinationNotEmpty(dest.to_path_buf()));
         }
     }
-    let staging = staging_sibling(dest);
-    if staging.exists() {
-        // A previous run's staging can only remain after a crash
-        // between the walk and the cleanup (or a concurrent export,
-        // which this unique naming already excludes): never resume
-        // into it, never merge — remove and start clean.
-        fs::remove_dir_all(&staging).map_err(|source| ExportError::Io {
-            path: staging.clone(),
-            source,
-        })?;
-    }
-    fs::create_dir_all(&staging).map_err(|source| ExportError::Io {
-        path: staging.clone(),
-        source,
-    })?;
-    let root = view.lookup("").map_err(|source| ExportError::View {
-        path: String::new(),
-        source,
-    })?;
-    let mut report = ExportReport::default();
-    match export_node(view, &root, "", &staging, 0, &mut report) {
-        Ok(()) => {
-            fs::rename(&staging, dest).map_err(|source| ExportError::Io {
-                path: dest.to_path_buf(),
-                source,
-            })?;
-            Ok(report)
-        }
+    let staging = claim_staging(dest)?;
+    match run_export(view, &staging, dest) {
+        Ok(report) => Ok(report),
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
             Err(error)
@@ -142,22 +127,74 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
     }
 }
 
-/// A uniquely named staging sibling for one export invocation: the
-/// final name plus a pid-and-time suffix, so concurrent exports never
-/// share staging and a crashed run's leftovers are recognizable.
-fn staging_sibling(dest: &Path) -> PathBuf {
+/// The fallible export body: root lookup, walk, and publish. Every
+/// error here returns through the caller's cleanup, so staging never
+/// survives a failed export — including a failed root lookup (before
+/// anything is written) and a failed final rename (after a complete
+/// walk), which would otherwise strand a whole plaintext tree behind
+/// a reported failure.
+fn run_export<V: NamespaceView>(
+    view: &V,
+    staging: &Path,
+    dest: &Path,
+) -> Result<ExportReport, ExportError> {
+    let root = view.lookup("").map_err(|source| ExportError::View {
+        path: String::new(),
+        source,
+    })?;
+    let mut report = ExportReport::default();
+    export_node(view, &root, "", staging, 0, &mut report)?;
+    fs::rename(staging, dest).map_err(|source| ExportError::Io {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    Ok(report)
+}
+
+/// Claim the staging directory for one export invocation: a
+/// deterministic sibling of `dest`, created atomically. Determinism
+/// is what makes crashed-run leftovers discoverable — a unique
+/// suffix per run could never find them — and atomic `create_dir`
+/// (never exists-check-then-create) is what makes the claim a
+/// reservation: exactly one same-destination export owns staging.
+///
+/// A colliding claim means a concurrent export or a crashed
+/// predecessor. The other party is either already gone (crash) or
+/// fails closed when its staging disappears mid-walk (concurrent) —
+/// both loud, neither corrupting `dest` — so clear once and retry
+/// once; a second collision is pathological and surfaces as I/O.
+fn claim_staging(dest: &Path) -> Result<PathBuf, ExportError> {
     let stem = dest
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("export");
-    dest.with_file_name(format!(
-        "{stem}.wyrd-export-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|time| time.as_nanos())
-            .unwrap_or(0)
-    ))
+    let staging = dest.with_file_name(format!("{stem}.wyrd-export-staging"));
+    if let Some(parent) = staging.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|source| ExportError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+    }
+    match fs::create_dir(&staging) {
+        Ok(()) => Ok(staging),
+        Err(collision) if collision.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_dir_all(&staging).map_err(|source| ExportError::Io {
+                path: staging.clone(),
+                source,
+            })?;
+            fs::create_dir(&staging).map_err(|source| ExportError::Io {
+                path: staging.clone(),
+                source,
+            })?;
+            Ok(staging)
+        }
+        Err(source) => Err(ExportError::Io {
+            path: staging,
+            source,
+        }),
+    }
 }
 
 /// One read window per view round trip: small enough to bound memory
@@ -378,6 +415,9 @@ mod tests {
         arena: Vec<Vec<u8>>,
         dirs: Vec<Vec<(String, FakeNode)>>,
         missing: Vec<ContentId>,
+        /// When set, the root lookup fails: the export must clean up
+        /// staging it already claimed and report the view error.
+        fail_root: bool,
     }
 
     #[derive(Clone)]
@@ -529,6 +569,9 @@ mod tests {
         fn lookup(&self, path: &str) -> Result<Node, ViewError> {
             let key = path.trim_start_matches('/');
             if key.is_empty() {
+                if self.fail_root {
+                    return Err(ViewError::InvalidPath);
+                }
                 return Ok(Node::Dir {
                     subtree: Self::dir_id(self.root),
                 });
@@ -807,6 +850,63 @@ mod tests {
                 "staging leftover: {name}"
             );
         }
+    }
+
+    #[test]
+    fn failed_root_lookup_leaves_no_staging() {
+        let (mut view, _) = drive();
+        view.fail_root = true;
+        let dest = tmp();
+        let out = dest.join("out");
+
+        let error = export_tree(&view, &out).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ExportError::View {
+                    source: ViewError::InvalidPath,
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        // Staging was claimed before the lookup ran: nothing was
+        // written into it, and the single cleanup scope removed it.
+        assert!(!out.exists(), "the destination is absent, not partial");
+        assert_no_staging(&out);
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn crashed_run_leftovers_are_cleared_by_the_next_export() {
+        let (view, expected) = drive();
+        let dest = tmp();
+        let out = dest.join("out");
+        // A crashed predecessor's staging: same deterministic name
+        // the next export claims, holding junk that must never merge.
+        let staging = out.with_file_name("out.wyrd-export-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("junk.txt"), b"stale").unwrap();
+
+        let report = export_tree(&view, &out).unwrap();
+
+        assert_eq!(report.files, 6);
+        assert!(!staging.exists(), "staging renamed into place");
+        for (rel, bytes) in &expected {
+            assert_eq!(
+                &std::fs::read(out.join(rel)).unwrap(),
+                bytes,
+                "mismatch at {rel}"
+            );
+        }
+        assert!(
+            out.read_dir()
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() != "junk.txt"),
+            "the crashed run's junk never merges"
+        );
+        std::fs::remove_dir_all(dest).unwrap();
     }
 
     #[test]

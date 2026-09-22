@@ -65,9 +65,12 @@ any format break.
   and root-escaping targets are refused, so the plain copy stays
   self-contained.
 - `<out_dir>` must not exist or must be empty; export never merges
-  into a populated tree. The walk lands in a staging sibling and
-  renames it into place only after the whole tree succeeds, so a
-  failed export leaves no partial tree behind.
+  into a populated tree. The walk lands in `<out_dir>.wyrd-export-staging`,
+  claimed atomically and renamed into place only after the whole tree
+  succeeds, so a failed export leaves no partial tree behind — and a
+  crashed run's staging is cleared by the next export. Concurrent
+  exports to the same destination are not supported: at most one
+  proceeds, the other fails closed.
 
 ## Credential files
 

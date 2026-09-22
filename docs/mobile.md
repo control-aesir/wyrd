@@ -143,8 +143,8 @@ Platform-independent crate (extracted; see the status note above).
 Responsibilities:
 
 * daemon composition;
-* `WyrdNode` (planned here as `Daemon`);
-* `LiveNode` (planned here as `LiveDaemon`);
+* `WyrdNode`;
+* `LiveNode`/`LiveParts`;
 * `NamespaceView` trait (`DriveView` stayed in `wyrd-fuse` as its first implementation);
 * projection state;
 * projection generations;
@@ -903,9 +903,9 @@ This extraction builds on the tracked composition seam — `refactor(daemon): ma
 * Move `Daemon` and `LiveDaemon` into the new crate. ✅ done as `WyrdNode` and `LiveNode`.
 * Move `DriveView` into the new crate if it does not already live at an appropriate platform-independent boundary. ✅ resolved the other way: `DriveView` stayed in `wyrd-fuse`; providers program against the `NamespaceView` trait.
 * Move writable-handle and mutation-queue infrastructure into the core as the write path lands. ✅ done.
-* Ensure the core has no FUSE or Unix-specific dependencies.
-* Retain `wyrd-daemon` as the desktop composition layer.
-* Keep FUSE behavior unchanged during the extraction.
+* Ensure the core has no FUSE or Unix-specific dependencies. ✅ done (contract 34's `wyrd-core` clause forbids fuser, clap, and libc).
+* Retain `wyrd-daemon` as the desktop composition layer. ✅ done (library; the binary lives in `wyrd-cli`).
+* Keep FUSE behavior unchanged during the extraction. ✅ done (workspace suite green at every phase).
 
 ### Exit condition
 

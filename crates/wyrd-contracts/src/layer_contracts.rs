@@ -454,30 +454,42 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
 /// Contract 34 (packaging half): the distribution build compiles the
 /// user-facing binary from `wyrd-cli`. The Phase 4 move broke this
 /// once (the flake built `-p wyrd-daemon`, which installs no binary,
-/// and `wyrd-dist` failed packing `bin/wyrd`), so the source package
-/// is pinned here rather than in review vigilance.
+/// and `wyrd-dist` failed packing `bin/wyrd`), so it is asserted, not
+/// remembered. A structural guard over the flake text — not a
+/// substitute for a release `nix build` — so it matches every
+/// `cargoExtraArgs` line rather than trusting line layout, and fails
+/// closed if the flag ever names another package.
 #[test]
 fn flake_builds_the_binary_from_wyrd_cli() {
     let text =
         fs::read_to_string(workspace_root().join("flake.nix")).expect("flake.nix is readable");
-    let args = text
+    let args: Vec<&str> = text
         .lines()
-        .find(|line| line.contains("cargoExtraArgs"))
-        .expect("flake names the binary source package");
+        .filter(|line| line.contains("cargoExtraArgs"))
+        .collect();
     assert!(
-        args.contains("-p wyrd-cli"),
-        "distribution must build the binary from wyrd-cli, found: {args}"
+        !args.is_empty(),
+        "flake names no binary source package at all"
+    );
+    assert!(
+        args.iter().any(|line| line.contains("-p wyrd-cli")),
+        "distribution must build the binary from wyrd-cli, found: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|line| line.contains("-p wyrd-daemon")),
+        "distribution must not build the binary from the library-only daemon: {args:?}"
     );
 }
 
 /// Contract 34 (membership half): the workspace member set is exact.
 /// Additions fail closed through the unknown-member policy; removals
-/// would silently narrow every member-wide check, so the list itself
-/// is pinned.
+/// would silently narrow every member-wide check, so the set itself
+/// is pinned. Order is not an invariant (Cargo ignores it), so the
+/// comparison is order-insensitive and a reorder never fails this.
 #[test]
 fn workspace_members_are_exact() {
     let root_manifest = read_manifest(&workspace_root());
-    let members: Vec<String> = root_manifest
+    let mut members: Vec<String> = root_manifest
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(|m| m.as_array())
@@ -485,20 +497,22 @@ fn workspace_members_are_exact() {
         .iter()
         .filter_map(|m| m.as_str().map(str::to_owned))
         .collect();
+    members.sort();
+    let mut expected = [
+        "crates/wyrd-format",
+        "crates/wyrd-sync",
+        "crates/wyrd-fuse",
+        "crates/wyrd-core",
+        "crates/wyrd-daemon",
+        "crates/wyrd-cli",
+        "crates/wyrd-contracts",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    expected.sort();
     assert_eq!(
-        members,
-        [
-            "crates/wyrd-format",
-            "crates/wyrd-sync",
-            "crates/wyrd-fuse",
-            "crates/wyrd-core",
-            "crates/wyrd-daemon",
-            "crates/wyrd-cli",
-            "crates/wyrd-contracts",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>(),
+        members, expected,
         "workspace membership drifted: add or remove the member deliberately here"
     );
 }

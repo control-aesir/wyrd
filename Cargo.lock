@@ -5215,6 +5215,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "thiserror 2.0.20",
  "wyrd-format",
+ "wyrd-sync",
 ]
 
 [[package]]
@@ -5259,6 +5260,7 @@ name = "wyrd-fuse"
 version = "0.1.0-alpha.1"
 dependencies = [
  "thiserror 2.0.20",
+ "wyrd-core",
  "wyrd-format",
 ]
 

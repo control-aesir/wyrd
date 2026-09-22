@@ -244,10 +244,7 @@ where
     /// nodes fail; symlinks resolve at the FUSE boundary, never here.
     pub fn open(&self, node: &Node) -> Result<OpenFile, ViewError> {
         match node {
-            Node::File { size, chunks, .. } => Ok(OpenFile {
-                chunks: chunks.clone(),
-                size: *size,
-            }),
+            Node::File { size, chunks, .. } => Ok(OpenFile::new(chunks.clone(), *size)),
             Node::Conflict { .. } => Err(ViewError::Conflict),
             Node::Dir { .. } | Node::MergedDir { .. } | Node::Symlink { .. } => {
                 Err(ViewError::NotAFile)
@@ -272,15 +269,15 @@ where
         // Never serve past the declared size, whatever the chunks carry.
         let end = offset
             .saturating_add(u64::try_from(len).map_err(|_| ViewError::Corrupt)?)
-            .min(file.size);
+            .min(file.size());
         // A read reaching the declared end inherits the full-file
         // validation duty (its walk is whole-file anyway); interior
         // reads stop once their window is served.
-        let must_validate = end == file.size;
+        let must_validate = end == file.size();
         let mut out = Vec::with_capacity(end.saturating_sub(offset) as usize);
         let mut consumed: u64 = 0;
         let mut exhausted = true;
-        for chunk in &file.chunks {
+        for chunk in file.chunks() {
             let bytes = self.load_chunk(chunk)?;
             let chunk_len = u64::try_from(bytes.len()).map_err(|_| ViewError::Corrupt)?;
             let chunk_end = consumed.saturating_add(chunk_len);
@@ -301,7 +298,7 @@ where
         // lying size, a trailing reference past it, or a zero-size
         // declaration with chunks is corrupt. Chunks exhausted before
         // serving the requested window are short content: also corrupt.
-        if exhausted && consumed != file.size {
+        if exhausted && consumed != file.size() {
             return Err(ViewError::Corrupt);
         }
         if out.len() != end.saturating_sub(offset) as usize {

@@ -1,118 +1,19 @@
-use thiserror::Error;
-use wyrd_format::{ContentId, FetchStatus, StoreFailure};
+//! Namespace value types live in `wyrd-core` (the provider-neutral
+//! namespace model) and are re-exported here so existing view and
+//! backend code keeps its paths. What stays in this module is the
+//! kernel-boundary policy: untrusted symlink targets served to the
+//! kernel via `readlink`.
 
-pub trait Materialization {
-    fn status(&self, id: &ContentId) -> FetchStatus;
-}
-
-/// What `lookup` resolves a path to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Node {
-    File {
-        size: u64,
-        executable: bool,
-        chunks: Vec<ContentId>,
-    },
-    Dir {
-        subtree: ContentId,
-    },
-    Symlink {
-        target: String,
-    },
-    /// Every head resolves this path to a directory, but the directory
-    /// contents differ: a DAG conflict that is not a path conflict. The
-    /// path itself serves as one directory — `readdir` lists the union
-    /// of children, each resolved across the per-head subtrees, so a
-    /// child that agrees everywhere serves normally.
-    MergedDir {
-        subtrees: Vec<(wyrd_format::SnapshotId, ContentId)>,
-    },
-    /// The heads disagree at this path. Versions list only the heads
-    /// where the path resolves; absence elsewhere is part of the
-    /// divergence, not a separate version. The conflict itself is not
-    /// readable: version-qualified lookup paths (`foo@N`, counted in
-    /// SnapshotId byte order) address the versions, and nothing
-    /// synthetic is ever listed by `readdir`.
-    Conflict {
-        versions: Vec<ConflictVersion>,
-    },
-}
-
-/// One head's resolution of a conflicted path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConflictVersion {
-    pub snapshot: wyrd_format::SnapshotId,
-    pub node: Node,
-}
-
-/// File attributes for `stat`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Attr {
-    pub kind: Kind,
-    pub size: u64,
-    pub executable: bool,
-}
-
-/// Node kinds, including conflicted paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    File,
-    Dir,
-    Symlink,
-    Conflict,
-}
-
-/// One directory entry from `readdir`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirEntry {
-    pub name: String,
-    pub node: Node,
-}
-
-/// An opened file: the chunk list plus the declared size reads verify
-/// against.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenFile {
-    pub(crate) chunks: Vec<ContentId>,
-    pub(crate) size: u64,
-}
-
-/// Read-only failures. Store failures carry the resource
-/// classification plus the debug string: a full or unwritable disk
-/// reads differently from a torn data path, so the classification
-/// travels with the error instead of being re-derived from text.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ViewError {
-    #[error("no such path")]
-    NotFound,
-    #[error("invalid path")]
-    InvalidPath,
-    #[error("not a directory")]
-    NotADirectory,
-    #[error("not a file")]
-    NotAFile,
-    #[error(
-        "path is conflicted across heads; read a version via `path@N` or resolve before reading"
-    )]
-    Conflict,
-    #[error("content is remote-only; the daemon would block and fetch")]
-    /// Content the serving policy wants but this device does not hold.
-    /// The missing identity rides the error so a demand-driven backend
-    /// can register exactly that want and retry.
-    NotMaterialized { content: ContentId },
-    #[error("content unavailable: no peer reachable and nothing cached")]
-    Unavailable,
-    #[error("content failed verification; scrub and repair before surfacing")]
-    Corrupt,
-    #[error("local store failure: {1}")]
-    Store(StoreFailure, String),
-}
+pub use wyrd_core::view::{
+    Attr, ConflictVersion, DirEntry, Kind, MaterializationPolicy as Materialization, Node,
+    OpenFile, ViewError,
+};
 
 /// Why a symlink target cannot be served to the kernel. Targets are
 /// member-authored and untrusted; the kernel resolves whatever
 /// `readlink` returns in the host mount namespace, so an absolute or
 /// root-escaping target would break the mount boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfinementError {
     #[error("symlink target is absolute; absolute targets resolve in the host namespace")]
     Absolute,

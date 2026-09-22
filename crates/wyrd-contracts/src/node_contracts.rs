@@ -18,12 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
+use wyrd_core::live::LiveConfig;
 use wyrd_core::mutation::{MutationKind, MutationOutcome};
+use wyrd_core::node::WyrdNode;
 use wyrd_core::view::{
     Attr, DirEntry, Head, NamespaceView, Node, OpenFile, RuntimeMaterialization, ViewError,
     ViewLockError,
 };
-use wyrd_daemon::core::{LiveConfig, WyrdNode};
 use wyrd_format::{ContentId, FetchStatus, MemoryObjectStore, ObjectStore};
 use wyrd_fuse::{DriveView, ViewHead};
 use wyrd_sync::bulk::MemoryBulkSource;

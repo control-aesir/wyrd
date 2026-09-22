@@ -52,7 +52,7 @@
 //! [`DurableStore`]: crate::durable::DurableStore
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use wyrd_format::{
@@ -74,6 +74,7 @@ use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
+pub use super::bootstrap::PairingRequest;
 
 /// Engine failures: durable-commit, runtime-record, and mailbox-
 /// settlement trouble are fatal. Per-envelope mailbox, decode, and
@@ -153,6 +154,10 @@ pub enum EngineError {
     MalformedKeystore,
     #[error("the supplied identity is not this drive's owner")]
     OwnerMismatch,
+    #[error("the supplied identity does not match this drive's member custody record")]
+    DeviceMismatch,
+    #[error("no staged pairing secret in this directory: run pairing-request first")]
+    MissingPairingSecret,
     #[error("bootstrap invitation failed to open: {0}")]
     Invitation(#[from] crate::control::ControlError),
     #[error("bootstrap invitation and its capability disagree on the recipient")]
@@ -608,6 +613,31 @@ impl Engine {
         sealed: &crate::control::SealedBootstrap,
     ) -> Result<Engine, EngineError> {
         super::bootstrap::accept_invitation(dir, passphrase, identity, encryption, sealed)
+    }
+
+    /// Stage (or reuse) this device's pairing secret and return the
+    /// public pairing material for the owner. See
+    /// [`super::bootstrap::pairing_request`]: re-running returns the
+    /// same key, never a fresh one.
+    pub fn pairing_request(
+        dir: &Path,
+        passphrase: &str,
+        identity: &DeviceIdentitySecret,
+    ) -> Result<PairingRequest, EngineError> {
+        super::bootstrap::pairing_request(dir, passphrase, identity)
+    }
+
+    /// Join a drive from the staged pairing secret plus the owner's
+    /// sealed invitation: member custody persists before the accept
+    /// commits, so the joined device reopens afterwards. See
+    /// [`super::bootstrap::join`] for the ordering and refusal rules.
+    pub fn join(
+        dir: PathBuf,
+        passphrase: &str,
+        identity: DeviceIdentitySecret,
+        sealed: &crate::control::SealedBootstrap,
+    ) -> Result<Engine, EngineError> {
+        super::bootstrap::join(dir, passphrase, identity, sealed)
     }
 
     /// Admit a device to the drive: author, sign, and commit the

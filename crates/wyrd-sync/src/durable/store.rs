@@ -76,7 +76,7 @@ pub(crate) fn commit_name(seq: u64) -> String {
     format!("{seq:016x}.commit")
 }
 
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 

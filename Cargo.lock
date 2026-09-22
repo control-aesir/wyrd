@@ -5210,6 +5210,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-core"
+version = "0.1.0-alpha.1"
+
+[[package]]
 name = "wyrd-daemon"
 version = "0.1.0-alpha.1"
 dependencies = [

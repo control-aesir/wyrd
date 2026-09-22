@@ -4,6 +4,7 @@ members = [
     "crates/wyrd-format",
     "crates/wyrd-sync",
     "crates/wyrd-fuse",
+    "crates/wyrd-core",
     "crates/wyrd-daemon",
     "crates/wyrd-contracts",
 ]
@@ -36,6 +37,7 @@ fuser = { path = "vendor/fuser" }
 wyrd-format = { path = "crates/wyrd-format" }
 wyrd-sync = { path = "crates/wyrd-sync" }
 wyrd-fuse = { path = "crates/wyrd-fuse" }
+wyrd-core = { path = "crates/wyrd-core" }
 
 # content hashing
 blake3 = "1.8"

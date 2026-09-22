@@ -106,6 +106,11 @@
 //!     the path, asserting through the `NamespaceView` surface
 //!     (`docs/architecture.md`, layer target).
 //!
+//! 36. `node_serves_over_a_view_defined_outside_the_fuse_crate` —
+//!     the loop, parts, and projection compose over an out-of-crate
+//!     `NamespaceView` implementation, so the node never names one
+//!     presentation's view type (`docs/architecture.md`, layer target).
+//!
 //! The upgrade contracts (`docs/upgrade-contract.md`), one per invariant:
 //!
 //! 23. `upgrade_new_encoding_is_new_representation` — re-stored content

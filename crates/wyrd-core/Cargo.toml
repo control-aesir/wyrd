@@ -6,6 +6,7 @@ license.workspace = true
 description = "Wyrd's embeddable local node: namespace, snapshots, mutations, materialization, and sync control over wyrd-sync. No presentation, no argument parsing, no process supervision."
 
 [dependencies]
+wyrd-format.workspace = true
 thiserror.workspace = true
 
 [lints]

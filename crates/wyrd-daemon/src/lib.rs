@@ -19,7 +19,8 @@ pub mod mutation;
 pub mod projection;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
 pub use wyrd_core::session;
-pub mod want;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::want;
 
 /// Test-only minimal relay for live-mailbox integration tests.
 #[cfg(test)]

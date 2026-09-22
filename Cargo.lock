@@ -2681,7 +2681,6 @@ version = "0.45.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38ca5c25a6df8d4d78fdf39b42792438f6ce22b4809ccbfdb27582ed9ca45407"
 dependencies = [
- "aes",
  "base64",
  "bech32",
  "bip39",
@@ -2699,21 +2698,6 @@ dependencies = [
  "universal-time",
  "url",
  "zeroize",
-]
-
-[[package]]
-name = "nostr-connect"
-version = "0.45.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dcb124b932705c146e3e7e61d1b4d2c63720434422ed191a550228d04149555"
-dependencies = [
- "async-utility",
- "futures-core",
- "nostr",
- "nostr-sdk",
- "opaquerr",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5193,6 +5177,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-cli"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "clap",
+ "fuser",
+ "hex",
+ "libc",
+ "nostr",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "wyrd-core",
+ "wyrd-daemon",
+ "wyrd-format",
+ "wyrd-fuse",
+ "wyrd-sync",
+ "zeroize",
+]
+
+[[package]]
 name = "wyrd-contracts"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -5230,27 +5235,14 @@ dependencies = [
 name = "wyrd-daemon"
 version = "0.1.0-alpha.1"
 dependencies = [
- "clap",
  "fuser",
- "futures-util",
- "getrandom 0.2.17",
- "hex",
  "libc",
- "nostr",
- "nostr-connect",
- "nostr-sdk",
- "serde_json",
  "thiserror 2.0.20",
- "tokio",
- "tokio-tungstenite",
  "tracing",
- "tracing-log",
- "tracing-subscriber",
  "wyrd-core",
  "wyrd-format",
  "wyrd-fuse",
  "wyrd-sync",
- "zeroize",
 ]
 
 [[package]]

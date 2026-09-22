@@ -6,6 +6,7 @@ members = [
     "crates/wyrd-fuse",
     "crates/wyrd-core",
     "crates/wyrd-daemon",
+    "crates/wyrd-cli",
     "crates/wyrd-contracts",
 ]
 
@@ -38,6 +39,7 @@ wyrd-format = { path = "crates/wyrd-format" }
 wyrd-sync = { path = "crates/wyrd-sync" }
 wyrd-fuse = { path = "crates/wyrd-fuse" }
 wyrd-core = { path = "crates/wyrd-core" }
+wyrd-daemon = { path = "crates/wyrd-daemon" }
 
 # content hashing
 blake3 = "1.8"

@@ -118,12 +118,26 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "zeroize",
             ],
         }),
-        // Thin parsing over the node API: may drive core and the
-        // daemon's public host surface, never the view crate or raw
-        // FUSE directly.
+        // The `wyrd` process host: argument parsing, credential
+        // files, mount orchestration, diagnostics, and exit codes over
+        // the daemon's public surface. It mounts through the FUSE
+        // adapter, so the host crates (fuser, libc, tracing) and the
+        // credential/control-plane crates (hex, nostr) are its own —
+        // never the sync transport internals or the contract suite.
         "wyrd-cli" => Some(MemberPolicy {
             workspace_allow: &["wyrd-format", "wyrd-sync", "wyrd-core", "wyrd-daemon"],
-            external_allow: &["clap", "thiserror", "zeroize"],
+            external_allow: &[
+                "clap",
+                "fuser",
+                "hex",
+                "libc",
+                "nostr",
+                "thiserror",
+                "tracing",
+                "tracing-subscriber",
+                "tracing-log",
+                "zeroize",
+            ],
         }),
         // The suite itself: leaf, depends on every crate, and the
         // reverse edge is checked separately below. No third-party

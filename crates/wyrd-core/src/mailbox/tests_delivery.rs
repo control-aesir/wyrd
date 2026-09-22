@@ -328,6 +328,93 @@ fn unacked_and_mid_recovery_mail_survive_stream_recovery() {
     assert_quiet(&mut mailbox);
 }
 
+/// A recovery episode must not stall supervision: with the relay down
+/// the relay-recovery episode spins without converging, yet the
+/// supervisor keeps ticking (its tick count advances and the episode's
+/// attempts stay observable) instead of wedging inside the episode's
+/// unbounded retry loop. Restarting the relay lets the in-flight
+/// episode converge and the mailbox reads live again.
+#[test]
+fn relay_recovery_episode_does_not_stall_the_supervisor() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let receiver = keys();
+    let relays = vec![url];
+
+    let mailbox = live_mailbox(&receiver, &relays, temp_path("seen-supervisor-ticks"));
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+
+    // Kill the relay: after the grace ticks the supervisor starts a
+    // relay-recovery episode that cannot converge while nothing is up.
+    relay.shutdown();
+    let start = Instant::now();
+    loop {
+        if mailbox.health().relay_recovery_attempts >= 1 {
+            break;
+        }
+        assert!(
+            start.elapsed() < OUTAGE_TIMEOUT,
+            "recovery episode starts while the relay is down"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The episode is in flight and cannot converge; the supervisor
+    // must still tick through it.
+    let ticks = mailbox.health().supervisor_ticks;
+    std::thread::sleep(Duration::from_millis(300));
+    let later = mailbox.health();
+    assert!(
+        later.supervisor_ticks > ticks,
+        "supervisor ticks during an in-flight recovery episode"
+    );
+    assert!(
+        later.relay_recovery_attempts >= 1,
+        "in-flight recovery progress stays observable"
+    );
+
+    // The outage clears: the in-flight episode converges on its own
+    // loop and the mailbox reads live again.
+    relay.restart();
+    wait_for_health(&mailbox, true, RECOVERY_TIMEOUT);
+}
+
+/// Shutdown stays bounded while a recovery episode is in flight: the
+/// runtime backstop aborts the episode task instead of waiting out an
+/// outage that never clears.
+#[test]
+fn shutdown_during_recovery_episode_stays_bounded() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let receiver = keys();
+    let relays = vec![url];
+
+    let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-shutdown-episode"));
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+
+    relay.shutdown();
+    let start = Instant::now();
+    loop {
+        if mailbox.health().relay_recovery_attempts >= 1 {
+            break;
+        }
+        assert!(
+            start.elapsed() < OUTAGE_TIMEOUT,
+            "recovery episode starts while the relay is down"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let deadline = Duration::from_secs(5);
+    let shutdown_start = Instant::now();
+    mailbox.shutdown(deadline);
+    assert!(
+        shutdown_start.elapsed() < deadline,
+        "shutdown returns within its deadline, took {:?}",
+        shutdown_start.elapsed()
+    );
+}
+
 /// Degraded, not down: with two relays and one killed, the mailbox
 /// stays live on the survivor and delivery flows — no recovery episode
 /// fires while at least one relay is connected.

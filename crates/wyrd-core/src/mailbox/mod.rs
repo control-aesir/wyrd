@@ -281,6 +281,17 @@ pub struct MailboxHealth {
     /// successfully requested, not confirmed redelivery — a replay whose
     /// history is itself dropped schedules the next one instead.
     pub saturation_recoveries: u64,
+    /// Supervisor tick-loop iterations, lifetime total. The loop ticks
+    /// through in-flight recovery episodes, so this count proves the
+    /// supervisor is still reporting while an episode spins — health
+    /// fields alone read stale-zero through an outage.
+    pub supervisor_ticks: u64,
+    /// `recover_stream` loop iterations, lifetime total: stream-recovery
+    /// progress while the episode is in flight.
+    pub stream_recovery_attempts: u64,
+    /// `recover_relays` loop iterations, lifetime total: relay-recovery
+    /// progress while the episode is in flight.
+    pub relay_recovery_attempts: u64,
 }
 
 impl MailboxHealth {
@@ -305,6 +316,21 @@ struct SupervisorState {
     saturated: AtomicBool,
     /// Saturation replays issued, lifetime total (see `saturated`).
     saturation_recoveries: AtomicU64,
+    /// Supervisor tick-loop iterations, lifetime total (see
+    /// [`MailboxHealth::supervisor_ticks`]).
+    ticks: AtomicU64,
+    /// Stream-recovery loop iterations, lifetime total.
+    stream_recovery_attempts: AtomicU64,
+    /// Relay-recovery loop iterations, lifetime total.
+    relay_recovery_attempts: AtomicU64,
+    /// A stream-recovery episode is in flight. Claimed by the tick loop
+    /// before spawning the episode task, released when the task ends:
+    /// at most one episode per kind runs at a time, and a trigger
+    /// while one is in flight is a no-op (the in-flight loop already
+    /// retries forever).
+    stream_episode: AtomicBool,
+    /// A relay-recovery episode is in flight (see `stream_episode`).
+    relay_episode: AtomicBool,
 }
 
 /// Durable record of consumed gift wraps: one hex event id per line,
@@ -503,6 +529,11 @@ where
             connected_relays: AtomicUsize::new(0),
             saturated: AtomicBool::new(false),
             saturation_recoveries: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            stream_recovery_attempts: AtomicU64::new(0),
+            relay_recovery_attempts: AtomicU64::new(0),
+            stream_episode: AtomicBool::new(false),
+            relay_episode: AtomicBool::new(false),
         });
         // Listen before subscribing: the drainer must be polled past its
         // broadcast subscription before the REQ whose replay it has to
@@ -589,6 +620,9 @@ where
             connected_relays: self.health.connected_relays.load(Ordering::Relaxed),
             total_relays: self.total_relays,
             saturation_recoveries: self.health.saturation_recoveries.load(Ordering::Relaxed),
+            supervisor_ticks: self.health.ticks.load(Ordering::Relaxed),
+            stream_recovery_attempts: self.health.stream_recovery_attempts.load(Ordering::Relaxed),
+            relay_recovery_attempts: self.health.relay_recovery_attempts.load(Ordering::Relaxed),
         }
     }
 
@@ -894,6 +928,17 @@ async fn resubscribe(client: &Client, filter: &Filter, subscription_id: &Subscri
 /// ID per mailbox, CLOSE before REQ, so recovery never accumulates
 /// relay-side subscriptions. Relay replay after any resubscribe
 /// converges through the durable dedupe log.
+///
+/// Recovery episodes run as spawned tasks, never inline: the tick loop
+/// keeps polling health into `SupervisorState` (ticks, attempts) while
+/// an episode spins, so one wedged relay's recovery cannot starve the
+/// supervision of the others, a second failure is reacted to on the next
+/// tick, and shutdown aborts the episode tasks instead of waiting out an
+/// outage. At most one episode per kind is in flight at a time. A
+/// saturation resubscribe can interleave with an episode resubscribe,
+/// but both go CLOSE-before-REQ under the stable subscription ID and any
+/// double replay converges through seen/held dedupe, so no lock
+/// serializes them.
 async fn supervise(
     client: Arc<Client>,
     filter: Filter,
@@ -908,6 +953,10 @@ async fn supervise(
     let mut last_saturation_replay: Option<Instant> = None;
     loop {
         tick.tick().await;
+        // The tick count advances on every loop pass, including passes
+        // that launch or run alongside a recovery episode: it is the
+        // proof the supervisor keeps reporting while an episode spins.
+        health.ticks.fetch_add(1, Ordering::Relaxed);
         refresh(&client, &health).await;
         // Offline mailbox: nothing to re-drive; health is stream-alive
         // alone, and an empty client refuses connect/subscribe.
@@ -933,19 +982,36 @@ async fn supervise(
                 health.saturated.store(true, Ordering::Relaxed);
             }
         }
-        if !health.stream_alive.load(Ordering::Relaxed) {
-            // A poisoned swap fails the tick, not the process: the
-            // stream stays flagged down and recovery retries next tick.
-            let _ = recover_stream(
-                &client,
-                &filter,
-                &incoming,
-                &intake_waker,
-                &health,
-                &subscription_id,
-            )
-            .await;
-            refresh(&client, &health).await;
+        if !health.stream_alive.load(Ordering::Relaxed)
+            && !health.stream_episode.swap(true, Ordering::Relaxed)
+        {
+            // Spawned, never awaited: the tick loop keeps ticking while
+            // the episode spins, and a trigger while one is in flight is
+            // a no-op (the in-flight loop retries forever). A poisoned
+            // channel lock inside the episode fails the task, not the
+            // process: the stream stays flagged down and the next tick
+            // spawns a fresh episode. The trailing refresh publishes the
+            // episode's outcome promptly; the tick loop's own refresh
+            // covers it regardless.
+            let episode_client = Arc::clone(&client);
+            let episode_filter = filter.clone();
+            let episode_incoming = Arc::clone(&incoming);
+            let episode_waker = Arc::clone(&intake_waker);
+            let episode_health = Arc::clone(&health);
+            let episode_subscription = subscription_id.clone();
+            tokio::spawn(async move {
+                let _claim = ClearOnDrop(&episode_health.stream_episode);
+                let _ = recover_stream(
+                    &episode_client,
+                    &episode_filter,
+                    &episode_incoming,
+                    &episode_waker,
+                    &episode_health,
+                    &episode_subscription,
+                )
+                .await;
+                refresh(&episode_client, &episode_health).await;
+            });
             down_ticks = 0;
         }
         if health.connected_relays.load(Ordering::Relaxed) == 0 {
@@ -954,9 +1020,28 @@ async fn supervise(
             down_ticks = 0;
         }
         if down_ticks >= OUTAGE_GRACE_TICKS {
-            recover_relays(&client, &filter, &health, &subscription_id).await;
-            refresh(&client, &health).await;
+            // Grace restarts whether or not an episode spawns: an
+            // in-flight episode keeps retrying, and the next grace window
+            // re-triggers only if it is somehow gone.
             down_ticks = 0;
+            if !health.relay_episode.swap(true, Ordering::Relaxed) {
+                // Spawned, never awaited (see the stream episode above).
+                let episode_client = Arc::clone(&client);
+                let episode_filter = filter.clone();
+                let episode_health = Arc::clone(&health);
+                let episode_subscription = subscription_id.clone();
+                tokio::spawn(async move {
+                    let _claim = ClearOnDrop(&episode_health.relay_episode);
+                    recover_relays(
+                        &episode_client,
+                        &episode_filter,
+                        &episode_health,
+                        &episode_subscription,
+                    )
+                    .await;
+                    refresh(&episode_client, &episode_health).await;
+                });
+            }
         }
     }
 }
@@ -967,8 +1052,22 @@ async fn refresh(client: &Client, health: &SupervisorState) {
         .store(connected_count(client).await, Ordering::Relaxed);
 }
 
+/// Releases a recovery-episode claim when the episode task ends: the
+/// next trigger may spawn a fresh episode. Runs on task abort too (the
+/// future is dropped), though by then the runtime is going away and no
+/// tick loop remains to retrigger.
+struct ClearOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Client-level recovery: the notification stream died, so re-drive the
 /// client and hand the mailbox a fresh channel with a respawned drainer.
+/// Runs as a spawned supervisor episode (see [`supervise`]), never
+/// inline: at most one stream episode is in flight at a time.
 /// The replacement drainer is established (listening) before the
 /// resubscribe whose replay it has to catch — reversing that order drops
 /// relay history into the broadcast void between REQ and listen.
@@ -986,6 +1085,11 @@ async fn recover_stream(
     let receiver = establish_drainer(client, intake_waker, health).await;
     let mut attempt: u32 = 0;
     loop {
+        // Progress stays observable while the episode spins: each loop
+        // pass counts, including the converging one.
+        health
+            .stream_recovery_attempts
+            .fetch_add(1, Ordering::Relaxed);
         client.connect().await;
         if resubscribe(client, filter, subscription_id).await {
             break;
@@ -1009,7 +1113,9 @@ async fn recover_stream(
 /// disconnects, see above) and wait briefly for progress, backing off with
 /// a capped delay between attempts. On success, replace the subscription
 /// under the stable ID to refresh relay-side state; relay replay plus the
-/// durable dedupe log converge the replacement.
+/// durable dedupe log converge the replacement. Runs as a spawned
+/// supervisor episode (see [`supervise`]), never inline: at most one
+/// relay episode is in flight at a time.
 async fn recover_relays(
     client: &Arc<Client>,
     filter: &Filter,
@@ -1018,6 +1124,11 @@ async fn recover_relays(
 ) {
     let mut attempt: u32 = 0;
     loop {
+        // Progress stays observable while the episode spins: each loop
+        // pass counts, including the converging one.
+        health
+            .relay_recovery_attempts
+            .fetch_add(1, Ordering::Relaxed);
         client.connect().and_wait(RECOVERY_ATTEMPT_TIMEOUT).await;
         let connected = connected_count(client).await;
         let recovered = connected > 0 && resubscribe(client, filter, subscription_id).await;

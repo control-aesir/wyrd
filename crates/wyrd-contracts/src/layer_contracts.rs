@@ -596,6 +596,38 @@ mod policy_tests {
     }
 
     #[test]
+    fn cli_host_deps_are_exact() {
+        // The process host's full production edge set, pinned so a
+        // widening (or a silent policy trim) fails here and not in
+        // review vigilance. The live contract above checks the real
+        // manifest; this names the expectation.
+        let violations = check_member(
+            "wyrd-cli",
+            &deps(&[
+                "wyrd-format",
+                "wyrd-sync",
+                "wyrd-core",
+                "wyrd-daemon",
+                "clap",
+                "fuser",
+                "hex",
+                "libc",
+                "nostr",
+                "thiserror",
+                "tracing",
+                "tracing-subscriber",
+                "tracing-log",
+                "zeroize",
+            ]),
+            &empty_ws(),
+        );
+        assert!(
+            violations.is_empty(),
+            "cli allowlist drifted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn format_substrate_stays_closed() {
         let violations = check_member("wyrd-format", &deps(&["blake3", "tokio"]), &empty_ws());
         assert_eq!(violations.len(), 1);

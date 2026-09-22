@@ -3,7 +3,9 @@
 Wyrd's cross-crate architectural contract suite: one named test per review
 contract, each composed end to end through the public APIs of
 `wyrd-format → wyrd-sync → wyrd-fuse → wyrd-daemon`, so an invariant
-regression fails a test instead of a deployment.
+regression fails a test instead of a deployment. `wyrd-cli` is a
+binary-only process host, so no crate can depend on it; its edges are
+pinned by contract 34's member-wide dependency check instead.
 
 ## What belongs here
 

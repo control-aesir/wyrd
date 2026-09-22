@@ -124,7 +124,8 @@ Wyrd's bet is that these are one system: git's object model, Syncthing's replica
 | `crates/wyrd-format` | The format contract: two identities (content/storage), canonical encoding, chunking, Merkle file trees, snapshot DAG |
 | `crates/wyrd-sync` | Peer replication on iroh: snapshot announcements, encrypted manifests, roles × materialization, two-phase content, zero-trust encryption |
 | `crates/wyrd-fuse` | The drive as a filesystem: live view, time travel, visible conflicts |
-| `crates/wyrd-daemon` | Composition: engine + view + presentation backends (read-write FUSE today) and the `wyrd` binary (`init`, `mount`) |
+| `crates/wyrd-daemon` | Composition library: engine + view + presentation backends (read-write FUSE today) |
+| `crates/wyrd-cli` | The `wyrd` process host: `init`, `mount`, diagnostics, exit codes over the daemon's surface |
 | `crates/wyrd-contracts` | Cross-crate architectural contract suite: one named test per review contract, composed end to end |
 
 Design docs live in `docs/` (`architecture.md` is the one-page entry point);
@@ -145,7 +146,7 @@ cargo check
 cargo nextest run
 ```
 
-On macOS, the `wyrd-daemon` and `wyrd-contracts` test binaries link the
+On macOS, the `wyrd-cli` and `wyrd-contracts` test binaries link the
 system FUSE library at load, and `wyrd mount` needs the kernel extension,
 so running them requires system macFUSE: `brew install --cask macfuse`,
 then approve the "Benjamin Fleischer" system software under System
@@ -165,7 +166,8 @@ supply the runtime library or the kernel extension. `cargo check` and the
 
 `crates/wyrd-format` carries the format contract and `crates/wyrd-sync`
 the cryptography and state machines (both under test); the read-write
-FUSE backend is implemented in `crates/wyrd-daemon` (`wyrd init`, `wyrd
+FUSE backend is implemented in `crates/wyrd-daemon` and driven by the
+`wyrd` process host in `crates/wyrd-cli` (`wyrd init`, `wyrd
 mount`), which also opens the drive's real-iroh serving endpoint.
 
 To try the alpha without installing Rust:

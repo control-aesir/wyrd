@@ -1,14 +1,14 @@
 use super::admission::{admit_device, next_epoch};
+use super::tests_harness::{device_of, owner_engine};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::ManifestRecord;
 
-use wyrd_format::TransitionId;
 use zeroize::Zeroizing;
 
 use crate::control::bootstrap::open_bootstrap;
 use crate::control::{seal, Message};
-use crate::durable::{AuthorizedCapability, AuthorizedSnapshot, Fact};
-use crate::keys::capability::{Capability, WrappedCapability};
+use crate::durable::{AuthorizedSnapshot, Fact};
+use crate::keys::capability::WrappedCapability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, Builder};
 use crate::runtime::test_util::{
@@ -16,70 +16,6 @@ use crate::runtime::test_util::{
     MemoryRelay, TestDir,
 };
 use crate::transport::mailbox::seal_for_recipient;
-
-/// An owner engine holding epoch 1: genesis drained, epoch key
-/// installed, self capability committed (the production shape of a
-/// drive creator one transition in). Returns the engine plus the
-/// genesis id the admission must parent onto.
-fn owner_engine() -> (TestDir, Engine, TransitionId) {
-    let dir = TestDir::new("admit-device");
-    let (owner_sk, owner_id) = key(10);
-    let owner_encryption = DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap();
-    let mut engine = Engine::open(
-        dir.path.clone(),
-        member_drive(),
-        owner_id,
-        "test-pass",
-        identity_secret(&owner_sk),
-        owner_encryption,
-    )
-    .unwrap();
-    engine.add_epoch_key(1, Zeroizing::new(control_key(1)));
-    let (_builder, genesis) = Builder::genesis(10);
-    let sealed = seal(
-        &control_key(1),
-        &member_drive(),
-        1,
-        &transition_message(&genesis),
-    )
-    .unwrap();
-    let (sender_sk, _) = identity(0x01);
-    let mut relay = MemoryRelay::default();
-    relay.push(seal_for_recipient(&sender_sk, owner_id, &sealed.encode()).unwrap());
-    let mut mailbox = MemoryMailbox {
-        relay: &mut relay,
-        owner: owner_id,
-    };
-    let report = engine.drain(&mut mailbox).unwrap();
-    assert_eq!(report.accepted, 1, "genesis drains");
-    // The epoch-1 secret the control helper derives from, installed
-    // as an authorized self capability the way drive creation does.
-    let epoch1 = EpochSecret::from_bytes([0x07; 32]);
-    let state = engine
-        .log
-        .state_of(&genesis.transition_id())
-        .expect("genesis state");
-    let registered = state
-        .encryption_key_of(&owner_id)
-        .copied()
-        .expect("owner key registered");
-    let cap = Capability::new(
-        member_drive(),
-        owner_id,
-        registered,
-        genesis.transition_id(),
-        1,
-        vec![epoch1],
-    )
-    .unwrap();
-    let authorized =
-        AuthorizedCapability::authorize(cap, member_drive(), &engine.log, &genesis.transition_id())
-            .unwrap();
-    engine
-        .commit_facts(&[Fact::Capability(authorized)])
-        .unwrap();
-    (dir, engine, genesis.transition_id())
-}
 
 #[test]
 fn epoch_increment_checked_at_boundary() {
@@ -94,7 +30,7 @@ fn epoch_increment_checked_at_boundary() {
 fn failed_admit_leaves_no_phantom_tip() {
     use crate::durable::CrashStage;
 
-    let (_dir, mut engine, _genesis) = owner_engine();
+    let (_dir, mut engine, _genesis) = owner_engine("admit-device");
     let tip_before = engine.log.known_state().expect("tip").transition_id;
     let newcomer_id = identity(0x57).1;
     let newcomer_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE7; 32]).unwrap());
@@ -125,7 +61,7 @@ fn failed_admit_leaves_no_phantom_tip() {
 
 #[test]
 fn admit_device_authors_transition_and_invitation() {
-    let (_dir, mut engine, genesis_id) = owner_engine();
+    let (_dir, mut engine, genesis_id) = owner_engine("admit-device");
     let newcomer = DeviceIdentitySecret::generate().unwrap();
     let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
     let newcomer_id = {
@@ -186,7 +122,7 @@ fn admit_device_authors_transition_and_invitation() {
 
 #[test]
 fn admit_device_requires_owner_authority() {
-    let (_dir, engine, _genesis) = owner_engine();
+    let (_dir, engine, _genesis) = owner_engine("admit-device");
     // Reopen as a non-member device sharing the store directory is
     // refused by the lock; instead drain genesis into a fresh
     // non-owner engine and attempt the admit there.
@@ -227,17 +163,9 @@ fn admit_device_requires_owner_authority() {
     let _ = engine;
 }
 
-/// The device id an identity secret names.
-fn device_of(identity: &DeviceIdentitySecret) -> wyrd_format::DeviceId {
-    use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-    let kp = Keypair::from_secret_key(SECP256K1, &identity.secret_key());
-    let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
-    wyrd_format::DeviceId::from_bytes(xonly.serialize())
-}
-
 #[test]
 fn admit_queues_and_delivers_newcomer_catch_up() {
-    let (_dir, mut engine, _genesis) = owner_engine();
+    let (_dir, mut engine, _genesis) = owner_engine("admit-device");
     let (owner_sk, owner_id) = key(10);
     let newcomer = DeviceIdentitySecret::generate().unwrap();
     let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
@@ -355,7 +283,7 @@ fn admit_delivers_current_heads_to_the_newcomer() {
     use std::collections::BTreeMap;
     use wyrd_format::{BaoRoot, Manifest};
 
-    let (_dir, mut engine, genesis_id) = owner_engine();
+    let (_dir, mut engine, genesis_id) = owner_engine("admit-device");
     let (owner_sk, _) = key(10);
     // A live head: the owner's epoch-1 snapshot, body plus
     // announcement committed the way intake would record them,

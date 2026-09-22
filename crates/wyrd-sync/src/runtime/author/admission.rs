@@ -50,6 +50,13 @@ pub(crate) fn admit_device(
     if pre.members.contains(&device) {
         return Err(EngineError::AlreadyMember);
     }
+    if engine.log.is_retired(&device) {
+        // Retired identities are single-use within the chain: a
+        // removed device returns only under a fresh identity. The
+        // chain rule stays authoritative; this refuses early with a
+        // renderable error instead of authoring a doomed transition.
+        return Err(EngineError::RetiredDevice);
+    }
     let epoch = next_epoch(tip.epoch)?;
     let secret = EpochSecret::generate()?;
     let mut members: Vec<DeviceId> = pre.members.iter().copied().collect();

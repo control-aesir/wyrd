@@ -25,7 +25,7 @@ mod conformance;
 mod properties;
 
 use std::collections::{BTreeSet, HashMap};
-use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
+use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId};
 
 pub use state::{apply, ApplyError, MembershipState};
 pub(crate) use validate::sign_transition;
@@ -293,6 +293,29 @@ impl MembershipLog {
     /// The owner set of a valid transition.
     pub fn owners_of(&self, id: &TransitionId) -> Option<BTreeSet<DeviceId>> {
         self.state_of(id).map(|s| s.owners)
+    }
+
+    /// Whether the device was ever admitted on the canonical chain:
+    /// retired identities are single-use and cannot be re-admitted,
+    /// even after removal. Follows predecessor links from the known
+    /// tip, so history is chain-local like validation itself. Used by
+    /// authoring to refuse retired re-admits before signing; the chain
+    /// rule stays authoritative for anything authored elsewhere.
+    pub fn is_retired(&self, device: &DeviceId) -> bool {
+        let mut cursor = self.known_state().map(|known| known.transition_id);
+        while let Some(id) = cursor {
+            let Some(t) = self.transitions.get(&id) else {
+                break;
+            };
+            if t.changes()
+                .iter()
+                .any(|change| matches!(change, Change::Admit(a) if a.device == *device))
+            {
+                return true;
+            }
+            cursor = t.prev;
+        }
+        false
     }
 
     /// Number of observed transitions.

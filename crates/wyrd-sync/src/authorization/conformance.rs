@@ -259,6 +259,35 @@ fn snapshot_with_unknown_parent_is_pending() {
 // --- voided / superseded / stranded --------------------------------------
 
 #[test]
+fn removed_author_work_is_superseded_once_the_log_advances() {
+    // B admitted at epoch 2 authors S bound to the admission
+    // transition; removal at epoch 3 advances K past S.epoch. S stays
+    // authorized history (B was a member of its bound transition) but
+    // can never advance the live view: superseded, never eligible,
+    // never rejected. Valid signature is not valid current-state
+    // authorship (epochs.md).
+    let mut f = Fixture::new(1);
+    let (b_sk, b) = f.device(2);
+    f.membership(vec![admit(b)]);
+    assert_eq!(f.tip_epoch, 2);
+    let s = f.snapshot(Vec::new(), tree_id(1), b, &b_sk, 0);
+    let mut dag = SnapshotDag::new(f.drive);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Eligible,
+        "pre-removal work by a member is live"
+    );
+    f.membership(vec![Change::Remove(b)]);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Superseded,
+        "post-removal the same work is retained history, never live"
+    );
+    assert!(dag.eligible_heads(&f.log).is_empty());
+}
+
+#[test]
 fn voided_branch_reference_is_voided() {
     let mut f = Fixture::new(1);
     let (_, second) = f.device(2);

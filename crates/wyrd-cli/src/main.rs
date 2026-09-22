@@ -12,21 +12,22 @@ use crate::probes::combine_status;
 use crate::probes::macos_preflight;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
+use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::LiveMailbox;
-#[cfg(test)]
 use wyrd_daemon::core::RuntimeMaterialization;
-use wyrd_daemon::fuse::FuseBackend;
+use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 use zeroize::Zeroizing;
 
-/// The `wyrd` binary: create a drive, or mount its live projection.
-/// Both subcommands need the credential files (read and hardened by
-/// wyrd code, never by clap); `--relay` is mount-only deployment
-/// state — nothing in the keystore names relays, so they arrive as
-/// flags.
+/// The `wyrd` binary: create a drive, mount its live projection, or
+/// export its namespace to a plain directory tree. All three
+/// subcommands need the credential files (read and hardened by wyrd
+/// code, never by clap); `--relay` is mount-only deployment state —
+/// nothing in the keystore names relays, so they arrive as flags.
+/// Export is offline by construction: no relays, no serving, no FUSE.
 #[derive(Debug, Parser)]
 #[command(name = "wyrd", version, about)]
 struct Cli {
@@ -73,6 +74,19 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
+    /// Export the drive's namespace to a plain directory tree: files,
+    /// directories (empty ones included), symlinks, and the executable
+    /// bit, with multi-head conflicts as `name@N` siblings. The output
+    /// needs no wyrd software to read — this is the offline egress
+    /// path guaranteed before any format break.
+    Export {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Destination directory: must not exist or must be empty.
+        out_dir: PathBuf,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
 }
 
 #[cfg(unix)]
@@ -112,6 +126,8 @@ pub(crate) enum CliError {
     Serving(std::io::Error),
     #[error("bulk source failed: {0}")]
     Bulk(std::io::Error),
+    #[error("export failed: {0}")]
+    Export(#[from] wyrd_core::export::ExportError),
     #[error("macOS FUSE preflight failed: {0}")]
     #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
@@ -139,6 +155,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
     let (identity, passphrase) = match &cli.command {
         Command::Init { credentials, .. } => read_credentials(credentials)?,
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
+        Command::Export { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
@@ -153,6 +170,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             verbose,
             ..
         } => mount(drive_dir, mountpoint, relay, verbose, &passphrase, identity),
+        Command::Export {
+            drive_dir, out_dir, ..
+        } => export(drive_dir, out_dir, &passphrase, identity),
     }
 }
 
@@ -508,6 +528,38 @@ fn mount(
     combine_status(result, session_result)
 }
 
+/// Export the drive's namespace to a plain tree. The open path
+/// mirrors mount's preamble (keystore, object store, live heads)
+/// minus everything export refuses to need: no diagnostics file, no
+/// serving endpoint, no bulk source, no mailbox, no FUSE session.
+/// The composed view type arrives through the daemon's surface, so
+/// this host never names the view crate directly.
+fn export(
+    drive_dir: PathBuf,
+    out_dir: PathBuf,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> = WyrdNode::new(
+        engine,
+        FsObjectStore::open(drive_dir.clone())
+            .map_err(|error| CliError::Store(error.to_string()))?,
+    )?;
+    daemon.refresh_live_heads()?;
+    let report = export_tree(daemon.view(), &out_dir)?;
+    eprintln!(
+        "exported {} files, {} dirs, {} symlinks ({} conflicts, {} bytes) to {}",
+        report.files,
+        report.dirs,
+        report.symlinks,
+        report.conflicts,
+        report.bytes,
+        out_dir.display()
+    );
+    Ok(())
+}
+
 /// Bind the fetch side's iroh endpoint (N0 relays for peer
 /// reachability) and wrap it in the real bulk source.
 fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
@@ -558,6 +610,8 @@ mod probes;
 
 #[cfg(test)]
 mod tests_cli;
+#[cfg(test)]
+mod tests_export;
 #[cfg(test)]
 mod tests_harness;
 #[cfg(test)]

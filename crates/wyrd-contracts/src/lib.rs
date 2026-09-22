@@ -154,6 +154,8 @@
 //! (capability negotiation).
 
 #[cfg(test)]
+mod egress_contracts;
+#[cfg(test)]
 mod fuse_contracts;
 #[cfg(test)]
 mod join_contracts;

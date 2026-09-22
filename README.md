@@ -200,6 +200,12 @@ wyrd init ./mydrive --identity-file ./identity.bin --passphrase-file ./passphras
 mkdir -p ./mnt
 wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./passphrase.txt
 # Stop with Ctrl-C (SIGINT/SIGTERM shuts down cleanly: flush, unmount, exit).
+
+# 4. Export a plain copy any time: files, directories, symlinks, and the
+#    executable bit land as an ordinary tree that needs no wyrd software
+#    to read. Conflicts export as `name@N` siblings. Offline, and the
+#    destination must not exist or must be empty.
+wyrd export ./mydrive ./plain-copy --identity-file ./identity.bin --passphrase-file ./passphrase.txt
 ```
 
 Mounting needs system FUSE (macFUSE on macOS, libfuse on Linux — see the

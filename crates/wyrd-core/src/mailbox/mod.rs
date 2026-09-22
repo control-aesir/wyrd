@@ -98,6 +98,14 @@ mod seen_store;
 
 use seen_store::SeenStore;
 
+/// Test-only minimal relay for mailbox integration tests: a minimal
+/// NIP-01 websocket server over tokio-tungstenite (dev-dependency, so
+/// it never ships). Lives beside the mailbox so the contract's
+/// nostr-scope rule keeps passing — it is mailbox test harness, not a
+/// second nostr subsystem.
+#[cfg(test)]
+pub(crate) mod mini_relay;
+
 #[cfg(test)]
 mod tests_backpressure;
 #[cfg(test)]
@@ -133,7 +141,7 @@ use wyrd_sync::transport::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
 
-use crate::lifecycle::WakeSignal;
+use crate::wake::WakeSignal;
 
 /// Wyrd's rumor kind: an application-specific regular event (9000-9999 is
 /// the non-replaceable app range), never published to relays itself — it

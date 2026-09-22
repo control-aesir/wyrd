@@ -15,7 +15,9 @@ pub use wyrd_core::budgets;
 pub mod core;
 pub mod fuse;
 pub mod lifecycle;
-pub mod live_mailbox;
+// The node's relay mailbox, owned by wyrd-core: the composer opens it
+// and hands it to the loop, like the rest of the live family.
+pub use wyrd_core::mailbox;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
 pub use wyrd_core::mutation;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
@@ -24,10 +26,6 @@ pub use wyrd_core::projection;
 pub use wyrd_core::session;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
 pub use wyrd_core::want;
-
-/// Test-only minimal relay for live-mailbox integration tests.
-#[cfg(test)]
-pub(crate) mod mini_relay;
 
 pub use budgets::ResourceBudgets;
 pub use core::{

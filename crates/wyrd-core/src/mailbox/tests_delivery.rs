@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 // --- integration tests over an in-process relay ---
 
-use crate::mini_relay::MiniRelay;
+use super::mini_relay::MiniRelay;
 
 /// The reviewer's key boundary test: two gift-wrapped deliveries stay
 /// distinct at the transport layer, but after both are acked, a
@@ -397,7 +397,7 @@ fn intake_delivery_pokes_the_attached_waker() {
     let relays = vec![url];
     let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-intake-wake"));
 
-    let waker = std::sync::Arc::new(crate::lifecycle::WakeSignal::default());
+    let waker = std::sync::Arc::new(crate::wake::WakeSignal::default());
     mailbox.attach_waker(std::sync::Arc::clone(&waker));
 
     relay.inject(seal_rumor(
@@ -409,7 +409,7 @@ fn intake_delivery_pokes_the_attached_waker() {
     let stop = std::sync::atomic::AtomicBool::new(false);
     assert_eq!(
         waker.wait(&stop, Duration::from_secs(10)),
-        crate::lifecycle::Wake::Signal,
+        crate::wake::Wake::Signal,
         "a forwarded delivery must poke the pacing signal"
     );
     // The event is genuinely deliverable, not just a spurious poke.

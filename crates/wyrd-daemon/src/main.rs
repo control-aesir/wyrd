@@ -378,7 +378,7 @@ fn mount(
     let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
         .map_err(|_| CliError::IdentityFormat)?;
     let seen_path = drive_dir.join("mailbox.seen");
-    let mut mailbox = wyrd_daemon::live_mailbox::LiveMailbox::connect(
+    let mut mailbox = wyrd_daemon::mailbox::LiveMailbox::connect(
         nostr::key::Keys::new(nostr_secret.clone()),
         nostr_secret,
         relays.clone(),

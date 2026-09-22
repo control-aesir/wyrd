@@ -12,6 +12,7 @@
 
 pub mod budgets;
 pub mod live;
+pub mod mailbox;
 pub mod mutation;
 pub mod node;
 pub mod projection;

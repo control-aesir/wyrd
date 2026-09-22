@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Wyrd is a decentralized data substrate where data keeps its identity, history, and permissions independently of the machines that hold it.">
+<meta name="theme-color" content="#EAE2CC" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#121614" media="(prefers-color-scheme: dark)">
+<title>Wyrd — the decentralized append-only drive that remembers</title>
+<link rel="canonical" href="https://wyrd.enesis.md/">
+<meta property="og:title" content="Wyrd — the decentralized append-only drive that remembers">
+<meta property="og:description" content="Wyrd is a decentralized data substrate where data keeps its identity, history, and permissions independently of the machines that hold it.">
+<meta property="og:url" content="https://wyrd.enesis.md/">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Wyrd — the decentralized append-only drive that remembers">
+<meta name="twitter:description" content="A decentralized data substrate where data keeps its identity, history, and permissions.">
+<style>
+  /* Self-hosted type (page/fonts/, latin subsets, no external requests).
+     Newsreader arrives as a variable font; the weight ranges below expose
+     exactly what the page uses. */
+  @font-face{
+    font-family: 'Newsreader';
+    src: url('fonts/newsreader-roman.woff2') format('woff2');
+    font-weight: 400 600;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face{
+    font-family: 'Newsreader';
+    src: url('fonts/newsreader-italic.woff2') format('woff2');
+    font-weight: 400 500;
+    font-style: italic;
+    font-display: swap;
+  }
+  @font-face{
+    font-family: 'IBM Plex Mono';
+    src: url('fonts/ibm-plex-mono-400.woff2') format('woff2');
+    font-weight: 400;
+    font-display: swap;
+  }
+  @font-face{
+    font-family: 'IBM Plex Mono';
+    src: url('fonts/ibm-plex-mono-500.woff2') format('woff2');
+    font-weight: 500;
+    font-display: swap;
+  }
+  /*
+    Design plan (frontend-design pass):
+    Subject — Wyrd, an append-only drive. Audience — developers judging a
+    pre-alpha. Job — make "nothing is ever erased" tangible, then hand over
+    the CLI. One memorable thing: the hero is a working snapshot stepper,
+    not a diagram. Everything else stays quiet.
+    Color — aged archive paper, iron-gall ink, verdigris seal, burnt copper
+    reserved for the single call to action. Verdigris leads; copper appears
+    almost nowhere else, so the CTA is unmistakable.
+    Type — Newsreader carries every human voice (headline, prose, asides);
+    Plex Mono speaks only for the machine (hashes, snapshots, CLI, the drive
+    listing). Small interface words use the system sans so mono never becomes
+    decoration.
+    Layout — left aligned throughout, asymmetric hero, whitespace instead of
+    rules except inside the § code where rules carry meaning.
+  */
+  :root{
+    color-scheme: light dark;
+
+    --font-serif: 'Newsreader', Georgia, 'Times New Roman', serif;
+    --font-mono: 'IBM Plex Mono', 'SFMono-Regular', Consolas, monospace;
+    --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+
+    --paper: #EAE2CC;
+    --ink: #1B1F1C;
+    --ink-soft: #565248;
+    --seal: #2E6B52;
+    --seal-deep: #1F4A38;
+    --ember: #A34A24;
+    --ember-deep: #7E381B;
+    --card-text: #FBF4E4;
+
+    --slate: #141816;
+    --slate-raised: #1C2220;
+    --slate-line: #333B37;
+    --slate-text: #EDE6D2;
+    --slate-dim: #9AA294;
+    --mint: #8FD0B4;
+  }
+
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper: #121614;
+      --ink: #E8E2D0;
+      --ink-soft: #A3A89B;
+      --seal: #7FBFA4;
+      --seal-deep: #A9DCC4;
+      --ember: #D0824A;
+      --ember-deep: #E59A62;
+      --card-text: #171310;
+      --slate: #1A201D;
+      --slate-raised: #222926;
+      --slate-line: #39423E;
+      --slate-text: #EDE6D2;
+      --slate-dim: #9AA294;
+    }
+  }
+
+  *, *::before, *::after{ box-sizing: border-box; }
+  html{ scroll-behavior: smooth; scroll-padding-top: 76px; }
+  body{
+    margin: 0;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-serif);
+    font-size: 18px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, p{ margin: 0; }
+  a{ color: inherit; }
+  a:focus-visible, button:focus-visible{
+    outline: 2px solid var(--ember);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  .wrap{
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 0 clamp(20px, 5vw, 56px);
+  }
+  .section .standfirst{
+    margin-top: 14px;
+    font-size: 1.12rem;
+    color: var(--ink-soft);
+  }
+  .prose{ margin-top: 26px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px 36px; }
+
+  /* Top bar */
+  .topbar{
+    position: sticky;
+    top: env(safe-area-inset-top, 0px);
+    z-index: 20;
+    background: var(--paper);
+    background: color-mix(in srgb, var(--paper) 90%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--slate-line);
+  }
+  .topbar .wrap{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding-top: 16px;
+    padding-bottom: 16px;
+  }
+  .wordmark{
+    font-style: italic;
+    font-weight: 500;
+    font-size: 1.4rem;
+    text-decoration: none;
+    letter-spacing: -0.01em;
+  }
+  .topbar nav{ display: flex; gap: 22px; align-items: baseline; }
+  .topbar nav a{
+    font-family: var(--font-ui);
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+    text-decoration: none;
+  }
+  .topbar nav a:hover{ color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+
+  /* Hero: headline left, working drive right */
+  .hero{ padding: clamp(56px, 9vw, 120px) 0 clamp(48px, 7vw, 84px); }
+  .hero-grid{
+    display: grid;
+    grid-template-columns: minmax(0, 1.02fr) minmax(0, 0.98fr);
+    gap: clamp(36px, 6vw, 72px);
+    align-items: start;
+  }
+  .hero h1{
+    font-size: clamp(3rem, 7vw, 5.2rem);
+    line-height: 1.0;
+    letter-spacing: -0.02em;
+    font-weight: 500;
+    text-wrap: balance;
+  }
+  .hero-sub{
+    margin-top: 26px;
+    font-size: 1.2rem;
+    font-weight: 400;
+    line-height: 1.55;
+    max-width: 34ch;
+  }
+  .hero-thesis{
+    margin-top: 18px;
+    font-size: 1.05rem;
+    color: var(--ink-soft);
+    max-width: 38ch;
+  }
+  .etymology{
+    margin-top: 22px;
+    font-style: italic;
+    color: var(--ink-soft);
+    font-size: 0.98rem;
+    max-width: 40ch;
+    border-left: 2px solid var(--seal);
+    padding-left: 14px;
+  }
+  .cta-row{
+    margin-top: 30px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    align-items: baseline;
+  }
+  .cta-run{
+    display: inline-block;
+    padding: 13px 26px;
+    background: var(--ember);
+    color: var(--card-text);
+    font-family: var(--font-ui);
+    font-weight: 600;
+    font-size: 0.95rem;
+    text-decoration: none;
+    border-radius: 5px;
+  }
+  .cta-run:hover{ background: var(--ember-deep); }
+  .cta-read{
+    font-family: var(--font-ui);
+    font-size: 0.95rem;
+    color: var(--seal);
+    text-decoration: underline;
+    text-underline-offset: 4px;
+  }
+  .alpha-note{
+    margin-top: 22px;
+    font-family: var(--font-ui);
+    font-size: 0.82rem;
+    color: var(--ink-soft);
+  }
+
+  /* The drive: the one dark machine surface on the page */
+  .drive{
+    background: var(--slate);
+    color: var(--slate-text);
+    border-radius: 10px;
+    padding: 22px 22px 18px;
+    box-shadow: 0 24px 60px -30px rgba(0, 0, 0, 0.55);
+  }
+  .drive-head{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--slate-line);
+  }
+  .drive-title{ font-family: var(--font-ui); font-size: 0.8rem; color: var(--slate-dim); }
+  .drive-store{ font-family: var(--font-mono); font-size: 0.78rem; color: var(--mint); white-space: nowrap; }
+  .drive-snap{ padding: 14px 0 4px; }
+  .drive-id{ font-family: var(--font-mono); font-size: 0.85rem; color: var(--slate-text); }
+  .drive-moment{ font-style: italic; color: var(--slate-dim); font-size: 0.95rem; margin-top: 2px; }
+  .drive-view{
+    margin-top: 12px;
+    background: var(--slate-raised);
+    border: 1px solid var(--slate-line);
+    border-radius: 6px;
+    padding: 14px 16px;
+    min-height: 148px;
+    font-family: var(--font-mono);
+    font-size: 0.83rem;
+    line-height: 1.7;
+  }
+  .drive-view .absent{ color: var(--slate-dim); }
+  .drive-view .gone{ color: #E59A62; }
+  .drive-view .ok{ color: var(--mint); }
+  .drive-view .holders{ margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--slate-line); color: var(--slate-dim); }
+  .drive-view .holders b{ color: var(--slate-text); font-weight: 500; }
+  .drive-note{
+    margin-top: 12px;
+    font-size: 0.95rem;
+    font-style: italic;
+    color: var(--slate-dim);
+    min-height: 3.2em;
+  }
+  .drive-steps{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 14px;
+    border-top: 1px solid var(--slate-line);
+  }
+  .drive-btn{
+    font-family: var(--font-ui);
+    font-size: 0.82rem;
+    background: transparent;
+    color: var(--slate-text);
+    border: 1px solid var(--slate-line);
+    border-radius: 5px;
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  .drive-btn:hover:not(:disabled){ border-color: var(--mint); color: var(--mint); }
+  .drive-btn:disabled{ opacity: 0.35; cursor: default; }
+  .drive-dots{ display: flex; gap: 8px; margin: 0 auto; }
+  .drive-dot{
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 1px solid var(--slate-line);
+    background: transparent;
+    cursor: pointer;
+    position: relative;
+  }
+  .drive-dot::after{
+    content: "";
+    position: absolute;
+    inset: 8px;
+    border-radius: 50%;
+    background: var(--slate-dim);
+  }
+  .drive-dot[aria-current="true"]{ border-color: var(--mint); }
+  .drive-dot[aria-current="true"]::after{ background: var(--mint); }
+
+  /* Sections */
+  .section{ padding: clamp(48px, 7vw, 88px) 0; }
+  .section h2{
+    font-size: clamp(1.9rem, 3.4vw, 2.6rem);
+    line-height: 1.12;
+    letter-spacing: -0.015em;
+    font-weight: 500;
+    text-wrap: balance;
+  }
+  .prose strong{ font-weight: 600; }
+  .closing-line{
+    margin-top: 30px;
+    font-size: 1.25rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+  .closing-line em{ color: var(--seal); }
+
+  /* The § code: the only ruled ledger on the page */
+  .code{ margin-top: 38px; border-bottom: 1px solid var(--slate-line); display: grid; grid-template-columns: 1fr 1fr; gap: 0 44px; }
+  .article{
+    display: grid;
+    grid-template-columns: 56px 1fr;
+    gap: 4px 18px;
+    padding: 24px 0;
+    border-top: 1px solid var(--slate-line);
+  }
+  .article-no{
+    font-style: italic;
+    font-size: 1.05rem;
+    color: var(--seal);
+  }
+  .article h3{ font-size: 1.25rem; font-weight: 500; grid-column: 2; }
+  .article p{ grid-column: 2; margin-top: 8px; color: var(--ink-soft); font-size: 1rem; max-width: 60ch; }
+
+  /* Neighbours */
+  .neighbours{ margin-top: 34px; display: grid; }
+  .neighbour{
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 6px 28px;
+    padding: 20px 0;
+  }
+  .neighbour + .neighbour{ border-top: 1px solid var(--slate-line); }
+  .neighbour h3{ font-family: var(--font-ui); font-weight: 600; font-size: 0.98rem; padding-top: 3px; }
+  .neighbour p{ color: var(--ink-soft); font-size: 1rem; max-width: 58ch; }
+
+  /* Status */
+  .status-grid{
+    margin-top: 36px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: clamp(28px, 5vw, 64px);
+  }
+  .status-col h3{ font-family: var(--font-ui); font-weight: 600; font-size: 0.9rem; }
+  .status-list{ margin: 16px 0 0; padding: 0; list-style: none; display: grid; gap: 13px; }
+  .status-list li{
+    display: flex;
+    gap: 12px;
+    font-size: 0.99rem;
+    color: var(--ink-soft);
+    line-height: 1.55;
+  }
+  .status-list li::before{
+    content: "";
+    flex: none;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    margin-top: 7px;
+  }
+  .status-list li.yes::before{ background: var(--seal); }
+  .status-list li.no::before{ background: transparent; border: 1.5px solid var(--ember); }
+  .licence{ margin-top: 32px; font-size: 0.95rem; color: var(--ink-soft); }
+  .licence a{ color: var(--seal); text-decoration: underline; text-underline-offset: 3px; }
+
+  /* Run it */
+  .cli{
+    margin-top: 28px;
+    background: var(--slate);
+    color: var(--slate-text);
+    border-radius: 10px;
+    padding: 22px 24px;
+    overflow-x: auto;
+  }
+  .cli pre{ margin: 0; }
+  .cli code{ font-family: var(--font-mono); font-size: 0.85rem; line-height: 1.8; white-space: pre; tab-size: 2; }
+  .cli .c{ color: var(--slate-dim); }
+  .run-note{ margin-top: 20px; font-size: 0.95rem; color: var(--ink-soft); }
+  .run-note a{ color: var(--seal); text-decoration: underline; text-underline-offset: 3px; }
+  .run-note code{ font-family: var(--font-mono); font-size: 0.87em; }
+
+  footer{ padding: 40px 0 calc(48px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--slate-line); }
+  .footer-grid{ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 18px; align-items: baseline; }
+  .footer-word{ font-style: italic; font-size: 1.2rem; }
+  .footer-tag{ font-size: 0.9rem; color: var(--ink-soft); margin-top: 4px; }
+  .footer-links{ display: flex; gap: 22px; font-family: var(--font-ui); font-size: 0.85rem; }
+  .footer-links a{ color: var(--ink-soft); }
+  .footer-links a:hover{ color: var(--ink); }
+
+  @media (max-width: 920px){
+    .hero-grid{ grid-template-columns: 1fr; }
+    .drive{ max-width: 560px; }
+    .prose{ grid-template-columns: 1fr; }
+    .code{ grid-template-columns: 1fr; }
+  }
+  @media (max-width: 640px){
+    body{ font-size: 17px; }
+    .status-grid{ grid-template-columns: 1fr; }
+    .neighbour{ grid-template-columns: 1fr; gap: 6px; }
+    .article{ grid-template-columns: 40px 1fr; }
+    .topbar nav a.nav-hide{ display: none; }
+  }
+  @media (prefers-reduced-motion: reduce){
+    html{ scroll-behavior: auto; }
+  }
+  .sr-only{
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Wyrd",
+  "operatingSystem": "Linux, macOS",
+  "applicationCategory": "DeveloperApplication",
+  "license": "https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd/tree/master/LICENSE",
+  "description": "A decentralized data substrate and append-only drive where data keeps its identity, history, and permissions independently of the machines that hold it.",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+</head>
+<body>
+<div id="top">
+
+  <header class="topbar">
+    <div class="wrap">
+      <a class="wordmark" href="#top">wyrd</a>
+      <nav aria-label="Page">
+        <a class="nav-hide" href="#concept">Idea</a>
+        <a class="nav-hide" href="#rules">Rules</a>
+        <a href="#status">Status</a>
+        <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd" target="_blank" rel="noopener noreferrer">Source on gitworkshop</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap hero-grid">
+        <div>
+          <h1 id="hero-title">Nothing is ever erased.</h1>
+          <h2 class="hero-sub">Wyrd is a decentralized drive where data keeps its identity, history, and permissions, no matter which machines happen to hold it.</h2>
+          <p class="hero-thesis">Your devices keep what they need. Peers you approve can fetch the rest. No central service sits in the middle of that exchange.</p>
+          <p class="etymology">Wyrd is the Old English word for fate: what has already happened, weighing on what comes next.</p>
+          <div class="cta-row">
+            <a class="cta-run" href="#start">Run it yourself</a>
+            <a class="cta-read" href="#rules">Read the rules</a>
+          </div>
+          <p class="alpha-note">Pre-alpha. The on-disk format can still change between releases.</p>
+        </div>
+
+        <div class="drive" aria-label="Demonstration of snapshots">
+          <div class="drive-head">
+            <span class="drive-title">field-notes.txt across four snapshots</span>
+            <span class="drive-store" id="drive-store">store holds 3 objects</span>
+          </div>
+          <div class="drive-snap">
+            <div class="drive-id" id="drive-id">snapshot 0a13…e02</div>
+            <p class="drive-moment" id="drive-moment">first write</p>
+          </div>
+          <div class="drive-view" id="drive-view" aria-live="polite"><div><span class="ok">field-notes.txt</span> <span class="absent">(3 chunks)</span></div><div class="absent">9be2…11  77ac…f0  c301…9d</div><div class="holders">held by <b>laptop</b>, <b>vault</b>; phone holds nothing yet</div></div>
+          <p class="drive-note" id="drive-note">Three pieces land in the store, and the snapshot points at all three.</p>
+          <div class="drive-steps">
+            <button class="drive-btn" id="drive-prev" type="button">Earlier</button>
+            <div class="drive-dots" role="group" aria-label="Snapshots">
+              <button class="drive-dot" type="button" data-snap="0" aria-label="Snapshot 1, first write"></button>
+              <button class="drive-dot" type="button" data-snap="1" aria-label="Snapshot 2, edited"></button>
+              <button class="drive-dot" type="button" data-snap="2" aria-label="Snapshot 3, deleted"></button>
+              <button class="drive-dot" type="button" data-snap="3" aria-label="Snapshot 4, restored"></button>
+            </div>
+            <button class="drive-btn" id="drive-next" type="button">Later</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="concept">
+      <div class="wrap">
+        <h2>The file is not the thing. The history is.</h2>
+        <p class="standfirst">A Wyrd drive is a chain of snapshots. Everything else follows from that.</p>
+        <div class="prose">
+          <p>Every file is split into pieces, and each piece is named after the hash of its own bytes. Two files that share a paragraph, or two backups a week apart with almost nothing changed, quietly share the same pieces. Nobody deduplicates anything by hand.</p>
+          <p>A snapshot is a small object pointing into a tree of those pieces, much like a Git commit points into its tree — except the snapshot describes the state of an entire drive. Writing never alters what is stored. It adds new pieces and publishes a new snapshot.</p>
+          <p>That gives storage and meaning separate lives. A NAS can keep the full history while a phone keeps a few files and fetches the rest on demand. Pinning and eviction change what a device holds, never what the drive contains. And because identity travels with the data, applications beyond filesystems can build on the same substrate.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="rules">
+      <div class="wrap">
+        <h2>What holds, always</h2>
+        <p class="standfirst">Seven articles the system will not bend on, whatever else changes underneath.</p>
+        <div class="code">
+          <div class="article">
+            <span class="article-no">§1</span>
+            <h3>Every change is a new snapshot</h3>
+            <p>Snapshots name their parents and form an append-only chain. When two devices write at once, the drive briefly has two heads, and that is shown rather than hidden.</p>
+          </div>
+          <div class="article">
+            <span class="article-no">§2</span>
+            <h3>Deleting publishes; it does not erase</h3>
+            <p>Removing a file publishes a snapshot that stops referencing it. The pieces stay in the store until a separate, explicit cleanup runs, so a bad script or a careless rm costs you nothing.</p>
+          </div>
+          <div class="article">
+            <span class="article-no">§3</span>
+            <h3>What you hold is your choice</h3>
+            <p>A NAS can keep everything forever. A laptop can keep a working set and fetch the rest. A phone holds a view into the drive, not a copy of it.</p>
+          </div>
+          <div class="article">
+            <span class="article-no">§4</span>
+            <h3>Corruption is cheap to catch</h3>
+            <!-- slot:rules/s4-body -->
+            <p>Every piece is addressed by its own hash, so a damaged chunk announces itself. A good copy can be fetched from another holder; fully automatic repair is still being built.</p>
+            <!-- /slot:rules/s4-body -->
+          </div>
+          <div class="article">
+            <span class="article-no">§5</span>
+            <h3>Storage peers stay blind</h3>
+            <!-- slot:rules/s5-body -->
+            <p>Everything is encrypted before it leaves your device. A vault on rented hardware sees ciphertext, sizes, and timing. Never names, folders, or which objects match.</p>
+            <!-- /slot:rules/s5-body -->
+          </div>
+          <div class="article">
+            <span class="article-no">§6</span>
+            <h3>Conflicts stay visible</h3>
+            <p>Two devices editing apart keep both versions as separate objects. You resolve the conflict. Nothing is silently merged or overwritten.</p>
+          </div>
+          <div class="article">
+            <span class="article-no">§7</span>
+            <h3>The door stays open</h3>
+            <p>The local store is ordinary files on disk, and any snapshot materializes into a plain directory. No export format stands between you and your data.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="neighbours">
+      <div class="wrap">
+          <h2>Where the other tools stop</h2>
+          <p class="standfirst">Each of these nails one part. Wyrd is the bet that they belong in one system.</p>
+          <p class="sr-only">How Wyrd compares to Syncthing, borg and restic, git-annex, Time Machine, and object storage, and where each of those tools stops.</p>
+        <div class="neighbours">
+          <div class="neighbour">
+            <h3>Syncthing</h3>
+            <p>Keeps folders live across devices, but a deletion or a corrupted file races everywhere just as fast. No history sits underneath to fall back on.</p>
+          </div>
+          <div class="neighbour">
+            <h3>borg, restic</h3>
+            <p>Trusted backup with a one-way flow, device to repository. No peer roles, no live folder to work inside.</p>
+          </div>
+          <div class="neighbour">
+            <h3>git-annex</h3>
+            <p>The closest relative in spirit. Shaped like a repository to manage rather than a drive to live in.</p>
+          </div>
+          <div class="neighbour">
+            <h3>Time Machine</h3>
+            <p>The manners Wyrd wants: step back through time. Bound to one machine and one company's filesystem.</p>
+          </div>
+          <div class="neighbour">
+            <h3>Object storage</h3>
+            <p>Addressable and reachable, but identity, history, and access control are left to whatever gets built around it.</p>
+          </div>
+        </div>
+        <p class="closing-line">Git's object model, Syncthing's replication, <em>Time Machine's manners.</em></p>
+      </div>
+    </section>
+
+    <section class="section" id="status">
+      <div class="wrap">
+        <h2>Right now</h2>
+        <p class="standfirst">Pre-alpha, stated plainly. What runs today, and what does not yet.</p>
+        <div class="status-grid">
+          <div class="status-col">
+            <h3>Working today</h3>
+            <ul class="status-list">
+              <li class="yes">Content-addressed store and the append-only snapshot chain</li>
+              <li class="yes">Membership, capabilities, and per-epoch encryption keys</li>
+              <li class="yes">Encrypted sync between peers over a real peer-to-peer transport</li>
+              <li class="yes">A read-write mount to create, write, and browse like a folder</li>
+              <li class="yes">A serving endpoint other devices can fetch from</li>
+            </ul>
+          </div>
+          <div class="status-col">
+            <h3>Not yet</h3>
+            <!-- slot:status/not-yet -->
+            <ul class="status-list">
+              <li class="no">Garbage collection, so the store only grows for now</li>
+              <li class="no">Fully automatic repair of corrupted chunks</li>
+              <li class="no">Recovery if every root-key holder is lost</li>
+              <li class="no">Resilient multi-relay networking and remote signers</li>
+              <li class="no">A dedicated export command, though materializing works</li>
+            </ul>
+            <!-- /slot:status/not-yet -->
+          </div>
+        </div>
+        <p class="licence">MIT licensed. Identity rides on Nostr-style keys; transport runs on iroh. The <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd" target="_blank" rel="noopener noreferrer">repository</a> holds the full status and the normative format spec.</p>
+      </div>
+    </section>
+
+    <section class="section" id="start">
+      <div class="wrap">
+        <h2>Run it yourself</h2>
+        <p class="standfirst">The alpha gives you the local substrate first: create a drive, mount it, invite peers.</p>
+        <div class="cli">
+<pre><code><span class="c"># needs Nix, or build from source per the README</span>
+nix run .#wyrd -- --help
+
+<span class="c"># credentials, each a private file</span>
+head -c 32 /dev/urandom &gt; identity.bin &amp;&amp; chmod 600 identity.bin
+printf 'my-passphrase' &gt; passphrase.txt &amp;&amp; chmod 600 passphrase.txt
+
+<span class="c"># create a drive, then mount a live view of it</span>
+wyrd init ./mydrive --identity-file ./identity.bin --passphrase-file ./passphrase.txt
+wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./passphrase.txt</code></pre>
+        </div>
+        <p class="run-note">Mounting needs system FUSE, libfuse on Linux or macFUSE on macOS. Without a <code>--relay</code> flag the drive stays local-only. Full setup lives in the <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd" target="_blank" rel="noopener noreferrer">repository</a>.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-word">wyrd</div>
+          <div class="footer-tag">A decentralized data substrate, kept honestly.</div>
+        </div>
+        <div class="footer-links">
+          <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd" target="_blank" rel="noopener noreferrer">gitworkshop</a>
+          <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd/tree/master/LICENSE" target="_blank" rel="noopener noreferrer">License</a>
+          <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd/tree/master/ROADMAP.md" target="_blank" rel="noopener noreferrer">Roadmap</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  var snaps = [
+    {
+      id: "snapshot 0a13…e02",
+      moment: "first write",
+      store: "store holds 3 objects",
+      view: '<div><span class="ok">field-notes.txt</span> <span class="absent">(3 chunks)</span></div>' +
+            '<div class="absent">9be2…11  77ac…f0  c301…9d</div>' +
+            '<div class="holders">held by <b>laptop</b>, <b>vault</b>; phone holds nothing yet</div>',
+      note: "Three pieces land in the store, and the snapshot points at all three."
+    },
+    {
+      id: "snapshot c1f9…44a",
+      moment: "edited a paragraph",
+      store: "store holds 5 objects",
+      view: '<div><span class="ok">field-notes.txt</span> <span class="absent">(revised, 2 chunks shared)</span></div>' +
+            '<div class="absent">9be2…11  77ac…f0  <span class="ok">41de…b8  e077…2a</span></div>' +
+            '<div class="holders">held by <b>laptop</b>, <b>vault</b>; phone fetches it on demand</div>',
+      note: "Two new pieces join. The two unchanged ones are shared, not copied."
+    },
+    {
+      id: "snapshot 77bd…10f",
+      moment: "deleted the file",
+      store: "store holds 5 objects",
+      view: '<div class="gone">field-notes.txt is gone from this view.</div>' +
+            '<div class="absent">Nothing was erased. All 5 objects remain.</div>' +
+            '<div class="holders">no live view references it; <b>vault</b> still holds all 5 objects</div>',
+      note: "Deletion is a state change: the snapshot stops referencing the file."
+    },
+    {
+      id: "materialize 0a13…e02",
+      moment: "stepped back in time",
+      store: "store holds 5 objects",
+      view: '<div><span class="ok">field-notes.txt</span> <span class="absent">(as first written)</span></div>' +
+            '<div class="absent">9be2…11  77ac…f0  c301…9d</div>' +
+            '<div class="holders"><b>phone</b> materializes the original on demand; nothing was re-uploaded</div>',
+      note: "Any snapshot materializes into a plain directory. The past is intact."
+    }
+  ];
+  var i = 0;
+  var id = document.getElementById("drive-id");
+  var moment = document.getElementById("drive-moment");
+  var store = document.getElementById("drive-store");
+  var view = document.getElementById("drive-view");
+  var note = document.getElementById("drive-note");
+  var prev = document.getElementById("drive-prev");
+  var next = document.getElementById("drive-next");
+  var dots = Array.prototype.slice.call(document.querySelectorAll(".drive-dot"));
+  function render(){
+    id.textContent = snaps[i].id;
+    moment.textContent = snaps[i].moment;
+    store.textContent = snaps[i].store;
+    view.innerHTML = snaps[i].view;
+    note.textContent = snaps[i].note;
+    prev.disabled = (i === 0);
+    next.disabled = (i === snaps.length - 1);
+    dots.forEach(function(d, k){ d.setAttribute("aria-current", k === i ? "true" : "false"); });
+  }
+  prev.addEventListener("click", function(){ if (i > 0){ i -= 1; announce(); render(); restart(); } });
+  next.addEventListener("click", function(){ if (i < snaps.length - 1){ i += 1; announce(); render(); restart(); } });
+  dots.forEach(function(d){
+    d.addEventListener("click", function(){ i = parseInt(d.getAttribute("data-snap"), 10); announce(); render(); restart(); });
+  });
+
+  /* Auto-play every 5 seconds, looping. Pauses while hovered or focused,
+     while the tab is hidden, and entirely under reduced motion. Screen
+     readers only hear manual steps, never the auto-advance. */
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var panel = view.closest(".drive");
+  var timer = null;
+  function announce(){ view.setAttribute("aria-live", "polite"); }
+  function silence(){ view.setAttribute("aria-live", "off"); }
+  function stop(){ if (timer){ clearInterval(timer); timer = null; } }
+  function start(){
+    if (reduceMotion || timer || document.hidden) return;
+    silence();
+    timer = setInterval(function(){ i = (i + 1) % snaps.length; render(); }, 5000);
+  }
+  function restart(){ stop(); start(); }
+  if (panel){
+    panel.addEventListener("pointerenter", stop);
+    panel.addEventListener("pointerleave", start);
+    panel.addEventListener("focusin", stop);
+    panel.addEventListener("focusout", start);
+  }
+  document.addEventListener("visibilitychange", function(){
+    if (document.hidden){ stop(); } else { start(); }
+  });
+  render();
+  start();
+})();
+</script>
+</body>
+</html>

@@ -88,6 +88,11 @@ pub enum InvalidReason {
     /// The changes fail to apply (dangling owners, duplicate
     /// admits/removes, `SetOwners` rules).
     BadChanges,
+    /// An `Admit` names a retired device identity: the device was
+    /// admitted before on this predecessor chain. Device identity is
+    /// single-use within a membership chain; replacing a device means
+    /// admitting a fresh `DeviceId`.
+    AdmitRetiredDevice,
     /// The declared set roots differ from the derived ones.
     RootMismatch,
     /// Genesis does not end with exactly one member who is the owner.

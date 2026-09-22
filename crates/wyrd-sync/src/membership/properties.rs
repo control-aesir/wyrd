@@ -50,21 +50,25 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 }
 
 /// Interpret ops into a valid linear chain: ill-formed ops (admitting a
-/// member, removing the owner or a stranger) degrade to `Rotate`, so
-/// every generated chain is canonical end to end and the properties can
-/// assert global invariants rather than re-derive validity.
+/// member, admitting a retired device, removing the owner or a stranger)
+/// degrade to `Rotate`, so every generated chain is canonical end to end
+/// and the properties can assert global invariants rather than re-derive
+/// validity. The retired-device rule mirrors the chain invariant:
+/// identity is single-use within a membership chain.
 fn build_chain(ops: &[Op]) -> Vec<MembershipTransition> {
     let (mut b, genesis) = Builder::genesis(10);
     let mut members = BTreeSet::from([0usize]);
+    let mut retired = BTreeSet::new();
     let mut chain = vec![genesis];
     for op in ops {
         let changes = match op {
-            Op::Admit(i) if !members.contains(i) => {
+            Op::Admit(i) if !members.contains(i) && !retired.contains(i) => {
                 members.insert(*i);
                 vec![admit(device(*i))]
             }
             Op::Remove(i) if *i != 0 && members.contains(i) => {
                 members.remove(i);
+                retired.insert(*i);
                 vec![Change::Remove(device(*i))]
             }
             Op::Admit(_) | Op::Remove(_) | Op::Rotate => vec![Change::Rotate],
@@ -124,6 +128,21 @@ fn observe_all(log: &mut MembershipLog, transitions: &[MembershipTransition]) {
     for t in transitions {
         log.observe(t.clone());
     }
+}
+
+/// Ever-admitted devices at the tip of a generated chain: the
+/// retirement set the fresh-device finders must avoid. A removed device
+/// leaves `tip_members` but stays retired — identity is single-use.
+fn tip_seen(chain: &[MembershipTransition]) -> BTreeSet<DeviceId> {
+    let mut seen = BTreeSet::from([device(0)]);
+    for t in chain.iter().skip(1) {
+        for c in t.changes() {
+            if let Change::Admit(a) = c {
+                seen.insert(a.device);
+            }
+        }
+    }
+    seen
 }
 
 /// Member set at the tip of a generated chain, replayed the way the
@@ -212,9 +231,12 @@ proptest! {
         let tip_id = b.prev.expect("prefix tip");
         let tip_epoch = b.epoch;
         // Two valid siblings: Rotate vs admitting a fresh device.
+        // Fresh means never admitted, not merely not-a-member: a
+        // retired device stays retired.
+        let seen = tip_seen(&prefix_chain);
         let mut pool_fresh = fresh;
-        if members.contains(&device(pool_fresh)) || pool_fresh == 0 {
-            pool_fresh = (0..POOL).find(|i| *i != 0 && !members.contains(&device(*i))).expect("pool has room");
+        if members.contains(&device(pool_fresh)) || seen.contains(&device(pool_fresh)) || pool_fresh == 0 {
+            pool_fresh = (0..POOL).find(|i| *i != 0 && !seen.contains(&device(*i))).expect("pool has room");
         }
         let fork_rotate = signed(
             &b, tip_epoch + 1, Some(tip_id), Vec::new(), vec![Change::Rotate],
@@ -284,7 +306,7 @@ proptest! {
             &b, tip_epoch + 1, Some(tip_id), Vec::new(), vec![Change::Rotate],
             &member_vec, &[owner], &sk_owner, owner,
         );
-        let fresh = (0..POOL).find(|i| *i != 0 && !members.contains(&device(*i))).expect("pool has room");
+        let fresh = (0..POOL).find(|i| *i != 0 && !tip_seen(&prefix_chain).contains(&device(*i))).expect("pool has room");
         let mut with_new = members.clone();
         with_new.insert(device(fresh));
         let fork = signed(
@@ -366,7 +388,7 @@ proptest! {
             let tip_id = tip.transition_id();
             let tip_epoch = tip.epoch;
             let fresh = (0..POOL)
-                .find(|i| *i != 0 && !members.contains(&device(*i)))
+                .find(|i| *i != 0 && !tip_seen(&chain).contains(&device(*i)))
                 .expect("pool has room");
             let member_vec: Vec<DeviceId> = members.iter().copied().collect();
             let sibling_rotate = signed(

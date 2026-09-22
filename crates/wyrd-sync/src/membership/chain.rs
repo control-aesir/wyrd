@@ -7,8 +7,8 @@
 //! in ascending epoch order (id order as tiebreak), so every predecessor
 //! is classified before its children and the result is deterministic.
 
-use std::collections::{HashMap, HashSet};
-use wyrd_format::{MembershipTransition, TransitionId};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 
 use super::state::MembershipState;
 use super::validate::{
@@ -19,8 +19,16 @@ use super::{InvalidReason, MembershipLog, TransitionStatus};
 /// The outcome of validating one transition against its predecessor.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Link {
-    /// Valid link; carries the derived state.
-    Valid(MembershipState),
+    /// Valid link; carries the derived state plus the chain's
+    /// historical admission set: every device admitted from genesis
+    /// through this transition. Retirement is chain-local — the set
+    /// flows through predecessor links only, so a voided branch never
+    /// poisons its siblings. Current state and history stay separate:
+    /// the member/owner roots cover the current sets alone.
+    Valid {
+        state: MembershipState,
+        admitted: BTreeSet<DeviceId>,
+    },
     /// Failed its own checks.
     Invalid(InvalidReason),
     /// Ancestry is unobserved; may become valid.
@@ -71,7 +79,7 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
     // Genesis selection: canonical(1) is the unique valid genesis.
     let geneses: Vec<TransitionId> = by_epoch
         .iter()
-        .filter(|(epoch, id)| *epoch == 1 && matches!(link.get(id), Some(Link::Valid(_))))
+        .filter(|(epoch, id)| *epoch == 1 && matches!(link.get(id), Some(Link::Valid { .. })))
         .map(|(_, id)| *id)
         .collect();
     match geneses.len() {
@@ -79,7 +87,7 @@ pub(crate) fn analyse(log: &MembershipLog) -> Analysis {
         1 => {
             let genesis = geneses[0];
             result.status.insert(genesis, TransitionStatus::Canonical);
-            if let Some(Link::Valid(state)) = link.get(&genesis) {
+            if let Some(Link::Valid { state, .. }) = link.get(&genesis) {
                 result.states.insert(genesis, state.clone());
             }
             result.canonical.push(genesis);
@@ -122,7 +130,10 @@ fn validate_link(
         return match derive_next(&empty, t)
             .and_then(|state| check_genesis_shape(&state).map(|_| state))
         {
-            Ok(state) => Link::Valid(state),
+            Ok(state) => Link::Valid {
+                state,
+                admitted: admits(t).collect(),
+            },
             Err(reason) => Link::Invalid(reason),
         };
     };
@@ -143,8 +154,8 @@ fn validate_link(
         Some(prev) => prev.clone(),
         None => return Link::Pending,
     };
-    let prev_state = match prev_link {
-        Link::Valid(state) => state,
+    let (prev_state, prev_admitted) = match prev_link {
+        Link::Valid { state, admitted } => (state, admitted),
         Link::Invalid(_) | Link::Orphaned => return Link::Orphaned,
         Link::Pending => return Link::Pending,
     };
@@ -157,6 +168,15 @@ fn validate_link(
         Ok(state) => state,
         Err(reason) => return Link::Invalid(reason),
     };
+
+    // Retired identities: an Admit names a device admitted before on
+    // this chain. Checked after derive so structural violations keep
+    // their own reasons (a same-transition remove+admit is BadChanges,
+    // not retirement). History flows through predecessor links, never
+    // the whole observed set.
+    if admits(t).any(|device| prev_admitted.contains(&device)) {
+        return Link::Invalid(InvalidReason::AdmitRetiredDevice);
+    }
 
     // Resolution shape: `resolves` names each voided sibling exactly
     // once, and every entry must identify a valid transition at
@@ -177,12 +197,23 @@ fn validate_link(
         // Already classified, as with the predecessor above: a lookup,
         // never a descent. Unknown-but-observed stays Pending.
         match link.get(entry) {
-            Some(Link::Valid(_)) => {}
+            Some(Link::Valid { .. }) => {}
             Some(Link::Pending) | None => return Link::Pending,
             Some(_) => return Link::Invalid(InvalidReason::InvalidResolvesEntry),
         }
     }
-    Link::Valid(state)
+    Link::Valid {
+        state,
+        admitted: prev_admitted.iter().copied().chain(admits(t)).collect(),
+    }
+}
+
+/// Devices admitted by a transition's own changes.
+fn admits(t: &MembershipTransition) -> impl Iterator<Item = DeviceId> + '_ {
+    t.changes().iter().filter_map(|change| match change {
+        Change::Admit(admission) => Some(admission.device),
+        _ => None,
+    })
 }
 
 /// Memoized link classification for an observed transition. Gathers the
@@ -288,7 +319,7 @@ fn walk(
         let kids: Vec<TransitionId> = children_of(children, &current)
             .iter()
             .copied()
-            .filter(|c| matches!(link.get(c), Some(Link::Valid(_))))
+            .filter(|c| matches!(link.get(c), Some(Link::Valid { .. })))
             .collect();
         if kids.is_empty() {
             break;
@@ -311,7 +342,7 @@ fn walk(
                 break;
             }
             result.status.insert(child, TransitionStatus::Canonical);
-            if let Some(Link::Valid(state)) = link.get(&child) {
+            if let Some(Link::Valid { state, .. }) = link.get(&child) {
                 result.states.insert(child, state.clone());
             }
             result.canonical.push(child);
@@ -364,7 +395,7 @@ fn handle_conflict(
     let mut candidates: Vec<TransitionId> = Vec::new();
     for contender in contenders {
         for grand in children_of(children, contender) {
-            if !matches!(link.get(grand), Some(Link::Valid(_))) {
+            if !matches!(link.get(grand), Some(Link::Valid { .. })) {
                 continue;
             }
             // Grandchildren come from the same-pass index; a miss
@@ -411,12 +442,12 @@ fn handle_conflict(
                 return ConflictOutcome::Unresolved;
             };
             result.status.insert(winner, TransitionStatus::Canonical);
-            if let Some(Link::Valid(state)) = link.get(&winner) {
+            if let Some(Link::Valid { state, .. }) = link.get(&winner) {
                 result.states.insert(winner, state.clone());
             }
             result.canonical.push(winner);
             result.status.insert(r, TransitionStatus::Canonical);
-            if let Some(Link::Valid(state)) = link.get(&r) {
+            if let Some(Link::Valid { state, .. }) = link.get(&r) {
                 result.states.insert(r, state.clone());
             }
             result.canonical.push(r);
@@ -433,7 +464,7 @@ fn handle_conflict(
                     TransitionStatus::Contested
                 };
                 result.status.insert(*c, status);
-                if let Some(Link::Valid(state)) = link.get(c) {
+                if let Some(Link::Valid { state, .. }) = link.get(c) {
                     result.states.insert(*c, state.clone());
                 }
             }
@@ -454,7 +485,7 @@ fn handle_conflict(
 fn mark_contested(link: &HashMap<TransitionId, Link>, result: &mut Analysis, ids: &[TransitionId]) {
     for id in ids {
         result.status.insert(*id, TransitionStatus::Contested);
-        if let Some(Link::Valid(state)) = link.get(id) {
+        if let Some(Link::Valid { state, .. }) = link.get(id) {
             result.states.insert(*id, state.clone());
         }
     }
@@ -490,7 +521,7 @@ fn classify_remaining(
             Link::Orphaned => {
                 result.status.insert(id, TransitionStatus::Orphaned);
             }
-            Link::Valid(state) => {
+            Link::Valid { state, .. } => {
                 // Inherit from the nearest classified ancestor.
                 let mut current = id;
                 let status = loop {
@@ -554,7 +585,7 @@ mod tests {
         }
         let tip = chain.last().expect("nonempty chain");
         let mut link = HashMap::new();
-        assert!(matches!(link_for(&log, tip, &mut link), Link::Valid(_)));
+        assert!(matches!(link_for(&log, tip, &mut link), Link::Valid { .. }));
         assert_eq!(link.len(), DEPTH, "every link classified exactly once");
     }
 }

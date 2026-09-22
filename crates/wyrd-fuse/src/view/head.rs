@@ -74,3 +74,15 @@ impl ViewHead {
         }
     }
 }
+
+// SAFETY: `wyrd_core::view::Head` is constructible only from sync's
+// `AuthorizedSnapshot`, which only BIP-340 verification produces —
+// the same trust claim as the daemon's former `LiveHead`, carried by
+// the type instead of a second wrapper. This is the one production
+// crossing from verified sync state into view heads.
+#[allow(unsafe_code)]
+unsafe impl VerifiedSnapshot for wyrd_core::view::Head {
+    fn into_snapshot(self) -> Snapshot {
+        wyrd_core::view::Head::into_snapshot(self)
+    }
+}

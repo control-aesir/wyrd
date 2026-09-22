@@ -16,7 +16,9 @@
 //! the view consults for absent content. [`NamespaceView`] (below, next
 //! commit) is the read surface the node loop programs against.
 
-use wyrd_format::{ContentId, FetchStatus, Snapshot, StoreFailure};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use wyrd_format::{ContentId, FetchStatus, ObjectStore, Snapshot, StoreFailure};
 use wyrd_sync::durable::AuthorizedSnapshot;
 
 /// The residency policy for content the local store does not hold: a
@@ -180,4 +182,73 @@ pub enum ViewError {
     Corrupt,
     #[error("local store failure: {1}")]
     Store(StoreFailure, String),
+}
+
+/// The read surface the node loop programs against: what the node
+/// requires from a namespace view, derived from the loop's own needs
+/// (publish generations, serve reads, apply mutations) rather than
+/// from any one presentation backend.
+///
+/// Heads cross as [`Head`], never as raw snapshots, so every
+/// implementation serves verified state by construction. The
+/// constructors are the node-facing pair: views with their own
+/// admission ticket (like `DriveView`'s `ViewHead` constructors, kept
+/// for tests and backends) convert at their boundary.
+pub trait NamespaceView: Sized {
+    /// The object store behind the view.
+    type Store: ObjectStore;
+    /// The residency policy consulted for absent content.
+    type Materialization: MaterializationPolicy;
+
+    /// Open a view over an owned store and verified heads.
+    fn open(store: Self::Store, materialization: Self::Materialization, heads: Vec<Head>) -> Self;
+
+    /// Open a view over a shared store handle: the loop and the
+    /// serving backend address the same bytes, each locking only for
+    /// its own operation.
+    fn open_shared(
+        store: Arc<RwLock<Self::Store>>,
+        materialization: Self::Materialization,
+        heads: Vec<Head>,
+    ) -> Self;
+
+    /// Clone the shared store handle: fetch and intake address the
+    /// store without taking the view lock, so bulk I/O never stalls
+    /// serving.
+    fn store_handle(&self) -> Arc<RwLock<Self::Store>>;
+
+    /// Read the backing object store. Poison fails closed, never
+    /// serves a torn store.
+    fn store_read(&self) -> Result<RwLockReadGuard<'_, Self::Store>, ViewLockError>;
+
+    /// Write the backing object store. Same fail-closed poison mapping.
+    fn store_write(&self) -> Result<RwLockWriteGuard<'_, Self::Store>, ViewLockError>;
+
+    /// Replace the head set: "current" is policy over heads, and the
+    /// policy owner updates the publication as heads advance. Only
+    /// verified heads cross here.
+    fn set_heads(&mut self, heads: Vec<Head>);
+
+    /// Replace the residency policy after engine work.
+    fn set_materialization(&mut self, materialization: Self::Materialization);
+
+    /// The residency policy's status for one content id.
+    fn status(&self, id: &ContentId) -> FetchStatus;
+
+    /// Resolve a path to its node, merging across heads.
+    fn lookup(&self, path: &str) -> Result<Node, ViewError>;
+
+    /// Attributes for a path: `lookup` plus the attr projection.
+    fn stat(&self, path: &str) -> Result<Attr, ViewError>;
+
+    /// List a directory's children.
+    fn readdir(&self, node: &Node) -> Result<Vec<DirEntry>, ViewError>;
+
+    /// Open a file for reading. Directory, symlink, and conflict nodes
+    /// fail; symlinks resolve at the presentation boundary, never here.
+    fn open_file(&self, node: &Node) -> Result<OpenFile, ViewError>;
+
+    /// Read `len` bytes at `offset`, bounded by the declared size with
+    /// the same windowed integrity the view documents.
+    fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError>;
 }

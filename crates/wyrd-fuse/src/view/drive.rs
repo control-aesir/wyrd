@@ -10,6 +10,7 @@ use super::grammar;
 use super::head::ViewHead;
 use super::merge::merge;
 use super::types::{Attr, DirEntry, Kind, Materialization, Node, OpenFile, ViewError};
+use wyrd_core::view::{Head, NamespaceView, ViewLockError};
 
 /// A mounted drive's read-only view: the head set plus the stores that
 /// serve it. Heads are whole snapshots; the walked root is always the
@@ -470,4 +471,79 @@ fn parse_path(path: &str) -> Result<Vec<Component>, ViewError> {
         return Err(ViewError::InvalidPath);
     }
     Ok(components)
+}
+
+/// The node-facing surface over this view: the read operations the
+/// node loop programs against, with heads crossing as verified
+/// [`Head`]s. The inherent `ViewHead` constructors stay for tests and
+/// backends with their own admission ticket; this impl converts at the
+/// boundary, so both paths serve identical bytes.
+impl<S, M> NamespaceView for DriveView<S, M>
+where
+    S: ObjectStore,
+    S::Error: std::fmt::Debug,
+    M: Materialization,
+{
+    type Store = S;
+    type Materialization = M;
+
+    fn open(store: S, materialization: M, heads: Vec<Head>) -> Self {
+        DriveView {
+            store: Arc::new(RwLock::new(store)),
+            materialization,
+            heads: heads.into_iter().map(Head::into_snapshot).collect(),
+        }
+    }
+
+    fn open_shared(store: Arc<RwLock<S>>, materialization: M, heads: Vec<Head>) -> Self {
+        DriveView {
+            store,
+            materialization,
+            heads: heads.into_iter().map(Head::into_snapshot).collect(),
+        }
+    }
+
+    fn store_handle(&self) -> Arc<RwLock<S>> {
+        Arc::clone(&self.store)
+    }
+
+    fn store_read(&self) -> Result<RwLockReadGuard<'_, S>, ViewLockError> {
+        self.store.read().map_err(|_| ViewLockError)
+    }
+
+    fn store_write(&self) -> Result<RwLockWriteGuard<'_, S>, ViewLockError> {
+        self.store.write().map_err(|_| ViewLockError)
+    }
+
+    fn set_heads(&mut self, heads: Vec<Head>) {
+        self.heads = heads.into_iter().map(Head::into_snapshot).collect();
+    }
+
+    fn set_materialization(&mut self, materialization: M) {
+        self.materialization = materialization;
+    }
+
+    fn status(&self, id: &ContentId) -> FetchStatus {
+        self.materialization.status(id)
+    }
+
+    fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+        self.lookup(path)
+    }
+
+    fn stat(&self, path: &str) -> Result<Attr, ViewError> {
+        self.stat(path)
+    }
+
+    fn readdir(&self, node: &Node) -> Result<Vec<DirEntry>, ViewError> {
+        self.readdir(node)
+    }
+
+    fn open_file(&self, node: &Node) -> Result<OpenFile, ViewError> {
+        self.open(node)
+    }
+
+    fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError> {
+        self.read(file, offset, len)
+    }
 }

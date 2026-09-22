@@ -205,6 +205,11 @@ fn is_populated(dest: &Path) -> bool {
 /// fate — published trees never contain it, failed runs remove it
 /// with everything else — and it is written by exactly one owner, so
 /// no coordination beyond the filesystem is needed.
+///
+/// Updates are atomic (write-then-rename), never truncate-in-place:
+/// a concurrent reader sees the old complete timestamp or the new
+/// complete one, never a torn file. Without that, a sweeper reading
+/// mid-rewrite would misread a live run as marker-less.
 const HEARTBEAT_FILE: &str = ".wyrd-heartbeat";
 
 /// A heartbeat older than this marks its staging as crashed: no
@@ -276,6 +281,18 @@ fn staging_parts(dest: &Path) -> (String, PathBuf) {
 /// means there is nothing to sweep; anything else failing here fails
 /// the export, fail-closed.
 fn sweep_stale_staging(dest: &Path, now: SystemTime) -> Result<(), ExportError> {
+    sweep_staging_with_probe(dest, now, &mut |_| {})
+}
+
+/// The sweep with a test seam: `probe` runs between stale
+/// classification and removal, so a test can refresh the heartbeat
+/// in that window and prove the recheck spares the directory. The
+/// production probe is a no-op.
+fn sweep_staging_with_probe(
+    dest: &Path,
+    now: SystemTime,
+    probe: &mut dyn FnMut(&Path),
+) -> Result<(), ExportError> {
     let (stem, parent) = staging_parts(dest);
     if parent.as_os_str().is_empty() {
         return Ok(());
@@ -309,6 +326,17 @@ fn sweep_stale_staging(dest: &Path, now: SystemTime) -> Result<(), ExportError> 
         if !is_stale(&path, now) {
             continue;
         }
+        probe(&path);
+        // Recheck immediately before removal: a heartbeat refreshed
+        // after classification (a live run beating in the window)
+        // spares the directory. The residual race — a refresh landing
+        // between this recheck and the removal — costs a run stalled
+        // past the lease its staging, and it fails loudly on its next
+        // filesystem op; `dest` itself is never partial. That window
+        // is one re-read wide, not one lease wide.
+        if !is_stale(&path, now) {
+            continue;
+        }
         match fs::remove_dir_all(&path) {
             Ok(()) => {}
             // Vanished mid-sweep: its owner published or cleaned it
@@ -323,12 +351,13 @@ fn sweep_stale_staging(dest: &Path, now: SystemTime) -> Result<(), ExportError> 
 }
 
 /// Whether a staging sibling belongs to a crashed run: its heartbeat
-/// timestamp is older than [`STALE_AFTER`]. A missing or unreadable
-/// heartbeat falls back to the directory mtime, so a crash before
-/// the first heartbeat still ages out; a missing mtime reads as
-/// live. Every fallback points at leaving the directory alone —
-/// deleting a live export is the one outcome this predicate must
-/// never produce.
+/// timestamp is older than [`STALE_AFTER`]. Heartbeat updates are
+/// atomic renames, so a reader never sees a torn marker — only
+/// complete old or new timestamps. A missing or unparsable marker
+/// falls back to the directory mtime, so a crash before the first
+/// heartbeat still ages out; a missing mtime reads as live. Every
+/// fallback points at leaving the directory alone — deleting a live
+/// export is the one outcome this predicate must never produce.
 fn is_stale(staging: &Path, now: SystemTime) -> bool {
     if let Some(beat) = fs::read_to_string(staging.join(HEARTBEAT_FILE))
         .ok()
@@ -354,10 +383,12 @@ fn now_nanos(now: SystemTime) -> u128 {
 }
 
 /// One run's heartbeat writer: rewrites the timestamp file as the
-/// walk progresses. Write failures surface as I/O errors, which is
-/// also what a run observes when its staging disappears underneath
-/// it — either way the export fails loudly instead of publishing
-/// from a tree it no longer owns.
+/// walk progresses, atomically (write a sibling, rename over the
+/// marker) so concurrent readers never see a torn value. Write
+/// failures surface as I/O errors, which is also what a run
+/// observes when its staging disappears underneath it — either way
+/// the export fails loudly instead of publishing from a tree it no
+/// longer owns.
 struct Heartbeat {
     path: PathBuf,
 }
@@ -368,7 +399,10 @@ impl Heartbeat {
     }
 
     fn beat(&mut self) -> std::io::Result<()> {
-        fs::write(&self.path, now_nanos(SystemTime::now()).to_string())
+        let pending = self.path.with_extension("tmp");
+        fs::write(&pending, now_nanos(SystemTime::now()).to_string())?;
+        fs::rename(&pending, &self.path)?;
+        Ok(())
     }
 }
 
@@ -1145,6 +1179,50 @@ mod tests {
         assert_eq!(report.files, 6);
         assert!(live.is_dir(), "a live export's staging is untouched");
         assert!(out.is_dir(), "our own export published normally");
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn heartbeat_refreshed_before_removal_spares_the_directory() {
+        // The classification/removal race, deterministically: the
+        // staging reads stale, the owner beats in the window (the
+        // probe), and the recheck must spare it. Without the recheck
+        // this test deletes a live run's tree.
+        let dest = tmp();
+        let out = dest.join("out");
+        let staging = out.with_file_name("out.wyrd-export.3.3");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(HEARTBEAT_FILE), b"1").unwrap();
+
+        sweep_staging_with_probe(&out, SystemTime::now(), &mut |path| {
+            assert_eq!(path, staging);
+            std::fs::write(
+                staging.join(HEARTBEAT_FILE),
+                now_nanos(SystemTime::now()).to_string(),
+            )
+            .unwrap();
+        })
+        .unwrap();
+
+        assert!(staging.is_dir(), "the refreshed run survives the sweep");
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn unparsable_heartbeat_with_fresh_dir_survives() {
+        // A torn or foreign marker must never read as stale on its
+        // own: with atomic heartbeat renames our own markers are
+        // always complete, so garbage falls back to the directory
+        // mtime — fresh here — and the directory is left alone.
+        let dest = tmp();
+        let out = dest.join("out");
+        let staging = out.with_file_name("out.wyrd-export.4.4");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(HEARTBEAT_FILE), b"\0 torn \0").unwrap();
+
+        sweep_stale_staging(&out, SystemTime::now()).unwrap();
+
+        assert!(staging.is_dir(), "garbage marker alone sweeps nothing");
         std::fs::remove_dir_all(dest).unwrap();
     }
 

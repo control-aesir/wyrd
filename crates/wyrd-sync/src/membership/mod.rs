@@ -295,6 +295,16 @@ impl MembershipLog {
         self.state_of(id).map(|s| s.owners)
     }
 
+    /// The canonical chain's genesis, or `None` while the log has
+    /// no unique canonical chain (e.g. a genesis conflict). Genesis
+    /// selection must go through here: the observed set can hold
+    /// invalid epoch-1 transitions (intake persists any structurally
+    /// bounded transition as evidence), so selecting by shape alone
+    /// can anchor to bytes no invitee accepts.
+    pub fn canonical_genesis(&self) -> Option<TransitionId> {
+        chain::analyse(self).canonical.first().copied()
+    }
+
     /// Whether the device was ever admitted on the canonical chain:
     /// retired identities are single-use and cannot be re-admitted,
     /// even after removal. Follows predecessor links from the known

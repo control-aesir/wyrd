@@ -10,7 +10,7 @@ use crate::control::{seal, Message};
 use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::keys::capability::WrappedCapability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
-use crate::membership::test_util::{drive as member_drive, key, Builder};
+use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
 use crate::runtime::test_util::{
     control_key, encryption_key, identity, identity_secret, transition_message, MemoryMailbox,
     MemoryRelay, TestDir,
@@ -383,5 +383,115 @@ fn admit_delivers_current_heads_to_the_newcomer() {
     assert!(
         held.runtime.announcement(&head_id).is_some(),
         "newcomer learns the head snapshot"
+    );
+}
+
+#[test]
+fn admission_anchors_to_canonical_genesis_despite_invalid_rival() {
+    use crate::membership::{InvalidReason, TransitionStatus};
+    use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+    use wyrd_format::{Change, MembershipTransition};
+
+    let (_dir, mut engine, genesis_id) = owner_engine("admit-invalid-genesis");
+
+    // An invalid epoch-1 rival: claims another owner but carries the
+    // wrong key's signature, so it classifies `Invalid` — yet intake
+    // persists any structurally bounded transition as observed
+    // evidence. The rival id sorts before the valid genesis, which is
+    // exactly the shape that used to win genesis selection by id
+    // order. The search is deterministic: fixed candidates, first one
+    // that sorts first.
+    let mut rival = None;
+    for byte in 0x40..=0x7Fu8 {
+        let (_, owner) = key(byte);
+        let (wrong_sk, _) = key(byte.wrapping_add(1));
+        let mut candidate = MembershipTransition::new(
+            1,
+            None,
+            Vec::new(),
+            vec![
+                Change::Admit(Admission {
+                    device: owner,
+                    encryption_key: encryption_key(
+                        &DeviceEncryptionSecret::from_bytes([0xE7; 32]).unwrap(),
+                    ),
+                }),
+                Change::SetOwners(vec![owner]),
+            ],
+            set_root(MEMBER_SET_CONTEXT, &[owner]).unwrap(),
+            set_root(OWNER_SET_CONTEXT, &[owner]).unwrap(),
+            owner,
+        )
+        .unwrap();
+        sign(&mut candidate, &wrong_sk, &member_drive());
+        if candidate.transition_id() < genesis_id {
+            rival = Some(candidate);
+            break;
+        }
+    }
+    let rival = rival.expect("a rival genesis id sorting before the valid one");
+    let rival_id = rival.transition_id();
+
+    // The rival arrives over the wire like any gossip: intake
+    // persists it as evidence without promoting it.
+    let sealed = seal(
+        &control_key(1),
+        &member_drive(),
+        1,
+        &transition_message(&rival),
+    )
+    .unwrap();
+    let (sender_sk, _) = identity(0x01);
+    let mut relay = MemoryRelay::default();
+    relay.push(seal_for_recipient(&sender_sk, engine.device(), &sealed.encode()).unwrap());
+    let mut mailbox = MemoryMailbox {
+        relay: &mut relay,
+        owner: engine.device(),
+    };
+    let report = engine.drain(&mut mailbox).unwrap();
+    assert_eq!(report.accepted, 1, "rival persists as observed evidence");
+    assert!(
+        matches!(
+            engine.log.status(&rival_id),
+            Some(TransitionStatus::Invalid(InvalidReason::BadSignature))
+        ),
+        "rival classifies invalid, got {:?}",
+        engine.log.status(&rival_id)
+    );
+    assert_eq!(
+        engine.log.known_state().expect("tip").transition_id,
+        genesis_id,
+        "rival changes no canonical state"
+    );
+
+    // Admission still anchors the invitation to the canonical
+    // genesis, and the newcomer accepts it: under shape-based
+    // selection this join failed with `BadGenesis` after the owner's
+    // transition was already durable.
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    let invitation = open_bootstrap(&newcomer_encryption, &outcome.invitation).unwrap();
+    let anchored = MembershipTransition::from_canonical_bytes(&invitation.genesis).unwrap();
+    assert_eq!(
+        anchored.transition_id(),
+        genesis_id,
+        "invitation anchors to the canonical genesis"
+    );
+    let join_dir = TestDir::new("admit-invalid-genesis-join");
+    let joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+        &outcome.invitation,
+    )
+    .unwrap();
+    assert!(
+        joined.log.known_state().is_some(),
+        "invitee accepts the anchored invitation"
     );
 }

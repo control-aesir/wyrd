@@ -415,6 +415,138 @@ fn shutdown_during_recovery_episode_stays_bounded() {
     );
 }
 
+/// Concurrent resubscribe transactions serialize instead of
+/// interleaving their CLOSE+REQ halves: every caller in a burst over
+/// the mailbox's own client, filter, subscription ID, and lock reports
+/// success (no subscribe failing on the locally still-registered ID,
+/// no subscribe stranded by another caller's CLOSE), the relay holds
+/// exactly one subscription afterward, and mail published after the
+/// burst delivers exactly once. This is the overlap saturation replay
+/// and both episode kinds can produce once episodes run as tasks.
+#[test]
+fn concurrent_resubscribes_serialize_under_one_subscription() {
+    const CALLERS: usize = 16;
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let receiver_key = receiver.public_key();
+    let relays = vec![url];
+
+    let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-resubscribe-race"));
+    // The initial REQ races the relay core loop: wait for
+    // registration instead of assuming it.
+    let registered = Instant::now();
+    while relay.subscription_count() != 1 {
+        assert!(
+            registered.elapsed() < DELIVERY_TIMEOUT,
+            "initial subscribe registers once"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Overlap the real transaction on the runtime: same client, filter,
+    // subscription ID, and lock the supervisor paths share.
+    let outcomes = mailbox.rt().block_on(async {
+        let mut tasks = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let client = Arc::clone(&mailbox.client);
+            let filter = mailbox.filter.clone();
+            let subscription_id = mailbox.subscription_id.clone();
+            let lock = Arc::clone(&mailbox.resubscribe_lock);
+            tasks.push(tokio::spawn(async move {
+                resubscribe(&client, &filter, &subscription_id, &lock).await
+            }));
+        }
+        let mut outcomes = Vec::with_capacity(CALLERS);
+        for task in tasks {
+            outcomes.push(task.await.expect("resubscribe task runs"));
+        }
+        outcomes
+    });
+    assert!(
+        outcomes.iter().all(|ok| *ok),
+        "serialized transactions all succeed"
+    );
+    // Registration races the relay core loop: poll for the single
+    // surviving subscription instead of assuming it.
+    let replaced = Instant::now();
+    while relay.subscription_count() != 1 {
+        assert!(
+            replaced.elapsed() < DELIVERY_TIMEOUT,
+            "one subscription replaces, not one per caller"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The surviving subscription is live: mail published after the
+    // burst delivers exactly once, not zero times (stranded CLOSE) and
+    // not multiplied (leaked subs).
+    relay.inject(seal_rumor(&sender, receiver_key, "after-burst".to_string()));
+    let delivery =
+        wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("post-burst mail delivers");
+    assert_eq!(delivery.envelope().ciphertext, "after-burst");
+    mailbox
+        .settle(delivery.id(), Disposition::Ack)
+        .expect("acks");
+    assert_quiet(&mut mailbox);
+}
+
+/// The resubscribe transaction honors the mailbox's lock: while the
+/// test holds it, a concurrent transaction cannot finish its CLOSE+REQ,
+/// and releasing the lock lets it through. Deterministic pin for the
+/// serialization the burst test above exercises — MiniRelay replaces
+/// same-ID subscriptions, so the burst's end state looks identical
+/// with or without the lock and only this probe fails when the
+/// acquisition is removed.
+#[test]
+fn resubscribe_waits_on_the_shared_lock() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let receiver = keys();
+    let relays = vec![url];
+
+    let mailbox = live_mailbox(&receiver, &relays, temp_path("seen-resubscribe-lock"));
+    let registered = Instant::now();
+    while relay.subscription_count() != 1 {
+        assert!(
+            registered.elapsed() < DELIVERY_TIMEOUT,
+            "initial subscribe registers once"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Hold the mailbox's own lock inside the runtime: no supervisor
+    // path contends for it on a healthy idle mailbox (no saturation,
+    // no episode), so the only waiter is the spawned transaction.
+    mailbox.rt().block_on(async {
+        let held = mailbox.resubscribe_lock.lock().await;
+        let client = Arc::clone(&mailbox.client);
+        let filter = mailbox.filter.clone();
+        let subscription_id = mailbox.subscription_id.clone();
+        let lock = Arc::clone(&mailbox.resubscribe_lock);
+        let pending =
+            tokio::spawn(
+                async move { resubscribe(&client, &filter, &subscription_id, &lock).await },
+            );
+        // Give a lock-ignoring transaction ample room to finish: it
+        // must still be pending while the lock is held.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !pending.is_finished(),
+            "resubscribe waits while the shared lock is held"
+        );
+        drop(held);
+        assert!(
+            tokio::time::timeout(DELIVERY_TIMEOUT, pending)
+                .await
+                .expect("resubscribe task runs")
+                .expect("resubscribe task succeeds"),
+            "released transaction succeeds"
+        );
+    });
+}
+
 /// Degraded, not down: with two relays and one killed, the mailbox
 /// stays live on the survivor and delivery flows — no recovery episode
 /// fires while at least one relay is connected.

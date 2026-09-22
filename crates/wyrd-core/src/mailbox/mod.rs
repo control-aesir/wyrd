@@ -436,6 +436,17 @@ pub struct LiveMailbox<S> {
     /// Relay count registered at construction, for [`MailboxHealth`]. The
     /// set never changes after `connect`, so this needs no synchronization.
     total_relays: usize,
+    /// The mailbox's stable relay attachment: one filter and one
+    /// subscription ID for the mailbox lifetime (see `connect`). Every
+    /// (re)subscribe — setup, saturation replay, both episode kinds —
+    /// uses these, so recovery replays never accumulate relay-side
+    /// subscriptions.
+    filter: Filter,
+    subscription_id: SubscriptionId,
+    /// Serializes resubscribe CLOSE+REQ transactions across the
+    /// saturation path and both episode kinds (see [`resubscribe`]).
+    /// Held for one transaction only, never across an episode.
+    resubscribe_lock: Arc<tokio::sync::Mutex<()>>,
     /// Handovers taken from the relay and not yet acked, in pull order,
     /// bounded by [`MAX_UNACKED_DELIVERIES`]. `recv` prefers new mail and
     /// otherwise rotates this deque front-to-back, re-offering each
@@ -558,6 +569,7 @@ where
         let subscription_id = SubscriptionId::generate();
         let setup_subscription_id = subscription_id.clone();
         let setup_filter = filter.clone();
+        let resubscribe_lock = Arc::new(tokio::sync::Mutex::new(()));
         runtime.block_on(async move {
             for relay in relay_urls {
                 client_for_setup
@@ -581,12 +593,13 @@ where
 
         runtime.spawn(supervise(
             Arc::clone(&client),
-            filter,
+            filter.clone(),
             Arc::clone(&incoming),
             Arc::clone(&intake_waker),
             Arc::clone(&health),
-            subscription_id,
+            subscription_id.clone(),
             total_relays,
+            Arc::clone(&resubscribe_lock),
         ));
 
         Ok(Self {
@@ -600,6 +613,9 @@ where
             intake_waker,
             health,
             total_relays,
+            filter,
+            subscription_id,
+            resubscribe_lock,
             unacked: VecDeque::new(),
             settled_below: 0,
             outstanding: HashSet::new(),
@@ -901,7 +917,21 @@ const OUTAGE_GRACE_TICKS: u32 = 3;
 /// (and the relay replaying) forever. Between CLOSE and REQ the relay
 /// retains everything and the new REQ replays it, so the gap loses
 /// nothing; seen/held dedupe converges the replay.
-async fn resubscribe(client: &Client, filter: &Filter, subscription_id: &SubscriptionId) -> bool {
+///
+/// The whole transaction holds the mailbox's resubscribe lock:
+/// saturation replay and both episode kinds share one stable ID, so
+/// interleaved halves can strand a subscribe-then-closed subscription
+/// or fail a subscribe on the locally still-registered ID. The lock is
+/// held for one transaction only — episodes release it between attempts
+/// and the tick loop only waits on it at due saturation ticks — so a
+/// wedged holder stalls at most one transaction, never supervision.
+async fn resubscribe(
+    client: &Client,
+    filter: &Filter,
+    subscription_id: &SubscriptionId,
+    lock: &tokio::sync::Mutex<()>,
+) -> bool {
+    let _transaction = lock.lock().await;
     // Unsubscribe only reports per-relay results inside its output, so
     // this cannot fail the episode: at worst the CLOSE is lost and the
     // relay holds one extra subscription until the next recovery.
@@ -935,10 +965,10 @@ async fn resubscribe(client: &Client, filter: &Filter, subscription_id: &Subscri
 /// supervision of the others, a second failure is reacted to on the next
 /// tick, and shutdown aborts the episode tasks instead of waiting out an
 /// outage. At most one episode per kind is in flight at a time. A
-/// saturation resubscribe can interleave with an episode resubscribe,
-/// but both go CLOSE-before-REQ under the stable subscription ID and any
-/// double replay converges through seen/held dedupe, so no lock
-/// serializes them.
+/// saturation resubscribe can run while an episode resubscribes; both
+/// go through [`resubscribe`], which serializes the CLOSE-before-REQ
+/// transaction on the mailbox's lock, and any double replay converges
+/// through seen/held dedupe.
 async fn supervise(
     client: Arc<Client>,
     filter: Filter,
@@ -947,6 +977,7 @@ async fn supervise(
     health: Arc<SupervisorState>,
     subscription_id: SubscriptionId,
     total_relays: usize,
+    resubscribe_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     let mut tick = tokio::time::interval(SUPERVISOR_INTERVAL);
     let mut down_ticks: u32 = 0;
@@ -975,7 +1006,7 @@ async fn supervise(
         if saturation_replay_due(last_saturation_replay, Instant::now())
             && health.saturated.swap(false, Ordering::Relaxed)
         {
-            if resubscribe(&client, &filter, &subscription_id).await {
+            if resubscribe(&client, &filter, &subscription_id, &resubscribe_lock).await {
                 health.saturation_recoveries.fetch_add(1, Ordering::Relaxed);
                 last_saturation_replay = Some(Instant::now());
             } else {
@@ -999,6 +1030,7 @@ async fn supervise(
             let episode_waker = Arc::clone(&intake_waker);
             let episode_health = Arc::clone(&health);
             let episode_subscription = subscription_id.clone();
+            let episode_lock = Arc::clone(&resubscribe_lock);
             tokio::spawn(async move {
                 let _claim = ClearOnDrop(&episode_health.stream_episode);
                 let _ = recover_stream(
@@ -1008,6 +1040,7 @@ async fn supervise(
                     &episode_waker,
                     &episode_health,
                     &episode_subscription,
+                    &episode_lock,
                 )
                 .await;
                 refresh(&episode_client, &episode_health).await;
@@ -1030,6 +1063,7 @@ async fn supervise(
                 let episode_filter = filter.clone();
                 let episode_health = Arc::clone(&health);
                 let episode_subscription = subscription_id.clone();
+                let episode_lock = Arc::clone(&resubscribe_lock);
                 tokio::spawn(async move {
                     let _claim = ClearOnDrop(&episode_health.relay_episode);
                     recover_relays(
@@ -1037,6 +1071,7 @@ async fn supervise(
                         &episode_filter,
                         &episode_health,
                         &episode_subscription,
+                        &episode_lock,
                     )
                     .await;
                     refresh(&episode_client, &episode_health).await;
@@ -1081,6 +1116,7 @@ async fn recover_stream(
     intake_waker: &Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: &Arc<SupervisorState>,
     subscription_id: &SubscriptionId,
+    resubscribe_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), MailboxError> {
     let receiver = establish_drainer(client, intake_waker, health).await;
     let mut attempt: u32 = 0;
@@ -1091,7 +1127,7 @@ async fn recover_stream(
             .stream_recovery_attempts
             .fetch_add(1, Ordering::Relaxed);
         client.connect().await;
-        if resubscribe(client, filter, subscription_id).await {
+        if resubscribe(client, filter, subscription_id, resubscribe_lock).await {
             break;
         }
         tokio::time::sleep(recovery_delay(attempt)).await;
@@ -1121,6 +1157,7 @@ async fn recover_relays(
     filter: &Filter,
     health: &Arc<SupervisorState>,
     subscription_id: &SubscriptionId,
+    resubscribe_lock: &Arc<tokio::sync::Mutex<()>>,
 ) {
     let mut attempt: u32 = 0;
     loop {
@@ -1131,7 +1168,8 @@ async fn recover_relays(
             .fetch_add(1, Ordering::Relaxed);
         client.connect().and_wait(RECOVERY_ATTEMPT_TIMEOUT).await;
         let connected = connected_count(client).await;
-        let recovered = connected > 0 && resubscribe(client, filter, subscription_id).await;
+        let recovered =
+            connected > 0 && resubscribe(client, filter, subscription_id, resubscribe_lock).await;
         health.connected_relays.store(connected, Ordering::Relaxed);
         if recovered {
             return;

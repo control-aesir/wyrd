@@ -11,4 +11,5 @@
 //! never its definition.
 
 pub mod session;
+pub mod wake;
 pub mod want;

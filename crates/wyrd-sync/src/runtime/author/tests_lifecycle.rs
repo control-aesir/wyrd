@@ -47,11 +47,15 @@ fn membership_lifecycle_bounds_acquisition_and_moves_authority() {
         &invitation_b,
     )
     .unwrap();
-    let mut receiver = MemoryMailbox {
-        relay: &mut relay,
-        owner: second_id,
+    // Scoped like the send above: the mailbox borrows the relay,
+    // so the borrow ends at the block instead of a `drop` no-op.
+    let first = {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: second_id,
+        };
+        joined_b.drain(&mut receiver).unwrap()
     };
-    let first = joined_b.drain(&mut receiver).unwrap();
     assert_eq!(first.accepted, 2, "transition plus capability");
     assert_eq!(
         joined_b.log.known_state().expect("tip").epoch,
@@ -68,7 +72,6 @@ fn membership_lifecycle_bounds_acquisition_and_moves_authority() {
             .is_some(),
         "B holds the admission-epoch secret"
     );
-    drop(receiver);
 
     // Admit C (epoch 3); its invitation goes unclaimed — C never
     // joins, which is fine: obligations queue until delivery.

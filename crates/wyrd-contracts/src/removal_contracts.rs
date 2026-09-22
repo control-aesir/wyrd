@@ -26,10 +26,11 @@ fn epoch1() -> EpochSecret {
 
 /// One owner engine holding epoch 1, mirroring the join rig: genesis
 /// drained, self capability committed, built only through public
-/// calls.
+/// calls. The fixture device stays local to the constructor: callers
+/// work through the engine, so keeping it on the struct would be an
+/// unread field.
 struct Owner {
     engine: Engine,
-    device: Device,
 }
 
 fn owner() -> Owner {
@@ -99,7 +100,7 @@ fn owner() -> Owner {
     )]);
     let report = engine.drain(&mut relay).unwrap();
     assert_eq!(report.accepted, 1, "self capability installs epoch 1");
-    Owner { engine, device }
+    Owner { engine }
 }
 
 /// Admit `newcomer` through the owner engine and join it from the

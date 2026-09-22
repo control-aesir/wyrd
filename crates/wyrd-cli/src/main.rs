@@ -18,17 +18,19 @@ use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
-use wyrd_format::{DeviceId, TransitionId};
+use wyrd_format::{DeviceEncryptionKey, DeviceId, TransitionId};
+use wyrd_sync::control::SealedBootstrap;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
 use wyrd_sync::runtime::Engine;
 use zeroize::Zeroizing;
 
 /// The `wyrd` binary: create a drive, mount its live projection,
-/// export its namespace to a plain directory tree, or administer its
-/// membership. All subcommands need the credential files (read and hardened by wyrd
-/// code, never by clap); `--relay` is mount-only deployment state —
-/// nothing in the keystore names relays, so they arrive as flags.
+/// export its namespace to a plain directory tree, administer its
+/// membership, or pair a new device. All subcommands need the
+/// credential files (read and hardened by wyrd code, never by clap);
+/// `--relay` is mount-only deployment state — nothing in the
+/// keystore names relays, so they arrive as flags.
 /// Export is offline by construction: no relays, no serving, no FUSE.
 #[derive(Debug, Parser)]
 #[command(name = "wyrd", version, about)]
@@ -89,15 +91,28 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
-    /// Administer drive membership: list members, inspect the log, or
-    /// author remove/rotate/set-owner transitions. Reads are offline
-    /// projections of the keystore; writes commit one transition plus
-    /// catch-up obligations, delivered on the next mounted sync.
+    /// Administer drive membership: list members, inspect the log,
+    /// invite a device, or author remove/rotate/set-owner transitions.
+    /// Reads are offline projections of the keystore; writes commit
+    /// one transition plus catch-up obligations, delivered on the
+    /// next mounted sync.
     Member {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
         #[command(subcommand)]
         action: MemberAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Pair this device with a drive: identify it, stage pairing
+    /// material for the owner, or join from a sealed invitation. The
+    /// owner admits the staged key via `member invite`; the invitation
+    /// file travels out-of-band.
+    Device {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: DeviceAction,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -132,6 +147,44 @@ enum MemberAction {
         /// The new owner, 64 hex characters.
         device: String,
     },
+    /// Admit a device (owner-only) and write its sealed invitation to
+    /// a file for out-of-band delivery. The transition commits with
+    /// the usual catch-up obligations; the invitation itself travels
+    /// outside wyrd, and the newcomer joins from it.
+    Invite {
+        /// Device to admit, 64 hex characters.
+        device: String,
+        /// Its encryption key, 64 hex characters (from its
+        /// pairing-request output).
+        encryption_key: String,
+        /// Where to write the sealed invitation.
+        out: PathBuf,
+    },
+}
+
+/// One local-device pairing action. Pairing and join are offline file
+/// exchanges; the drive directory holds the staged secret and (after
+/// join) the member custody record.
+#[derive(Debug, Subcommand)]
+enum DeviceAction {
+    /// Identify this device: its id plus the encryption key the
+    /// membership state registers for it (`unregistered` until the
+    /// device's admission arrives — a fresh join only holds genesis).
+    /// Also the cheapest reopen probe: it opens the keystore.
+    Id,
+    /// Stage this device's pairing secret and write the public
+    /// pairing material (device plus encryption key, no secrets) for
+    /// the owner. Re-running returns the same key.
+    PairingRequest {
+        /// Where to write the pairing material.
+        out: PathBuf,
+    },
+    /// Join a drive from the owner's sealed invitation. Writes member
+    /// custody before accepting, so the device reopens afterwards.
+    Join {
+        /// The sealed invitation file.
+        invitation: PathBuf,
+    },
 }
 
 #[cfg(unix)]
@@ -155,6 +208,10 @@ pub(crate) enum CliError {
     Credential { path: PathBuf, reason: &'static str },
     #[error("identity file must contain exactly 32 raw bytes or 64 hex characters")]
     IdentityFormat,
+    #[error("invitation file does not decode as a sealed bootstrap")]
+    InvitationFormat,
+    #[error("invitation file exceeds the 1 MiB size limit")]
+    InvitationTooLarge,
     #[error("identity secret is invalid: {0}")]
     Identity(#[from] wyrd_sync::keys::CryptoError),
     #[error("engine failed: {0}")]
@@ -202,6 +259,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
         Command::Member { credentials, .. } => read_credentials(credentials)?,
+        Command::Device { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
@@ -222,6 +280,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Member {
             drive_dir, action, ..
         } => member(drive_dir, action, &passphrase, identity),
+        Command::Device {
+            drive_dir, action, ..
+        } => device(drive_dir, action, &passphrase, identity),
     }
 }
 
@@ -658,7 +719,126 @@ fn member(
             println!("owner is now {device} at epoch {}", transition.epoch);
             Ok(())
         }
+        MemberAction::Invite {
+            device,
+            encryption_key,
+            out,
+        } => {
+            let device = parse_device_id(&device)?;
+            let encryption_key = parse_encryption_key(&encryption_key)?;
+            let outcome = engine.admit_device(device, encryption_key)?;
+            fs::write(&out, outcome.invitation.encode()).map_err(|source| CliError::Io {
+                path: out.clone(),
+                source,
+            })?;
+            println!(
+                "invited {device} at epoch {} -> {}",
+                outcome.transition.epoch,
+                out.display()
+            );
+            Ok(())
+        }
     }
+}
+
+/// Pair this device with a drive over the keystore: identify it,
+/// stage pairing material, or join from a sealed invitation. Like
+/// `member`, everything here is offline — files in, files out.
+fn device(
+    drive_dir: PathBuf,
+    action: DeviceAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    match action {
+        DeviceAction::Id => {
+            let engine = Engine::open_keystore(drive_dir, passphrase, identity)?;
+            print!("{}", device_id_report(&engine)?);
+            Ok(())
+        }
+        DeviceAction::PairingRequest { out } => {
+            let pairing = Engine::pairing_request(&drive_dir, passphrase, &identity)?;
+            fs::write(
+                &out,
+                format!(
+                    "device {}\nencryption-key {}\n",
+                    pairing.device, pairing.encryption_key
+                ),
+            )
+            .map_err(|source| CliError::Io {
+                path: out.clone(),
+                source,
+            })?;
+            println!(
+                "pairing material for {} -> {}",
+                pairing.device,
+                out.display()
+            );
+            Ok(())
+        }
+        DeviceAction::Join { invitation } => {
+            let bytes = read_bounded(&invitation, MAX_INVITATION_BYTES)?;
+            let sealed = SealedBootstrap::decode(&bytes).map_err(|_| CliError::InvitationFormat)?;
+            let engine = Engine::join(drive_dir, passphrase, identity, &sealed)?;
+            let epoch = engine
+                .membership_log()
+                .known_state()
+                .map(|tip| tip.epoch)
+                .unwrap_or(0);
+            println!(
+                "joined {} drive {} at epoch {epoch}",
+                engine.device(),
+                engine.drive()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Read a bounded non-credential input file. Invitation bytes are
+/// sealed, not secret, so no ownership hardening applies — but an
+/// unbounded read lets a corrupt file exhaust memory before decode
+/// refuses it.
+fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, CliError> {
+    let mut file = fs::File::open(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((max + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > max {
+        return Err(CliError::InvitationTooLarge);
+    }
+    Ok(bytes)
+}
+
+/// The sealed invitation bound: genesis plus one wrapped capability.
+/// Kilobytes in practice; a megabyte leaves headroom no honest
+/// inviter approaches.
+const MAX_INVITATION_BYTES: usize = 1024 * 1024;
+
+/// This device's id plus the encryption key the membership state
+/// registers for it. `unregistered` is honest, not an error: a fresh
+/// join holds genesis only, and its own admission arrives with the
+/// catch-up set. Built as a string so tests assert the rendering
+/// without capturing stdout.
+fn device_id_report(engine: &Engine) -> Result<String, CliError> {
+    let device = engine.device();
+    let log = engine.membership_log();
+    let registered = log
+        .known_state()
+        .and_then(|tip| log.state_of(&tip.transition_id))
+        .and_then(|state| state.encryption_key_of(&device).copied());
+    Ok(match registered {
+        Some(key) => format!("device {device}\nencryption-key {key}\n"),
+        None => format!("device {device}\nencryption-key unregistered\n"),
+    })
 }
 
 /// Parse a device identity from 64 hex characters (x-only pubkey).
@@ -670,6 +850,20 @@ fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
             CliError::Usage("device must be 64 hex characters naming an x-only pubkey".into())
         })?;
     Ok(DeviceId::from_bytes(bytes))
+}
+
+/// Parse a device encryption key from 64 hex characters (x-only
+/// pubkey, from the newcomer's pairing-request output).
+fn parse_encryption_key(hex: &str) -> Result<DeviceEncryptionKey, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage(
+                "encryption key must be 64 hex characters naming an x-only pubkey".into(),
+            )
+        })?;
+    Ok(DeviceEncryptionKey::from_bytes(bytes))
 }
 
 /// Removing the sole owner is valid but terminal (epochs.md): it
@@ -840,6 +1034,8 @@ mod probes;
 
 #[cfg(test)]
 mod tests_cli;
+#[cfg(test)]
+mod tests_device;
 #[cfg(test)]
 mod tests_export;
 #[cfg(test)]

@@ -11,8 +11,10 @@
 //! `SecretKey` only at the curve-API boundary. The transient never
 //! outlives the call.
 
-use secp256k1::SecretKey;
+use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use zeroize::ZeroizeOnDrop;
+
+use wyrd_format::{DeviceEncryptionKey, DeviceId};
 
 use super::CryptoError;
 
@@ -80,6 +82,26 @@ macro_rules! device_secret {
 
 device_secret!(DeviceIdentitySecret);
 device_secret!(DeviceEncryptionSecret);
+
+impl DeviceIdentitySecret {
+    /// The device id this identity names: the x-only public key.
+    /// Public output only — the secret never leaves the wrapper, and
+    /// the transient curve key lives for this call alone.
+    pub fn device_id(&self) -> DeviceId {
+        let keypair = Keypair::from_secret_key(SECP256K1, &self.secret_key());
+        DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
+    }
+}
+
+impl DeviceEncryptionSecret {
+    /// The encryption key this secret names: the x-only public key
+    /// shared with the owner at pairing time. Public output only, same
+    /// transient-key discipline as [`DeviceIdentitySecret::device_id`].
+    pub fn encryption_key(&self) -> DeviceEncryptionKey {
+        let keypair = Keypair::from_secret_key(SECP256K1, &self.secret_key());
+        DeviceEncryptionKey::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
+    }
+}
 
 #[cfg(test)]
 mod tests {

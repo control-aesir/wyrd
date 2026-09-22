@@ -44,6 +44,7 @@ mod tests_set_owners;
 mod tests_snapshot;
 
 pub(super) use admission::admit_device;
+pub(super) use admission::reissue_invitation;
 pub use admission::AdmitOutcome;
 pub(super) use announce::{announce, announce_pending};
 pub(super) use deliver::deliver_pending;

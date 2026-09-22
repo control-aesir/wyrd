@@ -65,15 +65,21 @@ fn encryption_key_of(secret: &[u8; 32]) -> wyrd_format::DeviceEncryptionKey {
     wyrd_format::DeviceEncryptionKey::from_bytes(*keys.public_key().as_bytes())
 }
 
-/// Admit a device through the engine directly (the CLI has no invite
-/// command yet): the member commands under test administer existing
-/// membership; admission setup stays on the engine surface.
+/// Admit a device through the CLI invite command: the member
+/// commands under test administer existing membership, and admission
+/// setup exercises the same invite surface a user drives.
 fn admit(fixture: &Fixture, secret: &[u8; 32]) -> DeviceId {
     let id = device_id_of(secret);
-    {
-        let mut engine = fixture.open();
-        engine.admit_device(id, encryption_key_of(secret)).unwrap();
-    }
+    let key = encryption_key_of(secret);
+    let out = fixture._temp.0.join(format!("invitation-{id}"));
+    command(fixture.args(vec![
+        "invite".into(),
+        id.to_string(),
+        key.to_string(),
+        out.display().to_string(),
+    ]))
+    .unwrap();
+    assert!(out.exists(), "invite writes the sealed invitation");
     id
 }
 

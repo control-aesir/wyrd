@@ -1,11 +1,11 @@
 use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
-use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition};
+use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
 use crate::keys::EpochSecret;
-use crate::membership::sign_transition;
+use crate::membership::{sign_transition, TransitionStatus};
 use crate::runtime::engine::{Engine, EngineError};
 use zeroize::Zeroizing;
 
@@ -179,6 +179,111 @@ pub(crate) fn admit_device(
 /// `u64` protocol field with the same boundary.
 pub(super) fn next_epoch(tip_epoch: u64) -> Result<u64, EngineError> {
     tip_epoch.checked_add(1).ok_or(EngineError::EpochExhausted)
+}
+
+/// Reissue a device's sealed invitation from durable state: finds the
+/// device's canonical admission, re-mints its grant from the held
+/// epoch secrets, and reseals it. The recovery path for an admission
+/// whose invitation never reached a file (process death between
+/// commit and publication): nothing here authors, so it runs
+/// repeatedly from any process holding the secrets. The reseal uses
+/// fresh randomness, so the bytes differ from the original —
+/// equivalence is functional (the invitee joins), never byte
+/// equality.
+///
+/// Authority mirrors admission: only a current canonical owner
+/// reissues, and only for an active canonical member. Revocation
+/// bounds acquisition — a removed device's lost invitation stays
+/// lost — and a valid-but-noncanonical branch never anchors a
+/// grant, since the durable authorization path would not accept it.
+pub(crate) fn reissue_invitation(
+    engine: &Engine,
+    device: DeviceId,
+) -> Result<SealedBootstrap, EngineError> {
+    let tip = engine
+        .log
+        .known_state()
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let current = engine
+        .log
+        .state_of(&tip.transition_id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    if !current.owners.contains(&engine.device) {
+        return Err(EngineError::NotOwner);
+    }
+    if !current.members.contains(&device) {
+        return Err(EngineError::NotMember);
+    }
+    let (epoch, id) = canonical_admission_of(engine, &device)?;
+    let transition = engine
+        .log
+        .transition(&id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let post = engine
+        .log
+        .state_of(&id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let encryption_key = transition
+        .changes()
+        .iter()
+        .find_map(|change| match change {
+            Change::Admit(admission) if admission.device == device => {
+                Some(admission.encryption_key)
+            }
+            _ => None,
+        })
+        .ok_or(EngineError::NotMember)?;
+    // Secrets `1..=epoch`, as at admission: the keyring holds every
+    // past epoch from an authorized capability each.
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let mut secrets = Vec::with_capacity(epoch as usize);
+    for past in 1..=epoch {
+        secrets.push(
+            rebuilt
+                .keyring
+                .secret(past)
+                .cloned()
+                .ok_or(EngineError::MissingEpochSecret(past))?,
+        );
+    }
+    let grant = Capability::mint(engine.drive, device, &post, transition, secrets)?;
+    Ok(seal_bootstrap(
+        &engine.identity_secret,
+        &engine.drive,
+        device,
+        &encryption_key,
+        &genesis_bytes(engine)?,
+        grant.wrap()?.as_bytes(),
+    )?)
+}
+
+/// The device's admission on the canonical chain. At most one per
+/// device: a second admit is refused while the first holds
+/// membership, and retirement forbids return. Anything off the
+/// canonical chain — contested, voided, or invalid — never anchors
+/// a grant; with no canonical admission the reissue fails closed.
+fn canonical_admission_of(
+    engine: &Engine,
+    device: &DeviceId,
+) -> Result<(u64, TransitionId), EngineError> {
+    let statuses = engine.log.statuses();
+    engine
+        .log
+        .observed_ids()
+        .into_iter()
+        .filter_map(|id| {
+            if !matches!(statuses.get(&id), Some(TransitionStatus::Canonical)) {
+                return None;
+            }
+            let transition = engine.log.transition(&id)?;
+            let admits = transition
+                .changes()
+                .iter()
+                .any(|change| matches!(change, Change::Admit(a) if a.device == *device));
+            admits.then_some((transition.epoch, id))
+        })
+        .min_by_key(|(epoch, _)| *epoch)
+        .ok_or(EngineError::NotMember)
 }
 
 /// The canonical genesis bytes the invitation anchors to, from the

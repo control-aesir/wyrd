@@ -4,14 +4,14 @@ pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
     pub(crate) fn new() -> Self {
-        let path = env::temp_dir().join(format!(
-            "wyrd-daemon-cli-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Process id plus an atomic counter: wall-clock nanos collide
+        // under parallel nextest (observed: StoreLocked on a sibling's
+        // directory), while a counter is unique by construction.
+        // Remove first so a crashed run's leftovers never poison init.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = env::temp_dir().join(format!("wyrd-daemon-cli-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         TempDir(path)
     }

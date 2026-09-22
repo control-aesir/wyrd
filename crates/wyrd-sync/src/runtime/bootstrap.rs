@@ -28,9 +28,8 @@
 //! drive starts headless; the first snapshot comes from
 //! [`Engine::author_snapshot`](super::engine::Engine::author_snapshot).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-
-use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
 use zeroize::Zeroizing;
 
 use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
@@ -38,7 +37,9 @@ use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTran
 
 use super::engine::{Engine, EngineError};
 use crate::control::bootstrap::{open_bootstrap, SealedBootstrap};
-use crate::durable::{atomic_write, AuthorizedCapability, DurableStore, Fact};
+use crate::durable::{
+    atomic_write, fsync_dir, AuthorizedCapability, DurableError, DurableStore, Fact,
+};
 use crate::keys::capability::{Capability, DriveKeyring, WrappedCapability};
 use crate::keys::keystore::{
     unwrap_device_secret, unwrap_root, wrap_device_secret, wrap_root, WrappedSecret,
@@ -53,6 +54,12 @@ const KEYSTORE_FILE: &str = "keystore";
 
 /// The only custody-record version.
 const KEYSTORE_VERSION: u8 = 0x02;
+
+/// The member custody-record version: a joined device's store carries
+/// its own encryption secret and nothing else — no root, no escrow.
+/// Members never hold either; epoch keys re-derive from the pending
+/// invitation on every resync.
+const MEMBER_KEYSTORE_VERSION: u8 = 0x03;
 
 /// Create a new single-device drive. `identity` is the owner's Nostr
 /// identity (the signer's key, T6); everything else is generated and
@@ -74,7 +81,7 @@ pub(super) fn create(
     let mut drive_bytes = [0u8; 32];
     random_bytes(&mut drive_bytes)?;
     let drive = DriveId::from_bytes(drive_bytes);
-    let device = device_id(&identity);
+    let device = identity.device_id();
     let genesis = genesis_transition(drive, &identity, &encryption)?;
 
     // Seal the custody record before the drive is usable. A crash before
@@ -126,15 +133,67 @@ pub(super) fn create(
 /// directory, the encryption secret and root are unwrapped from the
 /// custody record, and the epoch-1 secret is un-escrowed under the root.
 /// The caller supplies the identity secret (the signer's key).
+///
+/// A member custody record reopens the same way minus root and escrow:
+/// the encryption secret unwraps from the record and epoch keys
+/// re-derive from the pending invitation on resync, so a joined device
+/// reopens with exactly what it held before the restart.
 pub(super) fn open_keystore(
     dir: PathBuf,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<Engine, EngineError> {
     let drive = read_drive(&dir)?;
-    let (owner, root_wrapped, device_wrapped, escrow_record) = read_custody(&dir)?;
+    match read_custody(&dir)? {
+        Custody::Owner {
+            owner,
+            root: root_wrapped,
+            device: device_wrapped,
+            escrow: escrow_record,
+        } => open_owner_keystore(
+            dir,
+            drive,
+            passphrase,
+            identity,
+            owner,
+            root_wrapped,
+            device_wrapped,
+            escrow_record,
+        ),
+        Custody::Member {
+            device: recorded,
+            device_secret,
+        } => {
+            let device = identity.device_id();
+            if device != recorded {
+                return Err(EngineError::DeviceMismatch);
+            }
+            let encryption = DeviceEncryptionSecret::from_bytes(unwrap_device_secret(
+                &device_secret,
+                passphrase,
+            )?)?;
+            let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
+            engine.resync()?;
+            Ok(engine)
+        }
+    }
+}
 
-    let device = device_id(&identity);
+/// The owner half of [`open_keystore`]: root and epoch-1 escrow unwrap,
+/// the deterministic genesis completes an interrupted bootstrap, and
+/// the self capability installs exactly the escrowed epoch.
+#[allow(clippy::too_many_arguments)]
+fn open_owner_keystore(
+    dir: PathBuf,
+    drive: DriveId,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+    owner: DeviceId,
+    root_wrapped: WrappedSecret,
+    device_wrapped: WrappedSecret,
+    escrow_record: escrow::EscrowRecord,
+) -> Result<Engine, EngineError> {
+    let device = identity.device_id();
     if device != owner {
         return Err(EngineError::OwnerMismatch);
     }
@@ -201,8 +260,42 @@ pub(super) fn accept_invitation(
     encryption: DeviceEncryptionSecret,
     sealed: &SealedBootstrap,
 ) -> Result<Engine, EngineError> {
-    let device = device_id(&identity);
-    let invitation = open_bootstrap(&encryption, sealed)?;
+    let verified = verify_invitation(&identity, &encryption, sealed)?;
+
+    let store = DurableStore::open(dir.clone(), verified.drive, passphrase)?;
+    if read_drive(&dir)? != verified.drive {
+        return Err(EngineError::DriveExists);
+    }
+    accept_with_store(
+        store,
+        verified.drive,
+        verified.device,
+        identity,
+        encryption,
+        verified.genesis,
+        verified.pending_capability,
+    )
+}
+
+/// The verified invitation material: the invitee device, the drive,
+/// the valid authoritative genesis, and the pending capability
+/// bytes. Shared by accept and join so both enforce the identical
+/// checks — signature, recipient, genesis validity, capability
+/// binding — before anything touches disk.
+struct VerifiedInvitation {
+    device: DeviceId,
+    drive: DriveId,
+    genesis: MembershipTransition,
+    pending_capability: Vec<u8>,
+}
+
+fn verify_invitation(
+    identity: &DeviceIdentitySecret,
+    encryption: &DeviceEncryptionSecret,
+    sealed: &SealedBootstrap,
+) -> Result<VerifiedInvitation, EngineError> {
+    let device = identity.device_id();
+    let invitation = open_bootstrap(encryption, sealed)?;
     if invitation.invitee != device {
         return Err(EngineError::InvitationMismatch);
     }
@@ -230,7 +323,7 @@ pub(super) fn accept_invitation(
     // is not ours. The unwrap also proves the encryption secret opens
     // the pending record every later open will re-derive from.
     let capability = WrappedCapability::from_bytes(invitation.capability.clone())
-        .unwrap(&encryption)
+        .unwrap(encryption)
         .map_err(EngineError::Crypto)?;
     if capability.device != device {
         return Err(EngineError::InvitationMismatch);
@@ -249,18 +342,34 @@ pub(super) fn accept_invitation(
     {
         return Err(EngineError::InvitationMismatch);
     }
+    Ok(VerifiedInvitation {
+        device,
+        drive: invitation.drive,
+        genesis,
+        pending_capability: invitation.capability,
+    })
+}
 
-    let store = DurableStore::open(dir.clone(), invitation.drive, passphrase)?;
-    if read_drive(&dir)? != invitation.drive {
-        return Err(EngineError::DriveExists);
-    }
-    let mut engine =
-        Engine::open_with_store(store, invitation.drive, device, identity, encryption)?;
+/// The store-held half of [`accept_invitation`]: commit the invitation
+/// genesis plus the pending capability record, then resync. Split out
+/// so [`join`] can hold the store lock across the custody guard, the
+/// custody write, and the accept — concurrent joiners serialize on
+/// the lock instead of racing the keystore write past each other.
+fn accept_with_store(
+    store: DurableStore,
+    drive: DriveId,
+    device: DeviceId,
+    identity: DeviceIdentitySecret,
+    encryption: DeviceEncryptionSecret,
+    genesis: MembershipTransition,
+    pending_capability: Vec<u8>,
+) -> Result<Engine, EngineError> {
+    let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
     if engine.log.known_state().is_none() {
         engine.log.observe(genesis.clone());
         engine.commit_facts(&[
             Fact::Transition(genesis),
-            Fact::BootstrapPending(invitation.capability),
+            Fact::BootstrapPending(pending_capability),
         ])?;
     }
     // The commit above carries the pending record, so this resync
@@ -338,7 +447,7 @@ fn install_self_capability(
     let cap = Capability::new(
         engine.drive,
         engine.device,
-        encryption_key(&engine.encryption_secret),
+        engine.encryption_secret.encryption_key(),
         genesis.transition_id(),
         genesis.epoch,
         vec![epoch.clone()],
@@ -358,7 +467,7 @@ fn genesis_transition(
     identity: &DeviceIdentitySecret,
     encryption: &DeviceEncryptionSecret,
 ) -> Result<MembershipTransition, EngineError> {
-    let owner = device_id(identity);
+    let owner = identity.device_id();
     let mut transition = MembershipTransition::new(
         1,
         None,
@@ -366,7 +475,7 @@ fn genesis_transition(
         vec![
             Change::Admit(Admission {
                 device: owner,
-                encryption_key: encryption_key(encryption),
+                encryption_key: encryption.encryption_key(),
             }),
             Change::SetOwners(vec![owner]),
         ],
@@ -403,9 +512,196 @@ fn encode_custody(
     out
 }
 
-type Custody = (DeviceId, WrappedSecret, WrappedSecret, escrow::EscrowRecord);
+/// What a drive directory's custody record holds: the creator's
+/// full root custody, or a joined member's device secret alone. The
+/// version byte selects; anything else is malformed.
+enum Custody {
+    Owner {
+        owner: DeviceId,
+        root: WrappedSecret,
+        device: WrappedSecret,
+        escrow: escrow::EscrowRecord,
+    },
+    Member {
+        device: DeviceId,
+        device_secret: WrappedSecret,
+    },
+}
 
 fn decode_custody(bytes: &[u8]) -> Result<Custody, EngineError> {
+    if bytes.is_empty() {
+        return Err(EngineError::MalformedKeystore);
+    }
+    match bytes[0] {
+        KEYSTORE_VERSION => decode_owner_custody(bytes),
+        MEMBER_KEYSTORE_VERSION => decode_member_custody(bytes),
+        _ => Err(EngineError::MalformedKeystore),
+    }
+}
+/// A member custody record: the joined device plus its
+/// passphrase-wrapped encryption secret. Same length-prefixed shape
+/// as the owner record, minus root and escrow.
+fn encode_member_custody(device: &DeviceId, wrapped: &WrappedSecret) -> Vec<u8> {
+    let secret = wrapped.as_bytes();
+    let mut out = Vec::with_capacity(1 + 32 + 2 + secret.len());
+    out.push(MEMBER_KEYSTORE_VERSION);
+    out.extend_from_slice(device.as_bytes());
+    out.extend_from_slice(&(secret.len() as u16).to_le_bytes());
+    out.extend_from_slice(secret);
+    out
+}
+
+/// Persist a member custody record over any previous one. Join writes
+/// this before accepting the invitation: the secret must be on disk
+/// before any fact commits, or a crash between the two loses the only
+/// copy. Re-running join reuses the staged secret, so overwriting
+/// with the same bytes is the idempotent resume path.
+pub(super) fn write_member_custody(
+    dir: &Path,
+    device: &DeviceId,
+    wrapped: &WrappedSecret,
+) -> Result<(), EngineError> {
+    atomic_write(dir, KEYSTORE_FILE, &encode_member_custody(device, wrapped))
+        .map_err(EngineError::Io)
+}
+
+/// A newcomer's pairing material: the device id plus the encryption
+/// key the owner admits. No secrets — safe to ferry out-of-band to
+/// the owner alongside the invite request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingRequest {
+    pub device: DeviceId,
+    pub encryption_key: DeviceEncryptionKey,
+}
+
+/// The staged pairing secret: generated once per newcomer directory
+/// and wrapped under the passphrase. Created atomically (`create_new`
+/// claims the file; the loser of a concurrent race reuses the
+/// winner's wrap), so two pairing-requests can never strand an
+/// admission under a key this device no longer holds.
+const PAIRING_FILE: &str = "pairing.secret";
+
+/// Stage this device's pairing secret (or reuse the staged one) and
+/// return the public pairing material. Re-running returns the same
+/// key: the owner may already have admitted it, so regenerating
+/// would strand the admission.
+pub(super) fn pairing_request(
+    dir: &Path,
+    passphrase: &str,
+    identity: &DeviceIdentitySecret,
+) -> Result<PairingRequest, EngineError> {
+    std::fs::create_dir_all(dir)?;
+    let device = identity.device_id();
+    let path = dir.join(PAIRING_FILE);
+    let secret = match std::fs::read(&path) {
+        Ok(staged) => unwrap_pairing_secret(&staged, passphrase)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let fresh = DeviceEncryptionSecret::generate()?;
+            let wrapped = wrap_device_secret(fresh.as_bytes(), passphrase)?;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(wrapped.as_bytes())?;
+                    file.sync_all()?;
+                    drop(file);
+                    fsync_dir(dir)?;
+                    fresh
+                }
+                // Lost the race: the winner's wrap is authoritative.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    unwrap_pairing_secret(&std::fs::read(&path)?, passphrase)?
+                }
+                Err(error) => return Err(EngineError::Io(error)),
+            }
+        }
+        Err(error) => return Err(EngineError::Io(error)),
+    };
+    Ok(PairingRequest {
+        device,
+        encryption_key: secret.encryption_key(),
+    })
+}
+
+fn unwrap_pairing_secret(
+    staged: &[u8],
+    passphrase: &str,
+) -> Result<DeviceEncryptionSecret, EngineError> {
+    DeviceEncryptionSecret::from_bytes(unwrap_device_secret(
+        &WrappedSecret::from_bytes(staged.to_vec()),
+        passphrase,
+    )?)
+    .map_err(EngineError::Crypto)
+}
+
+/// Join from the staged pairing secret plus the owner's sealed
+/// invitation. The staged secret must open the invitation before
+/// anything touches disk; the store lock is then held across the
+/// custody guard, the custody write, and the accept, so concurrent
+/// joiners serialize instead of racing the keystore past each other.
+/// Member custody persists before the accept commits, so a crash
+/// between the two resumes with the secret on disk (the accept
+/// itself is idempotent). Custody is never clobbered: an owner
+/// record refuses outright, and a member record for another device
+/// refuses rather than stranding it.
+pub(super) fn join(
+    dir: PathBuf,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+    sealed: &SealedBootstrap,
+) -> Result<Engine, EngineError> {
+    let staged = read_pairing_secret(&dir, passphrase)?;
+    let verified = verify_invitation(&identity, &staged, sealed)?;
+    let device = verified.device;
+    // The store open binds the directory to the invitation's drive
+    // and takes the lock every later step holds; a directory bound
+    // to another drive refuses here, before any custody is touched.
+    let store = match DurableStore::open(dir.clone(), verified.drive, passphrase) {
+        Err(DurableError::DriveMismatch) => return Err(EngineError::DriveExists),
+        store => store?,
+    };
+    match read_custody_opt(&dir)? {
+        Some(Custody::Owner { .. }) => return Err(EngineError::OwnerCustodyExists),
+        Some(Custody::Member {
+            device: recorded, ..
+        }) if recorded != device => return Err(EngineError::DeviceMismatch),
+        _ => {}
+    }
+    write_member_custody(
+        &dir,
+        &device,
+        &wrap_device_secret(staged.as_bytes(), passphrase)?,
+    )?;
+    accept_with_store(
+        store,
+        verified.drive,
+        device,
+        identity,
+        staged,
+        verified.genesis,
+        verified.pending_capability,
+    )
+}
+
+/// The staged pairing secret, or a directed error when pairing never
+/// ran: joining without staging would mint a key the owner never
+/// admitted.
+fn read_pairing_secret(
+    dir: &Path,
+    passphrase: &str,
+) -> Result<DeviceEncryptionSecret, EngineError> {
+    match std::fs::read(dir.join(PAIRING_FILE)) {
+        Ok(staged) => unwrap_pairing_secret(&staged, passphrase),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(EngineError::MissingPairingSecret)
+        }
+        Err(error) => Err(EngineError::Io(error)),
+    }
+}
+
+fn decode_owner_custody(bytes: &[u8]) -> Result<Custody, EngineError> {
     const HEADER: usize = 1 + 32 + 6;
     if bytes.len() < HEADER || bytes[0] != KEYSTORE_VERSION {
         return Err(EngineError::MalformedKeystore);
@@ -429,7 +725,32 @@ fn decode_custody(bytes: &[u8]) -> Result<Custody, EngineError> {
     if pos != bytes.len() {
         return Err(EngineError::MalformedKeystore);
     }
-    Ok((owner, root, device, escrow_record))
+    Ok(Custody::Owner {
+        owner,
+        root,
+        device,
+        escrow: escrow_record,
+    })
+}
+
+fn decode_member_custody(bytes: &[u8]) -> Result<Custody, EngineError> {
+    const HEADER: usize = 1 + 32 + 2;
+    if bytes.len() < HEADER || bytes[0] != MEMBER_KEYSTORE_VERSION {
+        return Err(EngineError::MalformedKeystore);
+    }
+    let device = DeviceId::from_bytes(bytes[1..33].try_into().expect("bounds checked"));
+    let secret_len = u16::from_le_bytes([bytes[33], bytes[34]]) as usize;
+    let end = HEADER
+        .checked_add(secret_len)
+        .ok_or(EngineError::MalformedKeystore)?;
+    if end != bytes.len() {
+        return Err(EngineError::MalformedKeystore);
+    }
+    let device_secret = WrappedSecret::from_bytes(bytes[HEADER..end].to_vec());
+    Ok(Custody::Member {
+        device,
+        device_secret,
+    })
 }
 
 /// Undo a failed create. The custody record always goes; the store
@@ -451,6 +772,18 @@ fn read_custody(dir: &Path) -> Result<Custody, EngineError> {
     decode_custody(&std::fs::read(dir.join(KEYSTORE_FILE))?)
 }
 
+/// The custody record if one is bound to the directory: a missing
+/// file is a fresh directory, not an error. Used where the caller
+/// guards before writing (join), never where a record is required
+/// (open).
+fn read_custody_opt(dir: &Path) -> Result<Option<Custody>, EngineError> {
+    match std::fs::read(dir.join(KEYSTORE_FILE)) {
+        Ok(bytes) => decode_custody(&bytes).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(EngineError::Io(error)),
+    }
+}
+
 fn read_drive(dir: &Path) -> Result<DriveId, EngineError> {
     let bytes = std::fs::read(dir.join("DRIVE"))?;
     let id: [u8; 32] = bytes
@@ -458,18 +791,6 @@ fn read_drive(dir: &Path) -> Result<DriveId, EngineError> {
         .try_into()
         .map_err(|_| EngineError::MalformedDrive)?;
     Ok(DriveId::from_bytes(id))
-}
-
-/// The device id an identity secret names: the x-only public key.
-fn device_id(identity: &DeviceIdentitySecret) -> DeviceId {
-    let keypair = Keypair::from_secret_key(SECP256K1, &identity.secret_key());
-    DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
-}
-
-/// The encryption key a device encryption secret names.
-fn encryption_key(encryption: &DeviceEncryptionSecret) -> DeviceEncryptionKey {
-    let keypair = Keypair::from_secret_key(SECP256K1, &encryption.secret_key());
-    DeviceEncryptionKey::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
 }
 
 #[cfg(test)]
@@ -496,7 +817,7 @@ mod tests {
         // Simulate the crash window: the custody record is durable but the
         // genesis transition was never committed.
         let custody = encode_custody(
-            &device_id(&identity),
+            &identity.device_id(),
             &wrap_root(root.as_bytes(), "test-pass").unwrap(),
             &wrap_device_secret(encryption.as_bytes(), "test-pass").unwrap(),
             &escrow::wrap(&root.escrow_key(&drive, 1), &drive, 1, &epoch).unwrap(),
@@ -527,6 +848,229 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn member_custody_reopens_without_root_or_escrow() {
+        let dir = TestDir::new("member-custody");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        // A member store holds the wrapped device secret and nothing
+        // else: no root, no escrow. The store open writes DRIVE; the
+        // custody write is the member record join will persist.
+        {
+            let _store = DurableStore::open(dir.path.clone(), drive, "test-pass").unwrap();
+            write_member_custody(
+                &dir.path,
+                &identity.device_id(),
+                &wrap_device_secret(encryption.as_bytes(), "test-pass").unwrap(),
+            )
+            .unwrap();
+        }
+        let engine = open_keystore(dir.path.clone(), "test-pass", identity.clone()).unwrap();
+        assert_eq!(
+            engine.device(),
+            identity.device_id(),
+            "the recorded device reopens"
+        );
+        assert!(
+            engine.log.known_state().is_none(),
+            "no membership observed yet"
+        );
+        // A wrong identity names no record here, and a wrong
+        // passphrase fails the wrap open: both fail closed.
+        let other = DeviceIdentitySecret::generate().unwrap();
+        assert!(matches!(
+            open_keystore(dir.path.clone(), "test-pass", other),
+            Err(EngineError::DeviceMismatch)
+        ));
+        assert!(matches!(
+            open_keystore(dir.path.clone(), "wrong-pass", identity),
+            Err(EngineError::Keystore(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_member_custody_fails_closed() {
+        let device = DeviceIdentitySecret::generate().unwrap().device_id();
+        let wrapped = wrap_device_secret(
+            DeviceEncryptionSecret::generate().unwrap().as_bytes(),
+            "test-pass",
+        )
+        .unwrap();
+        let mut record = encode_member_custody(&device, &wrapped);
+        assert!(
+            matches!(decode_custody(&record), Ok(Custody::Member { .. })),
+            "the member record decodes"
+        );
+        record[0] = 0x01;
+        assert!(matches!(
+            decode_custody(&record),
+            Err(EngineError::MalformedKeystore)
+        ));
+        record[0] = MEMBER_KEYSTORE_VERSION;
+        record.pop();
+        assert!(matches!(
+            decode_custody(&record),
+            Err(EngineError::MalformedKeystore)
+        ));
+    }
+
+    #[test]
+    fn pairing_request_stages_once_and_reuses() {
+        let dir = TestDir::new("pairing-request");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let first = pairing_request(&dir.path, "test-pass", &identity).unwrap();
+        assert_eq!(first.device, identity.device_id());
+        // Re-running returns the same key: the owner may already have
+        // admitted it, so a fresh secret would strand the admission.
+        let second = pairing_request(&dir.path, "test-pass", &identity).unwrap();
+        assert_eq!(first, second, "pairing material is stable");
+        // The staged wrap opens under the right passphrase only.
+        assert!(matches!(
+            pairing_request(&dir.path, "wrong-pass", &identity),
+            Err(EngineError::Keystore(_))
+        ));
+    }
+
+    #[test]
+    fn join_round_trip_reopens_as_member() {
+        let owner_dir = TestDir::new("join-owner");
+        let newcomer_dir = TestDir::new("join-newcomer");
+        let owner_identity = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_identity = DeviceIdentitySecret::generate().unwrap();
+        let mut owner = create(owner_dir.path.clone(), "test-pass", owner_identity).unwrap();
+        let pairing = pairing_request(&newcomer_dir.path, "test-pass", &newcomer_identity).unwrap();
+        let invitation = owner
+            .admit_device(pairing.device, pairing.encryption_key)
+            .unwrap()
+            .invitation;
+        let joined = join(
+            newcomer_dir.path.clone(),
+            "test-pass",
+            newcomer_identity.clone(),
+            &invitation,
+        )
+        .unwrap();
+        assert!(
+            joined.log.known_state().is_some(),
+            "join commits the invitation genesis"
+        );
+        drop(joined);
+        // The joined device reopens from member custody with its
+        // invited epochs held: restart-safe like the owner path.
+        let reopened =
+            open_keystore(newcomer_dir.path.clone(), "test-pass", newcomer_identity).unwrap();
+        assert!(
+            reopened.log.known_state().is_some(),
+            "member custody reopens"
+        );
+        assert!(
+            reopened.epoch_keys.contains_key(&1) && reopened.epoch_keys.contains_key(&2),
+            "invited epochs reinstall from the pending record on reopen"
+        );
+    }
+
+    #[test]
+    fn join_into_owner_directory_refuses_and_preserves_custody() {
+        let dir = TestDir::new("join-owner-dir");
+        let owner_identity = DeviceIdentitySecret::generate().unwrap();
+        let mut owner = create(dir.path.clone(), "test-pass", owner_identity.clone()).unwrap();
+        let owner_keystore = std::fs::read(dir.path.join(KEYSTORE_FILE)).unwrap();
+        // A pairing staged in the owner's own directory, admitted,
+        // then joined there: the DRIVE check passes (same drive), so
+        // only the custody guard stands between join and root loss.
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let pairing = pairing_request(&dir.path, "test-pass", &newcomer).unwrap();
+        let invitation = owner
+            .admit_device(pairing.device, pairing.encryption_key)
+            .unwrap()
+            .invitation;
+        drop(owner);
+        assert!(matches!(
+            join(dir.path.clone(), "test-pass", newcomer, &invitation,),
+            Err(EngineError::OwnerCustodyExists)
+        ));
+        assert_eq!(
+            std::fs::read(dir.path.join(KEYSTORE_FILE)).unwrap(),
+            owner_keystore,
+            "a refused join leaves the owner keystore byte-identical"
+        );
+        drop(open_keystore(dir.path.clone(), "test-pass", owner_identity).unwrap());
+    }
+
+    #[test]
+    fn join_over_other_member_custody_refuses() {
+        let dir = TestDir::new("join-other-member");
+        let owner_identity = DeviceIdentitySecret::generate().unwrap();
+        let owner_dir = TestDir::new("join-other-member-owner");
+        let mut owner =
+            create(owner_dir.path.clone(), "test-pass", owner_identity.clone()).unwrap();
+        // First device joins normally.
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let pairing = pairing_request(&dir.path, "test-pass", &newcomer).unwrap();
+        let admitted = owner
+            .admit_device(pairing.device, pairing.encryption_key)
+            .unwrap()
+            .invitation;
+        drop(join(dir.path.clone(), "test-pass", newcomer.clone(), &admitted).unwrap());
+        // A second device stages over the same pairing file, then
+        // attempts to join the occupied directory: the member record
+        // names the first device, so the write refuses rather than
+        // stranding it.
+        let other = DeviceIdentitySecret::generate().unwrap();
+        let other_encryption = DeviceEncryptionSecret::generate().unwrap();
+        std::fs::write(
+            dir.path.join(PAIRING_FILE),
+            wrap_device_secret(other_encryption.as_bytes(), "test-pass")
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let sealed = invitation(
+            owner.drive,
+            &owner_identity,
+            &DeviceEncryptionSecret::generate().unwrap(),
+            &other,
+            &other_encryption,
+            EpochSecret::generate().unwrap(),
+        );
+        assert!(matches!(
+            join(dir.path.clone(), "test-pass", other, &sealed),
+            Err(EngineError::DeviceMismatch)
+        ));
+        // The first device still reopens from its intact custody.
+        drop(open_keystore(dir.path.clone(), "test-pass", newcomer).unwrap());
+    }
+
+    #[test]
+    fn join_with_foreign_invitation_refuses_before_writing_custody() {
+        let dir = TestDir::new("join-foreign");
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        pairing_request(&dir.path, "test-pass", &newcomer).unwrap();
+        // An invitation addressed to another key: the staged secret
+        // cannot open it, so nothing may touch disk.
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let stranger = DeviceIdentitySecret::generate().unwrap();
+        let stranger_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let sealed = invitation(
+            drive_id(),
+            &owner,
+            &owner_encryption,
+            &stranger,
+            &stranger_encryption,
+            EpochSecret::generate().unwrap(),
+        );
+        assert!(matches!(
+            join(dir.path.clone(), "test-pass", newcomer, &sealed),
+            Err(EngineError::Invitation(_))
+        ));
+        assert!(
+            !dir.path.join(KEYSTORE_FILE).exists(),
+            "a refused join writes no custody"
+        );
+    }
+
     /// Seal a genuine invitation: the owner admits nobody yet (the
     /// admission transition arrives via catch-up), but grants the
     /// invitee the epoch-1 secret bound to the genesis it anchors.
@@ -539,8 +1083,8 @@ mod tests {
         epoch: EpochSecret,
     ) -> crate::control::bootstrap::SealedBootstrap {
         let genesis = genesis_transition(drive, owner, owner_encryption).unwrap();
-        let invitee_id = device_id(invitee);
-        let invitee_key = encryption_key(invitee_encryption);
+        let invitee_id = invitee.device_id();
+        let invitee_key = invitee_encryption.encryption_key();
         let capability = Capability::new(
             drive,
             invitee_id,
@@ -659,8 +1203,8 @@ mod tests {
         let invitee = DeviceIdentitySecret::generate().unwrap();
         let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
         let drive = drive_id();
-        let invitee_id = device_id(&invitee);
-        let invitee_key = encryption_key(&invitee_encryption);
+        let invitee_id = invitee.device_id();
+        let invitee_key = invitee_encryption.encryption_key();
         let epoch = EpochSecret::generate().unwrap();
 
         // A well-formed but invalid genesis: correctly signed by the
@@ -672,12 +1216,12 @@ mod tests {
             None,
             Vec::new(),
             vec![Change::Admit(Admission {
-                device: device_id(&owner),
-                encryption_key: encryption_key(&owner_encryption),
+                device: owner.device_id(),
+                encryption_key: owner_encryption.encryption_key(),
             })],
             [0xFF; 32],
             [0xFF; 32],
-            device_id(&owner),
+            owner.device_id(),
         )
         .unwrap();
         sign_transition(&mut bad, &owner.secret_key(), &drive);
@@ -748,8 +1292,8 @@ mod tests {
         let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
         let drive = drive_id();
         let genesis = genesis_transition(drive, &owner, &owner_encryption).unwrap();
-        let invitee_id = device_id(&invitee);
-        let invitee_key = encryption_key(&invitee_encryption);
+        let invitee_id = invitee.device_id();
+        let invitee_key = invitee_encryption.encryption_key();
         let epoch = EpochSecret::generate().unwrap();
 
         // A structurally valid grant for another drive: it unwraps

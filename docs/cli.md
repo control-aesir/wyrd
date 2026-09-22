@@ -16,7 +16,9 @@ wyrd mount <drive_dir> <mountpoint> [--relay <url>...] [--verbose] \
     --identity-file <path> --passphrase-file <path>
 wyrd export <drive_dir> <out_dir> \
     --identity-file <path> --passphrase-file <path>
-wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device>) \
+wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> | reissue-invitation <device> <out>) \
+    --identity-file <path> --passphrase-file <path>
+wyrd device <drive_dir> (id | pairing-request <out> | join <invitation>) \
     --identity-file <path> --passphrase-file <path>
 ```
 
@@ -108,10 +110,63 @@ characters (x-only pubkeys).
 - `set-owner <device>`: hand ownership to a member (v0 ownership is
   a singleton). Authority comes from the pre-transition owner set,
   so the current owner signs the handover.
+- `invite <device> <encryption-key> <out>`: admit a device and write
+  its sealed invitation to `<out>` for out-of-band delivery. The
+  transition commits with the usual catch-up obligations; the
+  newcomer joins from the invitation file. The destination is
+  claimed before the commit: an existing file is refused, and an
+  uncreatable path fails with no transition authored. A write
+  failure past the commit leaves the admission standing — recover
+  with `reissue-invitation` below instead of re-inviting (which
+  reports `AlreadyMember`).
+- `reissue-invitation <device> <out>`: reseal a device's invitation
+  from durable state, for an admission whose invitation never
+  reached a file. Authors nothing; the reseal opens identically,
+  with fresh randomness. Owner-only, like admission, and only for
+  an active canonical member: revocation bounds acquisition, so a
+  removed device's lost invitation stays lost, and a
+  valid-but-noncanonical branch never anchors a grant. Same
+  destination policy as `invite`.
 
 Membership state beyond the CLI: device identity is single-use
 within a membership chain — a removed device returns only under a
 fresh identity (`docs/epochs.md`).
+
+### `device` — pair this device with a drive
+
+The local-device half of multi-device setup. Pairing and join are
+offline file exchanges; the drive directory holds the staged secret
+and (after join) the member custody record. Catch-up arrives on the
+next mounted sync, not here.
+
+- `id`: this device's id plus the encryption key the membership
+  state registers for it. `unregistered` is honest, not an error: a
+  fresh join holds genesis only, and its own admission arrives with
+  the catch-up set. Also the cheapest reopen probe — it opens the
+  keystore, which works for owner and member records alike.
+- `pairing-request <out>`: stage this device's pairing secret and
+  write the public pairing material (device plus encryption key, no
+  secrets) to `<out>` for the owner. Re-running returns the same
+  key: the owner may already have admitted it.
+- `join <invitation>`: join from the owner's sealed invitation.
+  Member custody persists before the accept commits, so the device
+  reopens afterwards. A pairing for another key, a truncated or
+  forged invitation, or a join without pairing all fail closed, and
+  a refused join writes nothing. Join never targets an owner's
+  drive home or another device's member directory: an owner record
+  refuses outright, and a member record for another device refuses
+  rather than stranding it.
+
+The pairing flow, end to end:
+
+```
+# newcomer, in its own directory
+wyrd device <newcomer-dir> pairing-request pairing.txt --identity-file ... --passphrase-file ...
+# owner, with the pairing material
+wyrd member <owner-dir> invite <device> <encryption-key> invitation --identity-file ... --passphrase-file ...
+# newcomer, with the invitation file
+wyrd device <newcomer-dir> join invitation --identity-file ... --passphrase-file ...
+```
 
 ## Credential files
 
@@ -132,7 +187,7 @@ Both are read and hardened by wyrd code, never by clap:
 
 - `mount` initializes structured diagnostics first: events to stderr
   plus `drive_dir/mount.log`, truncated per mount (one mount, one
-  log — no rotation code). Init, export, and member log nothing to disk.
+  log — no rotation code). Init, export, member, and device log nothing to disk.
 - `--help` and `--version` print and exit successfully.
 - Exit `0` on success; exit `2` on any failure, with the reason on
   stderr (`error: ...`). Usage errors (bad flags, missing options)

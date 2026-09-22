@@ -17,8 +17,8 @@
 //! particular numbers. They are independent of the protocol ingest limits
 //! (`Limits::V0`), which still bound every committed object.
 //!
-//! This module depends only on std: it is the future `wyrd-core` session
-//! surface, kept liftable with the rest of the coordinator.
+//! This module depends only on std: it is the `wyrd-core` session
+//! surface.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,15 +139,14 @@ impl WriteBudget {
         }
     }
 
-    /// Test-only: the aggregate buffered bytes.
-    #[cfg(test)]
-    pub(crate) fn total(&self) -> usize {
+    /// Introspection for providers and tests: the aggregate buffered bytes.
+    pub fn total(&self) -> usize {
         self.lock().map(|state| state.total).unwrap_or(0)
     }
 
-    /// Test-only: the number of dirty (budgeted) handles.
-    #[cfg(test)]
-    pub(crate) fn dirty_handles(&self) -> usize {
+    /// Introspection for providers and tests: the number of dirty
+    /// (budgeted) handles.
+    pub fn dirty_handles(&self) -> usize {
         self.lock().map(|state| state.lengths.len()).unwrap_or(0)
     }
 

@@ -36,7 +36,8 @@ arbitrary subsets of that drive locally.
 | `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror only |
 | `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format` only |
-| `wyrd-daemon` | Composition: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-sync`, `wyrd-fuse`, `fuser` |
+| `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control; no presentation, no process supervision | `wyrd-format`, `wyrd-sync` |
+| `wyrd-daemon` | Composition: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-core`, `wyrd-sync`, `wyrd-fuse`, `fuser` |
 | `wyrd-contracts` | Test suite: one named test per architectural contract, composed end to end | all of the above |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,

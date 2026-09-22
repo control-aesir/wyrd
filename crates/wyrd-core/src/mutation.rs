@@ -20,9 +20,8 @@
 //! the caller only after the pass publishes — a returned success means
 //! the new state is served.
 //!
-//! This module depends only on `wyrd-format` and std: it is the future
-//! `wyrd-core` mutation surface, kept liftable with the rest of the
-//! coordinator.
+//! This module depends only on `wyrd-format` and std: it is the
+//! `wyrd-core` mutation surface.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use wyrd_format::{ContentId, StoreFailure};
 
-use crate::lifecycle::WakeSignal;
+use crate::wake::WakeSignal;
 
 /// Total admitted-but-incomplete mutations, including the one executing.
 /// Admission beyond the bound fails with [`MutationError::Saturated`]
@@ -365,7 +364,7 @@ impl MutationQueue {
     /// A queue bounded at `limit` admitted-but-incomplete requests.
     /// Production passes its budget at composition; tests use small
     /// bounds to exercise saturation without thousands of threads.
-    pub(crate) fn with_limit(limit: usize) -> Self {
+    pub fn with_limit(limit: usize) -> Self {
         MutationQueue {
             state: Mutex::new(QueueState::default()),
             work: Condvar::new(),
@@ -520,9 +519,9 @@ impl MutationQueue {
         }
     }
 
-    /// Test-only: the number of admitted-but-incomplete requests.
-    #[cfg(test)]
-    pub(crate) fn outstanding(&self) -> usize {
+    /// Introspection for providers and tests: the number of
+    /// admitted-but-incomplete requests.
+    pub fn outstanding(&self) -> usize {
         self.lock_state().outstanding
     }
 }
@@ -593,7 +592,7 @@ impl Drop for MutationBatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::Wake;
+    use crate::wake::Wake;
 
     fn mkdir(path: &str) -> MutationKind {
         MutationKind::Mkdir {

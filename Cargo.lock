@@ -5210,6 +5210,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-core"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "thiserror 2.0.20",
+ "wyrd-format",
+]
+
+[[package]]
 name = "wyrd-daemon"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -5229,6 +5237,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "wyrd-core",
  "wyrd-format",
  "wyrd-fuse",
  "wyrd-sync",

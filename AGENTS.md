@@ -10,6 +10,7 @@ to. The README carries the vision; `docs/` carries the current design contract.
 - `crates/wyrd-format` — CAS, typed identities, chunking, Merkle snapshot DAG. The format contract.
 - `crates/wyrd-sync` — iroh transport, encrypted manifests, roles × materialization, two-phase content.
 - `crates/wyrd-fuse` — Mount-free drive view (the filesystem-shaped read surface; never mounts).
+- `crates/wyrd-core` — Embeddable local node (namespace, mutations, materialization, sync control). Depends on `wyrd-format`/`wyrd-sync` only; the daemon is one host for it.
 - `crates/wyrd-daemon` — Composition crate: engine + view + presentation backends (FUSE adapter today; mobile file surfaces later). The composer per T16.
 - `crates/wyrd-contracts` — Cross-crate architectural contract suite: one named test per review contract, composed end to end over the public APIs. Workspace leaf; depends on every crate, nothing depends on it.
 - `docs/` — agent-digestible architecture docs. `object-model.md` is the normative

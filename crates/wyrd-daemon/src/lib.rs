@@ -10,15 +10,19 @@
 //! platform errors instead of POSIX ones. The FUSE adapter ([`fuse`])
 //! is the first such backend, not a property of the core.
 
-pub mod budgets;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::budgets;
 pub mod core;
 pub mod fuse;
 pub mod lifecycle;
 pub mod live_mailbox;
-pub mod mutation;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::mutation;
 pub mod projection;
-pub mod session;
-pub mod want;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::session;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::want;
 
 /// Test-only minimal relay for live-mailbox integration tests.
 #[cfg(test)]

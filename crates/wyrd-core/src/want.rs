@@ -100,7 +100,7 @@ impl Default for WantRegistry {
 
 impl WantRegistry {
     /// A registry bounded at `limit` outstanding identities.
-    pub(crate) fn with_limit(limit: usize) -> Self {
+    pub fn with_limit(limit: usize) -> Self {
         WantRegistry {
             state: Mutex::new(RegistryState::default()),
             limit,
@@ -211,9 +211,9 @@ impl WantRegistry {
         }
     }
 
-    /// Test access to the in-flight mark.
-    #[cfg(test)]
-    pub(crate) fn is_admitted(&self, content: &ContentId) -> bool {
+    /// Introspection for providers and tests: whether `content` carries
+    /// the in-flight mark.
+    pub fn is_admitted(&self, content: &ContentId) -> bool {
         self.state
             .lock()
             .map(|state| state.admitted.contains(content))

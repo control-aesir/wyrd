@@ -24,8 +24,7 @@
 //! `docs/resource-limits.md` for the derivation.
 //!
 //! This module depends only on the sibling bound owners and std: it is
-//! the future `wyrd-core` coordination surface, kept liftable with the
-//! rest of the coordinator.
+//! the `wyrd-core` coordination surface.
 
 use crate::mutation::MAX_PENDING_MUTATIONS;
 use crate::session::{MAX_BUFFERED_BYTES, MAX_DIRTY_HANDLES, MAX_WRITE_BUFFER_BYTES};
@@ -46,11 +45,11 @@ pub const DEFAULT_MAX_ADMIT_PER_PASS: usize = 1024;
 /// pinned-capture memory.
 pub const DEFAULT_MAX_OPEN_HANDLES: usize = 4096;
 
-/// The daemon-side resource bounds, threaded from [`crate::LiveConfig`]
-/// into the loop (`LiveDaemon`), the registries, and the backend at
-/// composition time. Every field has a constructor-level override for
-/// tests (`with_limit`, `with_limits`), so this struct is the
-/// production wiring, not a second enforcement point.
+/// The node-side resource bounds, threaded from the live config into
+/// the loop, the registries, and the backend at composition time.
+/// Every field has a constructor-level override for tests
+/// (`with_limit`, `with_limits`), so this struct is the production
+/// wiring, not a second enforcement point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceBudgets {
     /// Distinct demanded identities the want registry carries at

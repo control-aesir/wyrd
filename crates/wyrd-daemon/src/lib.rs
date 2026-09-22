@@ -10,7 +10,8 @@
 //! platform errors instead of POSIX ones. The FUSE adapter ([`fuse`])
 //! is the first such backend, not a property of the core.
 
-pub mod budgets;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::budgets;
 pub mod core;
 pub mod fuse;
 pub mod lifecycle;

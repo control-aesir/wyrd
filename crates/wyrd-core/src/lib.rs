@@ -13,6 +13,7 @@
 pub mod budgets;
 pub mod live;
 pub mod mutation;
+pub mod node;
 pub mod projection;
 pub mod session;
 pub mod view;

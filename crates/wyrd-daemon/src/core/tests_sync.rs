@@ -1,5 +1,7 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 use wyrd_format::{ContentId, FetchStatus};
 use wyrd_sync::transport::mailbox::Mailbox;
 
@@ -24,7 +26,8 @@ use wyrd_sync::transport::mailbox::MailboxEnvelope;
 #[test]
 fn dirty_handle_budget_refuses_through_the_mount() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -81,7 +84,8 @@ fn dirty_handle_budget_refuses_through_the_mount() {
 #[test]
 fn concurrent_readers_see_atomic_generations() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("race.txt", b"v1").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -123,7 +127,8 @@ fn concurrent_readers_see_atomic_generations() {
 #[test]
 fn want_admission_publishes_without_other_changes() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("anchor.txt", b"anchor").unwrap();
     let (mut live, _backend) = live_backend(daemon);
     let baseline = live.generation();
@@ -213,7 +218,8 @@ fn want_admission_cap_paces_floods_across_passes() {
 #[test]
 fn sync_once_discards_poison_and_keeps_serving() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("steady.txt", b"steady").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -248,7 +254,8 @@ fn sync_once_discards_poison_and_keeps_serving() {
 #[test]
 fn sync_once_accepts_idle_bulk_source() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("fetched.txt", b"local").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -276,7 +283,8 @@ fn sync_once_accepts_idle_bulk_source() {
 #[test]
 fn open_handles_survive_sync_republication() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("stable.txt", b"v1").unwrap();
     let (mut live, backend) = live_backend(daemon);
 
@@ -319,7 +327,8 @@ fn open_handles_survive_sync_republication() {
 #[test]
 fn dirty_backlog_clears_on_clean_pass() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("steady.txt", b"steady").unwrap();
     let (mut live, backend) = live_backend(daemon);
     let failed = live.sync_once(&mut SettlementFailingMailbox, None::<&mut MemoryBulkSource>);

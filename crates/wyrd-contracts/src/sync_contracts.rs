@@ -1,7 +1,7 @@
 //! The sync-facing contracts: verified heads, queue pressure, and
 //! bounded bulk.
 
-use wyrd_daemon::core::{Daemon, LiveConfig, LiveError};
+use wyrd_daemon::core::{LiveConfig, LiveError, RuntimeMaterialization, WyrdNode};
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_daemon::ResourceBudgets;
 use wyrd_format::{
@@ -34,8 +34,8 @@ use zeroize::Zeroizing;
 /// take the composer role production gives `main.rs` — the backend is
 /// built from the parts, never handed out by the node.
 fn serving_backend<S: ObjectStore>(
-    parts: wyrd_daemon::core::LiveParts<S>,
-) -> FuseBackend<S, wyrd_daemon::core::DaemonMaterialization>
+    parts: wyrd_daemon::core::LiveParts<DriveView<S, RuntimeMaterialization>>,
+) -> FuseBackend<S, RuntimeMaterialization>
 where
     S::Error: std::fmt::Debug,
 {
@@ -141,7 +141,8 @@ fn only_engine_classification_mounts_the_daemon_view() {
 
     let mut engine = loaded.rig.take_engine();
     loaded.want_all(&mut engine);
-    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
 
     // Control plane through the daemon: the capability and the
     // announcement commit.
@@ -237,7 +238,8 @@ fn failed_pass_recovers_serving_on_retry() {
     loaded.publish_all();
 
     let engine = loaded.rig.take_engine();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) =
         daemon.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
     let backend = serving_backend(parts);
@@ -296,7 +298,8 @@ fn failed_projection_leaves_installed_heads_untouched() {
 
     let mut engine = loaded.rig.take_engine();
     loaded.want_all(&mut engine);
-    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
 
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
@@ -339,7 +342,8 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
 
     let mut engine = loaded.rig.take_engine();
     loaded.want_all(&mut engine);
-    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
 
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
@@ -412,7 +416,7 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
 /// errors and the previously published generation keeps serving. This is
 /// the production mount path (`into_live` + `sync_once`, the composer
 /// startup sequence in `main.rs`), not just the direct
-/// `Daemon::refresh_live_heads` API.
+/// `WyrdNode::refresh_live_heads` API.
 #[test]
 fn live_sync_pass_never_projects_mixed_validity_heads() {
     // Head A fully published; refresh installs it, and the live split
@@ -423,7 +427,8 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
 
     let mut engine = loaded.rig.take_engine();
     loaded.want_all(&mut engine);
-    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
     daemon.refresh_live_heads().unwrap();
@@ -532,7 +537,8 @@ fn authored_snapshots_mount_through_the_daemon_view() {
     assert_eq!(authored.snapshot().author, rig.recipient.id);
     assert_eq!(authored.snapshot().epoch, 2, "bound to the canonical tip");
 
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("alpha.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();
@@ -621,7 +627,7 @@ impl<M: Mailbox> Mailbox for FailFirstSend<'_, M> {
     }
 }
 
-/// Daemon write publication across members, with retry. Member A
+/// WyrdNode write publication across members, with retry. Member A
 /// authors through `put_file` and announces through the control-plane
 /// mailbox; member B drains, fetches from A's serving vault, refreshes
 /// live heads, and serves the new file. A failed announcement leaves
@@ -638,7 +644,8 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
     rig.enqueue_capability(&admit, &secrets);
     assert_eq!(rig.drain().accepted, 1, "the self-capability lands");
-    let mut daemon_a = Daemon::new(rig.take_engine(), MemoryObjectStore::default()).unwrap();
+    let mut daemon_a: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(rig.take_engine(), MemoryObjectStore::default()).unwrap();
     let authored = daemon_a.put_file("shared.txt", b"shared bytes").unwrap();
 
     // Member B: the owner's engine over its own scratch dir, with the
@@ -666,7 +673,8 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     rig.enqueue_transition_for(&admit, 1, owner, &mut relay_b);
     let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
     rig.enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
-    let daemon_b = Daemon::new(engine_b, MemoryObjectStore::default()).unwrap();
+    let daemon_b: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine_b, MemoryObjectStore::default()).unwrap();
     let (mut live_b, parts_b) =
         daemon_b.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
     let backend_b = serving_backend(parts_b);
@@ -854,7 +862,8 @@ fn a_bootstrapped_drive_serves_its_first_authored_snapshot() {
     let authored = engine.author_snapshot(&store, tree).unwrap();
     assert_eq!(authored.snapshot().epoch, 1, "the genesis epoch");
 
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("boot.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();
@@ -1182,7 +1191,8 @@ fn conflicted_drive_rejects_mounted_writes() {
             .set_materialization(*id, MaterializationState::Cached)
             .unwrap();
     }
-    let mut daemon = Daemon::new(engine, loaded.objects.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
     daemon.refresh_live_heads().unwrap();
@@ -1357,7 +1367,8 @@ fn a_mismatched_snapshot_manifest_never_mounts() {
     );
 
     let engine = rig.take_engine();
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.drain(&mut rig.relay).unwrap();
     daemon.execute_plan(&mut bulk).unwrap();
     let err = daemon.refresh_live_heads().unwrap_err();

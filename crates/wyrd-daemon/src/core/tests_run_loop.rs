@@ -1,5 +1,7 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -18,7 +20,8 @@ use wyrd_sync::bulk::MemoryBulkSource;
 #[test]
 fn run_loop_stops_immediately() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
 
     let stop = std::sync::atomic::AtomicBool::new(true);
@@ -46,7 +49,8 @@ fn run_loop_stops_immediately() {
 #[test]
 fn run_loop_runs_until_stopped() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     drop(parts);
 
@@ -86,7 +90,8 @@ fn run_loop_runs_until_stopped() {
 #[test]
 fn run_loop_aborts_after_mailbox_error_cap() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     drop(parts);
 
@@ -182,7 +187,8 @@ fn await_pending(queue: &std::sync::Arc<crate::mutation::MutationQueue>) {
 #[test]
 fn terminal_loop_error_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     drop(parts);
     let queue = Arc::clone(live.mutations());
@@ -228,7 +234,8 @@ fn terminal_loop_error_completes_blocked_submitters() {
 #[test]
 fn clean_stop_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     drop(parts);
     let queue = Arc::clone(live.mutations());

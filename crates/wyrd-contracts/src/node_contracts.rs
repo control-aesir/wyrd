@@ -14,9 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wyrd_core::view::NamespaceView;
-use wyrd_daemon::core::{Daemon, LiveConfig};
+use wyrd_daemon::core::{LiveConfig, RuntimeMaterialization, WyrdNode};
 use wyrd_daemon::{MutationKind, MutationOutcome};
 use wyrd_format::MemoryObjectStore;
+use wyrd_fuse::DriveView;
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
@@ -78,7 +79,8 @@ fn node_composes_and_serves_without_a_presentation_backend() {
     )
     .unwrap();
 
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("hello.txt", b"hello").unwrap();
     assert_serves_hello(daemon.view());
 

@@ -1,5 +1,7 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 use wyrd_format::ObjectStore;
 
 use std::sync::atomic::Ordering;
@@ -14,7 +16,8 @@ use wyrd_format::{FsObjectStore, MemoryObjectStore};
 #[test]
 fn file_write_session_commits_and_reopens() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -60,7 +63,8 @@ fn file_write_session_commits_and_reopens() {
 fn uncommitted_handle_writes_die_with_the_daemon() {
     let (engine, dir, identity) = scratch_drive();
     {
-        let daemon = Daemon::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+        let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+            WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
         let (live, backend) = live_backend(daemon);
         let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -98,7 +102,8 @@ fn uncommitted_handle_writes_die_with_the_daemon() {
     let reopened =
         wyrd_sync::runtime::Engine::open_keystore(dir.clone(), "daemon-test-pass", identity)
             .unwrap();
-    let mut daemon = Daemon::new(reopened, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(reopened, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
     daemon.refresh_live_heads().unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
@@ -127,7 +132,8 @@ fn uncommitted_handle_writes_die_with_the_daemon() {
 #[test]
 fn concurrent_handles_isolate_and_second_commit_is_stale() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("c.txt", b"AAAA").unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
@@ -170,7 +176,8 @@ fn concurrent_handles_isolate_and_second_commit_is_stale() {
 #[test]
 fn o_trunc_without_writes_commits_an_empty_file() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("t.txt", b"hello").unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
@@ -199,7 +206,8 @@ fn o_trunc_without_writes_commits_an_empty_file() {
 #[test]
 fn o_sync_commits_each_write() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -246,7 +254,8 @@ fn o_sync_commits_each_write() {
 #[test]
 fn zero_length_write_is_a_noop() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("z.txt", b"data").unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
@@ -297,7 +306,8 @@ fn zero_length_write_is_a_noop() {
 #[test]
 fn namespace_operations_commit_and_serve() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -336,7 +346,8 @@ fn namespace_operations_commit_and_serve() {
 #[test]
 fn namespace_operations_reject_invalid_targets() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -385,7 +396,8 @@ fn namespace_operations_reject_invalid_targets() {
 #[test]
 fn setattr_truncates_and_toggles_exec() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 
@@ -486,7 +498,8 @@ fn path_truncate_reads_only_the_kept_prefix() {
     .insert_into(&mut store)
     .unwrap();
     engine.author_snapshot(&store, root).unwrap();
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
@@ -512,7 +525,8 @@ fn path_truncate_reads_only_the_kept_prefix() {
 #[test]
 fn handle_mode_change_preserves_content() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, backend) = live_backend(daemon);
     let (stop, loop_handle) = spawn_live_loop(live);
 

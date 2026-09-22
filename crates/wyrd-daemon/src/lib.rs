@@ -3,7 +3,7 @@
 //! engine to a `wyrd-fuse` [`wyrd_fuse::DriveView`] and owns
 //! presentation backends.
 //!
-//! Two rules shape the layout. The core ([`core::Daemon`]) is
+//! Two rules shape the layout. The core ([`core::WyrdNode`]) is
 //! presentation-agnostic: mobile platforms (Android SAF/DocumentsProvider,
 //! iOS file provider) cannot use FUSE, so the platform surface is a
 //! pluggable backend over the same view — the same five operations,
@@ -31,8 +31,8 @@ pub(crate) mod mini_relay;
 
 pub use budgets::ResourceBudgets;
 pub use core::{
-    Daemon, DaemonError, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary,
-    SyncReport,
+    FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, NodeError,
+    RuntimeMaterialization, SyncReport, WyrdNode,
 };
 pub use lifecycle::{Supervisor, Wake, WakeSignal};
 pub use mutation::{

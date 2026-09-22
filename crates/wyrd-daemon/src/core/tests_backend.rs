@@ -1,5 +1,7 @@
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
 
@@ -24,7 +26,8 @@ use wyrd_sync::bulk::MemoryBulkSource;
 #[test]
 fn into_live_shares_view_with_backend() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("live.txt", b"shared").unwrap();
 
     let (mut live, backend) = live_backend(daemon);
@@ -61,7 +64,8 @@ fn into_live_shares_view_with_backend() {
 #[test]
 fn dirty_backlog_republishes_without_new_changes() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("dirty.txt", b"pending").unwrap();
     let (mut live, backend) = live_backend(daemon);
     let failed = live.sync_once(&mut SettlementFailingMailbox, None::<&mut MemoryBulkSource>);
@@ -98,7 +102,8 @@ fn dirty_backlog_republishes_without_new_changes() {
 #[test]
 fn mkdir_through_backend_commits_and_serves() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let (live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
     // The test takes the composer role: the backend is built from the
     // node's live parts, never handed out by the node.
@@ -177,7 +182,8 @@ fn mkdir_through_backend_commits_and_serves() {
 #[test]
 fn into_live_stores_the_composition_config_budgets() {
     let (engine, dir, _) = scratch_drive();
-    let daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     let config = LiveConfig {
         budgets: ResourceBudgets {
             max_admit_per_pass: 2,
@@ -208,7 +214,8 @@ fn into_live_stores_the_composition_config_budgets() {
 #[test]
 fn create_at_saturated_table_creates_nothing() {
     let (engine, dir, _) = scratch_drive();
-    let mut daemon = Daemon::new(engine, MemoryObjectStore::default()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
     daemon.put_file("live.txt", b"shared").unwrap();
     // One config for composition and loop: the backend's handle cap
     // and the loop's admission cap come from the same value.

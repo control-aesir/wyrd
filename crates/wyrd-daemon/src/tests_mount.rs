@@ -2,6 +2,8 @@ use super::logging::build_mount_subscriber;
 use super::tests_harness::{reclaim, write_secret, TempDir, WithoutRustLog, JOIN_TIMEOUT};
 use super::*;
 
+use wyrd_fuse::DriveView;
+
 /// Mount diagnostics initialize a per-mount log file. A second init
 /// in the same process truncates its own path but reuses the
 /// installed subscriber — the first install wins by design — and
@@ -213,7 +215,8 @@ fn mount_preamble_projects_authorized_heads_without_fuse() {
     let identity = read_identity(&identity_file).unwrap();
     let engine = Engine::open_keystore(drive.clone(), "test-pass", identity).unwrap();
     let store = FsObjectStore::open(drive).unwrap();
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.put_file("hello.txt", b"hello mount").unwrap();
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("hello.txt").unwrap();
@@ -254,7 +257,8 @@ fn live_mount_serves_read_write_until_shutdown() {
     let identity = read_identity(&identity_file).unwrap();
     let engine = Engine::open_keystore(drive.clone(), "test-pass", identity.clone()).unwrap();
     let store = FsObjectStore::open(drive.clone()).unwrap();
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.put_file("hello.txt", b"hello mount").unwrap();
     drop(daemon);
 
@@ -295,7 +299,8 @@ fn live_mount_serves_read_write_until_shutdown() {
     let identity = read_identity(&identity_file).unwrap();
     let engine = Engine::open_keystore(drive_path.clone(), "test-pass", identity).unwrap();
     let store = FsObjectStore::open(drive_path).unwrap();
-    let mut daemon = Daemon::new(engine, store).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("written.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();

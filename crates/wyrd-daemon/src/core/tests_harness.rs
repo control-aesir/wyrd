@@ -116,7 +116,7 @@ where
 /// tests take the composer role `main.rs` plays in production — the
 /// backend is built from the live parts, never handed out by the node.
 pub(super) fn live_backend<S: ObjectStore + Send + Sync + 'static>(
-    daemon: Daemon<S>,
+    daemon: WyrdNode<DriveView<S, RuntimeMaterialization>>,
 ) -> (
     LiveNode<DriveView<S, RuntimeMaterialization>>,
     crate::fuse::FuseBackend<S, RuntimeMaterialization>,

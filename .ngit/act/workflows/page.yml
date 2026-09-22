@@ -1,0 +1,47 @@
+name: page
+
+# Static site for https://wyrd.enesis.md/ from `page/` (self-contained
+# index.html + fonts + svg, no build step). Mirrors the enesis editor
+# pattern (marketing-ci.yml / editor-ci.yml): Cloudflare Pages via
+# wrangler, deploy only on master pushes, scoped to page/** so Rust
+# changes never trigger it.
+#
+# One job: page/check.ts pins marketing claims to docs (fails on drift
+# or present-tense overclaims), then deploys — production on master
+# pushes, preview (`--branch` of the PR head) on pull requests.
+#   Needs the org convention secrets: CLOUDFLARE_ACCOUNT and
+#   CLOUDFLARE_API_TOKEN.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "page/**"
+      - ".ngit/act/workflows/page.yml"
+  pull_request:
+    paths:
+      - "page/**"
+      - ".ngit/act/workflows/page.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno run --allow-read page/check.ts
+      # Production: master pushes deploy the production branch.
+      - if: github.ref == 'refs/heads/master'
+        run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Preview: PRs deploy under their head branch, never production.
+      - if: github.event_name == 'pull_request'
+        run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md --branch=${{ github.head_ref }}
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

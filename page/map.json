@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "page": "page/index.html",
+  "lock": "page/map.lock.json",
+  "slots": [
+    {
+      "slot": "rules/s4-body",
+      "backs": [
+        { "file": "README.md", "heading": "### 4. Continuous Self-Healing Integrity" },
+        { "file": "docs/architecture.md", "heading": "## Current status" }
+      ],
+      "mustContain": ["fully automatic repair is still being built"],
+      "forbids": ["protocol repairs", "automatically repairs"]
+    },
+    {
+      "slot": "rules/s5-body",
+      "backs": [
+        { "file": "docs/trust.md", "heading": "## What each party can know (the security boundary, stated precisely)" },
+        { "file": "docs/architecture.md", "heading": "## Invariants (hold everywhere, always)" }
+      ],
+      "mustContain": ["ciphertext, sizes, and timing"],
+      "forbids": []
+    },
+    {
+      "slot": "status/not-yet",
+      "backs": [
+        { "file": "docs/architecture.md", "heading": "## Current status" },
+        { "file": "README.md", "heading": "## Status" }
+      ],
+      "mustContain": ["Fully automatic repair of corrupted chunks"],
+      "forbids": []
+    }
+  ]
+}

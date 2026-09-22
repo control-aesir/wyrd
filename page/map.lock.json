@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hashes": {
+    "rules/s4-body#0": "b42ece5505532fdabf7fba79fb8ea1c0b1933d401ba941581d8de26cbd7e4766",
+    "rules/s4-body#1": "b860385679d3523298e08ef9f411480375291ee944be6c85f9914c7285763328",
+    "rules/s5-body#0": "177ef75ab644966eff9b8036507ce3312d5cbd52fd0593eb6cc174683e619fd0",
+    "rules/s5-body#1": "c60284cfb90cee7f09aa01afb3efac0ee9d42382747bcd29e12750d7c3a54cb9",
+    "status/not-yet#0": "b860385679d3523298e08ef9f411480375291ee944be6c85f9914c7285763328",
+    "status/not-yet#1": "efd83a0d0a77c8d9e782e9226e65fe178bf504236969d668ca72a66e0992f500"
+  }
+}

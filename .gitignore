@@ -29,3 +29,6 @@ repomix*
 
 # Env
 .env
+
+# Wrangler local state (per-command cache under the repo root)
+.wrangler/

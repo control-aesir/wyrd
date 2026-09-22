@@ -7,6 +7,7 @@ in
 {
   dotenv.enable = true;
 
+  languages.deno.enable = true;
   languages.rust.enable = true;
   languages.rust.toolchainFile = ./rust-toolchain.toml;
 
@@ -57,6 +58,17 @@ in
       enable = true;
       entry = "cargo deny check";
       stages = [ "push" ];
+      pass_filenames = false;
+    };
+
+    # Marketing honesty gate: claims on page/index.html stay pinned to
+    # their backing docs/ sections (page/map.json + page/map.lock.json).
+    # Runs only when the page, the mapping, or the docs change.
+    page-check = {
+      enable = true;
+      name = "page docs mapping";
+      entry = "deno run --allow-read page/check.ts";
+      files = "^(page/|docs/|README\\.md)";
       pass_filenames = false;
     };
   };

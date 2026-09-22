@@ -10,8 +10,10 @@
 //! mobile file surfaces later) consume the view and map errors at their
 //! own boundary.
 
-use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, Snapshot, Tree};
-use wyrd_fuse::{DriveView, Materialization, VerifiedSnapshot, ViewHead};
+use wyrd_core::projection::Projection;
+use wyrd_core::view::{Head, MaterializationPolicy, NamespaceView};
+use wyrd_format::{chunk, ContentId, Entry, FetchStatus, ObjectStore, Tree};
+use wyrd_fuse::{DriveView, ViewHead};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{Engine, RoutePublishing},
@@ -21,48 +23,29 @@ use wyrd_sync::{
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::fuse::FuseBackend;
+use crate::budgets::ResourceBudgets;
 use crate::lifecycle::WakeSignal;
 use crate::mutation::MutationQueue;
-use crate::projection::Projection;
 use crate::want::WantRegistry;
 
 use super::live::{LiveConfig, LiveDaemon};
 
-/// The daemon's bridge from `wyrd-sync`'s verified snapshots to the
-/// view's heads: the one in-tree implementation of [`VerifiedSnapshot`],
-/// constructible only from an `AuthorizedSnapshot` — and only sync's
-/// verification produces one of those. The field stays private: a
-/// `LiveHead` is usable only by handing it to [`ViewHead::new`].
-pub struct LiveHead(AuthorizedSnapshot);
-
-impl LiveHead {
-    pub(crate) fn new(verified: AuthorizedSnapshot) -> Self {
-        Self(verified)
-    }
+/// Bridge authorized snapshots into verified view heads. In safe code
+/// this is the only path from the sync layer's verified bodies to the
+/// view: [`Head`] is constructible only from an `AuthorizedSnapshot`,
+/// and only sync's verification produces one of those.
+pub(super) fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<Head> {
+    heads.into_iter().map(Head::new).collect()
 }
 
-// SAFETY: the sole in-tree implementation of the verification
-// capability. `LiveHead` wraps `AuthorizedSnapshot`, and sync's BIP-340
-// verification is the only thing that can construct one — the claim
-// matches the type's own construction contract.
-#[allow(unsafe_code)]
-unsafe impl VerifiedSnapshot for LiveHead {
-    fn into_snapshot(self) -> Snapshot {
-        self.0.snapshot().clone()
-    }
-}
-
-/// Bridge authorized snapshots into view heads. In safe code this is
-/// the only path from the sync layer's verified bodies to the view:
-/// crossing the boundary any other way requires an explicit
-/// [`VerifiedSnapshot`] `unsafe impl`.
-pub(super) fn view_heads(heads: impl IntoIterator<Item = AuthorizedSnapshot>) -> Vec<ViewHead> {
-    heads
-        .into_iter()
-        .map(LiveHead::new)
-        .map(ViewHead::new)
-        .collect()
+/// The loop's ephemeral views still build through the view's own
+/// admission ticket until Phase 3 makes the loop generic over
+/// [`NamespaceView`]: same verified bytes, same Heads, converted at
+/// the view boundary.
+pub(super) fn view_heads_legacy(
+    heads: impl IntoIterator<Item = AuthorizedSnapshot>,
+) -> Vec<ViewHead> {
+    view_heads(heads).into_iter().map(ViewHead::new).collect()
 }
 
 /// All-or-nothing closure gate shared by the direct refresh and the live
@@ -130,7 +113,7 @@ pub struct DaemonMaterialization {
     pub(super) runtime: wyrd_sync::runtime::RuntimeState,
 }
 
-impl Materialization for DaemonMaterialization {
+impl MaterializationPolicy for DaemonMaterialization {
     fn status(&self, id: &ContentId) -> FetchStatus {
         self.runtime.status(id)
     }
@@ -151,6 +134,30 @@ pub enum DaemonError {
     Runtime(#[from] wyrd_sync::runtime::EngineError),
 }
 
+/// The shared publication slot every serving backend reads: one
+/// alias for the nested lock shape, so the four holders (loop,
+/// parts, backend construction, observation) name one type.
+pub type SharedProjection<S> = Arc<RwLock<Arc<Projection<DriveView<S, DaemonMaterialization>>>>>;
+
+/// The live half of a split daemon: everything a presentation
+/// backend needs, with no presentation type in the signatures. The
+/// composer builds its backend from these parts (the FUSE adapter via
+/// `FuseBackend::shared_with_wants`); the node itself never names the
+/// backend.
+pub struct LiveParts<S: ObjectStore> {
+    /// The published serving generations, shared with the backend.
+    pub projection: SharedProjection<S>,
+    /// Demand the backend registers; the loop admits it each pass.
+    pub wants: Arc<WantRegistry>,
+    /// Mounted mutations: the backend submits and blocks, the loop
+    /// drains and applies them serially each pass.
+    pub mutations: Arc<MutationQueue>,
+    /// Resource bounds for this live session, fixed at composition.
+    pub budgets: ResourceBudgets,
+    /// How long a backend `open` blocks for demand before failing.
+    pub open_timeout: Duration,
+}
+
 impl<S: ObjectStore> Daemon<S>
 where
     S::Error: std::fmt::Debug,
@@ -167,13 +174,6 @@ where
     /// The read-only drive view backends present.
     pub fn view(&self) -> &DriveView<S, DaemonMaterialization> {
         &self.view
-    }
-
-    /// Consume the composed daemon and hand its shared view to the FUSE
-    /// presentation backend. The engine has already projected authorized
-    /// heads before this handoff; the backend only serves that view.
-    pub fn into_fuse_backend(self) -> crate::fuse::FuseBackend<S, DaemonMaterialization> {
-        crate::fuse::FuseBackend::new(self.view)
     }
 
     /// Drain control-plane messages and refresh the materialization projection.
@@ -232,7 +232,7 @@ where
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
             verified_heads(&runtime, heads, &*store)?
         };
-        self.view.set_heads(view_heads(heads));
+        NamespaceView::set_heads(&mut self.view, view_heads(heads));
         Ok(())
     }
 
@@ -353,16 +353,17 @@ where
     }
 
     /// Split the composed daemon for live serving: the engine and the
-    /// store stay with the sync loop while the backend half moves into
-    /// the FUSE session thread. Both halves share one projection slot,
-    /// one mutation channel, and one store handle for bytes: intake,
-    /// fetch, and local mutations mutate durable state and the store
-    /// with no publication lock held, and each pass publishes a whole
-    /// new generation under one short write lock — serving never
-    /// observes a half-published projection and never stalls on bulk
-    /// I/O. The composer's synchronously refreshed view is adopted as
-    /// the baseline generation, so the backend never serves an empty
-    /// view while the engine already has heads.
+    /// store stay with the sync loop while the backend parts move to
+    /// the composer, which builds its presentation backend from them.
+    /// Both halves share one projection slot, one mutation channel,
+    /// and one store handle for bytes: intake, fetch, and local
+    /// mutations mutate durable state and the store with no
+    /// publication lock held, and each pass publishes a whole new
+    /// generation under one short write lock — serving never observes
+    /// a half-published projection and never stalls on bulk I/O. The
+    /// composer's synchronously refreshed view is adopted as the
+    /// baseline generation, so the backend never serves an empty view
+    /// while the engine already has heads.
     /// Split with explicit resource bounds: the registries and the
     /// backend enforce their own refusals from the config's budgets,
     /// and the loop paces admission from the stored copy of the same
@@ -373,7 +374,7 @@ where
         self,
         open_timeout: Duration,
         config: &LiveConfig,
-    ) -> (LiveDaemon<S>, FuseBackend<S, DaemonMaterialization>) {
+    ) -> (LiveDaemon<S>, LiveParts<S>) {
         let revision = self.engine.current();
         let store = self.view.store_handle();
         let baseline = Projection::initial(self.view, revision);
@@ -386,13 +387,13 @@ where
         // callers (mailbox intake) so every producer wakes the loop.
         let waker = Arc::new(WakeSignal::default());
         mutations.attach_waker(Arc::clone(&waker));
-        let backend = FuseBackend::shared_with_wants(
-            Arc::clone(&projection),
-            Arc::clone(&wants),
-            Arc::clone(&mutations),
+        let parts = LiveParts {
+            projection: Arc::clone(&projection),
+            wants: Arc::clone(&wants),
+            mutations: Arc::clone(&mutations),
+            budgets,
             open_timeout,
-            &budgets,
-        );
+        };
         (
             LiveDaemon {
                 engine: self.engine,
@@ -405,7 +406,7 @@ where
                 budgets,
                 waker,
             },
-            backend,
+            parts,
         )
     }
 }

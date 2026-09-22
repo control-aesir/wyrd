@@ -111,6 +111,29 @@ where
     (stop, handle)
 }
 
+/// Compose a live loop plus its FUSE adapter from the node's parts:
+/// tests take the composer role `main.rs` plays in production — the
+/// backend is built from the live parts, never handed out by the node.
+pub(super) fn live_backend<S: ObjectStore + Send + Sync + 'static>(
+    daemon: Daemon<S>,
+) -> (
+    LiveDaemon<S>,
+    crate::fuse::FuseBackend<S, DaemonMaterialization>,
+)
+where
+    S::Error: std::fmt::Debug,
+{
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let backend = crate::fuse::FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
+    (live, backend)
+}
+
 /// A mailbox whose settlement always fails: every pass offers the
 /// same envelope and every settle aborts the drain, so the loop's
 /// error cap trips instead of the loop idling forever.

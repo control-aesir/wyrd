@@ -18,7 +18,8 @@ pub mod lifecycle;
 pub mod live_mailbox;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
 pub use wyrd_core::mutation;
-pub mod projection;
+// Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
+pub use wyrd_core::projection;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.
 pub use wyrd_core::session;
 // Moved to wyrd-core; re-exported here until the Phase 3 shim removal.

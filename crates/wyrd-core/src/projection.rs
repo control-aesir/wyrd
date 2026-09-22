@@ -17,20 +17,22 @@
 //! no per-report predicate, so a future commit path cannot silently skip
 //! publication the way a report-counter gate could.
 //!
-//! This module depends only on `wyrd-format`, `wyrd-fuse`, and std: no
-//! transport, no FUSE types, no Unix. That is deliberate — it is the
-//! future `wyrd-core` coordination surface, kept liftable verbatim when
-//! the core/daemon crate split lands.
+//! Generic over [`NamespaceView`](crate::view::NamespaceView): the
+//! publication slot works against the provider-neutral read surface,
+//! never any one presentation's view type.
 
 use std::sync::{Arc, RwLock};
 
-use wyrd_format::ObjectStore;
-use wyrd_fuse::{DriveView, Materialization, ViewHead};
+use crate::view::{Head, NamespaceView};
 
 /// One published generation: the serving view plus the versions that
 /// produced it. Immutable after construction; the loop publishes by
 /// replacing the whole value, never by mutating it.
-pub struct Projection<S: ObjectStore, M: Materialization> {
+///
+/// The `NamespaceView` bound lives on the constructor and accessor
+/// methods, not the struct: holders name their concrete view without
+/// repeating its bounds.
+pub struct Projection<V> {
     /// Publication count. Bumps on every publish; readers use it to
     /// detect staleness (an older generation is a complete, merely
     /// outdated snapshot — never a torn one).
@@ -39,27 +41,24 @@ pub struct Projection<S: ObjectStore, M: Materialization> {
     /// from. Equal revisions mean provably identical projections, so
     /// the idle loop can skip republication without recomputing heads.
     revision: u64,
-    view: DriveView<S, M>,
+    view: V,
 }
 
-impl<S: ObjectStore, M: Materialization> Projection<S, M>
-where
-    S::Error: std::fmt::Debug,
-{
+impl<V: NamespaceView> Projection<V> {
     /// Publish a generation over a shared store handle: the loop and
     /// the backends address the same bytes, each locking only for its
     /// own operation. Heads and facts are fixed at construction.
     pub fn new(
-        store: Arc<RwLock<S>>,
-        materialization: M,
-        heads: Vec<ViewHead>,
+        store: Arc<RwLock<V::Store>>,
+        materialization: V::Materialization,
+        heads: Vec<Head>,
         generation: u64,
         revision: u64,
     ) -> Self {
         Projection {
             generation,
             revision,
-            view: DriveView::shared(store, materialization, heads),
+            view: V::open_shared(store, materialization, heads),
         }
     }
 
@@ -70,7 +69,7 @@ where
     /// change. The adopted heads and facts come from the composer's
     /// synchronously refreshed view, so the baseline is exact — the
     /// loop reconciles anything committed after the split.
-    pub fn initial(view: DriveView<S, M>, revision: u64) -> Self {
+    pub fn initial(view: V, revision: u64) -> Self {
         Projection {
             generation: 0,
             revision,
@@ -82,7 +81,7 @@ where
     /// generation bumps, the durable revision carries over. The
     /// test/simulation path — the production loop builds generations
     /// with [`new`](Self::new), advancing both counters together.
-    pub fn successor(current: &Self, view: DriveView<S, M>) -> Self {
+    pub fn successor(current: &Self, view: V) -> Self {
         Projection {
             generation: current.generation + 1,
             revision: current.revision,
@@ -101,7 +100,7 @@ where
     }
 
     /// The serving view of this generation.
-    pub fn view(&self) -> &DriveView<S, M> {
+    pub fn view(&self) -> &V {
         &self.view
     }
 }

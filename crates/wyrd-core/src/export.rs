@@ -10,17 +10,36 @@
 //! [`ViewError::NotMaterialized`](crate::view::ViewError::NotMaterialized)
 //! content fails the export closed instead of fetching.
 //!
-//! Multi-head conflicts materialize as `name@N` siblings, numbered in
-//! SnapshotId byte order exactly like the version-selection grammar,
-//! so `doc@1` on disk is `doc@1` in the mount. Export never picks a
-//! winner silently; a stored name colliding with a versioned sibling
-//! fails closed as [`ExportError::NameCollision`].
+//! Failure is atomic: the walk lands in a uniquely named staging
+//! sibling and renames it into place only after the whole tree
+//! succeeds, so a failed export leaves no partial tree behind —
+//! neither a retry-blocking `DestinationNotEmpty` nor a tree that
+//! looks complete but silently dropped files.
+//!
+//! Symlinks pass the same confinement policy as the mount
+//! ([`confine_symlink_target`](crate::view::confine_symlink_target)):
+//! absolute and root-escaping targets are refused, because the plain
+//! copy must stay self-contained. Multi-head conflicts materialize as
+//! `name@N` siblings, numbered in SnapshotId byte order exactly like
+//! the version-selection grammar, so `doc@1` on disk is `doc@1` in
+//! the mount. Export never picks a winner silently; a stored name
+//! colliding with a versioned sibling fails closed as
+//! [`ExportError::NameCollision`].
+//!
+//! Walk depth is bounded by the format's [`MAX_PATH_DEPTH`](wyrd_format::MAX_PATH_DEPTH):
+//! the mutation layer never authors deeper trees, so a deeper walk
+//! means a provider outside the format contract, and export refuses
+//! rather than recursing unbounded.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::view::{NamespaceView, Node, OpenFile, ViewError};
+use wyrd_format::MAX_PATH_DEPTH;
+
+use crate::view::{
+    confine_symlink_target, ConfinementError, NamespaceView, Node, OpenFile, ViewError,
+};
 
 /// What one export produced, for logs and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,15 +67,32 @@ pub enum ExportError {
     },
     #[error("export name collision at {0}: a stored name meets a versioned sibling")]
     NameCollision(PathBuf),
+    #[error("symlink at {path} escapes the drive and is refused: {source}")]
+    Symlink {
+        path: String,
+        source: ConfinementError,
+    },
+    #[error("{path}: served {actual} bytes for a {expected}-byte file")]
+    SizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("namespace deeper than the 256-component limit at {0}")]
+    TooDeep(String),
     #[error("symlinks are not supported on this platform")]
     SymlinkUnsupported,
 }
 
 /// Materialize the view's namespace under `dest` and report what
 /// landed. `dest` must not exist or must be empty — export never
-/// merges into a populated tree. Remote-only content fails the whole
-/// export: a partial tree that silently drops files is worse than no
-/// tree.
+/// merges into a populated tree.
+///
+/// The walk lands in a staging sibling and renames it into place on
+/// success; a failed export removes the staging directory, so `dest`
+/// is either the complete tree or untouched. Remote-only content
+/// fails the whole export: a partial tree that silently drops files
+/// is worse than no tree.
 pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportReport, ExportError> {
     if dest.exists() {
         let empty = dest
@@ -70,19 +106,58 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
         if !empty {
             return Err(ExportError::DestinationNotEmpty(dest.to_path_buf()));
         }
-    } else {
-        fs::create_dir_all(dest).map_err(|source| ExportError::Io {
-            path: dest.to_path_buf(),
+    }
+    let staging = staging_sibling(dest);
+    if staging.exists() {
+        // A previous run's staging can only remain after a crash
+        // between the walk and the cleanup (or a concurrent export,
+        // which this unique naming already excludes): never resume
+        // into it, never merge — remove and start clean.
+        fs::remove_dir_all(&staging).map_err(|source| ExportError::Io {
+            path: staging.clone(),
             source,
         })?;
     }
+    fs::create_dir_all(&staging).map_err(|source| ExportError::Io {
+        path: staging.clone(),
+        source,
+    })?;
     let root = view.lookup("").map_err(|source| ExportError::View {
         path: String::new(),
         source,
     })?;
     let mut report = ExportReport::default();
-    export_node(view, &root, "", dest, &mut report)?;
-    Ok(report)
+    match export_node(view, &root, "", &staging, 0, &mut report) {
+        Ok(()) => {
+            fs::rename(&staging, dest).map_err(|source| ExportError::Io {
+                path: dest.to_path_buf(),
+                source,
+            })?;
+            Ok(report)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+/// A uniquely named staging sibling for one export invocation: the
+/// final name plus a pid-and-time suffix, so concurrent exports never
+/// share staging and a crashed run's leftovers are recognizable.
+fn staging_sibling(dest: &Path) -> PathBuf {
+    let stem = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export");
+    dest.with_file_name(format!(
+        "{stem}.wyrd-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or(0)
+    ))
 }
 
 /// One read window per view round trip: small enough to bound memory
@@ -91,15 +166,19 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
 const READ_WINDOW: usize = 128 * 1024;
 
 /// Write one resolved node to `dest`. `vpath` is the drive path for
-/// error context (`""` at the root, whose destination already
-/// exists). Every arm checks for a pre-existing destination first so
-/// a stored name meeting a versioned sibling fails as a collision,
-/// never a silent overwrite.
+/// error context (`""` at the root, whose destination — the staging
+/// directory — already exists). `depth` counts directory levels from
+/// the root and fails closed past the format limit, so a provider
+/// outside the format contract cannot recurse unbounded. Every arm
+/// checks for a pre-existing destination first so a stored name
+/// meeting a versioned sibling fails as a collision, never a silent
+/// overwrite.
 fn export_node<V: NamespaceView>(
     view: &V,
     node: &Node,
     vpath: &str,
     dest: &Path,
+    depth: usize,
     report: &mut ExportReport,
 ) -> Result<(), ExportError> {
     match node {
@@ -122,6 +201,9 @@ fn export_node<V: NamespaceView>(
             Ok(())
         }
         Node::Dir { .. } | Node::MergedDir { .. } => {
+            if depth > MAX_PATH_DEPTH {
+                return Err(ExportError::TooDeep(vpath.to_owned()));
+            }
             if !vpath.is_empty() {
                 if dest.exists() {
                     return Err(ExportError::NameCollision(dest.to_path_buf()));
@@ -147,12 +229,20 @@ fn export_node<V: NamespaceView>(
                     &entry.node,
                     &child_vpath,
                     &dest.join(&entry.name),
+                    depth + 1,
                     report,
                 )?;
             }
             Ok(())
         }
         Node::Symlink { target } => {
+            // The plain copy must stay self-contained: the same
+            // targets the mount refuses (absolute, root-escaping)
+            // never land on disk either.
+            confine_symlink_target(vpath, target).map_err(|source| ExportError::Symlink {
+                path: vpath.to_owned(),
+                source,
+            })?;
             if dest.exists() {
                 return Err(ExportError::NameCollision(dest.to_path_buf()));
             }
@@ -177,7 +267,7 @@ fn export_node<V: NamespaceView>(
                     return Err(ExportError::NameCollision(sibling));
                 }
                 let child_vpath = format!("{vpath}@{}", index + 1);
-                export_node(view, &version.node, &child_vpath, &sibling, report)?;
+                export_node(view, &version.node, &child_vpath, &sibling, depth, report)?;
             }
             Ok(())
         }
@@ -185,8 +275,9 @@ fn export_node<V: NamespaceView>(
 }
 
 /// Stream one open file to `out` in read windows, returning the byte
-/// count. An empty read ends the stream — the view (not export) owns
-/// integrity, so a short stream lands as served.
+/// count. An empty read ends the stream, and the total must equal the
+/// declared size: a provider serving short must fail the export loud
+/// rather than land a truncated file that reads as complete.
 fn stream_file<V: NamespaceView, W: Write>(
     view: &V,
     file: &OpenFile,
@@ -202,7 +293,7 @@ fn stream_file<V: NamespaceView, W: Write>(
                 source,
             })?;
         if chunk.is_empty() {
-            return Ok(offset);
+            break;
         }
         offset += chunk.len() as u64;
         out.write_all(&chunk).map_err(|source| ExportError::Io {
@@ -210,6 +301,14 @@ fn stream_file<V: NamespaceView, W: Write>(
             source,
         })?;
     }
+    if offset != file.size() {
+        return Err(ExportError::SizeMismatch {
+            path: vpath.to_owned(),
+            expected: file.size(),
+            actual: offset,
+        });
+    }
+    Ok(offset)
 }
 
 /// Apply the executable bit the drive recorded. Regular files land
@@ -252,7 +351,9 @@ mod tests {
 
     use wyrd_format::{ContentId, FetchStatus, MemoryObjectStore, SnapshotId};
 
-    use crate::view::{Attr, ConflictVersion, DirEntry, Head, Kind, MaterializationPolicy};
+    use crate::view::{
+        Attr, ConfinementError, ConflictVersion, DirEntry, Head, Kind, MaterializationPolicy,
+    };
 
     /// Residency that serves everything local. Export is offline by
     /// contract; the walk tests never consult the network, and the
@@ -281,8 +382,17 @@ mod tests {
 
     #[derive(Clone)]
     enum FakeNode {
-        File { arena: usize, executable: bool },
-        Dir { index: usize },
+        File {
+            arena: usize,
+            executable: bool,
+            /// Declared size override: `None` serves the arena length
+            /// honestly; `Some` lets a test play a provider that
+            /// declares more (or less) than it streams.
+            declared: Option<u64>,
+        },
+        Dir {
+            index: usize,
+        },
         Symlink(String),
         Conflict(Vec<(u8, FakeNode)>),
     }
@@ -322,6 +432,7 @@ mod tests {
             FakeNode::File {
                 arena: self.arena.len() - 1,
                 executable,
+                declared: None,
             }
         }
 
@@ -339,8 +450,12 @@ mod tests {
 
         fn node(&self, node: &FakeNode) -> Node {
             match node {
-                FakeNode::File { arena, executable } => Node::File {
-                    size: self.arena[*arena].len() as u64,
+                FakeNode::File {
+                    arena,
+                    executable,
+                    declared,
+                } => Node::File {
+                    size: declared.unwrap_or(self.arena[*arena].len() as u64),
                     executable: *executable,
                     chunks: vec![Self::file_id(*arena)],
                 },
@@ -504,21 +619,27 @@ mod tests {
     }
 
     fn tmp() -> PathBuf {
+        // pid + time still collides across threads starting in the
+        // same instant (parallel nextest workers share both), so a
+        // process-wide counter makes every scratch dir unique.
+        static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "wyrd-export-{}-{}",
+            "wyrd-export-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// A drive with nested and empty dirs, a symlink, an executable,
-    /// a multi-window file, and a conflict listed out of order (the
-    /// export must still number by SnapshotId byte order).
+    /// A drive with nested and empty dirs, symlinks (one nested and
+    /// confined), an executable, a multi-window file, and a conflict
+    /// listed out of order (the export must still number by SnapshotId
+    /// byte order).
     fn drive() -> (FakeView, BTreeMap<String, Vec<u8>>) {
         let mut view = FakeView::default();
         let hello = view.file(b"hello, wyrd", false);
@@ -527,7 +648,14 @@ mod tests {
         let tool = view.file(b"#!/bin/sh\n", true);
         let opt_a = view.file(b"version A", false);
         let opt_b = view.file(b"version B", false);
-        let sub = view.dir(vec![("nested.txt".to_owned(), nested)]);
+        let sub = view.dir(vec![
+            ("nested.txt".to_owned(), nested),
+            // One pop from depth 1 stays inside the drive: confined.
+            (
+                "back".to_owned(),
+                FakeNode::Symlink("../hello.txt".to_owned()),
+            ),
+        ]);
         let empty = view.dir(vec![]);
         // Versions arrive out of order: export sorts by snapshot.
         let conflict = FakeNode::Conflict(vec![(2u8, opt_a), (1u8, opt_b)]);
@@ -561,7 +689,7 @@ mod tests {
 
         assert_eq!(report.files, 6, "hello, big, tool, nested, opt@1, opt@2");
         assert_eq!(report.dirs, 3, "root, sub, empty");
-        assert_eq!(report.symlinks, 1);
+        assert_eq!(report.symlinks, 2, "link and sub/back");
         assert_eq!(report.conflicts, 1);
         assert_eq!(
             report.bytes,
@@ -581,6 +709,11 @@ mod tests {
         assert_eq!(
             std::fs::read_link(out.join("link")).unwrap(),
             PathBuf::from("hello.txt")
+        );
+        assert_eq!(
+            std::fs::read_link(out.join("sub").join("back")).unwrap(),
+            PathBuf::from("../hello.txt"),
+            "confined relative targets land verbatim"
         );
         #[cfg(unix)]
         {
@@ -658,6 +791,172 @@ mod tests {
             matches!(error, ExportError::NameCollision(_)),
             "unexpected: {error:?}"
         );
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    /// No staging sibling survives beside `dest`, whatever the
+    /// outcome: a failed export must not litter recognizable
+    /// leftovers for the next run to trip over.
+    fn assert_no_staging(dest: &Path) {
+        let parent = dest.parent().unwrap();
+        let stem = dest.file_name().unwrap().to_str().unwrap().to_owned();
+        for entry in std::fs::read_dir(parent).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            assert!(
+                !name.starts_with(&format!("{stem}.wyrd-export-")),
+                "staging leftover: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_export_leaves_no_partial_tree() {
+        let (mut view, _) = drive();
+        // `big.bin` is the third root child: `hello.txt` lands in
+        // staging first, then the walk fails — the regression the
+        // first-child-missing test never exercises.
+        view.mark_missing(2);
+        let dest = tmp();
+        let out = dest.join("out");
+
+        let error = export_tree(&view, &out).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ExportError::View {
+                    source: ViewError::NotMaterialized { .. },
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert!(!out.exists(), "the destination is absent, not partial");
+        assert_no_staging(&out);
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn failed_export_preserves_a_preexisting_empty_destination() {
+        let (mut view, _) = drive();
+        view.mark_missing(2);
+        let dest = tmp();
+        let out = dest.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let error = export_tree(&view, &out).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ExportError::View {
+                    source: ViewError::NotMaterialized { .. },
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert!(
+            out.is_dir() && out.read_dir().unwrap().next().is_none(),
+            "the pre-existing destination is still there and still empty"
+        );
+        assert_no_staging(&out);
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn refuses_absolute_and_escaping_symlink_targets() {
+        let mut view = FakeView::default();
+        view.set_root(vec![(
+            "abs".to_owned(),
+            FakeNode::Symlink("/etc/passwd".to_owned()),
+        )]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExportError::Symlink {
+                    source: ConfinementError::Absolute,
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_no_staging(&dest.join("out"));
+
+        let mut view = FakeView::default();
+        let esc = view.dir(vec![(
+            "esc".to_owned(),
+            // Two pops from depth 1: above the drive root.
+            FakeNode::Symlink("../../evil".to_owned()),
+        )]);
+        view.set_root(vec![("sub".to_owned(), esc)]);
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExportError::Symlink {
+                    source: ConfinementError::EscapesRoot,
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_no_staging(&dest.join("out"));
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn fails_closed_on_short_reads() {
+        let mut view = FakeView::default();
+        view.arena.push(b"abc".to_vec());
+        view.set_root(vec![(
+            "short.txt".to_owned(),
+            FakeNode::File {
+                arena: 0,
+                executable: false,
+                // Declares 100 bytes, streams 3.
+                declared: Some(100),
+            },
+        )]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+
+        match error {
+            ExportError::SizeMismatch {
+                expected, actual, ..
+            } => assert_eq!((expected, actual), (100, 3)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(!dest.join("out").exists(), "no truncated file lands");
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn fails_closed_beyond_max_depth() {
+        let mut view = FakeView::default();
+        let leaf = view.file(b"deep", false);
+        let mut node = leaf;
+        // Single-letter names: the walk must trip the depth cap long
+        // before the filesystem path limit matters.
+        for level in 0..260 {
+            let name = ((b'a' + (level % 26) as u8) as char).to_string();
+            node = view.dir(vec![(name, node)]);
+        }
+        view.set_root(vec![("top".to_owned(), node)]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+
+        assert!(
+            matches!(error, ExportError::TooDeep(_)),
+            "unexpected: {error:?}"
+        );
+        assert!(!dest.join("out").exists());
         std::fs::remove_dir_all(dest).unwrap();
     }
 }

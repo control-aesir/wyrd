@@ -222,6 +222,6 @@ peers can fetch from.
 What it is not: peer sync is not hardened (signer-session wiring and
 multi-relay supervision are still open), there is no garbage collection
 (the store grows forever), writes are whole-file (append/truncate flags
-are refused), there is no export command and no auto-update, and drives
+are refused), there is no auto-update, and drives
 created by one alpha may not open under the next. Bugs go to the
 repository's ngit issues.

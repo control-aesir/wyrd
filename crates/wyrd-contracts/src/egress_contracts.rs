@@ -17,55 +17,95 @@
 use wyrd_core::export::export_tree;
 use wyrd_core::node::WyrdNode;
 use wyrd_core::view::RuntimeMaterialization;
-use wyrd_format::MemoryObjectStore;
+use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_fuse::DriveView;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 
-/// A fresh engine directory for one egress composition.
+/// A fresh engine directory for one egress composition. The
+/// process-wide counter keeps parallel workers from sharing a
+/// scratch dir when they start in the same instant.
 fn egress_dir(name: &str) -> std::path::PathBuf {
+    static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "wyrd-egress-{name}-{}-{}",
+        "wyrd-egress-{name}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// Egress over the real stack: author through the node, export
-/// through the neutral walk, and read the output back with plain
-/// filesystem calls. The entry set is asserted exactly — the tree
-/// holds the drive's files and nothing else, in particular no wyrd
-/// artifacts.
+/// Egress over the real stack: author through the engine, serve
+/// through the node, export through the neutral walk, and read the
+/// output back with plain filesystem calls. The tree is built at the
+/// format level so it exercises entry kinds the node's `put_file`
+/// surface does not offer — a symlink and an executable — proving
+/// the walk serves what real snapshots actually contain. The entry
+/// set is asserted exactly: the tree holds the drive's files and
+/// nothing else, in particular no wyrd artifacts.
+///
+/// A two-head conflict is deliberately absent: `author_snapshot`
+/// resolves onto the current heads, so forking a second head through
+/// the public API is impossible (it arrives via intake, never local
+/// authoring). Conflict rendering composes from the `foo@N` grammar
+/// tests and the core walk tests instead.
 #[test]
 fn export_round_trips_a_real_drive_to_a_plain_tree() {
     let dir = egress_dir("round-trip");
-    let engine = Engine::create(
+    let mut engine = Engine::create(
         dir.clone(),
         "egress-test-pass",
         DeviceIdentitySecret::generate().unwrap(),
     )
     .unwrap();
+    let mut store = MemoryObjectStore::default();
+    let hello = store.insert(ObjectKind::Chunk, b"hello egress").unwrap();
+    let script = store.insert(ObjectKind::Chunk, b"#!/bin/sh\n").unwrap();
+    let nested = store.insert(ObjectKind::Chunk, b"nested").unwrap();
+    let empty = Tree::from_entries(vec![])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let mut root = Tree::from_entries(vec![])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    for (path, entry) in [
+        (
+            "hello.txt",
+            Entry::file("hello.txt", 12, false, vec![hello]).unwrap(),
+        ),
+        (
+            "tool.sh",
+            Entry::file("tool.sh", 10, true, vec![script]).unwrap(),
+        ),
+        (
+            "sub/nested.txt",
+            Entry::file("nested.txt", 6, false, vec![nested]).unwrap(),
+        ),
+        ("link", Entry::symlink("link", "hello.txt").unwrap()),
+        ("empty", Entry::dir("empty", empty).unwrap()),
+    ] {
+        root = wyrd_format::put(&mut store, root, path, entry).unwrap();
+    }
+    engine.author_snapshot(&store, root).unwrap();
     let mut node: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
-        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
-    node.put_file("hello.txt", b"hello egress").unwrap();
-    node.put_file("sub/nested.txt", b"nested").unwrap();
-    node.put_file("sub/gone.txt", b"gone").unwrap();
-    // The emptied directory stays, matching the mutation layer.
-    node.remove("sub/gone.txt").unwrap();
+        WyrdNode::new(engine, store).unwrap();
+    node.refresh_live_heads().unwrap();
 
     let out = dir.join("out");
     let report = export_tree(node.view(), &out).unwrap();
 
-    assert_eq!(report.files, 2);
-    assert_eq!(report.dirs, 2, "root and sub");
-    assert_eq!(report.symlinks, 0);
+    assert_eq!(report.files, 3);
+    assert_eq!(report.dirs, 3, "root, sub, and empty");
+    assert_eq!(report.symlinks, 1);
     assert_eq!(report.conflicts, 0);
-    assert_eq!(report.bytes, 12 + 6);
+    assert_eq!(report.bytes, 12 + 10 + 6);
     assert_eq!(
         std::fs::read(out.join("hello.txt")).unwrap(),
         b"hello egress"
@@ -74,12 +114,32 @@ fn export_round_trips_a_real_drive_to_a_plain_tree() {
         std::fs::read(out.join("sub").join("nested.txt")).unwrap(),
         b"nested"
     );
-    let mut entries = Vec::new();
-    for entry in walk(&out) {
-        entries.push(entry);
+    assert_eq!(
+        std::fs::read_link(out.join("link")).unwrap(),
+        std::path::PathBuf::from("hello.txt")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(out.join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "executable bit preserved");
     }
+    let mut entries = walk(&out);
     entries.sort();
-    assert_eq!(entries, ["hello.txt", "sub", "sub/nested.txt"]);
+    assert_eq!(
+        entries,
+        [
+            "empty",
+            "hello.txt",
+            "link",
+            "sub",
+            "sub/nested.txt",
+            "tool.sh"
+        ]
+    );
 
     std::fs::remove_dir_all(dir).unwrap();
 }

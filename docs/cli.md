@@ -61,8 +61,13 @@ any format break.
 - Multi-head conflicts export as `name@N` siblings, numbered in
   SnapshotId byte order — the same numbering the mounted `foo@N`
   grammar selects by. Export never picks a winner silently.
+- Symlinks pass the same confinement policy as the mount: absolute
+  and root-escaping targets are refused, so the plain copy stays
+  self-contained.
 - `<out_dir>` must not exist or must be empty; export never merges
-  into a populated tree.
+  into a populated tree. The walk lands in a staging sibling and
+  renames it into place only after the whole tree succeeds, so a
+  failed export leaves no partial tree behind.
 
 ## Credential files
 

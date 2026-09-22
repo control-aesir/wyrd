@@ -9,6 +9,7 @@ description = "Wyrd's cross-crate architectural contract suite: one named test p
 wyrd-format.workspace = true
 wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
+wyrd-core.workspace = true
 wyrd-daemon = { path = "../wyrd-daemon" }
 
 [dev-dependencies]

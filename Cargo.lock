@@ -5202,6 +5202,7 @@ dependencies = [
  "secp256k1",
  "tokio",
  "toml",
+ "wyrd-core",
  "wyrd-daemon",
  "wyrd-format",
  "wyrd-fuse",

@@ -91,6 +91,14 @@
 //!     genuine admission converges around it; the pusher is transport,
 //!     never authority.
 //!
+//! The layering contracts (workspace extraction program):
+//!
+//! 34. `crate_dependencies_follow_the_layered_dag` — every member's
+//!     production dependencies point downward along
+//!     `wyrd-format → wyrd-sync → wyrd-core → presentation`, and the
+//!     policy fails closed on unknown crates or edges
+//!     (`docs/architecture.md`, crate map).
+//!
 //! The upgrade contracts (`docs/upgrade-contract.md`), one per invariant:
 //!
 //! 23. `upgrade_new_encoding_is_new_representation` — re-stored content
@@ -137,6 +145,8 @@
 mod fuse_contracts;
 #[cfg(test)]
 mod join_contracts;
+#[cfg(test)]
+mod layer_contracts;
 #[cfg(test)]
 mod serving_contracts;
 #[cfg(test)]

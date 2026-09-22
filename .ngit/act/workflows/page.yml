@@ -6,11 +6,9 @@ name: page
 # wrangler, deploy only on master pushes, scoped to page/** so Rust
 # changes never trigger it.
 #
-# Jobs:
-# - check runs on master: pins marketing claims to docs via
-#   page/check.ts (fails on drift or present-tense overclaims).
-# - deploy runs on master only, after check, and publishes `page/`
-#   to the wyrd-enesis-md Pages project (custom domain wyrd.enesis.md).
+# One job: page/check.ts pins marketing claims to docs (fails on drift
+# or present-tense overclaims), then deploys — production on master
+# pushes, preview (`--branch` of the PR head) on pull requests.
 #   Needs the org convention secrets: CLOUDFLARE_ACCOUNT and
 #   CLOUDFLARE_API_TOKEN.
 
@@ -20,6 +18,11 @@ on:
     paths:
       - "page/**"
       - ".ngit/act/workflows/page.yml"
+  pull_request:
+    paths:
+      - "page/**"
+      - ".ngit/act/workflows/page.yml"
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -30,7 +33,15 @@ jobs:
         with:
           deno-version: v2.x
       - run: deno run --allow-read page/check.ts
-      - run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md
+      # Production: master pushes deploy the production branch.
+      - if: github.ref == 'refs/heads/master'
+        run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Preview: PRs deploy under their head branch, never production.
+      - if: github.event_name == 'pull_request'
+        run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md --branch=${{ github.head_ref }}
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

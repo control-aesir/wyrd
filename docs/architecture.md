@@ -46,6 +46,22 @@ presentation-agnostic (mobile platforms cannot use FUSE, so the platform
 surface is a pluggable backend over the same view); the FUSE adapter is the
 first backend, not a property of the core.
 
+## Layer target (node extraction in progress)
+
+The daemon conflates "the Wyrd local node" with "the process that runs
+the node", so it splits along the dependency direction it already has:
+`wyrd-core` (the embeddable node: namespace, snapshots, mutations,
+materialization, sync control — never FUSE, argument parsing, POSIX
+errno mapping, or process supervision), `wyrd-daemon` (process
+lifecycle, supervision, services, platform providers), and `wyrd-cli`
+(thin parsing over the node API). `wyrd-daemon` depends on `wyrd-core`,
+never the reverse; CLI and providers consume public surfaces only. The
+DAG is machine-enforced by contract 34 (`layer_contracts.rs`) before
+any code moves, so each extraction phase lands against an invariant
+rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
+to the mailbox subsystem by the same contract: control-plane framing
+lives with sync control, never ambient across the node.
+
 ## Invariants (hold everywhere, always)
 
 1. **Objects are immutable.** ContentId = domain-separated BLAKE3 of

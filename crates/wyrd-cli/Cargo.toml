@@ -1,0 +1,39 @@
+[package]
+name = "wyrd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wyrd's command line: the wyrd process host. Argument parsing, credential files, mount orchestration, diagnostics, and exit codes over the daemon's public surface."
+
+[[bin]]
+name = "wyrd"
+path = "src/main.rs"
+
+[dependencies]
+wyrd-format.workspace = true
+wyrd-sync.workspace = true
+wyrd-core.workspace = true
+wyrd-daemon.workspace = true
+clap.workspace = true
+fuser = "0.18"
+hex.workspace = true
+libc.workspace = true
+nostr.workspace = true
+thiserror.workspace = true
+# Mount diagnostics: structured events to stderr plus a per-mount file,
+# and a bridge so fuser's log records land in the same record.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-log = "0.2"
+zeroize.workspace = true
+
+[dev-dependencies]
+# Downstream tests build a real `Engine` per test; enabling the fast KDF
+# profile here keeps that affordable without touching production builds.
+wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+# The mount-path tests name the composed view type explicitly; the
+# binary itself only ever touches it through the daemon's surface.
+wyrd-fuse.workspace = true
+
+[lints]
+workspace = true

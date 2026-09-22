@@ -118,12 +118,26 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "zeroize",
             ],
         }),
-        // Thin parsing over the node API: may drive core and the
-        // daemon's public host surface, never the view crate or raw
-        // FUSE directly.
+        // The `wyrd` process host: argument parsing, credential
+        // files, mount orchestration, diagnostics, and exit codes over
+        // the daemon's public surface. It mounts through the FUSE
+        // adapter, so the host crates (fuser, libc, tracing) and the
+        // credential/control-plane crates (hex, nostr) are its own —
+        // never the sync transport internals or the contract suite.
         "wyrd-cli" => Some(MemberPolicy {
             workspace_allow: &["wyrd-format", "wyrd-sync", "wyrd-core", "wyrd-daemon"],
-            external_allow: &["clap", "thiserror", "zeroize"],
+            external_allow: &[
+                "clap",
+                "fuser",
+                "hex",
+                "libc",
+                "nostr",
+                "thiserror",
+                "tracing",
+                "tracing-subscriber",
+                "tracing-log",
+                "zeroize",
+            ],
         }),
         // The suite itself: leaf, depends on every crate, and the
         // reverse edge is checked separately below. No third-party
@@ -579,6 +593,38 @@ mod policy_tests {
         let violations = check_member("wyrd-cli", &deps(&["wyrd-core", "wyrd-fuse"]), &empty_ws());
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("wyrd-fuse"));
+    }
+
+    #[test]
+    fn cli_host_deps_are_exact() {
+        // The process host's full production edge set, pinned so a
+        // widening (or a silent policy trim) fails here and not in
+        // review vigilance. The live contract above checks the real
+        // manifest; this names the expectation.
+        let violations = check_member(
+            "wyrd-cli",
+            &deps(&[
+                "wyrd-format",
+                "wyrd-sync",
+                "wyrd-core",
+                "wyrd-daemon",
+                "clap",
+                "fuser",
+                "hex",
+                "libc",
+                "nostr",
+                "thiserror",
+                "tracing",
+                "tracing-subscriber",
+                "tracing-log",
+                "zeroize",
+            ]),
+            &empty_ws(),
+        );
+        assert!(
+            violations.is_empty(),
+            "cli allowlist drifted: {violations:?}"
+        );
     }
 
     #[test]

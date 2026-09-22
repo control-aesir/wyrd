@@ -37,7 +37,8 @@ arbitrary subsets of that drive locally.
 | `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format`, `wyrd-core` (namespace value model) |
 | `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control; no presentation, no process supervision | `wyrd-format`, `wyrd-sync` |
-| `wyrd-daemon` | Composition: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-core`, `wyrd-sync`, `wyrd-fuse`, `fuser` |
+| `wyrd-daemon` | Composition library: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-core`, `wyrd-sync`, `wyrd-fuse`, `fuser` |
+| `wyrd-cli` | The `wyrd` process host: argument parsing, credential files, mount orchestration, diagnostics, exit codes | `wyrd-daemon` (+ `wyrd-core`/`wyrd-sync`/`wyrd-format` surfaces), `clap`, `fuser`, `libc` |
 | `wyrd-contracts` | Test suite: one named test per architectural contract, composed end to end | all of the above |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
@@ -53,14 +54,15 @@ The daemon conflates "the Wyrd local node" with "the process that runs
 the node", so it splits along the dependency direction it already has:
 `wyrd-core` (the embeddable node: namespace, snapshots, mutations,
 materialization, sync control — never FUSE, argument parsing, POSIX
-errno mapping, or process supervision), `wyrd-daemon` (process
-lifecycle, supervision, services, platform providers), and `wyrd-cli`
-(thin parsing over the node API). `wyrd-daemon` depends on `wyrd-core`,
-never the reverse; CLI and providers consume public surfaces only. The
-DAG is machine-enforced by contract 34 (`layer_contracts.rs`) for the
-members present today, with the `wyrd-core`/`wyrd-cli` clauses
-activating when those crates join the workspace — each extraction
-phase lands against an invariant rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
+errno mapping, or process supervision), `wyrd-daemon` (composition
+library: process lifecycle, supervision, services, platform
+providers), and `wyrd-cli` (the `wyrd` process host: argument
+parsing, credential files, mount orchestration, diagnostics, exit
+codes over the daemon's public surface). `wyrd-daemon` depends on
+`wyrd-core`, never the reverse; CLI and providers consume public
+surfaces only. The DAG is machine-enforced by contract 34
+(`layer_contracts.rs`) for every member — each extraction phase lands
+against an invariant rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
 to the mailbox subsystem by the same contract: control-plane framing
 lives with sync control, never ambient across the node.
 

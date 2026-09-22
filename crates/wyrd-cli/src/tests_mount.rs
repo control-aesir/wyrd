@@ -231,7 +231,7 @@ fn mount_preamble_projects_authorized_heads_without_fuse() {
 /// test runner's job, so an explicit run always attempts the mount
 /// instead of silently passing. Needs kernel FUSE plus local
 /// networking for the serving endpoint. Run it where both hold:
-/// `cargo nextest run -p wyrd-daemon --bin wyrd --run-ignored all`
+/// `cargo nextest run -p wyrd-cli --bin wyrd --run-ignored all`
 #[test]
 #[ignore = "needs kernel FUSE and local networking"]
 fn live_mount_serves_read_write_until_shutdown() {

@@ -724,7 +724,7 @@ mode below, so no shipped build satisfies T6 yet.
   lifetime. The engine signs snapshots and announcements with it and seals
   NIP-44 envelopes with it (`wyrd-sync/src/runtime/author/deliver.rs`); the live
   mailbox is built from the same key, which unwraps inbound gift wraps
-  (`LiveMailbox::connect`, called from `wyrd-daemon/src/main.rs`). In this
+  (`LiveMailbox::connect`, called from `wyrd-cli/src/main.rs`). In this
   mode the daemon **does** hold the nsec: anyone who can read the identity
   file or the daemon's memory holds the device identity.
 - **NIP-46 mode — specified, not wired.** The `SignerSession` trait

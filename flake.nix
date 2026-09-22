@@ -47,7 +47,7 @@
           src = craneLib.cleanCargoSource ./.;
           # Only the user-facing binary. Library crates ride along as its
           # dependencies; nothing else installs a binary.
-          cargoExtraArgs = "-p wyrd-daemon";
+          cargoExtraArgs = "-p wyrd-cli";
           strictDeps = true;
           # The test suite (nextest, doctests) runs in rust-ci with the full
           # dev environment; the distribution build only proves the binary

@@ -6,6 +6,7 @@ members = [
     "crates/wyrd-fuse",
     "crates/wyrd-core",
     "crates/wyrd-daemon",
+    "crates/wyrd-cli",
     "crates/wyrd-contracts",
 ]
 
@@ -38,6 +39,7 @@ wyrd-format = { path = "crates/wyrd-format" }
 wyrd-sync = { path = "crates/wyrd-sync" }
 wyrd-fuse = { path = "crates/wyrd-fuse" }
 wyrd-core = { path = "crates/wyrd-core" }
+wyrd-daemon = { path = "crates/wyrd-daemon" }
 
 # content hashing
 blake3 = "1.8"
@@ -52,7 +54,7 @@ thiserror = "2"
 # FUSE boundary error mapping (daemon adapter only)
 libc = "0.2"
 
-# CLI parsing (daemon binary): derive structs replace hand-rolled argv
+# CLI parsing (CLI binary): derive structs replace hand-rolled argv
 # surgery; credential-file hardening stays wyrd-owned
 clap = { version = "4", features = ["derive"] }
 

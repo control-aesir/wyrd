@@ -3,11 +3,7 @@ name = "wyrd-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Wyrd's daemon: composes the sync engine with the drive view and presentation backends (FUSE today, platform file surfaces later)"
-
-[[bin]]
-name = "wyrd"
-path = "src/main.rs"
+description = "Wyrd's daemon library: composes the sync engine with the drive view and presentation backends (FUSE today, platform file surfaces later). The wyrd binary lives in wyrd-cli."
 
 [dependencies]
 wyrd-format.workspace = true
@@ -15,33 +11,15 @@ wyrd-sync.workspace = true
 wyrd-fuse.workspace = true
 wyrd-core.workspace = true
 fuser = "0.18"
-futures-util.workspace = true
-# Jitter entropy for supervision backoff (equal-jitter decorrelation of
-# retry storms; the same approved CSPRNG substrate wyrd-sync builds on)
-getrandom.workspace = true
-hex.workspace = true
 libc.workspace = true
-clap.workspace = true
-nostr.workspace = true
-nostr-connect.workspace = true
-nostr-sdk.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-# Mount diagnostics: structured events to stderr plus a per-mount file,
-# and a bridge so fuser's log records land in the same record.
+# Structured mount events the process host bridges into its diagnostics.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tracing-log = "0.2"
-zeroize.workspace = true
 
 [dev-dependencies]
 # Downstream tests build a real `Engine` per test; enabling the fast KDF
 # profile here keeps that affordable without touching production builds.
 wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
-serde_json = "1"
-# In-process websocket relay for live mailbox integration tests (test-only:
-# a minimal NIP-01 server; never a runtime dependency).
-tokio-tungstenite = "0.28"
 
 [lints]
 workspace = true

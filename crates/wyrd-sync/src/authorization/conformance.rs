@@ -687,6 +687,237 @@ fn recovery_parent_that_dies_in_the_fixed_point_is_rejected() {
     );
 }
 
+// --- adversarial ancestry -------------------------------------------------
+//
+// The trust contract's critical rule: recovery may graft content onto
+// eligible heads but must never adopt lineage. These tests attack the
+// ancestry shapes a malicious or confused peer could serve — voided
+// bindings, conflict branches, revoked authorship, stale canonical
+// bindings — and pin the verdict each shape must produce.
+
+/// Build the standard voided fork: `a` rotates at epoch 2, `fork`
+/// admits a second device on the same prev, and `r` resolves at epoch
+/// 3 with `a` winning. Returns the voided fork's id and epoch.
+fn voided_fork(f: &mut Fixture) -> (TransitionId, u64) {
+    let a = f.builder.child(vec![Change::Rotate]);
+    let (_, second) = f.device(2);
+    let mut fork = a.clone();
+    fork = fork.with_changes(vec![admit(second)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second]).unwrap();
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    let mut r = f.builder.child(vec![Change::Rotate]);
+    r.prev = Some(a.transition_id());
+    r = r.with_resolves(vec![fork.transition_id()]).unwrap();
+    r.epoch = 3;
+    crate::membership::test_util::sign(&mut r, &f.sk, &f.drive);
+    f.observe_raw(a);
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    f.observe_raw(fork);
+    f.observe_raw(r);
+    (fork_id, fork_epoch)
+}
+
+#[test]
+fn recovery_bound_to_a_voided_transition_is_voided() {
+    // The recovery flag changes the author and parent rules; it does
+    // not change the binding rule. A recovery snapshot bound to a
+    // voided transition is voided history like any other snapshot on
+    // that binding — the flag never escapes the binding.
+    let mut f = Fixture::new(1);
+    let (fork_id, fork_epoch) = voided_fork(&mut f);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut recovery = f.owner_snapshot(Vec::new(), tree_id(1));
+    recovery.membership = fork_id;
+    recovery.epoch = fork_epoch;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Voided,
+        "a voided binding voides even a recovery snapshot"
+    );
+    assert!(dag.eligible_heads(&f.log).is_empty());
+}
+
+#[test]
+fn recovery_parenting_a_voided_bound_snapshot_is_rejected() {
+    // Recovery grafts content, never lineage: parenting a snapshot
+    // bound to a voided transition is rejected even though the
+    // recovery itself binds the canonical tip and is owner-signed.
+    let mut f = Fixture::new(1);
+    let (fork_id, fork_epoch) = voided_fork(&mut f);
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut voided = f.owner_snapshot(Vec::new(), tree_id(1));
+    voided.membership = fork_id;
+    voided.epoch = fork_epoch;
+    sign_snapshot(&mut voided, &f.sk, &f.drive);
+    let id_voided = observe(&mut dag, &voided);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_voided),
+        Classification::Voided
+    );
+    let mut recovery = f.owner_snapshot(vec![id_voided], tree_id(2));
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryParentInvalid),
+        "recovery must not adopt voided lineage"
+    );
+}
+
+#[test]
+fn recovery_cannot_adopt_a_conflict_branch() {
+    // Two rivals at epoch 3 freeze the log: both contested, the tip
+    // stays at epoch 2. A recovery grafted onto the conflicted branch
+    // is rejected — the branch is not eligible lineage, and recovery
+    // must not launder it into the live view whichever rival wins.
+    let mut f = Fixture::new(1);
+    let a = f.builder.child(vec![Change::Rotate]); // epoch 2
+    let b1 = f.builder.child(vec![Change::Rotate]); // epoch 3, prev a
+    let (_, third) = f.device(3);
+    let mut b2 = a.clone();
+    b2 = b2.with_changes(vec![admit(third)]).unwrap();
+    b2.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, third]).unwrap();
+    b2.epoch = 3;
+    b2.prev = Some(a.transition_id());
+    crate::membership::test_util::sign(&mut b2, &f.sk, &f.drive);
+    f.observe_raw(a);
+    let b1_id = b1.transition_id();
+    f.observe_raw(b1);
+    f.observe_raw(b2);
+    assert_eq!(f.tip_epoch, 2, "the freeze holds the tip at epoch 2");
+    let mut dag = SnapshotDag::new(f.drive);
+    let mut s1 = f.owner_snapshot(Vec::new(), tree_id(1));
+    s1.membership = b1_id;
+    s1.epoch = 3;
+    sign_snapshot(&mut s1, &f.sk, &f.drive);
+    let id_s1 = observe(&mut dag, &s1);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_s1),
+        Classification::Pending(Pendency::ContestedTransition)
+    );
+    // The recovery binds the frozen tip and is owner-signed; its only
+    // sin is the conflicted parent.
+    let mut recovery = f.owner_snapshot(vec![id_s1], tree_id(2));
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryParentInvalid),
+        "recovery must wait out the conflict, not adopt a side"
+    );
+}
+
+#[test]
+fn revoked_author_cannot_resurface_through_ancestry() {
+    // B is admitted at epoch 2, authors live work, and is removed at
+    // epoch 3. Every post-removal authorship trick must fail: new work
+    // bound to the current tip is rejected (B is no member), new work
+    // bound to the old transition is retained history at best, and no
+    // ancestry shape — owner parenting included — ever makes B's own
+    // snapshot eligible again.
+    let mut f = Fixture::new(1);
+    let (b_sk, b) = f.device(2);
+    f.membership(vec![admit(b)]); // K = 2
+    let tip_at_2 = f.tip;
+    let mut dag = SnapshotDag::new(f.drive);
+    let s1 = f.snapshot(Vec::new(), tree_id(1), b, &b_sk, 0);
+    let id_s1 = observe(&mut dag, &s1);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_s1),
+        Classification::Eligible,
+        "pre-removal member work is live"
+    );
+    f.membership(vec![Change::Remove(b)]); // K = 3
+                                           // Post-removal work bound to the current tip: rejected, not a
+                                           // member of the bound state.
+    let after = f.snapshot(vec![id_s1], tree_id(2), b, &b_sk, 0);
+    let id_after = observe(&mut dag, &after);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_after),
+        Classification::Rejected(Rejection::AuthorNotMember)
+    );
+    // Post-removal work bound to the old transition (B was a member
+    // then): authorized history, never live. Backdating the epoch to
+    // the current one is a mismatch, not a promotion.
+    let mut resurfaced = f.snapshot(vec![id_s1], tree_id(3), b, &b_sk, 0);
+    resurfaced.membership = tip_at_2;
+    resurfaced.epoch = 2;
+    sign_snapshot(&mut resurfaced, &b_sk, &f.drive);
+    let id_resurfaced = observe(&mut dag, &resurfaced);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_resurfaced),
+        Classification::Superseded,
+        "old-binding authorship is retained history, never live"
+    );
+    let mut backdated = resurfaced.clone();
+    backdated.epoch = 3;
+    sign_snapshot(&mut backdated, &b_sk, &f.drive);
+    let id_backdated = observe(&mut dag, &backdated);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_backdated),
+        Classification::Rejected(Rejection::EpochMismatch)
+    );
+    // Even the owner's explicit adoption cannot make B's snapshot
+    // itself eligible: the adopted child is the owner's live work,
+    // the revoked author's snapshot stays history.
+    let live = f.owner_snapshot(Vec::new(), tree_id(4));
+    let id_live = observe(&mut dag, &live);
+    let adopted = f.owner_snapshot(vec![id_live, id_resurfaced], tree_id(5));
+    let id_adopted = observe(&mut dag, &adopted);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_adopted),
+        Classification::Eligible,
+        "the owner's merge is live work"
+    );
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_resurfaced),
+        Classification::CanonicalHistory,
+        "adoption resurrects content into history, never into eligibility"
+    );
+    assert_eq!(dag.eligible_heads(&f.log), vec![id_adopted]);
+}
+
+#[test]
+fn recovery_bound_to_a_stale_canonical_transition_is_rejected() {
+    // Cross-epoch ancestry: after the log advances to K = 2, a
+    // recovery bound to the (canonical, superseded) genesis names
+    // genesis-epoch parents. The binding is valid history but the
+    // parents are not current eligible heads, so the recovery is
+    // rejected — stale lineage cannot mint a live head.
+    let mut f = Fixture::new(1);
+    let genesis_id = f.tip;
+    let mut dag = SnapshotDag::new(f.drive);
+    let base = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id_base = observe(&mut dag, &base);
+    let (_sk, member) = f.device(3);
+    f.membership(vec![admit(member)]); // K = 2
+    let mut recovery = f.owner_snapshot(vec![id_base], tree_id(2));
+    recovery.membership = genesis_id;
+    recovery.epoch = 1;
+    recovery
+        .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
+        .unwrap();
+    sign_snapshot(&mut recovery, &f.sk, &f.drive);
+    let id_recovery = observe(&mut dag, &recovery);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id_recovery),
+        Classification::Rejected(Rejection::RecoveryParentInvalid),
+        "a stale-canonical binding cannot mint a live recovery head"
+    );
+}
+
 // --- determinism ----------------------------------------------------------
 
 #[test]

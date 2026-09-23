@@ -5,15 +5,20 @@ use wyrd_core::budgets::ResourceBudgets;
 use wyrd_daemon::core::{LiveConfig, LiveError, RuntimeMaterialization, WyrdNode};
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
+    membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT},
+    snapshot::RECOVERY_FLAG,
     BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, Manifest, ManifestEntry,
-    MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId, StorageId, Tree,
+    MembershipTransition, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId,
+    StorageId, Tree,
 };
 use wyrd_fuse::{DriveView, ViewError};
+use wyrd_sync::authorization::{Classification, Rejection, SnapshotDag};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
 use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
 use wyrd_sync::keys::DeviceIdentitySecret;
+use wyrd_sync::membership::{MembershipLog, TransitionStatus};
 use wyrd_sync::runtime::{
     Engine, EngineError, RoutePublishing, RouteReport, RuntimeState,
     MAX_PENDING_MESSAGES as PENDING_BOUND,
@@ -25,8 +30,9 @@ use wyrd_sync::transport::mailbox::{
 };
 
 use crate::support::{
-    drive, mount_heads, scratch_dir, seal_flat_drive, signed_snapshot, signed_transition,
-    AnnouncedRoots, Loaded, Relay, RemoteOnlyMaterialization, Rig,
+    device, drive, mount_heads, scratch_dir, seal_flat_drive, sign_snapshot, sign_transition,
+    signed_snapshot, signed_transition, AnnouncedRoots, Loaded, Relay, RemoteOnlyMaterialization,
+    Rig,
 };
 use zeroize::Zeroizing;
 
@@ -1383,4 +1389,160 @@ fn a_mismatched_snapshot_manifest_never_mounts() {
     );
     drop(daemon);
     rig.teardown();
+}
+
+/// Recovery grafts content only, and a voided transition never
+/// authorizes — regardless of ancestry shape (`docs/epochs.md`, Layer
+/// 3; `docs/trust.md` recovery rule). Composed end to end over the
+/// public APIs: hand-signed membership transitions observe into the
+/// public [`MembershipLog`], hand-signed snapshots into the public
+/// [`SnapshotDag`], and every verdict comes out of the production
+/// classifier — no sync test internals.
+#[test]
+fn recovery_grafts_content_only_and_voided_transitions_never_authorize() {
+    let drive_id = drive();
+    let owner = device(1);
+    let second = device(2);
+
+    // Genesis: singleton owner, mirroring the membership fixtures.
+    let mut genesis = MembershipTransition::new(
+        1,
+        None,
+        Vec::new(),
+        vec![
+            Change::Admit(Admission {
+                device: owner.id,
+                encryption_key: owner.encryption_key,
+            }),
+            Change::SetOwners(vec![owner.id]),
+        ],
+        set_root(MEMBER_SET_CONTEXT, &[owner.id]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner.id]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
+        owner.id,
+    )
+    .unwrap();
+    sign_transition(&mut genesis, &owner.signing, &drive_id);
+    let genesis_id = genesis.transition_id();
+
+    // The voided fork: `a` rotates at epoch 2, `fork` admits a second
+    // device as its same-prev sibling, `r` resolves at epoch 3 with
+    // `a` winning.
+    let a = signed_transition(
+        2,
+        Some(genesis_id),
+        vec![],
+        vec![Change::Rotate],
+        &[owner.id],
+        &[owner.id],
+        &owner,
+    );
+    let a_id = a.transition_id();
+    let fork = signed_transition(
+        2,
+        Some(genesis_id),
+        vec![],
+        vec![Change::Admit(Admission {
+            device: second.id,
+            encryption_key: second.encryption_key,
+        })],
+        &[owner.id, second.id],
+        &[owner.id],
+        &owner,
+    );
+    let fork_id = fork.transition_id();
+    let fork_epoch = fork.epoch;
+    let r = signed_transition(
+        3,
+        Some(a_id),
+        vec![fork_id],
+        vec![Change::Rotate],
+        &[owner.id],
+        &[owner.id],
+        &owner,
+    );
+    let r_id = r.transition_id();
+
+    let mut log = MembershipLog::new(drive_id);
+    log.observe(genesis);
+    log.observe(a);
+    log.observe(fork);
+    log.observe(r);
+    assert_eq!(
+        log.status(&fork_id),
+        Some(TransitionStatus::Voided),
+        "the test setup must actually void the fork"
+    );
+
+    let tree_a = ContentId::from_bytes([0xA1; 32]);
+    let tree_b = ContentId::from_bytes([0xB2; 32]);
+    let mut dag = SnapshotDag::new(drive_id);
+    let verdict = |dag: &SnapshotDag, log: &MembershipLog, id: &SnapshotId| {
+        dag.classify(log)
+            .remove(id)
+            .expect("observed snapshot is classified")
+    };
+
+    // A snapshot bound to the voided transition is voided history —
+    // and stays voided through any ancestry shape built on it: child
+    // and grandchild are stranded, never live.
+    let voided = signed_snapshot(vec![], tree_a, &owner, fork_id, fork_epoch, 1);
+    let id_voided = dag.observe(voided);
+    assert_eq!(verdict(&dag, &log, &id_voided), Classification::Voided);
+    let child = signed_snapshot(vec![id_voided], tree_b, &owner, r_id, 3, 2);
+    let id_child = dag.observe(child);
+    assert_eq!(
+        verdict(&dag, &log, &id_child),
+        Classification::Stranded,
+        "dead lineage is never adopted, one generation down"
+    );
+    let grandchild = signed_snapshot(vec![id_child], tree_a, &owner, r_id, 3, 3);
+    let id_grandchild = dag.observe(grandchild);
+    assert_eq!(
+        verdict(&dag, &log, &id_grandchild),
+        Classification::Stranded,
+        "dead lineage is never adopted, two generations down"
+    );
+
+    // The live head at the tip, and the legitimate recovery: grafting
+    // the live head's content on is eligible.
+    let live = signed_snapshot(vec![], tree_b, &owner, r_id, 3, 4);
+    let id_live = dag.observe(live);
+    let mut recovery = signed_snapshot(vec![id_live], tree_a, &owner, r_id, 3, 5);
+    recovery.set_flags(RECOVERY_FLAG).unwrap();
+    sign_snapshot(&mut recovery, &owner.signing, &drive_id);
+    let id_recovery = dag.observe(recovery);
+    assert_eq!(
+        verdict(&dag, &log, &id_recovery),
+        Classification::Eligible,
+        "recovery grafting an eligible head's content is eligible"
+    );
+
+    // Recovery parenting voided lineage: rejected, not stranded — the
+    // graft rule refuses the lineage outright.
+    let mut bad_graft = signed_snapshot(vec![id_voided], tree_a, &owner, r_id, 3, 6);
+    bad_graft.set_flags(RECOVERY_FLAG).unwrap();
+    sign_snapshot(&mut bad_graft, &owner.signing, &drive_id);
+    let id_bad_graft = dag.observe(bad_graft);
+    assert_eq!(
+        verdict(&dag, &log, &id_bad_graft),
+        Classification::Rejected(Rejection::RecoveryParentInvalid),
+        "recovery adopts content, never lineage"
+    );
+
+    // Recovery bound to the voided transition itself: voided. The
+    // flag is no escape from the binding.
+    let mut voided_recovery = signed_snapshot(vec![], tree_a, &owner, fork_id, fork_epoch, 7);
+    voided_recovery.set_flags(RECOVERY_FLAG).unwrap();
+    sign_snapshot(&mut voided_recovery, &owner.signing, &drive_id);
+    let id_voided_recovery = dag.observe(voided_recovery);
+    assert_eq!(
+        verdict(&dag, &log, &id_voided_recovery),
+        Classification::Voided,
+        "a voided binding voids even a recovery snapshot"
+    );
+
+    // Only the live head and its legitimate recovery advance the
+    // view; nothing voided-derived does.
+    assert_eq!(dag.eligible_heads(&log), vec![id_recovery]);
 }

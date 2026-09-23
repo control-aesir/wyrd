@@ -467,6 +467,94 @@ step5_export() {
     check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")"
   done
 }
+# converged <file> <want>: file exists with exactly the wanted content.
+converged() {
+  [[ -f "$1" ]] && [[ "$(cat "$1")" == "$2" ]]
+}
+
+# --- step 6: live relay convergence -------------------------------------
+# Two mounts, one relay, both directions: the owner's writes appear on
+# the member's mount and back. This is the publish path's e2e proof —
+# intake, outbox, announcement, fetch — over a real relay process.
+step6_relay() {
+  step 6 "live relay convergence"
+  local od="$DRIVES/owner" oc="$CREDS/owner"
+  local ndr="$DRIVES/newcomer" nc="$CREDS/newcomer"
+  local relay="ws://127.0.0.1:$RELAY_PORT"
+
+  command -v nostr-rs-relay >/dev/null \
+    || die "nostr-rs-relay missing in the guest (provision.sh installs it)"
+
+  # The suite owns the port: a previous --keep run may have stranded a
+  # relay, and two relays cannot share the port. Exact-name match only.
+  pkill -x nostr-rs-relay 2>/dev/null || true
+  sleep 1
+
+  cat > "$E2E_ROOT/relay.toml" <<EOF
+[info]
+relay_url = "$relay/"
+name = "wyrd-e2e"
+description = "Lima e2e relay; guest-local, one run."
+
+[network]
+address = "127.0.0.1"
+port = $RELAY_PORT
+EOF
+  mkdir -p "$E2E_ROOT/relay-db"
+  nostr-rs-relay -c "$E2E_ROOT/relay.toml" -d "$E2E_ROOT/relay-db" \
+    >"$LOGDIR/relay.out" 2>"$LOGDIR/relay.err" &
+  echo $! > "$E2E_ROOT/relay.pid"
+  poll_until 20 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RELAY_PORT" \
+    || die "relay never listened on $RELAY_PORT (see relay.err)"
+  pass "relay listening on $RELAY_PORT"
+
+  start_mount owner-relay "$oc" "$od" "$MNTS/owner-relay" --relay "$relay"
+  start_mount member-relay "$nc" "$ndr" "$MNTS/member-relay" --relay "$relay"
+
+  # With a relay given, intake must stay live: the idle warning from
+  # step 2 must be absent, and the serving endpoint (whose address the
+  # announcements carry) must be bound on both mounts.
+  local m
+  for m in owner-relay member-relay; do
+    grep -q "control-plane intake stays idle" "$LOGDIR/mount-$m.err" \
+      && die "$m: idle intake despite --relay"
+    grep -q "serving over iroh" "$LOGDIR/mount-$m.err" \
+      || die "$m: serving endpoint never bound"
+  done
+  pass "both relay mounts keep intake live and serve"
+
+  # Owner to member, then member to owner, then owner again: the last
+  # leg proves convergence holds across successive writes, not just
+  # the first catch-up.
+  echo "owner-write-1" > "$MNTS/owner-relay/shared.txt"
+  poll_until 90 converged "$MNTS/member-relay/shared.txt" "owner-write-1" \
+    || die "member never converged on the owner's write"
+  pass "member converges on owner writes via the relay"
+
+  echo "member-write-1" > "$MNTS/member-relay/from-member.txt"
+  poll_until 90 converged "$MNTS/owner-relay/from-member.txt" "member-write-1" \
+    || die "owner never converged on the member's write"
+  pass "owner converges on member writes via the relay"
+
+  echo "owner-write-2" > "$MNTS/owner-relay/shared.txt"
+  poll_until 90 converged "$MNTS/member-relay/shared.txt" "owner-write-2" \
+    || die "member missed the owner's second write"
+  pass "convergence holds across successive writes"
+
+  stop_mount owner-relay INT
+  stop_mount member-relay TERM
+  kill "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+  wait "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+  pass "relay stopped"
+
+  local f
+  for f in "$LOGDIR"/step6-*.stderr "$LOGDIR"/mount-owner-relay.err \
+          "$LOGDIR"/mount-member-relay.err "$LOGDIR"/relay.out "$LOGDIR"/relay.err; do
+    [[ -f "$f" ]] || continue
+    check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")" \
+      "$(cat "$nc/identity")" "$(cat "$nc/passphrase")"
+  done
+}
 main() {
   # Fresh slate every run: steps build on each other within one run, and a
   # previous partial run must never leak state into the next. Unmount
@@ -483,6 +571,7 @@ main() {
   if [[ $run_all -eq 1 || "$only" == "3" ]]; then step3_matrix; fi
   if [[ $run_all -eq 1 || "$only" == "4" ]]; then step4_member; fi
   if [[ $run_all -eq 1 || "$only" == "5" ]]; then step5_export; fi
+  if [[ $run_all -eq 1 || "$only" == "6" ]]; then step6_relay; fi
   echo "e2e: $PASS_COUNT checks passed"
 }
 

@@ -488,6 +488,12 @@ epoch**; otherwise the device re-encrypts under its current epoch and
 publishes a new mapping. Fetching an un-decryptable representation is
 meaningless (and fails the two checks above anyway).
 
+The per-object version of this rule — what authenticates each
+capability-carrying ciphertext and message, and why valid material from
+one context cannot transplant into another — is the [capability binding
+matrix](capability-bindings.md), the review artifact of the
+recipient/key-substitution audit.
+
 ## Snapshot authorization (decided; state machine in `epochs.md`)
 
 The snapshot commits to the **exact membership state that authorizes it**:

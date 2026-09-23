@@ -11,8 +11,8 @@ use crate::keys::{DeviceEncryptionSecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::membership::MembershipLog;
 use crate::runtime::test_util::{
-    capability_message, control_key, deliver, drain, encryption_key, fixture, owner, queue,
-    transition_message,
+    capability_message, control_key, deliver, drain, encryption_key, fixture, identity, owner,
+    queue, transition_message,
 };
 
 #[test]
@@ -64,6 +64,66 @@ fn capability_defers_until_its_transition_lands() {
     assert_eq!(fixture.engine.current(), 2);
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.capabilities.len(), 1);
+}
+
+#[test]
+fn capability_minted_for_another_device_never_installs() {
+    // A well-formed wrap for device B — minted against a valid
+    // admission, ECDH-sealed to B's registered key — delivered intact
+    // to A. A cannot unwrap it, so it suppresses: the recipient
+    // binding is cryptographic, not advisory, and no code path
+    // installs a capability for a device it was not sealed to.
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let (_b_id_sk, b) = identity(0x0B);
+    let b_enc_sk = DeviceEncryptionSecret::from_bytes([0xB0; 32]).unwrap();
+
+    // One epoch-2 transition admitting both devices.
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = builder.child(vec![
+        Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(&encryption_sk),
+        }),
+        Change::Admit(Admission {
+            device: b,
+            encryption_key: encryption_key(&b_enc_sk),
+        }),
+    ]);
+    let mut scratch = MembershipLog::new(member_drive());
+    scratch.observe(genesis.clone());
+    scratch.observe(admission.clone());
+    let state = scratch
+        .state_of(&admission.transition_id())
+        .expect("admission is valid");
+    let secrets = vec![EpochSecret::from_bytes([0x07; 32]); 2];
+    let capability =
+        Capability::mint(member_drive(), b, &state, &admission, secrets).expect("B is a member");
+    let wrapped = capability.wrap().expect("wraps").as_bytes().to_vec();
+    // Honest outer fields naming B: the wrap is simply not ours.
+    let delivery = Message::Capability(CapabilityPayload {
+        device: b,
+        epoch: 2,
+        wrapped,
+    });
+
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &delivery),
+    ];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    // Two commits (the transitions) plus one suppression (the
+    // foreign wrap): suppression consumes without committing.
+    assert_eq!(report.accepted, 3);
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.transitions.len(), 2);
+    assert!(
+        facts.capabilities.is_empty(),
+        "B's wrap never installs on A"
+    );
 }
 
 #[test]

@@ -1199,6 +1199,57 @@ mod tests {
     }
 
     #[test]
+    fn accept_invitation_sealed_to_a_substituted_key_is_refused() {
+        // The seal names the victim device but wraps to an attacker's
+        // encryption key: the victim's secret cannot open it, so accept
+        // refuses before touching disk. The recipient key is
+        // cryptographic, never advisory — a seal that opens under the
+        // wrong key is no invitation at all.
+        let dir = TestDir::new("accept-invitation-substituted-key");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let owner_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let invitee = DeviceIdentitySecret::generate().unwrap();
+        let invitee_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let attacker_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let drive = drive_id();
+        let genesis = genesis_transition(drive, &owner, &owner_encryption).unwrap();
+        let invitee_id = invitee.device_id();
+        let invitee_key = invitee_encryption.encryption_key();
+        let capability = Capability::new(
+            drive,
+            invitee_id,
+            invitee_key,
+            genesis.transition_id(),
+            1,
+            vec![EpochSecret::generate().unwrap()],
+        )
+        .unwrap();
+        let sealed = seal_bootstrap(
+            &owner,
+            &drive,
+            invitee_id,
+            &attacker_encryption.encryption_key(),
+            &genesis.canonical_bytes(),
+            capability.wrap().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Engine::accept_invitation(
+                dir.path.clone(),
+                "test-pass",
+                invitee,
+                invitee_encryption,
+                &sealed
+            ),
+            Err(EngineError::Invitation(_))
+        ));
+        assert!(
+            !dir.path.join("DRIVE").exists(),
+            "substituted-key invitations never touch disk"
+        );
+    }
+
+    #[test]
     fn accept_invitation_with_invalid_genesis_is_refused_before_disk() {
         let dir = TestDir::new("accept-invitation-tampered");
         let owner = DeviceIdentitySecret::generate().unwrap();

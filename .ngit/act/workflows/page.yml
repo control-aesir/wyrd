@@ -33,15 +33,7 @@ jobs:
         with:
           deno-version: v2.x
       - run: deno run --allow-read page/check.ts
-      # Production: master pushes deploy the production branch.
-      - if: github.ref == 'refs/heads/master'
-        run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      # Preview: PRs deploy under their head branch, never production.
-      - if: github.event_name == 'pull_request'
-        run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md --branch=${{ github.head_ref }}
+      - run: deno run -A npm:wrangler pages deploy page/ --project-name=wyrd-enesis-md
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

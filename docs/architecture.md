@@ -177,9 +177,11 @@ router: a serving endpoint over the vault answers peer fetches by
 transport root, announcement `node_addr` routes publish into the fetch
 plane on every sync pass, and a serving restart's route update rewires
 serving (contract 13). Still open: the NIP-46 signer-session client
-wiring, multi-relay mailbox supervision and relay interop coverage, and
-the durable announcement outbox (`feat(sync): durable announcement outbox
-and retry contract`). The live write path behind the FUSE mount has
+wiring, multi-relay mailbox supervision and relay interop coverage.
+The durable announcement outbox itself has landed (queued/delivered
+facts with byte-identical sealed retries, contract-tested); what was
+open was its live-loop wiring, which has now landed too — see below.
+The live write path behind the FUSE mount has
 landed (`docs/write-path.md`): the daemon-owned mutation queue and the
 mounted write surface, namespace operations, generation-aware
 projection/caches, and append-handle semantics are merged. Remaining v0
@@ -193,7 +195,10 @@ open tracking issues name what comes next.
 The local `wyrd` CLI mounts a live projection: a supervised
 loop drains the NIP-59 control-plane mailbox, admits FUSE demand into
 durable `Cached` materialization each pass, refreshes materialization
-facts and live heads into the serving view without remounting, and
+facts and live heads into the serving view without remounting, then
+publishes undischarged announcement, transition, and capability
+obligations from the durable outbox (mailbox failures stall delivery,
+never the pass), and
 shuts down cleanly on SIGINT/SIGTERM. `open`/`read` on non-local
 content registers a want and blocks bounded (`docs/fetch-on-open.md`);
 the loop runs with a real iroh bulk source and publishes recorded routes

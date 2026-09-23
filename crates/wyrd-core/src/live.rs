@@ -1,9 +1,9 @@
 //! The live sync loop: one drive's engine plus the published
 //! projection its serving backends read, generic over the namespace
 //! view so any provider (FUSE now, mobile surfaces later) composes the
-//! same node. Intake and fetch touch only the engine, the durable
-//! store, and the shared store handle — never the publication lock —
-//! so bulk I/O never stalls serving; publication swaps in a whole new
+//! same node. Intake, fetch, and outbound publish touch only the
+//! engine, the durable store, the shared store handle, and the mailbox
+//! — never the publication lock — so bulk I/O never stalls serving; publication swaps in a whole new
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
@@ -281,6 +281,12 @@ pub struct LiveNode<V: NamespaceView> {
     /// with the mailbox adapter so new mail wakes intake too: one
     /// signal, every producer.
     pub(super) waker: Arc<WakeSignal>,
+    /// This drive's current retrieval route, announced with every
+    /// snapshot announcement so peers can dial back. Set by the
+    /// composer (which owns the serving endpoint lifecycle) after the
+    /// endpoint is flushed; `None` sends routeless announcements, as
+    /// the loopback contracts do.
+    pub(super) node_addr: Option<Vec<u8>>,
 }
 
 /// The live half of a split node: everything a presentation
@@ -388,6 +394,7 @@ where
                 dirty: false,
                 budgets,
                 waker,
+                node_addr: None,
             },
             parts,
         )
@@ -400,6 +407,52 @@ where
         self.engine
             .set_materialization(content, MaterializationState::Cached)?;
         Ok(())
+    }
+
+    /// Install this drive's retrieval route for announcements: the
+    /// composer calls this after flushing its serving endpoint, so the
+    /// first seal carries a dialable address. Replacing the route
+    /// later only affects not-yet-sealed announcements — sealed bytes
+    /// are byte-identical retries by design, so the route rides the
+    /// first send.
+    pub fn set_node_addr(&mut self, node_addr: Option<Vec<u8>>) {
+        self.node_addr = node_addr;
+    }
+
+    /// Send every undischarged outbound obligation: transitions and
+    /// capabilities first (tip-first minimizes intake deferrals on the
+    /// receiving side), then announcements. Durable and retryable —
+    /// each send commits its own delivered marker, so a failure leaves
+    /// the rest pending for the next pass and a crash resumes from the
+    /// outbox, never by re-authoring.
+    ///
+    /// Mailbox-class failures are absorbed, not raised: a relay outage
+    /// (or no relay configured at all) must stall remote delivery,
+    /// never the local pass — the intake drain remains the loop's
+    /// relay-health signal, and the pending projection stays the
+    /// delivery backlog's source of truth. Any partial progress before
+    /// the failure stands durably; the returned count covers only the
+    /// fully completed step, so a mid-burst failure under-reports one
+    /// pass and the next pass corrects it.
+    fn publish<M: Mailbox>(&mut self, mailbox: &mut M) -> Result<usize, LiveError> {
+        let mut sent = 0usize;
+        // A stalled delivery step must not starve announcements (or
+        // vice versa): each step absorbs its own mailbox failure and
+        // the pass still attempts the other half.
+        sent += match self.engine.deliver_pending(mailbox) {
+            Ok(n) => n,
+            Err(EngineError::Mailbox(_)) => 0,
+            Err(other) => return Err(LiveError::Engine(other)),
+        };
+        sent += match self
+            .engine
+            .announce_pending(mailbox, self.node_addr.as_deref())
+        {
+            Ok(n) => n,
+            Err(EngineError::Mailbox(_)) => 0,
+            Err(other) => return Err(LiveError::Engine(other)),
+        };
+        Ok(sent)
     }
 
     /// One supervised pass: drain the mailbox into the engine, run a
@@ -435,9 +488,10 @@ where
         report
     }
 
-    /// One pass body: intake, fetch, then conditional republication.
-    /// Republication clears the dirty backlog; every failure path
-    /// leaves it set (via the [`LiveNode::sync_once`] wrapper).
+    /// One pass body: intake, fetch, conditional republication, then
+    /// outbound publish. Republication clears the dirty backlog; every
+    /// failure path leaves it set (via the [`LiveNode::sync_once`]
+    /// wrapper).
     fn sync_pass<M: Mailbox, B: RoutePublishing>(
         &mut self,
         mailbox: &mut M,
@@ -496,14 +550,21 @@ where
         self.wants.retire_where(|content, waiters| {
             completed_runtime.status(content) == FetchStatus::Available || waiters == 0
         });
-        // The publication gate is the durable commit sequence, not the
-        // pass reports: every fact commit this pass (intake, want
-        // admission, fetch, mutation) advanced it, and empty passes leave
-        // it untouched. The dirty backlog covers the one case the sequence
-        // cannot see — a failed pass that committed before failing.
+        // The publication gate is the durable commit sequence plus the
+        // outbound outbox, not the pass reports: every fact commit this
+        // pass (intake, want admission, fetch, mutation) advanced the
+        // sequence and empty passes leave it untouched — but a pass
+        // that changed nothing locally can still owe the relay sends
+        // (obligations queued before a restart, or skipped for a
+        // missing key), and those sends commit delivered markers of
+        // their own. Skipping the pass would stall remote delivery
+        // until unrelated local activity happens to run it. The dirty
+        // backlog covers the one case neither sees — a failed pass
+        // that committed before failing.
         let revision = self.engine.current();
         let generation = self.generation();
-        if !self.dirty && revision == self.published_revision {
+        let outbound = self.engine.has_pending_outbound()?;
+        if !self.dirty && revision == self.published_revision && !outbound {
             batch.finish();
             return Ok(SyncReport {
                 drained,
@@ -538,6 +599,14 @@ where
         // Publication is done: a completed mutation's success now means
         // the new generation serves.
         batch.finish();
+        // Publish after the batch completes, never before: a returned
+        // write success means the state serves locally, not that the
+        // relay acknowledged it. Remote delivery is at-least-once async
+        // over the durable outbox — the delivered markers committed
+        // here advance the sequence, so the next pass republishes the
+        // (semantically unchanged) generation and retries whatever is
+        // still pending.
+        let _sent = self.publish(mailbox)?;
         Ok(SyncReport {
             drained,
             fetched,

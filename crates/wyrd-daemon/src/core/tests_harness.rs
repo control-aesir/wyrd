@@ -137,6 +137,35 @@ where
     (live, backend)
 }
 
+/// A mailbox whose sends always fail with a transport error while
+/// intake stays empty: the loop's publish step absorbs the failure
+/// (remote delivery stalls, the local pass succeeds) instead of
+/// failing the mount — the no-relay / dead-relay posture.
+pub(super) struct SendFailingMailbox;
+
+impl Mailbox for SendFailingMailbox {
+    fn send(
+        &mut self,
+        _envelope: MailboxEnvelope,
+    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+        Err(wyrd_sync::transport::mailbox::MailboxError::Transport(
+            "relay unreachable".into(),
+        ))
+    }
+
+    fn recv(&mut self) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
+        Ok(None)
+    }
+
+    fn settle(
+        &mut self,
+        _id: DeliveryId,
+        _disposition: Disposition,
+    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+        Ok(())
+    }
+}
+
 /// A mailbox whose settlement always fails: every pass offers the
 /// same envelope and every settle aborts the drain, so the loop's
 /// error cap trips instead of the loop idling forever.

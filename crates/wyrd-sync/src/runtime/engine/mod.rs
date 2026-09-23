@@ -1129,6 +1129,18 @@ impl Engine {
             .pending_announcements())
     }
 
+    /// Whether any outbound obligation awaits a send — announcements,
+    /// transitions, or capabilities — from a single rebuild. The live
+    /// loop's republication gate consults this so a quiet drive with a
+    /// pending outbox (queued before a restart, or skipped for a
+    /// missing key) still runs its publish step instead of idling.
+    pub fn has_pending_outbound(&self) -> Result<bool, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        Ok(!rebuilt.runtime.pending_announcements().is_empty()
+            || !rebuilt.runtime.pending_transitions().is_empty()
+            || !rebuilt.runtime.pending_capabilities().is_empty())
+    }
+
     /// Drain every envelope currently in the mailbox, committing facts
     /// per accepted message. Stops at the first empty `recv`.
     pub fn drain(&mut self, mailbox: &mut impl Mailbox) -> Result<DrainReport, EngineError> {

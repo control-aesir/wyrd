@@ -133,6 +133,27 @@ fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
     }
 }
 
+/// Upper bound for one provider dial: iroh discovery can stall behind
+/// relay propagation, and an unbounded dial wedges the supervised loop
+/// inside a pass (no error, no idle line, FUSE still serving — a peer
+/// that looks alive but never converges). A timeout reports as
+/// transport failure, so the plan retries it on the next pass.
+const FETCH_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Dial one provider with a deadline: the timeout above is the live
+/// value; the parameter exists so tests can prove boundedness fast
+/// against an unroutable provider.
+async fn dial(
+    endpoint: &Endpoint,
+    provider: EndpointAddr,
+    timeout: std::time::Duration,
+) -> Result<iroh::endpoint::Connection, BulkError> {
+    tokio::time::timeout(timeout, endpoint.connect(provider, iroh_blobs::ALPN))
+        .await
+        .map_err(|_| BulkError::Transport("provider dial timed out".to_string()))?
+        .map_err(|error| BulkError::Transport(error.to_string()))
+}
+
 /// A synchronous [`BulkSource`] backed by iroh-blobs' verified streaming API.
 ///
 /// The address maps are populated by the control/runtime layer. Root manifests
@@ -321,10 +342,7 @@ impl IrohBulkSource {
         let provider = blob.provider.clone();
         let hash = blob.hash();
         self.runtime.block_on(async move {
-            let connection = endpoint
-                .connect(provider, iroh_blobs::ALPN)
-                .await
-                .map_err(|error| BulkError::Transport(error.to_string()))?;
+            let connection = dial(&endpoint, provider, FETCH_DIAL_TIMEOUT).await?;
             let (size, _) = get_verified_size(&connection, &hash)
                 .await
                 .map_err(|error| BulkError::Transport(error.to_string()))?;
@@ -929,6 +947,46 @@ mod tests {
             server_a.close().await;
         });
         source.shutdown();
+    }
+
+    #[test]
+    fn dial_against_a_silent_relay_times_out_instead_of_hanging() {
+        use iroh::{endpoint::presets, Endpoint, RelayUrl};
+        use std::time::{Duration, Instant};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A relay that accepts TCP and never speaks: the handshake
+        // stalls exactly like the guest failure (relay-coordinated
+        // discovery with no bound). The listener is leaked so the port
+        // stays open for the test's duration.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::mem::forget(listener);
+        let client = runtime.block_on(async {
+            Endpoint::builder(presets::N0)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
+        let provider = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x77; 32]).public())
+            .with_relay_url(relay);
+        let start = Instant::now();
+        let result = runtime.block_on(dial(&client, provider, Duration::from_millis(500)));
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(BulkError::Transport(ref message)) if message == "provider dial timed out"),
+            "silent relay must trip the dial timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "dial must stay bounded, took {elapsed:?}"
+        );
+        runtime.block_on(client.close());
     }
 
     #[test]

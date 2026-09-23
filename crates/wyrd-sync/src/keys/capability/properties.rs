@@ -4,8 +4,11 @@
 //! `DriveKeyring::install` is example-tested in `tests.rs`; these assert
 //! the state machine instead: after ANY sequence of installs — old,
 //! current, future-bound, duplicated, conflicting, and misdirected —
-//! the held secrets are exactly the newest valid capability for this
-//! device and drive, never older, never swapped, never foreign. Every
+//! the held secrets are exactly the newest *genuinely minted*
+//! capability for this device and drive: never older, never swapped,
+//! never foreign. ("Genuinely minted" matters because the conflicting
+//! shapes below are forgeries — same binding, swapped secrets — and
+//! must never become held state over the minted values.) Every
 //! capability covers `1..=N` contiguously by construction, so the held
 //! set is always a full prefix `1..=M`; the model below tracks that
 //! prefix and every install must agree with it or fail leaving state
@@ -155,6 +158,98 @@ fn operand(pool: &Pool, index: u8) -> &Capability {
     }
 }
 
+/// The model verdict for one operand against the held prefix: either
+/// the carried secrets fill vacant epochs, the first epoch where
+/// they disagree with held state, or a refusal that never reaches
+/// the secrets. One helper for every secret-carrying shape, so the
+/// fill/conflict rule cannot drift between operand classes. Note a
+/// conflicting shape installs cleanly into a vacant keyring and only
+/// conflicts once the epoch it disagrees about is held — the model
+/// and the implementation agree on that order dependence.
+enum Verdict {
+    Fill,
+    Conflict(u64),
+    Refused,
+}
+
+fn model_verdict(cap: &Capability, expected: &BTreeMap<u64, EpochSecret>) -> Verdict {
+    let mut conflict = None;
+    for (i, s) in cap.secrets.iter().enumerate() {
+        let epoch = i as u64 + 1;
+        if let Some(held) = expected.get(&epoch) {
+            if held != s {
+                conflict = Some(epoch);
+                break;
+            }
+        }
+    }
+    match conflict {
+        Some(epoch) => Verdict::Conflict(epoch),
+        None => Verdict::Fill,
+    }
+}
+
+/// Deterministic coverage companion to the property above: the
+/// generator may omit operand classes on any given run, so this
+/// fixed sequence exercises every class at least once with exact
+/// expected outcomes. Newest-first, then replays, then each refusal
+/// and conflict shape in turn.
+#[test]
+fn every_operand_class_behaves_deterministically() {
+    let rig = rig();
+    let mut keyring = DriveKeyring::new(rig.drive, rig.device_a);
+    let mut expected: BTreeMap<u64, EpochSecret> = BTreeMap::new();
+    let held = |keyring: &DriveKeyring| -> BTreeMap<u64, EpochSecret> {
+        (1..=3)
+            .filter_map(|e| keyring.secret(e).cloned().map(|s| (e, s)))
+            .collect()
+    };
+
+    // Newest first: fills the whole prefix.
+    assert_eq!(
+        keyring.install(&rig.pool.new, &rig.log),
+        Ok(InstallReport::Added { from: 1, to: 3 })
+    );
+    for epoch in 1..=3 {
+        expected.insert(epoch, rig.pool.new.secrets[epoch as usize - 1].clone());
+    }
+    assert_eq!(held(&keyring), expected);
+
+    // Replays and old-after-new: no-ops.
+    for index in [0u8, 0, 1] {
+        let cap = operand(&rig.pool, index);
+        assert!(matches!(model_verdict(cap, &expected), Verdict::Fill));
+        assert_eq!(keyring.install(cap, &rig.log), Ok(InstallReport::NoChange));
+        assert_eq!(held(&keyring), expected);
+    }
+
+    // Each conflict and refusal shape, with its exact error class
+    // and no state movement.
+    for index in [2u8, 3, 4, 5, 6, 7] {
+        let cap = operand(&rig.pool, index);
+        let result = keyring.install(cap, &rig.log);
+        match index {
+            2 | 3 => assert!(matches!(result, Err(InstallError::EpochConflict(_)))),
+            4 => assert!(matches!(result, Err(InstallError::WrongDevice(..)))),
+            5 => assert!(matches!(
+                result,
+                Err(InstallError::Unauthorized(
+                    CapabilityError::UnknownTransition(_)
+                ))
+            )),
+            6 => assert!(matches!(result, Err(InstallError::WrongDrive(..)))),
+            _ => assert!(matches!(
+                result,
+                Err(InstallError::Unauthorized(
+                    CapabilityError::StaleEncryptionKey
+                ))
+            )),
+        }
+        assert_eq!(held(&keyring), expected, "failures move no state");
+    }
+    assert_eq!(held(&keyring), expected);
+}
+
 proptest! {
     /// Adversarial installation orderings: any sequence over the eight
     /// shapes must keep the keyring exactly at the newest valid
@@ -182,47 +277,8 @@ proptest! {
             prop_assert_eq!(&before, &expected, "keyring tracks the model");
 
             // The model verdict for this operand against the held prefix.
-            enum Verdict {
-                Fill,
-                Conflict(u64),
-                Refused,
-            }
             let verdict = match index {
-                0 | 1 => {
-                    let mut conflict = None;
-                    for (i, s) in cap.secrets.iter().enumerate() {
-                        let epoch = i as u64 + 1;
-                        if let Some(held) = expected.get(&epoch) {
-                            if held != s {
-                                conflict = Some(epoch);
-                                break;
-                            }
-                        }
-                    }
-                    match conflict {
-                        Some(epoch) => Verdict::Conflict(epoch),
-                        None => Verdict::Fill,
-                    }
-                }
-                2 | 3 => {
-                    // Same rule: a conflicting shape installs cleanly
-                    // into a vacant keyring and only conflicts once
-                    // the epoch it disagrees about is held.
-                    let mut conflict = None;
-                    for (i, s) in cap.secrets.iter().enumerate() {
-                        let epoch = i as u64 + 1;
-                        if let Some(held) = expected.get(&epoch) {
-                            if held != s {
-                                conflict = Some(epoch);
-                                break;
-                            }
-                        }
-                    }
-                    match conflict {
-                        Some(epoch) => Verdict::Conflict(epoch),
-                        None => Verdict::Fill,
-                    }
-                }
+                0..=3 => model_verdict(cap, &expected),
                 _ => Verdict::Refused,
             };
 

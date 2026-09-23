@@ -164,6 +164,44 @@ fn append_commits_onto_the_current_end() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A path-addressed truncate while an append handle is open is refused:
+/// the open-time `O_APPEND|O_TRUNC` check cannot see the kernel's split
+/// (open arrives append-only, the truncation follows as a separate
+/// `setattr`), so the refusal is enforced at the `setattr` boundary.
+/// With no append handle open the same truncate commits.
+#[test]
+fn path_truncate_refused_while_append_open() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, ino, _) = backend.create_at(1, "t.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"data").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+
+    let append = backend
+        .open_write("t.txt", libc::O_WRONLY | libc::O_APPEND)
+        .unwrap();
+    assert_eq!(
+        backend.setattr_attrs(ino, None, Some(0), None),
+        Err(fuser::Errno::EOPNOTSUPP)
+    );
+    backend.release_handle(append).unwrap();
+    backend.setattr_attrs(ino, None, Some(0), None).unwrap();
+    assert_eq!(backend.attr_at("t.txt").unwrap().size, 0);
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// An append handle's reads stay coherent after its own commit: the
 /// handle's base advances to the committed identity, so a same-
 /// descriptor read does not trip over the old base boundary.

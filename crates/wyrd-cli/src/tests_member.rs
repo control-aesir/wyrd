@@ -1,5 +1,6 @@
 use super::tests_harness::{write_secret, TempDir};
 use super::*;
+use wyrd_format::{Entry, FsObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_sync::runtime::EngineError;
 
 struct Fixture {
@@ -197,7 +198,6 @@ fn member_remove_sole_owner_needs_confirmation() {
         "owner set empties with the sole owner"
     );
 }
-
 /// Rotate bumps the epoch with membership untouched.
 #[test]
 fn member_rotate_bumps_epoch_keeps_membership() {
@@ -244,5 +244,37 @@ fn member_set_owner_hands_authority_over() {
     assert!(
         matches!(error, CliError::Engine(EngineError::NotOwner)),
         "old owner lost authority: {error:?}"
+    );
+}
+
+/// Rotate carries the namespace: a drive with files serves them at
+/// the new epoch afterwards, and the carry extends the old tip.
+#[test]
+fn member_rotate_carries_files_forward() {
+    let fixture = Fixture::new();
+    let first = {
+        let identity = read_identity(&fixture.identity_file).unwrap();
+        let mut engine =
+            Engine::open_keystore(fixture.drive.clone(), "test-pass", identity).unwrap();
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        let chunk = store.insert(ObjectKind::Chunk, b"kept").unwrap();
+        let entry = Entry::file("kept.txt", 4, false, vec![chunk]).unwrap();
+        let tree = Tree::from_entries(vec![entry])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, tree).unwrap()
+    };
+    command(fixture.args(vec!["rotate".into()])).unwrap();
+
+    let engine = fixture.open();
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "the carry serves the files after rotate");
+    assert_eq!(heads[0].snapshot().epoch, 2);
+    assert_eq!(heads[0].snapshot().tree, first.snapshot().tree);
+    assert_eq!(
+        heads[0].snapshot().parents,
+        vec![first.snapshot().snapshot_id()],
+        "the carry extends the old tip"
     );
 }

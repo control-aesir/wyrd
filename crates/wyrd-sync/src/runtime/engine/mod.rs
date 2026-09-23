@@ -954,6 +954,59 @@ impl Engine {
         super::author::author(self, objects, tree)
     }
 
+    /// Carry pre-transition live heads forward at the new epoch: one
+    /// ordinary member-authored snapshot per base, over the same tree,
+    /// parenting onto its head. The transition author calls this after
+    /// committing a locally authored transition, passing the served
+    /// heads captured before it; intake never calls it (a synced carry
+    /// arrives as an ordinary announcement). The parent link is what
+    /// keeps the old tip live-lineage (the fixed point sustains head
+    /// and carry together, the stale-fork shape in reverse), so the
+    /// old tip becomes canonical history instead of a stale fork and
+    /// the next write extends the carry. Only pre-transition eligible
+    /// heads carry, so a stale fork never resurrects; a conflicted
+    /// drive carries every head, each onto its own, so the fork
+    /// survives the epoch unmerged. Empty bases carry nothing (a fresh
+    /// drive stays snapshot-free); a caller that left the member set
+    /// (self-removal) carries nothing, since it cannot author at the
+    /// new epoch. A base whose tree is not local fails the carry
+    /// closed: the transition already committed, and silently
+    /// orphaning history would be worse than the explicit error.
+    pub fn carry_heads<S: ObjectStore>(
+        &mut self,
+        objects: &S,
+        bases: Vec<AuthorizedSnapshot>,
+    ) -> Result<Vec<AuthorizedSnapshot>, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        if bases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rebuilt = self.store.rebuild(self.device)?;
+        let known = rebuilt
+            .log
+            .known_state()
+            .ok_or(EngineError::NoCanonicalMembership)?;
+        let members = rebuilt
+            .log
+            .members_of(&known.transition_id)
+            .ok_or(EngineError::NoCanonicalMembership)?;
+        if !members.contains(&self.device) {
+            return Ok(Vec::new());
+        }
+        let mut carried = Vec::with_capacity(bases.len());
+        for head in &bases {
+            carried.push(super::author::author_with_parents(
+                self,
+                objects,
+                head.snapshot().tree,
+                vec![head.snapshot().snapshot_id()],
+            )?);
+        }
+        Ok(carried)
+    }
+
     /// Announce an authored snapshot over the control plane to every
     /// other member, returning the number of envelopes sent this call.
     /// The epoch's control key must be held; the author is not sent to

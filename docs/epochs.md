@@ -384,6 +384,29 @@ dead forks are never reclassified back, and implementers must not add
 recursive rescue logic. Recovery grafts *content*, never *lineage* — that is
 the only path back.
 
+### Transition continuity: carry snapshots
+
+A membership transition advances the epoch without file work, so the
+previous tip is superseded the moment the log moves on
+(bounded-fork degradation above) and a quiet drive serves no heads.
+The device that authors the transition restores continuity by
+authoring one carry snapshot per pre-transition eligible head, over
+the same tree, parenting onto its head, bound to the new epoch. The
+carry is an ordinary member-authored snapshot: it classifies
+eligible everywhere it is observed and syncs through the normal
+announcement path, so peers converge on it with no special intake
+handling. The parent link keeps the old tip live-lineage (head and
+carry sustain each other through the fixed point, the stale-fork
+shape in reverse): the old tip becomes canonical history, never a
+stale fork, and the next write extends the carry. Only
+pre-transition eligible heads carry, so a stale fork never
+resurrects; a conflicted drive carries every head, each onto its
+own, and the fork survives the epoch unmerged. A transition on an
+empty drive carries nothing; an author that left the member set
+(self-removal) carries nothing. A carry whose tree is not local
+fails closed after the transition commits — loudly, never by
+silently orphaning history.
+
 The two central semantics, restated:
 
 - **Valid signature ≠ valid current-state transition.** Ciphertext-valid

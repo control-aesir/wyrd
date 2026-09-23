@@ -18,11 +18,12 @@ use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
-use wyrd_format::{DeviceEncryptionKey, DeviceId, TransitionId};
+use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 use wyrd_sync::control::SealedBootstrap;
+use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
-use wyrd_sync::runtime::Engine;
+use wyrd_sync::runtime::{Engine, EngineError};
 use zeroize::Zeroizing;
 
 /// The `wyrd` binary: create a drive, mount its live projection,
@@ -700,7 +701,7 @@ fn member(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    let mut engine = Engine::open_keystore(drive_dir, passphrase, identity)?;
+    let mut engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
     match action {
         MemberAction::List => {
             print!("{}", member_list_report(&engine)?);
@@ -717,19 +718,32 @@ fn member(
         MemberAction::Remove { device, yes } => {
             let device = parse_device_id(&device)?;
             require_last_owner_confirmation(&engine, &device, yes)?;
-            let transition = engine.remove_device(device)?;
-            println!("removed {device} at epoch {}", transition.epoch);
+            let (transition, carried) = transition_with_carry(&mut engine, &drive_dir, |engine| {
+                engine.remove_device(device)
+            })?;
+            println!(
+                "removed {device} at epoch {} ({} carried)",
+                transition.epoch, carried
+            );
             Ok(())
         }
         MemberAction::Rotate => {
-            let transition = engine.rotate_epoch()?;
-            println!("rotated to epoch {}", transition.epoch);
+            let (transition, carried) =
+                transition_with_carry(&mut engine, &drive_dir, |engine| engine.rotate_epoch())?;
+            println!(
+                "rotated to epoch {} ({} carried)",
+                transition.epoch, carried
+            );
             Ok(())
         }
         MemberAction::SetOwner { device } => {
             let device = parse_device_id(&device)?;
-            let transition = engine.set_owners(device)?;
-            println!("owner is now {device} at epoch {}", transition.epoch);
+            let (transition, carried) =
+                transition_with_carry(&mut engine, &drive_dir, |engine| engine.set_owners(device))?;
+            println!(
+                "owner is now {device} at epoch {} ({} carried)",
+                transition.epoch, carried
+            );
             Ok(())
         }
         MemberAction::Invite {
@@ -751,6 +765,7 @@ fn member(
                     engine.admit_device(device, encryption_key)
                 }
             };
+            let bases = engine.live_heads()?;
             let outcome = match admit(&mut engine) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -758,12 +773,14 @@ fn member(
                     return Err(error.into());
                 }
             };
+            let carried = carry_bases(&mut engine, &drive_dir, bases)?;
             write_invitation(&out, &mut file, &outcome.invitation.encode())?;
             println!(
-                "invited {device}{} at epoch {} -> {}",
+                "invited {device}{} at epoch {} -> {} ({} carried)",
                 if reader { " as reader" } else { "" },
                 outcome.transition.epoch,
-                out.display()
+                out.display(),
+                carried
             );
             Ok(())
         }
@@ -785,6 +802,41 @@ fn member(
             Ok(())
         }
     }
+}
+
+/// Author a membership transition plus its namespace carry in one
+/// offline step: capture the served heads, commit the transition via
+/// `author`, then carry each captured head forward at the new epoch
+/// (transition continuity: a quiet drive keeps serving its files,
+/// and the next write extends the carry instead of bootstrapping
+/// from empty). The object store opens only when something carries,
+/// so a fresh drive's transition never touches it. A failed carry
+/// reports loudly with the transition already durable at its epoch.
+fn transition_with_carry(
+    engine: &mut Engine,
+    drive_dir: &Path,
+    author: impl FnOnce(&mut Engine) -> Result<MembershipTransition, EngineError>,
+) -> Result<(MembershipTransition, usize), CliError> {
+    let bases = engine.live_heads()?;
+    let transition = author(engine)?;
+    let carried = carry_bases(engine, drive_dir, bases)?;
+    Ok((transition, carried))
+}
+
+/// Carry captured pre-transition heads forward at the new epoch,
+/// returning the number carried. Empty bases carry nothing without
+/// touching the object store.
+fn carry_bases(
+    engine: &mut Engine,
+    drive_dir: &Path,
+    bases: Vec<AuthorizedSnapshot>,
+) -> Result<usize, CliError> {
+    if bases.is_empty() {
+        return Ok(0);
+    }
+    let store = FsObjectStore::open(drive_dir.to_path_buf())
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    Ok(engine.carry_heads(&store, bases)?.len())
 }
 
 /// Claim an invitation destination before any irreversible step: an

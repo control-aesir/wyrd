@@ -11,15 +11,12 @@ this document is stale.
 ## Subcommands
 
 ```
-wyrd init <drive_dir> --identity-file <path> --passphrase-file <path>
-wyrd mount <drive_dir> <mountpoint> [--relay <url>...] [--verbose] \
-    --identity-file <path> --passphrase-file <path>
-wyrd export <drive_dir> <out_dir> \
-    --identity-file <path> --passphrase-file <path>
-wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>) \
-    --identity-file <path> --passphrase-file <path>
-wyrd device <drive_dir> (id | pairing-request <out> | join <invitation>) \
-    --identity-file <path> --passphrase-file <path>
+wyrd init --identity-file <path> --passphrase-file <path> <drive_dir>
+wyrd mount [--relay <url>...] [--verbose] \
+    --identity-file <path> --passphrase-file <path> <drive_dir> <mountpoint>
+wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir>
+wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
+wyrd device --identity-file <path> --passphrase-file <path> <drive_dir> (id | pairing-request <out> | join <invitation>)
 ```
 
 ### `init` — create a drive
@@ -169,11 +166,11 @@ The pairing flow, end to end:
 
 ```
 # newcomer, in its own directory
-wyrd device <newcomer-dir> pairing-request pairing.txt --identity-file ... --passphrase-file ...
+wyrd device --identity-file ... --passphrase-file ... <newcomer-dir> pairing-request pairing.txt
 # owner, with the pairing material
-wyrd member <owner-dir> invite <device> <encryption-key> invitation --identity-file ... --passphrase-file ...
+wyrd member --identity-file ... --passphrase-file ... <owner-dir> invite <device> <encryption-key> invitation
 # newcomer, with the invitation file
-wyrd device <newcomer-dir> join invitation --identity-file ... --passphrase-file ...
+wyrd device --identity-file ... --passphrase-file ... <newcomer-dir> join invitation
 ```
 
 ## Credential files

@@ -33,6 +33,10 @@ mounts:
 - location: "/path/to/wyrd-checkout"
   mountPoint: "/mnt/wyrd"
   writable: false
+  9p:
+    # The guest executes scripts straight off this share; any attribute
+    # or page caching serves stale files after host-side edits.
+    cache: "none"
 # Scratch space shared host<->guest for log collection. Drive dirs,
 # mountpoints, and test state all live on guest-local disk, never here:
 # FUSE mounts over a 9p share are unsupported.

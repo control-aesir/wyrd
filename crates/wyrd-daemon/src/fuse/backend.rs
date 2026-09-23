@@ -507,17 +507,6 @@ where
     /// pointless work downstream. This is advisory —
     /// `insert_handle` re-enforces atomically at insert time, and
     /// the release there unwinds the budget reservation, so a race
-    /// that fills the table between check and insert still fails
-    /// closed without leaking. Namespace mutations do not use this;
-    /// they reserve a slot (below) instead.
-    fn check_handle_available(&self) -> Result<(), fuser::Errno> {
-        let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
-        if files.by_handle.len() + files.reserved >= self.max_open_handles {
-            return Err(fuser::Errno::EMFILE);
-        }
-        Ok(())
-    }
-
     /// Promise a handle slot to an in-progress create: the count
     /// holds room across the blocking mutation submit, which must
     /// not hold the table lock. A saturated table (open plus
@@ -570,23 +559,6 @@ where
         Ok(FileHandle(fh))
     }
 
-    /// Insert a freshly built handle, returning its kernel handle.
-    /// Past the handle cap the insert refuses `EMFILE` and the
-    /// handle is dropped unregistered — the caller maps it before
-    /// any kernel reply, so no half-open descriptor escapes.
-    fn insert_handle(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
-        let Ok(mut files) = self.files.lock() else {
-            return Err(fuser::Errno::EIO);
-        };
-        if files.by_handle.len() + files.reserved >= self.max_open_handles {
-            return Err(fuser::Errno::EMFILE);
-        }
-        let fh = files.next;
-        files.next = fh.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
-        files.by_handle.insert(fh, handle);
-        Ok(FileHandle(fh))
-    }
-
     /// Clone the handle entry out of the table, keeping the table lock
     /// off the data path.
     fn handle_of(&self, fh: FileHandle) -> Result<Handle, fuser::Errno> {
@@ -614,6 +586,66 @@ where
             },
             Handle::Read(_) => false,
         })
+    }
+
+    /// Clean writable handles open on `path`: they hold no uncommitted
+    /// state, so a concurrent path change can re-pin them instead of
+    /// stranding them stale.
+    fn clean_handles_on(&self, path: &str) -> Vec<Arc<Mutex<WriteHandle>>> {
+        let Ok(files) = self.files.lock() else {
+            return Vec::new();
+        };
+        files
+            .by_handle
+            .values()
+            .filter_map(|handle| match handle {
+                Handle::Write(write) => match write.lock() {
+                    Ok(guard) => (!guard.dirty && !guard.failed && guard.path == path)
+                        .then(|| Arc::clone(write)),
+                    Err(_) => None,
+                },
+                Handle::Read(_) => None,
+            })
+            .collect()
+    }
+
+    /// Re-pin a clean handle onto its path's current state after a
+    /// concurrent path change committed: refresh base and capture.
+    /// Best-effort — failure keeps the stale rule as the fallback, so
+    /// a missed repin degrades to `EIO` at flush, never to silent
+    /// content loss. A handle that went dirty in the meantime is left
+    /// alone: buffered content must never be discarded.
+    fn repin_handle(
+        &self,
+        handle: &Arc<Mutex<WriteHandle>>,
+        path: &str,
+    ) -> Result<(), fuser::Errno> {
+        let projection = self.projection()?;
+        let node = projection
+            .view()
+            .lookup(path)
+            .map_err(|error| errno_of(&error))?;
+        let (base, capture) = match &node {
+            Node::File {
+                size,
+                executable,
+                chunks,
+            } => (
+                FileIdentity::new(*size, *executable, chunks.clone()),
+                projection
+                    .view()
+                    .open(&node)
+                    .map_err(|error| errno_of(&error))?,
+            ),
+            _ => return Err(fuser::Errno::EISDIR),
+        };
+        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        if write.dirty || write.failed || write.path != path {
+            return Ok(());
+        }
+        write.base = base;
+        write.capture = capture;
+        Ok(())
     }
 
     /// Read through an open handle: the open-time capture serves the
@@ -754,10 +786,11 @@ where
     }
 
     /// Open `path` for writing: capture the open-time identity and
-    /// return a writable handle. `O_TRUNC` starts the image empty and
-    /// immediately dirty (so a close with no writes still commits the
-    /// empty file). `O_SYNC`/`O_DSYNC` make every successful write its
-    /// own commit. `O_APPEND` buffers an ordered append sequence.
+    /// return a writable handle. `O_TRUNC` commits the truncation
+    /// during open and the handle starts clean on the empty base (a
+    /// close with no writes then commits nothing — the file is
+    /// already empty). `O_SYNC`/`O_DSYNC` make every successful write
+    /// its own commit. `O_APPEND` buffers an ordered append sequence.
     pub fn open_write(&self, path: &str, flags: i32) -> Result<FileHandle, fuser::Errno> {
         if self.mutations.is_none() {
             return Err(fuser::Errno::EROFS);
@@ -774,6 +807,46 @@ where
             // before the first append; not representable in the v0
             // append model, so refuse rather than silently ignore one.
             return Err(fuser::Errno::EOPNOTSUPP);
+        }
+        // Reserve the handle slot before any blocking submit below:
+        // a saturated table fails before any side effect, and the
+        // promise holds room across the submits. Every path after
+        // this consumes the promise (`insert_reserved`) or returns
+        // it — except a failed `insert_reserved` itself, which keeps
+        // create_at's accounting (the promise is consumed there).
+        self.reserve_slot()?;
+        let handle = match self.build_write_handle(path, flags, append, truncate) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.release_slot();
+                return Err(error);
+            }
+        };
+        self.insert_reserved(Handle::Write(Arc::new(Mutex::new(handle))))
+    }
+
+    /// Build the writable handle for [`open_write`](Self::open_write):
+    /// resolve the node, commit an `O_TRUNC` truncation up front, and
+    /// capture the identity the handle commits against.
+    fn build_write_handle(
+        &self,
+        path: &str,
+        flags: i32,
+        append: bool,
+        truncate: bool,
+    ) -> Result<WriteHandle, fuser::Errno> {
+        if truncate {
+            // The truncation commits during open, not at the first
+            // flush: the kernel delivers `O_TRUNC` as open plus a
+            // separate fh-less `setattr`, so a handle carrying the
+            // pre-truncate base would go stale before its first
+            // commit. The followup `setattr` short-circuits as a
+            // no-op in `set_size_at`.
+            self.submit(MutationKind::SetAttrs {
+                path: path.to_string(),
+                size: Some(0),
+                executable: None,
+            })?;
         }
         let projection = self.projection()?;
         let node = projection
@@ -794,41 +867,20 @@ where
             // unreachable but keeps the identity derivation total.
             _ => return Err(fuser::Errno::EISDIR),
         };
-        // Admission before side effects: a saturated table fails
-        // here, before the truncate reservation below marks the
-        // handle dirty in the budget.
-        self.check_handle_available()?;
         let id = self.budget.next_handle();
-        let (image, dirty) = if truncate {
-            self.budget
-                .reserve(id, 0)
-                .map_err(|_| fuser::Errno::ENOSPC)?;
-            (Some(Vec::new()), true)
-        } else {
-            (None, false)
-        };
         let executable = base.executable();
-        let handle = WriteHandle {
+        Ok(WriteHandle {
             path: path.to_string(),
             capture,
             base,
             executable,
-            image,
+            image: None,
             append,
-            dirty,
+            dirty: false,
             failed: false,
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
-        };
-        // Release on failure covers the race the pre-check cannot:
-        // a table that fills between check and insert still fails
-        // closed, and the truncate reservation above is unwound, so
-        // failed opens never consume dirty-handle or aggregate budget.
-        // `release` is idempotent, hence unconditional.
-        self.insert_handle(Handle::Write(Arc::new(Mutex::new(handle))))
-            .inspect_err(|_| {
-                self.budget.release(id);
-            })
+        })
     }
 
     /// Create the file `name` under `parent_ino` and open it for
@@ -1360,14 +1412,37 @@ where
     }
 
     /// Truncate/extend the file at `ino` to `size` (path-addressed
-    /// `setattr(size)`).
+    /// `setattr(size)`). A truncate to the current size submits
+    /// nothing: this absorbs the kernel's `O_TRUNC` split (`open`
+    /// commits the truncation itself; the followup `setattr` finds
+    /// the size already there) and makes repeated truncates cheap.
+    /// Open clean handles on the path re-pin onto the committed size
+    /// (see below); dirty ones keep the stale rule.
     pub fn set_size_at(&self, ino: u64, size: u64) -> Result<(), fuser::Errno> {
         let path = self.inode_path(ino)?;
+        let current = self
+            .attr_at(&path)
+            .map(|attr| attr.size)
+            .unwrap_or(u64::MAX);
+        if current == size {
+            return Ok(());
+        }
+        // Clean handles hold no uncommitted state, so the concurrent
+        // truncate re-pins them instead of stranding them stale. This
+        // is what makes the kernel's `O_TRUNC` split work: open
+        // arrives trunc-less and the fh-less followup `setattr` lands
+        // here while the opening handle is still clean. A repin that
+        // fails (lock poison, kind change mid-flight) degrades to the
+        // stale rule — never to silent content loss.
+        let clean = self.clean_handles_on(&path);
         self.submit(MutationKind::SetAttrs {
-            path,
+            path: path.clone(),
             size: Some(size),
             executable: None,
         })?;
+        for handle in &clean {
+            let _ = self.repin_handle(handle, &path);
+        }
         Ok(())
     }
 
@@ -1454,12 +1529,17 @@ where
                 if size.is_some() && self.append_open_on(&path) {
                     return Err(fuser::Errno::EOPNOTSUPP);
                 }
-                self.submit(MutationKind::SetAttrs {
-                    path,
-                    size,
-                    executable,
-                })?;
-                Ok(())
+                match (size, executable) {
+                    (Some(size), None) => self.set_size_at(ino, size),
+                    _ => {
+                        self.submit(MutationKind::SetAttrs {
+                            path,
+                            size,
+                            executable,
+                        })?;
+                        Ok(())
+                    }
+                }
             }
         }
     }

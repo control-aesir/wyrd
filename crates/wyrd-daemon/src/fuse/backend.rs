@@ -598,6 +598,24 @@ where
         }
     }
 
+    /// Whether an `O_APPEND` handle is open on `path`. A path-addressed
+    /// truncate then is `EOPNOTSUPP` (write-path.md): an append handle
+    /// has no image to truncate, and the open-time flag check alone
+    /// cannot see the kernel's `O_APPEND|O_TRUNC` split — open arrives
+    /// append-only and the truncation follows as a separate `setattr`.
+    fn append_open_on(&self, path: &str) -> bool {
+        let Ok(files) = self.files.lock() else {
+            return false;
+        };
+        files.by_handle.values().any(|handle| match handle {
+            Handle::Write(write) => match write.lock() {
+                Ok(guard) => guard.append && guard.path == path,
+                Err(_) => false,
+            },
+            Handle::Read(_) => false,
+        })
+    }
+
     /// Read through an open handle: the open-time capture serves the
     /// bytes, so head advancement cannot change what an open
     /// descriptor returns. A dirty writable handle serves its buffered
@@ -1426,6 +1444,9 @@ where
                 if size.is_none() && executable.is_none() {
                     return Ok(());
                 }
+                if size.is_some() && self.append_open_on(&path) {
+                    return Err(fuser::Errno::EOPNOTSUPP);
+                }
                 self.submit(MutationKind::SetAttrs {
                     path,
                     size,
@@ -1971,6 +1992,86 @@ where
             Ok(()) => reply.ok(),
             Err(error) => reply.error(_log.fail(error)),
         }
+    }
+
+    /// Symbolic links are known and deliberately unsupported in v0, so
+    /// refuse explicitly: without this override fuser's default replies
+    /// `EPERM`, which misreports a policy refusal as a permission failure.
+    fn symlink(
+        &self,
+        _req: &fuser::Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &std::path::Path,
+        reply: fuser::ReplyEntry,
+    ) {
+        let _log = RequestLog::new("symlink");
+        reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
+    }
+
+    /// Hard links are known and deliberately unsupported in v0, for the
+    /// same reason as symlinks above (fuser's default is `EPERM`).
+    fn link(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        let _log = RequestLog::new("link");
+        reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
+    }
+
+    /// Extended attributes are known and deliberately unsupported in v0:
+    /// fuser's defaults reply `ENOSYS`, which misreports a policy refusal
+    /// as a missing handler.
+    fn setxattr(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let _log = RequestLog::new("setxattr");
+        reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
+    }
+
+    fn getxattr(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        let _log = RequestLog::new("getxattr");
+        reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
+    }
+
+    fn listxattr(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        let _log = RequestLog::new("listxattr");
+        reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
+    }
+
+    fn removexattr(
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let _log = RequestLog::new("removexattr");
+        reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
     fn rename(

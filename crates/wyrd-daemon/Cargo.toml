@@ -14,7 +14,7 @@ fuser = "0.18"
 libc.workspace = true
 thiserror.workspace = true
 # Structured mount events the process host bridges into its diagnostics.
-tracing = "0.1"
+tracing.workspace = true
 
 [dev-dependencies]
 # Downstream tests build a real `Engine` per test; enabling the fast KDF

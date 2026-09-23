@@ -51,6 +51,9 @@ fastcdc = { version = "5.0.0", default-features = false }
 # errors
 thiserror = "2"
 
+# structured diagnostics (daemon backends, CLI mount log, live sync loop)
+tracing = "0.1"
+
 # FUSE boundary error mapping (daemon adapter only)
 libc = "0.2"
 

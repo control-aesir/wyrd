@@ -22,7 +22,7 @@ nostr.workspace = true
 thiserror.workspace = true
 # Mount diagnostics: structured events to stderr plus a per-mount file,
 # and a bridge so fuser's log records land in the same record.
-tracing = "0.1"
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-log = "0.2"
 zeroize.workspace = true

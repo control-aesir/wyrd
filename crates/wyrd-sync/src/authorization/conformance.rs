@@ -804,8 +804,9 @@ fn recovery_cannot_adopt_a_conflict_branch() {
         classify_one(&dag, &f.log, &id_s1),
         Classification::Pending(Pendency::ContestedTransition)
     );
-    // The recovery binds the frozen tip and is owner-signed; its only
-    // sin is the conflicted parent.
+    // The recovery binds the canonical tip (frozen at epoch 2) and is
+    // owner-signed; its only sin is parenting the snapshot bound to
+    // the contested transition.
     let mut recovery = f.owner_snapshot(vec![id_s1], tree_id(2));
     recovery
         .set_flags(wyrd_format::snapshot::RECOVERY_FLAG)
@@ -839,9 +840,9 @@ fn revoked_author_cannot_resurface_through_ancestry() {
         Classification::Eligible,
         "pre-removal member work is live"
     );
+    // Post-removal work bound to the current tip is rejected: B is
+    // not a member of the bound state.
     f.membership(vec![Change::Remove(b)]); // K = 3
-                                           // Post-removal work bound to the current tip: rejected, not a
-                                           // member of the bound state.
     let after = f.snapshot(vec![id_s1], tree_id(2), b, &b_sk, 0);
     let id_after = observe(&mut dag, &after);
     assert_eq!(

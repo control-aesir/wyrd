@@ -7,6 +7,11 @@ that pins each window. A crash anywhere must leave before-XOR-full
 state per subsystem — torn writes are invisible, never half-applied —
 and the subsystems must agree with each other on reopen.
 
+This is an extensible inventory of current boundaries, not an
+exhaustive closed set: future durable recovery state (for example a
+device-local journal) adds its own write, replay, and
+snapshot-commit sections and tests without reworking the model.
+
 Four boundary kinds recur below:
 
 - **durable**: bytes that survive power loss (fsynced files, CURRENT-anchored commits).

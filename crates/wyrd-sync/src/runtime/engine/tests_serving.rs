@@ -436,6 +436,31 @@ fn announced_head_serves_from_the_author_vault_after_author_restart() {
     // The author restarts: durable facts and vault bytes both survive.
     restart(&mut pair.a, &controls);
 
+    // Residency evidence on disk: the chunk's vault file exists under
+    // the restarted author before anything is served — the record
+    // names bytes that are really there, not bytes the import
+    // promised.
+    let state_a = pair.a.engine.runtime_state().unwrap();
+    let record_a = state_a
+        .root_manifest_record(&authored.snapshot().snapshot_id())
+        .expect("restarted author records");
+    let chunk_entry = record_a
+        .manifest
+        .entries()
+        .iter()
+        .find(|entry| entry.kind == ObjectKind::Chunk && entry.content_id == chunk)
+        .cloned()
+        .expect("maps the chunk");
+    assert!(
+        pair.a
+            .dir
+            .path
+            .join("vault")
+            .join(chunk_entry.transport.to_string())
+            .is_file(),
+        "the published representation's vault file survives the restart"
+    );
+
     // B fetches over the restarted author's vault and materializes
     // the exact plaintext.
     let serving_a = crate::serving::VaultSource::from_state(

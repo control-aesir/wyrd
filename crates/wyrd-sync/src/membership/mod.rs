@@ -205,19 +205,19 @@ impl MembershipLog {
 
     /// One classification of the current observed set, memoized: the
     /// first read after an `observe` runs the full traversal and every
-    /// later read clones the cached maps until the set changes again.
-    /// Cloning the maps keeps the borrow short (no caller can hold the
-    /// cache across an `observe`), at the cost of one map copy per
-    /// read — traversal dominates copies at any hostile depth.
-    fn analysed(&self) -> chain::Analysis {
-        if let Some(cached) = self.analysis.borrow().clone() {
-            return cached;
+    /// later read shares the cached maps until the set changes again.
+    /// The closure runs under the cache borrow, so reads copy only
+    /// the verdict they return — never the whole maps — while no
+    /// caller can hold the cache across an `observe`.
+    fn with_analysis<R>(&self, f: impl FnOnce(&chain::Analysis) -> R) -> R {
+        if self.analysis.borrow().is_none() {
+            #[cfg(test)]
+            self.analyses_run.set(self.analyses_run.get() + 1);
+            *self.analysis.borrow_mut() = Some(chain::analyse(self));
         }
-        #[cfg(test)]
-        self.analyses_run.set(self.analyses_run.get() + 1);
-        let fresh = chain::analyse(self);
-        *self.analysis.borrow_mut() = Some(fresh.clone());
-        fresh
+        let cached = self.analysis.borrow();
+        let analysis = cached.as_ref().expect("populated above");
+        f(analysis)
     }
 
     /// Whether the id is in the observed set.
@@ -240,10 +240,15 @@ impl MembershipLog {
     /// `None`.
     pub fn authoritative(&self, id: &TransitionId) -> Option<Authorizable<'_>> {
         let transition = self.transitions.get(id)?;
-        let analysis = self.analysed();
-        match analysis.states.get(id).cloned() {
+        let (state, status) = self.with_analysis(|analysis| {
+            (
+                analysis.states.get(id).cloned(),
+                analysis.status.get(id).copied(),
+            )
+        });
+        match state {
             Some(state) => Some(Authorizable::Valid(transition, state)),
-            None => match analysis.status.get(id) {
+            None => match status {
                 Some(TransitionStatus::Pending) => Some(Authorizable::Pending),
                 // Every observed transition is classified; a
                 // classification without a derived state can never
@@ -268,8 +273,9 @@ impl MembershipLog {
         ids
     }
 
-    /// Classify a transition against the observed set. Each call runs a
-    /// full analysis; callers needing many verdicts should prefer
+    /// Classify a transition against the observed set. Served from the
+    /// memoized analysis while the observed set is unchanged; callers
+    /// needing many verdicts should still prefer
     /// [`MembershipLog::statuses`].
     ///
     /// `None` covers unobserved ids — and, defensively, observed ids
@@ -289,27 +295,24 @@ impl MembershipLog {
         if FORCE_UNCLASSIFIED.with(|flag| flag.get()) {
             return None;
         }
-        let analysis = self.analysed();
-        analysis.status.get(id).copied()
+        self.with_analysis(|analysis| analysis.status.get(id).copied())
     }
 
     /// All verdicts from one analysis pass. Prefer this over repeated
     /// [`MembershipLog::status`] calls when reading many verdicts —
-    /// one map serves every lookup, instead of one cached-analysis
-    /// clone per call.
+    /// one map serves every lookup.
     pub fn statuses(&self) -> HashMap<TransitionId, TransitionStatus> {
-        self.analysed().status
+        self.with_analysis(|analysis| analysis.status.clone())
     }
 
     /// The canonical tip's state, or `None` while the log has no unique
     /// canonical chain (e.g. a genesis conflict).
     pub fn known_state(&self) -> Option<KnownState> {
-        let analysis = self.analysed();
-        let tip = analysis.canonical.last()?;
-        let t = self.transitions.get(tip)?;
+        let tip = self.with_analysis(|analysis| analysis.canonical.last().copied())?;
+        let t = self.transitions.get(&tip)?;
         Some(KnownState {
             epoch: t.epoch,
-            transition_id: *tip,
+            transition_id: tip,
             members_root: t.members_root,
             owners_root: t.owners_root,
             readers_root: t.readers_root,
@@ -319,13 +322,13 @@ impl MembershipLog {
     /// The epoch at which membership evaluation is frozen by an unresolved
     /// conflict, or `None` when the canonical chain is unobstructed.
     pub fn frozen_at(&self) -> Option<u64> {
-        self.analysed().frozen_at
+        self.with_analysis(|analysis| analysis.frozen_at)
     }
 
     /// The derived member/owner sets of a valid transition (canonical,
     /// contested, or voided alike — all are valid history).
     pub fn state_of(&self, id: &TransitionId) -> Option<MembershipState> {
-        self.analysed().states.get(id).cloned()
+        self.with_analysis(|analysis| analysis.states.get(id).cloned())
     }
 
     /// The member set of a valid transition.
@@ -350,7 +353,7 @@ impl MembershipLog {
     /// bounded transition as evidence), so selecting by shape alone
     /// can anchor to bytes no invitee accepts.
     pub fn canonical_genesis(&self) -> Option<TransitionId> {
-        self.analysed().canonical.first().copied()
+        self.with_analysis(|analysis| analysis.canonical.first().copied())
     }
 
     /// Whether the device was ever admitted on the canonical chain:

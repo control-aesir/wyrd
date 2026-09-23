@@ -156,6 +156,10 @@ pub enum EngineError {
     MalformedDrive,
     #[error("the custody record is malformed")]
     MalformedKeystore,
+    #[error(
+        "escrow sidecar for epoch {0} disagrees with the held epoch key: custody corrupt, refusing to replace held material"
+    )]
+    EscrowConflict(u64),
     #[error("the supplied identity is not this drive's owner")]
     OwnerMismatch,
     #[error("the supplied identity does not match this drive's member custody record")]

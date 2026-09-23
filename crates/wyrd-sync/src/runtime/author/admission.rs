@@ -225,14 +225,16 @@ fn admit(
     }
     engine.commit_facts(&batch)?;
     engine.resync()?;
-    // Mint-time escrow (T13), same commit-then-escrow order as the
-    // shared tail: the sidecar lands only after the admission batch
-    // commits.
-    escrow_fresh_secret(engine, epoch, &secret)?;
     engine.add_epoch_key(
         epoch,
         Zeroizing::new(secret.control_key(&engine.drive, epoch)),
     );
+    // Mint-time escrow (T13), after the key install: the sidecar
+    // lands only after the admission batch commits (commit-then-
+    // escrow), and an escrow failure must never drop the held key —
+    // the install above is infallible memory state, the persist
+    // below is fallible disk state.
+    escrow_fresh_secret(engine, epoch, &secret)?;
     Ok(AdmitOutcome {
         transition,
         invitation,

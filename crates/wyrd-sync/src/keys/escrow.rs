@@ -29,10 +29,16 @@
 //! record.
 //!
 //! Ordering (pinned): the sidecar lands AFTER the transition's durable
-//! commit. A crash between them leaves a missing sidecar — today's gap,
-//! with recovery falling back to keyring catch-up — never an orphan
-//! record a retried authoring could mismatch with a fresh secret for
-//! the same epoch.
+//! commit. A crash between them leaves a missing sidecar — the degraded
+//! recovery state — never an orphan record a retried authoring could
+//! mismatch with a fresh secret for the same epoch. The hole heals:
+//! every later authoring backfills missing sidecars below the new
+//! epoch from the keyring, so a missing record lasts until the next
+//! mint, not forever; meanwhile keyring catch-up serves ordinary
+//! operation and only root-alone recovery of that epoch waits.
+//! Present sidecars are never rewritten, and restoration fills
+//! vacancies only — a sidecar disagreeing with held material fails
+//! the open (`EscrowConflict`) instead of replacing it.
 
 use std::path::{Path, PathBuf};
 

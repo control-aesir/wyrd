@@ -481,6 +481,13 @@ fn install_self_capability(
 /// keyring catch-up; a present record for the wrong drive, or one
 /// that fails the tag, is corrupt custody and fails closed — a
 /// guardian must never install a secret the root did not seal.
+///
+/// Conflict policy (fill-vacant, never replace): a sidecar whose
+/// secret differs from the already-held epoch key fails the open
+/// with `EscrowConflict` instead of swapping the key the durable
+/// fact history runs on. Escrow restores vacant epochs; it never
+/// outranks held material — the same rule the invitation resync
+/// applies to provisional secrets.
 fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
     let Some(root) = engine.root.clone() else {
         return Ok(());
@@ -500,7 +507,19 @@ fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
             return Err(EngineError::MalformedKeystore);
         }
         let secret = escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?;
-        engine.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive, epoch)));
+        let key = secret.control_key(&drive, epoch);
+        match engine.epoch_keys.get(&epoch) {
+            // Same secret already held (e.g. keyring-derived):
+            // leave it. Restoration fills vacancies only.
+            Some(held) if **held == key => {}
+            // A validly sealed but different secret: corrupt or
+            // transplanted custody. Fail the open rather than run
+            // the durable history on a replaced key.
+            Some(_) => return Err(EngineError::EscrowConflict(epoch)),
+            None => {
+                engine.add_epoch_key(epoch, Zeroizing::new(key));
+            }
+        }
     }
     Ok(())
 }
@@ -1350,6 +1369,104 @@ mod tests {
             Some(&epoch3_key),
             "root custody alone restores epoch 3"
         );
+    }
+
+    #[test]
+    fn conflicting_escrow_sidecar_fails_owner_open_closed() {
+        // A valid same-root sidecar holding a DIFFERENT secret for an
+        // epoch the keyring covers: owner open fails with
+        // EscrowConflict instead of silently running the durable
+        // history on a replaced key. Escrow fills vacancies; it never
+        // outranks held material.
+        let dir = TestDir::new("conflicting-escrow");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        engine
+            .admit_device(newcomer.device_id(), newcomer_encryption.encryption_key())
+            .unwrap();
+        let drive = engine.drive;
+        // Forge the conflicting sidecar: unwrap the root from the
+        // keystore and seal another epoch-2 secret under it.
+        let Custody::Owner { root: wrapped, .. } =
+            read_custody(&dir.path).expect("keystore exists")
+        else {
+            panic!("owner custody");
+        };
+        let root = DriveRootKey::from_bytes(unwrap_root(&wrapped, "test-pass").unwrap());
+        let forged = escrow::wrap(
+            &root.escrow_key(&drive, 2),
+            &drive,
+            2,
+            &EpochSecret::generate().unwrap(),
+        )
+        .unwrap();
+        escrow::persist_record(&dir.path, &forged).unwrap();
+        drop(engine);
+        assert!(matches!(
+            Engine::open_keystore(dir.path.clone(), "test-pass", owner),
+            Err(EngineError::EscrowConflict(2))
+        ));
+    }
+
+    #[test]
+    fn failed_escrow_persist_heals_on_next_authoring() {
+        // Fault injection for the commit-then-escrow window: a file
+        // where the sidecar directory must go (fails under any uid,
+        // unlike permission bits). The admission commits — epoch 2 is
+        // durable — but the escrow persist fails loudly, leaving the
+        // degraded state: committed epoch, no recovery record. The
+        // next authoring backfills the missing sidecar from the
+        // keyring and writes its own, so the hole heals instead of
+        // lasting forever.
+        let dir = TestDir::new("escrow-backfill");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
+        std::fs::write(dir.path.join(escrow::ESCROW_DIR), b"blocker").unwrap();
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        assert!(matches!(
+            engine.admit_device(newcomer.device_id(), newcomer_encryption.encryption_key()),
+            Err(EngineError::Io(_))
+        ));
+        assert_eq!(
+            engine.log.known_state().map(|known| known.epoch),
+            Some(2),
+            "the transition commits before the escrow fails"
+        );
+        assert!(
+            !escrow::record_path(&dir.path, 2).exists(),
+            "no sidecar: the degraded recovery state"
+        );
+        // Heal the fault and author again: epoch 2 backfills from the
+        // keyring, epoch 3 writes fresh.
+        std::fs::remove_file(dir.path.join(escrow::ESCROW_DIR)).unwrap();
+        engine.rotate_epoch().unwrap();
+        let epoch2_key = engine.epoch_keys.get(&2).cloned().expect("held");
+        let epoch3_key = engine.epoch_keys.get(&3).cloned().expect("held");
+        assert_eq!(
+            escrow::load_record(&dir.path, 2)
+                .unwrap()
+                .expect("backfilled")
+                .epoch,
+            2
+        );
+        assert_eq!(
+            escrow::load_record(&dir.path, 3)
+                .unwrap()
+                .expect("fresh")
+                .epoch,
+            3
+        );
+        drop(engine);
+        // Both epochs restore from root custody alone.
+        let mut engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
+        engine.epoch_keys.remove(&2);
+        engine.epoch_keys.remove(&3);
+        restore_escrowed_epochs(&mut engine).unwrap();
+        assert_eq!(engine.epoch_keys.get(&2), Some(&epoch2_key));
+        assert_eq!(engine.epoch_keys.get(&3), Some(&epoch3_key));
     }
 
     #[test]

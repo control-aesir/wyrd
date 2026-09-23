@@ -19,8 +19,10 @@
 //!               0x01 Remove(d)     + DeviceId
 //!               0x02 Rotate()      (no payload)
 //!               0x03 SetOwners(D)  + u32 LE count + DeviceIds
+//!               0x04 AdmitReader(a) + DeviceId + encryption key
 //! members_root: 32 bytes
 //! owners_root:  32 bytes
+//! readers_root: 32 bytes
 //! author:       DeviceId (32 bytes)
 //! epoch:        u64 LE (declared last in the preimage)
 //! ```
@@ -38,6 +40,9 @@ pub const MEMBER_SET_CONTEXT: &str = "wyrd member set v1";
 
 /// Context for deriving owner-set roots.
 pub const OWNER_SET_CONTEXT: &str = "wyrd owner set v1";
+
+/// Context for deriving reader-set roots.
+pub const READER_SET_CONTEXT: &str = "wyrd reader set v1";
 
 /// Derive a set root over devices: domain-separated BLAKE3 over the set
 /// encoded as `u32` LE count followed by the 32-byte x-only pubkeys in
@@ -72,13 +77,21 @@ pub struct Admission {
 }
 
 /// Canonical tag byte for each change kind (object-model.md decision
-/// record): Admit, Remove, Rotate, SetOwners.
+/// record): Admit, Remove, Rotate, SetOwners, AdmitReader.
+///
+/// `Remove` evicts from both the member and reader sets: revocation is
+/// total, and a device holds at most one role at a time, so one
+/// removal transition ends every participation. Role changes go
+/// through removal first (admission requires the device in neither
+/// set); combined with single-use device identity, a role change
+/// always names a fresh `DeviceId`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Admit(Admission),
     Remove(DeviceId),
     Rotate,
     SetOwners(Vec<DeviceId>),
+    AdmitReader(Admission),
 }
 
 impl Change {
@@ -89,6 +102,7 @@ impl Change {
             Change::Remove(_) => 0x01,
             Change::Rotate => 0x02,
             Change::SetOwners(_) => 0x03,
+            Change::AdmitReader(_) => 0x04,
         }
     }
 }
@@ -112,6 +126,8 @@ pub struct MembershipTransition {
     pub members_root: [u8; 32],
     /// Hash of the owner set after the changes.
     pub owners_root: [u8; 32],
+    /// Hash of the reader set after the changes.
+    pub readers_root: [u8; 32],
     /// The signing device: an owner **in the pre-transition state**.
     pub author: DeviceId,
     /// BIP-340 signature over the drive-bound signing message.
@@ -165,6 +181,7 @@ impl MembershipTransition {
         changes: Vec<Change>,
         members_root: [u8; 32],
         owners_root: [u8; 32],
+        readers_root: [u8; 32],
         author: DeviceId,
     ) -> Result<Self, MembershipError> {
         check_counts(&resolves, &changes)?;
@@ -175,6 +192,7 @@ impl MembershipTransition {
             changes,
             members_root,
             owners_root,
+            readers_root,
             author,
             signature: [0; 64],
         })
@@ -251,10 +269,15 @@ impl MembershipTransition {
                         out.extend_from_slice(device.as_bytes());
                     }
                 }
+                Change::AdmitReader(admission) => {
+                    out.extend_from_slice(admission.device.as_bytes());
+                    out.extend_from_slice(admission.encryption_key.as_bytes());
+                }
             }
         }
         out.extend_from_slice(&self.members_root);
         out.extend_from_slice(&self.owners_root);
+        out.extend_from_slice(&self.readers_root);
         out.extend_from_slice(self.author.as_bytes());
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out
@@ -362,22 +385,33 @@ impl MembershipTransition {
                     pos += owner_bytes;
                     Change::SetOwners(owners)
                 }
+                0x04 => {
+                    need(pos, 64)?;
+                    let device = DeviceId::from_bytes(id32(pos));
+                    let encryption_key = DeviceEncryptionKey::from_bytes(id32(pos + 32));
+                    pos += 64;
+                    Change::AdmitReader(Admission {
+                        device,
+                        encryption_key,
+                    })
+                }
                 unknown => return Err(MembershipError::UnknownChangeTag(unknown)),
             };
             changes.push(change);
         }
 
-        // roots, author, epoch, signature
-        need(pos, 32 + 32 + 32 + 8 + 64)?;
+        // Roots, author, epoch, signature.
+        need(pos, 32 + 32 + 32 + 32 + 8 + 64)?;
         let members_root = id32(pos);
         let owners_root = id32(pos + 32);
-        let author = DeviceId::from_bytes(id32(pos + 64));
+        let readers_root = id32(pos + 64);
+        let author = DeviceId::from_bytes(id32(pos + 96));
         let epoch = u64::from_le_bytes(
-            bytes[pos + 96..pos + 104]
+            bytes[pos + 128..pos + 136]
                 .try_into()
                 .expect("bounds checked"),
         );
-        pos += 104;
+        pos += 136;
         let signature = bytes[pos..pos + 64].try_into().expect("bounds checked");
         pos += 64;
         if pos != len {
@@ -390,6 +424,7 @@ impl MembershipTransition {
             changes,
             members_root,
             owners_root,
+            readers_root,
             author,
             signature,
         })
@@ -423,6 +458,7 @@ mod tests {
             vec![Change::Rotate],
             [0x20; 32],
             [0x21; 32],
+            [0x22; 32],
             device(0x30),
         )
         .unwrap();
@@ -436,6 +472,7 @@ mod tests {
         assert_eq!(Change::Remove(device(1)).tag(), 0x01);
         assert_eq!(Change::Rotate.tag(), 0x02);
         assert_eq!(Change::SetOwners(vec![device(1)]).tag(), 0x03);
+        assert_eq!(Change::AdmitReader(admission(1)).tag(), 0x04);
     }
 
     #[test]
@@ -460,6 +497,8 @@ mod tests {
         assert_eq!(&pre[cursor..cursor + 32], &[0x20; 32]);
         cursor += 32;
         assert_eq!(&pre[cursor..cursor + 32], &[0x21; 32]);
+        cursor += 32;
+        assert_eq!(&pre[cursor..cursor + 32], &[0x22; 32]);
         cursor += 32;
         assert_eq!(&pre[cursor..cursor + 32], &[0x30; 32]);
         cursor += 32;
@@ -487,6 +526,7 @@ mod tests {
             changes: vec![Change::SetOwners(vec![device(0x11)])],
             members_root: [0; 32],
             owners_root: [0; 32],
+            readers_root: [0; 32],
             author: device(0x11),
             signature: [0; 64],
         };
@@ -612,6 +652,7 @@ mod setowners_tests {
             changes: vec![Change::SetOwners(vec![device(0x01), device(0x02)])],
             members_root: [0; 32],
             owners_root: [0; 32],
+            readers_root: [0; 32],
             author: device(0x01),
             signature: [0; 64],
         };
@@ -645,6 +686,7 @@ mod admission_tests {
             changes: vec![Change::Admit(admission(7))],
             members_root: [0; 32],
             owners_root: [0; 32],
+            readers_root: [0; 32],
             author: DeviceId::from_bytes([1; 32]),
             signature: [0; 64],
         };
@@ -665,9 +707,34 @@ mod admission_tests {
             changes: vec![Change::Admit(admission(9))],
             members_root: [0; 32],
             owners_root: [0; 32],
+            readers_root: [0; 32],
             author: DeviceId::from_bytes([1; 32]),
             signature: [0; 64],
         };
+        let decoded = MembershipTransition::from_canonical_bytes(&t.canonical_bytes()).unwrap();
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn admit_reader_round_trips_both_keys() {
+        let t = MembershipTransition {
+            epoch: 2,
+            prev: Some(TransitionId::from_bytes([0x10; 32])),
+            resolves: Vec::new(),
+            changes: vec![Change::AdmitReader(admission(9))],
+            members_root: [0; 32],
+            owners_root: [0; 32],
+            readers_root: [0; 32],
+            author: DeviceId::from_bytes([1; 32]),
+            signature: [0; 64],
+        };
+        let pre = t.signing_preimage();
+        // Same offset as Admit (tag 0x00 ↔ 0x04, identical payload):
+        // prev flag(1) + prev id(32) + resolves count(4) + changes
+        // count(4) puts the tag at offset 41.
+        assert_eq!(pre[41], 0x04, "AdmitReader tag");
+        assert_eq!(&pre[42..74], &[9; 32], "device key");
+        assert_eq!(&pre[74..106], &[9 ^ 0xA5; 32], "encryption key");
         let decoded = MembershipTransition::from_canonical_bytes(&t.canonical_bytes()).unwrap();
         assert_eq!(decoded, t);
     }
@@ -681,6 +748,7 @@ mod admission_tests {
             changes: vec![Change::Admit(admission(3))],
             members_root: [0; 32],
             owners_root: [0; 32],
+            readers_root: [0; 32],
             author: DeviceId::from_bytes([1; 32]),
             signature: [0; 64],
         };

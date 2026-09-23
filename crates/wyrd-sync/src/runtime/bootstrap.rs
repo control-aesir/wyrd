@@ -32,7 +32,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition};
 
 use super::engine::{Engine, EngineError};
@@ -481,6 +483,7 @@ fn genesis_transition(
         ],
         set_root(MEMBER_SET_CONTEXT, &[owner])?,
         set_root(OWNER_SET_CONTEXT, &[owner])?,
+        set_root(READER_SET_CONTEXT, &[])?,
         owner,
     )?;
     sign_transition(&mut transition, &identity.secret_key(), &drive);
@@ -1219,6 +1222,7 @@ mod tests {
                 device: owner.device_id(),
                 encryption_key: owner_encryption.encryption_key(),
             })],
+            [0xFF; 32],
             [0xFF; 32],
             [0xFF; 32],
             owner.device_id(),

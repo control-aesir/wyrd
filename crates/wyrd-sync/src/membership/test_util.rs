@@ -5,7 +5,9 @@
 
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use std::collections::BTreeSet;
-use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{
     Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, TransitionId,
 };
@@ -31,6 +33,30 @@ pub(crate) fn admit(device: DeviceId) -> Change {
     };
     let keypair = Keypair::from_secret_key(SECP256K1, &sk);
     Change::Admit(Admission {
+        device,
+        encryption_key: DeviceEncryptionKey::from_bytes(
+            XOnlyPublicKey::from_keypair(&keypair).0.serialize(),
+        ),
+    })
+}
+
+/// A deterministic reader admission for fixtures, mirroring [`admit`]:
+/// same key derivation, reader role. Test-only.
+pub(crate) fn admit_reader(device: DeviceId) -> Change {
+    let mut counter = 0u8;
+    let sk = loop {
+        let mut input = Vec::with_capacity(32 + device.as_bytes().len() + 1);
+        input.extend_from_slice(b"wyrd test encryption key v1");
+        input.extend_from_slice(device.as_bytes());
+        input.push(counter);
+        let hash = blake3::hash(&input);
+        if let Ok(sk) = SecretKey::from_slice(hash.as_bytes()) {
+            break sk;
+        }
+        counter = counter.checked_add(1).expect("test scalar space exhausted");
+    };
+    let keypair = Keypair::from_secret_key(SECP256K1, &sk);
+    Change::AdmitReader(Admission {
         device,
         encryption_key: DeviceEncryptionKey::from_bytes(
             XOnlyPublicKey::from_keypair(&keypair).0.serialize(),
@@ -69,6 +95,7 @@ pub(crate) struct Builder {
     pub sk: SecretKey,
     pub members: BTreeSet<DeviceId>,
     pub owners: BTreeSet<DeviceId>,
+    pub readers: BTreeSet<DeviceId>,
     pub prev: Option<TransitionId>,
     pub epoch: u64,
 }
@@ -85,6 +112,7 @@ impl Builder {
             vec![admit(owner), Change::SetOwners(vec![owner])],
             set_root(MEMBER_SET_CONTEXT, &[owner]).unwrap(),
             set_root(OWNER_SET_CONTEXT, &[owner]).unwrap(),
+            set_root(READER_SET_CONTEXT, &[]).unwrap(),
             owner,
         )
         .unwrap();
@@ -95,6 +123,7 @@ impl Builder {
                 sk,
                 members: [owner].into(),
                 owners: [owner].into(),
+                readers: BTreeSet::new(),
                 prev: Some(t.transition_id()),
                 epoch: 1,
             },
@@ -124,6 +153,11 @@ impl Builder {
                 &self.owners.iter().copied().collect::<Vec<_>>(),
             )
             .unwrap(),
+            set_root(
+                READER_SET_CONTEXT,
+                &self.readers.iter().copied().collect::<Vec<_>>(),
+            )
+            .unwrap(),
             author,
         )
         .unwrap();
@@ -143,8 +177,12 @@ impl Builder {
                 Change::Admit(admission) => {
                     self.members.insert(admission.device);
                 }
+                Change::AdmitReader(admission) => {
+                    self.readers.insert(admission.device);
+                }
                 Change::Remove(d) => {
                     self.members.remove(d);
+                    self.readers.remove(d);
                     if self.owners.contains(d) && self.owners.len() == 1 {
                         self.owners.clear();
                     }

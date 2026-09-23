@@ -117,6 +117,7 @@ Rules:
 | drive | `DriveId` — random 256-bit, immutable | logical encrypted namespace; distinct from every other identifier |
 | device | Nostr public key (`DeviceId`) | a Wyrd participant; holds a wrapped drive capability + its Nostr signing key; secrets travel to the separate device encryption key (T14) |
 | owner | one or more Nostr public keys | membership administration (v0: exactly one owner; owner *sets* and threshold policies are a later extension this model already accommodates) |
+| reader | a Nostr public key in the membership log's reader set | read-only participation: holds epoch secrets and materializes the drive, authors nothing — no authorship gate accepts a reader's work |
 | vault | transport identity only | stores ciphertext; holds no keys, no Wyrd authorization |
 
 Every identifier answers a different question — this separation is deliberate:
@@ -526,6 +527,7 @@ M_snapshot   = ASCII("wyrd snapshot v1") || DriveId(32 bytes)
 M_membership = ASCII("wyrd membership v1") || DriveId(32 bytes)
                || transition_signing_preimage(prev, resolves, changes,
                                               members_root, owners_root,
+                                              readers_root,
                                               author, epoch)
 ```
 
@@ -564,7 +566,8 @@ Two predicates, never collapsed (full definitions and the classification
 state machine in `epochs.md`):
 
 - **Historically valid** — genuine signature, valid *and rooted* membership
-  transition, author a member of the committed state. Intrinsic to the
+  transition, author a member of the committed state (readers are known
+  to the log but author nothing — their snapshots reject). Intrinsic to the
   snapshot against the log; it does not depend on canonicalization
   outcomes. `authorized(S)` = historically valid **and** the referenced
   transition is canonical.

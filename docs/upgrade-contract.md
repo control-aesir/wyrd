@@ -93,18 +93,22 @@ Releases are not required to write every format they read:
   software release supports many protocol versions; the numbers stay
   decoupled.
 
-## Verification (implemented, with two blocked halves)
+## Verification (implemented, with three blocked halves)
 
 `wyrd-contracts` carries one named test per invariant direction
 (catalog 23-33), over fixture stores checked in under
-`tests/fixtures/stores/<release>/`. Two fixtures exist: the `dev`
-harness-smoke store and genuine `v0.1.0-alpha.1` bytes produced by
-that release's own codec; per-release fixtures continue under
-their tag with each release. Two tests stay deliberately ignored
+`tests/fixtures/stores/<release>/`. One fixture exists: the `dev`
+harness-smoke store; per-release fixtures continue under
+their tag with each release. (The `v0.1.0-alpha.1` fixture went out
+with the reader-set format break: pre-v1 alphas may break
+compatibility, and no legacy transition decoder is carried for
+unshipped software. The next release cuts a fresh fixture and
+re-enables cross-release replay.) Three tests stay deliberately ignored
 until their blockers land: fact-payload replay (invariant 2's
-payload clause, pending the v0.9.0 payload-versioning issue) and
-the full version matrix (invariant 5's matrix half, pending
-capability negotiation). The list below is the acceptance set for
+payload clause, pending the v0.9.0 payload-versioning issue),
+previous-release replay (invariant 3's cross-release form, pending
+the next release fixture), and the full version matrix
+(invariant 5's matrix half, pending capability negotiation). The list below is the acceptance set for
 the contract issue — one bullet per invariant, in the same order:
 
 1. new encodings are new representations: old objects keep their

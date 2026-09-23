@@ -96,10 +96,14 @@ pub enum EngineError {
     NoCanonicalMembership,
     #[error("this device is not a member of the canonical membership state")]
     NotAMember,
+    #[error("this device is a reader and cannot author snapshots")]
+    ReaderCannotAuthor,
     #[error("this device is not an owner in the pre-transition state")]
     NotOwner,
     #[error("device is already a member")]
     AlreadyMember,
+    #[error("device is already a reader; remove it before admitting under a new identity")]
+    AlreadyReader,
     #[error("device is not a member of the canonical membership state")]
     NotMember,
     #[error("an owner with co-owners can only leave via SetOwners")]
@@ -666,21 +670,35 @@ impl Engine {
         super::author::admit_device(self, device, encryption_key)
     }
 
+    /// Admit a device as a reader: the same commit path as
+    /// [`Engine::admit_device`], with a reader-tagged change. The
+    /// invitation, capability grant, and catch-up are identical — the
+    /// role lives in the membership log, and the authorship gates
+    /// (local and peer) enforce it from there. Only an owner admits.
+    /// See [`super::author::admit_reader`].
+    pub fn admit_reader(
+        &mut self,
+        device: DeviceId,
+        encryption_key: DeviceEncryptionKey,
+    ) -> Result<super::author::AdmitOutcome, EngineError> {
+        super::author::admit_reader(self, device, encryption_key)
+    }
+
     /// Remove a device from the drive: author, sign, and commit the
     /// removal transition (exactly one new epoch), install the new
     /// epoch's self capability when this device remains a member, and
-    /// queue catch-up for the remaining members. The removed device
-    /// receives no new-epoch material. Only an owner removes; removing
-    /// the sole owner is valid but terminal. See
-    /// [`super::author::remove_device`].
+    /// queue catch-up for the remaining members and readers. The
+    /// removed device — member or reader — receives no new-epoch
+    /// material. Only an owner removes; removing the sole owner is
+    /// valid but terminal. See [`super::author::remove_device`].
     pub fn remove_device(&mut self, device: DeviceId) -> Result<MembershipTransition, EngineError> {
         super::author::remove_device(self, device)
     }
 
     /// Force a fresh epoch secret: author, sign, and commit the
     /// rotation transition (exactly one new epoch), reinstall the new
-    /// epoch's self capability, and queue catch-up for every member.
-    /// Membership is unchanged. Only an owner rotates. See
+    /// epoch's self capability, and queue catch-up for every other
+    /// admitted device. Membership is unchanged. Only an owner rotates. See
     /// [`super::author::rotate_epoch`].
     pub fn rotate_epoch(&mut self) -> Result<MembershipTransition, EngineError> {
         super::author::rotate_epoch(self)

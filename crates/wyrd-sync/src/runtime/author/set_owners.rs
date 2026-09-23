@@ -1,4 +1,6 @@
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceId, MembershipTransition};
 
 use super::admission::next_epoch;
@@ -42,6 +44,7 @@ pub(crate) fn set_owners(
     let secret = EpochSecret::generate()?;
     let members: Vec<DeviceId> = pre.members.iter().copied().collect();
     let owners = vec![new_owner];
+    let readers: Vec<DeviceId> = pre.readers.iter().copied().collect();
     let mut transition = MembershipTransition::new(
         epoch,
         Some(tip.transition_id),
@@ -49,6 +52,7 @@ pub(crate) fn set_owners(
         vec![Change::SetOwners(owners)],
         set_root(MEMBER_SET_CONTEXT, &members)?,
         set_root(OWNER_SET_CONTEXT, &[new_owner])?,
+        set_root(READER_SET_CONTEXT, &readers)?,
         engine.device,
     )?;
     sign_transition(

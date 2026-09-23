@@ -16,7 +16,7 @@ wyrd mount <drive_dir> <mountpoint> [--relay <url>...] [--verbose] \
     --identity-file <path> --passphrase-file <path>
 wyrd export <drive_dir> <out_dir> \
     --identity-file <path> --passphrase-file <path>
-wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> | reissue-invitation <device> <out>) \
+wyrd member <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>) \
     --identity-file <path> --passphrase-file <path>
 wyrd device <drive_dir> (id | pairing-request <out> | join <invitation>) \
     --identity-file <path> --passphrase-file <path>
@@ -90,7 +90,7 @@ itself. Catch-up delivery to other devices happens on the next
 mounted sync via the mailbox, not here. Devices are 64 hex
 characters (x-only pubkeys).
 
-- `list`: members and owners at the canonical tip, one identity per
+- `list`: members, owners, and readers at the canonical tip, one identity per
   line under an `epoch <n> tip <id>` header.
 - `log`: every observed transition in epoch order with its
   canonical status (`canonical`, `contested`, `voided`, `orphaned`,
@@ -100,31 +100,33 @@ characters (x-only pubkeys).
   state, and held epoch secrets. Knowledge is not possession: a
   known epoch without its secret authorizes nothing until the
   capability arrives.
-- `remove <device>`: author a removal transition. The removed device
-  receives no new-epoch material; its acquisition ends at the
-  removal boundary while its history stays valid. Removing the sole
-  owner is valid but terminal — it empties the owner set and no
-  future transition can be authorized — so it requires `--yes`.
+- `remove <device>`: author a removal transition. The removed device —
+  member or reader — receives no new-epoch material; its acquisition
+  ends at the removal boundary while its history stays valid.
+  Removing the sole owner is valid but terminal — it empties the owner
+  set and no future transition can be authorized — so it requires
+  `--yes`.
 - `rotate`: force a fresh epoch secret. Membership unchanged; every
-  current member is owed the new-epoch wrap.
+  current member and reader is owed the new-epoch wrap.
 - `set-owner <device>`: hand ownership to a member (v0 ownership is
   a singleton). Authority comes from the pre-transition owner set,
   so the current owner signs the handover.
-- `invite <device> <encryption-key> <out>`: admit a device and write
-  its sealed invitation to `<out>` for out-of-band delivery. The
-  transition commits with the usual catch-up obligations; the
-  newcomer joins from the invitation file. The destination is
-  claimed before the commit: an existing file is refused, and an
-  uncreatable path fails with no transition authored. A write
-  failure past the commit leaves the admission standing — recover
-  with `reissue-invitation` below instead of re-inviting (which
-  reports `AlreadyMember`).
+- `invite <device> <encryption-key> <out> [--reader]`: admit a device
+  and write its sealed invitation to `<out>` for out-of-band delivery.
+  The transition commits with the usual catch-up obligations; the
+  newcomer joins from the invitation file. With `--reader` the device
+  joins read-only: it holds every epoch secret but authors nothing.
+  The destination is claimed before the commit: an existing file is
+  refused, and an uncreatable path fails with no transition authored.
+  A write failure past the commit leaves the admission standing —
+  recover with `reissue-invitation` below instead of re-inviting
+  (which reports `AlreadyMember` — or `AlreadyReader`).
 - `reissue-invitation <device> <out>`: reseal a device's invitation
   from durable state, for an admission whose invitation never
   reached a file. Authors nothing; the reseal opens identically,
   with fresh randomness. Owner-only, like admission, and only for
-  an active canonical member: revocation bounds acquisition, so a
-  removed device's lost invitation stays lost, and a
+  an active canonical member or reader: revocation bounds
+  acquisition, so a removed device's lost invitation stays lost, and a
   valid-but-noncanonical branch never anchors a grant. Same
   destination policy as `invite`.
 

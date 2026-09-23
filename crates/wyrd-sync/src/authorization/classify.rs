@@ -194,7 +194,17 @@ fn preverdict(
     }
     match log.members_of(&t.transition_id()) {
         Some(members) if members.contains(&s.author) => {}
-        _ => return Pre::Rejected(Rejection::AuthorNotMember),
+        _ => {
+            // Readers are visible in the log but voiceless: their
+            // snapshots are rejected with a reason that names the
+            // misconfiguration instead of lumping them with strangers.
+            match log.readers_of(&t.transition_id()) {
+                Some(readers) if readers.contains(&s.author) => {
+                    return Pre::Rejected(Rejection::AuthorIsReader);
+                }
+                _ => return Pre::Rejected(Rejection::AuthorNotMember),
+            }
+        }
     }
     if s.flags() & RECOVERY_FLAG != 0 {
         // The recovery author must be the current canonical owner — not

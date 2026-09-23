@@ -389,7 +389,9 @@ fn admit_delivers_current_heads_to_the_newcomer() {
 #[test]
 fn admission_anchors_to_canonical_genesis_despite_invalid_rival() {
     use crate::membership::{InvalidReason, TransitionStatus};
-    use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+    use wyrd_format::membership::{
+        set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+    };
     use wyrd_format::{Change, MembershipTransition};
 
     let (_dir, mut engine, genesis_id) = owner_engine("admit-invalid-genesis");
@@ -420,6 +422,7 @@ fn admission_anchors_to_canonical_genesis_despite_invalid_rival() {
             ],
             set_root(MEMBER_SET_CONTEXT, &[owner]).unwrap(),
             set_root(OWNER_SET_CONTEXT, &[owner]).unwrap(),
+            set_root(READER_SET_CONTEXT, &[]).unwrap(),
             owner,
         )
         .unwrap();
@@ -586,7 +589,9 @@ fn reissue_after_removal_refuses() {
 #[test]
 fn reissue_selects_only_the_canonical_admission() {
     use crate::membership::TransitionStatus;
-    use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+    use wyrd_format::membership::{
+        set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+    };
     use wyrd_format::{Change, MembershipTransition};
 
     let (_dir, mut engine, genesis_id) = owner_engine("reissue-fork");
@@ -609,6 +614,7 @@ fn reissue_selects_only_the_canonical_admission() {
         vec![crate::membership::test_util::admit(rival_member)],
         set_root(MEMBER_SET_CONTEXT, &[owner_id, rival_member]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[owner_id]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner_id,
     )
     .unwrap();
@@ -623,6 +629,7 @@ fn reissue_selects_only_the_canonical_admission() {
         vec![Change::Rotate],
         set_root(MEMBER_SET_CONTEXT, &[owner_id, newcomer_id]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[owner_id]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner_id,
     )
     .unwrap();
@@ -637,6 +644,7 @@ fn reissue_selects_only_the_canonical_admission() {
         vec![crate::membership::test_util::admit(newcomer_id)],
         set_root(MEMBER_SET_CONTEXT, &[owner_id, rival_member, newcomer_id]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[owner_id]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner_id,
     )
     .unwrap();

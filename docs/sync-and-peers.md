@@ -126,7 +126,8 @@ drive contains.
 - Objects are encrypted client-side (per-object AEAD, fresh random nonce,
   AAD binding over version/kind/ContentId) before leaving the device — in
   transit and at rest. A wrong manifest mapping fails at the AEAD tag.
-- Manifests are sealed to the drive; only drive members can interpret them.
+- Manifests are sealed to the drive; only admitted devices (members and
+  readers) can interpret them.
 - Snapshots are signed by their author device's identity key; peers reject
   unverifiable snapshots.
 - The full key hierarchy, admission, removal, and rotation semantics are
@@ -136,7 +137,8 @@ drive contains.
 
 Any member can author snapshots — authorization comes from membership
 state, not drive creation. New devices join through admission and receive
-capabilities; there are no guest privileges. Membership is signed,
+capabilities; readers join through reader admission and receive the same
+capabilities without authorship. Membership is signed,
 replicated state that members agree on.
 
 ### Post-admission discovery (catch-up obligation)

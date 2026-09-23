@@ -46,9 +46,10 @@ MembershipTransition {
     epoch:        u64              // the epoch this transition creates
     prev:         transition id (None only at genesis)
     resolves:     Vec<TransitionId> // conflict branches voided by this transition
-    changes:      Vec<Change>      // Admit | Remove | Rotate | SetOwners
+    changes:      Vec<Change>      // Admit | Remove | Rotate | SetOwners | AdmitReader
     members_root: hash of the member set AFTER applying changes
     owners_root:  hash of the owner set AFTER applying changes
+    readers_root: hash of the reader set AFTER applying changes
     author:       Nostr pubkey
     signature:    BIP-340 over the challenge of
                   "wyrd membership v1" || DriveId || signing preimage
@@ -63,31 +64,34 @@ are deterministic BIP-340 nonces, so the id is stable). The transition's
 signature** — transitions are sealed documents, not content-addressed
 objects, so they carry no envelope framing (object-model.md, decision 17).
 
-A **membership state** is `(epoch, transition_id, members_root, owners_root)`. A peer's
+A **membership state** is `(epoch, transition_id, members_root, owners_root, readers_root)`. A peer's
 authoritative knowledge is its **known membership state** — the canonical
 tip — not a bare epoch number; known membership epoch ≠ held epoch secrets
 (a device can learn epoch N's transition long before its capability for N
 arrives). The genesis transition (epoch 1, `prev = None`, empty `resolves`)
 is created with the drive; `members_root` and `owners_root` both cover
-exactly the owner. Every epoch number has a state, so snapshots can always
+exactly the owner, and `readers_root` covers the empty set (genesis admits
+no readers). Every epoch number has a state, so snapshots can always
 reference one — the snapshot's membership reference is never optional.
 
 Set roots are **derived, never authoritative** (verifiers recompute them
 from the transition chain): `BLAKE3-derive_key` with the pinned contexts
-`"wyrd member set v1"` / `"wyrd owner set v1"` over the set encoded as a
+`"wyrd member set v1"` / `"wyrd owner set v1"` / `"wyrd reader set v1"`
+over the set encoded as a
 `u32` LE count followed by the 32-byte x-only pubkeys in ascending bytewise
 order, duplicates removed (object-model.md, decision 18).
 
 Change application (`apply(state, changes)`), pinned semantics:
 
-- `Admit(d, k)` requires `d ∉ members` and registers `k` as the device's
-  delivery encryption key. A device identity is **single-use within a
-  membership chain**: `d` must never have been admitted before on the
-  predecessor chain — a removed device cannot be re-admitted under the
-  same key (chain-level `AdmitRetiredDevice`; retirement is chain-local
-  historical state, so a sibling branch that never admitted `d` is
-  unaffected). `Remove(d)` requires `d ∈ members`
-  and removes `d` from **members**; removing a device who is an owner is
+- `Admit(d, k)` requires `d ∉ members` **and** `d ∉ readers` and registers
+  `k` as the device's delivery encryption key. A device identity is
+  **single-use within a membership chain**: `d` must never have been
+  admitted before on the predecessor chain — a removed device cannot be
+  re-admitted under the same key (chain-level `AdmitRetiredDevice`;
+  retirement is chain-local historical state, so a sibling branch that
+  never admitted `d` is unaffected). `Remove(d)` requires
+  `d ∈ members ∪ readers` and removes `d` from **both sets**; removing a
+  device who is an owner is
   allowed only when they are the **sole owner** — the owner set empties
   with them (valid and terminal, per the terminal-state rule below). An
   owner with co-owners can only leave via `SetOwners`. **Removing and
@@ -96,12 +100,20 @@ Change application (`apply(state, changes)`), pinned semantics:
   registration and its delivery key leave membership cleanly; replacing
   a device means a removal transition followed by a later admission
   **under a fresh device identity**.
+- `AdmitReader(d, k)` requires `d ∉ members` **and** `d ∉ readers` and
+  registers `d` as a **reader** with delivery key `k`. Readers hold
+  epoch secrets and materialize the drive, but author nothing: snapshot
+  authorization admits members only, and local authoring refuses readers
+  explicitly. Roles are disjoint and change through removal — admitting
+  a reader as a member (or a member as a reader) is invalid while the
+  current role holds, and single-use identity means the re-admission
+  names a fresh device. Retirement covers both admission tags.
 - `SetOwners(D)` requires `|D| == 1` in **v0** and replaces the owner set
   wholesale; the final invariant `owners ⊆ members` is enforced after all
   changes as the backstop against dangling owners (e.g. `SetOwners` of a
-  non-member).
-- `Rotate()` changes no member or owner; it exists to force a fresh epoch
-  secret.
+  non-member — or of a reader, who is never a member).
+- `Rotate()` changes no member, owner, or reader; it exists to force a
+  fresh epoch secret.
 - Changes apply sequentially; `changes` is non-empty.
 
 ### Validity and rootedness
@@ -112,17 +124,22 @@ A transition is **valid** iff:
    `epoch − 1` (None only at genesis); every entry in `resolves` identifies
    a valid transition at `epoch − 1`; `changes` is non-empty and every
    change is individually well-formed.
-2. `apply(state(prev), changes) == (members_root, owners_root)` — the
+2. `apply(state(prev), changes) == (members_root, owners_root, readers_root)` — the
    resulting roots are **derived, not independently authoritative**; the
    verifier recomputes them. Change rules:
-   - `Admit(d, k)` requires `d ∉ members`, `d` never admitted before on
-     this chain (retired identities are single-use), and registers `k` as the
-     device's delivery encryption key; `Remove(d)` requires `d ∈ members`.
+   - `Admit(d, k)` requires `d ∉ members`, `d ∉ readers`, `d` never
+     admitted before on this chain (retired identities are single-use),
+     and registers `k` as the device's delivery encryption key;
+     `Remove(d)` requires `d ∈ members ∪ readers` and evicts from both.
+   - `AdmitReader(d, k)` requires `d ∉ members`, `d ∉ readers`, `d` never
+     admitted before on this chain, and registers `d` as a reader with
+     delivery key `k`. Readers are disjoint from members; owners are a
+     subset of members.
    - `SetOwners(D)` requires `|D| == 1` in **v0** (singleton ownership;
      multi-owner is a later extension that relaxes exactly this rule) and
      the device must be a member. Owners are a subset of members.
-   - `Rotate()` changes no member or owner; it exists to force a fresh
-     epoch secret (compromise response).
+   - `Rotate()` changes no member, owner, or reader; it exists to force a
+     fresh epoch secret (compromise response).
 3. `T.author` is an owner **in the pre-transition state** (`state(prev)`).
    Signature authority always comes from the state being left — this is
    what makes `SetOwners` and removing the last current owner expressible.
@@ -195,8 +212,10 @@ Implementations MUST warn before applying a last-owner removal.
 
 ### Epoch bump triggers
 
-Admit, remove, rotate, owner-set change. One transition = exactly one new
-epoch.
+Admit, reader-admit, remove, rotate, owner-set change. One transition =
+exactly one new epoch. Rotation and removal deliver to the resulting
+members **and** readers alike — readers must keep decrypting to keep
+reading; a removed device of either role receives nothing further.
 
 ## Layer 2 — epoch secrets and capabilities
 
@@ -500,9 +519,15 @@ invalid genesis `prev`; epoch gap; wrong predecessor; wrong author; author
 owner *before* the transition (valid) vs author made owner *by* the
 transition (invalid); author removed by the transition (invalid); remove
 last owner (valid, terminal); invalid `SetOwners` (non-member, multiple
-owners in v0); duplicate admission; re-admission of a retired device
-(same key after removal, invalid); retirement chain-locality (sibling
-branch admission unaffected); duplicate removal; empty changes; valid
+owners in v0); duplicate admission; admitting a reader as a member and a
+member as a reader (invalid — roles change through removal); reader
+admission registers the delivery key and separates roles; removal evicts
+readers and drops their key; re-admission of a retired device
+(same key after removal, invalid, in either role); retirement chain-locality (sibling
+branch admission unaffected); duplicate removal; removing a stranger
+who is neither member nor reader (invalid); genesis with a reader
+(invalid); `SetOwners` of a reader (invalid); declared `readers_root`
+mismatch (invalid); empty changes; valid
 `Rotate`; rotation produces a distinct epoch secret; non-empty `resolves`
 with no active conflict (invalid); conflicting transitions with same
 predecessor (conflict); conflicting transitions with different predecessors
@@ -514,7 +539,8 @@ by the resolution, not by arrival).
 **Snapshots:** valid snapshot; bad signature; wrong DriveId; invalid pubkey
 (fails `lift_x`); unknown membership transition; transition from a voided
 branch (VOIDED); orphaned transition reference (PENDING); author not in
-committed membership (REJECTED); epoch/membership mismatch; snapshot bound
+committed membership (REJECTED); author is a reader (REJECTED with the
+reader named, not lumped with strangers); epoch/membership mismatch; snapshot bound
 to a noncanonical (contested) transition; valid old snapshot after
 revocation; old snapshot becomes superseded when the log advances;
 same-epoch child of an eligible head; same-epoch child of a
@@ -526,7 +552,9 @@ snapshot by non-owner (invalid); recovery parenting a stranded head
 (invalid); recovery from stranded content; determinism: identical (log,
 DAG) ⇒ identical verdicts regardless of arrival order.
 
-**Capabilities:** correct recipient; wrong recipient; wrong DriveId; wrong
+**Capabilities:** correct recipient; recipient is a reader (valid — minting
+is keyed on the registered key, not member status; authorship is gated
+elsewhere); wrong recipient; wrong DriveId; wrong
 epoch; wrong transition; replay of an older capability (no-op, no
 downgrade); replay after removal (no future secrets); capability containing
 a future epoch secret (invalid); capability containing the DriveRootKey

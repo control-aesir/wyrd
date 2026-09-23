@@ -3,7 +3,9 @@ use super::super::test_util::{admit, drive, key, sign, Builder};
 use super::super::*;
 use super::*;
 use std::collections::BTreeSet;
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
 // --- genesis -----------------------------------------------------------
@@ -42,6 +44,7 @@ fn genesis_with_non_empty_resolves_is_invalid() {
             g.changes().to_vec(),
             g.members_root,
             g.owners_root,
+            g.readers_root,
             g.author,
         )
         .unwrap();
@@ -95,6 +98,7 @@ fn genesis_conflict_is_resolved_like_any_other() {
         vec![Change::Rotate],
         set_root(MEMBER_SET_CONTEXT, &[owner1]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[owner1]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner1,
     )
     .unwrap();
@@ -147,6 +151,7 @@ fn contradictory_genesis_resolutions_refreeze() {
         vec![Change::Rotate],
         set_root(MEMBER_SET_CONTEXT, &[owner1]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[owner1]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner1,
     )
     .unwrap();
@@ -158,6 +163,7 @@ fn contradictory_genesis_resolutions_refreeze() {
         vec![Change::Rotate],
         set_root(MEMBER_SET_CONTEXT, &[owner2]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[owner2]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner2,
     )
     .unwrap();

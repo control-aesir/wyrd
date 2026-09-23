@@ -16,16 +16,32 @@ fn admit_change(pattern: u8) -> Change {
     })
 }
 
-/// The member and owner sets at one point in the transition chain, plus
-/// each member's registered **device encryption key** (trust.md T14: the
-/// capability-ECDH target, carried by the Admit transition). Owners are
-/// always a subset of members (enforced by [`apply`]); the set roots
-/// cover the identity keys only — encryption keys ride along as device
-/// state, not as set material.
+#[cfg(test)]
+fn admit_reader_change(pattern: u8) -> Change {
+    Change::AdmitReader(Admission {
+        device: DeviceId::from_bytes([pattern; 32]),
+        encryption_key: DeviceEncryptionKey::from_bytes([pattern ^ 0xA5; 32]),
+    })
+}
+
+/// The member, owner, and reader sets at one point in the transition
+/// chain, plus each admitted device's registered **device encryption
+/// key** (trust.md T14: the capability-ECDH target, carried by either
+/// admission transition). Owners are always a subset of members and
+/// readers are always disjoint from members (both enforced by
+/// [`apply`]); the set roots cover the identity keys only —
+/// encryption keys ride along as device state, not as set material.
+///
+/// Readers hold epoch secrets and materialize the drive, but no authorship
+/// gate accepts their work: they are visibility without voice. A device
+/// holds at most one role; changing roles goes through removal, and
+/// single-use device identity means the re-admission names a fresh
+/// `DeviceId`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MembershipState {
     pub members: BTreeSet<DeviceId>,
     pub owners: BTreeSet<DeviceId>,
+    pub readers: BTreeSet<DeviceId>,
     pub encryption_keys: BTreeMap<DeviceId, DeviceEncryptionKey>,
 }
 
@@ -33,9 +49,13 @@ pub struct MembershipState {
 pub enum ApplyError {
     #[error("admitted device is already a member")]
     AdmitExistingMember,
+    #[error("admitted device is already a reader; remove it before admitting as a member")]
+    AdmitExistingReaderAsMember,
+    #[error("admitted device is already a member or reader")]
+    AdmitReaderExisting,
     #[error("device removed and re-admitted in one transition; replacing a device means removal now, admission later")]
     RemoveThenAdmitSameDevice,
-    #[error("removed device is not a member")]
+    #[error("removed device is neither a member nor a reader")]
     RemoveUnknownMember,
     #[error("an owner with co-owners can only leave via SetOwners")]
     RemovingOwner,
@@ -45,12 +65,13 @@ pub enum ApplyError {
     SetOwnersNotSingleton,
 }
 
-/// Apply changes sequentially to a state. `Remove` deletes from members;
-/// removing a device who is an owner is allowed only when they are the
-/// sole owner (the owner set empties with them: valid and terminal). The
-/// final `owners ⊆ members` invariant is checked once, after all changes,
-/// as the backstop against dangling owners (e.g. `SetOwners` of a
-/// non-member).
+/// Apply changes sequentially to a state. `Remove` evicts from both the
+/// member and reader sets; removing a device who is an owner is allowed
+/// only when they are the sole owner (the owner set empties with them:
+/// valid and terminal). Admission requires the device in neither set.
+/// The final `owners ⊆ members` invariant is checked once, after all
+/// changes, as the backstop against dangling owners (e.g. `SetOwners`
+/// of a non-member — or of a reader, who is never a member).
 impl MembershipState {
     /// The registered encryption key of a member, used to mint a new
     /// capability (trust.md T14): the capability targets the registered
@@ -73,24 +94,43 @@ pub fn apply(state: &MembershipState, changes: &[Change]) -> Result<MembershipSt
         })
         .collect();
     for change in changes {
-        if let Change::Admit(admission) = change {
-            if removed.contains(&admission.device) {
-                return Err(ApplyError::RemoveThenAdmitSameDevice);
+        match change {
+            Change::Admit(admission) | Change::AdmitReader(admission) => {
+                if removed.contains(&admission.device) {
+                    return Err(ApplyError::RemoveThenAdmitSameDevice);
+                }
             }
+            _ => {}
         }
     }
     let mut next = state.clone();
     for change in changes {
         match change {
             Change::Admit(admission) => {
-                if !next.members.insert(admission.device) {
+                if next.members.contains(&admission.device) {
                     return Err(ApplyError::AdmitExistingMember);
                 }
+                if next.readers.contains(&admission.device) {
+                    return Err(ApplyError::AdmitExistingReaderAsMember);
+                }
+                next.members.insert(admission.device);
+                next.encryption_keys
+                    .insert(admission.device, admission.encryption_key);
+            }
+            Change::AdmitReader(admission) => {
+                if next.members.contains(&admission.device)
+                    || next.readers.contains(&admission.device)
+                {
+                    return Err(ApplyError::AdmitReaderExisting);
+                }
+                next.readers.insert(admission.device);
                 next.encryption_keys
                     .insert(admission.device, admission.encryption_key);
             }
             Change::Remove(d) => {
-                if !next.members.remove(d) {
+                let was_member = next.members.remove(d);
+                let was_reader = next.readers.remove(d);
+                if !was_member && !was_reader {
                     return Err(ApplyError::RemoveUnknownMember);
                 }
                 next.encryption_keys.remove(d);
@@ -128,6 +168,7 @@ mod tests {
         MembershipState {
             members: members.iter().map(|b| d(*b)).collect(),
             owners: owners.iter().map(|b| d(*b)).collect(),
+            readers: BTreeSet::new(),
             encryption_keys: BTreeMap::new(),
         }
     }
@@ -190,6 +231,62 @@ mod tests {
     fn rotate_changes_nothing() {
         let s = state(&[1, 2], &[1]);
         assert_eq!(apply(&s, &[Change::Rotate]).unwrap(), s);
+    }
+
+    #[test]
+    fn reader_admission_and_removal_rules() {
+        let s = state(&[1], &[1]);
+        let next = apply(&s, &[admit_reader_change(2)]).unwrap();
+        assert!(next.readers.contains(&d(2)));
+        assert!(!next.members.contains(&d(2)));
+        assert_eq!(
+            next.encryption_keys.get(&d(2)),
+            Some(&DeviceEncryptionKey::from_bytes([2 ^ 0xA5; 32])),
+            "reader admission registers the encryption key"
+        );
+        // Admitting a reader as a member is refused while the reader
+        // role holds: roles change through removal, never in place.
+        assert_eq!(
+            apply(&next, &[admit_change(2)]),
+            Err(ApplyError::AdmitExistingReaderAsMember)
+        );
+        // Admitting a member as a reader is refused likewise.
+        assert_eq!(
+            apply(&s, &[admit_reader_change(1)]),
+            Err(ApplyError::AdmitReaderExisting)
+        );
+        // Re-admitting a current reader is refused.
+        assert_eq!(
+            apply(&next, &[admit_reader_change(2)]),
+            Err(ApplyError::AdmitReaderExisting)
+        );
+        // One removal ends either participation, with the key.
+        let next = apply(&next, &[Change::Remove(d(2))]).unwrap();
+        assert!(!next.readers.contains(&d(2)));
+        assert!(!next.encryption_keys.contains_key(&d(2)));
+        // Removing a stranger still fails.
+        assert_eq!(
+            apply(&s, &[Change::Remove(d(9))]),
+            Err(ApplyError::RemoveUnknownMember)
+        );
+        // Remove-then-admit-reader in one transition is the same silent
+        // re-key as for members.
+        assert_eq!(
+            apply(&next, &[Change::Remove(d(3)), admit_reader_change(3)]),
+            Err(ApplyError::RemoveThenAdmitSameDevice)
+        );
+    }
+
+    #[test]
+    fn setowners_of_a_reader_dangles() {
+        // Readers are never members, so naming one as owner fails the
+        // final subset invariant.
+        let s = state(&[1], &[1]);
+        let next = apply(&s, &[admit_reader_change(2)]).unwrap();
+        assert_eq!(
+            apply(&next, &[Change::SetOwners(vec![d(2)])]),
+            Err(ApplyError::DanglingOwner)
+        );
     }
 
     #[test]

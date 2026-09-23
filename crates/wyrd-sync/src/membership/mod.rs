@@ -151,6 +151,7 @@ pub struct KnownState {
     pub transition_id: TransitionId,
     pub members_root: [u8; 32],
     pub owners_root: [u8; 32],
+    pub readers_root: [u8; 32],
 }
 
 /// The membership log machine over an observed transition set.
@@ -270,6 +271,7 @@ impl MembershipLog {
             transition_id: *tip,
             members_root: t.members_root,
             owners_root: t.owners_root,
+            readers_root: t.readers_root,
         })
     }
 
@@ -295,6 +297,11 @@ impl MembershipLog {
         self.state_of(id).map(|s| s.owners)
     }
 
+    /// The reader set of a valid transition.
+    pub fn readers_of(&self, id: &TransitionId) -> Option<BTreeSet<DeviceId>> {
+        self.state_of(id).map(|s| s.readers)
+    }
+
     /// The canonical chain's genesis, or `None` while the log has
     /// no unique canonical chain (e.g. a genesis conflict). Genesis
     /// selection must go through here: the observed set can hold
@@ -317,10 +324,9 @@ impl MembershipLog {
             let Some(t) = self.transitions.get(&id) else {
                 break;
             };
-            if t.changes()
-                .iter()
-                .any(|change| matches!(change, Change::Admit(a) if a.device == *device))
-            {
+            if t.changes().iter().any(|change| {
+                matches!(change, Change::Admit(a) | Change::AdmitReader(a) if a.device == *device)
+            }) {
                 return true;
             }
             cursor = t.prev;

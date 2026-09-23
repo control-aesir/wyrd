@@ -56,6 +56,7 @@ fn stub_transition(epoch: u64, salt: u8) -> MembershipTransition {
         Vec::new(),
         [salt; 32],
         [0; 32],
+        [0; 32],
         DeviceId::from_bytes([0; 32]),
     )
     .unwrap()
@@ -553,6 +554,7 @@ fn mint_uses_the_state_registered_encryption_key() {
     let state = MembershipState {
         members: BTreeSet::from([device]),
         owners: BTreeSet::from([device]),
+        readers: BTreeSet::new(),
         encryption_keys: BTreeMap::from([(device, registered_key)]),
     };
     let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
@@ -574,6 +576,7 @@ fn mint_derives_the_transition_binding() {
     let state = MembershipState {
         members: BTreeSet::from([device]),
         owners: BTreeSet::from([device]),
+        readers: BTreeSet::new(),
         encryption_keys: BTreeMap::from([(device, registered_key)]),
     };
     let (mut builder, genesis) = Builder::genesis(10);
@@ -599,6 +602,7 @@ fn mint_rejects_secrets_mismatching_the_transition_epoch() {
     let state = MembershipState {
         members: BTreeSet::from([device]),
         owners: BTreeSet::from([device]),
+        readers: BTreeSet::new(),
         encryption_keys: BTreeMap::from([(device, registered_key)]),
     };
     let (_, genesis) = Builder::genesis(10);
@@ -629,6 +633,7 @@ fn capability_for_a_superseded_encryption_key_is_rejected() {
     let state = MembershipState {
         members: BTreeSet::from([device]),
         owners: BTreeSet::from([device]),
+        readers: BTreeSet::new(),
         encryption_keys: BTreeMap::from([(device, registered_key)]),
     };
     let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
@@ -663,6 +668,7 @@ fn mint_rejects_a_non_member() {
     let state = MembershipState {
         members: BTreeSet::from([member]),
         owners: BTreeSet::from([member]),
+        readers: BTreeSet::new(),
         encryption_keys: BTreeMap::from([(member, DeviceEncryptionKey::from_bytes([0x5A; 32]))]),
     };
     let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
@@ -671,6 +677,32 @@ fn mint_rejects_a_non_member() {
         Capability::mint(drive, stranger, &state, &genesis, secrets),
         Err(CapabilityError::NotAMember)
     ));
+}
+
+#[test]
+fn mint_covers_a_reader() {
+    // Readers hold epoch secrets: minting is keyed on the registered
+    // encryption key, not on member status, so a reader's grant mints
+    // exactly like a member's. Authorship is gated elsewhere.
+    use crate::membership::test_util::Builder;
+    use crate::membership::MembershipState;
+    use std::collections::BTreeSet;
+    let drive = DriveId::from_bytes([0x33; 32]);
+    let member = DeviceId::from_bytes([0x55; 32]);
+    let reader = DeviceId::from_bytes([0x66; 32]);
+    let (_, reader_key) = enc_pair(0x44);
+    let (_, member_key) = enc_pair(0x45);
+    let state = MembershipState {
+        members: BTreeSet::from([member]),
+        owners: BTreeSet::from([member]),
+        readers: BTreeSet::from([reader]),
+        encryption_keys: BTreeMap::from([(member, member_key), (reader, reader_key)]),
+    };
+    let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
+    let (_, genesis) = Builder::genesis(10);
+    let cap = Capability::mint(drive, reader, &state, &genesis, secrets).unwrap();
+    assert_eq!(cap.encryption_key, reader_key);
+    assert!(cap.validate_against(&state).is_ok());
 }
 
 proptest! {

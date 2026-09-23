@@ -388,6 +388,7 @@ mod tests {
             vec![admit(0x20), Change::SetOwners(vec![owner])],
             [0x20; 32],
             [0x21; 32],
+            [0x22; 32],
             owner,
         )
         .unwrap();

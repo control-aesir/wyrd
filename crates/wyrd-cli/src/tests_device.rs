@@ -165,6 +165,41 @@ impl Pair {
             parse_encryption_key(&key).unwrap(),
         )
     }
+
+    /// The reader variant: invite with `--reader`, then join. The
+    /// invitation, custody, and join mechanics are identical — only
+    /// the log role differs.
+    fn pair_and_join_reader(&self) -> (DeviceId, wyrd_format::DeviceEncryptionKey) {
+        let (device, key) = self.stage_pairing();
+        command(self.owner_member(vec![
+            "invite".into(),
+            device.clone(),
+            key.clone(),
+            self.invitation_file.display().to_string(),
+            "--reader".into(),
+        ]))
+        .unwrap();
+        command(self.newcomer_device(vec![
+            "join".into(),
+            self.invitation_file.display().to_string(),
+        ]))
+        .unwrap();
+        (
+            parse_device_id(&device).unwrap(),
+            parse_encryption_key(&key).unwrap(),
+        )
+    }
+
+    /// The owner's `member list` report over its keystore.
+    fn owner_list(&self) -> String {
+        let engine = Engine::open_keystore(
+            self.owner_drive.clone(),
+            "owner-pass",
+            read_identity(&self.owner_identity).unwrap(),
+        )
+        .unwrap();
+        member_list_report(&engine).unwrap()
+    }
 }
 
 /// The x-only pubkey a 32-byte secret names.
@@ -177,6 +212,37 @@ fn device_id_of(secret: &[u8; 32]) -> DeviceId {
 fn encryption_key_of(secret: &[u8; 32]) -> wyrd_format::DeviceEncryptionKey {
     let keys = nostr::key::Keys::new(nostr::key::SecretKey::from_slice(secret).unwrap());
     wyrd_format::DeviceEncryptionKey::from_bytes(*keys.public_key().as_bytes())
+}
+
+#[test]
+fn reader_join_round_trip() {
+    let pair = Pair::new();
+    let (newcomer, _) = pair.pair_and_join_reader();
+
+    // The owner lists the newcomer as a reader, never a member.
+    let list = pair.owner_list();
+    assert!(
+        list.contains(&format!("reader {newcomer}")),
+        "owner lists the reader: {list}"
+    );
+    assert!(
+        !list.contains(&format!("member {newcomer}")),
+        "reader is not listed as a member: {list}"
+    );
+
+    // The reader joins and reopens from custody like a member: the
+    // role lives in the log, not in the join mechanics.
+    command(pair.newcomer_device(vec!["id".into()])).unwrap();
+    command(pair.newcomer_member(vec!["list".into()])).unwrap();
+
+    // Removal ends the reader's participation through the same
+    // surface that ends a member's.
+    command(pair.owner_member(vec!["remove".into(), newcomer.to_string()])).unwrap();
+    let list = pair.owner_list();
+    assert!(
+        !list.contains(&newcomer.to_string()),
+        "removed reader leaves the list: {list}"
+    );
 }
 
 #[test]

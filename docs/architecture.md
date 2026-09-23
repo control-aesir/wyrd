@@ -139,6 +139,12 @@ Hard-won operational rules:
   rejected before commit. Replay therefore never encounters an
   announcement conflict that intake could have detected.
 
+Crash windows are enumerated per subsystem — what is durable, visible,
+servable, and propagated, and which test pins each window — in
+[crash-consistency.md](crash-consistency.md). The standing rule: a
+crash leaves before-XOR-full state per subsystem, and the subsystems
+agree with each other on reopen.
+
 ## Current status
 
 Pre-alpha. `wyrd-format` implements identities, canonical codecs,

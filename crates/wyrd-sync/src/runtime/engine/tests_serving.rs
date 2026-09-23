@@ -397,6 +397,74 @@ fn fetched_representations_serve_after_restart_and_reauthoring() {
     );
 }
 
+/// Head published, object servable after the AUTHOR restarts: A
+/// authors and announces, restarts, and B fetches the announced
+/// head's objects from the restarted author's vault and materializes
+/// the exact plaintext. Residency is written before the record that
+/// names it, so the restart cannot strand a published head without
+/// its bytes.
+#[test]
+fn announced_head_serves_from_the_author_vault_after_author_restart() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects
+        .insert(ObjectKind::Chunk, b"restart served payload")
+        .unwrap();
+    let tree = Tree::from_entries(vec![
+        Entry::file("file.txt", 22, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_snapshot(&authored, &mut mailbox, None)
+            .unwrap()
+    };
+    assert_eq!(sent, 2);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
+
+    // The author restarts: durable facts and vault bytes both survive.
+    restart(&mut pair.a, &controls);
+
+    // B fetches over the restarted author's vault and materializes
+    // the exact plaintext.
+    let serving_a = crate::serving::VaultSource::from_state(
+        &pair.a.engine.runtime_state().unwrap(),
+        pair.a.engine.vault(),
+    )
+    .unwrap();
+    let mut serving_a = serving_a;
+    let mut peer_objects = MemoryObjectStore::default();
+    pair.b
+        .engine
+        .set_materialization(chunk, MaterializationState::Cached)
+        .unwrap();
+    let report = pair
+        .b
+        .engine
+        .execute_plan(&mut serving_a, &mut peer_objects)
+        .unwrap();
+    assert_eq!(
+        report.objects, 2,
+        "tree plus chunk land from the restarted vault"
+    );
+    assert_eq!(
+        peer_objects.get(&chunk).unwrap().as_deref(),
+        Some(&b"restart served payload"[..]),
+        "materialized plaintext is exact"
+    );
+}
+
 /// Authoring writes vault bytes first and commits facts second, so a
 /// torn commit leaves orphaned vault envelopes but never a durable
 /// record naming a missing representation. Restart is headless, and

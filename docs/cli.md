@@ -111,6 +111,12 @@ characters (x-only pubkeys).
 - `set-owner <device>`: hand ownership to a member (v0 ownership is
   a singleton). Authority comes from the pre-transition owner set,
   so the current owner signs the handover.
+- `remove`, `rotate`, `set-owner`, and `invite` carry the namespace
+  forward: after the transition commits, each served head is
+  re-authored at the new epoch over the same tree (transition
+  continuity, `epochs.md`), so a quiet drive keeps serving its files
+  and the next write extends the carry. A transition on an empty
+  drive carries nothing; the reported `(N carried)` names the count.
 - `invite <device> <encryption-key> <out> [--reader]`: admit a device
   and write its sealed invitation to `<out>` for out-of-band delivery.
   The transition commits with the usual catch-up obligations; the

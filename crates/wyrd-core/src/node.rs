@@ -276,20 +276,44 @@ where
     /// ([`LiveNode::split`](crate::live::LiveNode::split)); this
     /// unwraps the node's view into the split inputs (store handle,
     /// baseline view, revision) and adopts the result.
+    ///
+    /// Recovery barrier: pending namespace carries drain before the
+    /// live view is exposed or any mutation admitted. A quiet drive
+    /// with staged heads serves them here, so the first mounted write
+    /// extends recovered history instead of bootstrapping from empty
+    /// and conflicting with the later carry. A drain that changed
+    /// queue state republishes the baseline view — authored carries
+    /// and discharged still-eligible heads alike — so the loop's
+    /// revision gate (which would otherwise see no change past the
+    /// split) serves them on the first pass. A drain failure (unheld
+    /// carry bytes) fails composition closed: serving an empty view
+    /// over pending recovery would invite exactly the orphan-write
+    /// the queue exists to prevent — restore the bytes (or run a
+    /// member command after they arrive) and compose again.
     pub fn into_live(
-        self,
+        mut self,
         open_timeout: Duration,
         config: &LiveConfig,
-    ) -> (LiveNode<V>, LiveParts<V>) {
+    ) -> Result<(LiveNode<V>, LiveParts<V>), NodeError> {
+        let recovery = {
+            let store = self
+                .view
+                .store_read()
+                .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
+            self.engine.carry_pending(&*store)?
+        };
+        if recovery.queue_changed() {
+            self.refresh_live_heads()?;
+        }
         let revision = self.engine.current();
         let store = self.view.store_handle();
-        LiveNode::split(
+        Ok(LiveNode::split(
             self.engine,
             store,
             self.view,
             revision,
             open_timeout,
             config,
-        )
+        ))
     }
 }

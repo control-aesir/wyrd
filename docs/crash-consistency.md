@@ -39,6 +39,45 @@ op leaves no phantom tip. Pinned by `failed_admit_leaves_no_phantom_tip`
 and `admit_queues_and_delivers_newcomer_catch_up` (restart before
 first send still delivers; `author/tests_admission.rs`).
 
+## Namespace carry across transitions
+
+A transition supersedes the previous heads without file work, so
+the author stages the current eligible-head set as durable carry
+obligations (`CarryQueued`) in its own batch BEFORE the transition
+commits — the set derives inside the engine, so no caller can stage
+a stale branch — then drains the queue (`CarryDone` per head)
+afterwards. The crash states, all pinned in
+`author/tests_carry.rs`:
+
+- crash between stage and transition: the heads are still
+  eligible, so the drain discharges the staged set — benign. The
+  discharge still republishes the composed baseline: a stage-only
+  crash must serve the valid head, not an empty view. Pinned by
+  `stage_only_crash_serves_the_still_eligible_head`
+  (`daemon/core/tests_mount.rs`).
+- crash between transition commit and drain: the staged set
+  survives; the next drain (after a restart, or after the next
+  transition) completes it. Pinned by
+  `interrupted_carry_resumes_after_restart_without_memory_bases`.
+- crash between a carry commit and its Done marker: the retry
+  finds the current-epoch child and discharges without
+  re-authoring — exactly once. Pinned by
+  `torn_carry_commit_discharges_without_duplicates`.
+- carry with unheld bytes: the drain fails closed
+  (`TreeUnavailable`) with the obligation still pending; restoring
+  the bytes and retrying resumes. Pinned by
+  `missing_tree_carry_fails_closed_and_retries`.
+- departed author (self-removal): the drain authors nothing and
+  leaves the set pending on the frozen drive. Pinned by
+  `self_removal_leaves_the_queue_pending`.
+- mounted write before any drain: `into_live` drains before
+  exposing the view or admitting mutations, so the first write
+  extends recovered history — and a drain failure fails
+  composition closed instead of serving an empty view over pending
+  recovery. Pinned by
+  `mounted_write_after_interrupted_carry_extends_recovered_history`
+  (`daemon/core/tests_mount.rs`).
+
 ## Snapshot authoring and heads
 
 Vault imports land before the facts that name them (body, then each

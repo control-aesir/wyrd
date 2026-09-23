@@ -104,7 +104,9 @@ fn mkdir_through_backend_commits_and_serves() {
     let (engine, dir, _) = scratch_drive();
     let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
         WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
-    let (live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (live, parts) = daemon
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
     // The test takes the composer role: the backend is built from the
     // node's live parts, never handed out by the node.
     let backend = FuseBackend::shared_with_wants(
@@ -192,7 +194,7 @@ fn into_live_stores_the_composition_config_budgets() {
         },
         ..LiveConfig::default()
     };
-    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config);
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
     assert_eq!(
         live.budgets(),
         config.budgets,
@@ -229,7 +231,7 @@ fn create_at_saturated_table_creates_nothing() {
             ..ResourceBudgets::default()
         },
     };
-    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config);
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
     // The test takes the composer role: the backend is built from the
     // node's live parts, never handed out by the node.
     let backend = FuseBackend::shared_with_wants(

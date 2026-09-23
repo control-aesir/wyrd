@@ -1,5 +1,6 @@
 use super::tests_harness::{write_secret, TempDir};
 use super::*;
+use wyrd_format::{ContentId, Entry, FsObjectStore, ObjectKind, ObjectStore, SnapshotId, Tree};
 use wyrd_sync::runtime::EngineError;
 
 struct Fixture {
@@ -197,7 +198,6 @@ fn member_remove_sole_owner_needs_confirmation() {
         "owner set empties with the sole owner"
     );
 }
-
 /// Rotate bumps the epoch with membership untouched.
 #[test]
 fn member_rotate_bumps_epoch_keeps_membership() {
@@ -245,4 +245,89 @@ fn member_set_owner_hands_authority_over() {
         matches!(error, CliError::Engine(EngineError::NotOwner)),
         "old owner lost authority: {error:?}"
     );
+}
+
+/// Rotate carries the namespace: a drive with files serves them at
+/// the new epoch afterwards, and the carry extends the old tip.
+#[test]
+fn member_rotate_carries_files_forward() {
+    let fixture = Fixture::new();
+    let (tree, first) = write_file(&fixture, "kept.txt", b"kept");
+    command(fixture.args(vec!["rotate".into()])).unwrap();
+
+    let engine = fixture.open();
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "the carry serves the files after rotate");
+    assert_eq!(heads[0].snapshot().epoch, 2);
+    assert_eq!(heads[0].snapshot().tree, tree);
+    assert_eq!(
+        heads[0].snapshot().parents,
+        vec![first],
+        "the carry extends the old tip"
+    );
+}
+
+/// Author one file snapshot over the fixture drive, returning its
+/// tree and snapshot id.
+fn write_file(fixture: &Fixture, name: &str, bytes: &[u8]) -> (ContentId, SnapshotId) {
+    let identity = read_identity(&fixture.identity_file).unwrap();
+    let mut engine = Engine::open_keystore(fixture.drive.clone(), "test-pass", identity).unwrap();
+    let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+    let chunk = store.insert(ObjectKind::Chunk, bytes).unwrap();
+    let entry = Entry::file(name, bytes.len() as u64, false, vec![chunk]).unwrap();
+    let tree = Tree::from_entries(vec![entry])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let first = engine.author_snapshot(&store, tree).unwrap();
+    (tree, first.snapshot().snapshot_id())
+}
+
+/// Invite carries the namespace: the newcomer's epoch starts from
+/// the carried files, not an empty view.
+#[test]
+fn member_invite_carries_files_forward() {
+    let fixture = Fixture::new();
+    let (tree, first) = write_file(&fixture, "kept.txt", b"kept");
+    admit(&fixture, &[0x44; 32]);
+
+    let engine = fixture.open();
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "the carry serves the files after invite");
+    assert_eq!(heads[0].snapshot().epoch, 2);
+    assert_eq!(heads[0].snapshot().tree, tree);
+    assert_eq!(heads[0].snapshot().parents, vec![first]);
+}
+
+/// Remove carries the namespace for the remaining owner.
+#[test]
+fn member_remove_carries_files_forward() {
+    let fixture = Fixture::new();
+    let second = admit(&fixture, &[0x44; 32]);
+    let (tree, first) = write_file(&fixture, "kept.txt", b"kept");
+    command(fixture.args(vec!["remove".into(), second.to_string()])).unwrap();
+
+    let engine = fixture.open();
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "the carry serves the files after remove");
+    assert_eq!(heads[0].snapshot().epoch, 3, "admit plus removal");
+    assert_eq!(heads[0].snapshot().tree, tree);
+    assert_eq!(heads[0].snapshot().parents, vec![first]);
+}
+
+/// Handover carries the namespace: the outgoing owner stays a
+/// member, so its transition still carries.
+#[test]
+fn member_set_owner_carries_files_forward() {
+    let fixture = Fixture::new();
+    let second = admit(&fixture, &[0x44; 32]);
+    let (tree, first) = write_file(&fixture, "kept.txt", b"kept");
+    command(fixture.args(vec!["set-owner".into(), second.to_string()])).unwrap();
+
+    let engine = fixture.open();
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "the carry serves the files after handover");
+    assert_eq!(heads[0].snapshot().epoch, 3, "admit plus handover");
+    assert_eq!(heads[0].snapshot().tree, tree);
+    assert_eq!(heads[0].snapshot().parents, vec![first]);
 }

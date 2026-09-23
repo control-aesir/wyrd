@@ -18,11 +18,11 @@ use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
-use wyrd_format::{DeviceEncryptionKey, DeviceId, TransitionId};
+use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 use wyrd_sync::control::SealedBootstrap;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
-use wyrd_sync::runtime::Engine;
+use wyrd_sync::runtime::{Engine, EngineError};
 use zeroize::Zeroizing;
 
 /// The `wyrd` binary: create a drive, mount its live projection,
@@ -504,7 +504,7 @@ fn mount(
     // backend share this config's budgets, wired into both halves
     // by `into_live` below.
     let config = LiveConfig::default();
-    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
     let backend = FuseBackend::shared_with_wants(
@@ -700,7 +700,7 @@ fn member(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    let mut engine = Engine::open_keystore(drive_dir, passphrase, identity)?;
+    let mut engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
     match action {
         MemberAction::List => {
             print!("{}", member_list_report(&engine)?);
@@ -717,19 +717,32 @@ fn member(
         MemberAction::Remove { device, yes } => {
             let device = parse_device_id(&device)?;
             require_last_owner_confirmation(&engine, &device, yes)?;
-            let transition = engine.remove_device(device)?;
-            println!("removed {device} at epoch {}", transition.epoch);
+            let (transition, carried) = transition_with_carry(&mut engine, &drive_dir, |engine| {
+                engine.remove_device(device)
+            })?;
+            println!(
+                "removed {device} at epoch {} ({} carried)",
+                transition.epoch, carried
+            );
             Ok(())
         }
         MemberAction::Rotate => {
-            let transition = engine.rotate_epoch()?;
-            println!("rotated to epoch {}", transition.epoch);
+            let (transition, carried) =
+                transition_with_carry(&mut engine, &drive_dir, |engine| engine.rotate_epoch())?;
+            println!(
+                "rotated to epoch {} ({} carried)",
+                transition.epoch, carried
+            );
             Ok(())
         }
         MemberAction::SetOwner { device } => {
             let device = parse_device_id(&device)?;
-            let transition = engine.set_owners(device)?;
-            println!("owner is now {device} at epoch {}", transition.epoch);
+            let (transition, carried) =
+                transition_with_carry(&mut engine, &drive_dir, |engine| engine.set_owners(device))?;
+            println!(
+                "owner is now {device} at epoch {} ({} carried)",
+                transition.epoch, carried
+            );
             Ok(())
         }
         MemberAction::Invite {
@@ -751,6 +764,7 @@ fn member(
                     engine.admit_device(device, encryption_key)
                 }
             };
+            engine.stage_carry_heads()?;
             let outcome = match admit(&mut engine) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -758,12 +772,14 @@ fn member(
                     return Err(error.into());
                 }
             };
+            let carried = carry_pending(&mut engine, &drive_dir)?;
             write_invitation(&out, &mut file, &outcome.invitation.encode())?;
             println!(
-                "invited {device}{} at epoch {} -> {}",
+                "invited {device}{} at epoch {} -> {} ({} carried)",
                 if reader { " as reader" } else { "" },
                 outcome.transition.epoch,
-                out.display()
+                out.display(),
+                carried
             );
             Ok(())
         }
@@ -785,6 +801,41 @@ fn member(
             Ok(())
         }
     }
+}
+
+/// Author a membership transition plus its namespace carry in one
+/// offline step: stage the served heads as durable obligations,
+/// commit the transition via `author`, then drain the carry queue
+/// at the new epoch (transition continuity: a quiet drive keeps
+/// serving its files, and the next write extends the carry instead
+/// of bootstrapping from empty). Staging precedes the
+/// transition commit, so a crash between the commit and the drain
+/// leaves a discoverable obligation: the next drain — after a
+/// restart, or after the next transition — completes it. The object
+/// store opens only when something is pending, so a fresh drive's
+/// transition never touches it. A failed drain reports loudly with
+/// the transition already durable at its epoch and the obligation
+/// still pending.
+fn transition_with_carry(
+    engine: &mut Engine,
+    drive_dir: &Path,
+    author: impl FnOnce(&mut Engine) -> Result<MembershipTransition, EngineError>,
+) -> Result<(MembershipTransition, usize), CliError> {
+    engine.stage_carry_heads()?;
+    let transition = author(engine)?;
+    let carried = carry_pending(engine, drive_dir)?;
+    Ok((transition, carried))
+}
+
+/// Drain the durable carry queue, returning the number carried. The
+/// store opens only when obligations are pending.
+fn carry_pending(engine: &mut Engine, drive_dir: &Path) -> Result<usize, CliError> {
+    if engine.pending_carries()?.is_empty() {
+        return Ok(0);
+    }
+    let store = FsObjectStore::open(drive_dir.to_path_buf())
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    Ok(engine.carry_pending(&store)?.authored.len())
 }
 
 /// Claim an invitation destination before any irreversible step: an

@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
     ChildManifest, ContentId, Entry, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot,
-    Tree,
+    SnapshotId, Tree,
 };
 
 use crate::authorization::SnapshotDag;
-use crate::durable::{AuthorizedSnapshot, Fact};
+use crate::durable::{AuthorizedSnapshot, Fact, Rebuilt};
 use crate::ingest::{check_manifest, check_tree, Limits};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::ManifestRecord;
@@ -40,6 +40,50 @@ pub(crate) fn author<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let mut dag = SnapshotDag::new(engine.drive);
+    for body in rebuilt.runtime.snapshot_bodies.values() {
+        dag.observe(body.clone());
+    }
+    author_over(
+        engine,
+        objects,
+        tree,
+        dag.eligible_heads(&rebuilt.log),
+        rebuilt,
+    )
+}
+
+/// Author over explicit parents: the carry path re-carries history at
+/// a new epoch parenting onto the carried head (which the
+/// eligible-head computation could never produce once the epoch
+/// advanced — the fixed point sustains head and carry together).
+/// Every check below still applies: the root must verify, the
+/// author must be a member of the canonical state, and the
+/// manifests must correspond.
+pub(crate) fn author_with_parents<S: ObjectStore>(
+    engine: &mut Engine,
+    objects: &S,
+    tree: ContentId,
+    parents: Vec<SnapshotId>,
+) -> Result<AuthorizedSnapshot, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    author_over(engine, objects, tree, parents, rebuilt)
+}
+
+fn author_over<S: ObjectStore>(
+    engine: &mut Engine,
+    objects: &S,
+    tree: ContentId,
+    parents: Vec<SnapshotId>,
+    rebuilt: Rebuilt,
+) -> Result<AuthorizedSnapshot, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
     let bytes = objects
         .get(&tree)
         .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?
@@ -50,7 +94,6 @@ where
     let root_tree = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree))?;
     check_tree(&Limits::V0, &root_tree).map_err(EngineError::Ingest)?;
 
-    let rebuilt = engine.store.rebuild(engine.device)?;
     let known = rebuilt
         .log
         .known_state()
@@ -72,12 +115,6 @@ where
         }
         return Err(EngineError::NotAMember);
     }
-
-    let mut dag = SnapshotDag::new(engine.drive);
-    for body in rebuilt.runtime.snapshot_bodies.values() {
-        dag.observe(body.clone());
-    }
-    let parents = dag.eligible_heads(&rebuilt.log);
 
     let max_seen = rebuilt
         .runtime

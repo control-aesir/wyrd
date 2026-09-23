@@ -194,6 +194,30 @@ pub enum EngineError {
     TransitionUnclassified(TransitionId),
 }
 
+/// What one [`Engine::carry_pending`] drain did. Composition
+/// republishes the baseline whenever recovery changed queue
+/// state — authored carries advance the namespace, and discharges
+/// retire obligations — never only on authored snapshots: a
+/// stage-only crash leaves a valid eligible head whose discharge
+/// must still reach the view.
+#[derive(Debug, Default)]
+pub struct CarryReport {
+    /// Carries authored by this call: ordinary snapshots over the
+    /// staged heads' trees, parenting onto them.
+    pub authored: Vec<AuthorizedSnapshot>,
+    /// Obligations discharged without authoring: still-eligible
+    /// heads and already-carried ones.
+    pub discharged: usize,
+}
+
+impl CarryReport {
+    /// Whether the drain changed queue state: authored or
+    /// discharged anything. An empty pending set reports false.
+    pub fn queue_changed(&self) -> bool {
+        !self.authored.is_empty() || self.discharged > 0
+    }
+}
+
 /// What one [`Engine::drain`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainReport {
@@ -952,6 +976,117 @@ impl Engine {
         S::Error: std::fmt::Debug,
     {
         super::author::author(self, objects, tree)
+    }
+
+    /// Stage the current eligible heads as durable carry
+    /// obligations, before the transition that supersedes them
+    /// commits. The set derives inside the engine from the freshly
+    /// rebuilt membership/DAG state — callers supply nothing, so a
+    /// retained stale handle can never be staged: only the live
+    /// heads at staging time queue. Staging rides its own batch
+    /// ahead of the transition, and a stage without a following
+    /// transition is benign: the drain discards heads that are still
+    /// eligible. Returns the number newly staged; restaging is
+    /// idempotent, and an empty stage commits nothing.
+    pub fn stage_carry_heads(&mut self) -> Result<usize, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        let mut facts = Vec::new();
+        for head in dag.eligible_heads(&rebuilt.log) {
+            if rebuilt.runtime.carry_covered(head) {
+                continue;
+            }
+            facts.push(Fact::CarryQueued(head));
+        }
+        let staged = facts.len();
+        if staged > 0 {
+            self.commit_facts(&facts)?;
+        }
+        Ok(staged)
+    }
+
+    /// The still-undischarged carry obligations: pre-transition heads
+    /// staged but not yet re-authored at the known epoch.
+    pub fn pending_carries(&self) -> Result<Vec<SnapshotId>, EngineError> {
+        Ok(self.store.rebuild(self.device)?.runtime.pending_carries())
+    }
+
+    /// Drain the durable carry queue: re-author every still-pending
+    /// pre-transition head at the known epoch, parenting onto it, and
+    /// discharge each obligation. This is what makes the
+    /// transition/carry sequence recoverable: the staged set survives
+    /// a crash between the transition commit and the drain, and the
+    /// next drain — after a restart, or after the next transition —
+    /// completes it. Idempotent per head: a head that is still
+    /// eligible (the transition never landed) or that already has a
+    /// current-epoch child (a completed carry, never authored twice)
+    /// is discharged without authoring; a head whose body is gone
+    /// (arrives later via sync) stays pending. A head whose tree is
+    /// not local fails the drain closed with the obligation still
+    /// pending, so restoring the bytes and retrying resumes. A caller
+    /// that left the member set drains nothing (its pending set
+    /// stays: the frozen drive cannot author, and no other device
+    /// completes another's queue). Returns what the drain did, so
+    /// composition can republish whenever recovery changed queue
+    /// state — not only when it authored snapshots.
+    pub fn carry_pending<S: ObjectStore>(&mut self, objects: &S) -> Result<CarryReport, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        let mut report = CarryReport::default();
+        let rebuilt = self.store.rebuild(self.device)?;
+        let pending = rebuilt.runtime.pending_carries();
+        if pending.is_empty() {
+            return Ok(report);
+        }
+        let known = rebuilt
+            .log
+            .known_state()
+            .ok_or(EngineError::NoCanonicalMembership)?;
+        let members = rebuilt
+            .log
+            .members_of(&known.transition_id)
+            .ok_or(EngineError::NoCanonicalMembership)?;
+        if !members.contains(&self.device) {
+            return Ok(report);
+        }
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        let eligible = dag.eligible_heads(&rebuilt.log);
+        for head in pending {
+            if eligible.contains(&head) {
+                // Staged but the transition never landed: the head
+                // still serves, nothing to carry.
+                self.commit_facts(&[Fact::CarryDone(head)])?;
+                report.discharged += 1;
+                continue;
+            }
+            let already = dag.ids().iter().any(|id| {
+                dag.snapshot(id)
+                    .is_some_and(|s| s.parents.contains(&head) && s.epoch == known.epoch)
+            });
+            if already {
+                // A completed carry (or its synced echo): discharge,
+                // never author twice.
+                self.commit_facts(&[Fact::CarryDone(head)])?;
+                report.discharged += 1;
+                continue;
+            }
+            let Some(body) = dag.snapshot(&head) else {
+                // The body arrives later via sync; stay pending.
+                continue;
+            };
+            let snapshot =
+                super::author::author_with_parents(self, objects, body.tree, vec![head])?;
+            report.authored.push(snapshot);
+            self.commit_facts(&[Fact::CarryDone(head)])?;
+        }
+        Ok(report)
     }
 
     /// Announce an authored snapshot over the control plane to every

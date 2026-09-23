@@ -124,7 +124,9 @@ pub(super) fn live_backend<S: ObjectStore + Send + Sync + 'static>(
 where
     S::Error: std::fmt::Debug,
 {
-    let (live, parts) = daemon.into_live(Duration::from_secs(30), &LiveConfig::default());
+    let (live, parts) = daemon
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
     let backend = crate::fuse::FuseBackend::shared_with_wants(
         parts.projection,
         parts.wants,

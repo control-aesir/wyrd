@@ -31,6 +31,8 @@ mod snapshot;
 #[cfg(test)]
 mod tests_admission;
 #[cfg(test)]
+mod tests_carry;
+#[cfg(test)]
 mod tests_harness;
 #[cfg(test)]
 mod tests_lifecycle;
@@ -55,3 +57,4 @@ pub(super) use remove_device::remove_device;
 pub(super) use rotate_epoch::rotate_epoch;
 pub(super) use set_owners::set_owners;
 pub(super) use snapshot::author;
+pub(super) use snapshot::author_with_parents;

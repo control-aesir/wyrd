@@ -111,6 +111,11 @@
 //!     `NamespaceView` implementation, so the node never names one
 //!     presentation's view type (`docs/architecture.md`, layer target).
 //!
+//! 37. `recovery_grafts_content_only_and_voided_transitions_never_authorize` —
+//!     recovery is eligible only onto eligible heads, and a voided
+//!     membership binding voids every snapshot on it through any
+//!     ancestry shape (`docs/epochs.md`, Layer 3).
+//!
 //! The upgrade contracts (`docs/upgrade-contract.md`), one per invariant:
 //!
 //! 23. `upgrade_new_encoding_is_new_representation` — re-stored content

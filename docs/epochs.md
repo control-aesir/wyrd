@@ -414,7 +414,10 @@ discoverable obligation: the next drain — after a restart, after
 the next transition, or at live composition (`into_live`, which
 drains before exposing the view or admitting mutations and fails
 closed on a drain error) — completes it, idempotently per head
-(see the carry crash states in `crash-consistency.md`). A carry whose tree
+(see the carry crash states in `crash-consistency.md`). The drain
+reports whether it changed queue state, and composition
+republishes whenever it did — including a stage-only crash, whose
+discharge of the still-eligible head must reach the view. A carry whose tree
 is not local fails the drain closed with the obligation still
 pending — loudly, never by silently orphaning history.
 

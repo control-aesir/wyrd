@@ -835,7 +835,7 @@ fn carry_pending(engine: &mut Engine, drive_dir: &Path) -> Result<usize, CliErro
     }
     let store = FsObjectStore::open(drive_dir.to_path_buf())
         .map_err(|error| CliError::Store(error.to_string()))?;
-    Ok(engine.carry_pending(&store)?.len())
+    Ok(engine.carry_pending(&store)?.authored.len())
 }
 
 /// Claim an invitation destination before any irreversible step: an

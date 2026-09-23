@@ -137,9 +137,9 @@ fn rotate_carries_the_live_tree_forward_at_the_new_epoch() {
     );
     assert_eq!(engine.pending_carries().unwrap(), vec![first_id]);
 
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert_eq!(carried.len(), 1, "one staged head, one carry");
-    let carry = carried[0].snapshot();
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(report.authored.len(), 1, "one staged head, one carry");
+    let carry = report.authored[0].snapshot();
     assert_eq!(carry.epoch, 3, "carried at the new epoch");
     assert_eq!(carry.tree, tree, "the same namespace, re-carried");
     assert_eq!(
@@ -200,7 +200,7 @@ fn carry_is_vacuous_on_an_empty_drive() {
     );
     let transition = engine.rotate_epoch().unwrap();
     assert_eq!(transition.epoch, 2);
-    assert!(engine.carry_pending(&objects).unwrap().is_empty());
+    assert!(engine.carry_pending(&objects).unwrap().authored.is_empty());
     assert!(head_trees(&engine).is_empty());
     assert!(engine.pending_carries().unwrap().is_empty());
 }
@@ -222,12 +222,12 @@ fn remove_carries_for_the_remaining_owner() {
     engine.stage_carry_heads().unwrap();
     let transition = engine.remove_device(second_id).unwrap();
     assert_eq!(transition.epoch, 3, "admit then removal");
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert_eq!(carried.len(), 1);
-    assert_eq!(carried[0].snapshot().epoch, 3);
-    assert_eq!(carried[0].snapshot().tree, tree);
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(report.authored.len(), 1);
+    assert_eq!(report.authored[0].snapshot().epoch, 3);
+    assert_eq!(report.authored[0].snapshot().tree, tree);
     assert_eq!(
-        carried[0].snapshot().parents,
+        report.authored[0].snapshot().parents,
         vec![first_id],
         "the carry extends its head"
     );
@@ -259,9 +259,10 @@ fn conflicted_drive_carries_each_head_without_merging() {
 
     engine.stage_carry_heads().unwrap();
     engine.rotate_epoch().unwrap();
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert_eq!(carried.len(), 2, "every head carries, none drops");
-    let mut parents: Vec<SnapshotId> = carried
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(report.authored.len(), 2, "every head carries, none drops");
+    let mut parents: Vec<SnapshotId> = report
+        .authored
         .iter()
         .flat_map(|carry| carry.snapshot().parents.clone())
         .collect();
@@ -270,10 +271,14 @@ fn conflicted_drive_carries_each_head_without_merging() {
         parents, expected_heads,
         "each carry extends its own head: the fork survives unmerged"
     );
-    for carry in &carried {
+    for carry in &report.authored {
         assert_eq!(carry.snapshot().epoch, 2, "carried at the new epoch");
     }
-    let mut trees: Vec<ContentId> = carried.iter().map(|carry| carry.snapshot().tree).collect();
+    let mut trees: Vec<ContentId> = report
+        .authored
+        .iter()
+        .map(|carry| carry.snapshot().tree)
+        .collect();
     trees.sort();
     let mut expected = vec![tree_a, tree_b];
     expected.sort();
@@ -294,8 +299,11 @@ fn self_removal_leaves_the_queue_pending() {
     // The author left the member set: the drain refuses nothing and
     // authors nothing, and the obligation stays pending on the
     // frozen drive instead of failing the removal.
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert!(carried.is_empty(), "a departed author carries nothing");
+    let report = engine.carry_pending(&objects).unwrap();
+    assert!(
+        report.authored.is_empty(),
+        "a departed author carries nothing"
+    );
     assert_eq!(engine.pending_carries().unwrap().len(), 1);
 }
 
@@ -315,10 +323,14 @@ fn interrupted_carry_resumes_after_restart_without_memory_bases() {
     assert_eq!(engine.pending_carries().unwrap().len(), 1);
 
     // The drain takes no bases: the staged set is the obligation.
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert_eq!(carried.len(), 1, "the staged head carries after restart");
-    assert_eq!(carried[0].snapshot().epoch, 2);
-    assert_eq!(carried[0].snapshot().tree, tree);
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(
+        report.authored.len(),
+        1,
+        "the staged head carries after restart"
+    );
+    assert_eq!(report.authored[0].snapshot().epoch, 2);
+    assert_eq!(report.authored[0].snapshot().tree, tree);
     assert_eq!(head_trees(&engine), vec![tree]);
     assert!(engine.pending_carries().unwrap().is_empty());
 }
@@ -340,13 +352,13 @@ fn torn_carry_commit_discharges_without_duplicates() {
     // pending. Same durable state, no fault framework needed.
     let first_id = first.snapshot().snapshot_id();
     super::author_with_parents(&mut engine, &objects, tree_a, vec![first_id]).unwrap();
-    let carried = engine.carry_pending(&objects).unwrap();
+    let report = engine.carry_pending(&objects).unwrap();
     assert_eq!(
-        carried.len(),
+        report.authored.len(),
         1,
         "only the still-pending head authors; the torn one discharges"
     );
-    assert_eq!(carried[0].snapshot().tree, tree_b);
+    assert_eq!(report.authored[0].snapshot().tree, tree_b);
     assert_eq!(head_trees(&engine).len(), 2, "no duplicate of branch A");
     assert!(engine.pending_carries().unwrap().is_empty());
 }
@@ -385,8 +397,8 @@ fn missing_tree_carry_fails_closed_and_retries() {
 
     // The bytes arrive; the retry carries without further staging.
     file_tree(&mut objects, "later.txt", b"later");
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert_eq!(carried.len(), 1);
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(report.authored.len(), 1);
     assert_eq!(head_trees(&engine), vec![tree]);
     assert!(engine.pending_carries().unwrap().is_empty());
 }
@@ -417,8 +429,12 @@ fn staging_captures_only_the_current_eligible_set() {
     assert_eq!(engine.pending_carries().unwrap(), vec![second_id]);
 
     engine.rotate_epoch().unwrap();
-    let carried = engine.carry_pending(&objects).unwrap();
-    assert_eq!(carried.len(), 1, "the stale branch never resurrects");
-    assert_eq!(carried[0].snapshot().tree, tree_new);
-    assert_eq!(carried[0].snapshot().parents, vec![second_id]);
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(
+        report.authored.len(),
+        1,
+        "the stale branch never resurrects"
+    );
+    assert_eq!(report.authored[0].snapshot().tree, tree_new);
+    assert_eq!(report.authored[0].snapshot().parents, vec![second_id]);
 }

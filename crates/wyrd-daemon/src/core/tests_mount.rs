@@ -407,3 +407,54 @@ fn mounted_write_after_interrupted_carry_extends_recovered_history() {
     drop(engine);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A stage-only crash still serves: the transition never landed, so
+/// the old head is eligible; the into_live drain discharges it and
+/// republishes the baseline instead of composing an empty view over
+/// a valid head.
+#[test]
+fn stage_only_crash_serves_the_still_eligible_head() {
+    let (mut engine, dir, identity) = scratch_drive();
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"kept").unwrap();
+    let entry = Entry::file("kept.txt", 4, false, vec![chunk]).unwrap();
+    let tree = Tree::from_entries(vec![entry])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    engine.author_snapshot(&objects, tree).unwrap();
+    engine.stage_carry_heads().unwrap();
+    assert_eq!(engine.pending_carries().unwrap().len(), 1);
+    // Crash between the stage commit and the transition commit: the
+    // engine dies (memory objects stand in for the durable disk
+    // store — only facts truly reopen).
+    drop(engine);
+    let engine = Engine::open_keystore(dir.clone(), "daemon-test-pass", identity).unwrap();
+
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, objects).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let kept = std::time::Instant::now();
+    let read = loop {
+        if let Ok(fh) = backend.open_at("kept.txt") {
+            break fh;
+        }
+        assert!(
+            kept.elapsed() < Duration::from_secs(10),
+            "the discharged head never published"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"kept");
+    backend.release_handle(read).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}

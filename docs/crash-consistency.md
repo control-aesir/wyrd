@@ -50,7 +50,11 @@ afterwards. The crash states, all pinned in
 `author/tests_carry.rs`:
 
 - crash between stage and transition: the heads are still
-  eligible, so the drain discards the staged set — benign.
+  eligible, so the drain discharges the staged set — benign. The
+  discharge still republishes the composed baseline: a stage-only
+  crash must serve the valid head, not an empty view. Pinned by
+  `stage_only_crash_serves_the_still_eligible_head`
+  (`daemon/core/tests_mount.rs`).
 - crash between transition commit and drain: the staged set
   survives; the next drain (after a restart, or after the next
   transition) completes it. Pinned by

@@ -170,9 +170,9 @@ fn concurrent_handles_isolate_and_second_commit_is_stale() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// `O_TRUNC` is immediately dirty: opening with no later write still
-/// commits an empty snapshot at the boundary, so closing cannot
-/// silently leave the old content.
+/// `O_TRUNC` commits during open: opening with no later write still
+/// leaves an empty file, so closing cannot silently leave the old
+/// content. The handle starts clean on the empty base.
 #[test]
 fn o_trunc_without_writes_commits_an_empty_file() {
     let (engine, dir, _) = scratch_drive();
@@ -551,6 +551,44 @@ fn handle_mode_change_preserves_content() {
     );
     backend.release_handle(read).unwrap();
     assert_eq!(backend.attr_at("m.txt").unwrap().perm, 0o755);
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A path truncate while a clean handle is open re-pins it instead of
+/// stranding it stale: the handle holds no uncommitted state, so the
+/// concurrent change is lossless. (The kernel's `O_TRUNC` split lands
+/// here — open arrives trunc-less and the fh-less followup `setattr`
+/// truncates while the opening handle is still clean.) A dirty handle
+/// keeps the stale rule.
+#[test]
+fn path_truncate_repins_a_clean_handle() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, ino, _) = backend.create_at(1, "r.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"hello").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+
+    let clean = backend.open_write("r.txt", libc::O_RDWR).unwrap();
+    backend.set_size_at(ino, 0).unwrap();
+    backend.write_handle(clean, 0, b"new").unwrap();
+    backend.commit_handle(clean).unwrap();
+    backend.release_handle(clean).unwrap();
+
+    let read = backend.open_at("r.txt").unwrap();
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"new");
+    backend.release_handle(read).unwrap();
 
     stop.store(true, Ordering::Relaxed);
     loop_handle

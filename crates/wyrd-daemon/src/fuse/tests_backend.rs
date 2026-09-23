@@ -427,10 +427,12 @@ fn open_handles_refuse_emfile_past_the_cap() {
     );
 }
 
-/// A truncated open refused `EMFILE` leaks no budget: the
-/// dirty-handle mark the truncate reservation took is unwound, so
-/// saturated-table failures never permanently consume write budget
-/// and turn later writes into phantom `ENOSPC`.
+/// A truncated open refused `EMFILE` leaks nothing and commits
+/// nothing: the slot reservation fails before any side effect, so
+/// saturated-table failures never consume write budget and never
+/// truncate. The success path needs a draining loop, so it is pinned
+/// by the core `O_TRUNC` tests and the Lima matrix instead — this
+/// backend has no loop and a submit would block forever.
 #[test]
 fn failed_truncated_open_releases_its_budget_reservation() {
     let (mut backend, _) = evolving_backend(b"first", b"second");
@@ -440,7 +442,7 @@ fn failed_truncated_open_releases_its_budget_reservation() {
     assert_eq!(
         backend.open_write("f.txt", libc::O_RDWR | libc::O_TRUNC),
         Err(fuser::Errno::EMFILE),
-        "a saturated table refuses before reserving"
+        "a saturated table refuses before side effects"
     );
     assert_eq!(
         backend.budget.dirty_handles(),
@@ -448,15 +450,7 @@ fn failed_truncated_open_releases_its_budget_reservation() {
         "no leaked dirty-handle mark"
     );
     assert_eq!(backend.budget.total(), 0, "no leaked aggregate bytes");
-    // Draining room restores normal opens: the refused truncate left
-    // no permanent `ENOSPC` behind. The dirty handle is dropped with
-    // the backend instead of released: releasing a dirty handle
-    // commits through the mutation channel, which has no loop here.
     assert!(backend.release_handle(reader).is_ok());
-    let _truncated = backend
-        .open_write("f.txt", libc::O_RDWR | libc::O_TRUNC)
-        .unwrap();
-    assert_eq!(backend.budget.dirty_handles(), 1);
     backend.destroy();
 }
 

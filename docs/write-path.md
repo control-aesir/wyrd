@@ -455,7 +455,7 @@ merely implementation properties.
 | `O_CREAT` | Create the file if absent (its own empty-file snapshot, per `create`). |
 | `O_EXCL` | With `O_CREAT`, `EEXIST` if the name exists. |
 | `O_APPEND` | Appends at the current end at commit time (see handles); the target must remain a regular file. |
-| `O_TRUNC` | The handle's overlay starts **empty**; the truncation commits at the next `flush`/`fsync`/`release`, not at open. It captures the opened file's base identity and **obeys the normal stale-handle rule**: if another commit changed the file before the truncation commits, the handle is stale (`EIO`). |
+| `O_TRUNC` | The truncation commits **during open** and the handle starts clean on the empty base. It must: the kernel delivers `O_TRUNC` as open plus a separate fh-less `setattr`, so a handle carrying the pre-truncate base would go stale before its first commit. A concurrent change *after* open still stales the handle (`EIO`); a path truncate that lands while the opening handle is still clean re-pins it instead (the handle holds nothing to lose). |
 | `O_SYNC` / `O_DSYNC` | Accepted; every write is its own durable snapshot (see flush/fsync). |
 | `O_DIRECT`, `O_PATH` | `EOPNOTSUPP` (not representable). |
 
@@ -644,9 +644,10 @@ Each row locks a decided invariant.
   after either; it may be lost after `write` without a commit boundary.
 - **`O_SYNC` per write**: each successful `write` produces its own
   durable snapshot before returning.
-- **`O_TRUNC`**: open truncates nothing; the empty commit happens at the
-  committing boundary; a concurrent change to the file makes the
-  truncation commit stale (`EIO`).
+- **`O_TRUNC`**: the truncation is visible to other opens immediately
+  (it commits during open); a concurrent change after open makes the
+  handle stale (`EIO`), while a truncate landing on a still-clean
+  handle re-pins it.
 - **`create` then content**: two snapshots, both roots readable; a crash
   after `create` leaves the empty file.
 - **Failed commit is terminal**: after a stale/`EIO` commit the overlay is

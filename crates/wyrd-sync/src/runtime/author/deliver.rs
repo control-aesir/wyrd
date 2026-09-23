@@ -153,6 +153,7 @@ pub(super) fn seal_fresh_for(
 pub(super) fn send_sealed_to(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
+    kind: &'static str,
     sealed_bytes: &[u8],
     recipients: impl IntoIterator<Item = DeviceId>,
     delivered: impl Fn(DeviceId) -> Fact,
@@ -161,6 +162,11 @@ pub(super) fn send_sealed_to(
     for recipient in recipients {
         let envelope = seal_for_recipient(&engine.identity_secret, recipient, sealed_bytes)?;
         mailbox.send(envelope)?;
+        // Per-send forensics, mirroring the intake verdict lines: with
+        // relay ids on one side and control kinds on the other, a
+        // stuck peer's whole outbox can be reconstructed envelope by
+        // envelope.
+        tracing::debug!(kind, recipient = ?recipient, "outbox send");
         engine.commit_facts(&[delivered(recipient)])?;
         sent += 1;
     }
@@ -282,9 +288,14 @@ fn deliver_transitions(
             recipients.push(pending[index].1);
             index += 1;
         }
-        sent += send_sealed_to(engine, mailbox, &sealed_bytes, recipients, |recipient| {
-            Fact::TransitionDelivered(id, recipient)
-        })?;
+        sent += send_sealed_to(
+            engine,
+            mailbox,
+            "transition",
+            &sealed_bytes,
+            recipients,
+            |recipient| Fact::TransitionDelivered(id, recipient),
+        )?;
     }
     Ok(sent)
 }
@@ -457,9 +468,14 @@ fn deliver_capabilities(
                 bytes
             }
         };
-        sent += send_sealed_to(engine, mailbox, &sealed_bytes, [recipient], |delivered| {
-            Fact::CapabilityDelivered(epoch, delivered)
-        })?;
+        sent += send_sealed_to(
+            engine,
+            mailbox,
+            "capability",
+            &sealed_bytes,
+            [recipient],
+            |delivered| Fact::CapabilityDelivered(epoch, delivered),
+        )?;
     }
     Ok(sent)
 }

@@ -25,6 +25,7 @@ getrandom.workspace = true
 blake3.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 # Zeroize secret material on drop (root key, epoch secrets, capability and
 # keystore plaintexts). `derive` gives us `ZeroizeOnDrop` for the newtype

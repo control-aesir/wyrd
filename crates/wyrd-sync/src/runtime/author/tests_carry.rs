@@ -35,6 +35,23 @@ fn unheld_tree(name: &str, bytes: &[u8]) -> ContentId {
     file_tree(&mut scratch, name, bytes)
 }
 
+/// A copy of `base` with one file added, inserted into `objects`.
+fn extend_tree(
+    objects: &mut MemoryObjectStore,
+    base: &ContentId,
+    name: &str,
+    bytes: &[u8],
+) -> ContentId {
+    let chunk = objects.insert(ObjectKind::Chunk, bytes).unwrap();
+    let old = Tree::decode(&objects.get(base).unwrap().unwrap()).unwrap();
+    let mut entries = old.entries().to_vec();
+    entries.push(Entry::file(name, bytes.len() as u64, false, vec![chunk]).unwrap());
+    Tree::from_entries(entries)
+        .unwrap()
+        .insert_into(objects)
+        .unwrap()
+}
+
 /// The served trees: what a remount would show right now.
 fn head_trees(engine: &Engine) -> Vec<ContentId> {
     engine
@@ -110,9 +127,7 @@ fn rotate_carries_the_live_tree_forward_at_the_new_epoch() {
     assert_eq!(head_trees(&engine), vec![tree]);
 
     // The CLI stages the served heads before the transition commits.
-    let staged = engine
-        .stage_carry_bases(engine.live_heads().unwrap())
-        .unwrap();
+    let staged = engine.stage_carry_heads().unwrap();
     assert_eq!(staged, 1);
     let transition = engine.rotate_epoch().unwrap();
     assert_eq!(transition.epoch, 3, "admit plus rotation");
@@ -160,16 +175,7 @@ fn rotate_carries_the_live_tree_forward_at_the_new_epoch() {
     );
 
     // The next write extends the carry instead of orphaning history.
-    let extended = {
-        let chunk = objects.insert(ObjectKind::Chunk, b"new file").unwrap();
-        let old = Tree::decode(&objects.get(&tree).unwrap().unwrap()).unwrap();
-        let mut entries = old.entries().to_vec();
-        entries.push(Entry::file("new.txt", 8, false, vec![chunk]).unwrap());
-        Tree::from_entries(entries)
-            .unwrap()
-            .insert_into(&mut objects)
-            .unwrap()
-    };
+    let extended = extend_tree(&mut objects, &tree, "new.txt", b"new file");
     let second = engine.author_snapshot(&objects, extended).unwrap();
     assert_eq!(
         second.snapshot().parents,
@@ -188,9 +194,9 @@ fn carry_is_vacuous_on_an_empty_drive() {
     let (_dir, mut engine, _genesis) = owner_engine("carry-empty");
     let objects = MemoryObjectStore::default();
     assert_eq!(
-        engine.stage_carry_bases(Vec::new()).unwrap(),
+        engine.stage_carry_heads().unwrap(),
         0,
-        "nothing staged, nothing committed"
+        "nothing eligible, nothing committed"
     );
     let transition = engine.rotate_epoch().unwrap();
     assert_eq!(transition.epoch, 2);
@@ -213,9 +219,7 @@ fn remove_carries_for_the_remaining_owner() {
     let first = engine.author_snapshot(&objects, tree).unwrap();
     let first_id = first.snapshot().snapshot_id();
 
-    engine
-        .stage_carry_bases(engine.live_heads().unwrap())
-        .unwrap();
+    engine.stage_carry_heads().unwrap();
     let transition = engine.remove_device(second_id).unwrap();
     assert_eq!(transition.epoch, 3, "admit then removal");
     let carried = engine.carry_pending(&objects).unwrap();
@@ -253,7 +257,7 @@ fn conflicted_drive_carries_each_head_without_merging() {
     expected_heads.sort();
     assert!(expected_heads.contains(&fork_id));
 
-    engine.stage_carry_bases(bases).unwrap();
+    engine.stage_carry_heads().unwrap();
     engine.rotate_epoch().unwrap();
     let carried = engine.carry_pending(&objects).unwrap();
     assert_eq!(carried.len(), 2, "every head carries, none drops");
@@ -285,9 +289,7 @@ fn self_removal_leaves_the_queue_pending() {
     let tree = file_tree(&mut objects, "kept.txt", b"carry me");
     engine.author_snapshot(&objects, tree).unwrap();
 
-    engine
-        .stage_carry_bases(engine.live_heads().unwrap())
-        .unwrap();
+    engine.stage_carry_heads().unwrap();
     engine.remove_device(owner_id).unwrap();
     // The author left the member set: the drain refuses nothing and
     // authors nothing, and the obligation stays pending on the
@@ -304,9 +306,7 @@ fn interrupted_carry_resumes_after_restart_without_memory_bases() {
     let tree = file_tree(&mut objects, "kept.txt", b"carry me");
     engine.author_snapshot(&objects, tree).unwrap();
 
-    engine
-        .stage_carry_bases(engine.live_heads().unwrap())
-        .unwrap();
+    engine.stage_carry_heads().unwrap();
     engine.rotate_epoch().unwrap();
     // Abrupt death after the transition commit, before the drain:
     // no memory survives, only durable facts.
@@ -333,9 +333,7 @@ fn torn_carry_commit_discharges_without_duplicates() {
     let _fork_id = commit_fork(&mut engine, genesis, tree_b, first.snapshot().timestamp);
     file_tree(&mut objects, "b.txt", b"branch b");
 
-    engine
-        .stage_carry_bases(engine.live_heads().unwrap())
-        .unwrap();
+    engine.stage_carry_heads().unwrap();
     engine.rotate_epoch().unwrap();
     // Death after branch A's carry commits but before its Done
     // marker does: the carry exists, the obligation is still
@@ -373,9 +371,7 @@ fn missing_tree_carry_fails_closed_and_retries() {
         "the head is eligible regardless of bytes"
     );
 
-    engine
-        .stage_carry_bases(engine.live_heads().unwrap())
-        .unwrap();
+    engine.stage_carry_heads().unwrap();
     engine.rotate_epoch().unwrap();
     let failed = engine.carry_pending(&objects);
     assert!(
@@ -393,4 +389,36 @@ fn missing_tree_carry_fails_closed_and_retries() {
     assert_eq!(carried.len(), 1);
     assert_eq!(head_trees(&engine), vec![tree]);
     assert!(engine.pending_carries().unwrap().is_empty());
+}
+
+#[test]
+fn staging_captures_only_the_current_eligible_set() {
+    // A superseded head is never staged: the set derives inside the
+    // engine from the live membership/DAG state, so no caller can
+    // queue a stale branch for resurrection. (The previous
+    // caller-supplied-bases API admitted retained handles; it is
+    // gone.)
+    let (_dir, mut engine, _genesis) = owner_engine("carry-stale");
+    let mut objects = MemoryObjectStore::default();
+    let tree_old = file_tree(&mut objects, "old.txt", b"old");
+    let first = engine.author_snapshot(&objects, tree_old).unwrap();
+    let first_id = first.snapshot().snapshot_id();
+    let tree_new = extend_tree(&mut objects, &tree_old, "new.txt", b"new");
+    let second = engine.author_snapshot(&objects, tree_new).unwrap();
+    let second_id = second.snapshot().snapshot_id();
+    assert_eq!(
+        classify(&engine, &first_id),
+        Classification::CanonicalHistory,
+        "the old tip is history before any transition"
+    );
+
+    let staged = engine.stage_carry_heads().unwrap();
+    assert_eq!(staged, 1, "only the eligible head stages");
+    assert_eq!(engine.pending_carries().unwrap(), vec![second_id]);
+
+    engine.rotate_epoch().unwrap();
+    let carried = engine.carry_pending(&objects).unwrap();
+    assert_eq!(carried.len(), 1, "the stale branch never resurrects");
+    assert_eq!(carried[0].snapshot().tree, tree_new);
+    assert_eq!(carried[0].snapshot().parents, vec![second_id]);
 }

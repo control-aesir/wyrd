@@ -245,7 +245,9 @@ where
     V::Store: ObjectStore + Send + Sync,
     <V::Store as ObjectStore>::Error: std::fmt::Debug,
 {
-    let (mut live, parts) = node.into_live(Duration::from_secs(5), &LiveConfig::default());
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
     // The test thread never touches the loop owner: it reads through
     // the shared publication slot from the node's own parts — the
     // same slot a backend would build from, but no backend exists.

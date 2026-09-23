@@ -246,8 +246,9 @@ fn failed_pass_recovers_serving_on_retry() {
     let engine = loaded.rig.take_engine();
     let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
         WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
-    let (mut live, parts) =
-        daemon.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
+    let (mut live, parts) = daemon
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
     let backend = serving_backend(parts);
     for id in &loaded.content.content_ids {
         live.want(*id).unwrap();
@@ -438,8 +439,9 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
     daemon.refresh_live_heads().unwrap();
-    let (mut live, parts) =
-        daemon.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
+    let (mut live, parts) = daemon
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
     let backend = serving_backend(parts);
     assert_eq!(live.generation(), 0, "the split publishes baseline zero");
     let handle = backend.open_at("keeper.txt").expect("baseline serves");
@@ -681,8 +683,9 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     rig.enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
     let daemon_b: WyrdNode<DriveView<_, RuntimeMaterialization>> =
         WyrdNode::new(engine_b, MemoryObjectStore::default()).unwrap();
-    let (mut live_b, parts_b) =
-        daemon_b.into_live(std::time::Duration::from_secs(30), &LiveConfig::default());
+    let (mut live_b, parts_b) = daemon_b
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
     let backend_b = serving_backend(parts_b);
 
     // The first announcement never leaves the author — and the local
@@ -1216,7 +1219,9 @@ fn conflicted_drive_rejects_mounted_writes() {
     assert!(names.contains(&"a.txt".to_string()), "{names:?}");
     assert!(names.contains(&"b.txt".to_string()), "{names:?}");
 
-    let (live, parts) = daemon.into_live(Duration::from_secs(5), &LiveConfig::default());
+    let (live, parts) = daemon
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
     let backend = serving_backend(parts);
     let stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);

@@ -504,7 +504,7 @@ fn mount(
     // backend share this config's budgets, wired into both halves
     // by `into_live` below.
     let config = LiveConfig::default();
-    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
     let backend = FuseBackend::shared_with_wants(
@@ -764,8 +764,7 @@ fn member(
                     engine.admit_device(device, encryption_key)
                 }
             };
-            let bases = engine.live_heads()?;
-            engine.stage_carry_bases(bases)?;
+            engine.stage_carry_heads()?;
             let outcome = match admit(&mut engine) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -805,11 +804,11 @@ fn member(
 }
 
 /// Author a membership transition plus its namespace carry in one
-/// offline step: capture the served heads, stage them as durable
-/// carry obligations, commit the transition via `author`, then drain
-/// the carry queue at the new epoch (transition continuity: a quiet
-/// drive keeps serving its files, and the next write extends the
-/// carry instead of bootstrapping from empty). Staging precedes the
+/// offline step: stage the served heads as durable obligations,
+/// commit the transition via `author`, then drain the carry queue
+/// at the new epoch (transition continuity: a quiet drive keeps
+/// serving its files, and the next write extends the carry instead
+/// of bootstrapping from empty). Staging precedes the
 /// transition commit, so a crash between the commit and the drain
 /// leaves a discoverable obligation: the next drain — after a
 /// restart, or after the next transition — completes it. The object
@@ -822,7 +821,7 @@ fn transition_with_carry(
     drive_dir: &Path,
     author: impl FnOnce(&mut Engine) -> Result<MembershipTransition, EngineError>,
 ) -> Result<(MembershipTransition, usize), CliError> {
-    engine.stage_carry_bases(engine.live_heads()?)?;
+    engine.stage_carry_heads()?;
     let transition = author(engine)?;
     let carried = carry_pending(engine, drive_dir)?;
     Ok((transition, carried))

@@ -42,9 +42,10 @@ first send still delivers; `author/tests_admission.rs`).
 ## Namespace carry across transitions
 
 A transition supersedes the previous heads without file work, so
-the author stages each pre-transition eligible head as a durable
-carry obligation (`CarryQueued`) in its own batch BEFORE the
-transition commits, then drains the queue (`CarryDone` per head)
+the author stages the current eligible-head set as durable carry
+obligations (`CarryQueued`) in its own batch BEFORE the transition
+commits — the set derives inside the engine, so no caller can stage
+a stale branch — then drains the queue (`CarryDone` per head)
 afterwards. The crash states, all pinned in
 `author/tests_carry.rs`:
 
@@ -65,6 +66,13 @@ afterwards. The crash states, all pinned in
 - departed author (self-removal): the drain authors nothing and
   leaves the set pending on the frozen drive. Pinned by
   `self_removal_leaves_the_queue_pending`.
+- mounted write before any drain: `into_live` drains before
+  exposing the view or admitting mutations, so the first write
+  extends recovered history — and a drain failure fails
+  composition closed instead of serving an empty view over pending
+  recovery. Pinned by
+  `mounted_write_after_interrupted_carry_extends_recovered_history`
+  (`daemon/core/tests_mount.rs`).
 
 ## Snapshot authoring and heads
 

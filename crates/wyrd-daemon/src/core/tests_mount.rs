@@ -3,12 +3,14 @@ use super::*;
 use wyrd_fuse::DriveView;
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use crate::fuse::FuseBackend;
 
 use super::tests_harness::{live_backend, scratch_drive, spawn_live_loop};
 
-use wyrd_format::MemoryObjectStore;
+use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+use wyrd_sync::runtime::Engine;
 
 /// The mounted-drive roundtrip plus write coherence: create, write,
 /// commit (the `fsync` durability boundary), read back, and directory
@@ -326,5 +328,82 @@ fn stale_writable_handle_after_namespace_change() {
         .unwrap()
         .expect("loop shuts down cleanly");
     drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A mounted write after an interrupted carry extends the recovered
+/// history: `into_live` drains the staged queue before admitting
+/// mutations, so the write parents the carry instead of
+/// bootstrapping from empty (which would conflict with the later
+/// carry once a member command drains it).
+#[test]
+fn mounted_write_after_interrupted_carry_extends_recovered_history() {
+    let (mut engine, dir, identity) = scratch_drive();
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"kept").unwrap();
+    let entry = Entry::file("kept.txt", 4, false, vec![chunk]).unwrap();
+    let tree = Tree::from_entries(vec![entry])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    engine.author_snapshot(&objects, tree).unwrap();
+    // Staged and rotated, never drained: the crash state.
+    engine.stage_carry_heads().unwrap();
+    engine.rotate_epoch().unwrap();
+    assert!(engine.live_heads().unwrap().is_empty());
+
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, objects).unwrap();
+    // The barrier under test: into_live drains before serving.
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    // The recovered file serves once the first pass publishes.
+    let kept = std::time::Instant::now();
+    let read = loop {
+        if let Ok(fh) = backend.open_at("kept.txt") {
+            break fh;
+        }
+        assert!(
+            kept.elapsed() < Duration::from_secs(10),
+            "the recovered carry never published"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"kept");
+    backend.release_handle(read).unwrap();
+
+    // The mounted write extends the carry; both files serve.
+    let (fh, _, _) = backend.create_at(1, "new.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"new").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+    let old = backend.open_at("kept.txt").unwrap();
+    assert_eq!(backend.read_handle(old, 0, 64).unwrap(), b"kept");
+    backend.release_handle(old).unwrap();
+    let fresh = backend.open_at("new.txt").unwrap();
+    assert_eq!(backend.read_handle(fresh, 0, 64).unwrap(), b"new");
+    backend.release_handle(fresh).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    // Lineage: one head extending the carry. A bootstrap would
+    // parent nothing; a conflict with a later carry would leave two
+    // heads (a member drain afterwards finds nothing pending and
+    // authors nothing).
+    let engine = Engine::open_keystore(dir.clone(), "daemon-test-pass", identity).unwrap();
+    assert!(engine.pending_carries().unwrap().is_empty());
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "no conflict with a later carry");
+    assert_eq!(
+        heads[0].snapshot().parents.len(),
+        1,
+        "the write extends the carry"
+    );
+    drop(engine);
     std::fs::remove_dir_all(dir).unwrap();
 }

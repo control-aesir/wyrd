@@ -954,29 +954,28 @@ impl Engine {
         super::author::author(self, objects, tree)
     }
 
-    /// Stage pre-transition eligible heads as durable carry
+    /// Stage the current eligible heads as durable carry
     /// obligations, before the transition that supersedes them
-    /// commits. Staging rides its own batch ahead of the transition
-    /// (the bases are known only to the transition author, never to
-    /// the commit path), and a stage without a following transition
-    /// is benign: the drain discards heads that are still eligible.
-    /// Returns the number newly staged; restaging is idempotent, and
-    /// an empty stage commits nothing.
-    pub fn stage_carry_bases(
-        &mut self,
-        bases: Vec<AuthorizedSnapshot>,
-    ) -> Result<usize, EngineError> {
-        if bases.is_empty() {
-            return Ok(0);
-        }
+    /// commits. The set derives inside the engine from the freshly
+    /// rebuilt membership/DAG state — callers supply nothing, so a
+    /// retained stale handle can never be staged: only the live
+    /// heads at staging time queue. Staging rides its own batch
+    /// ahead of the transition, and a stage without a following
+    /// transition is benign: the drain discards heads that are still
+    /// eligible. Returns the number newly staged; restaging is
+    /// idempotent, and an empty stage commits nothing.
+    pub fn stage_carry_heads(&mut self) -> Result<usize, EngineError> {
         let rebuilt = self.store.rebuild(self.device)?;
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
         let mut facts = Vec::new();
-        for head in &bases {
-            let id = head.snapshot().snapshot_id();
-            if rebuilt.runtime.carry_covered(id) {
+        for head in dag.eligible_heads(&rebuilt.log) {
+            if rebuilt.runtime.carry_covered(head) {
                 continue;
             }
-            facts.push(Fact::CarryQueued(id));
+            facts.push(Fact::CarryQueued(head));
         }
         let staged = facts.len();
         if staged > 0 {

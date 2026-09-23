@@ -41,6 +41,7 @@ WYRD_BIN="$WYRD_BIN"
 NIXPKGS_REV="$REV"
 RELAY_PORT="18761"
 E2E_ONLY_STEP="$ONLY_STEP"
+E2E_RUST_LOG="${E2E_RUST_LOG:-}"
 EOF
 
 if ! limactl list 2>/dev/null | grep -q "^$INSTANCE[[:space:]].*Running"; then

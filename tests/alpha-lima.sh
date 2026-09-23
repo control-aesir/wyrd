@@ -142,9 +142,16 @@ poll_until() { # <seconds> <cmd...>
 start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
   local name="$1" c="$2" d="$3" m="$4"; shift 4
   mkdir -p "$m"
+  # Debug passthrough for stuck-peer forensics (E2E_RUST_LOG=wyrd_core=debug):
+  # empty means the binary's default info level, never an empty filter.
+  # Scoped to the mount process only: offline assertions require stderr
+  # to start with `error: `, so the restored shell must not leak it.
+  local old_rust_log="${RUST_LOG-__unset}"
+  [[ -n "${E2E_RUST_LOG:-}" ]] && export RUST_LOG="$E2E_RUST_LOG"
   with_creds "$c" mount "$d" "$m" "$@" \
     >"$LOGDIR/mount-$name.out" 2>"$LOGDIR/mount-$name.err" &
   echo $! > "$E2E_ROOT/mount-$name.pid"
+  if [[ "$old_rust_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_rust_log"; fi
   poll_until 20 mountpoint -q "$m" \
     || die "$name: mountpoint never came up (see mount-$name.err)"
   pass "$name: mountpoint up"

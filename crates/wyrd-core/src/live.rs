@@ -566,6 +566,19 @@ where
         let outbound = self.engine.has_pending_outbound()?;
         if !self.dirty && revision == self.published_revision && !outbound {
             batch.finish();
+            // Idle passes report too: accepted-without-commit means a
+            // memory-only suppression verdict, nonzero skipped means
+            // mail waiting on an epoch key, and nonzero discarded means
+            // terminal poison — each a different operator conclusion
+            // from the same silent symptom (a peer that never converges).
+            tracing::debug!(
+                accepted = drained.accepted,
+                duplicates = drained.duplicates,
+                deferred = drained.deferred,
+                skipped = drained.skipped,
+                discarded = drained.discarded,
+                "sync pass idle: revision unchanged, outbox empty"
+            );
             return Ok(SyncReport {
                 drained,
                 fetched,
@@ -606,7 +619,25 @@ where
         // here advance the sequence, so the next pass republishes the
         // (semantically unchanged) generation and retries whatever is
         // still pending.
-        let _sent = self.publish(mailbox)?;
+        let sent = self.publish(mailbox)?;
+        tracing::debug!(
+            accepted = drained.accepted,
+            duplicates = drained.duplicates,
+            deferred = drained.deferred,
+            skipped = drained.skipped,
+            discarded = drained.discarded,
+            manifests = fetched.manifests,
+            snapshot_bodies = fetched.snapshot_bodies,
+            objects = fetched.objects,
+            unfulfilled = fetched.unfulfilled,
+            transport_errors = fetched.transport_errors,
+            missing = fetched.missing,
+            invalid = fetched.invalid,
+            unavailable_keys = fetched.unavailable_keys,
+            local_failures = fetched.local_failures,
+            sent = sent,
+            "sync pass published"
+        );
         Ok(SyncReport {
             drained,
             fetched,

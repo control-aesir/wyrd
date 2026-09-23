@@ -108,7 +108,10 @@ until their blockers land: fact-payload replay (invariant 2's
 payload clause, pending the v0.9.0 payload-versioning issue),
 previous-release replay (invariant 3's cross-release form, pending
 the next release fixture), and the full version matrix
-(invariant 5's matrix half, pending capability negotiation). The list below is the acceptance set for
+(invariant 5's matrix half, pending capability negotiation). Release
+checklist, so this coverage cannot silently remain absent: cutting a
+release checks in `tests/fixtures/stores/<tag>/` and re-enables
+`upgrade_previous_release_store_replays` against it. The list below is the acceptance set for
 the contract issue — one bullet per invariant, in the same order:
 
 1. new encodings are new representations: old objects keep their

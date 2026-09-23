@@ -216,6 +216,63 @@ fn admit_reader_refuses_current_and_retired_devices() {
 }
 
 #[test]
+fn reader_converges_across_a_later_rotation() {
+    // The edge the unit tests do not cover: a reader receiving and
+    // installing a later rotation capability, converging past the
+    // rotation exactly like a member.
+    let (_dir, mut engine, invitation, reader, reader_encryption, reader_id) =
+        admit_reader_fixture("reader-rotation");
+    let (_join_dir, mut joined) = join_reader(
+        "reader-rotation-join",
+        &mut engine,
+        &invitation,
+        reader,
+        reader_encryption,
+        reader_id,
+    );
+    engine.rotate_epoch().unwrap();
+    let mut relay = MemoryRelay::default();
+    let mut sender = MemoryMailbox {
+        relay: &mut relay,
+        owner: engine.device(),
+    };
+    assert!(
+        engine.deliver_pending(&mut sender).unwrap() > 0,
+        "rotation sends to the reader"
+    );
+    let mut receiver = MemoryMailbox {
+        relay: &mut relay,
+        owner: reader_id,
+    };
+    let report = joined.drain(&mut receiver).unwrap();
+    // The rotation transition can arrive sealed under the epoch-3
+    // key before the capability installs it: that pre-key offer
+    // skips transiently, and the settling drain goes quiet.
+    let settled = joined.drain(&mut receiver).unwrap();
+    assert_eq!(
+        report.accepted + settled.accepted,
+        2,
+        "transition plus capability both land"
+    );
+    assert_eq!(settled.skipped, 0, "the settling drain goes quiet");
+    let state = joined.log.known_state().expect("canonical tip");
+    assert_eq!(state.epoch, 3, "reader converges past the rotation");
+    assert!(
+        joined
+            .log
+            .readers_of(&state.transition_id)
+            .expect("post state")
+            .contains(&reader_id),
+        "reader stays a reader across rotation"
+    );
+    let held = joined.store.rebuild(reader_id).unwrap();
+    assert!(
+        held.keyring.secret(3).is_some(),
+        "rotation-epoch secret installed from the delivered wrap"
+    );
+}
+
+#[test]
 fn removed_reader_gets_no_new_epoch_material() {
     let (_dir, mut engine, invitation, reader, reader_encryption, reader_id) =
         admit_reader_fixture("reader-removed");

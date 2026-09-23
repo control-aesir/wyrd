@@ -1,4 +1,6 @@
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, MembershipTransition};
 
 use super::admission::next_epoch;
@@ -37,7 +39,9 @@ pub(crate) fn remove_device(
     if !pre.owners.contains(&engine.device) {
         return Err(EngineError::NotOwner);
     }
-    if !pre.members.contains(&device) {
+    // Removal ends every participation: members and readers alike are
+    // valid targets, and one transition evicts from both sets.
+    if !pre.members.contains(&device) && !pre.readers.contains(&device) {
         return Err(EngineError::NotMember);
     }
     if pre.owners.contains(&device) && pre.owners.len() > 1 {
@@ -62,6 +66,12 @@ pub(crate) fn remove_device(
         } else {
             pre.owners.iter().copied().collect()
         };
+    let readers: Vec<wyrd_format::DeviceId> = pre
+        .readers
+        .iter()
+        .copied()
+        .filter(|r| *r != device)
+        .collect();
     let mut transition = MembershipTransition::new(
         epoch,
         Some(tip.transition_id),
@@ -69,6 +79,7 @@ pub(crate) fn remove_device(
         vec![Change::Remove(device)],
         set_root(MEMBER_SET_CONTEXT, &members)?,
         set_root(OWNER_SET_CONTEXT, &owners)?,
+        set_root(READER_SET_CONTEXT, &readers)?,
         engine.device,
     )?;
     sign_transition(

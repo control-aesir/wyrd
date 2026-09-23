@@ -3,7 +3,9 @@ use super::super::test_util::{admit, drive, key, sign, Builder};
 use super::super::*;
 use super::*;
 use std::collections::BTreeSet;
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
 // --- change rules -------------------------------------------------------
@@ -23,6 +25,7 @@ fn invalid_setowners_cases() {
         vec![Change::SetOwners(vec![stranger])],
         set_root(MEMBER_SET_CONTEXT, &[owner]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[stranger]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner,
     )
     .unwrap();
@@ -233,6 +236,7 @@ fn removal_of_unknown_member_is_invalid() {
         vec![Change::Remove(stranger)],
         set_root(MEMBER_SET_CONTEXT, &[]).unwrap(),
         set_root(OWNER_SET_CONTEXT, &[]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         owner,
     )
     .unwrap();

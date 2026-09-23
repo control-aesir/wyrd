@@ -13,11 +13,19 @@
 //! with the genesis key, so ownership changes would invalidate the
 //! suffix). Owner-set transitions stay covered by the example-based
 //! conformance tests; everything generated here varies admits, removes,
-//! rotates, forks, resolutions, and corruption.
+//! rotates, forks, resolutions, and corruption. Reader admissions stay
+//! out of the generator for the same reason ownership does: the
+//! fork-test replays re-derive declared roots from tracked member sets
+//! only, and threading a third set through every sibling fixture buys
+//! no structural coverage the machine's uniform set handling doesn't
+//! already get — readers are pinned by example-based conformance,
+//! author-gate, and integration tests instead.
 
 use proptest::prelude::*;
 use std::collections::BTreeSet;
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 
 use super::chain::build_children_index;
@@ -100,6 +108,7 @@ fn signed(
         changes,
         set_root(MEMBER_SET_CONTEXT, members).unwrap(),
         set_root(OWNER_SET_CONTEXT, owners).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         author,
     )
     .unwrap();

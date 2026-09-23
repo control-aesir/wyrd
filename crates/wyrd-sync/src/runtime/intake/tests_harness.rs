@@ -1,5 +1,7 @@
 use secp256k1::SecretKey;
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 
 use crate::membership::test_util::{drive as member_drive, sign};
@@ -25,6 +27,7 @@ pub(super) fn signed(
         changes,
         set_root(MEMBER_SET_CONTEXT, members).unwrap(),
         set_root(OWNER_SET_CONTEXT, owners).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         author,
     )
     .unwrap();

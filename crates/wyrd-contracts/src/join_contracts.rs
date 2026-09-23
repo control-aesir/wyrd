@@ -154,6 +154,71 @@ fn newcomer_relay(envelopes: Vec<MailboxEnvelope>) -> Relay {
     relay
 }
 
+/// Reader convergence is read-only end to end: a reader joins through
+/// the same invitation and catch-up path as a member, converges on the
+/// admission state, and then cannot author — the refusal arrives over
+/// the public engine API, not just the internal gates.
+#[test]
+fn reader_converges_read_only() {
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+    use wyrd_sync::runtime::EngineError;
+
+    let mut owner = owner();
+    let newcomer = device(0x20);
+    let outcome = owner
+        .engine
+        .admit_reader(newcomer.id, newcomer.encryption_key)
+        .unwrap();
+    assert_eq!(outcome.transition.epoch, 2);
+    let mut joined = Engine::accept_invitation(
+        scratch_dir("join-reader"),
+        "contracts",
+        newcomer.identity.clone(),
+        newcomer.encryption.clone(),
+        &outcome.invitation,
+    )
+    .unwrap();
+    let mut outbox = Relay::new();
+    let sent = owner.engine.deliver_pending(&mut outbox).unwrap();
+    assert!(sent >= 2, "transition plus capability at minimum");
+    let mut envelopes = Vec::new();
+    while let Some(delivery) = outbox.recv().unwrap() {
+        let id = delivery.id();
+        envelopes.push(delivery.envelope().clone());
+        outbox.settle(id, Disposition::Ack).unwrap();
+    }
+    let mut relay = newcomer_relay(envelopes);
+    let report = joined.drain(&mut relay).unwrap();
+    assert_eq!(report.accepted, 2);
+    assert_eq!(report.skipped, 0);
+    let tip = joined
+        .membership_log()
+        .known_state()
+        .expect("reader converges");
+    assert_eq!(tip.epoch, 2);
+    assert!(
+        joined
+            .membership_log()
+            .readers_of(&tip.transition_id)
+            .expect("post state")
+            .contains(&newcomer.id),
+        "reader observes its own admission"
+    );
+
+    // The converged reader holds secrets but no voice: authoring a
+    // well-formed tree refuses with the role named.
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"payload").unwrap();
+    let tree = Tree::from_entries(vec![Entry::file("file.txt", 7, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    assert!(matches!(
+        joined.author_snapshot(&objects, tree),
+        Err(EngineError::ReaderCannotAuthor)
+    ));
+}
+
 /// Ordered catch-up converges: transition plus capability drain to
 /// acceptance with nothing held, skipped, or duplicated.
 #[test]
@@ -439,6 +504,7 @@ fn forged_transition_from_member_cannot_extend_newcomer_state() {
         Some(owner.genesis.transition_id()),
         Vec::new(),
         vec![Change::Rotate],
+        [0xFF; 32],
         [0xFF; 32],
         [0xFF; 32],
         owner.device.id,

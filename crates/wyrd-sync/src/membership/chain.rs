@@ -208,10 +208,11 @@ fn validate_link(
     }
 }
 
-/// Devices admitted by a transition's own changes.
+/// Devices admitted by a transition's own changes, in either role:
+/// retirement is about identity use, not the role granted.
 fn admits(t: &MembershipTransition) -> impl Iterator<Item = DeviceId> + '_ {
     t.changes().iter().filter_map(|change| match change {
-        Change::Admit(admission) => Some(admission.device),
+        Change::Admit(admission) | Change::AdmitReader(admission) => Some(admission.device),
         _ => None,
     })
 }

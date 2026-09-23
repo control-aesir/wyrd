@@ -6,7 +6,9 @@ use super::state::{apply, MembershipState};
 use super::InvalidReason;
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{DriveId, MembershipTransition};
 
 /// BIP-340 challenge context for membership transitions (trust.md).
@@ -61,23 +63,28 @@ pub(crate) fn check_intrinsic(t: &MembershipTransition) -> Result<(), InvalidRea
         return Err(InvalidReason::EmptyChanges);
     }
     for change in t.changes() {
-        if let wyrd_format::Change::Admit(admission) = change {
-            // The encryption key must be a real curve point: a garbage
-            // key would make the device uncapability-able forever.
-            if XOnlyPublicKey::from_slice(admission.encryption_key.as_bytes()).is_err() {
-                return Err(InvalidReason::BadChanges);
+        match change {
+            wyrd_format::Change::Admit(admission) | wyrd_format::Change::AdmitReader(admission) => {
+                // The encryption key must be a real curve point: a garbage
+                // key would make the device uncapability-able forever.
+                if XOnlyPublicKey::from_slice(admission.encryption_key.as_bytes()).is_err() {
+                    return Err(InvalidReason::BadChanges);
+                }
             }
+            _ => {}
         }
     }
     Ok(())
 }
 
 /// The genesis shape (epochs.md): the derived state must cover exactly one
-/// device, who is the owner.
+/// device, who is the owner. No readers at genesis: the founding device
+/// bootstraps with full membership, and read-only participation starts
+/// with an owner-signed admission.
 pub(crate) fn check_genesis_shape(state: &MembershipState) -> Result<(), InvalidReason> {
     let singleton =
         state.members.len() == 1 && state.owners.len() == 1 && state.members == state.owners;
-    if singleton {
+    if singleton && state.readers.is_empty() {
         Ok(())
     } else {
         Err(InvalidReason::BadGenesis)
@@ -117,7 +124,12 @@ pub(crate) fn derive_next(
         &derived.owners.iter().copied().collect::<Vec<_>>(),
     )
     .is_ok_and(|root| root == t.owners_root);
-    if !(members_match && owners_match) {
+    let readers_match = set_root(
+        READER_SET_CONTEXT,
+        &derived.readers.iter().copied().collect::<Vec<_>>(),
+    )
+    .is_ok_and(|root| root == t.readers_root);
+    if !(members_match && owners_match && readers_match) {
         return Err(InvalidReason::RootMismatch);
     }
     Ok(derived)

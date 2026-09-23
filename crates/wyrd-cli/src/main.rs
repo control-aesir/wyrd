@@ -150,7 +150,8 @@ enum MemberAction {
     /// Admit a device (owner-only) and write its sealed invitation to
     /// a file for out-of-band delivery. The transition commits with
     /// the usual catch-up obligations; the newcomer joins from the
-    /// invitation file.
+    /// invitation file. With `--reader` the device joins read-only:
+    /// it holds every epoch secret but authors nothing.
     Invite {
         /// Device to admit, 64 hex characters.
         device: String,
@@ -159,6 +160,9 @@ enum MemberAction {
         encryption_key: String,
         /// Where to write the sealed invitation.
         out: PathBuf,
+        /// Admit as a reader instead of a member.
+        #[arg(long)]
+        reader: bool,
     },
     /// Reissue a device's sealed invitation from durable state, for
     /// an admission whose invitation never reached a file. Authors
@@ -732,6 +736,7 @@ fn member(
             device,
             encryption_key,
             out,
+            reader,
         } => {
             let device = parse_device_id(&device)?;
             let encryption_key = parse_encryption_key(&encryption_key)?;
@@ -739,7 +744,14 @@ fn member(
             // admit failure the claim is removed so a retry starts
             // clean. See claim_out for the policy.
             let mut file = claim_out(&out)?;
-            let outcome = match engine.admit_device(device, encryption_key) {
+            let admit = |engine: &mut Engine| {
+                if reader {
+                    engine.admit_reader(device, encryption_key)
+                } else {
+                    engine.admit_device(device, encryption_key)
+                }
+            };
+            let outcome = match admit(&mut engine) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     let _ = fs::remove_file(&out);
@@ -748,7 +760,8 @@ fn member(
             };
             write_invitation(&out, &mut file, &outcome.invitation.encode())?;
             println!(
-                "invited {device} at epoch {} -> {}",
+                "invited {device}{} at epoch {} -> {}",
+                if reader { " as reader" } else { "" },
                 outcome.transition.epoch,
                 out.display()
             );
@@ -978,6 +991,7 @@ fn member_list_report(engine: &Engine) -> Result<String, CliError> {
     };
     let members = log.members_of(&tip.transition_id).unwrap_or_default();
     let owners = log.owners_of(&tip.transition_id).unwrap_or_default();
+    let readers = log.readers_of(&tip.transition_id).unwrap_or_default();
     let mut out = format!("epoch {} tip {}\n", tip.epoch, tip.transition_id);
     for owner in &owners {
         out.push_str(&format!("owner {owner}\n"));
@@ -986,6 +1000,9 @@ fn member_list_report(engine: &Engine) -> Result<String, CliError> {
         if !owners.contains(member) {
             out.push_str(&format!("member {member}\n"));
         }
+    }
+    for reader in &readers {
+        out.push_str(&format!("reader {reader}\n"));
     }
     Ok(out)
 }

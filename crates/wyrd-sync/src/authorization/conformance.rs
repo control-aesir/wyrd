@@ -161,6 +161,32 @@ fn author_not_in_committed_membership_is_rejected() {
 }
 
 #[test]
+fn reader_authored_snapshot_is_rejected_as_reader() {
+    // Readers are visible in the log but voiceless: their snapshots
+    // are rejected with a reason that names the misconfiguration
+    // instead of lumping them with strangers.
+    let mut f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let (sk_reader, reader) = f.device(9);
+    f.membership(vec![crate::membership::test_util::admit_reader(reader)]);
+    let s = f.snapshot(Vec::new(), tree_id(1), reader, &sk_reader, 0);
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        classify_one(&dag, &f.log, &id),
+        Classification::Rejected(Rejection::AuthorIsReader)
+    );
+    // Removal returns the device to stranger status: a snapshot
+    // bound to the post-removal tip rejects as AuthorNotMember.
+    f.membership(vec![Change::Remove(reader)]);
+    let after = f.snapshot(Vec::new(), tree_id(2), reader, &sk_reader, 0);
+    let after_id = observe(&mut dag, &after);
+    assert_eq!(
+        classify_one(&dag, &f.log, &after_id),
+        Classification::Rejected(Rejection::AuthorNotMember)
+    );
+}
+
+#[test]
 fn epoch_membership_mismatch_is_rejected() {
     let f = Fixture::new(1);
     let mut dag = SnapshotDag::new(f.drive);

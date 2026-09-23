@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey};
-use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{
     BaoRoot, Change, ContentId, DeviceEncryptionKey, DeviceId, DriveId, Entry, Manifest,
     MembershipTransition, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId,
@@ -121,6 +123,7 @@ pub(crate) fn signed_transition(
         changes,
         set_root(MEMBER_SET_CONTEXT, members).unwrap(),
         set_root(OWNER_SET_CONTEXT, owners).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         author.id,
     )
     .unwrap();

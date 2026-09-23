@@ -35,6 +35,8 @@ mod tests_harness;
 #[cfg(test)]
 mod tests_lifecycle;
 #[cfg(test)]
+mod tests_reader;
+#[cfg(test)]
 mod tests_removal;
 #[cfg(test)]
 mod tests_rotation;
@@ -44,6 +46,7 @@ mod tests_set_owners;
 mod tests_snapshot;
 
 pub(super) use admission::admit_device;
+pub(super) use admission::admit_reader;
 pub(super) use admission::reissue_invitation;
 pub use admission::AdmitOutcome;
 pub(super) use announce::{announce, announce_pending};

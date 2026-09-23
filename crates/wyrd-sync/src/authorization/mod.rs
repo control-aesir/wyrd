@@ -47,6 +47,10 @@ pub enum Rejection {
     InvalidAuthorKey,
     /// The author is not a member of the committed membership state.
     AuthorNotMember,
+    /// The author is a reader: known to the log, but readers author
+    /// nothing. Distinct from `AuthorNotMember` so operators can tell
+    /// a misconfigured reader from a stranger.
+    AuthorIsReader,
     /// `S.epoch != S.membership.epoch`.
     EpochMismatch,
     /// The referenced transition is known-invalid: dead evidence, never

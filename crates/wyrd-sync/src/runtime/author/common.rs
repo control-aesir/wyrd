@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 /// failure leaves no phantom tip), install the author's self
 /// capability when the author remains a member of the resulting
 /// state, queue the new tip and the new-epoch wrap for every other
-/// resulting member, and resync onto the committed state. Returns the
-/// post-transition state.
+/// resulting admitted device (members and readers alike), and resync
+/// onto the committed state. Returns the post-transition state.
 ///
 /// `secret` is the transition's fresh epoch secret, so capabilities
 /// cover `1..=epoch` contiguously from the keyring plus the fresh
@@ -68,15 +68,16 @@ pub(super) fn commit_new_epoch(
         batch.push(Fact::Capability(authorized));
     }
     // Delivery obligations join the same batch: the transition is not
-    // durable without its catch-up. Only resulting members are owed
-    // new-epoch material — a removed device, including a removed
-    // author, receives nothing further.
-    for member in post.members.iter() {
-        if *member == engine.device() {
+    // durable without its catch-up. Only resulting admitted devices —
+    // members and readers alike — are owed new-epoch material: readers
+    // must keep decrypting to keep reading. A removed device,
+    // including a removed author, receives nothing further.
+    for other in post.members.iter().chain(post.readers.iter()) {
+        if *other == engine.device() {
             continue;
         }
-        batch.push(Fact::TransitionQueued(tip_id, *member));
-        batch.push(Fact::CapabilityQueued(epoch, *member));
+        batch.push(Fact::TransitionQueued(tip_id, *other));
+        batch.push(Fact::CapabilityQueued(epoch, *other));
     }
     engine.commit_facts(&batch)?;
     engine.resync()?;

@@ -1,4 +1,6 @@
-use wyrd_format::membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
@@ -18,12 +20,25 @@ pub struct AdmitOutcome {
     pub invitation: SealedBootstrap,
 }
 
+/// Which role an admission grants. Members author snapshots peers
+/// accept; readers hold every epoch secret and materialize the drive,
+/// but no authorship gate accepts their work. One shared commit path
+/// serves both: the change tag, the root vectors, and the pre-checks
+/// differ, while epoch minting, sealing, staging, and catch-up are
+/// identical — a reader's invitation must open and converge exactly
+/// like a member's, minus authorship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdmissionKind {
+    Member,
+    Reader,
+}
+
 /// Admit a device: author, sign, and commit the admission transition,
 /// install the new epoch's self capability, and seal the newcomer's
 /// invitation. One transition is exactly one new epoch (epochs.md), so
 /// admission mints a fresh epoch secret and every capability minted
 /// here covers `1..=epoch` contiguously from the keyring plus the
-/// fresh secret — no backward secrecy for admission, by design.
+/// fresh one — no backward secrecy for admission, by design.
 ///
 /// Authority comes from the pre-transition owner set (epochs.md rule
 /// 3): only an owner admits, and the transition commits together with
@@ -36,6 +51,27 @@ pub(crate) fn admit_device(
     device: DeviceId,
     encryption_key: DeviceEncryptionKey,
 ) -> Result<AdmitOutcome, EngineError> {
+    admit(engine, device, encryption_key, AdmissionKind::Member)
+}
+
+/// Admit a device as a reader: same commit path as [`admit_device`],
+/// with a reader-tagged change. The invitation, capability grant, and
+/// catch-up are identical — the role lives in the membership log, and
+/// the authorship gates (local and peer) enforce it from there.
+pub(crate) fn admit_reader(
+    engine: &mut Engine,
+    device: DeviceId,
+    encryption_key: DeviceEncryptionKey,
+) -> Result<AdmitOutcome, EngineError> {
+    admit(engine, device, encryption_key, AdmissionKind::Reader)
+}
+
+fn admit(
+    engine: &mut Engine,
+    device: DeviceId,
+    encryption_key: DeviceEncryptionKey,
+    kind: AdmissionKind,
+) -> Result<AdmitOutcome, EngineError> {
     let tip = engine
         .log
         .known_state()
@@ -47,8 +83,15 @@ pub(crate) fn admit_device(
     if !pre.owners.contains(&engine.device) {
         return Err(EngineError::NotOwner);
     }
+    // One role per device: admission requires the device in neither
+    // set. Roles change through removal, and single-use identity means
+    // the re-admission names a fresh DeviceId (retirement refuses the
+    // old one below).
     if pre.members.contains(&device) {
         return Err(EngineError::AlreadyMember);
+    }
+    if pre.readers.contains(&device) {
+        return Err(EngineError::AlreadyReader);
     }
     if engine.log.is_retired(&device) {
         // Retired identities are single-use within the chain: a
@@ -60,18 +103,32 @@ pub(crate) fn admit_device(
     let epoch = next_epoch(tip.epoch)?;
     let secret = EpochSecret::generate()?;
     let mut members: Vec<DeviceId> = pre.members.iter().copied().collect();
-    members.push(device);
+    let mut readers: Vec<DeviceId> = pre.readers.iter().copied().collect();
+    let change = match kind {
+        AdmissionKind::Member => {
+            members.push(device);
+            Change::Admit(Admission {
+                device,
+                encryption_key,
+            })
+        }
+        AdmissionKind::Reader => {
+            readers.push(device);
+            Change::AdmitReader(Admission {
+                device,
+                encryption_key,
+            })
+        }
+    };
     let owners: Vec<DeviceId> = pre.owners.iter().copied().collect();
     let mut transition = MembershipTransition::new(
         epoch,
         Some(tip.transition_id),
         Vec::new(),
-        vec![Change::Admit(Admission {
-            device,
-            encryption_key,
-        })],
+        vec![change],
         set_root(MEMBER_SET_CONTEXT, &members)?,
         set_root(OWNER_SET_CONTEXT, &owners)?,
+        set_root(READER_SET_CONTEXT, &readers)?,
         engine.device,
     )?;
     sign_transition(
@@ -143,12 +200,15 @@ pub(crate) fn admit_device(
         cursor = t.prev;
     }
     batch.push(Fact::CapabilityQueued(epoch, device));
-    for member in post.members.iter() {
-        if *member == engine.device || *member == device {
+    // Every other admitted device — member or reader — is owed the
+    // new tip plus its new-epoch wrap: readers must keep decrypting
+    // to keep reading.
+    for other in post.members.iter().chain(post.readers.iter()) {
+        if *other == engine.device || *other == device {
             continue;
         }
-        batch.push(Fact::TransitionQueued(tip_id, *member));
-        batch.push(Fact::CapabilityQueued(epoch, *member));
+        batch.push(Fact::TransitionQueued(tip_id, *other));
+        batch.push(Fact::CapabilityQueued(epoch, *other));
     }
     // Current heads ride the catch-up: the newcomer learns what exists
     // before post-admission gossip reaches it. Every head is at or
@@ -211,7 +271,9 @@ pub(crate) fn reissue_invitation(
     if !current.owners.contains(&engine.device) {
         return Err(EngineError::NotOwner);
     }
-    if !current.members.contains(&device) {
+    // Either role holds a recoverable invitation: readers lose files
+    // the same way members do.
+    if !current.members.contains(&device) && !current.readers.contains(&device) {
         return Err(EngineError::NotMember);
     }
     let (epoch, id) = canonical_admission_of(engine, &device)?;
@@ -227,7 +289,9 @@ pub(crate) fn reissue_invitation(
         .changes()
         .iter()
         .find_map(|change| match change {
-            Change::Admit(admission) if admission.device == device => {
+            Change::Admit(admission) | Change::AdmitReader(admission)
+                if admission.device == device =>
+            {
                 Some(admission.encryption_key)
             }
             _ => None,
@@ -276,10 +340,9 @@ fn canonical_admission_of(
                 return None;
             }
             let transition = engine.log.transition(&id)?;
-            let admits = transition
-                .changes()
-                .iter()
-                .any(|change| matches!(change, Change::Admit(a) if a.device == *device));
+            let admits = transition.changes().iter().any(|change| {
+                matches!(change, Change::Admit(a) | Change::AdmitReader(a) if a.device == *device)
+            });
             admits.then_some((transition.epoch, id))
         })
         .min_by_key(|(epoch, _)| *epoch)

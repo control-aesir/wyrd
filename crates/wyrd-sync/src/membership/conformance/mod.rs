@@ -7,12 +7,17 @@
 use super::test_util::{sign, Builder};
 use super::*;
 use std::collections::BTreeSet;
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{Change, DeviceId, MembershipTransition};
 
 /// Hand-build a signed transition against the builder's drive and owner
 /// key. `members`/`owners` are the sets the DECLARED roots cover; the
-/// machine is expected to derive or reject them.
+/// machine is expected to derive or reject them. Declares an empty
+/// reader set: reader fixtures come from [`Builder`] (which mirrors
+/// reader admissions) or mutate `readers_root` explicitly, like the
+/// root-forgery tests do for `members_root`.
 pub(super) fn signed(
     b: &Builder,
     epoch: u64,
@@ -29,6 +34,7 @@ pub(super) fn signed(
         changes,
         set_root(MEMBER_SET_CONTEXT, members).unwrap(),
         set_root(OWNER_SET_CONTEXT, owners).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         *owners.first().expect("fixture names an author via owners"),
     )
     .unwrap();
@@ -54,4 +60,5 @@ mod evidence;
 mod genesis;
 mod history;
 mod orphanage;
+mod readers;
 mod validation;

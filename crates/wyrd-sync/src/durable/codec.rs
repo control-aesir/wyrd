@@ -783,6 +783,7 @@ mod tests {
             })],
             [0x03; 32],
             [0x04; 32],
+            [0x05; 32],
             DeviceId::from_bytes([0x01; 32]),
         )
         .unwrap();

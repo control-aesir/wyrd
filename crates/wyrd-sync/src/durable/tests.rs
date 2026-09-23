@@ -13,7 +13,9 @@ use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError, Runtime
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::PathBuf};
-use wyrd_format::membership::{set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT};
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
 use wyrd_format::{
     BaoRoot, Change, ContentId, DeviceId, DriveId, Manifest, ManifestEntry, MembershipTransition,
     ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
@@ -669,6 +671,7 @@ fn signed(
         changes,
         set_root(MEMBER_SET_CONTEXT, members).unwrap(),
         set_root(OWNER_SET_CONTEXT, owners).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
         author,
     )
     .unwrap();

@@ -391,12 +391,14 @@ impl ControlInbox {
             .ok_or(ControlError::UnknownEpoch(sealed.epoch))?;
         // Suppressed before opened: the id is over the sealed bytes,
         // so the verdict is stable across the open boundary and the
-        // same bytes revalidate to the same outcome either way.
-        if self.suppressed.contains(&sealed.message_id()) {
+        // same bytes revalidate to the same outcome either way. The
+        // id computes once and serves both the suppression lookup
+        // and the seen insert below.
+        let id = sealed.message_id();
+        if self.suppressed.contains(&id) {
             return Ok(IngestReport::Duplicate);
         }
         let (_, _, message) = open(key, &sealed)?;
-        let id = sealed.message_id();
         // A remembered suppression verdict short-circuits before the
         // seen insert: the same bytes revalidate to the same outcome,
         // and touching `seen` here would pin an id with no durable

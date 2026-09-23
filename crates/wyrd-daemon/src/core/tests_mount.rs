@@ -202,6 +202,49 @@ fn path_truncate_refused_while_append_open() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Rename rebinds the inode table the way the kernel rebinds dentries:
+/// the dst path resolves to the moved src ino immediately, so the next
+/// open off the moved dentry does not fail `ENOENT` on the gone src
+/// path. The replaced dst identity retires instead of reattaching.
+#[test]
+fn rename_rebinds_the_moved_inode() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, _, _) = backend.create_at(1, "rn-a", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"A").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+    let (fh, _, _) = backend.create_at(1, "rn-b", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"B").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+    let src_ino = backend.attr_at("rn-a").unwrap().ino;
+
+    backend.rename_at(1, "rn-a", 1, "rn-b", false).unwrap();
+
+    assert_eq!(
+        backend.attr_at("rn-b").unwrap().ino,
+        src_ino,
+        "the dst path resolves to the moved src ino"
+    );
+    let read = backend.open_at("rn-b").unwrap();
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"A");
+    backend.release_handle(read).unwrap();
+    assert_eq!(backend.attr_at("rn-a"), Err(fuser::Errno::ENOENT));
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// An append handle's reads stay coherent after its own commit: the
 /// handle's base advances to the committed identity, so a same-
 /// descriptor read does not trip over the old base boundary.

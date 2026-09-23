@@ -1334,6 +1334,10 @@ where
     }
 
     /// Move `name` under `parent_ino` to `new_name` under `new_parent`.
+    /// On success the inode table rebinds the way the kernel rebinds
+    /// its dentries (src ino now names the dst path; the replaced dst
+    /// mapping retires), so the next open off the moved dentry
+    /// resolves instead of failing `ENOENT` on the gone src path.
     pub fn rename_at(
         &self,
         parent_ino: u64,
@@ -1345,10 +1349,13 @@ where
         let from = join(&self.inode_path(parent_ino)?, name);
         let to = join(&self.inode_path(new_parent_ino)?, new_name);
         self.submit(MutationKind::Rename {
-            from,
-            to,
+            from: from.clone(),
+            to: to.clone(),
             no_replace,
         })?;
+        if let Ok(mut inodes) = self.inodes.write() {
+            inodes.renamed(&from, &to);
+        }
         Ok(())
     }
 

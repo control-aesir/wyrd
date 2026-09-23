@@ -208,6 +208,26 @@ impl InodeTable {
         }
     }
 
+    /// Rebind after a rename: the mapping that named `from` now names
+    /// `to` — the kernel moves the src dentry, ino included, onto the
+    /// dst name, so the next open presents the src ino for the dst
+    /// path — and whatever named `to` retires, since its identity died
+    /// with the rename. Without this the table still maps that ino at
+    /// the gone src path and the open fails `ENOENT` until the entry
+    /// cache expires. A same-path rename changes nothing.
+    pub(super) fn renamed(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        self.retire_path(to);
+        if let Some(ino) = self.by_path.remove(from) {
+            if let Some(entry) = self.by_ino.get_mut(&ino) {
+                entry.path = to.to_string();
+            }
+            self.by_path.insert(to.to_string(), ino);
+        }
+    }
+
     /// The ino for a freshly resolved path: reuse the mapping when it
     /// still names the same kind (refreshing its validated
     /// generation), otherwise retire the stale ino and mint a new one.

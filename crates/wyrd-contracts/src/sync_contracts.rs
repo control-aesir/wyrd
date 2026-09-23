@@ -15,9 +15,11 @@ use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::authorization::{Classification, Rejection, SnapshotDag};
 use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
+use wyrd_sync::control::{CapabilityPayload, Message};
 use wyrd_sync::durable::DurableError;
 use wyrd_sync::ingest::Limits;
-use wyrd_sync::keys::DeviceIdentitySecret;
+use wyrd_sync::keys::capability::Capability;
+use wyrd_sync::keys::{DeviceIdentitySecret, EpochSecret};
 use wyrd_sync::membership::{MembershipLog, TransitionStatus};
 use wyrd_sync::runtime::{
     Engine, EngineError, RoutePublishing, RouteReport, RuntimeState,
@@ -30,9 +32,9 @@ use wyrd_sync::transport::mailbox::{
 };
 
 use crate::support::{
-    device, drive, mount_heads, scratch_dir, seal_flat_drive, sign_snapshot, sign_transition,
-    signed_snapshot, signed_transition, AnnouncedRoots, Loaded, Relay, RemoteOnlyMaterialization,
-    Rig,
+    device, drive, mount_heads, scratch_dir, seal_flat_drive, sealed_envelope, sign_snapshot,
+    sign_transition, signed_snapshot, signed_transition, AnnouncedRoots, Loaded, Relay,
+    RemoteOnlyMaterialization, Rig,
 };
 use zeroize::Zeroizing;
 
@@ -767,6 +769,250 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     drop(live_b);
     drop(backend_b);
     rig.teardown();
+    std::fs::remove_dir_all(dir_b).unwrap();
+}
+
+/// Install one epoch capability on an engine through its relay: mint
+/// from the fully observed chain, wrap, seal under the covered
+/// epoch's control key, queue, and drain. Mirrors the join owner
+/// setup; used where the rig's admit-scoped helper cannot reach
+/// (capabilities past the admission epoch). Returns the drain
+/// report: callers draining a fresh relay see the whole backlog
+/// land, not just the capability.
+fn install_capability(
+    engine: &mut Engine,
+    relay: &mut Relay,
+    rig: &Rig,
+    transition: &MembershipTransition,
+    secrets: &[EpochSecret],
+    recipient: wyrd_format::DeviceId,
+) -> wyrd_sync::runtime::DrainReport {
+    let mut log = MembershipLog::new(drive());
+    log.observe(rig.genesis.clone());
+    log.observe(rig.admit.clone());
+    if transition.transition_id() != rig.admit.transition_id() {
+        log.observe(transition.clone());
+    }
+    let state = log
+        .state_of(&transition.transition_id())
+        .expect("the observed chain carries its state");
+    let registered = state
+        .encryption_key_of(&recipient)
+        .copied()
+        .expect("recipient registered");
+    let cap = Capability::new(
+        drive(),
+        recipient,
+        registered,
+        transition.transition_id(),
+        transition.epoch,
+        secrets.to_vec(),
+    )
+    .unwrap();
+    let covered = cap.up_to_epoch();
+    relay.queue([sealed_envelope(
+        &rig.owner.identity,
+        recipient,
+        &secrets[covered as usize - 1],
+        covered,
+        &Message::Capability(CapabilityPayload {
+            device: recipient,
+            epoch: covered,
+            wrapped: cap.wrap().unwrap().as_bytes().to_vec(),
+        }),
+    )]);
+    engine.drain(relay).unwrap()
+}
+
+/// Namespace continuity across members through a transition: the
+/// owner writes a file, stages, observes a rotation, and drains the
+/// carry; the member observes the rotation, fetches the carry, and
+/// serves the pre-transition file at the new epoch. The member
+/// needs both bodies — the carry's parent must be observed — while
+/// the pre-transition snapshot alone could never serve past the
+/// epoch advance, so serving afterwards proves the carry converged.
+#[test]
+fn carry_publication_converges_across_members() {
+    let mut rig = Rig::new();
+    let rotate = epoch3_child(&rig);
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone(), rig.epoch3.clone()];
+
+    // Owner engine over its own scratch dir, holding all three
+    // epoch control keys.
+    let dir_a = scratch_dir("carry-owner");
+    let mut engine_a = Engine::open(
+        dir_a.clone(),
+        drive(),
+        rig.owner.id,
+        "contracts",
+        rig.owner.identity.clone(),
+        rig.owner.encryption.clone(),
+    )
+    .unwrap();
+    for (epoch, secret) in [(1u64, &rig.epoch1), (2, &rig.epoch2), (3, &rig.epoch3)] {
+        engine_a.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive(), epoch)));
+    }
+    // Owner observes genesis + admit (sealed under epoch 1, held)
+    // and installs its epoch-2 self capability.
+    let mut relay_a = Relay::new();
+    rig.enqueue_transition_for(&rig.genesis.clone(), 1, rig.owner.id, &mut relay_a);
+    rig.enqueue_transition_for(&rig.admit.clone(), 1, rig.owner.id, &mut relay_a);
+    assert_eq!(engine_a.drain(&mut relay_a).unwrap().accepted, 2);
+    assert_eq!(
+        install_capability(
+            &mut engine_a,
+            &mut relay_a,
+            &rig,
+            &rig.admit.clone(),
+            &secrets[..2],
+            rig.owner.id,
+        )
+        .accepted,
+        1,
+        "the epoch-2 capability installs"
+    );
+
+    // Owner writes, stages, observes the rotation, installs epoch
+    // 3, and drains the carry.
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"kept").unwrap();
+    let tree = Tree::from_entries(vec![Entry::file("kept.txt", 4, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let first = engine_a.author_snapshot(&objects, tree).unwrap();
+    assert_eq!(engine_a.stage_carry_heads().unwrap(), 1);
+    rig.enqueue_transition_for(&rotate, 1, rig.owner.id, &mut relay_a);
+    assert_eq!(
+        engine_a.drain(&mut relay_a).unwrap().accepted,
+        1,
+        "rotation lands"
+    );
+    assert_eq!(
+        install_capability(
+            &mut engine_a,
+            &mut relay_a,
+            &rig,
+            &rotate,
+            &secrets,
+            rig.owner.id,
+        )
+        .accepted,
+        1,
+        "the epoch-3 capability installs"
+    );
+    let report = engine_a.carry_pending(&objects).unwrap();
+    assert_eq!(report.authored.len(), 1, "one staged head, one carry");
+    let carry = report.authored[0].clone();
+    assert_eq!(
+        carry.snapshot().parents,
+        vec![first.snapshot().snapshot_id()],
+        "the carry extends the pre-transition head"
+    );
+
+    // Member B: the recipient engine over its own scratch dir. It is
+    // told genesis/admit/epoch 1-2 up front but never sees the
+    // pre-transition snapshot.
+    let recipient = rig.recipient.id;
+    let dir_b = scratch_dir("carry-member");
+    let mut engine_b = Engine::open(
+        dir_b.clone(),
+        drive(),
+        recipient,
+        "contracts",
+        rig.recipient.identity.clone(),
+        rig.recipient.encryption.clone(),
+    )
+    .unwrap();
+    for (epoch, secret) in [(1u64, &rig.epoch1), (2, &rig.epoch2), (3, &rig.epoch3)] {
+        engine_b.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive(), epoch)));
+    }
+    let mut relay_b = Relay::new();
+    rig.enqueue_transition_for(&rig.genesis.clone(), 1, recipient, &mut relay_b);
+    rig.enqueue_transition_for(&rig.admit.clone(), 1, recipient, &mut relay_b);
+    rig.enqueue_capability_for(&rig.admit.clone(), &secrets[..2], recipient, &mut relay_b);
+    rig.enqueue_transition_for(&rotate, 1, recipient, &mut relay_b);
+    assert_eq!(
+        install_capability(
+            &mut engine_b,
+            &mut relay_b,
+            &rig,
+            &rotate,
+            &secrets,
+            recipient,
+        )
+        .accepted,
+        5,
+        "genesis, admit, capability, rotation, capability"
+    );
+    let daemon_b: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine_b, MemoryObjectStore::default()).unwrap();
+    let (mut live_b, parts_b) = daemon_b
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let backend_b = serving_backend(parts_b);
+
+    // Owner composes for announce + serve. The head goes first,
+    // alone: at epoch 3 it is superseded on arrival, so B must not
+    // serve it — the shape of the bug this carry fixes.
+    let mut daemon_a: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine_a, objects).unwrap();
+    let sent = daemon_a
+        .announce_snapshot(&first, &mut relay_b, None)
+        .unwrap();
+    assert_eq!(sent, 1, "the owner announces the head to its peer");
+    let mut peer = VaultPeer(daemon_a.serve().unwrap());
+    let report = live_b.sync_once(&mut relay_b, Some(&mut peer)).unwrap();
+    assert_eq!(report.drained.accepted, 1, "the head announcement lands");
+    assert_eq!(report.fetched.snapshot_bodies, 1, "the head body commits");
+    assert!(
+        matches!(backend_b.open_at("kept.txt"), Err(fuser::Errno::ENOENT)),
+        "a childless old head never serves past the epoch advance"
+    );
+
+    // Then the carry: B fetches it, and the pre-transition file
+    // serves at the new epoch.
+    let sent = daemon_a
+        .announce_snapshot(&carry, &mut relay_b, None)
+        .unwrap();
+    assert_eq!(sent, 1, "the owner announces the carry to its peer");
+    let report = live_b.sync_once(&mut relay_b, Some(&mut peer)).unwrap();
+    assert_eq!(report.drained.accepted, 1, "the carry announcement lands");
+    assert_eq!(report.fetched.snapshot_bodies, 1, "the carry body commits");
+
+    // Demand + pass 2: the pre-transition file serves at the new
+    // epoch on a drive that never held its snapshot.
+    let tree_id = carry.snapshot().tree;
+    let chunks = {
+        let store = backend_b.store_handle().unwrap();
+        let store = store.read().unwrap();
+        let tree_bytes = store
+            .get(&tree_id)
+            .unwrap()
+            .expect("the root tree fetched structurally");
+        Tree::decode(&tree_bytes)
+            .unwrap()
+            .entries()
+            .iter()
+            .flat_map(|entry| match &entry.content {
+                EntryContent::File { chunks, .. } => chunks.clone(),
+                EntryContent::Dir { .. } | EntryContent::Symlink { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(chunks.len(), 1, "one flat file chunk");
+    for chunk in &chunks {
+        live_b.want(*chunk).unwrap();
+    }
+    live_b.sync_once(&mut relay_b, Some(&mut peer)).unwrap();
+    let handle = backend_b.open_at("kept.txt").expect("the carry serves");
+    assert_eq!(backend_b.read_handle(handle, 0, 64).unwrap(), b"kept");
+
+    drop(daemon_a);
+    drop(live_b);
+    drop(backend_b);
+    rig.teardown();
+    std::fs::remove_dir_all(dir_a).unwrap();
     std::fs::remove_dir_all(dir_b).unwrap();
 }
 

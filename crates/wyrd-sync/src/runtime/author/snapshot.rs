@@ -55,11 +55,12 @@ where
 }
 
 /// Author over explicit parents: the carry path re-carries history at
-/// a new epoch with no parents (the empty subset the local-write rule
-/// permits), which the eligible-head computation could never produce
-/// once the epoch advanced. Every check below still applies: the root
-/// must verify, the author must be a member of the canonical state,
-/// and the manifests must correspond.
+/// a new epoch parenting onto the carried head (which the
+/// eligible-head computation could never produce once the epoch
+/// advanced — the fixed point sustains head and carry together).
+/// Every check below still applies: the root must verify, the
+/// author must be a member of the canonical state, and the
+/// manifests must correspond.
 pub(crate) fn author_with_parents<S: ObjectStore>(
     engine: &mut Engine,
     objects: &S,

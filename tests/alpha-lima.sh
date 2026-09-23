@@ -94,6 +94,16 @@ expect_fail2() {
   pass "$name fails closed (exit 2, error: ...)"
 }
 
+# expect_usage2 <log-name> <cmd...>: exit 2 with a usage error
+# (the complement of expect_fail2: here a bad invocation IS the case).
+expect_usage2() {
+  local name="$1"; shift
+  expect_exit 2 "$name" "$@" >/dev/null
+  grep -qE "Usage:|unexpected argument" "$LOGDIR/$name.stderr" \
+    || die "$name: expected a usage error"
+  pass "$name refused as a usage error (exit 2)"
+}
+
 # Credential factories. Secrets stay in files plus shell vars for the
 # leak check; they never reach logs (asserted per step).
 gen_identity() { # <out>: 32 random bytes as 64 hex chars, mode 600
@@ -395,6 +405,68 @@ step4_member() {
       "$(cat "$nc2/identity")" "$(cat "$nc2/passphrase")"
   done
 }
+# --- step 5: offline export ----------------------------------------------
+
+step5_export() {
+  step 5 "offline export"
+  local od="$DRIVES/owner" oc="$CREDS/owner"
+
+  # Export while mounted: the offline egress path reads the drive
+  # directly, and the tree must match the live mount exactly. (No
+  # divergent heads exist single-device, so no `name@N` siblings.)
+  start_mount export "$oc" "$od" "$MNTS/export"
+
+  # Offline commands take the store lock: exporting under a live
+  # mount refuses instead of reading a moving drive.
+  expect_fail2 step5-locked \
+    with_creds "$oc" export "$od" "$E2E_ROOT/export-locked"
+  grep -q "another process holds" "$LOGDIR/step5-locked.stderr" \
+    || die "locked-store refusal unexplained"
+  [[ -e "$E2E_ROOT/export-locked" ]] && die "refused export wrote output"
+
+  # Snapshot the live tree (listing, checksums, modes), then export
+  # offline after unmount and compare exactly.
+  (cd "$MNTS/export" && find . | sort > "$LOGDIR/tree.list")
+  (cd "$MNTS/export" && find . -type f -exec md5sum {} + | sort -k2 > "$LOGDIR/tree.md5")
+  (cd "$MNTS/export" && find . -type f -perm -111 | sort > "$LOGDIR/tree.exec")
+  stop_mount export INT
+
+  expect_exit 0 step5-export \
+    with_creds "$oc" export "$od" "$E2E_ROOT/export1" >/dev/null
+  pass "export materializes a plain tree"
+  (cd "$E2E_ROOT/export1" && find . | sort) | diff "$LOGDIR/tree.list" - \
+    || die "export listing differs from the live mount"
+  (cd "$E2E_ROOT/export1" && find . -type f -exec md5sum {} + | sort -k2) \
+    | diff "$LOGDIR/tree.md5" - || die "export content differs from the live mount"
+  (cd "$E2E_ROOT/export1" && find . -type f -perm -111 | sort) \
+    | diff "$LOGDIR/tree.exec" - || die "export modes differ from the live mount"
+  pass "export matches the live mount (listing, content, exec bits)"
+
+  # A refused export modifies nothing: snapshot the tree, refuse,
+  # compare.
+  cp -r "$E2E_ROOT/export1" "$E2E_ROOT/export1-copy"
+  expect_fail2 step5-populated \
+    with_creds "$oc" export "$od" "$E2E_ROOT/export1"
+  diff -r "$E2E_ROOT/export1" "$E2E_ROOT/export1-copy" \
+    || die "refused export modified the destination"
+  pass "populated destination refused, tree untouched"
+
+  expect_usage2 step5-no-relay \
+    with_creds "$oc" export --relay ws://127.0.0.1:1 "$od" "$E2E_ROOT/export2"
+
+  # A failed run leaves no partial tree behind.
+  mkdir -p "$E2E_ROOT/ro" && chmod 555 "$E2E_ROOT/ro"
+  expect_fail2 step5-unwritable \
+    with_creds "$oc" export "$od" "$E2E_ROOT/ro/out"
+  [[ -e "$E2E_ROOT/ro/out" ]] && die "failed export left a partial tree"
+  pass "failed export leaves no partial tree"
+  chmod 755 "$E2E_ROOT/ro"
+
+  local f
+  for f in "$LOGDIR"/step5-*.stderr "$LOGDIR"/mount-export.err; do
+    check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")"
+  done
+}
 main() {
   # Fresh slate every run: steps build on each other within one run, and a
   # previous partial run must never leak state into the next. Unmount
@@ -410,6 +482,7 @@ main() {
   if [[ $run_all -eq 1 || "$only" == "2" ]]; then step2_mount; fi
   if [[ $run_all -eq 1 || "$only" == "3" ]]; then step3_matrix; fi
   if [[ $run_all -eq 1 || "$only" == "4" ]]; then step4_member; fi
+  if [[ $run_all -eq 1 || "$only" == "5" ]]; then step5_export; fi
   echo "e2e: $PASS_COUNT checks passed"
 }
 

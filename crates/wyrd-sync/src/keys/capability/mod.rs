@@ -4,6 +4,8 @@ pub(crate) mod encoding;
 pub(crate) mod envelope;
 mod model;
 #[cfg(test)]
+mod properties;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use model::ecdh_shared;

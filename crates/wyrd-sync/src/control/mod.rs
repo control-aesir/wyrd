@@ -364,11 +364,19 @@ impl ControlInbox {
         self.keys.insert(epoch, key);
     }
 
-    /// Ingest sealed bytes: decode, scope to this drive, open with the
-    /// held epoch key, dedupe. Error precedence is framing first
-    /// (version, drive), then epoch key, then crypto; dedupe runs last.
-    /// Wrong-drive, unknown-epoch, and crypto failures are errors that
-    /// mutate nothing.
+    /// Ingest sealed bytes: decode, scope to this drive, consult the
+    /// suppression cache, open with the held epoch key, dedupe. Error
+    /// precedence is framing first (version, drive), then epoch key,
+    /// then remembered suppression, then crypto; seen-dedupe runs
+    /// last. Wrong-drive, unknown-epoch, and crypto failures are
+    /// errors that mutate nothing.
+    ///
+    /// The suppression check sits ahead of the AEAD open on purpose:
+    /// the dedupe id covers the sealed bytes, so a remembered terminal
+    /// verdict needs no crypto to re-apply — a suppressed redelivery
+    /// costs one hash, never an open. Seen-dedupe stays after the
+    /// open so a redelivery for an epoch whose key was removed still
+    /// reports UnknownEpoch rather than Duplicate.
     pub fn ingest(&mut self, sealed_bytes: &[u8]) -> Result<IngestReport, ControlError> {
         let sealed = SealedControl::decode(sealed_bytes)?;
         if sealed.version != CONTROL_VERSION {
@@ -381,17 +389,22 @@ impl ControlInbox {
             .keys
             .get(&sealed.epoch)
             .ok_or(ControlError::UnknownEpoch(sealed.epoch))?;
-        let (_, _, message) = open(key, &sealed)?;
+        // Suppressed before opened: the id is over the sealed bytes,
+        // so the verdict is stable across the open boundary and the
+        // same bytes revalidate to the same outcome either way. The
+        // id computes once and serves both the suppression lookup
+        // and the seen insert below.
         let id = sealed.message_id();
+        if self.suppressed.contains(&id) {
+            return Ok(IngestReport::Duplicate);
+        }
+        let (_, _, message) = open(key, &sealed)?;
         // A remembered suppression verdict short-circuits before the
         // seen insert: the same bytes revalidate to the same outcome,
         // and touching `seen` here would pin an id with no durable
         // fact past its verdict's eviction. Durable-tracked ids are
         // checked next; an id is never in both sets — suppressing
         // removes it from `seen`.
-        if self.suppressed.contains(&id) {
-            return Ok(IngestReport::Duplicate);
-        }
         if !self.seen.insert(id) {
             return Ok(IngestReport::Duplicate);
         }
@@ -686,6 +699,47 @@ mod tests {
         assert!(
             matches!(inbox.ingest(&first), Ok(IngestReport::Accepted { .. })),
             "evicted verdict ingests fresh, no stale seen-Duplicate"
+        );
+    }
+
+    /// A remembered suppression verdict applies before the AEAD open:
+    /// the same suppressed id under a wrong epoch key reports
+    /// Duplicate, never a crypto failure. Suppressed redeliveries cost
+    /// one hash over the sealed bytes, not one open — the budget rule
+    /// that keeps replay storms cheap.
+    #[test]
+    fn suppressed_verdict_applies_before_the_aead_open() {
+        let mut inbox = inbox();
+        let envelope = seal(
+            &control_key(5),
+            &drive(),
+            5,
+            &Message::MembershipTransition(TransitionPayload {
+                transition: vec![0x5A],
+            }),
+        )
+        .unwrap();
+        let id = match inbox.ingest(&envelope.encode()) {
+            Ok(IngestReport::Accepted { id, .. }) => id,
+            other => panic!("ingest accepts openable bytes, got {other:?}"),
+        };
+        inbox.suppress(&id);
+        // Same remembered verdict, wrong key: suppression wins
+        // without spending the open.
+        let mut wrong = ControlInbox::new(drive());
+        wrong.add_epoch_key(5, Zeroizing::new([0x99; 32]));
+        wrong.suppress(&id);
+        assert_eq!(
+            wrong.ingest(&envelope.encode()),
+            Ok(IngestReport::Duplicate)
+        );
+        // Sanity: without the remembered verdict the wrong key fails
+        // the tag, so the test proves precedence, not openability.
+        let mut fresh = ControlInbox::new(drive());
+        fresh.add_epoch_key(5, Zeroizing::new([0x99; 32]));
+        assert_eq!(
+            fresh.ingest(&envelope.encode()),
+            Err(ControlError::Crypto(CryptoError::OpenFailed))
         );
     }
 

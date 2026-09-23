@@ -4,7 +4,10 @@
 use super::*;
 
 use wyrd_format::membership::Admission;
-use wyrd_format::Change;
+use wyrd_format::membership::{
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
+use wyrd_format::{Change, DeviceId};
 
 use crate::keys::{DeviceEncryptionSecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, Builder};
@@ -87,6 +90,63 @@ fn chain3(c: &Chain) -> Vec<MembershipTransition> {
         c.admit_sender.clone(),
         c.admission.clone(),
     ]
+}
+
+#[test]
+fn rotation_with_substituted_transition_suppresses() {
+    // The wrap is genuinely bound to the epoch-3 admission, but the
+    // delivery carries a same-epoch sibling (a Rotate over the
+    // pre-admission state) instead. Epoch and limits agree, the
+    // unwrap succeeds — and then the transition↔capability binding
+    // check refuses the pairing: a wrap never authorizes a
+    // transition it was not minted for.
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let c = chain(device);
+    let wrapped = mint_wrap(&chain3(&c), &c.admission, device, secrets(3));
+
+    // Same-epoch sibling of the admission: Rotate keeps the
+    // pre-admission sets, so the roots stay consistent and the
+    // delivery passes every structural gate before the binding.
+    let mut scratch = MembershipLog::new(member_drive());
+    scratch.observe(c.genesis.clone());
+    scratch.observe(c.admit_sender.clone());
+    let pre = scratch
+        .state_of(&c.admit_sender.transition_id())
+        .expect("admit_sender is valid");
+    let members: Vec<DeviceId> = pre.members.iter().copied().collect();
+    let owners: Vec<DeviceId> = pre.owners.iter().copied().collect();
+    let readers: Vec<DeviceId> = pre.readers.iter().copied().collect();
+    let mut rival = c.admission.clone();
+    rival = rival.with_changes(vec![Change::Rotate]).unwrap();
+    rival.members_root = set_root(MEMBER_SET_CONTEXT, &members).unwrap();
+    rival.owners_root = set_root(OWNER_SET_CONTEXT, &owners).unwrap();
+    rival.readers_root = set_root(READER_SET_CONTEXT, &readers).unwrap();
+    // No signature: the binding check precedes any chain observation,
+    // so an unsigned sibling exercises exactly the refused pairing.
+
+    let rotation = rotation_delivery(&fixture, 3, &rival, wrapped);
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&c.genesis)),
+        deliver(&fixture, 2, &transition_message(&c.admit_sender)),
+        rotation,
+    ];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    // Two commits (the genuine transitions) plus one suppression
+    // (the substituted delivery): suppression consumes without
+    // committing.
+    assert_eq!(report.accepted, 3);
+    assert!(
+        !fixture.engine.log.contains(&rival.transition_id()),
+        "the substituted transition never reaches the log"
+    );
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.transitions.len(), 2);
+    assert!(
+        facts.capabilities.is_empty(),
+        "no capability installs off a substituted binding"
+    );
 }
 
 #[test]

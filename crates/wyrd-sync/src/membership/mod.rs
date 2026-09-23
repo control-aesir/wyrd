@@ -8,8 +8,11 @@
 //! detects conflicts; and advances state only through explicit, owner-
 //! signed resolution transitions.
 //!
-//! v0 note: classification recomputes per query (no incremental memo).
-//! Fine at log scale; optimize only with evidence.
+//! v0 note: classification memoizes per observed set (see
+//! [`MembershipLog::analysed`]): one input message batch costs one
+//! analysis no matter how many verdicts it reads, and `observe` is the
+//! only mutation, so invalidation is a single assignment. Optimize
+//! further only with evidence.
 
 mod chain;
 mod state;
@@ -24,6 +27,9 @@ mod conformance;
 #[cfg(test)]
 mod properties;
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId};
 
@@ -159,6 +165,18 @@ pub struct KnownState {
 pub struct MembershipLog {
     drive: DriveId,
     transitions: HashMap<TransitionId, MembershipTransition>,
+    /// The last classification of the current observed set. Every read
+    /// path goes through [`MembershipLog::analysed`], which serves this
+    /// cache while the set is unchanged: intake reads several verdicts
+    /// per message, so without the cache one drain batch would cost
+    /// one full traversal per verdict. `observe` is the only mutation
+    /// and drops the cache, so a served analysis always matches the
+    /// set it was computed over.
+    analysis: RefCell<Option<chain::Analysis>>,
+    /// Test seam for the intake budget audit: counts full analyses so
+    /// a test can prove repeated verdict reads cost one traversal.
+    #[cfg(test)]
+    analyses_run: Cell<usize>,
 }
 
 impl MembershipLog {
@@ -166,6 +184,9 @@ impl MembershipLog {
         MembershipLog {
             drive,
             transitions: HashMap::new(),
+            analysis: RefCell::new(None),
+            #[cfg(test)]
+            analyses_run: Cell::new(0),
         }
     }
 
@@ -177,7 +198,26 @@ impl MembershipLog {
     pub fn observe(&mut self, t: MembershipTransition) -> TransitionId {
         let id = t.transition_id();
         self.transitions.insert(id, t);
+        // The only mutation: every cached verdict may be stale.
+        self.analysis.borrow_mut().take();
         id
+    }
+
+    /// One classification of the current observed set, memoized: the
+    /// first read after an `observe` runs the full traversal and every
+    /// later read shares the cached maps until the set changes again.
+    /// The closure runs under the cache borrow, so reads copy only
+    /// the verdict they return — never the whole maps — while no
+    /// caller can hold the cache across an `observe`.
+    fn with_analysis<R>(&self, f: impl FnOnce(&chain::Analysis) -> R) -> R {
+        if self.analysis.borrow().is_none() {
+            #[cfg(test)]
+            self.analyses_run.set(self.analyses_run.get() + 1);
+            *self.analysis.borrow_mut() = Some(chain::analyse(self));
+        }
+        let cached = self.analysis.borrow();
+        let analysis = cached.as_ref().expect("populated above");
+        f(analysis)
     }
 
     /// Whether the id is in the observed set.
@@ -200,10 +240,15 @@ impl MembershipLog {
     /// `None`.
     pub fn authoritative(&self, id: &TransitionId) -> Option<Authorizable<'_>> {
         let transition = self.transitions.get(id)?;
-        let analysis = chain::analyse(self);
-        match analysis.states.get(id).cloned() {
+        let (state, status) = self.with_analysis(|analysis| {
+            (
+                analysis.states.get(id).cloned(),
+                analysis.status.get(id).copied(),
+            )
+        });
+        match state {
             Some(state) => Some(Authorizable::Valid(transition, state)),
-            None => match analysis.status.get(id) {
+            None => match status {
                 Some(TransitionStatus::Pending) => Some(Authorizable::Pending),
                 // Every observed transition is classified; a
                 // classification without a derived state can never
@@ -228,8 +273,9 @@ impl MembershipLog {
         ids
     }
 
-    /// Classify a transition against the observed set. Each call runs a
-    /// full analysis; callers needing many verdicts should prefer
+    /// Classify a transition against the observed set. Served from the
+    /// memoized analysis while the observed set is unchanged; callers
+    /// needing many verdicts should still prefer
     /// [`MembershipLog::statuses`].
     ///
     /// `None` covers unobserved ids — and, defensively, observed ids
@@ -249,26 +295,24 @@ impl MembershipLog {
         if FORCE_UNCLASSIFIED.with(|flag| flag.get()) {
             return None;
         }
-        let analysis = chain::analyse(self);
-        analysis.status.get(id).copied()
+        self.with_analysis(|analysis| analysis.status.get(id).copied())
     }
 
     /// All verdicts from one analysis pass. Prefer this over repeated
-    /// [`MembershipLog::status`] calls — each of those re-analyses the
-    /// whole observed set.
+    /// [`MembershipLog::status`] calls when reading many verdicts —
+    /// one map serves every lookup.
     pub fn statuses(&self) -> HashMap<TransitionId, TransitionStatus> {
-        chain::analyse(self).status
+        self.with_analysis(|analysis| analysis.status.clone())
     }
 
     /// The canonical tip's state, or `None` while the log has no unique
     /// canonical chain (e.g. a genesis conflict).
     pub fn known_state(&self) -> Option<KnownState> {
-        let analysis = chain::analyse(self);
-        let tip = analysis.canonical.last()?;
-        let t = self.transitions.get(tip)?;
+        let tip = self.with_analysis(|analysis| analysis.canonical.last().copied())?;
+        let t = self.transitions.get(&tip)?;
         Some(KnownState {
             epoch: t.epoch,
-            transition_id: *tip,
+            transition_id: tip,
             members_root: t.members_root,
             owners_root: t.owners_root,
             readers_root: t.readers_root,
@@ -278,13 +322,13 @@ impl MembershipLog {
     /// The epoch at which membership evaluation is frozen by an unresolved
     /// conflict, or `None` when the canonical chain is unobstructed.
     pub fn frozen_at(&self) -> Option<u64> {
-        chain::analyse(self).frozen_at
+        self.with_analysis(|analysis| analysis.frozen_at)
     }
 
     /// The derived member/owner sets of a valid transition (canonical,
     /// contested, or voided alike — all are valid history).
     pub fn state_of(&self, id: &TransitionId) -> Option<MembershipState> {
-        chain::analyse(self).states.get(id).cloned()
+        self.with_analysis(|analysis| analysis.states.get(id).cloned())
     }
 
     /// The member set of a valid transition.
@@ -309,7 +353,7 @@ impl MembershipLog {
     /// bounded transition as evidence), so selecting by shape alone
     /// can anchor to bytes no invitee accepts.
     pub fn canonical_genesis(&self) -> Option<TransitionId> {
-        chain::analyse(self).canonical.first().copied()
+        self.with_analysis(|analysis| analysis.canonical.first().copied())
     }
 
     /// Whether the device was ever admitted on the canonical chain:

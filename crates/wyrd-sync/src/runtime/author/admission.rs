@@ -3,6 +3,7 @@ use wyrd_format::membership::{
 };
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
+use super::common::escrow_fresh_secret;
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
@@ -228,6 +229,12 @@ fn admit(
         epoch,
         Zeroizing::new(secret.control_key(&engine.drive, epoch)),
     );
+    // Mint-time escrow (T13), after the key install: the sidecar
+    // lands only after the admission batch commits (commit-then-
+    // escrow), and an escrow failure must never drop the held key —
+    // the install above is infallible memory state, the persist
+    // below is fallible disk state.
+    escrow_fresh_secret(engine, epoch, &secret)?;
     Ok(AdmitOutcome {
         transition,
         invitation,

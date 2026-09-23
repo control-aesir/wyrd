@@ -11,10 +11,54 @@ use wyrd_format::MembershipTransition;
 
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
-use crate::keys::EpochSecret;
+use crate::keys::{escrow, EpochSecret};
 use crate::membership::MembershipState;
 use crate::runtime::engine::{Engine, EngineError};
 use zeroize::Zeroizing;
+
+/// Wrap the transition's fresh epoch secret under the owner's root
+/// and persist the keystore sidecar (T13). Owner engines opened
+/// through the keystore always hold the root; member engines and
+/// keystoreless opens hold none and escrow nothing — escrow is a
+/// custody function, and custody lives in the keystore flow.
+/// Production owner drives always open via the keystore, so authoring
+/// without a root is a test-only shape, never a silent production
+/// gap: the sidecar set simply covers the keystored epochs.
+///
+/// Backfill: any committed epoch below this one whose sidecar is
+/// missing (a commit-then-escrow crash window, or a failed persist)
+/// heals now from the keyring's held secrets, so the recovery hole
+/// lasts until the next authoring, not forever. Present sidecars are
+/// never rewritten — a present record is the mint's own seal, and
+/// keyring material must never overwrite custody (a conflicting
+/// present record fails closed at open instead).
+pub(super) fn escrow_fresh_secret(
+    engine: &Engine,
+    epoch: u64,
+    secret: &EpochSecret,
+) -> Result<(), EngineError> {
+    let Some(root) = engine.root.as_ref() else {
+        return Ok(());
+    };
+    let drive = engine.drive();
+    let dir = engine.store.dir().to_path_buf();
+    let rebuilt = engine.store.rebuild(engine.device())?;
+    for past in 2..epoch {
+        if escrow::load_record(&dir, past)?.is_some() {
+            continue;
+        }
+        let held = rebuilt
+            .keyring
+            .secret(past)
+            .cloned()
+            .ok_or(EngineError::MissingEpochSecret(past))?;
+        let record = escrow::wrap(&root.escrow_key(&drive, past), &drive, past, &held)?;
+        escrow::persist_record(&dir, &record)?;
+    }
+    let record = escrow::wrap(&root.escrow_key(&drive, epoch), &drive, epoch, secret)?;
+    escrow::persist_record(engine.store.dir(), &record)?;
+    Ok(())
+}
 
 /// Commit a signed membership transition: stage it against a cloned
 /// log (the live log stays pristine until the batch commits, so any
@@ -87,5 +131,20 @@ pub(super) fn commit_new_epoch(
             Zeroizing::new(secret.control_key(&engine.drive(), epoch)),
         );
     }
+    // Mint-time escrow (T13), after the key install: the fresh
+    // secret seals under the root only after the transition commits
+    // (commit-then-escrow), and an escrow failure must never drop a
+    // held key. Escrow failure reports loudly; the commit already
+    // happened, so the caller retries at a new epoch, never by
+    // rewriting this one.
+    //
+    // A crash or I/O error in that window leaves a committed epoch
+    // with no sidecar — the degraded recovery state. It heals on
+    // the next authoring: `escrow_fresh_secret` backfills missing
+    // sidecars below the new epoch from the keyring, so the hole
+    // lasts until the next mint, not forever. Meanwhile keyring
+    // catch-up serves ordinary operation; only root-alone recovery
+    // of that epoch waits for the backfill.
+    escrow_fresh_secret(engine, epoch, &secret)?;
     Ok(post)
 }

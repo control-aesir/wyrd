@@ -560,3 +560,31 @@ fn handle_mode_change_preserves_content() {
     drop(backend);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Offset-plus-length overflow fails at the API boundary (`EFBIG`).
+/// Through real syscalls the kernel preempts with `EINVAL` before FUSE
+/// is reached, so the Lima suite pins `EINVAL` while this test pins the
+/// mount's own checked arithmetic.
+#[test]
+fn write_offset_overflow_is_efbig() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, _ino, _) = backend.create_at(1, "o.txt", libc::O_RDWR).unwrap();
+    assert_eq!(
+        backend.write_handle(fh, u64::MAX - 4, b"12345678"),
+        Err(fuser::Errno::EFBIG)
+    );
+    backend.release_handle(fh).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}

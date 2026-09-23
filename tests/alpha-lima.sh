@@ -288,13 +288,120 @@ step3_matrix() {
   check_no_leaks "$LOGDIR/matrix.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# --- step 4: offline member/device ---------------------------------------
+
+step4_member() {
+  step 4 "offline member/device"
+  local od="$DRIVES/owner" oc="$CREDS/owner"
+  local ndr="$DRIVES/newcomer" nc="$CREDS/newcomer"
+  mkdir -p "$nc" "$ndr"
+  gen_identity "$nc/identity"; gen_passphrase "$nc/passphrase"
+  local n_identity n_passphrase
+  n_identity="$(cat "$nc/identity")"; n_passphrase="$(cat "$nc/passphrase")"
+
+  # The newcomer dir starts empty (no init): pairing stages member
+  # state, and join fills it. Joining an init'd owner home refuses.
+  expect_exit 0 step4-pairing \
+    with_creds "$nc" device "$ndr" pairing-request "$E2E_ROOT/pairing.txt" >/dev/null
+  pass "pairing-request stages material in an empty dir"
+  expect_exit 0 step4-pairing-stable \
+    with_creds "$nc" device "$ndr" pairing-request "$E2E_ROOT/pairing2.txt" >/dev/null
+  cmp -s "$E2E_ROOT/pairing.txt" "$E2E_ROOT/pairing2.txt" \
+    || die "pairing re-run changed the key"
+  pass "pairing re-run returns the same key"
+  local dev key
+  dev="$(awk '/^device /{print $2}' "$E2E_ROOT/pairing.txt")"
+  key="$(awk '/^encryption-key /{print $2}' "$E2E_ROOT/pairing.txt")"
+  [[ "${#dev}" == 64 && "${#key}" == 64 ]] || die "pairing material malformed"
+
+  expect_exit 0 step4-invite \
+    with_creds "$oc" member "$od" invite "$dev" "$key" "$E2E_ROOT/invitation" >/dev/null
+  [[ -f "$E2E_ROOT/invitation" ]] || die "invite wrote no invitation file"
+  pass "invite admits the device and seals an invitation"
+
+  # The destination is claimed before the commit: inviting a second
+  # device onto an existing file refuses with no transition authored.
+  local nc2="$CREDS/newcomer-b" ndr2="$DRIVES/newcomer-b"
+  mkdir -p "$nc2" "$ndr2"
+  gen_identity "$nc2/identity"; gen_passphrase "$nc2/passphrase"
+  expect_exit 0 step4-pairing-b \
+    with_creds "$nc2" device "$ndr2" pairing-request "$E2E_ROOT/pairing-b.txt" >/dev/null
+  local dev_b key_b
+  dev_b="$(awk '/^device /{print $2}' "$E2E_ROOT/pairing-b.txt")"
+  key_b="$(awk '/^encryption-key /{print $2}' "$E2E_ROOT/pairing-b.txt")"
+  touch "$E2E_ROOT/taken"
+  expect_fail2 step4-invite-taken \
+    with_creds "$oc" member "$od" invite "$dev_b" "$key_b" "$E2E_ROOT/taken"
+  with_creds "$oc" member "$od" list | grep -q "$dev_b" \
+    && die "refused invite still authored a transition"
+  pass "invite onto an existing file refuses before the commit"
+
+  # Lose the sealed invitation, recover with a reseal, join from it:
+  # the reseal opens identically, with fresh randomness.
+  rm "$E2E_ROOT/invitation"
+  expect_exit 0 step4-reissue \
+    with_creds "$oc" member "$od" reissue-invitation "$dev" "$E2E_ROOT/invitation2" >/dev/null
+  [[ -f "$E2E_ROOT/invitation2" ]] || die "reissue wrote no file"
+  pass "reissue reseals the admission from durable state"
+
+  expect_exit 0 step4-join \
+    with_creds "$nc" device "$ndr" join "$E2E_ROOT/invitation2" >/dev/null
+  pass "join accepts the reissued invitation"
+  local id_out
+  id_out="$(expect_exit 0 step4-id with_creds "$nc" device "$ndr" id)"
+  [[ "$id_out" == "device $dev"* ]] || die "joined id mismatch: $id_out"
+  pass "joined device reopens with member custody"
+
+  local owner_id
+  owner_id="$(with_creds "$oc" device "$od" id | awk '/^device /{print $2}')"
+  local list_out
+  list_out="$(expect_exit 0 step4-list with_creds "$oc" member "$od" list)"
+  echo "$list_out" | grep -q "^owner $owner_id$" || die "list misses the owner"
+  echo "$list_out" | grep -q "^member $dev$" || die "list misses the newcomer"
+  pass "list shows owner and newcomer at the tip"
+  local log_out
+  log_out="$(expect_exit 0 step4-log with_creds "$oc" member "$od" log)"
+  [[ "$(echo "$log_out" | wc -l)" == 2 ]] || die "log is not genesis+invite: $log_out"
+  echo "$log_out" | grep -q "canonical" || die "log misses canonical status"
+  pass "log shows genesis and invite, both canonical"
+  local held_before
+  held_before="$(expect_exit 0 step4-status with_creds "$oc" member "$od" status \
+    | sed -n 's/^held secrets: //p')"
+  [[ "$held_before" == "1 2" ]] || die "held secrets before rotate: $held_before"
+  pass "status shows held secrets 1 2"
+
+  expect_exit 0 step4-rotate with_creds "$oc" member "$od" rotate >/dev/null
+  pass "rotate forces a fresh epoch"
+  local held_after
+  held_after="$(with_creds "$oc" member "$od" status \
+    | sed -n 's/^held secrets: //p')"
+  [[ "$held_after" == "$held_before 3" ]] || die "held secrets did not grow: $held_after"
+  pass "held secrets grow across rotate ($held_after)"
+
+  expect_fail2 step4-reinvite \
+    with_creds "$oc" member "$od" invite "$dev" "$key" "$E2E_ROOT/invitation-dup"
+  grep -qi "already a member" "$LOGDIR/step4-reinvite.stderr" \
+    || die "re-invite did not report AlreadyMember"
+
+  expect_fail2 step4-remove-sole-owner \
+    with_creds "$oc" member "$od" remove "$owner_id"
+  grep -q "sole owner" "$LOGDIR/step4-remove-sole-owner.stderr" \
+    || die "sole-owner remove refusal unexplained"
+
+  local f
+  for f in "$LOGDIR"/step4-*.stderr; do
+    check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")" \
+      "$n_identity" "$n_passphrase" \
+      "$(cat "$nc2/identity")" "$(cat "$nc2/passphrase")"
+  done
+}
 main() {
   # Fresh slate every run: steps build on each other within one run, and a
   # previous partial run must never leak state into the next. Unmount
   # first — rm cannot remove a live mountpoint.
   mkdir -p "$MNTS" "$LOGDIR"
   cleanup_mounts
-  rm -rf "$DRIVES" "$CREDS" "$MNTS"
+  rm -rf "$E2E_ROOT"
   mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
   local only="${E2E_ONLY_STEP:-}"
   local run_all=1
@@ -302,6 +409,7 @@ main() {
   if [[ $run_all -eq 1 || "$only" == "1" ]]; then step1_init; fi
   if [[ $run_all -eq 1 || "$only" == "2" ]]; then step2_mount; fi
   if [[ $run_all -eq 1 || "$only" == "3" ]]; then step3_matrix; fi
+  if [[ $run_all -eq 1 || "$only" == "4" ]]; then step4_member; fi
   echo "e2e: $PASS_COUNT checks passed"
 }
 

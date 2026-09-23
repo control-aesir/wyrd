@@ -6,7 +6,10 @@ This is the project workflow for issues and pull requests over ngit.
 
 Describe the problem or proposed change, its context, and a concrete
 verification target. Use a clear Conventional Commit-style subject when the
-issue maps directly to an implementation change.
+issue maps directly to an implementation change. Implementation issues
+state their persistent-format impact in one line — which durable
+formats or protocol bytes change and what that means for
+`docs/upgrade-contract.md`, or explicitly `none`.
 
 ```bash
 ngit issue create --subject "feat(format): path-level tree mutation" \
@@ -63,6 +66,11 @@ into the commit so a wrong branch aborts the sequence:
 git branch --show-current && git commit -m "..."
 ```
 
+Hooks verify the staged tree, not the worktree: each commit in a
+multi-commit stack must compile standalone, or keep the PR to a single
+commit. A stack that only builds as a whole fails the hooks on every
+commit but the last.
+
 Set the PR to draft immediately after the first push. CI runs on
 `ready_for_review` only, for PRs touching the paths listed in the workflows
 under `.ngit/act/workflows/` (`workflow.yml` covers `crates/**`,
@@ -83,7 +91,10 @@ not rely on an unqualified issue number or raw event ID.
 
 Inspect the PR and comments with ngit. Address concrete findings with new
 commits, run the relevant checks locally, and push the branch again. Keep
-the PR in draft while iterating.
+the PR in draft while iterating. Do not change branches during a review:
+all related work stays on the PR's branch until it merges — switching
+branches mid-review orphans the review context and the CI attached to
+the branch.
 
 ```bash
 ngit pr view <pr> --comments --json

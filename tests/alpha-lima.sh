@@ -96,7 +96,50 @@ check_no_leaks() {
   pass "no secrets in $(basename "$log")"
 }
 
-# --- step 1: init lifecycle ----------------------------------------------
+# --- mount helpers -------------------------------------------------------
+# Mounts run as background jobs in this shell so `wait` reports their real
+# exit status. Readiness is polled via mountpoint(1), not via listing: an
+# unmounted empty dir lists fine too.
+poll_until() { # <seconds> <cmd...>
+  local n="$1"; shift
+  local i
+  for ((i = 0; i < n * 5; i++)); do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
+  local name="$1" c="$2" d="$3" m="$4"; shift 4
+  mkdir -p "$m"
+  with_creds "$c" mount "$d" "$m" "$@" \
+    >"$LOGDIR/mount-$name.out" 2>"$LOGDIR/mount-$name.err" &
+  echo $! > "$E2E_ROOT/mount-$name.pid"
+  poll_until 20 mountpoint -q "$m" \
+    || die "$name: mountpoint never came up (see mount-$name.err)"
+  pass "$name: mountpoint up"
+}
+
+stop_mount() { # <name> <signal>: signal, wait up to 15s, assert exit 0 + unmounted
+  local name="$1" sig="$2"
+  local pid
+  pid="$(cat "$E2E_ROOT/mount-$name.pid")"
+  kill "-$sig" "$pid"
+  local i status="timeout"
+  for ((i = 0; i < 75; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      set +e; wait "$pid"; status=$?; set -e
+      break
+    fi
+    sleep 0.2
+  done
+  [[ "$status" == "0" ]] || die "$name: shutdown exit $status on $sig, want clean 0"
+  mountpoint -q "$MNTS/$name" && die "$name: still mounted after $sig"
+  pass "$name: clean shutdown on $sig (exit 0, unmounted)"
+}
+
+# --- step 2: local-only mount --------------------------------------------
 step1_init() {
   step 1 "init lifecycle"
   local d="$DRIVES/owner" c="$CREDS/owner"
@@ -174,11 +217,45 @@ step1_init() {
   done
 }
 
+step2_mount() {
+  step 2 "local-only mount"
+  local d="$DRIVES/owner" c="$CREDS/owner"
+
+  start_mount local "$c" "$d" "$MNTS/local"
+  grep -q "warning: no --relay given; control-plane intake stays idle" \
+    "$LOGDIR/mount-local.err" || die "local: no idle-intake warning on stderr"
+  pass "local: idle-intake warning on stderr"
+  grep -q "control-plane intake stays idle: no --relay given" "$d/mount.log" \
+    || die "local: idle-intake line missing from mount.log"
+  pass "local: idle-intake line in mount.log"
+
+  echo "local-write" > "$MNTS/local/note.txt"
+  [[ "$(cat "$MNTS/local/note.txt")" == "local-write" ]] || die "local: read-your-write failed"
+  pass "local: reads/writes serve without a relay"
+
+  local first_id
+  first_id="$(grep -o "serving over iroh: [0-9a-f]*" "$LOGDIR/mount-local.err" | head -n 1)"
+  stop_mount local INT
+
+  # mount.log is truncated per mount: the second mount's log must not
+  # contain the first mount's endpoint id.
+  start_mount local2 "$c" "$d" "$MNTS/local"
+  grep -qF "$first_id" "$d/mount.log" && die "local: mount.log accumulated across mounts"
+  pass "local: mount.log truncated per mount"
+  [[ "$(cat "$MNTS/local/note.txt")" == "local-write" ]] || die "local: write lost across remount"
+  pass "local: writes persist across remount"
+  stop_mount local2 TERM
+
+  check_no_leaks "$LOGDIR/mount-local.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/mount-local2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$d/mount.log" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
 main() {
   local only="${E2E_ONLY_STEP:-}"
   local run_all=1
   [[ -n "$only" ]] && run_all=0
   if [[ $run_all -eq 1 || "$only" == "1" ]]; then step1_init; fi
+  if [[ $run_all -eq 1 || "$only" == "2" ]]; then step2_mount; fi
   echo "e2e: $PASS_COUNT checks passed"
 }
 

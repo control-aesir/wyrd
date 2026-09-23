@@ -166,6 +166,96 @@ fn retired_device_readmission_is_invalid() {
 }
 
 #[test]
+fn retired_device_readmission_across_epochs_is_invalid() {
+    // Retirement has no expiry: removing at epoch 3 and re-admitting at
+    // epoch 6, past unrelated rotations, is the same monotonicity
+    // violation as the adjacent case. The admitted set flows through
+    // the predecessor chain, so distance changes nothing.
+    let (mut b, genesis) = Builder::genesis(1);
+    let owner = *b.owners.iter().next().unwrap();
+    let (_sk2, m) = key(2);
+    let admitted = b.child(vec![admit(m)]); // valid epoch 2
+    let removed = b.child(vec![Change::Remove(m)]); // valid epoch 3
+    let r4 = b.child(vec![Change::Rotate]); // valid epoch 4
+    let r5 = b.child(vec![Change::Rotate]); // valid epoch 5
+    let readmit = signed(
+        &b,
+        6,
+        Some(r5.transition_id()),
+        Vec::new(),
+        vec![admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(
+        &mut log,
+        &[&genesis, &admitted, &removed, &r4, &r5, &readmit],
+    );
+    assert_eq!(
+        log.status(&readmit.transition_id()),
+        Some(TransitionStatus::Invalid(InvalidReason::AdmitRetiredDevice))
+    );
+}
+
+#[test]
+fn readmission_hidden_in_a_resolution_is_invalid() {
+    // A resolution is still a chain link: re-admitting a device the
+    // winning branch retired is invalid even when the re-admit rides
+    // along with `resolves`. Epoch 3 conflicts (remove-m vs rotate);
+    // the epoch-4 resolution builds on the removal branch, voids the
+    // rotation, and smuggles the re-admit in the same transition.
+    let (b, genesis) = Builder::genesis(1);
+    let owner = *b.owners.iter().next().unwrap();
+    let (_sk2, m) = key(2);
+    let admitted = signed(
+        &b,
+        2,
+        Some(genesis.transition_id()),
+        Vec::new(),
+        vec![admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let removed = signed(
+        &b,
+        3,
+        Some(admitted.transition_id()),
+        Vec::new(),
+        vec![Change::Remove(m)],
+        &[owner],
+        &[owner],
+    );
+    let rotated = signed(
+        &b,
+        3,
+        Some(admitted.transition_id()),
+        Vec::new(),
+        vec![Change::Rotate],
+        &[owner, m],
+        &[owner],
+    );
+    let resolution = signed(
+        &b,
+        4,
+        Some(removed.transition_id()),
+        vec![rotated.transition_id()],
+        vec![admit(m)],
+        &[owner, m],
+        &[owner],
+    );
+    let mut log = MembershipLog::new(drive());
+    observe_all(
+        &mut log,
+        &[&genesis, &admitted, &removed, &rotated, &resolution],
+    );
+    assert_eq!(
+        log.status(&resolution.transition_id()),
+        Some(TransitionStatus::Invalid(InvalidReason::AdmitRetiredDevice))
+    );
+}
+
+#[test]
 fn retirement_is_chain_local() {
     // Retirement follows the predecessor chain, never the whole
     // observed set: a device retired on one branch stays admittable on

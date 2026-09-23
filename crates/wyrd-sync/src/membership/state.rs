@@ -220,7 +220,10 @@ mod tests {
             apply(&s, &[admission(), Change::Remove(d(2))]),
             Err(ApplyError::RemoveThenAdmitSameDevice)
         );
-        // The supported path is removal now, admission later.
+        // `apply` folds one transition only and carries no history, so
+        // the later admission still applies here. The chain layer
+        // rejects it (InvalidReason::AdmitRetiredDevice): replacing a
+        // device means removal now, admission of a FRESH identity later.
         let removed = apply(&s, &[Change::Remove(d(2))]).unwrap();
         assert!(!removed.members.contains(&d(2)));
         let readmitted = apply(&removed, &[admission()]).unwrap();

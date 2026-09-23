@@ -22,17 +22,36 @@ MNTS="$E2E_ROOT/mnt"
 LOGDIR="$E2E_ROOT/logs"
 HOST_LOGS="/tmp/lima/logs/$(date +%Y%m%d-%H%M%S)"
 
-# Fresh slate every run: steps build on each other within one run, and a
-# previous partial run must never leak state into the next.
-rm -rf "$E2E_ROOT"
-mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
-
 collect_logs() {
   mkdir -p "$HOST_LOGS"
   cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null || true
   echo "logs collected under $HOST_LOGS (host: /tmp/lima/logs/)"
 }
-trap collect_logs EXIT
+
+# A failed step must never strand a mount: unmount everything and kill
+# leftover mount processes, so the next run starts clean. The unmount is
+# attempted unconditionally — gating on `mountpoint -q` or `-e` can skip a
+# live mount whose FUSE fs misbehaves under stat.
+cleanup_mounts() {
+  local m pidf
+  for m in "$MNTS"/*; do
+    [[ -e "$m" || -L "$m" ]] || continue
+    fusermount3 -uz "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+  done
+  for pidf in "$E2E_ROOT"/mount-*.pid; do
+    [[ -f "$pidf" ]] || continue
+    kill -KILL "$(cat "$pidf")" 2>/dev/null || true
+  done
+  # Reap anything we killed so no zombies linger.
+  wait 2>/dev/null || true
+  # A just-killed mount can need a beat before the kernel releases it.
+  sleep 1
+  for m in "$MNTS"/*; do
+    [[ -e "$m" || -L "$m" ]] || continue
+    fusermount3 -uz "$m" 2>/dev/null || true
+  done
+}
+trap 'cleanup_mounts; collect_logs' EXIT
 
 PASS_COUNT=0
 step()  { echo "=== step $1: $2 ==="; }
@@ -250,12 +269,39 @@ step2_mount() {
   check_no_leaks "$LOGDIR/mount-local2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$d/mount.log" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
+# --- step 3: write matrix -----------------------------------------------
+step3_matrix() {
+  step 3 "write matrix"
+  local d="$DRIVES/owner" c="$CREDS/owner"
+
+  start_mount matrix "$c" "$d" "$MNTS/matrix"
+  set +e
+  python3 /mnt/wyrd/tests/alpha-lima-matrix.py "$MNTS/matrix" >"$LOGDIR/matrix.out" 2>&1
+  local status=$?
+  set -e
+  cat "$LOGDIR/matrix.out"
+  [[ $status -eq 0 ]] || die "write matrix failed"
+  pass "write matrix: all python cases passed"
+  stop_mount matrix INT
+
+  check_no_leaks "$LOGDIR/mount-matrix.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/matrix.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
 main() {
+  # Fresh slate every run: steps build on each other within one run, and a
+  # previous partial run must never leak state into the next. Unmount
+  # first — rm cannot remove a live mountpoint.
+  mkdir -p "$MNTS" "$LOGDIR"
+  cleanup_mounts
+  rm -rf "$DRIVES" "$CREDS" "$MNTS"
+  mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
   local only="${E2E_ONLY_STEP:-}"
   local run_all=1
   [[ -n "$only" ]] && run_all=0
   if [[ $run_all -eq 1 || "$only" == "1" ]]; then step1_init; fi
   if [[ $run_all -eq 1 || "$only" == "2" ]]; then step2_mount; fi
+  if [[ $run_all -eq 1 || "$only" == "3" ]]; then step3_matrix; fi
   echo "e2e: $PASS_COUNT checks passed"
 }
 

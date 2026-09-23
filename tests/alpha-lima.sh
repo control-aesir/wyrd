@@ -561,17 +561,23 @@ main() {
   # first — rm cannot remove a live mountpoint.
   mkdir -p "$MNTS" "$LOGDIR"
   cleanup_mounts
+  # A stranded relay outlives `wait` in cleanup (it is a background job
+  # of this shell) and blocks the next run's bind: reclaim the port.
+  if [[ -f "$E2E_ROOT/relay.pid" ]]; then
+    kill -KILL "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+  fi
   rm -rf "$E2E_ROOT"
   mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
   local only="${E2E_ONLY_STEP:-}"
-  local run_all=1
-  [[ -n "$only" ]] && run_all=0
-  if [[ $run_all -eq 1 || "$only" == "1" ]]; then step1_init; fi
-  if [[ $run_all -eq 1 || "$only" == "2" ]]; then step2_mount; fi
-  if [[ $run_all -eq 1 || "$only" == "3" ]]; then step3_matrix; fi
-  if [[ $run_all -eq 1 || "$only" == "4" ]]; then step4_member; fi
-  if [[ $run_all -eq 1 || "$only" == "5" ]]; then step5_export; fi
-  if [[ $run_all -eq 1 || "$only" == "6" ]]; then step6_relay; fi
+  # Comma list (`--step 1,4,6`): steps build on each other, so iteration
+  # runs a prefix-closed selection, never a lone dependent step.
+  want_step() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
+  if want_step 1; then step1_init; fi
+  if want_step 2; then step2_mount; fi
+  if want_step 3; then step3_matrix; fi
+  if want_step 4; then step4_member; fi
+  if want_step 5; then step5_export; fi
+  if want_step 6; then step6_relay; fi
   echo "e2e: $PASS_COUNT checks passed"
 }
 

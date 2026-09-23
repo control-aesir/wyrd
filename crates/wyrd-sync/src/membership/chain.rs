@@ -38,7 +38,7 @@ pub(crate) enum Link {
 }
 
 /// The result of one classification run over the whole observed set.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Analysis {
     pub status: HashMap<TransitionId, TransitionStatus>,
     /// Derived states of valid links (canonical, contested, and voided

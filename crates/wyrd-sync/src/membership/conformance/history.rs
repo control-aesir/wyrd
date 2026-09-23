@@ -8,6 +8,43 @@ use wyrd_format::membership::{
 };
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
+// --- intake budgets ------------------------------------------------------
+//
+// The computational-budget audit pins the traversal budget: one input
+// batch costs one chain analysis no matter how many verdicts it reads.
+
+#[test]
+fn repeated_verdict_reads_cost_one_traversal() {
+    // Intake reads several verdicts per message (transition lookup,
+    // status, authorizing state), so the log memoizes the analysis
+    // per observed set instead of re-walking the chain per read.
+    let (mut b, genesis) = Builder::genesis(1);
+    let a = b.child(vec![Change::Rotate]);
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis);
+    log.observe(a);
+    let tip = log.known_state().expect("tip").transition_id;
+    for _ in 0..8 {
+        assert!(log.status(&tip).is_some());
+        assert!(log.state_of(&tip).is_some());
+        let _ = log.statuses();
+    }
+    assert_eq!(
+        log.analyses_run.get(),
+        1,
+        "reads share one traversal while the set is unchanged"
+    );
+    let r = b.child(vec![Change::Rotate]);
+    let r_id = r.transition_id();
+    log.observe(r);
+    assert!(log.status(&r_id).is_some());
+    assert_eq!(
+        log.analyses_run.get(),
+        2,
+        "observe invalidates exactly once"
+    );
+}
+
 // --- change rules -------------------------------------------------------
 
 #[test]

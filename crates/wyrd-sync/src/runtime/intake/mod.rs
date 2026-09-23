@@ -352,71 +352,83 @@ fn message_action(
             ]))
         }
         Message::SnapshotAnnouncement(announcement) => {
-            // Authorship first: an announcement is evidence only when
-            // the author's signature verifies against the drive-bound
-            // challenge. A bad signature is malformed evidence like an
-            // unparsable transition — suppress memory-only, never
-            // defer.
-            if verify_announcement(&engine.drive(), announcement).is_err() {
-                return Ok(Action::Suppress);
-            }
+            // Cheap rejection first: the membership lookup and the
+            // epoch agreement are hash-map reads, while the signature
+            // verify below is curve work. An announcement for an
+            // unseen transition defers (only that transition's arrival
+            // unblocks it) and an epoch-mismatched one suppresses —
+            // both without spending verification on bytes that cannot
+            // commit yet. Verification still gates every commit: a
+            // deferred message revalidates fully when flushed, so a
+            // bad signature only buys a bounded pending slot, never a
+            // fact.
             match engine.log.transition(&announcement.membership) {
                 // Unseen: only the arrival of this transition unblocks.
                 None => Ok(Action::Defer(DeferredWait::Unseen(announcement.membership))),
                 Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
-                Some(_) => match engine.log.status(&announcement.membership) {
-                    Some(TransitionStatus::Canonical) => {
-                        // The compatibility gate: an announcement becomes a
-                        // durable fact only when it is compatible with the
-                        // announcement already known for the snapshot — the
-                        // hydrated projection, or an announcement staged
-                        // earlier in this commit batch. Route updates
-                        // (mutable `node_addr` only) commit a fresh fact;
-                        // the last accepted route wins. An immutable fork is
-                        // the sender's invalid data: the verdict is final
-                        // but memory-only, and no announcement fact is
-                        // written, so replay never meets a conflict intake
-                        // could have detected.
-                        let known = engine
-                            .announcements
-                            .get(&announcement.snapshot)
-                            .or_else(|| staged.get(&announcement.snapshot));
-                        let committable = match known {
-                            None => true,
-                            Some(existing) => !matches!(
-                                existing.check_update(announcement),
-                                AnnouncementUpdate::Fork
-                            ),
-                        };
-                        if committable {
-                            staged.insert(announcement.snapshot, announcement.clone());
-                            Ok(Action::Commit(vec![
-                                Fact::Announcement(announcement.clone()),
-                                Fact::ControlMessage(*id),
-                            ]))
-                        } else {
-                            Ok(Action::Suppress)
-                        }
+                Some(_) => {
+                    // Authorship: an announcement is evidence only when
+                    // the author's signature verifies against the
+                    // drive-bound challenge. A bad signature is
+                    // malformed evidence like an unparsable
+                    // transition — suppress memory-only, never defer.
+                    if verify_announcement(&engine.drive(), announcement).is_err() {
+                        return Ok(Action::Suppress);
                     }
-                    Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
-                    Some(
-                        TransitionStatus::Contested
-                        | TransitionStatus::Voided
-                        | TransitionStatus::Orphaned
-                        | TransitionStatus::Pending,
-                    ) => Ok(Action::Defer(DeferredWait::StatusBlocked(
-                        announcement.membership,
-                    ))),
-                    // Observed a moment ago via transition(), but the
-                    // fresh analysis classifies nothing for it: an
-                    // internal disagreement, not sender data. Fail the
-                    // pass — the envelope stays retained for redelivery.
-                    // Unreachable through the public log API (both views
-                    // read the same observed set); defense in depth for a
-                    // future analysis that can miss, mirroring the
-                    // mailbox ceiling gates.
-                    None => Err(EngineError::TransitionUnclassified(announcement.membership)),
-                },
+                    match engine.log.status(&announcement.membership) {
+                        Some(TransitionStatus::Canonical) => {
+                            // The compatibility gate: an announcement becomes a
+                            // durable fact only when it is compatible with the
+                            // announcement already known for the snapshot — the
+                            // hydrated projection, or an announcement staged
+                            // earlier in this commit batch. Route updates
+                            // (mutable `node_addr` only) commit a fresh fact;
+                            // the last accepted route wins. An immutable fork is
+                            // the sender's invalid data: the verdict is final
+                            // but memory-only, and no announcement fact is
+                            // written, so replay never meets a conflict intake
+                            // could have detected.
+                            let known = engine
+                                .announcements
+                                .get(&announcement.snapshot)
+                                .or_else(|| staged.get(&announcement.snapshot));
+                            let committable = match known {
+                                None => true,
+                                Some(existing) => !matches!(
+                                    existing.check_update(announcement),
+                                    AnnouncementUpdate::Fork
+                                ),
+                            };
+                            if committable {
+                                staged.insert(announcement.snapshot, announcement.clone());
+                                Ok(Action::Commit(vec![
+                                    Fact::Announcement(announcement.clone()),
+                                    Fact::ControlMessage(*id),
+                                ]))
+                            } else {
+                                Ok(Action::Suppress)
+                            }
+                        }
+                        Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
+                        Some(
+                            TransitionStatus::Contested
+                            | TransitionStatus::Voided
+                            | TransitionStatus::Orphaned
+                            | TransitionStatus::Pending,
+                        ) => Ok(Action::Defer(DeferredWait::StatusBlocked(
+                            announcement.membership,
+                        ))),
+                        // Observed a moment ago via transition(), but the
+                        // fresh analysis classifies nothing for it: an
+                        // internal disagreement, not sender data. Fail the
+                        // pass — the envelope stays retained for redelivery.
+                        // Unreachable through the public log API (both views
+                        // read the same observed set); defense in depth for a
+                        // future analysis that can miss, mirroring the
+                        // mailbox ceiling gates.
+                        None => Err(EngineError::TransitionUnclassified(announcement.membership)),
+                    }
+                }
             }
         }
         // Envelope-defined but unhandled in v0: no rotation handler
@@ -557,6 +569,22 @@ fn rotation_commit(
     if delivery.device != engine.device {
         return suppress(engine);
     }
+    let transition = match MembershipTransition::from_canonical_bytes(&delivery.transition) {
+        Ok(transition) => transition,
+        Err(_) => return suppress(engine),
+    };
+    // Cheap structural gates before the ECDH+AEAD unwrap: the carried
+    // transition must arrive within ingest limits and name the
+    // delivery's epoch. Bytes that fail here can never authorize, so
+    // they never earn the unwrap — same terminal verdict, less work.
+    // (The transition↔capability binding check stays after the
+    // unwrap: the binding lives inside the wrap.)
+    if transition.epoch != delivery.epoch
+        || check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err()
+        || check_transition(&Limits::V0, &transition).is_err()
+    {
+        return suppress(engine);
+    }
     let capability = match WrappedCapability::from_bytes(delivery.wrapped.clone())
         .unwrap(&engine.encryption_secret)
     {
@@ -571,19 +599,10 @@ fn rotation_commit(
     if capability.device != engine.device || delivery.epoch != capability.covered_epoch() {
         return suppress(engine);
     }
-    let transition = match MembershipTransition::from_canonical_bytes(&delivery.transition) {
-        Ok(transition) => transition,
-        Err(_) => return suppress(engine),
-    };
-    // The carried transition must be the capability's own binding, at
-    // the delivery's epoch, within ingest limits — a transition for
-    // another epoch or binding paired with this wrap is tampering or a
-    // broken sender, never a gap that fills.
-    if transition.transition_id() != capability.transition
-        || transition.epoch != delivery.epoch
-        || check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err()
-        || check_transition(&Limits::V0, &transition).is_err()
-    {
+    // The carried transition must be the capability's own binding —
+    // a transition for another binding paired with this wrap is
+    // tampering or a broken sender, never a gap that fills.
+    if transition.transition_id() != capability.transition {
         return suppress(engine);
     }
     let transition_id = transition.transition_id();

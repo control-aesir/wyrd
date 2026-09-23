@@ -40,6 +40,52 @@ fn announcement_defers_until_membership_lands() {
     assert_eq!(facts.announcements.len(), 1);
 }
 
+/// Cheap rejection runs ahead of signature verification: an
+/// announcement for an unseen transition defers without spending the
+/// BIP-340 verify — even when its signature is garbage. The verify
+/// still gates the commit: when the transition lands, the flushed
+/// announcement revalidates, fails authorship, and suppresses with
+/// nothing committed.
+#[test]
+fn unsigned_announcement_for_unseen_transition_defers_then_suppresses() {
+    let mut fixture = fixture();
+    let (mut builder, genesis) = Builder::genesis(10);
+    let child = builder.child(vec![Change::Rotate]);
+    let mut bad = announcement_for(2, child.transition_id());
+    let Message::SnapshotAnnouncement(a) = &mut bad else {
+        panic!("announcement kind");
+    };
+    a.signature[0] ^= 0xFF;
+
+    // Membership unobserved: holds without verification.
+    let mail = vec![deliver(&fixture, 2, &bad)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(
+        report.deferred, 1,
+        "unseen membership defers before any signature work"
+    );
+    assert_eq!(fixture.engine.pending_count(), 1);
+    assert_eq!(fixture.engine.current(), 0);
+
+    // The transitions land: the held announcement revalidates, fails
+    // authorship, and suppresses — the transitions commit, it does not.
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&child)),
+    ];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 2);
+    assert_eq!(fixture.engine.pending_count(), 0);
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.transitions.len(), 2);
+    assert!(
+        facts.announcements.is_empty(),
+        "the bad signature still gates the commit"
+    );
+}
+
 /// A classification disagreement fails the pass but loses nothing:
 /// volatile state returns to the durable baseline with pending
 /// intact, and redelivery converges. The disagreement is injected

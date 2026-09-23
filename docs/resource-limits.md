@@ -38,6 +38,27 @@ protocol-adjacent, already bounded and backpressure-tested, and not
 operational tuning. The daemon-side bounds above are the configurable
 ones.
 
+## Intake computational budgets
+
+Byte ceilings alone do not bound CPU: a syntactically valid,
+cryptographically valid, semantically invalid message sails through
+cheap checks into expensive stages. The intake pipeline therefore
+orders cheap rejection ahead of expensive verification, and memoizes
+the one unbounded walk. Per-stage worst case for one hostile message:
+
+| Stage | At most | Enforcement |
+|---|---|---|
+| Mailbox handover | 96 KiB ciphertext, 64 KiB opened bytes | `MAX_MAILBOX_CIPHERTEXT_LEN` / `MAX_MAILBOX_OPEN_BYTES` reject pre-ingest; unopenable envelopes discard with no fact |
+| Control framing | 82-byte floor, then version / drive / epoch-key lookups | `SealedControl::decode` + `ControlInbox::ingest` reject before any crypto |
+| Suppression redelivery | one hash over the sealed bytes, never an AEAD open | remembered verdicts apply before `open`; the id covers the sealed bytes so the verdict is stable across the open boundary |
+| Announcement | two hash-map reads before one BIP-340 verify | membership lookup + epoch agreement precede `verify_announcement`; unseen transitions defer, mismatches suppress, verification still gates every commit |
+| Transition | length + count gates before observation | `check_total_len` / `check_transition` (`Limits::V0`) precede `MembershipLog::observe`; signatures verify inside chain analysis |
+| Chain traversal | one full analysis per observed-set version per batch, regardless of verdict reads | `MembershipLog` memoizes the analysis; `observe` is the only mutation and invalidates. No depth cap by design (10k-deep chains are pinned conformance) — the bound is analyses-per-batch, not depth |
+| Capability | one ECDH+AEAD unwrap of envelope-bounded bytes, then one memoized authorize | `WrappedCapability::unwrap` before `AuthorizedCapability::authorize`; unknown transitions defer into the 1024-bound pending shed, terminal history suppresses |
+| Rotation delivery | device check + transition decode + limits + epoch agreement before the unwrap | structural gates precede `WrappedCapability::unwrap`; the transition↔capability binding check stays after it (the binding lives inside the wrap) |
+| Manifest / object fan-out | none on intake, by construction | intake commits only transition / announcement / capability / control-message facts and never opens manifests, trees, or chunks; expansion is pull-based post-intake under the fetch byte ceiling and manifest count gates |
+| Commit rate | no time-based cap | structural: invalid commits 0 facts, replay commits 0 facts, over-limit deferrals shed with the relay retaining. Insider commit-rate bounding is the separate fact-log spam issue, not this table |
+
 ## Bytes in flight
 
 Fetch execution is single-threaded per pass, so "bytes in flight" is

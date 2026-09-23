@@ -301,4 +301,18 @@ pub enum Fact {
     /// Append-only like every fact: superseded blobs stay and
     /// re-derive the same keys deterministically.
     BootstrapPending(Vec<u8>),
+    /// A namespace-carry obligation: this pre-transition eligible head
+    /// must still be re-authored at the new epoch. Committed before
+    /// the transition it anticipates (staging), so a crash between the
+    /// transition commit and the carry leaves a discoverable
+    /// obligation instead of an orphaned namespace. Pending means
+    /// queued-but-uncarried; see
+    /// [`RuntimeState`](crate::runtime::RuntimeState).
+    CarryQueued(SnapshotId),
+    /// One carry obligation discharged: the head was re-authored at
+    /// the new epoch, was still eligible (the transition never
+    /// landed), or the author left the member set. Append-only like
+    /// every fact — pending is derived as queued-minus-done, never by
+    /// deletion.
+    CarryDone(SnapshotId),
 }

@@ -60,10 +60,14 @@ const TAG_CAPABILITY_SEALED: u8 = 0x11;
 const TAG_CAPABILITY_DELIVERED: u8 = 0x12;
 /// Pending invitation material: raw wrapped-capability bytes (non-empty).
 const TAG_BOOTSTRAP_PENDING: u8 = 0x13;
+/// One namespace-carry obligation: head SnapshotId (32).
+const TAG_CARRY_QUEUED: u8 = 0x14;
+/// One discharged carry obligation: head SnapshotId (32).
+const TAG_CARRY_DONE: u8 = 0x15;
 
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 19] = [
+const KNOWN_TAGS: [u8; 21] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -83,6 +87,8 @@ const KNOWN_TAGS: [u8; 19] = [
     TAG_CAPABILITY_SEALED,
     TAG_CAPABILITY_DELIVERED,
     TAG_BOOTSTRAP_PENDING,
+    TAG_CARRY_QUEUED,
+    TAG_CARRY_DONE,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -344,6 +350,8 @@ pub(super) fn encode_fact(
             }
             Ok((TAG_BOOTSTRAP_PENDING, wrapped.clone()))
         }
+        Fact::CarryQueued(head) => Ok((TAG_CARRY_QUEUED, head.as_bytes().to_vec())),
+        Fact::CarryDone(head) => Ok((TAG_CARRY_DONE, head.as_bytes().to_vec())),
     }
 }
 
@@ -597,6 +605,14 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             }
             Some(DecodedFact::BootstrapPending(record.to_vec()))
         }
+        TAG_CARRY_QUEUED => {
+            let raw: [u8; 32] = record.try_into().ok()?;
+            Some(DecodedFact::CarryQueued(SnapshotId::from_bytes(raw)))
+        }
+        TAG_CARRY_DONE => {
+            let raw: [u8; 32] = record.try_into().ok()?;
+            Some(DecodedFact::CarryDone(SnapshotId::from_bytes(raw)))
+        }
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
@@ -677,6 +693,8 @@ pub(super) enum DecodedFact {
     CapabilitySealed(u64, DeviceId, Vec<u8>),
     CapabilityDelivered(u64, DeviceId),
     BootstrapPending(Vec<u8>),
+    CarryQueued(SnapshotId),
+    CarryDone(SnapshotId),
 }
 
 #[cfg(test)]

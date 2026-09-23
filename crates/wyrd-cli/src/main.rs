@@ -20,7 +20,6 @@ use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
 use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 use wyrd_sync::control::SealedBootstrap;
-use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
 use wyrd_sync::runtime::{Engine, EngineError};
@@ -766,6 +765,7 @@ fn member(
                 }
             };
             let bases = engine.live_heads()?;
+            engine.stage_carry_bases(bases)?;
             let outcome = match admit(&mut engine) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -773,7 +773,7 @@ fn member(
                     return Err(error.into());
                 }
             };
-            let carried = carry_bases(&mut engine, &drive_dir, bases)?;
+            let carried = carry_pending(&mut engine, &drive_dir)?;
             write_invitation(&out, &mut file, &outcome.invitation.encode())?;
             println!(
                 "invited {device}{} at epoch {} -> {} ({} carried)",
@@ -805,38 +805,38 @@ fn member(
 }
 
 /// Author a membership transition plus its namespace carry in one
-/// offline step: capture the served heads, commit the transition via
-/// `author`, then carry each captured head forward at the new epoch
-/// (transition continuity: a quiet drive keeps serving its files,
-/// and the next write extends the carry instead of bootstrapping
-/// from empty). The object store opens only when something carries,
-/// so a fresh drive's transition never touches it. A failed carry
-/// reports loudly with the transition already durable at its epoch.
+/// offline step: capture the served heads, stage them as durable
+/// carry obligations, commit the transition via `author`, then drain
+/// the carry queue at the new epoch (transition continuity: a quiet
+/// drive keeps serving its files, and the next write extends the
+/// carry instead of bootstrapping from empty). Staging precedes the
+/// transition commit, so a crash between the commit and the drain
+/// leaves a discoverable obligation: the next drain — after a
+/// restart, or after the next transition — completes it. The object
+/// store opens only when something is pending, so a fresh drive's
+/// transition never touches it. A failed drain reports loudly with
+/// the transition already durable at its epoch and the obligation
+/// still pending.
 fn transition_with_carry(
     engine: &mut Engine,
     drive_dir: &Path,
     author: impl FnOnce(&mut Engine) -> Result<MembershipTransition, EngineError>,
 ) -> Result<(MembershipTransition, usize), CliError> {
-    let bases = engine.live_heads()?;
+    engine.stage_carry_bases(engine.live_heads()?)?;
     let transition = author(engine)?;
-    let carried = carry_bases(engine, drive_dir, bases)?;
+    let carried = carry_pending(engine, drive_dir)?;
     Ok((transition, carried))
 }
 
-/// Carry captured pre-transition heads forward at the new epoch,
-/// returning the number carried. Empty bases carry nothing without
-/// touching the object store.
-fn carry_bases(
-    engine: &mut Engine,
-    drive_dir: &Path,
-    bases: Vec<AuthorizedSnapshot>,
-) -> Result<usize, CliError> {
-    if bases.is_empty() {
+/// Drain the durable carry queue, returning the number carried. The
+/// store opens only when obligations are pending.
+fn carry_pending(engine: &mut Engine, drive_dir: &Path) -> Result<usize, CliError> {
+    if engine.pending_carries()?.is_empty() {
         return Ok(0);
     }
     let store = FsObjectStore::open(drive_dir.to_path_buf())
         .map_err(|error| CliError::Store(error.to_string()))?;
-    Ok(engine.carry_heads(&store, bases)?.len())
+    Ok(engine.carry_pending(&store)?.len())
 }
 
 /// Claim an invitation destination before any irreversible step: an

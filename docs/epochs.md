@@ -390,8 +390,10 @@ A membership transition advances the epoch without file work, so the
 previous tip is superseded the moment the log moves on
 (bounded-fork degradation above) and a quiet drive serves no heads.
 The device that authors the transition restores continuity by
-authoring one carry snapshot per pre-transition eligible head, over
-the same tree, parenting onto its head, bound to the new epoch. The
+staging each pre-transition eligible head as a durable carry
+obligation (`CarryQueued`) before the transition commits, then
+draining the queue afterwards: one carry snapshot per head, over the
+same tree, parenting onto its head, bound to the new epoch. The
 carry is an ordinary member-authored snapshot: it classifies
 eligible everywhere it is observed and syncs through the normal
 announcement path, so peers converge on it with no special intake
@@ -403,9 +405,13 @@ pre-transition eligible heads carry, so a stale fork never
 resurrects; a conflicted drive carries every head, each onto its
 own, and the fork survives the epoch unmerged. A transition on an
 empty drive carries nothing; an author that left the member set
-(self-removal) carries nothing. A carry whose tree is not local
-fails closed after the transition commits — loudly, never by
-silently orphaning history.
+(self-removal) drains nothing. Staging precedes the commit, so a
+crash between the transition commit and the drain leaves a
+discoverable obligation: the next drain — after a restart, or after
+the next transition — completes it, idempotently per head (see the
+carry crash states in `crash-consistency.md`). A carry whose tree
+is not local fails the drain closed with the obligation still
+pending — loudly, never by silently orphaning history.
 
 The two central semantics, restated:
 

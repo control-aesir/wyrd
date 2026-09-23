@@ -954,36 +954,72 @@ impl Engine {
         super::author::author(self, objects, tree)
     }
 
-    /// Carry pre-transition live heads forward at the new epoch: one
-    /// ordinary member-authored snapshot per base, over the same tree,
-    /// parenting onto its head. The transition author calls this after
-    /// committing a locally authored transition, passing the served
-    /// heads captured before it; intake never calls it (a synced carry
-    /// arrives as an ordinary announcement). The parent link is what
-    /// keeps the old tip live-lineage (the fixed point sustains head
-    /// and carry together, the stale-fork shape in reverse), so the
-    /// old tip becomes canonical history instead of a stale fork and
-    /// the next write extends the carry. Only pre-transition eligible
-    /// heads carry, so a stale fork never resurrects; a conflicted
-    /// drive carries every head, each onto its own, so the fork
-    /// survives the epoch unmerged. Empty bases carry nothing (a fresh
-    /// drive stays snapshot-free); a caller that left the member set
-    /// (self-removal) carries nothing, since it cannot author at the
-    /// new epoch. A base whose tree is not local fails the carry
-    /// closed: the transition already committed, and silently
-    /// orphaning history would be worse than the explicit error.
-    pub fn carry_heads<S: ObjectStore>(
+    /// Stage pre-transition eligible heads as durable carry
+    /// obligations, before the transition that supersedes them
+    /// commits. Staging rides its own batch ahead of the transition
+    /// (the bases are known only to the transition author, never to
+    /// the commit path), and a stage without a following transition
+    /// is benign: the drain discards heads that are still eligible.
+    /// Returns the number newly staged; restaging is idempotent, and
+    /// an empty stage commits nothing.
+    pub fn stage_carry_bases(
+        &mut self,
+        bases: Vec<AuthorizedSnapshot>,
+    ) -> Result<usize, EngineError> {
+        if bases.is_empty() {
+            return Ok(0);
+        }
+        let rebuilt = self.store.rebuild(self.device)?;
+        let mut facts = Vec::new();
+        for head in &bases {
+            let id = head.snapshot().snapshot_id();
+            if rebuilt.runtime.carry_covered(id) {
+                continue;
+            }
+            facts.push(Fact::CarryQueued(id));
+        }
+        let staged = facts.len();
+        if staged > 0 {
+            self.commit_facts(&facts)?;
+        }
+        Ok(staged)
+    }
+
+    /// The still-undischarged carry obligations: pre-transition heads
+    /// staged but not yet re-authored at the known epoch.
+    pub fn pending_carries(&self) -> Result<Vec<SnapshotId>, EngineError> {
+        Ok(self.store.rebuild(self.device)?.runtime.pending_carries())
+    }
+
+    /// Drain the durable carry queue: re-author every still-pending
+    /// pre-transition head at the known epoch, parenting onto it, and
+    /// discharge each obligation. This is what makes the
+    /// transition/carry sequence recoverable: the staged set survives
+    /// a crash between the transition commit and the drain, and the
+    /// next drain — after a restart, or after the next transition —
+    /// completes it. Idempotent per head: a head that is still
+    /// eligible (the transition never landed) or that already has a
+    /// current-epoch child (a completed carry, never authored twice)
+    /// is discharged without authoring; a head whose body is gone
+    /// (arrives later via sync) stays pending. A head whose tree is
+    /// not local fails the drain closed with the obligation still
+    /// pending, so restoring the bytes and retrying resumes. A caller
+    /// that left the member set drains nothing (its pending set
+    /// stays: the frozen drive cannot author, and no other device
+    /// completes another's queue). Returns the carries authored by
+    /// this call.
+    pub fn carry_pending<S: ObjectStore>(
         &mut self,
         objects: &S,
-        bases: Vec<AuthorizedSnapshot>,
     ) -> Result<Vec<AuthorizedSnapshot>, EngineError>
     where
         S::Error: std::fmt::Debug,
     {
-        if bases.is_empty() {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let pending = rebuilt.runtime.pending_carries();
+        if pending.is_empty() {
             return Ok(Vec::new());
         }
-        let rebuilt = self.store.rebuild(self.device)?;
         let known = rebuilt
             .log
             .known_state()
@@ -995,14 +1031,37 @@ impl Engine {
         if !members.contains(&self.device) {
             return Ok(Vec::new());
         }
-        let mut carried = Vec::with_capacity(bases.len());
-        for head in &bases {
-            carried.push(super::author::author_with_parents(
-                self,
-                objects,
-                head.snapshot().tree,
-                vec![head.snapshot().snapshot_id()],
-            )?);
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        let eligible = dag.eligible_heads(&rebuilt.log);
+        let mut carried = Vec::new();
+        for head in pending {
+            if eligible.contains(&head) {
+                // Staged but the transition never landed: the head
+                // still serves, nothing to carry.
+                self.commit_facts(&[Fact::CarryDone(head)])?;
+                continue;
+            }
+            let already = dag.ids().iter().any(|id| {
+                dag.snapshot(id)
+                    .is_some_and(|s| s.parents.contains(&head) && s.epoch == known.epoch)
+            });
+            if already {
+                // A completed carry (or its synced echo): discharge,
+                // never author twice.
+                self.commit_facts(&[Fact::CarryDone(head)])?;
+                continue;
+            }
+            let Some(body) = dag.snapshot(&head) else {
+                // The body arrives later via sync; stay pending.
+                continue;
+            };
+            let snapshot =
+                super::author::author_with_parents(self, objects, body.tree, vec![head])?;
+            carried.push(snapshot);
+            self.commit_facts(&[Fact::CarryDone(head)])?;
         }
         Ok(carried)
     }

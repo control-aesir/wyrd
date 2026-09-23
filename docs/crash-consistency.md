@@ -39,6 +39,33 @@ op leaves no phantom tip. Pinned by `failed_admit_leaves_no_phantom_tip`
 and `admit_queues_and_delivers_newcomer_catch_up` (restart before
 first send still delivers; `author/tests_admission.rs`).
 
+## Namespace carry across transitions
+
+A transition supersedes the previous heads without file work, so
+the author stages each pre-transition eligible head as a durable
+carry obligation (`CarryQueued`) in its own batch BEFORE the
+transition commits, then drains the queue (`CarryDone` per head)
+afterwards. The crash states, all pinned in
+`author/tests_carry.rs`:
+
+- crash between stage and transition: the heads are still
+  eligible, so the drain discards the staged set — benign.
+- crash between transition commit and drain: the staged set
+  survives; the next drain (after a restart, or after the next
+  transition) completes it. Pinned by
+  `interrupted_carry_resumes_after_restart_without_memory_bases`.
+- crash between a carry commit and its Done marker: the retry
+  finds the current-epoch child and discharges without
+  re-authoring — exactly once. Pinned by
+  `torn_carry_commit_discharges_without_duplicates`.
+- carry with unheld bytes: the drain fails closed
+  (`TreeUnavailable`) with the obligation still pending; restoring
+  the bytes and retrying resumes. Pinned by
+  `missing_tree_carry_fails_closed_and_retries`.
+- departed author (self-removal): the drain authors nothing and
+  leaves the set pending on the frozen drive. Pinned by
+  `self_removal_leaves_the_queue_pending`.
+
 ## Snapshot authoring and heads
 
 Vault imports land before the facts that name them (body, then each

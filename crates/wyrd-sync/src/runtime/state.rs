@@ -79,6 +79,11 @@ pub struct RuntimeState {
     pub(super) capability_queued: BTreeSet<(u64, DeviceId)>,
     pub(super) capability_sealed: BTreeMap<(u64, DeviceId), Vec<u8>>,
     pub(super) capability_delivered: BTreeSet<(u64, DeviceId)>,
+    /// Namespace-carry queue: pre-transition eligible heads still to
+    /// re-author at the new epoch, minus discharged ones. Pending is
+    /// derived as queued-minus-done; nothing is ever deleted.
+    pub(super) carry_queued: BTreeSet<SnapshotId>,
+    pub(super) carry_done: BTreeSet<SnapshotId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -122,6 +127,8 @@ impl RuntimeState {
             capability_queued: BTreeSet::new(),
             capability_sealed: BTreeMap::new(),
             capability_delivered: BTreeSet::new(),
+            carry_queued: BTreeSet::new(),
+            carry_done: BTreeSet::new(),
         }
     }
 
@@ -312,6 +319,38 @@ impl RuntimeState {
     pub fn capability_covered(&self, epoch: u64, recipient: DeviceId) -> bool {
         self.capability_queued.contains(&(epoch, recipient))
             || self.capability_delivered.contains(&(epoch, recipient))
+    }
+
+    /// Record a namespace-carry obligation for one pre-transition
+    /// head. Returns `true` if this was the first queueing of the
+    /// head; staging twice (a retried transition) stays idempotent.
+    pub fn record_carry_queued(&mut self, head: SnapshotId) -> bool {
+        self.carry_queued.insert(head)
+    }
+
+    /// Record one carry obligation discharged: the head was
+    /// re-authored at the new epoch, was still eligible (the
+    /// transition never landed), or the author left the member set.
+    pub fn record_carry_done(&mut self, head: SnapshotId) -> bool {
+        self.carry_done.insert(head)
+    }
+
+    /// Every still-undischarged carry obligation, in ascending head
+    /// order. Deterministic under replay, so resume carries in a
+    /// stable order.
+    pub fn pending_carries(&self) -> Vec<SnapshotId> {
+        self.carry_queued
+            .iter()
+            .copied()
+            .filter(|head| !self.carry_done.contains(head))
+            .collect()
+    }
+
+    /// Whether one carry obligation is already covered — queued or
+    /// discharged — so restaging stays idempotent instead of
+    /// appending duplicate queue facts per call.
+    pub fn carry_covered(&self, head: SnapshotId) -> bool {
+        self.carry_queued.contains(&head) || self.carry_done.contains(&head)
     }
 
     /// Record a snapshot announcement. Replaying the same announcement is a

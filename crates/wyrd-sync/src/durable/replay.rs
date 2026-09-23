@@ -43,6 +43,8 @@ pub enum RuntimeFact {
     CapabilityQueued(u64, DeviceId),
     CapabilitySealed(u64, DeviceId, Vec<u8>),
     CapabilityDelivered(u64, DeviceId),
+    CarryQueued(SnapshotId),
+    CarryDone(SnapshotId),
 }
 
 /// The replayed facts of commits `1..=CURRENT`, in commit order within
@@ -166,6 +168,12 @@ impl LoadedFacts {
                 // them.
                 self.bootstrap_pending.push(wrapped);
             }
+            DecodedFact::CarryQueued(head) => {
+                self.runtime_facts.push(RuntimeFact::CarryQueued(head));
+            }
+            DecodedFact::CarryDone(head) => {
+                self.runtime_facts.push(RuntimeFact::CarryDone(head));
+            }
         }
     }
 }
@@ -274,6 +282,12 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::CapabilityDelivered(epoch, recipient) => {
                 runtime.record_capability_delivered(epoch, recipient);
+            }
+            RuntimeFact::CarryQueued(head) => {
+                runtime.record_carry_queued(head);
+            }
+            RuntimeFact::CarryDone(head) => {
+                runtime.record_carry_done(head);
             }
         }
     }

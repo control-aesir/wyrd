@@ -37,7 +37,10 @@ use super::engine::{DrainReport, Engine};
 
 /// An isolated store directory, removed on drop (mirrors the
 /// durable-store test helper: process id plus counter, since tests
-/// run multithreaded).
+/// run multithreaded). Liveness is load-bearing: dropping the dir
+/// deletes the store underneath any engine opened on it, so fixtures
+/// must return the dir and callers must bind it for as long as the
+/// engine is used.
 pub(crate) struct TestDir {
     pub(crate) path: PathBuf,
 }

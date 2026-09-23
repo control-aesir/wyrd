@@ -45,6 +45,41 @@ fn fixture_release(release: &str) -> PathBuf {
     fixture_root().join(release)
 }
 
+/// The checked-in `dev` fixture's directory. Regeneration targets
+/// exactly this: pointing it at the fixture root destroys the
+/// per-release siblings and scatters the new store beside them.
+/// Name the helper at the call site so the target stays explicit.
+fn dev_fixture_dir() -> PathBuf {
+    fixture_release("dev")
+}
+
+#[test]
+fn regenerate_targets_dev_never_the_root() {
+    let dst = dev_fixture_dir();
+    assert_eq!(
+        dst.file_name().and_then(|n| n.to_str()),
+        Some("dev"),
+        "regeneration lands inside dev/"
+    );
+    assert_ne!(dst, fixture_root(), "never the fixture root itself");
+    assert_eq!(dst.parent(), Some(fixture_root().as_path()));
+}
+
+#[test]
+fn fixture_root_holds_only_release_dirs() {
+    // A regeneration pointed at the root would scatter store files
+    // (CURRENT, DRIVE, commits/) beside the release directories. Every
+    // entry here must be a per-release directory instead.
+    for entry in std::fs::read_dir(fixture_root()).unwrap() {
+        let entry = entry.unwrap();
+        assert!(
+            entry.path().is_dir(),
+            "stray file at the fixture root: {:?}",
+            entry.file_name()
+        );
+    }
+}
+
 /// Copy a store directory to scratch, minus the advisory lock: LOCK is
 /// kernel state recreated on open, never fixture content.
 fn copy_store(src: &Path, label: &str) -> PathBuf {
@@ -128,7 +163,11 @@ fn regenerate_fixture_store() -> PathBuf {
 #[ignore = "regenerates the checked-in dev fixture; run explicitly, see above"]
 fn regenerate_dev_fixture() {
     let dir = regenerate_fixture_store();
-    let dst = fixture_root();
+    // The dev fixture lives under its release directory: regenerating
+    // into the fixture root would destroy the per-release fixtures
+    // and scatter the new store beside them instead of inside `dev/`.
+    // Pinned by regenerate_targets_dev_never_the_root above.
+    let dst = dev_fixture_dir();
     if dst.exists() {
         std::fs::remove_dir_all(&dst).unwrap();
     }

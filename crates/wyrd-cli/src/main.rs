@@ -505,6 +505,12 @@ fn mount(
     // by `into_live` below.
     let config = LiveConfig::default();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
+    // Flush the serving endpoint before announcing its address, so the
+    // first seal carries a route peers can already dial. The loop owns
+    // sends from here: every pass publishes undischarged announcement,
+    // transition, and capability obligations to the relay.
+    serving.flush().map_err(CliError::Serving)?;
+    live.set_node_addr(Some(serving.node_addr_bytes()));
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
     let backend = FuseBackend::shared_with_wants(

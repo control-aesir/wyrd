@@ -21,12 +21,15 @@ filesystem surface:
 
 - persistent local state for membership, snapshots, manifests, materialization,
   capabilities, and pending work
-- relay pool / signer-client wiring for the control plane
 - bulk object transport and backpressure
 - crash recovery and restart reconciliation
 - read-only then read/write FUSE integration
 
-That is the next phase after the protocol/core contracts already in `wyrd-sync`.
+The control plane is wired both ways: intake drains the relay mailbox
+into the engine every pass, and the same pass publishes undischarged
+announcement, transition, and capability obligations back out
+(`LiveNode::publish`, over the durable outbox the authoring paths
+queue).
 
 ## Control-plane transport (Nostr mailbox)
 

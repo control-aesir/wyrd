@@ -3,6 +3,7 @@ use wyrd_format::membership::{
 };
 use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 
+use super::common::escrow_fresh_secret;
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
@@ -224,6 +225,10 @@ fn admit(
     }
     engine.commit_facts(&batch)?;
     engine.resync()?;
+    // Mint-time escrow (T13), same commit-then-escrow order as the
+    // shared tail: the sidecar lands only after the admission batch
+    // commits.
+    escrow_fresh_secret(engine, epoch, &secret)?;
     engine.add_epoch_key(
         epoch,
         Zeroizing::new(secret.control_key(&engine.drive, epoch)),

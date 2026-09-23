@@ -69,7 +69,7 @@ use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
-use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
+use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey};
 use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
 
@@ -461,6 +461,13 @@ pub struct Engine {
     /// never holds a bare `SecretKey` past one curve-API call.
     pub(super) identity_secret: DeviceIdentitySecret,
     pub(super) encryption_secret: DeviceEncryptionSecret,
+    /// The drive root key, owner engines only (`None` on member
+    /// engines and keystoreless opens). Retained so owner authoring
+    /// can escrow each fresh epoch secret at mint time (T13) without
+    /// the passphrase, which exists only at open. Same hygiene as
+    /// the device secrets: `ZeroizeOnDrop`, never serialized, never
+    /// leaves the process except inside sealed escrow records.
+    pub(super) root: Option<DriveRootKey>,
     pub(super) store: DurableStore,
     pub(super) inbox: ControlInbox,
     /// Held epoch control keys, retained outside the inbox so a
@@ -539,6 +546,10 @@ impl Engine {
             device,
             identity_secret,
             encryption_secret,
+            // Owner flows set this after open (create, open_keystore);
+            // member and keystoreless opens keep `None` and escrow
+            // nothing.
+            root: None,
             store,
             vault,
             inbox: ControlInbox::new(drive),

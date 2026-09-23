@@ -17,12 +17,24 @@
 //! ```
 //!
 //! The AAD is `version ‖ DriveId ‖ epoch`; the StorageId is derived over
-//! the record bytes, so vaults hold opaque blobs. v0 lifecycle: the owner
-//! wraps at mint time and publishes each record alongside its transition;
-//! vault replication rides later transport work. Mint-time integration
-//! (calling wrap from the owner flow) lands with the transition/owner
-//! work: this change provides the record type, derivation, and
-//! verification.
+//! the record bytes, so vaults hold opaque blobs.
+//!
+//! Storage home (decided): keystore sidecars, one file per epoch at
+//! `<store>/escrow/<epoch>`, written by the owner flow at mint time.
+//! Sidecars beat the alternatives on both sides: rewriting the keystore
+//! record per epoch would need the passphrase at author time (it is
+//! only present at open), and durable facts replicate to members while
+//! escrow is owner-local custody. Publication alongside transitions
+//! rides later transport work; v0 persistence is local and atomic per
+//! record.
+//!
+//! Ordering (pinned): the sidecar lands AFTER the transition's durable
+//! commit. A crash between them leaves a missing sidecar — today's gap,
+//! with recovery falling back to keyring catch-up — never an orphan
+//! record a retried authoring could mismatch with a fresh secret for
+//! the same epoch.
+
+use std::path::{Path, PathBuf};
 
 use wyrd_format::DriveId;
 use wyrd_format::StorageId;
@@ -132,6 +144,42 @@ pub fn unwrap(escrow_key: &[u8; 32], record: &EscrowRecord) -> Result<EpochSecre
             .try_into()
             .expect("48-byte ciphertext opens to 32 bytes"),
     ))
+}
+
+/// Keystore sidecar directory, inside the drive directory: per-epoch
+/// escrow records live beside the keystore file, not inside it, so
+/// authoring never needs the passphrase and no keystore version
+/// migrates. Epoch 1 keeps its historical home inside the custody
+/// record; epochs 2+ live here.
+pub const ESCROW_DIR: &str = "escrow";
+
+/// The sidecar path for one epoch's record.
+pub fn record_path(store_dir: &Path, epoch: u64) -> PathBuf {
+    store_dir.join(ESCROW_DIR).join(epoch.to_string())
+}
+
+/// Persist one epoch's record atomically (temp + fsync + rename, like
+/// every other drive file). Call only after the epoch's transition
+/// commits — see the ordering note at the top of this module.
+pub fn persist_record(store_dir: &Path, record: &EscrowRecord) -> std::io::Result<()> {
+    let dir = store_dir.join(ESCROW_DIR);
+    std::fs::create_dir_all(&dir)?;
+    crate::durable::atomic_write(&dir, &record.epoch.to_string(), &record.encode())
+}
+
+/// Read one epoch's sidecar: `None` when no record was written (the
+/// pre-escrow gap, or a crash between commit and persist — both fall
+/// back to keyring catch-up). A present-but-malformed record is
+/// corrupt custody and fails closed as `InvalidData`, never as a
+/// missing record.
+pub fn load_record(store_dir: &Path, epoch: u64) -> std::io::Result<Option<EscrowRecord>> {
+    match std::fs::read(record_path(store_dir, epoch)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+        Ok(bytes) => EscrowRecord::decode(&bytes).map(Some).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed escrow sidecar")
+        }),
+    }
 }
 
 #[cfg(test)]

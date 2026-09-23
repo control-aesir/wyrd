@@ -114,6 +114,10 @@ pub(super) fn create(
     // is deterministic and owner-verified.
     let result = (|| -> Result<Engine, EngineError> {
         let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
+        // Owner custody: the engine retains the root so later
+        // authoring can escrow each fresh epoch secret at mint time
+        // (T13). Member engines never hold it.
+        engine.root = Some(root);
         atomic_write(&dir, KEYSTORE_FILE, &custody)?;
         engine.commit_facts(&[Fact::Transition(genesis.clone())])?;
         engine.resync()?;
@@ -209,8 +213,9 @@ fn open_owner_keystore(
     let genesis = genesis_transition(drive, &identity, &encryption)?;
 
     let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
+    // Owner custody retained for mint-time escrow, like at create.
+    engine.root = Some(root);
     engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
-
     // Resume an interrupted bootstrap: the custody record is durable but
     // the genesis commit was lost to a crash. The genesis is deterministic
     // and the supplied identity was checked against the recorded owner, so
@@ -225,6 +230,12 @@ fn open_owner_keystore(
     // content): the escrow record covers exactly this epoch, and the
     // install is a no-op when the durable capability already exists.
     install_self_capability(&mut engine, &genesis, &epoch)?;
+    // Restore every later epoch's control key from its escrow sidecar:
+    // root custody alone re-derives the control plane even when the
+    // keyring lost those epochs (T13 recovery). Missing sidecars are
+    // the pre-escrow gap and fall back to keyring catch-up; corrupt
+    // ones fail closed below.
+    restore_escrowed_epochs(&mut engine)?;
     Ok(engine)
 }
 
@@ -458,6 +469,39 @@ fn install_self_capability(
         AuthorizedCapability::authorize(cap, engine.drive, &engine.log, &genesis.transition_id())
             .map_err(EngineError::Capability)?;
     engine.commit_facts(&[Fact::Capability(authorized)])?;
+    Ok(())
+}
+
+/// Install the control key of every escrowed epoch secret (T13
+/// recovery): root custody alone re-derives the control plane for
+/// epochs whose keyring material was lost. Epoch 1 keeps its
+/// historical keystore-escrow path in the caller; epochs 2+ read
+/// their sidecars up to the known tip. Missing sidecars are the
+/// pre-escrow gap (or a commit-then-escrow crash window) and skip to
+/// keyring catch-up; a present record for the wrong drive, or one
+/// that fails the tag, is corrupt custody and fails closed — a
+/// guardian must never install a secret the root did not seal.
+fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
+    let Some(root) = engine.root.clone() else {
+        return Ok(());
+    };
+    let drive = engine.drive;
+    let dir = engine.store.dir().to_path_buf();
+    let tip = engine
+        .log
+        .known_state()
+        .map(|known| known.epoch)
+        .unwrap_or(0);
+    for epoch in 2..=tip {
+        let Some(record) = escrow::load_record(&dir, epoch)? else {
+            continue;
+        };
+        if record.drive != drive || record.epoch != epoch {
+            return Err(EngineError::MalformedKeystore);
+        }
+        let secret = escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?;
+        engine.add_epoch_key(epoch, Zeroizing::new(secret.control_key(&drive, epoch)));
+    }
     Ok(())
 }
 
@@ -1246,6 +1290,65 @@ mod tests {
         assert!(
             !dir.path.join("DRIVE").exists(),
             "substituted-key invitations never touch disk"
+        );
+    }
+
+    #[test]
+    fn per_transition_escrow_restores_later_epochs_from_root_alone() {
+        // T13 mint-time integration: admitting a device (epoch 2)
+        // writes an escrow sidecar at commit time, and root custody
+        // alone restores the epoch-2 control key — no keyring, no
+        // catch-up delivery.
+        let dir = TestDir::new("per-transition-escrow");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        engine
+            .admit_device(newcomer.device_id(), newcomer_encryption.encryption_key())
+            .unwrap();
+        let epoch2_key = engine
+            .epoch_keys
+            .get(&2)
+            .cloned()
+            .expect("authoring installs the fresh control key");
+        // The sidecar exists on disk and decodes to epoch 2.
+        let record = escrow::load_record(&dir.path, 2)
+            .unwrap()
+            .expect("mint writes the sidecar");
+        assert_eq!(record.epoch, 2);
+        // The shared tail covers the other authoring paths: rotate
+        // through it and epoch 3 escrows the same way.
+        engine.rotate_epoch().unwrap();
+        let epoch3_key = engine
+            .epoch_keys
+            .get(&3)
+            .cloned()
+            .expect("rotation installs its control key");
+        assert_eq!(
+            escrow::load_record(&dir.path, 3)
+                .unwrap()
+                .expect("shared tail escrows every path")
+                .epoch,
+            3
+        );
+        drop(engine);
+        // Reopen from keystore alone, then prove the escrow path —
+        // not the keyring — restores the later epochs: remove the
+        // keyring-derived keys and restore from the sidecars.
+        let mut engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
+        engine.epoch_keys.remove(&2);
+        engine.epoch_keys.remove(&3);
+        restore_escrowed_epochs(&mut engine).unwrap();
+        assert_eq!(
+            engine.epoch_keys.get(&2),
+            Some(&epoch2_key),
+            "root custody alone restores epoch 2"
+        );
+        assert_eq!(
+            engine.epoch_keys.get(&3),
+            Some(&epoch3_key),
+            "root custody alone restores epoch 3"
         );
     }
 

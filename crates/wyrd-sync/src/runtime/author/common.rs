@@ -11,10 +11,36 @@ use wyrd_format::MembershipTransition;
 
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
-use crate::keys::EpochSecret;
+use crate::keys::{escrow, EpochSecret};
 use crate::membership::MembershipState;
 use crate::runtime::engine::{Engine, EngineError};
 use zeroize::Zeroizing;
+
+/// Wrap the transition's fresh epoch secret under the owner's root
+/// and persist the keystore sidecar (T13). Owner engines opened
+/// through the keystore always hold the root; member engines and
+/// keystoreless opens hold none and escrow nothing — escrow is a
+/// custody function, and custody lives in the keystore flow.
+/// Production owner drives always open via the keystore, so authoring
+/// without a root is a test-only shape, never a silent production
+/// gap: the sidecar set simply covers the keystored epochs.
+pub(super) fn escrow_fresh_secret(
+    engine: &Engine,
+    epoch: u64,
+    secret: &EpochSecret,
+) -> Result<(), EngineError> {
+    let Some(root) = engine.root.as_ref() else {
+        return Ok(());
+    };
+    let record = escrow::wrap(
+        &root.escrow_key(&engine.drive(), epoch),
+        &engine.drive(),
+        epoch,
+        secret,
+    )?;
+    escrow::persist_record(engine.store.dir(), &record)?;
+    Ok(())
+}
 
 /// Commit a signed membership transition: stage it against a cloned
 /// log (the live log stays pristine until the batch commits, so any
@@ -81,6 +107,15 @@ pub(super) fn commit_new_epoch(
     }
     engine.commit_facts(&batch)?;
     engine.resync()?;
+    // Mint-time escrow (T13): the fresh secret seals under the root
+    // only after the transition commits. Commit-then-escrow is the
+    // safe order — a crash between them leaves a missing sidecar
+    // (recovery falls back to keyring catch-up), never an orphan
+    // record a retry could mismatch with a fresh secret for the same
+    // epoch. Escrow failure reports loudly; the commit already
+    // happened, so the caller retries at a new epoch, never by
+    // rewriting this one.
+    escrow_fresh_secret(engine, epoch, &secret)?;
     if author_stays {
         engine.add_epoch_key(
             epoch,

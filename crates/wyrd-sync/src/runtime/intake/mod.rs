@@ -19,6 +19,7 @@ use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxE
 
 const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
+#[derive(Debug)]
 enum Action {
     Commit(Vec<Fact>),
     /// Deterministic suppression verdict: the message is invalid and
@@ -32,6 +33,7 @@ enum Action {
     Defer(DeferredWait),
 }
 
+#[derive(Debug)]
 enum Outcome {
     Accepted,
     Duplicate,
@@ -112,7 +114,13 @@ fn accept_envelope(
         // too: the mailbox already rejected them before ingest, and the
         // relay retains nothing for an acked handover.
         Ok(bytes) => bytes,
-        Err(_) => return Ok(Outcome::Discarded),
+        Err(error) => {
+            // Per-envelope forensics: a stuck peer shows identical
+            // silence for poison, missing keys, and deferral — the
+            // verdict line names which one each delivery met.
+            tracing::debug!(outcome = "discarded", reason = %error, "intake verdict");
+            return Ok(Outcome::Discarded);
+        }
     };
     // Rotation deliveries ride their own framing under a distinct
     // version: dispatch on the version byte before either framing
@@ -120,17 +128,25 @@ fn accept_envelope(
     // rotation header's ephemeral bytes would otherwise land where the
     // control envelope keeps its kind tag).
     if bytes.first() == Some(&ROTATION_VERSION) {
-        return accept_rotation(engine, envelope, &bytes);
+        let outcome = accept_rotation(engine, envelope, &bytes)?;
+        tracing::debug!(kind = "rotation-delivery", outcome = ?outcome, "intake verdict");
+        return Ok(outcome);
     }
     match engine.inbox.ingest(&bytes) {
         // Only a missing epoch key can heal: the bytes are well-formed
         // for our drive and may become openable when the key arrives.
-        Err(ControlError::UnknownEpoch(_)) => Ok(Outcome::Skipped),
+        Err(ControlError::UnknownEpoch(epoch)) => {
+            tracing::debug!(outcome = "skipped", epoch, "intake verdict");
+            Ok(Outcome::Skipped)
+        }
         // Decode, version, drive, and crypto failures under a held key
         // are terminal: the bytes can never become a processable
         // message. Consume without a fact so poison cannot accumulate
         // in the relay.
-        Err(_) => Ok(Outcome::Discarded),
+        Err(error) => {
+            tracing::debug!(outcome = "discarded", reason = %error, "intake verdict");
+            Ok(Outcome::Discarded)
+        }
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
             Some(id) => match engine.take_pending(&id) {
                 Some(entry) => commit_action(engine, &id, &entry.message, false, Some(entry.wait)),
@@ -156,7 +172,9 @@ fn commit_action(
     // several pending messages into one commit, and a fork must never
     // reach the fact log merely because two deferrals resolved together.
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
-    let mut facts = match message_action(engine, id, message, &mut staged) {
+    let action = message_action(engine, id, message, &mut staged);
+    tracing::debug!(kind = ?message.kind(), id = ?id, action = ?action, "intake verdict");
+    let mut facts = match action {
         Ok(Action::Commit(facts)) => facts,
         Ok(Action::Suppress) => {
             engine.inbox.suppress(id);

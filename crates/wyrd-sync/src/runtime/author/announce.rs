@@ -329,7 +329,12 @@ fn send_pending_for(
         .filter(|(id, _)| *id == snapshot)
         .map(|(_, recipient)| recipient)
         .collect();
-    send_sealed_to(engine, mailbox, sealed_bytes, recipients, |recipient| {
-        Fact::AnnouncementDelivered(snapshot, recipient)
-    })
+    send_sealed_to(
+        engine,
+        mailbox,
+        "announcement",
+        sealed_bytes,
+        recipients,
+        |recipient| Fact::AnnouncementDelivered(snapshot, recipient),
+    )
 }

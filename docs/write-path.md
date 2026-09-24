@@ -164,6 +164,9 @@ MutationRequest {
    the mutation fails `ETIMEDOUT` — retryable information, not a
    system failure. A mutation evaluated headless or multi-head never
    holds: nothing meaningful pins, so it fails closed as before.
+   A pass that fulfills fetch objects with mutations still queued
+   wakes the loop immediately, so a held mutation retries without
+   waiting out the idle pacing deadline.
 5. **Liveness consequence (named).** The daemon synchronization loop is a
    hard liveness dependency for every committing FUSE operation: a wedged
    loop blocks the caller indefinitely. That is a daemon health failure

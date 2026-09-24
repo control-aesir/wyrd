@@ -30,11 +30,12 @@ pub(crate) fn deliver_pending(
     mailbox: &mut impl Mailbox,
 ) -> Result<usize, EngineError> {
     // One validated delivery snapshot per pass: every read below comes
-    // from this rebuild. Mid-pass commits only append Sealed and
-    // Delivered facts — never new Queued pairs — so the frozen pending
-    // lists stay exact, and an in-memory overlay absorbs newly sealed
-    // bytes. No re-read per pair: a newcomer catch-up or a large
-    // fan-out costs one log decode, not one per obligation.
+    // from this rebuild. Mid-pass commits only append Sealed,
+    // SealedReplaced, and Delivered facts — never new Queued pairs — so
+    // the frozen pending lists stay exact, and an in-memory overlay
+    // absorbs newly sealed bytes. No re-read per pair: a newcomer
+    // catch-up or a large fan-out costs one log decode, not one per
+    // obligation.
     let rebuilt = engine.store.rebuild(engine.device)?;
     let mut sent = 0usize;
     sent += deliver_transitions(engine, mailbox, &rebuilt)?;
@@ -552,6 +553,26 @@ fn mint_fresh_rotation_bytes(
     let Some(registration) = state.encryption_key_of(&recipient).copied() else {
         return Ok(None);
     };
+    // Mint authority, checked before anything is sealed or committed
+    // (epochs.md rule 3). The recipient enforces this at intake: a proof
+    // signed outside the transition's pre-state owner set is suppressed.
+    // A sender without it would append a replacement, mark it
+    // transmitted, and deliver bytes the recipient discards — a durable
+    // fact claiming an obligation discharged that no recipient ever
+    // honours. Leave the obligation pending for an authorized signer
+    // instead; the relay reaches the owner.
+    let mint_authority = match transition.prev {
+        Some(prev) => engine.log.owners_of(&prev),
+        // Genesis establishes its own owner set; there is no earlier
+        // state to consult.
+        None => engine.log.owners_of(transition_id),
+    };
+    match mint_authority {
+        Some(owners) if owners.contains(&engine.device) => {}
+        // Signed, but by a device without mint authority.
+        Some(_) => return Ok(None),
+        None => return Err(EngineError::TransitionUnclassified(*transition_id)),
+    }
     let Some(secrets) = epoch_secrets(keyring, transition) else {
         return Ok(None);
     };

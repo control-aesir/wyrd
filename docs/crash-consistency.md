@@ -104,6 +104,22 @@ resumes without re-authoring. Pinned by
 `crash_before_announce_resumes_without_reauthoring`
 (`engine/tests_drain.rs`).
 
+A capability obligation whose sealed bytes went stale (a rotation
+framed under a superseded version) adds one more durable boundary
+before the mailbox: `CapabilitySealedReplaced` commits the
+replacement *before* the send, naming the superseded fact. A crash
+after the replacement commit and before the send therefore resumes by
+sending the committed bytes, not by re-minting the stale fact into a
+different set — the pass-local overlay this replaced died with the
+process and appended one fsynced, then-ignored record per obligation
+per pass for the whole outage. Minting is gated on the engine holding
+mint authority for the transition's pre-state, so a sender without it
+appends no replacement and leaves the obligation pending rather than
+recording a transmission the recipient would suppress. Pinned by
+`stale_capability_obligation_recovers_byte_identically_across_restart`
+and `non_owner_stale_obligation_commits_no_replacement`
+(`engine/tests_delivery.rs`).
+
 ## Keystore and custody
 
 The owner record (wrapped root + device secret + epoch-1 escrow)

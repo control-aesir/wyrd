@@ -47,11 +47,9 @@ pub(super) fn execute_sliced(
     objects: &mut impl ObjectStore,
     deadline: Option<std::time::Instant>,
 ) -> Result<ExecuteReport, EngineError> {
-    bulk.set_attempt_timeout(
-        deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now())),
-    );
+    bulk.set_attempt_deadline(deadline);
     let result = execute_inner(engine, bulk, objects, deadline);
-    bulk.set_attempt_timeout(None);
+    bulk.set_attempt_deadline(None);
     result
 }
 

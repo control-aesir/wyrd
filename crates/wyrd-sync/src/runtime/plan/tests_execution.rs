@@ -868,8 +868,8 @@ fn serving_reads_proceed_while_fetch_waits_on_bulk() {
 struct StallingBulk {
     stall: Duration,
     attempts: usize,
-    caps: Vec<Option<Duration>>,
-    current: Option<Duration>,
+    deadlines: Vec<Option<Instant>>,
+    current: Option<Instant>,
 }
 
 impl StallingBulk {
@@ -877,15 +877,19 @@ impl StallingBulk {
         Self {
             stall,
             attempts: 0,
-            caps: Vec::new(),
+            deadlines: Vec::new(),
             current: None,
         }
     }
 
     fn stall_once<T>(&mut self) -> Result<Option<T>, BulkError> {
         self.attempts += 1;
+        // Clamp at attempt time, exactly like the live source: a later
+        // attempt in the same pass sees the time actually remaining.
         let sleep = match self.current {
-            Some(cap) => self.stall.min(cap),
+            Some(deadline) => self
+                .stall
+                .min(deadline.saturating_duration_since(Instant::now())),
             None => self.stall,
         };
         std::thread::sleep(sleep);
@@ -894,9 +898,9 @@ impl StallingBulk {
 }
 
 impl AttemptBudget for StallingBulk {
-    fn set_attempt_timeout(&mut self, timeout: Option<Duration>) {
-        self.caps.push(timeout);
-        self.current = timeout;
+    fn set_attempt_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadlines.push(deadline);
+        self.current = deadline;
     }
 }
 
@@ -1037,14 +1041,14 @@ fn a_stalled_provider_cannot_outlast_the_runs_deadline() {
     );
     assert_eq!(report.objects, 0, "a stalled provider delivers nothing");
     assert_eq!(
-        bulk.caps.last(),
+        bulk.deadlines.last(),
         Some(&None),
-        "the cap is cleared on the way out"
+        "the deadline is cleared on the way out"
     );
     assert!(
-        matches!(bulk.caps.first(), Some(Some(cap)) if *cap <= Duration::from_millis(150)),
-        "the run's budget reached the source: {:?}",
-        bulk.caps
+        matches!(bulk.deadlines.first(), Some(Some(armed)) if *armed <= deadline + Duration::from_millis(5)),
+        "the run's deadline reached the source: {:?}",
+        bulk.deadlines
     );
 
     // A run whose deadline has passed attempts nothing.

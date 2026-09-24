@@ -624,6 +624,7 @@ where
             self.engine
                 .set_materialization(want, MaterializationState::Cached)
         })?;
+        let phase = std::time::Instant::now();
         let fetched = match bulk {
             Some(bulk) => {
                 // Route publication precedes every pass: routes come
@@ -648,6 +649,10 @@ where
             }
             None => ExecuteReport::default(),
         };
+        tracing::debug!(
+            elapsed_ms = phase.elapsed().as_millis(),
+            "pass phase fetch done"
+        );
         // Apply mounted mutations in admission order (the queue's total
         // order): each is evaluated against the state its predecessor
         // committed, never against what the syscall saw. Submitters block
@@ -805,7 +810,15 @@ where
         // here advance the sequence, so the next pass republishes the
         // (semantically unchanged) generation and retries whatever is
         // still pending.
+        tracing::debug!(
+            elapsed_ms = phase.elapsed().as_millis(),
+            "pass phase mutations done"
+        );
         let sent = self.publish(mailbox)?;
+        tracing::debug!(
+            elapsed_ms = phase.elapsed().as_millis(),
+            "pass phase publish done"
+        );
         tracing::debug!(
             accepted = drained.accepted,
             duplicates = drained.duplicates,

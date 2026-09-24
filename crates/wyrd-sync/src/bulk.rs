@@ -71,16 +71,19 @@ pub enum BulkError {
     Oversize { bytes: usize, max: usize },
 }
 
-/// Per-attempt fetch timeout knob: the plan caps each attempt at the
-/// remaining time to the nearest held-mutation deadline, so one
-/// stalled provider cannot push a timeout decision past its wall-clock
-/// bound. The default is a no-op (attempts run under the source's own
-/// built-in timeouts); sources with real per-attempt deadlines
-/// override it. Set per attempt immediately before use and restored to
-/// `None` for unbounded runs — the knob is plan-run state, not source
-/// configuration.
+/// Per-attempt fetch deadline knob: the plan hands the source the
+/// absolute instant its budget runs out (the nearest held-mutation
+/// deadline), and the source clamps **every** attempt to the time
+/// remaining at that attempt — a deadline, not a duration, so a later
+/// attempt in the same pass cannot re-arm with a stale budget after an
+/// earlier attempt burned its share. One stalled provider can no
+/// longer push a timeout decision past its wall-clock bound. The
+/// default is a no-op (attempts run under the source's own built-in
+/// timeouts); sources with real per-attempt deadlines override it.
+/// The knob is plan-run state: the plan sets it at entry and clears
+/// it on the way out.
 pub trait AttemptBudget {
-    fn set_attempt_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
+    fn set_attempt_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
 }
 
 /// The synchronous bulk boundary: sealed manifests and sealed objects
@@ -198,11 +201,11 @@ pub struct IrohBulkSource {
     /// update replaces it (last accepted wins), so those maps stay
     /// single-valued by policy.
     transport: BTreeMap<BaoRoot, Vec<IrohBlobRef>>,
-    /// Plan-run attempt cap from [`AttemptBudget`]: the remaining time
-    /// to the nearest held-mutation deadline, or `None` for the
-    /// built-in timeouts. Plan-run state, reset by the plan — never
-    /// source configuration.
-    attempt_timeout: Option<std::time::Duration>,
+    /// Plan-run deadline from [`AttemptBudget`]: the instant the pass's
+    /// budget runs out, re-clamped to the remaining time on every
+    /// attempt. `None` runs under the built-in timeouts. Plan-run
+    /// state, reset by the plan — never source configuration.
+    attempt_deadline: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -230,7 +233,7 @@ impl IrohBulkSource {
             snapshots: BTreeMap::new(),
             sealed: BTreeMap::new(),
             transport: BTreeMap::new(),
-            attempt_timeout: None,
+            attempt_deadline: None,
         }
     }
 
@@ -367,14 +370,19 @@ impl IrohBulkSource {
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
-        // The plan may cap this attempt at the remaining time to the
-        // nearest held-mutation deadline: a sliced attempt reports a
-        // transport timeout (retried next pass), never a strike — the
-        // deadline belongs to the waiter, not the provider. Uncapped
-        // runs use the built-in timeouts.
+        // The plan may cap this attempt at the time remaining to its
+        // deadline, re-read here so every attempt in the pass clamps
+        // to the live remaining: a sliced attempt reports a transport
+        // timeout (retried next pass), never a strike — the deadline
+        // belongs to the waiter, not the provider. Unbudgeted runs
+        // use the built-in timeouts.
         let blob_timeout = self
-            .attempt_timeout
-            .map(|cap| cap.min(FETCH_BLOB_TIMEOUT))
+            .attempt_deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(FETCH_BLOB_TIMEOUT)
+            })
             .unwrap_or(FETCH_BLOB_TIMEOUT);
         let dial_timeout = FETCH_DIAL_TIMEOUT.min(blob_timeout);
         self.runtime.block_on(async move {
@@ -454,8 +462,8 @@ where
 }
 
 impl AttemptBudget for IrohBulkSource {
-    fn set_attempt_timeout(&mut self, timeout: Option<std::time::Duration>) {
-        self.attempt_timeout = timeout;
+    fn set_attempt_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.attempt_deadline = deadline;
     }
 }
 

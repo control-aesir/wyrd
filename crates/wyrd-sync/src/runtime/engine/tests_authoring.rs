@@ -436,3 +436,19 @@ fn announcing_a_foreign_snapshot_fails_closed() {
         "a refused announcement never sends"
     );
 }
+
+/// Recovery grafts content under the current epoch, but only the
+/// current canonical owner may author it: a plain member holds the
+/// tree and the epoch material yet is refused before anything
+/// commits (`docs/epochs.md`, recovery authorization).
+#[test]
+fn recovery_authoring_requires_the_current_owner() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    assert!(matches!(
+        pair.a.engine.author_recovery_snapshot(&objects, tree),
+        Err(EngineError::RecoveryNotOwner)
+    ));
+}

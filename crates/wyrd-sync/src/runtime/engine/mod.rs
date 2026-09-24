@@ -98,6 +98,8 @@ pub enum EngineError {
     NotAMember,
     #[error("this device is a reader and cannot author snapshots")]
     ReaderCannotAuthor,
+    #[error("only the current canonical owner may author a recovery snapshot")]
+    RecoveryNotOwner,
     #[error("this device is not an owner in the pre-transition state")]
     NotOwner,
     #[error("device is already a member")]
@@ -976,6 +978,28 @@ impl Engine {
         S::Error: std::fmt::Debug,
     {
         super::author::author(self, objects, tree)
+    }
+
+    /// Author a recovery snapshot over `tree`, signed by this device
+    /// and bound to the canonical membership state. `tree` is
+    /// explicitly selected historical content — a recorded ContentId
+    /// the owner chose to republish, never live-derived lineage —
+    /// while the parents are always the current eligible heads, so a
+    /// recovery grafts bytes without adopting a dead fork. The body
+    /// carries the recovery flag under the signature
+    /// (`docs/epochs.md`, recovery snapshots). Only the current
+    /// canonical owner may recover; anyone else fails closed with
+    /// [`EngineError::RecoveryNotOwner`]. Fails closed like
+    /// [`Engine::author_snapshot`] otherwise.
+    pub fn author_recovery_snapshot<S: ObjectStore>(
+        &mut self,
+        objects: &S,
+        tree: ContentId,
+    ) -> Result<AuthorizedSnapshot, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::author_recovery(self, objects, tree)
     }
 
     /// Stage the current eligible heads as durable carry

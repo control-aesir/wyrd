@@ -1797,3 +1797,105 @@ fn recovery_grafts_content_only_and_voided_transitions_never_authorize() {
     // view; nothing voided-derived does.
     assert_eq!(dag.eligible_heads(&log), vec![id_recovery]);
 }
+
+/// Recovery rebuilds explicitly identified historical content and
+/// mounts it: the owner authors a tree, supersedes it across a
+/// rotation (carry keeps continuity, so the snapshot becomes
+/// canonical history), writes on without the bytes, then grafts the
+/// recorded historical tree back under the current epoch through the
+/// production authoring path. The recovery mounts with the
+/// historical bytes while the superseded snapshot stays out of the
+/// eligible set (`docs/epochs.md`, recovery; the materialization
+/// half contract 37's classifier-only coverage leaves open — no
+/// synthetic ContentIds here).
+#[test]
+fn recovery_rebuilds_explicit_historical_content_and_mounts() {
+    let dir = scratch_dir("recovery");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.clone(), "recovery-pass", identity).unwrap();
+
+    let mut store = MemoryObjectStore::default();
+    let historical_chunk = store
+        .insert(ObjectKind::Chunk, b"historical bytes")
+        .unwrap();
+    let historical = Tree::from_entries(vec![Entry::file(
+        "precious.txt",
+        16,
+        false,
+        vec![historical_chunk],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+
+    // The superseded past: author, then rotate with carry so the
+    // snapshot becomes canonical history instead of a live head.
+    let past = engine.author_snapshot(&store, historical).unwrap();
+    assert_eq!(past.snapshot().epoch, 1, "bound to the genesis tip");
+    assert_eq!(engine.stage_carry_heads().unwrap(), 1);
+    engine.rotate_epoch().unwrap();
+    let carried = engine.carry_pending(&store).unwrap();
+    assert_eq!(carried.authored.len(), 1, "continuity across the rotation");
+
+    // Live work moves on without the bytes.
+    let next_chunk = store.insert(ObjectKind::Chunk, b"new work").unwrap();
+    let next = Tree::from_entries(vec![
+        Entry::file("current.txt", 8, false, vec![next_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let live = engine.author_snapshot(&store, next).unwrap();
+    assert_eq!(live.snapshot().epoch, 2, "bound to the rotated tip");
+
+    // The recovery: the explicitly recorded historical tree,
+    // grafted onto the current eligible heads with the recovery
+    // flag — content, never lineage.
+    let recovery = engine.author_recovery_snapshot(&store, historical).unwrap();
+    assert_eq!(
+        recovery.snapshot().flags() & RECOVERY_FLAG,
+        RECOVERY_FLAG,
+        "a recovery snapshot carries the recovery flag"
+    );
+    assert_eq!(recovery.snapshot().epoch, 2, "bound to the current tip");
+    assert_eq!(
+        recovery.snapshot().parents,
+        vec![live.snapshot().snapshot_id()],
+        "recovery parents onto the eligible heads, never old lineage"
+    );
+    assert_eq!(recovery.snapshot().author, engine.device());
+
+    // Only the recovery is eligible: the superseded past, its
+    // carry, and the live head it extends are all history now.
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![recovery.snapshot().snapshot_id()],
+        "the superseded snapshot stays non-live"
+    );
+    assert!(
+        !heads
+            .iter()
+            .any(|h| h.snapshot().snapshot_id() == past.snapshot().snapshot_id()),
+        "the old snapshot never re-enters the eligible set"
+    );
+
+    // And the grafted bytes mount through the daemon view.
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("precious.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(
+        daemon.view().read(&file, 0, 16).unwrap(),
+        b"historical bytes",
+        "the recovery tree decrypts and mounts the selected bytes"
+    );
+
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}

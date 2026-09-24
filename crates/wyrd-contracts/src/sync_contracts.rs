@@ -1797,3 +1797,285 @@ fn recovery_grafts_content_only_and_voided_transitions_never_authorize() {
     // view; nothing voided-derived does.
     assert_eq!(dag.eligible_heads(&log), vec![id_recovery]);
 }
+
+/// Recovery rebuilds explicitly identified historical content and
+/// mounts it: the owner authors a tree, supersedes it across a
+/// rotation (carry keeps continuity, so the snapshot becomes
+/// canonical history), writes on without the bytes, then grafts the
+/// recorded historical tree back under the current epoch through the
+/// production authoring path. The recovery mounts with the
+/// historical bytes while the superseded snapshot stays out of the
+/// eligible set (`docs/epochs.md`, recovery; the materialization
+/// half contract 37's classifier-only coverage leaves open — no
+/// synthetic ContentIds here).
+#[test]
+fn recovery_rebuilds_explicit_historical_content_and_mounts() {
+    let dir = scratch_dir("recovery");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.clone(), "recovery-pass", identity).unwrap();
+
+    let mut store = MemoryObjectStore::default();
+    let historical_chunk = store
+        .insert(ObjectKind::Chunk, b"historical bytes")
+        .unwrap();
+    let historical = Tree::from_entries(vec![Entry::file(
+        "precious.txt",
+        16,
+        false,
+        vec![historical_chunk],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+
+    // The superseded past: author, then rotate with carry so the
+    // snapshot becomes canonical history instead of a live head.
+    let past = engine.author_snapshot(&store, historical).unwrap();
+    assert_eq!(past.snapshot().epoch, 1, "bound to the genesis tip");
+    assert_eq!(engine.stage_carry_heads().unwrap(), 1);
+    engine.rotate_epoch().unwrap();
+    let carried = engine.carry_pending(&store).unwrap();
+    assert_eq!(carried.authored.len(), 1, "continuity across the rotation");
+
+    // Live work moves on without the bytes.
+    let next_chunk = store.insert(ObjectKind::Chunk, b"new work").unwrap();
+    let next = Tree::from_entries(vec![
+        Entry::file("current.txt", 8, false, vec![next_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let live = engine.author_snapshot(&store, next).unwrap();
+    assert_eq!(live.snapshot().epoch, 2, "bound to the rotated tip");
+
+    // The recovery: the explicitly recorded historical tree,
+    // grafted onto the current eligible heads with the recovery
+    // flag — content, never lineage.
+    let recovery = engine.author_recovery_snapshot(&store, historical).unwrap();
+    assert_eq!(
+        recovery.snapshot().flags() & RECOVERY_FLAG,
+        RECOVERY_FLAG,
+        "a recovery snapshot carries the recovery flag"
+    );
+    assert_eq!(recovery.snapshot().epoch, 2, "bound to the current tip");
+    assert_eq!(
+        recovery.snapshot().parents,
+        vec![live.snapshot().snapshot_id()],
+        "recovery parents onto the eligible heads, never old lineage"
+    );
+    assert_eq!(recovery.snapshot().author, engine.device());
+
+    // Only the recovery is eligible: the superseded past, its
+    // carry, and the live head it extends are all history now.
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![recovery.snapshot().snapshot_id()],
+        "the superseded snapshot stays non-live"
+    );
+    assert!(
+        !heads
+            .iter()
+            .any(|h| h.snapshot().snapshot_id() == past.snapshot().snapshot_id()),
+        "the old snapshot never re-enters the eligible set"
+    );
+
+    // And the grafted bytes mount through the daemon view.
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("precious.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(
+        daemon.view().read(&file, 0, 16).unwrap(),
+        b"historical bytes",
+        "the recovery tree decrypts and mounts the selected bytes"
+    );
+
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Recovery resurrects bytes from a voided branch: real content is
+/// authored while its binding transition is canonical, the branch
+/// loses a membership conflict, and the owner grafts the recorded
+/// historical tree back under the resolution epoch through the
+/// production authoring path. The graft mounts with the historical
+/// bytes while the voided snapshot never re-enters the eligible set
+/// (`docs/epochs.md`, recovery; the voided-ancestry materialization
+/// half contract 37 covers with synthetic ContentIds only).
+#[test]
+fn recovery_resurrects_bytes_from_a_voided_branch_and_mounts() {
+    let mut rig = Rig::new();
+
+    // Real historical content, authored while its binding
+    // transition is canonical.
+    let mut store = MemoryObjectStore::default();
+    let chunk = store.insert(ObjectKind::Chunk, b"voided bytes").unwrap();
+    let historical = Tree::from_entries(vec![
+        Entry::file("doomed.txt", 12, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let admit = rig.admit.clone();
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability(&admit, &secrets);
+    assert_eq!(rig.drain().accepted, 1, "the self-capability lands");
+    let past_id = rig
+        .engine_mut()
+        .author_snapshot(&store, historical)
+        .unwrap()
+        .snapshot()
+        .snapshot_id();
+
+    // The conflict: a same-prev sibling admitting a third device,
+    // so the fork is a genuinely different document (deterministic
+    // signatures hash identical transitions identically) that
+    // freezes epoch 2.
+    let owner_id = rig.owner.id;
+    let recipient_id = rig.recipient.id;
+    let recipient_key = rig.recipient.encryption_key;
+    let second = device(0x30);
+    let fork = signed_transition(
+        2,
+        Some(rig.genesis.transition_id()),
+        vec![],
+        vec![Change::Admit(Admission {
+            device: second.id,
+            encryption_key: second.encryption_key,
+        })],
+        &[owner_id, second.id],
+        &[owner_id],
+        &rig.owner,
+    );
+    let fork_id = fork.transition_id();
+    rig.enqueue_transition(&fork, 2);
+    assert_eq!(rig.drain().accepted, 1, "the conflict freezes epoch 2");
+
+    // The resolution voids the admission branch, re-admits the
+    // recipient on the winning chain, and hands it the singleton
+    // ownership, so this rig's engine becomes the owner that may
+    // recover.
+    let resolution = signed_transition(
+        3,
+        Some(fork_id),
+        vec![rig.admit_id],
+        vec![
+            Change::Admit(Admission {
+                device: recipient_id,
+                encryption_key: recipient_key,
+            }),
+            Change::SetOwners(vec![recipient_id]),
+        ],
+        &[owner_id, second.id, recipient_id],
+        &[recipient_id],
+        &rig.owner,
+    );
+    let resolution_id = resolution.transition_id();
+    rig.enqueue_transition(&resolution, 3);
+    assert_eq!(
+        rig.drain().accepted,
+        1,
+        "the resolution voids the admission branch"
+    );
+
+    // The epoch-3 capability, minted from the resolved state over
+    // the full observed chain and delivered through the relay like
+    // any rotation delivery.
+    let mut log = MembershipLog::new(drive());
+    log.observe(rig.genesis.clone());
+    log.observe(rig.admit.clone());
+    log.observe(fork);
+    log.observe(resolution.clone());
+    let state = log
+        .state_of(&resolution_id)
+        .expect("the resolution carries its state");
+    let owner_identity = rig.owner.identity.clone();
+    let epoch3 = rig.epoch3.clone();
+    let capability = Capability::mint(
+        drive(),
+        recipient_id,
+        &state,
+        &resolution,
+        vec![rig.epoch1.clone(), rig.epoch2.clone(), epoch3.clone()],
+    )
+    .expect("the resolved membership admits its recipient");
+    let covered = capability.up_to_epoch();
+    let wrapped = capability.wrap().unwrap();
+    let envelope = sealed_envelope(
+        &owner_identity,
+        recipient_id,
+        &epoch3,
+        3,
+        &Message::Capability(CapabilityPayload {
+            device: recipient_id,
+            epoch: covered,
+            wrapped: wrapped.as_bytes().to_vec(),
+        }),
+    );
+    rig.relay.queue([envelope]);
+    assert_eq!(rig.drain().accepted, 1, "the epoch-3 capability lands");
+
+    let mut engine = rig.take_engine();
+    // Ordinary epoch-3 work first, so the recovery grafts onto a
+    // live head rather than a parentless edge.
+    let next_chunk = store.insert(ObjectKind::Chunk, b"live work").unwrap();
+    let next = Tree::from_entries(vec![
+        Entry::file("current.txt", 9, false, vec![next_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let live = engine.author_snapshot(&store, next).unwrap();
+    assert_eq!(live.snapshot().epoch, 3, "bound to the resolution tip");
+
+    // The recovery: the explicitly recorded historical tree,
+    // grafted onto the eligible head with the recovery flag.
+    let recovery = engine.author_recovery_snapshot(&store, historical).unwrap();
+    assert_eq!(
+        recovery.snapshot().flags() & RECOVERY_FLAG,
+        RECOVERY_FLAG,
+        "a recovery snapshot carries the recovery flag"
+    );
+    assert_eq!(recovery.snapshot().epoch, 3);
+    assert_eq!(
+        recovery.snapshot().parents,
+        vec![live.snapshot().snapshot_id()],
+        "recovery parents onto the eligible head, never voided lineage"
+    );
+
+    // Only the recovery is eligible: the voided past never comes back.
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![recovery.snapshot().snapshot_id()],
+        "the voided snapshot stays non-live"
+    );
+    assert!(
+        !heads.iter().any(|h| h.snapshot().snapshot_id() == past_id),
+        "a voided binding voids every snapshot on it"
+    );
+
+    // And the grafted bytes mount through the daemon view.
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("doomed.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(
+        daemon.view().read(&file, 0, 12).unwrap(),
+        b"voided bytes",
+        "the recovery tree decrypts and mounts the selected bytes"
+    );
+
+    drop(daemon);
+    rig.teardown();
+}

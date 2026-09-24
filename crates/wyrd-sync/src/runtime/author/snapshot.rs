@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
-    ChildManifest, ContentId, Entry, Manifest, ManifestEntry, ObjectKind, ObjectStore, Snapshot,
-    SnapshotId, Tree,
+    snapshot::RECOVERY_FLAG, ChildManifest, ContentId, Entry, Manifest, ManifestEntry, ObjectKind,
+    ObjectStore, Snapshot, SnapshotId, Tree,
 };
 
 use crate::authorization::SnapshotDag;
@@ -51,6 +51,7 @@ where
         tree,
         dag.eligible_heads(&rebuilt.log),
         rebuilt,
+        0,
     )
 }
 
@@ -71,7 +72,53 @@ where
     S::Error: std::fmt::Debug,
 {
     let rebuilt = engine.store.rebuild(engine.device)?;
-    author_over(engine, objects, tree, parents, rebuilt)
+    author_over(engine, objects, tree, parents, rebuilt, 0)
+}
+
+/// Author a recovery snapshot over `tree` on behalf of this engine's
+/// device. The tree is explicitly selected historical content — the
+/// caller passes a recorded ContentId, never live-derived lineage —
+/// while the parents are always the current eligible heads, derived
+/// inside exactly like [`author`]. Only the current canonical owner
+/// may recover (`docs/epochs.md`, recovery authorization): a member,
+/// a reader, or a stranger fails closed before anything commits. The
+/// body carries [`RECOVERY_FLAG`] under the signature, so every peer
+/// classifies it as recovery and never confuses it with ordinary
+/// writing.
+pub(crate) fn author_recovery<S: ObjectStore>(
+    engine: &mut Engine,
+    objects: &S,
+    tree: ContentId,
+) -> Result<AuthorizedSnapshot, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let known = rebuilt
+        .log
+        .known_state()
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    // The recovery author must be the current canonical owner — not
+    // merely a member of the bound epoch. The classifier enforces
+    // the same rule on intake (`RecoveryNotOwner`); authoring
+    // refuses up front so a misconfigured member fails loudly
+    // instead of authoring snapshots every peer rejects.
+    match rebuilt.log.owners_of(&known.transition_id) {
+        Some(owners) if owners.len() == 1 && owners.contains(&engine.device) => {}
+        _ => return Err(EngineError::RecoveryNotOwner),
+    }
+    let mut dag = SnapshotDag::new(engine.drive);
+    for body in rebuilt.runtime.snapshot_bodies.values() {
+        dag.observe(body.clone());
+    }
+    author_over(
+        engine,
+        objects,
+        tree,
+        dag.eligible_heads(&rebuilt.log),
+        rebuilt,
+        RECOVERY_FLAG,
+    )
 }
 
 fn author_over<S: ObjectStore>(
@@ -80,6 +127,7 @@ fn author_over<S: ObjectStore>(
     tree: ContentId,
     parents: Vec<SnapshotId>,
     rebuilt: Rebuilt,
+    flags: u8,
 ) -> Result<AuthorizedSnapshot, EngineError>
 where
     S::Error: std::fmt::Debug,
@@ -132,7 +180,7 @@ where
         engine.device,
         known.transition_id,
         known.epoch,
-        0,
+        flags,
         timestamp,
     )?;
     crate::authorization::predicates::sign_snapshot(

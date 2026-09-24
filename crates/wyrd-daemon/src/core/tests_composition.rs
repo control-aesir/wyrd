@@ -219,3 +219,84 @@ fn conflicted_write_error_requires_explicit_resolution() {
         "cannot write while the drive has 2 live heads"
     );
 }
+
+/// Recovery grafts explicitly identified historical bytes back onto
+/// the live view: a file is written, superseded across a rotation,
+/// removed from the live tree, then recovered by its recorded tree
+/// id through the production authoring path. The recovered bytes
+/// mount while the superseded snapshot never re-enters the eligible
+/// set (`docs/epochs.md`, recovery).
+#[test]
+fn recovery_grafts_historical_bytes_onto_the_live_view() {
+    let (engine, dir, identity) = scratch_drive();
+    let historical = {
+        let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+            WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+        let past = daemon
+            .put_file("precious.txt", b"historical bytes")
+            .unwrap();
+        assert_eq!(read_through(&daemon, "precious.txt"), b"historical bytes");
+        past.snapshot().tree
+    };
+
+    // Supersede across a rotation: carry keeps continuity, so the
+    // snapshot becomes canonical history instead of a live head.
+    // The daemon holds no membership surface, so the engine reopens
+    // from custody between compositions, exactly as the CLI does.
+    let mut engine =
+        Engine::open_keystore(dir.clone(), "daemon-test-pass", identity.clone()).unwrap();
+    assert_eq!(engine.stage_carry_heads().unwrap(), 1);
+    engine.rotate_epoch().unwrap();
+    let store = FsObjectStore::open(dir.clone()).unwrap();
+    assert_eq!(
+        engine.carry_pending(&store).unwrap().authored.len(),
+        1,
+        "continuity across the rotation"
+    );
+
+    // Live work moves on and drops the file; the bytes stay in the
+    // append-only store.
+    {
+        let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+            WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+        daemon.put_file("current.txt", b"new work").unwrap();
+        daemon.remove("precious.txt").unwrap();
+        assert_eq!(
+            daemon.view().lookup("precious.txt"),
+            Err(ViewError::NotFound),
+            "removal drops the path from the live view"
+        );
+        daemon
+            .view()
+            .lookup("current.txt")
+            .expect("live work survives alongside");
+    }
+
+    // The recovery, addressed by the recorded historical tree id:
+    // content selected explicitly, lineage from the live heads.
+    let mut engine = Engine::open_keystore(dir.clone(), "daemon-test-pass", identity).unwrap();
+    let recovery = engine
+        .author_recovery_snapshot(&FsObjectStore::open(dir.clone()).unwrap(), historical)
+        .unwrap();
+    let heads = engine.live_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![recovery.snapshot().snapshot_id()],
+        "the superseded snapshot stays non-live"
+    );
+
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    assert_eq!(
+        read_through(&daemon, "precious.txt"),
+        b"historical bytes",
+        "the grafted bytes mount through the live view"
+    );
+
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}

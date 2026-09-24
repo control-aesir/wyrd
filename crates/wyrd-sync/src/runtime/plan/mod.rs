@@ -152,7 +152,10 @@ fn execute_inner(
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
-                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Transport => {
+                    report.transport_errors += 1;
+                    engine.note_fetch_transport_failure(&body_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
@@ -190,7 +193,10 @@ fn execute_inner(
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
-                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Transport => {
+                    report.transport_errors += 1;
+                    engine.note_fetch_transport_failure(&root_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
@@ -228,7 +234,10 @@ fn execute_inner(
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
-                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Transport => {
+                    report.transport_errors += 1;
+                    engine.note_fetch_transport_failure(&child_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
@@ -261,10 +270,16 @@ fn execute_inner(
             // Strike representations whose bytes arrived and failed
             // validation regardless of the aggregate verdict: a corrupt
             // candidate keeps earning strikes even when a later
-            // candidate fulfilled. Absent, key-less, transport-failed,
-            // and locally-refused candidates never strike.
+            // candidate fulfilled. Transport failures strike on the
+            // same ledger (an unreachable route backs off instead of
+            // retrying every pass and starving the items behind it).
+            // Absent, key-less, and locally-refused candidates never
+            // strike: they are not evidence against the representation.
             for storage in &attempt.invalid {
                 engine.note_fetch_invalid(&FetchKey::Storage(*storage));
+            }
+            for storage in &attempt.transport_failed {
+                engine.note_fetch_transport_failure(&FetchKey::Storage(*storage));
             }
             match attempt.aggregate {
                 FetchOutcome::Fulfilled(()) => {

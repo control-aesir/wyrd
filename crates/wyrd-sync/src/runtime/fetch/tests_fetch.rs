@@ -9,7 +9,7 @@ use super::*;
 
 use std::collections::BTreeSet;
 
-use crate::bulk::{MemoryBulkSource, SealedManifest};
+use crate::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::engine::{FETCH_COOLDOWN_PASSES, FETCH_MAX_STRIKES};
@@ -28,6 +28,57 @@ fn hostile_transport(peer: &MemoryBulkSource, transport: BaoRoot) -> WithoutObje
         inner: peer.clone(),
         hidden: BTreeSet::new(),
         hidden_transport: BTreeSet::from([transport]),
+    }
+}
+
+/// A peer whose object routes fail in transport (every sealed and
+/// transport fetch errors) while manifests and bodies still flow: the
+/// model of a snapshot whose content provider went away.
+struct DeadObjectRoutes {
+    inner: MemoryBulkSource,
+    dead_storage: BTreeSet<StorageId>,
+    dead_roots: BTreeSet<BaoRoot>,
+}
+
+impl AttemptBudget for DeadObjectRoutes {}
+
+impl BulkSource for DeadObjectRoutes {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.dead_storage.contains(storage) {
+            return Err(BulkError::Transport("route dead".into()));
+        }
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.dead_roots.contains(root) {
+            return Err(BulkError::Transport("route dead".into()));
+        }
+        self.inner.fetch_transport(root, max)
     }
 }
 
@@ -508,6 +559,85 @@ fn repeatedly_invalid_representations_back_off() {
     assert_eq!(report.objects, 1);
     assert_eq!(report.unfulfilled, 0);
     assert_eq!(report.invalid, 0);
+}
+
+/// A transport-failed fetch backs off on the same ledger as invalid
+/// data: an unreachable route is not retried every pass forever, so
+/// it cannot starve the items sorted behind it. The representation
+/// stays pending through the cooldown, the strike count restarts
+/// after it, and healing the route fulfills.
+#[test]
+fn transport_failures_enter_cooldown_like_invalid_data() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"transport backoff",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    // The content object's routes fail in transport while manifests,
+    // trees, and bodies keep flowing: the model of a snapshot whose
+    // content provider went away.
+    let dead = |peer: &MemoryBulkSource| DeadObjectRoutes {
+        inner: peer.clone(),
+        dead_storage: BTreeSet::from([published.object_storage]),
+        dead_roots: BTreeSet::from([published.object_transport]),
+    };
+
+    // The first call converges manifests (two passes), so the object
+    // is attempted in both while striking once; every later call
+    // attempts once, striking once per run.
+    let report = fixture
+        .engine
+        .execute_plan(&mut dead(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.transport_errors, 2, "attempted while striking");
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut dead(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.transport_errors, 1, "attempted while striking");
+    }
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut dead(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.transport_errors, 0, "backing off");
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    let report = fixture
+        .engine
+        .execute_plan(&mut dead(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.transport_errors, 1, "retried after the cooldown");
 }
 
 #[test]

@@ -627,6 +627,17 @@ impl MutationQueue {
         state.deferred.push_back(queued);
     }
 
+    /// Return a run of entries to the held set in order, behind
+    /// whatever is already held: the batch's total order continues on
+    /// the next pass.
+    fn requeue_all(&self, queued: Vec<QueuedMutation>) {
+        if queued.is_empty() {
+            return;
+        }
+        let mut state = self.lock_state();
+        state.deferred.extend(queued);
+    }
+
     /// Lock the queue state, recovering a poisoned mutex: the state is
     /// plain data, so a panicked holder leaves it usable, and wedging
     /// every submitter is strictly worse than continuing.
@@ -749,6 +760,13 @@ impl MutationBatch<'_> {
     /// must observe exactly it, never a silent rebase. The first-defer
     /// instant is sticky: later defers of the same entry must not
     /// reset the prerequisite deadline.
+    ///
+    /// The queue's total order is why a defer must also **stop the
+    /// batch**: [`defer_and_release_rest`](Self::defer_and_release_rest)
+    /// is the only variant the loop uses, because a later entry
+    /// committing on top of a held one would invert the order the
+    /// write path promises. This primitive stays available for
+    /// tests that drive entries out of order.
     pub fn defer(&mut self, index: usize, base: wyrd_format::SnapshotId) {
         let entry = &mut self.entries[index];
         let mut queued = entry
@@ -767,6 +785,28 @@ impl MutationBatch<'_> {
             queued.base = Some(base);
         }
         self.queue.requeue(queued);
+    }
+
+    /// Hold the request at `index` and return every entry after it to
+    /// the queue, untouched and in order. The batch ends here: the
+    /// later requests are re-executed from scratch on the next pass,
+    /// in their original admission order behind the held entry —
+    /// never completed with a synthetic error, and never committed
+    /// past the defer. This is the loop's only defer path; it is what
+    /// keeps the total order when a prerequisite is missing.
+    pub fn defer_and_release_rest(&mut self, index: usize, base: wyrd_format::SnapshotId) {
+        self.defer(index, base);
+        // Drain the rest back to the front of the pending queue,
+        // preserving order. They are still outstanding: their reply
+        // slots wait, their admission slots stay consumed, and their
+        // wants (none yet — never executed) need no release.
+        let mut released: Vec<QueuedMutation> = Vec::with_capacity(self.entries.len() - index - 1);
+        for entry in self.entries.iter_mut().skip(index + 1) {
+            if let Some(queued) = entry.queued.take() {
+                released.push(queued);
+            }
+        }
+        self.queue.requeue_all(released);
     }
 
     /// The pinned base head for the request at `index`, if a previous
@@ -1260,6 +1300,72 @@ mod tests {
         }
         assert_eq!(wants.waiter_count(&chunk2), 0, "drop releases the want");
         assert_eq!(dropped.join().unwrap(), Err(MutationError::Engine));
+    }
+
+    /// A defer stops the batch: the held entry and every entry behind
+    /// it return to the queue in order, with nothing completed and no
+    /// entry executed past the defer. The next pass sees the same
+    /// total order — the held entry first — so M2 can never commit on
+    /// top of held M1.
+    #[test]
+    fn a_defer_returns_the_rest_of_the_batch_untouched() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let first = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("first")))
+        };
+        let second = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("second")))
+        };
+        // Both submitters must be admitted before the batch is taken,
+        // or the second one lands in a later batch.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.outstanding() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.len(), 2, "both requests in one batch");
+        // Admission order is whichever submitter won the race; the
+        // contract is that the batch keeps THAT order across the
+        // defer, not that it matches spawn order.
+        let head_kind = batch.request(0).kind().clone();
+        let tail_kind = batch.request(1).kind().clone();
+        assert!(matches!(head_kind, MutationKind::Mkdir { .. }));
+        batch.defer_and_release_rest(0, SnapshotId::from_bytes([0xB0; 32]));
+        // Nothing ran behind the defer: dropping the batch completes
+        // nothing (the held entry and the released one are back in
+        // the queue with their replies pending).
+        drop(batch);
+        assert_eq!(queue.outstanding(), 2, "both callers still blocked");
+        assert!(queue.nearest_deadline(Duration::from_secs(30)).is_some());
+
+        // The next pass holds the first entry again — and the second
+        // sits behind it in the same batch, still in admission order.
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch.request(0).kind(),
+            &head_kind,
+            "the held entry leads again"
+        );
+        assert_eq!(
+            batch.request(1).kind(),
+            &tail_kind,
+            "the rest follows in order"
+        );
+        assert_eq!(
+            batch.pinned(0),
+            Some(SnapshotId::from_bytes([0xB0; 32])),
+            "the retry keeps the head the first evaluation used"
+        );
+        batch.record(0, Ok(MutationOutcome::Done));
+        batch.record(1, Ok(MutationOutcome::Done));
+        batch.finish();
+        assert_eq!(first.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(second.join().unwrap(), Ok(MutationOutcome::Done));
     }
 
     /// The fetch budget's clock: the nearest deadline is the earliest

@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr};
@@ -84,6 +84,12 @@ pub(crate) enum MirrorItem {
 pub struct ServingHandle {
     runtime: tokio::runtime::Handle,
     sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+    /// At most one barrier is in flight: a caller whose timed-out
+    /// barrier is still queued behind a slow import must not pile
+    /// more barriers onto the unbounded channel (they would only
+    /// queue more stale acks). While set, a second caller reports
+    /// "not ready" instead of enqueueing its own.
+    barrier_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ServingHandle {
@@ -107,20 +113,38 @@ impl ServingHandle {
     /// send, retry next pass — the readiness ordering never weakens,
     /// and a slow mirror can no longer stretch the caller's pass.
     pub fn flush_bounded(&self, budget: std::time::Duration) -> Result<bool, std::io::Error> {
+        use std::sync::atomic::Ordering;
+        // One outstanding barrier: a caller that finds one in flight
+        // (the previous pass timed out but its item is still queued
+        // behind a slow import) reports "not ready" instead of
+        // queueing another onto the unbounded channel.
+        if self
+            .barrier_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let release = Arc::clone(&self.barrier_in_flight);
         let (ack, wait) = tokio::sync::oneshot::channel();
-        self.send(MirrorItem::Flush(ack))?;
+        if let Err(error) = self.send(MirrorItem::Flush(ack)) {
+            release.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
         // The timeout runs as a task on the runtime: a bare
         // `Handle::block_on` drives no timer, so the deadline would
         // panic instead of firing.
         let waiter = self.runtime.spawn(async move {
-            match tokio::time::timeout(budget, wait).await {
+            let outcome = match tokio::time::timeout(budget, wait).await {
                 Ok(Ok(Ok(()))) => Ok(true),
                 Ok(Ok(Err(message))) => Err(std::io::Error::other(format!(
                     "serving mirror import failed: {message}"
                 ))),
                 Ok(Err(_)) => Err(std::io::Error::other("serving mirror drain stopped")),
                 Err(_) => Ok(false),
-            }
+            };
+            release.store(false, Ordering::SeqCst);
+            outcome
         });
         self.runtime
             .block_on(waiter)
@@ -479,6 +503,7 @@ impl ServingEndpoint {
         ServingHandle {
             runtime: self.runtime.handle().clone(),
             sender: self.sender.clone(),
+            barrier_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

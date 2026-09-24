@@ -180,6 +180,24 @@ stop_mount() { # <name> <signal> [budget-s = 15]: signal, wait for exit,
   pass "$name: clean shutdown on $sig (exit 0, unmounted, ${elapsed}s)"
 }
 
+# stop_relay: TERM, poll briefly, then KILL — never a bare `wait` on a
+# process that may ignore or delay SIGTERM. An unbounded wait here is
+# how a failed check once hung the whole run: the guest shell sat in
+# do_wait on nostr-rs-relay for 44 minutes, and the EXIT trap could not
+# run because it came after the wait.
+stop_relay() {
+  local pid i
+  [[ -f "$E2E_ROOT/relay.pid" ]] || { pkill -x nostr-rs-relay 2>/dev/null || true; return 0; }
+  pid="$(cat "$E2E_ROOT/relay.pid")"
+  kill -TERM "$pid" 2>/dev/null || true
+  for ((i = 0; i < 25; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 # --- step 2: local-only mount --------------------------------------------
 step1_init() {
   step 1 "init lifecycle"
@@ -596,14 +614,17 @@ EOF
   # would measure the mirror, not the shutdown.
   poll_until 120 bash -c "[[ \$(grep -c 'sync pass idle' '$LOGDIR/mount-owner-relay.err') -gt $idle_before ]]" \
     || die "the owner never quiesced (serving-mirror drain stuck?)"
-  # Lift the throttle before the stop: the owner's control plane runs
-  # over the same loopback, and 15s is the stop's budget. The owner
-  # dies with its serving socket within the stop, so the member
-  # cannot pull the rest of the file after this point.
-  sudo tc qdisc del dev lo root 2>/dev/null || true
+  # Stop the owner with the throttle STILL on, so the member provably
+  # cannot pull the rest of the file during the stop window: the
+  # owner dies with its serving socket while loopback stays at
+  # 4mbit, so the member's remaining chunks stay undelivered. The
+  # shutdown's control plane rides the same loopback, but only small
+  # messages; the drain that needs the larger budget is the
+  # serving-store persist, which is disk, not network.
   # 90s: the owner holds a 56MiB closure, and its exit persists the
   # serving store — bounded, but far past the 15s small-vault budget.
   stop_mount owner-relay INT 90
+  sudo tc qdisc del dev lo root 2>/dev/null || true
   pass "owner stopped mid-transfer (member head installed, chunks remote)"
 
   local started elapsed rc
@@ -656,8 +677,7 @@ EOF
   # writes race and the member converges first on loopback). Tracked
   # as the conflict-divergence follow-up; non-blocking for the review.
 
-  kill "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
-  wait "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+  stop_relay
   pass "relay stopped"
 
   local f
@@ -683,10 +703,7 @@ main() {
   # never closes and the run would hang instead of failing.
   reap_background() {
     cleanup_mounts
-    if [[ -f "$E2E_ROOT/relay.pid" ]]; then
-      kill -KILL "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
-    fi
-    pkill -x nostr-rs-relay 2>/dev/null || true
+    stop_relay
   }
   trap reap_background EXIT
   # A run killed while step 6 throttled loopback leaves the qdisc
@@ -712,6 +729,13 @@ main() {
       || die "--step: '$entry' is not a step (expected a comma list of 1-6)"
     if (( entry > max_step )); then max_step=$entry; fi
   done
+  # An explicit but empty or empty-entry selection (``, `,`, `4,,5`)
+  # is a mistake, not "all steps": without this, it would run zero
+  # checks and pass.
+  [[ -n "$only" && "$max_step" -eq 0 ]] \
+    && die "--step: '$only' names no step (expected a comma list of 1-6)"
+  [[ ",$only," == *,,* ]] \
+    && die "--step: '$only' has an empty entry (expected 1-6 entries)"
   want_step() { [[ -z "$only" ]] || (( $1 <= max_step )); }
   if want_step 1; then step1_init; fi
   if want_step 2; then step2_mount; fi

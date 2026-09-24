@@ -66,13 +66,16 @@ devenv shell                # enter the dev environment (rust, git-hooks)
 
 ## Running the Lima e2e suite
 
-`./lima/run-alpha.sh [--keep] [--step N]` is long (minutes) and lives in a
+`./lima/run-alpha.sh [--keep] [--step N[,N...]]` is long (minutes) and lives in a
 guest. Operate it, never babysit it blind:
 
 - **Never pipe it through `tail`.** A foreground pipe buffers everything, so
   a twenty-minute run looks like a hang. Run it detached with the output to a
   log (`(./lima/run-alpha.sh --keep > /tmp/lima/run.log 2>&1 &)`) and poll the
   log in bounded chunks (~8 minutes per poll so the session never times out).
+- `--step` takes a comma list and runs the prefix closure (steps build on
+  each other): `--step 4` runs steps 1–4, `--step 4,6` runs 1–6. An empty
+  entry or a non-step is refused; an empty value means all steps.
 - **A repeated `FAIL:` line is a stop, not patience.** The harness exits on
   the first failed check, so two identical polls mean the run is over —
   read the log, pull the failing mount's stderr out of the guest

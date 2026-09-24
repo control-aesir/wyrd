@@ -730,7 +730,12 @@ where
                         base = ?base,
                         "mutation deferred for authoring content"
                     );
-                    batch.defer(index, base);
+                    // Total order: the held entry owns the front of
+                    // the queue, so everything after it in this batch
+                    // goes back untouched — never executed past the
+                    // defer. The pass then ends.
+                    batch.defer_and_release_rest(index, base);
+                    break;
                 }
                 other => batch.record(index, other),
             }
@@ -879,6 +884,7 @@ where
         match kind {
             MutationKind::Mkdir { path } => {
                 let heads = self.eval_heads(pinned, path)?;
+                self.demand_path_trees(&heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let base = match heads.as_slice() {
                     [] => None,
@@ -1038,6 +1044,7 @@ where
             MutationKind::Rmdir { path } => {
                 let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
+                self.demand_path_trees(&heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
@@ -1051,6 +1058,8 @@ where
             } => {
                 let heads = self.eval_heads(pinned, from)?;
                 let tree = self.single_tree(&heads, from)?;
+                self.demand_path_trees(&heads, from)?;
+                self.demand_path_trees(&heads, to)?;
                 if *no_replace && self.current_node(&heads, to)?.is_some() {
                     return Err(MutationError::AlreadyExists(to.clone()));
                 }
@@ -1245,6 +1254,67 @@ where
         }
     }
 
+    /// Demand every structural tree `path` needs before a namespace
+    /// mutation reads or rewrites it: the single head's root tree plus
+    /// each directory subtree along the path. The format mutations
+    /// walk those trees directly, so a missing one must become the
+    /// same typed prerequisite authoring uses — a registered want and
+    /// a pinned retry — never an opaque store failure. The walk stops
+    /// where the path stops resolving (a missing entry, a file in the
+    /// middle, a decode failure): the operation then reports its own
+    /// precise error.
+    fn demand_path_trees(
+        &self,
+        heads: &[AuthorizedSnapshot],
+        path: &str,
+    ) -> Result<(), MutationError> {
+        // A headless drive bootstraps from an empty tree — nothing to
+        // demand; a multi-head drive still refuses the operation.
+        let tree = match heads {
+            [] => return Ok(()),
+            [head] => head.snapshot().tree,
+            _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+        };
+        let store = self.store.read().map_err(|_| MutationError::Lock)?;
+        let mut current = tree;
+        for component in path.split('/').filter(|part| !part.is_empty()) {
+            if !store
+                .has(&current)
+                .map_err(|error| MutationError::Store(error.failure()))?
+            {
+                return Err(self.mutation_absent(&current, heads));
+            }
+            let Ok(Some(bytes)) = store.get(&current) else {
+                return Ok(());
+            };
+            let Ok(decoded) = Tree::decode(&bytes) else {
+                return Ok(());
+            };
+            let Some(subtree) = decoded
+                .entries()
+                .iter()
+                .find_map(|entry| (entry.name.as_str() == component).then_some(&entry.content))
+            else {
+                return Ok(());
+            };
+            let wyrd_format::EntryContent::Dir { subtree } = subtree else {
+                return Ok(());
+            };
+            current = *subtree;
+        }
+        // The last component's own subtree is needed only when the
+        // path descends further; the loop's final check covers it when
+        // the path names the directory itself and a deeper mutation
+        // follows.
+        if !store
+            .has(&current)
+            .map_err(|error| MutationError::Store(error.failure()))?
+        {
+            return Err(self.mutation_absent(&current, heads));
+        }
+        Ok(())
+    }
+
     /// Read at most `max_len` bytes of a regular file's plaintext from
     /// the current heads. A truncate uses this to read only the prefix it
     /// keeps, and never more than the target, so shrinking an oversized
@@ -1287,17 +1357,42 @@ where
         // honest read (with per-chunk verification) still runs when
         // the file is fully present, so bitrot fails closed exactly
         // as before.
+        let len = size.min(max_len);
         {
+            // Probe only the chunks the requested prefix overlaps: a
+            // shrink needs its kept head, never the tail, so a
+            // remote-only tail must not time the operation out
+            // (write-path.md's bounded-prefix rule). Chunk extents
+            // come from the recorded manifest mappings — plaintext
+            // sizes, a memory lookup, no store reads — and an
+            // unrecorded mapping ends the probe, leaving the view's
+            // sequential read to classify.
+            let runtime = self
+                .engine
+                .runtime_state()
+                .map_err(|_| MutationError::Engine)?;
             let store = self.store.read().map_err(|_| MutationError::Lock)?;
+            let mut start = 0u64;
             for chunk in file.chunks() {
+                if start >= len {
+                    break;
+                }
+                let Some(chunk_len) = runtime
+                    .recorded_mappings(chunk)
+                    .first()
+                    .map(|entry| entry.size)
+                    .filter(|size| *size > 0)
+                else {
+                    break;
+                };
                 match store.has(chunk) {
                     Ok(true) => {}
                     Ok(false) => return Err(self.mutation_absent(chunk, heads)),
                     Err(error) => return Err(MutationError::Store(error.failure())),
                 }
+                start = start.saturating_add(chunk_len);
             }
         }
-        let len = size.min(max_len);
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
             .map_err(|error| match error {
                 ViewError::NotMaterialized { content } => MutationError::NeedContent {
@@ -1876,6 +1971,31 @@ mod prereq_tests {
                 base: Some(base),
             }
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Structural trees go through the same absence rule as chunks:
+    /// `mkdir` against a head whose root tree is missing from the
+    /// store but claimed local by the engine fails closed
+    /// (`Store(Transient)` → EIO, no want), exactly like a chunk in
+    /// that state — the paired rule in `mutation_absent`, not the
+    /// format mutation's own error. When the engine calls the tree
+    /// remote, the same helper names it a `NeedContent` prerequisite
+    /// (the chunk tests pin that arm).
+    #[test]
+    fn namespace_mutation_on_absent_claimed_local_tree_fails_closed() {
+        let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("root-tree");
+        // Serve from an empty store: even the root tree is absent.
+        let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let error = node
+            .apply_mutation(
+                &crate::mutation::MutationKind::Mkdir {
+                    path: "newdir".to_string(),
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error, MutationError::Store(StoreFailure::Transient));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

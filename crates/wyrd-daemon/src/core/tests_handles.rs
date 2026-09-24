@@ -580,6 +580,68 @@ fn append_to_store_absent_but_engine_local_content_fails_closed() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A shrink reads only its kept prefix: a file whose head chunk is
+/// local and whose tail chunk is absent from the store truncates to a
+/// size inside the head chunk anyway. The prerequisite probe follows
+/// the requested prefix, so a remote-only tail never turns the
+/// truncate into a demand (and the shrink's own commit is local).
+#[test]
+fn path_truncate_over_a_remote_tail_reads_only_the_kept_prefix() {
+    use wyrd_format::{Entry, ObjectKind, Tree};
+
+    let (mut engine, dir, _) = scratch_drive();
+    let mut author_store = MemoryObjectStore::default();
+    // Two chunks: the chunker splits well past MAX_CHUNK.
+    let body = vec![b'z'; 400 * 1024];
+    let chunks = wyrd_format::chunk::insert_chunks(&mut author_store, &body).unwrap();
+    assert!(chunks.len() >= 2, "the fixture needs a tail chunk");
+    let tree = Tree::from_entries(vec![Entry::file(
+        "tail",
+        body.len() as u64,
+        false,
+        chunks.clone(),
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut author_store)
+    .unwrap();
+    engine.author_snapshot(&author_store, tree).unwrap();
+
+    // Serve with the tree and the head chunk only.
+    let mut serving = MemoryObjectStore::default();
+    let tree_bytes = author_store.get(&tree).unwrap().unwrap();
+    serving
+        .insert_verified(ObjectKind::Tree, &tree, &tree_bytes)
+        .unwrap();
+    let head_bytes = author_store.get(&chunks[0]).unwrap().unwrap();
+    serving
+        .insert_verified(ObjectKind::Chunk, &chunks[0], &head_bytes)
+        .unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, serving).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let ino = backend.attr_at("tail").unwrap().ino.0;
+    // Target inside the head chunk.
+    backend.set_size_at(ino, head_bytes.len() as u64).unwrap();
+    let read = backend.open_at("tail").unwrap();
+    assert_eq!(
+        backend.read_handle(read, 0, 1024).unwrap(),
+        head_bytes[..1024].to_vec()
+    );
+    backend.release_handle(read).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A mode change through a clean writable handle must not lose the
 /// file: the commit submits the buffered image, so the handle
 /// materializes the captured content before going dirty.

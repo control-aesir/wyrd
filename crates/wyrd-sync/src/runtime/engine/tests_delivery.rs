@@ -282,6 +282,20 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
     .expect("wraps")
     .as_bytes()
     .to_vec();
+    // A realistic `0x02`: the owner signs a genuine proof over the same
+    // vector the wrap carries, so this is a delivery the recipient would
+    // actually install. Sender-side validation of a *persisted* fact's
+    // proof is a separate concern — the durable-outbox follow-up.
+    let owner_identity = crate::runtime::test_util::identity_secret(&owner_sk);
+    let proof = crate::keys::owner_proof::OwnerProof::sign(
+        &owner_identity,
+        &member_drive(),
+        &member,
+        &child_id,
+        2,
+        &[secret(0xAA), secret(0xBB)],
+    )
+    .encode();
     let sealed = seal_rotation(
         &member_drive(),
         member,
@@ -289,23 +303,10 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
         2,
         &child.canonical_bytes(),
         &wrap,
-        &[],
+        &proof,
     )
     .expect("seals")
     .encode();
-    // The same obligation sealed under the superseded `0x01` framing,
-    // as a crash before discharge would have left on disk.
-    let mut old = seal_rotation(
-        &member_drive(),
-        member,
-        &registration,
-        2,
-        &child.canonical_bytes(),
-        &wrap,
-        &[],
-    )
-    .expect("seals");
-    old.version = crate::control::rotation::ROTATION_VERSION_SUPERSEDED;
     let keyless = identity(0x04).1;
     fx.engine
         .commit_facts(&[

@@ -131,6 +131,7 @@ fn mkdir_through_backend_commits_and_serves() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                max_mutation_wait: Duration::from_secs(30),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
@@ -226,6 +227,7 @@ fn create_at_saturated_table_creates_nothing() {
         error_base_delay: Duration::from_millis(5),
         error_max_delay: Duration::from_millis(20),
         max_consecutive_errors: 10,
+        max_mutation_wait: Duration::from_secs(30),
         budgets: ResourceBudgets {
             max_open_handles: 1,
             ..ResourceBudgets::default()

@@ -154,6 +154,7 @@ fn loop_announces_mounted_writes() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                max_mutation_wait: Duration::from_secs(30),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},

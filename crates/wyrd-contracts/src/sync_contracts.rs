@@ -1484,6 +1484,7 @@ fn conflicted_drive_rejects_mounted_writes() {
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
                 budgets: ResourceBudgets::default(),
+                max_mutation_wait: Duration::from_secs(30),
             },
             &mut |_, _| {},
         )

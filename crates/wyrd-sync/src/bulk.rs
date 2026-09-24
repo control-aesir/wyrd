@@ -140,6 +140,14 @@ fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
 /// transport failure, so the plan retries it on the next pass.
 const FETCH_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Upper bound for one whole blob fetch (dial plus verified transfer):
+/// the dial bound alone still leaves the size discovery and the Bao
+/// stream unbounded, and a peer that connects but never streams wedges
+/// the pass exactly the same way. Must exceed the dial bound with room
+/// for a slow-but-moving transfer; oversize and verified-invalid still
+/// short-circuit before any bytes buffer.
+const FETCH_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Dial one provider with a deadline: the timeout above is the live
 /// value; the parameter exists so tests can prove boundedness fast
 /// against an unroutable provider.
@@ -342,17 +350,25 @@ impl IrohBulkSource {
         let provider = blob.provider.clone();
         let hash = blob.hash();
         self.runtime.block_on(async move {
-            let connection = dial(&endpoint, provider, FETCH_DIAL_TIMEOUT).await?;
-            let (size, _) = get_verified_size(&connection, &hash)
-                .await
-                .map_err(|error| BulkError::Transport(error.to_string()))?;
-            if size > max as u64 {
-                return Err(BulkError::Oversize {
-                    bytes: usize::try_from(size).unwrap_or(usize::MAX),
-                    max,
-                });
-            }
-            bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
+            // One deadline for the whole attempt: dial, size discovery,
+            // and streaming share it, so a peer that connects but never
+            // streams cannot outlast a peer that never answers. Slow
+            // passes still complete; the plan retries what they miss.
+            tokio::time::timeout(FETCH_BLOB_TIMEOUT, async move {
+                let connection = dial(&endpoint, provider, FETCH_DIAL_TIMEOUT).await?;
+                let (size, _) = get_verified_size(&connection, &hash)
+                    .await
+                    .map_err(|error| BulkError::Transport(error.to_string()))?;
+                if size > max as u64 {
+                    return Err(BulkError::Oversize {
+                        bytes: usize::try_from(size).unwrap_or(usize::MAX),
+                        max,
+                    });
+                }
+                bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
+            })
+            .await
+            .map_err(|_| BulkError::Transport("blob fetch timed out".to_string()))?
         })
     }
 }

@@ -623,19 +623,20 @@ where
         let mutations = Arc::clone(&self.mutations);
         let mut batch = mutations.take_batch().with_wants(Arc::clone(&self.wants));
         for index in 0..batch.len() {
-            // Prerequisite deadline: wall-clock from the first defer,
-            // checked every pass. Past it the mutation fails terminal
-            // `TimedOut` — the submitter hears it and nothing applies
-            // later.
-            if let Some(since) = batch.deferred_since(index) {
-                if since.elapsed() >= self.max_mutation_wait {
-                    tracing::debug!(
-                        waited_ms = since.elapsed().as_millis(),
-                        "mutation prerequisite wait expired"
-                    );
-                    batch.record(index, Err(MutationError::TimedOut));
-                    continue;
-                }
+            // Prerequisite deadline: wall-clock from admission (the
+            // caller has been blocked since), checked every pass and
+            // on the first evaluation too — a request whose budget
+            // ran out while the loop was fetching fails terminal
+            // `TimedOut` without starting a wait. The submitter hears
+            // it and nothing applies later.
+            let since = batch.wait_since(index);
+            if since.elapsed() >= self.max_mutation_wait {
+                tracing::debug!(
+                    waited_ms = since.elapsed().as_millis(),
+                    "mutation prerequisite wait expired"
+                );
+                batch.record(index, Err(MutationError::TimedOut));
+                continue;
             }
             let pinned = batch.pinned(index);
             let kind = batch.request(index).kind().clone();

@@ -563,24 +563,39 @@ EOF
 
   # --- peer-down demand, bounded failure, re-announcement recovery ---
   # The owner commits a large file; its head (trees and manifests) reaches
-  # the member quickly, the bulk content streams after. Stopping the
-  # owner mid-transfer leaves the member with an installed head whose
-  # file chunks are remote-only — the exact state a mounted write must
-  # demand through. The member appends: the demand cannot be served, so
-  # the commit must fail bounded (ETIMEDOUT at the prerequisite
-  # deadline), never hang.
+  # the member, the bulk content streams after. On loopback the object
+  # phase finishes in milliseconds, so throttle loopback IP traffic
+  # (the bulk fetch travels over it; FUSE writes are unix sockets and
+  # stay instant) until the head is installed, then stop the owner
+  # mid-transfer: the member keeps an installed head whose file chunks
+  # are remote-only — the exact state a mounted write must demand
+  # through. The member appends: the demand cannot be served, so the
+  # commit must fail bounded (ETIMEDOUT at the prerequisite deadline),
+  # never hang.
+  command -v tc >/dev/null || die "tc missing (provision.sh installs iproute2)"
+  # Clear a qdisc stranded by a killed run before throttling.
+  sudo tc qdisc del dev lo root 2>/dev/null || true
+  sudo tc qdisc add dev lo root netem rate 4mbit delay 10ms
   dd if=/dev/zero of="$MNTS/owner-relay/peer-down.bin" bs=1M count=56 \
     status=none
-  poll_until 60 test -e "$MNTS/member-relay/peer-down.bin" \
+  poll_until 120 test -e "$MNTS/member-relay/peer-down.bin" \
     || die "member never saw the owner's file (head did not install)"
+  # Lift the throttle before the stop: the owner's graceful shutdown
+  # runs its control plane over the same loopback, and 15s is its
+  # budget. The owner dies with its serving socket within the stop, so
+  # the member cannot pull the rest of the file after this point.
+  sudo tc qdisc del dev lo root 2>/dev/null || true
   stop_mount owner-relay INT
   pass "owner stopped mid-transfer (member head installed, chunks remote)"
 
   local started elapsed rc
   started=$(date +%s)
   set +e
+  # notrunc is load-bearing: dd truncates by default, the kernel splits
+  # the truncate out of the open, and the append-handle guard then
+  # refuses the whole open (EOPNOTSUPP) before any byte is written.
   timeout 45 dd if=/dev/zero bs=1 count=1 of="$MNTS/member-relay/peer-down.bin" \
-    oflag=append conv=fsync status=none 2>"$LOGDIR/step6-peer-down.stderr"
+    oflag=append conv=notrunc,fsync status=none 2>"$LOGDIR/step6-peer-down.stderr"
   rc=$?
   set -e
   elapsed=$(( $(date +%s) - started ))
@@ -660,6 +675,21 @@ main() {
   # first — rm cannot remove a live mountpoint.
   mkdir -p "$MNTS" "$LOGDIR"
   cleanup_mounts
+  # Any exit — a failed check included — unmounts, reaps, and stops the
+  # relay: a surviving background process inherits this script's
+  # stdout, so the host's `limactl shell` would wait for a pipe that
+  # never closes and the run would hang instead of failing.
+  reap_background() {
+    cleanup_mounts
+    if [[ -f "$E2E_ROOT/relay.pid" ]]; then
+      kill -KILL "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+    fi
+    pkill -x nostr-rs-relay 2>/dev/null || true
+  }
+  trap reap_background EXIT
+  # A run killed while step 6 throttled loopback leaves the qdisc
+  # behind; clear it so this run starts unthrottled.
+  command -v tc >/dev/null && { sudo tc qdisc del dev lo root 2>/dev/null || true; }
   # A stranded relay outlives `wait` in cleanup (it is a background job
   # of this shell) and blocks the next run's bind: reclaim the port.
   if [[ -f "$E2E_ROOT/relay.pid" ]]; then

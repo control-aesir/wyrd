@@ -17,9 +17,11 @@
 //!
 //! One exception keeps the waiter blocked: a mutation whose authoring
 //! needs remote content holds across passes ([`MutationBatch::defer`]),
-//! pinned to its evaluated head with a wall-clock deadline. The hold
-//! never outlives the waiter and never applies after a failure — it is
-//! a prerequisite wait, not a background retry.
+//! pinned to its evaluated head with a wall-clock deadline measured
+//! from admission ([`MutationQueue::nearest_deadline`] feeds the
+//! fetch budget). The hold never outlives the waiter and never
+//! applies after a failure — it is a prerequisite wait, not a
+//! background retry.
 //!
 //! The queue has its own lock (never the projection's or the store's).
 //! Submitting wakes the loop's idle wait immediately; the loop drains the
@@ -361,10 +363,14 @@ pub struct QueuedMutation {
     /// rebase onto newer state.
     base: Option<wyrd_format::SnapshotId>,
     /// When the entry was first held for authoring prerequisites.
-    /// `None` until the first defer; later defers must not reset it,
-    /// so the deadline measures total prerequisite wait, not time
-    /// since the last retry.
+    /// `None` until the first defer; later defers must not reset it.
     first_deferred: Option<Instant>,
+    /// When the request was admitted. The prerequisite clock runs
+    /// from admission — the caller has been blocked since — so the
+    /// pass that first evaluates the request is inside the budget
+    /// too; a first evaluation that arrives after the budget expires
+    /// fails terminal `TimedOut` instead of starting a new wait.
+    submitted: Instant,
     /// Fetch wants this entry registered while held, in registration
     /// order. Released when the entry completes on any path — commit,
     /// failure, timeout, drop, or shutdown — so deferred retries never
@@ -522,6 +528,7 @@ impl MutationQueue {
                 reply: Arc::clone(&reply),
                 base: None,
                 first_deferred: None,
+                submitted: Instant::now(),
                 wanted: Vec::new(),
             });
         }
@@ -660,20 +667,20 @@ impl MutationQueue {
         self.lock_state().outstanding
     }
 
-    /// The earliest prerequisite deadline among held mutations: each
-    /// deferred entry's first hold plus `max_wait`. The fetch budget
-    /// derives from this — a pass with nothing held fetches unbounded
-    /// (today's behavior), while a pass that owes a timeout decision
-    /// stops starting new fetch work at the deadline so the decision
-    /// lands on time. `None` when nothing is held.
+    /// The earliest prerequisite deadline among outstanding
+    /// mutations: each entry's wait start (admission, or its first
+    /// defer) plus `max_wait`. The fetch budget derives from this —
+    /// a pass with nothing outstanding fetches unbounded, while a
+    /// pass that owes a mutation a decision stops starting new fetch
+    /// work at the deadline so the decision lands on time. `None`
+    /// when nothing is outstanding.
     pub fn nearest_deadline(&self, max_wait: Duration) -> Option<Instant> {
         let state = self.lock_state();
         state
             .pending
             .iter()
             .chain(state.deferred.iter())
-            .filter_map(|queued| queued.first_deferred)
-            .map(|since| since + max_wait)
+            .map(|queued| queued.first_deferred.unwrap_or(queued.submitted) + max_wait)
             .min()
     }
 }
@@ -779,6 +786,18 @@ impl MutationBatch<'_> {
             .as_ref()
             .expect("request is present until finish")
             .first_deferred
+    }
+
+    /// When the request at `index` started waiting: its first defer,
+    /// or its admission when never deferred. The deadline measures
+    /// total wait from there, so the first evaluation is bounded and
+    /// later defers never reset the clock.
+    pub fn wait_since(&self, index: usize) -> Instant {
+        let queued = self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish");
+        queued.first_deferred.unwrap_or(queued.submitted)
     }
 
     /// Fetch wants the request at `index` already holds, in

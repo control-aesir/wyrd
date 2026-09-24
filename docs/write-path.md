@@ -160,9 +160,12 @@ MutationRequest {
    can never silently rebase onto newer state. A changed, emptied, or
    multiplied head set fails the retry `Stale`, exactly like a raced
    handle commit. The wait is bounded by `max_mutation_wait` (default
-   30s, wall-clock from the first hold, checked every pass); past it
-   the mutation fails `ETIMEDOUT` — retryable information, not a
-   system failure.    A mutation evaluated headless or multi-head never
+   30s, wall-clock from admission — the caller has been blocked since
+   then — checked on the first evaluation and every pass after); past
+   it the mutation fails `ETIMEDOUT` — retryable information, not a
+   system failure. A first evaluation that arrives after the budget
+   already ran out fails the same way instead of starting a fresh
+   wait. A mutation evaluated headless or multi-head never
    holds: nothing meaningful pins, so it fails closed as before.
    The wait is a wall-clock bound on the loop, not just on the
    check: while any mutation is held, the pass's fetch runs under the

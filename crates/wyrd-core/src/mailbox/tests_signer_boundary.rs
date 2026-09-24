@@ -233,8 +233,10 @@ fn signer_key_proof_failure_drops_foreign_payload() {
 
 /// A signing failure at send time carrying the marker secret resolves
 /// the same way: the mailbox constructs (the key proof passes), and
-/// the seal failure is constant. Proves the two live holders suffice
-/// with no hidden third copy consulted on the send path.
+/// the seal failure is constant. This exercises the documented
+/// holders through the public API; the full graph itself stays a
+/// documentation contract (see the module docs), not a counted
+/// assertion — no stable mechanism observes every live copy.
 #[test]
 fn signer_seal_failure_drops_foreign_payload() {
     let open = keys();

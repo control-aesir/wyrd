@@ -133,16 +133,27 @@ fn loop_publishes_admission_catch_up() {
 /// counts every flush. A deterministic mirror outage and recovery.
 struct ControllableBarrier {
     fail: AtomicBool,
+    /// When set, the barrier burns its whole budget and reports
+    /// "not ready yet" — the slow-mirror case, which must skip the
+    /// discharge exactly like the failed one.
+    stall: AtomicBool,
     flushes: AtomicUsize,
 }
 
 impl ServingBarrier for ControllableBarrier {
-    fn flush(&self) -> std::io::Result<()> {
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
         self.flushes.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("mirror down"));
         }
-        Ok(())
+        if self.stall.load(Ordering::SeqCst) {
+            let start = Instant::now();
+            while start.elapsed() < budget.min(Duration::from_millis(50)) {
+                std::thread::yield_now();
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -177,6 +188,7 @@ fn announcement_discharge_waits_for_serving_readiness() {
 
     let barrier = Arc::new(ControllableBarrier {
         fail: AtomicBool::new(true),
+        stall: AtomicBool::new(false),
         flushes: AtomicUsize::new(0),
     });
     live.set_serving_barrier(barrier.clone());
@@ -227,8 +239,22 @@ fn announcement_discharge_waits_for_serving_readiness() {
     );
     assert_eq!(barrier.flushes.load(Ordering::SeqCst), 2);
 
-    // Mirror recovered: the next pass discharges the announcement.
+    // Slow mirror: burning the budget is "not ready yet", which skips
+    // the discharge the same way a failure does.
     barrier.fail.store(false, Ordering::SeqCst);
+    barrier.stall.store(true, Ordering::SeqCst);
+    let mut mailbox = ThreadRecordingMailbox::new();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(
+        live.pending_announcements().unwrap(),
+        vec![(id, member)],
+        "a slow mirror holds the announcement too"
+    );
+    assert!(mailbox.drained().is_empty(), "a slow mirror sends nothing");
+
+    // Mirror recovered: the next pass discharges the announcement.
+    barrier.stall.store(false, Ordering::SeqCst);
     let mut mailbox = ThreadRecordingMailbox::new();
     let report = live
         .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -238,7 +264,7 @@ fn announcement_discharge_waits_for_serving_readiness() {
         live.pending_announcements().unwrap().is_empty(),
         "the recovered barrier discharges the announcement"
     );
-    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 3);
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 4);
     let sent = mailbox.drained();
     assert_eq!(
         sent.len(),
@@ -257,14 +283,14 @@ fn announcement_discharge_waits_for_serving_readiness() {
         .unwrap();
     assert!(report.published, "delivered markers republicate once");
     assert!(mailbox.drained().is_empty(), "nothing left to send");
-    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 4);
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 5);
     let quiet = live
         .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
         .unwrap();
     assert!(!quiet.published, "a drained outbox idles");
     assert_eq!(
         barrier.flushes.load(Ordering::SeqCst),
-        4,
+        5,
         "idle passes never touch the barrier"
     );
 
@@ -302,6 +328,7 @@ fn loop_announces_mounted_writes() {
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
                 max_mutation_wait: Duration::from_secs(30),
+                serving_flush_budget: Duration::from_secs(5),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},

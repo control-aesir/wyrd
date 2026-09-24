@@ -206,6 +206,12 @@ pub struct LiveConfig {
     /// past it. Distinct from `open_timeout` (read-side demand wait):
     /// authoring and reading tune separately.
     pub max_mutation_wait: Duration,
+    /// Wall-clock budget for one serving-mirror readiness barrier
+    /// (announcement discharge waits at most this per pass, further
+    /// clipped to the nearest held mutation's remaining time). The
+    /// mirror keeps draining in the background; a pass that ran out
+    /// of budget skips the discharge and retries.
+    pub serving_flush_budget: Duration,
 }
 
 impl Default for LiveConfig {
@@ -217,6 +223,7 @@ impl Default for LiveConfig {
             max_consecutive_errors: 10,
             budgets: ResourceBudgets::default(),
             max_mutation_wait: Duration::from_secs(30),
+            serving_flush_budget: Duration::from_secs(5),
         }
     }
 }
@@ -230,18 +237,23 @@ impl Default for LiveConfig {
 /// endpoint's barrier; without one (tests, mirror-less compositions)
 /// announcements discharge ungated, as before.
 pub trait ServingBarrier: Send + Sync {
-    fn flush(&self) -> std::io::Result<()>;
+    /// Wait for readiness under `budget`: `Ok(true)` once every
+    /// earlier import landed, `Ok(false)` when the budget ran out
+    /// first (the drain continues; the next pass asks again),
+    /// `Err` when the mirror failed or is gone. Callers gate
+    /// announcement discharge on `true`.
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error>;
 }
 
 impl ServingBarrier for wyrd_sync::serving::ServingEndpoint {
-    fn flush(&self) -> std::io::Result<()> {
-        wyrd_sync::serving::ServingEndpoint::flush(self)
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
+        wyrd_sync::serving::ServingEndpoint::flush_bounded(self, budget)
     }
 }
 
 impl ServingBarrier for wyrd_sync::serving::ServingHandle {
-    fn flush(&self) -> std::io::Result<()> {
-        wyrd_sync::serving::ServingHandle::flush(self)
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
+        wyrd_sync::serving::ServingHandle::flush_bounded(self, budget)
     }
 }
 
@@ -333,6 +345,8 @@ pub struct LiveNode<V: NamespaceView> {
     /// installed by the composer alongside the route. `None` discharges
     /// ungated (tests, mirror-less compositions).
     pub(super) serving_barrier: Option<Arc<dyn ServingBarrier>>,
+    /// Stored copy of the config's per-pass barrier budget.
+    pub(super) serving_flush_budget: Duration,
 }
 
 /// The live half of a split node: everything a presentation
@@ -447,6 +461,7 @@ where
                 waker,
                 node_addr: None,
                 serving_barrier: None,
+                serving_flush_budget: config.serving_flush_budget,
             },
             parts,
         )
@@ -514,12 +529,34 @@ where
         // the obligations stay pending and the next pass retries — so
         // a sick mirror stalls propagation, never the mount.
         if let Some(barrier) = &self.serving_barrier {
-            if let Err(error) = barrier.flush() {
-                tracing::debug!(
-                    error = %error,
-                    "announcement discharge waits for serving readiness"
-                );
-                return Ok(sent);
+            // The barrier is time-boxed by the config and further
+            // clipped to the nearest held mutation's remaining time:
+            // a slow mirror must not stretch a mounted deadline by
+            // its drain duration. "Not ready in time" skips the
+            // discharge exactly like a failure — the obligation stays
+            // pending and the next pass asks again.
+            let budget = match self.mutations.nearest_deadline(self.max_mutation_wait) {
+                Some(deadline) => self
+                    .serving_flush_budget
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                None => self.serving_flush_budget,
+            };
+            match barrier.flush(budget) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        budget_ms = budget.as_millis(),
+                        "announcement discharge waits for serving readiness"
+                    );
+                    return Ok(sent);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "announcement discharge waits for serving readiness"
+                    );
+                    return Ok(sent);
+                }
             }
         }
         sent += match self

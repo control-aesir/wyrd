@@ -105,6 +105,7 @@ where
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
                 max_mutation_wait: Duration::from_secs(30),
+                serving_flush_budget: Duration::from_secs(5),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},

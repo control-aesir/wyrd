@@ -109,6 +109,7 @@ fn run_loop_aborts_after_mailbox_error_cap() {
         max_consecutive_errors: 2,
         budgets: ResourceBudgets::default(),
         max_mutation_wait: Duration::from_secs(30),
+        serving_flush_budget: Duration::from_secs(5),
     };
     let mut observed = 0u32;
     let mut mailbox = SettlementFailingMailbox;
@@ -220,6 +221,7 @@ fn terminal_loop_error_completes_blocked_submitters() {
         max_consecutive_errors: 2,
         budgets: ResourceBudgets::default(),
         max_mutation_wait: Duration::from_secs(30),
+        serving_flush_budget: Duration::from_secs(5),
     };
     let mut mailbox = SettlementFailingMailbox;
     let result = live.run_loop(

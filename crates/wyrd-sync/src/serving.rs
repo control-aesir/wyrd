@@ -92,15 +92,39 @@ impl ServingHandle {
     /// fail — announcing over a representation the mirror cannot
     /// serve would strand the peer until a restart.
     pub fn flush(&self) -> std::io::Result<()> {
+        match self.flush_bounded(std::time::Duration::MAX) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(std::io::Error::other("serving mirror drain stopped")),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The barrier under a time budget: `Ok(true)` once every earlier
+    /// import landed, `Ok(false)` when the budget ran out first (the
+    /// drain continues in the background and the next barrier sees
+    /// it), `Err` when the mirror failed or is gone. A caller gating
+    /// discharge treats "not ready" exactly like failure: skip the
+    /// send, retry next pass — the readiness ordering never weakens,
+    /// and a slow mirror can no longer stretch the caller's pass.
+    pub fn flush_bounded(&self, budget: std::time::Duration) -> Result<bool, std::io::Error> {
         let (ack, wait) = tokio::sync::oneshot::channel();
         self.send(MirrorItem::Flush(ack))?;
-        match self.runtime.block_on(wait) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(std::io::Error::other(format!(
-                "serving mirror import failed: {message}"
-            ))),
-            Err(_) => Err(std::io::Error::other("serving mirror drain stopped")),
-        }
+        // The timeout runs as a task on the runtime: a bare
+        // `Handle::block_on` drives no timer, so the deadline would
+        // panic instead of firing.
+        let waiter = self.runtime.spawn(async move {
+            match tokio::time::timeout(budget, wait).await {
+                Ok(Ok(Ok(()))) => Ok(true),
+                Ok(Ok(Err(message))) => Err(std::io::Error::other(format!(
+                    "serving mirror import failed: {message}"
+                ))),
+                Ok(Err(_)) => Err(std::io::Error::other("serving mirror drain stopped")),
+                Err(_) => Ok(false),
+            }
+        });
+        self.runtime
+            .block_on(waiter)
+            .map_err(|_| std::io::Error::other("serving barrier task lost"))?
     }
 
     fn send(&self, item: MirrorItem) -> std::io::Result<()> {
@@ -465,6 +489,12 @@ impl ServingEndpoint {
     /// the mirror cannot serve would strand the peer until a restart.
     pub fn flush(&self) -> std::io::Result<()> {
         self.handle().flush()
+    }
+
+    /// The endpoint's barrier under a time budget: see
+    /// [`ServingHandle::flush_bounded`].
+    pub fn flush_bounded(&self, budget: std::time::Duration) -> Result<bool, std::io::Error> {
+        self.handle().flush_bounded(budget)
     }
 
     /// Stop serving and join the runtime. The vault's write-through slot

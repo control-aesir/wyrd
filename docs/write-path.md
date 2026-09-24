@@ -345,7 +345,10 @@ restart reconciles un-discharged obligations back through the outbox
 as queued-minus-delivered).
 The outbox entry is eligible for discharge only once serving readiness
 (step 5) has succeeded for that snapshot — eligibility is
-composer-ordered (announce after flush), not engine-gated.
+barrier-gated per publish pass (the loop flushes the serving mirror
+before discharging announcements), not engine-gated: a failed barrier
+skips the discharge and the next pass retries, so a sick mirror stalls
+propagation, never the mount.
 
 Failure at each stage, explicitly:
 

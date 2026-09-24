@@ -24,8 +24,8 @@ mod tests_sync;
 
 pub use wyrd_core::budgets::ResourceBudgets;
 pub use wyrd_core::live::{
-    admit_wants, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, SyncReport,
-    MAILBOX_MAX_CONSECUTIVE_ERRORS, STORE_MAX_CONSECUTIVE_ERRORS,
+    admit_wants, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary,
+    ServingBarrier, SyncReport, MAILBOX_MAX_CONSECUTIVE_ERRORS, STORE_MAX_CONSECUTIVE_ERRORS,
 };
 pub use wyrd_core::node::{NodeError, WriteError, WyrdNode};
 pub use wyrd_core::view::RuntimeMaterialization;

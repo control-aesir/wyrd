@@ -221,6 +221,30 @@ impl Default for LiveConfig {
     }
 }
 
+/// Serving-mirror readiness barrier: the loop programs against this,
+/// never any one mirror implementation, so every provider's passes
+/// gate announcement discharge the same way. `flush` waits until every
+/// mirror import enqueued so far has landed; a failed import fails the
+/// barrier — announcing a transport root the mirror cannot serve would
+/// strand the peer until a restart. The composer installs its serving
+/// endpoint's barrier; without one (tests, mirror-less compositions)
+/// announcements discharge ungated, as before.
+pub trait ServingBarrier: Send + Sync {
+    fn flush(&self) -> std::io::Result<()>;
+}
+
+impl ServingBarrier for wyrd_sync::serving::ServingEndpoint {
+    fn flush(&self) -> std::io::Result<()> {
+        wyrd_sync::serving::ServingEndpoint::flush(self)
+    }
+}
+
+impl ServingBarrier for wyrd_sync::serving::ServingHandle {
+    fn flush(&self) -> std::io::Result<()> {
+        wyrd_sync::serving::ServingHandle::flush(self)
+    }
+}
+
 /// A live drive: the engine plus the published projection the
 /// serving backends read. The sync loop owns this value; each
 /// presentation backend owns its half from [`LiveNode::split`].
@@ -305,6 +329,10 @@ pub struct LiveNode<V: NamespaceView> {
     /// endpoint is flushed; `None` sends routeless announcements, as
     /// the loopback contracts do.
     pub(super) node_addr: Option<Vec<u8>>,
+    /// Serving-mirror readiness gate for announcement discharge,
+    /// installed by the composer alongside the route. `None` discharges
+    /// ungated (tests, mirror-less compositions).
+    pub(super) serving_barrier: Option<Arc<dyn ServingBarrier>>,
 }
 
 /// The live half of a split node: everything a presentation
@@ -418,6 +446,7 @@ where
                 max_mutation_wait: config.max_mutation_wait,
                 waker,
                 node_addr: None,
+                serving_barrier: None,
             },
             parts,
         )
@@ -440,6 +469,15 @@ where
     /// first send.
     pub fn set_node_addr(&mut self, node_addr: Option<Vec<u8>>) {
         self.node_addr = node_addr;
+    }
+
+    /// Install the serving-mirror readiness barrier for announcement
+    /// discharge: the composer passes its serving endpoint (shared
+    /// ownership — the endpoint lifecycle stays with the composer).
+    /// Every publish pass flushes before discharging announcements, so
+    /// a peer acting on an announcement never races the write-through.
+    pub fn set_serving_barrier(&mut self, barrier: Arc<dyn ServingBarrier>) {
+        self.serving_barrier = Some(barrier);
     }
 
     /// Send every undischarged outbound obligation: transitions and
@@ -467,6 +505,23 @@ where
             Err(EngineError::Mailbox(_)) => 0,
             Err(other) => return Err(LiveError::Engine(other)),
         };
+        // Serving readiness gates announcement discharge, never local
+        // publication (the projection above already swapped) and never
+        // the control plane (transitions and capabilities above already
+        // sent): a peer acting on an announcement fetches bulk
+        // representations by transport root, so the mirror must hold
+        // them first. A failed barrier skips this pass's discharge —
+        // the obligations stay pending and the next pass retries — so
+        // a sick mirror stalls propagation, never the mount.
+        if let Some(barrier) = &self.serving_barrier {
+            if let Err(error) = barrier.flush() {
+                tracing::debug!(
+                    error = %error,
+                    "announcement discharge waits for serving readiness"
+                );
+                return Ok(sent);
+            }
+        }
         sent += match self
             .engine
             .announce_pending(mailbox, self.node_addr.as_deref())
@@ -1190,6 +1245,19 @@ where
             "mutation evaluated live heads"
         );
         Ok(heads)
+    }
+
+    /// Every still-undischarged announcement obligation, in
+    /// `(snapshot, recipient)` order: queued pairs minus delivered
+    /// ones. Lets supervisors and tests observe the announcement
+    /// backlog — the delivery backlog's source of truth — without
+    /// touching the engine.
+    pub fn pending_announcements(
+        &self,
+    ) -> Result<Vec<(wyrd_format::SnapshotId, wyrd_format::DeviceId)>, LiveError> {
+        self.engine
+            .pending_announcements()
+            .map_err(LiveError::Engine)
     }
 
     /// The served generation count. Bumps exactly when a pass

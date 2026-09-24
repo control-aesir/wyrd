@@ -73,6 +73,43 @@ pub(crate) enum MirrorItem {
     Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
+/// A cloneable readiness handle for a serving endpoint: the channel
+/// and runtime the [`flush`](ServingEndpoint::flush) barrier needs,
+/// without the owned router and runtime the endpoint's shutdown
+/// consumes. The composer hands one to the live loop's serving
+/// barrier, so every publish pass gates announcement discharge on
+/// mirror readiness while endpoint ownership (and shutdown) stays
+/// with the composer.
+#[derive(Debug, Clone)]
+pub struct ServingHandle {
+    runtime: tokio::runtime::Handle,
+    sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+}
+
+impl ServingHandle {
+    /// Wait until every import enqueued so far has landed in the
+    /// serving mirror. A mirror import that failed makes the barrier
+    /// fail — announcing over a representation the mirror cannot
+    /// serve would strand the peer until a restart.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        self.send(MirrorItem::Flush(ack))?;
+        match self.runtime.block_on(wait) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(std::io::Error::other(format!(
+                "serving mirror import failed: {message}"
+            ))),
+            Err(_) => Err(std::io::Error::other("serving mirror drain stopped")),
+        }
+    }
+
+    fn send(&self, item: MirrorItem) -> std::io::Result<()> {
+        self.sender
+            .send(item)
+            .map_err(|_| std::io::Error::other("serving mirror closed"))
+    }
+}
+
 /// Unique temp-file suffix so concurrent imports of the same root never
 /// share a scratch path (same-root importers race only at the atomic
 /// rename, where the bytes are identical by construction).
@@ -411,27 +448,23 @@ impl ServingEndpoint {
         encode_node_addr(&self.addr())
     }
 
+    /// A cloneable readiness handle for the live loop's serving
+    /// barrier: shares this endpoint's mirror channel and runtime, so
+    /// per-pass announcement gating does not move the endpoint.
+    pub fn handle(&self) -> ServingHandle {
+        ServingHandle {
+            runtime: self.runtime.handle().clone(),
+            sender: self.sender.clone(),
+        }
+    }
+
     /// Wait until every import enqueued so far has landed in the serving
     /// mirror. Publication paths flush before announcing, so a peer acting
     /// on the announcement never races the write-through. A mirror import
     /// that failed makes the barrier fail — announcing over a representation
     /// the mirror cannot serve would strand the peer until a restart.
     pub fn flush(&self) -> std::io::Result<()> {
-        let (ack, wait) = tokio::sync::oneshot::channel();
-        self.send(MirrorItem::Flush(ack))?;
-        match self.runtime.block_on(wait) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(std::io::Error::other(format!(
-                "serving mirror import failed: {message}"
-            ))),
-            Err(_) => Err(std::io::Error::other("serving mirror drain stopped")),
-        }
-    }
-
-    fn send(&self, item: MirrorItem) -> std::io::Result<()> {
-        self.sender
-            .send(item)
-            .map_err(|_| std::io::Error::other("serving mirror closed"))
+        self.handle().flush()
     }
 
     /// Stop serving and join the runtime. The vault's write-through slot

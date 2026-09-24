@@ -51,7 +51,9 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
             external_allow: &["blake3", "hex", "thiserror", "fastcdc", "serde"],
         }),
         // Protocol machinery: format below, a pinned third-party set,
-        // nothing upward or sideways.
+        // nothing upward or sideways. `tracing` is the structured
+        // forensics facade (per-pass sync counts, intake verdicts,
+        // outbox sends) — events only, no subscriber, no I/O.
         "wyrd-sync" => Some(MemberPolicy {
             workspace_allow: &["wyrd-format"],
             external_allow: &[
@@ -71,6 +73,7 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "blake3",
                 "tokio",
                 "thiserror",
+                "tracing",
                 "zeroize",
             ],
         }),
@@ -79,7 +82,9 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
         // (fuser), argument parsing (clap), POSIX errno mapping (libc),
         // or process-signal handling. The `wyrd-core` edge on `wyrd-fuse`
         // is allowed now so Phase 2 can point the adapter at the
-        // provider-neutral API without a policy edit.
+        // provider-neutral API without a policy edit. `tracing` is the
+        // structured forensics facade (per-pass sync counts) — events
+        // only, no subscriber, no I/O.
         "wyrd-core" => Some(MemberPolicy {
             workspace_allow: &["wyrd-format", "wyrd-sync"],
             external_allow: &[
@@ -89,6 +94,7 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "nostr-sdk",
                 "thiserror",
                 "tokio",
+                "tracing",
             ],
         }),
         "wyrd-fuse" => Some(MemberPolicy {

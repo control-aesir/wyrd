@@ -47,7 +47,7 @@ pub(crate) fn deliver_pending(
 /// else derived from the delivery snapshot's keyring and installed. A
 /// device that never held the epoch has no key and no secret, which
 /// surfaces as [`EngineError::MissingEpochKey`].
-fn control_key_for(
+pub(super) fn control_key_for(
     engine: &mut Engine,
     keyring: &DriveKeyring,
     epoch: u64,
@@ -72,7 +72,7 @@ fn control_key_for(
 /// so it reports `Ok(None)`; anything else wrong fails closed, because
 /// sending undecodable bytes would discharge the obligation while
 /// delivering nothing.
-fn open_reused_sealed(
+pub(super) fn open_reused_sealed(
     engine: &mut Engine,
     keyring: &DriveKeyring,
     sealed_bytes: &[u8],

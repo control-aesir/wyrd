@@ -364,6 +364,11 @@ pub struct QueuedMutation {
     /// so the deadline measures total prerequisite wait, not time
     /// since the last retry.
     first_deferred: Option<Instant>,
+    /// Fetch wants this entry registered while held, in registration
+    /// order. Released when the entry completes on any path — commit,
+    /// failure, timeout, drop, or shutdown — so deferred retries never
+    /// accumulate waiter counts against the registry bound.
+    wanted: Vec<ContentId>,
 }
 
 impl QueuedMutation {
@@ -416,6 +421,13 @@ impl Reply {
 #[derive(Debug, Default)]
 struct QueueState {
     pending: VecDeque<QueuedMutation>,
+    /// Held entries retry before every new submission: a deferred
+    /// mutation pinned to head H must be served before later
+    /// mutations commit descendants of H, or the retry would fork the
+    /// lineage it was pinned to. The price is head-of-line blocking —
+    /// an unsatisfiable prerequisite holds the queue until its
+    /// deadline — which is why the deadline exists and is short.
+    deferred: VecDeque<QueuedMutation>,
     /// Admitted-but-incomplete, including executing requests: the bound
     /// covers every request whose caller is still blocked.
     outstanding: usize,
@@ -509,6 +521,7 @@ impl MutationQueue {
                 reply: Arc::clone(&reply),
                 base: None,
                 first_deferred: None,
+                wanted: Vec::new(),
             });
         }
         self.work.notify_one();
@@ -529,17 +542,22 @@ impl MutationQueue {
     /// other unfinished request.
     pub fn take_batch(&self) -> MutationBatch<'_> {
         let mut state = self.lock_state();
-        let entries = state
-            .pending
+        let mut entries: Vec<BatchEntry> = state
+            .deferred
             .drain(..)
             .map(|queued| BatchEntry {
                 queued: Some(queued),
                 result: None,
             })
             .collect();
+        entries.extend(state.pending.drain(..).map(|queued| BatchEntry {
+            queued: Some(queued),
+            result: None,
+        }));
         MutationBatch {
             queue: self,
             entries,
+            wants: None,
         }
     }
 
@@ -551,11 +569,25 @@ impl MutationQueue {
     /// queue closed with nothing pending and does nothing. Taken-but-
     /// unfinished requests are the batch guard's duty, not this.
     pub fn shutdown(&self) {
+        self.shutdown_with(None);
+    }
+
+    /// [`shutdown`](Self::shutdown) with fetch-want release: held
+    /// entries complete `Shutdown` through the normal `finish` path,
+    /// so their wants release exactly like any other terminal
+    /// outcome. Pass the loop's registry; teardown paths without one
+    /// (the daemon supervisor's belt-and-braces drain, which only ever
+    /// sees entries that never ran a pass and hence hold no wants)
+    /// use plain `shutdown`.
+    pub fn shutdown_with(&self, wants: Option<Arc<crate::want::WantRegistry>>) {
         {
             let mut state = self.lock_state();
             state.closed = true;
         }
         let mut batch = self.take_batch();
+        if let Some(wants) = wants {
+            batch = batch.with_wants(wants);
+        }
         for index in 0..batch.len() {
             batch.record(index, Err(MutationError::Shutdown));
         }
@@ -575,16 +607,16 @@ impl MutationQueue {
         queued.reply.complete(result);
     }
 
-    /// Return a taken entry to the pending set without touching its
+    /// Return a taken entry to the held set without touching its
     /// reply or the admission count: the submitter stays blocked and
     /// the saturation bound still counts exactly the queued work.
-    /// Deferred entries rejoin behind nothing taken this pass —
-    /// `push_back` preserves their submission order relative to each
-    /// other and to arrivals during the pass, so the total order
-    /// survives the hold.
+    /// Held entries retry ahead of every new submission (see
+    /// [`QueueState::deferred`]), preserving both submission order
+    /// among held entries and the total order the write path
+    /// promises.
     fn requeue(&self, queued: QueuedMutation) {
         let mut state = self.lock_state();
-        state.pending.push_back(queued);
+        state.deferred.push_back(queued);
     }
 
     /// Lock the queue state, recovering a poisoned mutex: the state is
@@ -610,7 +642,7 @@ impl MutationQueue {
             }
             let slice = (deadline - now).min(WAIT_SLICE);
             let state = self.lock_state();
-            if !state.pending.is_empty() {
+            if !state.pending.is_empty() || !state.deferred.is_empty() {
                 return;
             }
             match self.work.wait_timeout(state, slice) {
@@ -639,6 +671,10 @@ impl MutationQueue {
 pub struct MutationBatch<'a> {
     queue: &'a MutationQueue,
     entries: Vec<BatchEntry>,
+    /// Fetch registry for releasing entry wants on completion. Set by
+    /// the loop ([`with_wants`](Self::with_wants)); `None` in bare
+    /// queue tests, where no wants can exist.
+    wants: Option<Arc<crate::want::WantRegistry>>,
 }
 
 struct BatchEntry {
@@ -647,6 +683,15 @@ struct BatchEntry {
 }
 
 impl MutationBatch<'_> {
+    /// Attach the fetch registry whose wants this batch's entries may
+    /// hold: [`finish`](Self::finish) releases them on every
+    /// completion path. The live loop sets this; bare queue use leaves
+    /// it empty.
+    pub fn with_wants(mut self, wants: Arc<crate::want::WantRegistry>) -> Self {
+        self.wants = Some(wants);
+        self
+    }
+
     /// The number of requests in the batch.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -718,17 +763,50 @@ impl MutationBatch<'_> {
             .first_deferred
     }
 
+    /// Fetch wants the request at `index` already holds, in
+    /// registration order.
+    pub fn wanted(&self, index: usize) -> Vec<ContentId> {
+        self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .wanted
+            .clone()
+    }
+
+    /// Remember a newly registered fetch want for the request at
+    /// `index`, for release when the entry completes on any path.
+    pub fn note_want(&mut self, index: usize, chunk: ContentId) {
+        let queued = self.entries[index]
+            .queued
+            .as_mut()
+            .expect("request is present until finish");
+        if !queued.wanted.contains(&chunk) {
+            queued.wanted.push(chunk);
+        }
+    }
+
     /// Complete every request with its recorded result; an unrecorded
     /// request fails closed with `Engine`. Idempotent — [`Drop`] calls
     /// it, so an explicit call just makes the timing clear.
     ///
     /// Deferred entries are absent by construction: [`defer`](Self::defer)
     /// returns them to the queue, so `finish` never observes them.
+    ///
+    /// Every completed entry releases the fetch wants it registered
+    /// while held, on every path — recorded results and unrecorded
+    /// drop alike — so retries never accumulate waiter counts and a
+    /// shutdown cannot strand registry slots.
     pub fn finish(&mut self) {
         for entry in &mut self.entries {
-            let Some(queued) = entry.queued.take() else {
+            let Some(mut queued) = entry.queued.take() else {
                 continue;
             };
+            if let Some(wants) = &self.wants {
+                for chunk in queued.wanted.drain(..) {
+                    wants.release(&chunk);
+                }
+            }
             let result = entry.result.take().unwrap_or(Err(MutationError::Engine));
             self.queue.complete(queued, result);
         }
@@ -991,6 +1069,189 @@ mod tests {
         }
         assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
         assert_eq!(queue.outstanding(), 0);
+    }
+
+    /// Deferred entries retry ahead of new submissions: M1 defers,
+    /// M2 arrives, and the next batch serves M1 first. Otherwise M2
+    /// could commit a descendant of the head M1 is pinned to, forking
+    /// the lineage the pin protects.
+    #[test]
+    fn deferred_entries_retry_ahead_of_new_submissions() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let first = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("first")))
+        };
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        {
+            let mut batch = take_batch_blocking(&queue);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        let second = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("second")))
+        };
+        // Wait for the second admission: the held entry already counts
+        // as work, so the blocking take would return with M1 alone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while queue.outstanding() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second submission never admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch.request(0).kind(), &mkdir("first"), "held entry first");
+            assert_eq!(batch.request(1).kind(), &mkdir("second"));
+            assert_eq!(batch.pinned(0), Some(base));
+            assert_eq!(batch.pinned(1), None);
+            batch.record(0, Ok(MutationOutcome::Done));
+            batch.record(1, Ok(MutationOutcome::Done));
+            batch.finish();
+        }
+        assert_eq!(first.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(second.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(queue.outstanding(), 0);
+    }
+
+    /// One waiter per held chunk across retries: the loop registers
+    /// once (skipping chunks the entry already holds) and `finish`
+    /// releases exactly once, so repeated defers never accumulate
+    /// waiter counts against the registry bound.
+    #[test]
+    fn held_wants_release_exactly_once_across_retries() {
+        use wyrd_format::{ContentId, SnapshotId};
+
+        use crate::want::WantRegistry;
+
+        let queue = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::default());
+        let chunk = ContentId::from_bytes([0xC0; 32]);
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("held")))
+        };
+        // First defer: register, note, hold.
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk).unwrap();
+            batch.note_want(0, chunk);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 1);
+        // Second defer of the same entry: the loop skips re-registering
+        // a held chunk (mirroring sync_pass), so the count stays one.
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            assert_eq!(batch.wanted(0), vec![chunk]);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(
+            wants.waiter_count(&chunk),
+            1,
+            "no accumulation across retries"
+        );
+        // Terminal commit releases.
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            batch.record(0, Ok(MutationOutcome::Done));
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 0, "commit releases the want");
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+    }
+
+    /// Timeout and drop both release held wants: the deadline path
+    /// records `TimedOut` and an early return drops the batch, and
+    /// either way `finish` settles the registry.
+    #[test]
+    fn timeout_and_drop_release_held_wants() {
+        use wyrd_format::{ContentId, SnapshotId};
+
+        use crate::want::WantRegistry;
+
+        let queue = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::default());
+        let chunk = ContentId::from_bytes([0xC1; 32]);
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("timed-out")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk).unwrap();
+            batch.note_want(0, chunk);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 1);
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            batch.record(0, Err(MutationError::TimedOut));
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 0, "timeout releases the want");
+        assert_eq!(submitter.join().unwrap(), Err(MutationError::TimedOut));
+
+        // The drop path: an unrecorded entry fails Engine and still
+        // releases.
+        let chunk2 = ContentId::from_bytes([0xC2; 32]);
+        let dropped = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("dropped")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk2).unwrap();
+            batch.note_want(0, chunk2);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        {
+            let _batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            // Dropped with no recorded result.
+        }
+        assert_eq!(wants.waiter_count(&chunk2), 0, "drop releases the want");
+        assert_eq!(dropped.join().unwrap(), Err(MutationError::Engine));
+    }
+
+    /// Shutdown releases held wants through the same finish path:
+    /// a deferred entry completes `Shutdown` and its waiter count
+    /// returns to zero instead of stranding a registry slot.
+    #[test]
+    fn shutdown_with_registry_releases_held_wants() {
+        use wyrd_format::{ContentId, SnapshotId};
+
+        use crate::want::WantRegistry;
+
+        let queue = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::default());
+        let chunk = ContentId::from_bytes([0xC3; 32]);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("held")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk).unwrap();
+            batch.note_want(0, chunk);
+            batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 1);
+        queue.shutdown_with(Some(Arc::clone(&wants)));
+        assert_eq!(wants.waiter_count(&chunk), 0, "shutdown releases the want");
+        assert_eq!(submitter.join().unwrap(), Err(MutationError::Shutdown));
     }
 
     /// Deferred entries still count as queued work for saturation: a

@@ -559,7 +559,7 @@ where
         // Clone the queue handle so the batch borrow does not pin `self`
         // while mutations apply (the engine borrow is mutable).
         let mutations = Arc::clone(&self.mutations);
-        let mut batch = mutations.take_batch();
+        let mut batch = mutations.take_batch().with_wants(Arc::clone(&self.wants));
         for index in 0..batch.len() {
             // Prerequisite deadline: wall-clock from the first defer,
             // checked every pass. Past it the mutation fails terminal
@@ -586,23 +586,29 @@ where
                         batch.record(index, Err(MutationError::Engine));
                         continue;
                     };
-                    match self.wants.register(chunk) {
-                        Ok(()) => {
-                            tracing::debug!(
-                                chunk = ?chunk,
-                                base = ?base,
-                                "mutation deferred for authoring content"
-                            );
-                            batch.defer(index, base);
-                        }
-                        Err(error) => {
-                            tracing::debug!(
-                                error = ?error,
-                                "mutation demand refused"
-                            );
-                            batch.record(index, Err(MutationError::Engine));
+                    // One waiter per chunk: retries name new chunks as
+                    // the walk advances, but re-registering a held
+                    // chunk would accumulate counts against one
+                    // release.
+                    if !batch.wanted(index).contains(&chunk) {
+                        match self.wants.register(chunk) {
+                            Ok(()) => batch.note_want(index, chunk),
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = ?error,
+                                    "mutation demand refused"
+                                );
+                                batch.record(index, Err(MutationError::Engine));
+                                continue;
+                            }
                         }
                     }
+                    tracing::debug!(
+                        chunk = ?chunk,
+                        base = ?base,
+                        "mutation deferred for authoring content"
+                    );
+                    batch.defer(index, base);
                 }
                 other => batch.record(index, other),
             }
@@ -1253,7 +1259,9 @@ where
                         // Terminal: no further pass will drain, so complete
                         // still-queued submitters now — returning first
                         // would strand every admitted caller forever.
-                        self.mutations.shutdown();
+                        // Held entries release their fetch wants through
+                        // the same finish path as every terminal outcome.
+                        self.mutations.shutdown_with(Some(Arc::clone(&self.wants)));
                         return Err(error);
                     }
                     // The backoff sleeps on the pacing signal, so a stop
@@ -1270,7 +1278,7 @@ where
         }
         // Stopped with demand possibly in flight: same guarantee as the
         // terminal path — resolve, never strand.
-        self.mutations.shutdown();
+        self.mutations.shutdown_with(Some(Arc::clone(&self.wants)));
         Ok(summary)
     }
 

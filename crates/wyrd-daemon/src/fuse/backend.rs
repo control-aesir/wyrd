@@ -92,6 +92,14 @@ pub(super) fn current_owner() -> (u32, u32) {
 /// Map a mutation failure to the POSIX errno the write-path contract
 /// names. Everything unclassified is `EIO`: a durability or validation
 /// failure never masquerades as a more benign error.
+/// Log a refused mutation's underlying variant: several distinct
+/// failures share `EIO` at the boundary, and the errno alone cannot
+/// tell a conflicted drive from an unavailable view, a failed
+/// authoring, or a poisoned lock. Debug-gated; mutations are rare.
+fn log_refused(error: &MutationError) {
+    tracing::debug!(error = ?error, "mutation refused");
+}
+
 pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
     match error {
         MutationError::Saturated => fuser::Errno::EAGAIN,
@@ -911,11 +919,14 @@ where
             .submit(MutationKind::CreateFile {
                 path: child_path.clone(),
             })
-            .map_err(|error| mutation_errno(&error))
-        {
+            .map_err(|error| {
+                log_refused(&error);
+                mutation_errno(&error)
+            }) {
             Ok(MutationOutcome::Created(identity)) => identity,
-            Ok(_) => {
+            Ok(outcome) => {
                 self.release_slot();
+                tracing::debug!(outcome = ?outcome, "create got non-created outcome");
                 return Err(fuser::Errno::EIO);
             }
             Err(error) => {
@@ -1153,12 +1164,14 @@ where
                 write.failed = true;
                 write.dirty = false;
                 self.budget.release(write.id);
+                tracing::debug!("commit got non-committed outcome");
                 Err(fuser::Errno::EIO)
             }
             Err(error) => {
                 write.failed = true;
                 write.dirty = false;
                 self.budget.release(write.id);
+                log_refused(&error);
                 Err(mutation_errno(&error))
             }
         }
@@ -1372,7 +1385,7 @@ where
             .ok_or(fuser::Errno::EROFS)?
             .submit(kind)
             .map_err(|error| {
-                tracing::debug!(error = ?error, "mutation refused");
+                log_refused(&error);
                 mutation_errno(&error)
             })
     }

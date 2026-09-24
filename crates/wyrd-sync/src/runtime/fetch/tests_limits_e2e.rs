@@ -121,6 +121,11 @@ fn announced_body_over_the_parent_ceiling_commits_nothing() {
         report.snapshot_bodies, 0,
         "an over-ceiling body is refused, never committed"
     );
+    assert!(
+        report.invalid > 0,
+        "the refusal is counted as invalid remote data, not absence: {}",
+        report.invalid
+    );
     // Nothing durable, nothing resident, and the item stays pending
     // for a healthy retry rather than being marked consumed.
     let recorded = fixture
@@ -133,6 +138,25 @@ fn announced_body_over_the_parent_ceiling_commits_nothing() {
         report.unfulfilled > 0,
         "the refused body stays pending: unfulfilled {}",
         report.unfulfilled
+    );
+    assert!(
+        fixture
+            .engine
+            .vault()
+            .sealed(&body_root(&body))
+            .unwrap()
+            .is_none(),
+        "the rejected body never became vault-resident"
+    );
+    // A healthy retry still sees the same pending item: the refusal
+    // neither consumed it nor recorded a durable fact about it.
+    let retry = fixture
+        .engine
+        .execute_plan(&mut bulk, &mut objects)
+        .unwrap();
+    assert_eq!(
+        retry.snapshot_bodies, 0,
+        "the retry re-refetches nothing durable"
     );
 }
 
@@ -167,8 +191,14 @@ fn announced_body_at_the_parent_ceiling_converges_once() {
         .execute_plan(&mut bulk, &mut objects)
         .unwrap();
     assert_eq!(
-        again.snapshot_bodies, 0,
-        "the committed body is not refetched: the next pass is a no-op"
+        (
+            again.snapshot_bodies,
+            again.manifests,
+            again.objects,
+            again.unfulfilled
+        ),
+        (0, 0, 0, 0),
+        "the committed body is not refetched: the next pass is a true no-op"
     );
 }
 
@@ -270,9 +300,25 @@ fn announced_chunk_over_the_payload_ceiling_never_resides() {
         "an over-ceiling chunk never becomes a local object"
     );
     assert!(
+        report.invalid > 0,
+        "the refusal is counted as invalid remote data, not absence: {}",
+        report.invalid
+    );
+    assert!(
+        report.unfulfilled > 0,
+        "the refused object stays pending: unfulfilled {}",
+        report.unfulfilled
+    );
+    assert!(
         !objects.has(&published.content).unwrap(),
         "no plaintext object landed"
     );
+    let local = fixture
+        .engine
+        .runtime_state()
+        .map(|state| state.local_objects.len())
+        .unwrap_or_default();
+    assert_eq!(local, 0, "no durable LocalObject fact was recorded");
     assert!(
         fixture.engine.vault().sealed(&transport).unwrap().is_none(),
         "the rejected representation never became vault-resident"

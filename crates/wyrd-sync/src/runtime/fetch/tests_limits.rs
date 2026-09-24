@@ -1,7 +1,8 @@
-//! Structural ingest gates at the fetch decode boundary: a hostile
-//! but authenticated representation is rejected before vault
-//! residency, durable facts, or object insertion — not at a later
-//! closure check that only notices after the work is done.
+//! Structural gate boundary coverage at the fetch helpers: the
+//! decoded representation is refused before import. The fixtures here
+//! are unsigned and unpublished — they pin the structural boundary
+//! itself, not authentication. `tests_limits_e2e` covers the
+//! authenticated, announced, plan-level path.
 
 use super::*;
 

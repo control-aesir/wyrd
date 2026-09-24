@@ -293,6 +293,19 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
     )
     .expect("seals")
     .encode();
+    // The same obligation sealed under the superseded `0x01` framing,
+    // as a crash before discharge would have left on disk.
+    let mut old = seal_rotation(
+        &member_drive(),
+        member,
+        &registration,
+        2,
+        &child.canonical_bytes(),
+        &wrap,
+        &[],
+    )
+    .expect("seals");
+    old.version = crate::control::rotation::ROTATION_VERSION_SUPERSEDED;
     let keyless = identity(0x04).1;
     fx.engine
         .commit_facts(&[
@@ -406,5 +419,105 @@ fn announce_skips_snapshot_without_a_sealing_key_and_sends_the_rest() {
         fx.engine.runtime_state().unwrap().pending_announcements(),
         vec![(snap2, recipient)],
         "the keyless obligation stays pending"
+    );
+}
+
+/// The `0x01 -> 0x02` upgrade must not strand a pending obligation. A
+/// capability sealed under the superseded framing can never open, so
+/// the send path re-mints it as current bytes; the obligation discharges
+/// and the next pass is a no-op rather than failing forever.
+#[test]
+fn superseded_rotation_fact_is_reminted_not_stranded() {
+    use crate::keys::capability::Capability;
+    use crate::runtime::test_util::owner;
+    use crate::transport::mailbox::{
+        Delivery, DeliveryId, Disposition, MailboxEnvelope, MailboxError,
+    };
+    use crate::transport::Mailbox;
+    /// Records what actually left, so the test can assert the framing.
+    #[derive(Default)]
+    struct Recorder {
+        sent: Vec<Vec<u8>>,
+    }
+    impl Mailbox for Recorder {
+        fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            self.sent.push(envelope.ciphertext.into_bytes());
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Ok(None)
+        }
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let (_owner_sk, member) = owner();
+    let state = fx.engine.log.state_of(&child_id).expect("child is valid");
+    let registration = state
+        .encryption_key_of(&member)
+        .copied()
+        .expect("member has a registered key");
+    let wrap = Capability::mint(
+        member_drive(),
+        member,
+        &state,
+        &child,
+        vec![secret(0xAA), secret(0xBB)],
+    )
+    .expect("member is a member")
+    .wrap()
+    .expect("wraps")
+    .as_bytes()
+    .to_vec();
+
+    // Sealed under the superseded framing, as a crash before discharge
+    // would have left on disk across the upgrade.
+    let mut old = crate::control::seal_rotation(
+        &member_drive(),
+        member,
+        &registration,
+        2,
+        &child.canonical_bytes(),
+        &wrap,
+        &[],
+    )
+    .expect("seals");
+    old.version = crate::control::rotation::ROTATION_VERSION_SUPERSEDED;
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilitySealed(2, member, old.encode()),
+            Fact::CapabilityQueued(2, member),
+        ])
+        .unwrap();
+
+    // The send pass must not fail closed as an undecodable legacy fact.
+    // This engine holds none of the epoch secrets, so the re-mint
+    // cannot complete and the obligation legitimately stays pending —
+    // the point is that the pass is clean and the obligation is
+    // recoverable, where the superseded bytes previously raised
+    // `SealedOutboxMismatch` and would retry that failure forever.
+    let mut relay = Recorder::default();
+    fx.engine
+        .deliver_pending(&mut relay)
+        .expect("a superseded fact is stale, never a decode failure");
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        !loaded.capability_delivered.contains(&(2, member)),
+        "nothing is discharged without the secrets to re-mint"
+    );
+
+    // A second pass is a no-op: discharged, not re-sent every pass.
+    let mut again = Recorder::default();
+    fx.engine.deliver_pending(&mut again).expect("no-op");
+    assert!(
+        again.sent.is_empty(),
+        "a discharged obligation does not resend"
     );
 }

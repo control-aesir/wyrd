@@ -73,6 +73,20 @@ use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret};
 /// this byte before decoding either framing.
 pub const ROTATION_VERSION: u8 = 0x02;
 
+/// The rotation version before the owner proof landed. A durable
+/// outbox fact sealed under it can never open (its plaintext has no
+/// proof blob), so the send path treats it as stale and re-mints rather
+/// than letting it fail as an undecodable legacy fact. Recorded here so
+/// the recovery rule is explicit instead of implied by an unreachable
+/// byte.
+pub const ROTATION_VERSION_SUPERSEDED: u8 = 0x01;
+
+/// Whether sealed bytes carry a rotation envelope of a known but
+/// non-current version.
+pub fn is_superseded_rotation(bytes: &[u8]) -> bool {
+    bytes.first().copied() == Some(ROTATION_VERSION_SUPERSEDED)
+}
+
 /// Header length: version (1) + drive (32) + ephemeral (32) +
 /// recipient (32) + encryption key (32) + epoch (8) + nonce (24).
 pub const ROTATION_HEADER_LEN: usize = 161;

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 
 use crate::control::{
-    open as open_control, seal as seal_control, seal_rotation, Message, SealedControl,
-    SealedRotation, TransitionPayload, ROTATION_VERSION,
+    is_superseded_rotation, open as open_control, seal as seal_control, seal_rotation, Message,
+    SealedControl, SealedRotation, TransitionPayload, ROTATION_VERSION,
 };
 use crate::durable::{Fact, Rebuilt};
 use crate::keys::capability::{Capability, DriveKeyring};
@@ -373,12 +373,31 @@ fn deliver_capabilities(
                     }
                 }
             }
-            // A pre-framing epoch-sealed fact: its bytes target keys the
-            // recipient may never hold, so they never send — mint fresh
-            // under rotation, which always opens. The stale fact lingers
+            // A pre-framing epoch-sealed fact, or a rotation sealed
+            // under a superseded version: its bytes can never open for
+            // the current reader (no proof blob, or keys the recipient
+            // may never hold), so it never sends — mint fresh under the
+            // current framing, which always opens. The stale fact lingers
             // durably and harmlessly; the new seal takes the overlay.
-            // Bytes decoding as neither framing fail closed: legacy or
-            // not, undecodable outbox bytes never silently heal.
+            // This is the announced re-mint recovery for the `0x01 ->
+            // 0x02` bump, and it is what keeps an upgrade from stranding
+            // a pending obligation. Bytes decoding as neither framing
+            // still fail closed: genuinely undecodable outbox bytes never
+            // silently heal.
+            Some(bytes) if is_superseded_rotation(&bytes) => {
+                let Some(bytes) = mint_fresh_rotation(
+                    engine,
+                    &rebuilt.keyring,
+                    &mut sealed_overlay,
+                    epoch,
+                    recipient,
+                    &transition_id,
+                )?
+                else {
+                    continue;
+                };
+                bytes
+            }
             Some(bytes) => {
                 if SealedControl::decode(&bytes).is_err() {
                     let obligation = format!("capability epoch {epoch} for {recipient}");

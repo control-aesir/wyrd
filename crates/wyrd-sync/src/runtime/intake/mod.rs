@@ -652,10 +652,22 @@ fn rotation_commit(
             }
             Err(_) => return suppress(engine),
         };
-    // The signer must be an owner of this exact transition: signed, but
-    // by a device without mint authority, is still a member minting.
-    match scratch.owners_of(&transition_id) {
+    // The signer must be an owner of the **pre-state** that authorized
+    // this transition (epochs.md rule 3), not of the state it produces.
+    // That distinction is what makes handover work: the outgoing owner
+    // signs and mints, so a check against the post-state would suppress
+    // every legitimate handover while admitting the incoming owner — who
+    // could then choose the vector outright, recreating exactly the
+    // poisoning this proof exists to stop.
+    let mint_authority = match transition.prev {
+        Some(prev) => scratch.owners_of(&prev),
+        // Genesis establishes its own owner set; there is no earlier
+        // state to consult.
+        None => scratch.owners_of(&transition_id),
+    };
+    match mint_authority {
         Some(owners) if owners.contains(&proof.signer) => {}
+        // Signed, but by a device without mint authority.
         Some(_) => return suppress(engine),
         None => return Err(EngineError::TransitionUnclassified(transition_id)),
     }

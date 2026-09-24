@@ -683,3 +683,152 @@ fn member_signed_proof_is_refused() {
         "the non-owner-signed transition never entered the log"
     );
 }
+
+/// Ownership handover: mint authority is the **pre-state** owner set,
+/// so the outgoing owner's proof is the legitimate one. Checking the
+/// post-state instead would suppress every handover while admitting the
+/// incoming owner — who could then choose the vector outright.
+#[test]
+fn handover_delivery_authorizes_the_outgoing_owner() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let (_, sender) = identity(0x01);
+    let sender_key =
+        DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("fixture scalar is valid");
+    let admit_sender = builder.child(vec![Change::Admit(Admission {
+        device: sender,
+        encryption_key: encryption_key(&sender_key),
+    })]);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let admission = builder.child(vec![Change::Admit(Admission {
+        device,
+        encryption_key: encryption_key(&encryption_sk),
+    })]);
+    // Epoch 4: ownership moves from the genesis owner (10) to the
+    // admitted sender (0x01). The *outgoing* owner signs this.
+    let (owner_sk, _owner_id) = crate::runtime::test_util::owner();
+    let mut handover = builder.child(vec![Change::SetOwners(vec![sender])]);
+    crate::membership::test_util::sign(&mut handover, &owner_sk, &member_drive());
+    let handover_id = handover.transition_id();
+    // The handover grant's chain must include the handover itself.
+    let chain = vec![
+        genesis.clone(),
+        admit_sender.clone(),
+        admission.clone(),
+        handover.clone(),
+    ];
+
+    // Epochs 1..=2 ride the held control keys; epoch 3 arrives as a
+    // rotation (the device holds no epoch-3 key), then the handover at
+    // epoch 4 rides on top of it.
+    let chain3 = vec![genesis.clone(), admit_sender.clone(), admission.clone()];
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 2, &transition_message(&admit_sender)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+    let (wrapped3, proof3) = grant(&chain3, &admission, device, secrets(3));
+    let first = rotation_delivery(&fixture, 3, &admission, wrapped3, proof3);
+    queue(&mut fixture, vec![first]);
+    assert_eq!(drain(&mut fixture).accepted, 1, "epoch 3 converges");
+
+    let (wrapped, proof) = grant(&chain, &handover, device, secrets(4));
+    let rotation = rotation_delivery(&fixture, 4, &handover, wrapped, proof);
+    queue(&mut fixture, vec![rotation]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "the outgoing owner's proof authorizes the handover grant"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .membership_log()
+            .known_state()
+            .map(|s| s.epoch),
+        Some(4),
+        "the handover epoch commits"
+    );
+    assert_eq!(handover_id, handover.transition_id());
+}
+
+/// The inverse of the handover case: the **incoming** owner has no mint
+/// authority over the transition that promoted it, so a vector it signs
+/// is refused even though the signature is valid.
+#[test]
+fn incoming_owner_cannot_mint_the_handover_vector() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let (_, sender) = identity(0x01);
+    let sender_key =
+        DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("fixture scalar is valid");
+    let admit_sender = builder.child(vec![Change::Admit(Admission {
+        device: sender,
+        encryption_key: encryption_key(&sender_key),
+    })]);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let admission = builder.child(vec![Change::Admit(Admission {
+        device,
+        encryption_key: encryption_key(&encryption_sk),
+    })]);
+    let (owner_sk, _owner_id) = crate::runtime::test_util::owner();
+    let mut handover = builder.child(vec![Change::SetOwners(vec![sender])]);
+    crate::membership::test_util::sign(&mut handover, &owner_sk, &member_drive());
+    // The handover grant's chain must include the handover itself.
+    let chain = vec![
+        genesis.clone(),
+        admit_sender.clone(),
+        admission.clone(),
+        handover.clone(),
+    ];
+
+    // Epochs 1..=2 ride the held control keys; epoch 3 arrives as a
+    // rotation (the device holds no epoch-3 key), then the handover at
+    // epoch 4 rides on top of it.
+    let chain3 = vec![genesis.clone(), admit_sender.clone(), admission.clone()];
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 2, &transition_message(&admit_sender)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+    let (wrapped3, proof3) = grant(&chain3, &admission, device, secrets(3));
+    let first = rotation_delivery(&fixture, 3, &admission, wrapped3, proof3);
+    queue(&mut fixture, vec![first]);
+    assert_eq!(drain(&mut fixture).accepted, 1, "epoch 3 converges");
+
+    // The incoming owner (0x01) signs an attacker-chosen vector. Valid
+    // signature, wrong authority.
+    let incoming =
+        crate::runtime::test_util::identity_secret(&crate::membership::test_util::key(0x01).0);
+    let forged = vec![EpochSecret::from_bytes([0x6D; 32]); 4];
+    let proof = crate::keys::owner_proof::OwnerProof::sign(
+        &incoming,
+        &member_drive(),
+        &device,
+        &handover.transition_id(),
+        4,
+        &forged,
+    )
+    .encode();
+    let wrapped = mint_wrap(&chain, &handover, device, forged);
+    let rotation = rotation_delivery(&fixture, 4, &handover, wrapped, proof);
+    queue(&mut fixture, vec![rotation]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "consumed as poison: the promoted owner is not yet mint authority"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .membership_log()
+            .known_state()
+            .map(|s| s.epoch),
+        Some(3),
+        "the forged handover vector never entered the log"
+    );
+}

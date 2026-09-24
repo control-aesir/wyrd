@@ -9,7 +9,7 @@ use wyrd_format::{
 
 use super::{ManifestRecord, PendingObjectFetch, RuntimeState};
 use crate::bulk::{BulkError, BulkSource, SealedManifest};
-use crate::ingest::{check_manifest, Limits};
+use crate::ingest::{check_chunk_len, check_manifest, check_snapshot, Limits};
 use crate::keys::capability::DriveKeyring;
 use crate::seal::{open_manifest, verify, EncryptedObject};
 use crate::serving::Vault;
@@ -181,8 +181,15 @@ pub(super) fn snapshot_body(
     if SnapshotId::from_bytes(*derived.as_bytes()) != *snapshot {
         return FetchOutcome::Invalid;
     }
+    // Structural counts gate the decoded body before it can be
+    // recorded: an over-ceiling representation is invalid remote data,
+    // refused here rather than at a later closure check that would
+    // only notice after the fetch work was done.
     match Snapshot::decode(&bytes) {
-        Ok(snapshot) => FetchOutcome::Fulfilled(snapshot),
+        Ok(snapshot) => match check_snapshot(&Limits::V0, &snapshot) {
+            Ok(()) => FetchOutcome::Fulfilled(snapshot),
+            Err(_) => FetchOutcome::Invalid,
+        },
         // Unreachable for id-matching bytes (the id derives from the
         // encoding), but never serve undecodable bytes.
         Err(_) => FetchOutcome::Invalid,
@@ -361,6 +368,16 @@ pub(super) fn object(
             invalid.push(candidate.storage_id);
             continue;
         };
+        // The payload ceiling gates the decrypted plaintext before
+        // vault residency and object insertion: an over-ceiling chunk
+        // is invalid remote data, never stored and never served.
+        if candidate.kind == ObjectKind::Chunk
+            && check_chunk_len(&Limits::V0, plaintext.len()).is_err()
+        {
+            aggregate = worse(aggregate, FetchOutcome::Invalid);
+            invalid.push(candidate.storage_id);
+            continue;
+        }
         // Residency precedes the record (as in root and child): the
         // verified ciphertext lands in the serving vault before the
         // plaintext consequence, and a refusal is a local failure. A
@@ -460,3 +477,7 @@ impl<T> FetchOutcome<T> {
 mod tests_attempts;
 #[cfg(test)]
 mod tests_fetch;
+#[cfg(test)]
+mod tests_limits;
+#[cfg(test)]
+mod tests_limits_e2e;

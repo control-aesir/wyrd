@@ -7,14 +7,15 @@
 
 use super::tests_harness::{device_of, owner_engine};
 use crate::authorization::test_util::sign_snapshot;
-use crate::authorization::{Classification, Rejection, SnapshotDag};
+use crate::authorization::{Classification, Pendency, Rejection, SnapshotDag};
 use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::test_util::{drive as member_drive, key};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::test_util::{encryption_key, identity_secret, TestDir};
 use wyrd_format::{
-    ContentId, Entry, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId, Tree,
+    ContentId, Entry, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId,
+    TransitionId, Tree,
 };
 
 /// One file over one chunk, inserted into `objects`.
@@ -248,11 +249,129 @@ fn reader_authored_child_never_discharges_a_pending_carry() {
         vec![first_id],
         "the carry extends its head despite the decoy"
     );
+    // The genuine carry completes its own obligation on the author
+    // path (which commits CarryDone without bumping the no-op
+    // discharge counter): authored is the distinguishing signal.
+    assert_eq!(report.discharged, 0, "no no-op discharge happened");
     assert!(engine.pending_carries().unwrap().is_empty());
     assert_eq!(
         head_trees(&engine),
         vec![tree],
         "the namespace continues at the new epoch"
+    );
+}
+
+/// A snapshot bound to an unknown transition is pending, not
+/// continuity: the decoy never discharges the queue either.
+#[test]
+fn unknown_transition_child_never_discharges_a_pending_carry() {
+    let (_dir, mut engine, _genesis) = owner_engine("carry-pending-decoy");
+    let (owner_sk, _) = key(10);
+    let mut objects = MemoryObjectStore::default();
+    let tree = file_tree(&mut objects, "kept.txt", b"carry me");
+    let first = engine.author_snapshot(&objects, tree).unwrap();
+    let first_id = first.snapshot().snapshot_id();
+
+    engine.stage_carry_heads().unwrap();
+    let transition = engine.rotate_epoch().unwrap();
+    assert_eq!(transition.epoch, 2, "rotation over genesis");
+    assert_eq!(engine.pending_carries().unwrap(), vec![first_id]);
+
+    // Same epoch and parent as a genuine carry, but bound to a
+    // transition the log never observed.
+    let mut decoy = Snapshot::new(
+        vec![first_id],
+        tree,
+        engine.device(),
+        TransitionId::from_bytes([0xFF; 32]),
+        transition.epoch,
+        0,
+        first.snapshot().timestamp,
+    )
+    .unwrap();
+    sign_snapshot(&mut decoy, &owner_sk, &member_drive());
+    let authorized = AuthorizedSnapshot::authorize(decoy, &member_drive()).unwrap();
+    let decoy_id = authorized.snapshot().snapshot_id();
+    engine
+        .commit_facts(&[Fact::SnapshotBody(authorized)])
+        .unwrap();
+    assert_eq!(
+        classify(&engine, &decoy_id),
+        Classification::Pending(Pendency::UnknownTransition),
+        "the decoy is pending: its transition is unknown"
+    );
+
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(
+        report.authored.len(),
+        1,
+        "the pending child discharges nothing: the genuine carry still authors"
+    );
+    assert_eq!(report.discharged, 0, "no no-op discharge happened");
+    assert!(engine.pending_carries().unwrap().is_empty());
+}
+
+/// An accepted non-head child discharges without re-authoring: a
+/// genuine carry extended by a later write is `CanonicalHistory`,
+/// and its presence proves continuity, so the drain completes the
+/// obligation instead of forking a duplicate.
+#[test]
+fn canonical_history_child_discharges_without_reauthoring() {
+    let (_dir, mut engine, _genesis) = owner_engine("carry-accepted-child");
+    let (owner_sk, _) = key(10);
+    let mut objects = MemoryObjectStore::default();
+    let tree = file_tree(&mut objects, "kept.txt", b"carry me");
+    let first = engine.author_snapshot(&objects, tree).unwrap();
+    let first_id = first.snapshot().snapshot_id();
+
+    engine.stage_carry_heads().unwrap();
+    let transition = engine.rotate_epoch().unwrap();
+    assert_eq!(transition.epoch, 2, "rotation over genesis");
+
+    // The carry, committed directly as a synced echo would arrive:
+    // owner-signed, parented on the pending head, at the new epoch.
+    let mut carry = Snapshot::new(
+        vec![first_id],
+        tree,
+        engine.device(),
+        transition.transition_id(),
+        transition.epoch,
+        0,
+        first.snapshot().timestamp,
+    )
+    .unwrap();
+    sign_snapshot(&mut carry, &owner_sk, &member_drive());
+    let authorized = AuthorizedSnapshot::authorize(carry, &member_drive()).unwrap();
+    let carry_id = authorized.snapshot().snapshot_id();
+    engine
+        .commit_facts(&[Fact::SnapshotBody(authorized)])
+        .unwrap();
+    // A later write extends the carry through the production path,
+    // moving it from eligible tip to accepted history.
+    let extended = extend_tree(&mut objects, &tree, "new.txt", b"new file");
+    let child = engine.author_snapshot(&objects, extended).unwrap();
+    assert_eq!(
+        child.snapshot().parents,
+        vec![carry_id],
+        "the write extends the carry"
+    );
+    assert_eq!(
+        classify(&engine, &carry_id),
+        Classification::CanonicalHistory,
+        "the extended carry is accepted history"
+    );
+
+    let report = engine.carry_pending(&objects).unwrap();
+    assert!(
+        report.authored.is_empty(),
+        "accepted continuity authors no duplicate carry"
+    );
+    assert_eq!(report.discharged, 1, "the obligation completes");
+    assert!(engine.pending_carries().unwrap().is_empty());
+    assert_eq!(
+        head_trees(&engine),
+        vec![extended],
+        "old files plus the new one stay served"
     );
 }
 

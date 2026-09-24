@@ -67,6 +67,84 @@
 //! daemon composes exactly one mailbox per process (see the review note on
 //! runtime-per-mailbox cost before ever changing that).
 //!
+//! # Signer secret boundary
+//!
+//! Process-wide secret inventory for the local case. The mailbox's own
+//! holders are upstream `nostr`/`secp256k1` types, which cannot
+//! implement our scrubbing, so this boundary is documented and pinned,
+//! not scrubbed:
+//!
+//! | Holder | Lives in | Lifetime | Why it must exist |
+//! |---|---|---|---|
+//! | `identity: DeviceIdentitySecret` | CLI composer | mount duration | `Zeroizing`-backed, sync-audited; parsed once per mailbox/engine open |
+//! | engine identity clone | `Engine` | engine duration | snapshot authoring signs with the device key; the engine cannot borrow the CLI's copy |
+//! | bare `SecretKey` × 2 | `connect` arguments | the `connect` call only | transient parse results moved into the two `Keys` below; live across construction, not after |
+//! | signer `Keys` | `LiveMailbox.signer` | mailbox duration | outbound seals sign through the generic `S` boundary; a remote signer would hold no local secret (future: NIP-46 is not wired, see below) |
+//! | `open_keys: Keys` | `LiveMailbox` | mailbox duration | inbound `from_gift_wrap` needs the identity key, which the generic signer cannot lend |
+//!
+//! Two mailbox holders is the floor for the wired local case: signer
+//! and opener are the same key in different roles, and the generic `S`
+//! boundary forbids sharing one holder. Each `Keys` additionally
+//! retains upstream secret-plus-keypair material inside the holder.
+//! The remote-signer row is future/unverified: NIP-46 is not wired
+//! (`trust.md` says remote signing is not implemented; `wyrd-core`
+//! has no `nostr-connect` dependency), so its client keys, URI
+//! secret, error responses, and task lifetimes need this same
+//! boundary treatment when that mode lands. Until then the table
+//! covers the local composition only. `connect` adds no holder beyond
+//! these — `Keys::new` moves its argument, and the owner id, tag, and
+//! filter carry public material only.
+//!
+//! Disclosure audit (pinned by `tests_signer_boundary`, fail-closed on
+//! upstream upgrades):
+//!
+//! - `Debug`: `Keys` renders the public key only and `SecretKey` its
+//!   derived struct shape with secp256k1's non-disclosing placeholder
+//!   (nostr 0.45.5, secp256k1 0.30.0 without the `hashes` feature);
+//!   both renderings are pinned exactly. `LiveMailbox` itself has no
+//!   `Debug` impl at all (review discipline: no stable mechanism
+//!   asserts the absence, so adding one must update this section) —
+//!   and a future one stays safe through these pins, since every
+//!   secret holder renders through them for the wired local signer.
+//!   The production `NostrConnect` signer's pairing-secret URI field
+//!   renders `[REDACTED]` (nostr-connect 0.45.0, reviewed in source),
+//!   but that path is future/unverified with the row above: `nip46`
+//!   is outside our feature set, so it is documented, not test-pinned.
+//! - Errors, three classes: `Signer` is constant — foreign signer-trait
+//!   failures (a remote NIP-46 session returns arbitrary text) have
+//!   their payload dropped at the boundary, so key material can never
+//!   enter the error channel from the signer. The other fixed variants
+//!   render constant strings (exact-output pinned). `Transport` carries
+//!   relay, client-send, and dedupe-log I/O errors — relay-influenced,
+//!   but no secret flows into the request path (wraps carry ciphertext
+//!   plus ephemeral signatures), so there is nothing of ours to echo —
+//!   plus the gift-wrap rejection, whose rendering is pinned exactly
+//!   through the mailbox API.
+//! - Tasks: supervisor and drainer contexts carry client, filter
+//!   (public owner tag), channels, and health — no secret; the signer
+//!   serves the send path behind its `Arc` and is never cloned into a
+//!   spawned task.
+//! - Conversions, `LiveMailbox`/CLI signer path: the only
+//!   secret-to-bytes conversions here are the two transient
+//!   `from_slice` parses above; no `to_secret_*`/`as_secret_bytes`
+//!   call exists, and the CLI parses identity through `Zeroizing`
+//!   buffers. The sync control-seal path converts separately
+//!   (`nostr_secret` in `wyrd-sync`'s transport mailbox, used by seal
+//!   and open): its transient is dropped at return and its failures
+//!   map to the constant `InvalidKey`/`Crypto` variants, but it is
+//!   outside this section's pins.
+//!
+//! Accepted residual: upstream `Drop` performs best-effort
+//! `non_secure_erase` on the secret scalar and the keypair (nostr
+//! 0.45.5) — that is not a guarantee, because compiler moves and
+//! copies (including the transient bare keys and `Keys::new`
+//! internals) can leave bytes behind. Reachable holders persist for
+//! the mailbox/engine/process duration; the identity-mismatch early
+//! return drops `open_keys` the same best-effort way. Adding a holder,
+//! a `Debug` impl on mailbox types, a secret-bearing error variant, or
+//! a secret conversion must update this section and its tests
+//! together.
+//!
 //! # Supervision
 //!
 //! The SDK owns TCP reconnects and resubscribes automatically after one,
@@ -118,6 +196,8 @@ mod tests_harness;
 mod tests_interop;
 #[cfg(test)]
 mod tests_mailbox;
+#[cfg(test)]
+mod tests_signer_boundary;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -563,7 +643,7 @@ where
         // identity must fail here, not publish as a stranger.
         let signer_pk = runtime
             .block_on(signer.get_public_key_async())
-            .map_err(|error| MailboxError::Transport(error.to_string()))?;
+            .map_err(|_| MailboxError::Signer)?;
         if signer_pk != owner_pk {
             return Err(MailboxError::Identity);
         }
@@ -1299,7 +1379,7 @@ where
         let wrap = self
             .rt()
             .block_on(GiftWrapBuilder::new(recipient, rumor).finalize_async(&*self.signer))
-            .map_err(|error| MailboxError::Transport(error.to_string()))?;
+            .map_err(|_| MailboxError::Signer)?;
         self.rt()
             .block_on(async { self.client.send_event(&wrap).await })
             .map(|_| ())

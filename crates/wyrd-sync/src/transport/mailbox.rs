@@ -38,6 +38,13 @@ pub enum MailboxError {
         "identity mismatch: the signer, envelope, or open key disagree with the mailbox owner"
     )]
     Identity,
+    /// The signing backend failed. Constant string by design: signer
+    /// errors come from foreign trait implementations (a remote NIP-46
+    /// session can return arbitrary text), so their payload never
+    /// enters the error channel — it cannot carry key material into
+    /// logs or diagnostics.
+    #[error("signer operation failed")]
+    Signer,
     #[error("relay transport failed: {0}")]
     Transport(String),
 }

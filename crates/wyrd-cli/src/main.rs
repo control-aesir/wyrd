@@ -301,7 +301,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
 
 /// Read and harden the credential files. The passphrase keeps its
 /// trailing newline stripped; the identity may be raw or hex.
-fn read_credentials(creds: &Credentials) -> Result<(DeviceIdentitySecret, String), CliError> {
+fn read_credentials(
+    creds: &Credentials,
+) -> Result<(DeviceIdentitySecret, Zeroizing<String>), CliError> {
     let identity = read_identity(&creds.identity_file)?;
     let passphrase_bytes = read_secret_file(&creds.passphrase_file)?;
     let passphrase_text = std::str::from_utf8(&passphrase_bytes)
@@ -311,7 +313,11 @@ fn read_credentials(creds: &Credentials) -> Result<(DeviceIdentitySecret, String
         .strip_suffix("\r\n")
         .or_else(|| passphrase.strip_suffix('\n'))
         .unwrap_or(&passphrase);
-    Ok((identity, passphrase.to_owned()))
+    // Kept scrubbing: the passphrase lives in process memory until the
+    // command completes, so it stays in a `Zeroizing` rather than a
+    // plain `String`. Callers pass `&passphrase` as `&str` through
+    // deref coercion.
+    Ok((identity, Zeroizing::new(passphrase.to_owned())))
 }
 
 /// Read a bounded credential file without following symlinks. On Unix the

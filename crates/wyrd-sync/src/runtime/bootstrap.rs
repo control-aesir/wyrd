@@ -412,14 +412,14 @@ pub(super) fn install_invitation_keys(
         .map_err(EngineError::Crypto)?;
     // Verify everything before installing anything: a conflict leaves
     // the held keys untouched and fails closed.
-    let mut derived = Vec::with_capacity(capability.secrets.len());
+    let mut derived: Vec<(u64, Zeroizing<[u8; 32]>)> = Vec::with_capacity(capability.secrets.len());
     for (index, secret) in capability.secrets.iter().enumerate() {
         let epoch = index as u64 + 1;
-        derived.push((epoch, secret.control_key(&drive, epoch)));
+        derived.push((epoch, Zeroizing::new(secret.control_key(&drive, epoch))));
     }
     for (epoch, key) in &derived {
         if let Some(known) = keyring.secret(*epoch) {
-            if known.control_key(&drive, *epoch) != *key {
+            if known.control_key(&drive, *epoch) != **key {
                 return Err(EngineError::BootstrapKeyConflict(*epoch));
             }
         }
@@ -431,8 +431,9 @@ pub(super) fn install_invitation_keys(
     }
     for (epoch, key) in derived {
         // `add_epoch_key` overwrites, but every held key above was just
-        // proven equal, so this only fills vacant epochs.
-        engine.add_epoch_key(epoch, Zeroizing::new(key));
+        // proven equal, so this only fills vacant epochs. The
+        // provisional key moves in directly — no second copy.
+        engine.add_epoch_key(epoch, key);
     }
     Ok(())
 }
@@ -489,9 +490,11 @@ fn install_self_capability(
 /// outranks held material — the same rule the invitation resync
 /// applies to provisional secrets.
 fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
-    let Some(root) = engine.root.clone() else {
+    if engine.root.is_none() {
+        // Member engines and keystoreless opens hold no root and
+        // escrow nothing.
         return Ok(());
-    };
+    }
     let drive = engine.drive;
     let dir = engine.store.dir().to_path_buf();
     let tip = engine
@@ -506,7 +509,20 @@ fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
         if record.drive != drive || record.epoch != epoch {
             return Err(EngineError::MalformedKeystore);
         }
-        let secret = escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?;
+        // Borrow the root for one derivation at a time: the previous
+        // shape cloned it across the whole loop. The clone scrubbed
+        // itself on drop, but a borrow holds no second copy at all —
+        // and the short borrow never crosses the `&mut` keyring
+        // install below.
+        let secret = {
+            let Some(root) = engine.root.as_ref() else {
+                // Unreachable: presence is checked above and nothing
+                // in this loop replaces the root. Fail closed rather
+                // than report success after a partial restore.
+                return Err(EngineError::EscrowRootLost);
+            };
+            escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?
+        };
         let key = secret.control_key(&drive, epoch);
         match engine.epoch_keys.get(&epoch) {
             // Same secret already held (e.g. keyring-derived):

@@ -283,14 +283,18 @@ fn announcement_discharge_waits_for_serving_readiness() {
         .unwrap();
     assert!(report.published, "delivered markers republicate once");
     assert!(mailbox.drained().is_empty(), "nothing left to send");
-    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 5);
+    // The outbox is drained, so the barrier is not asked: it gates
+    // discharge, and there is nothing to discharge. (A slow mirror
+    // would otherwise burn its whole budget for nothing — and delay
+    // shutdown past its deadline.)
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 4);
     let quiet = live
         .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
         .unwrap();
     assert!(!quiet.published, "a drained outbox idles");
     assert_eq!(
         barrier.flushes.load(Ordering::SeqCst),
-        5,
+        4,
         "idle passes never touch the barrier"
     );
 

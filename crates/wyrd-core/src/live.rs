@@ -556,36 +556,14 @@ where
         // them first. A failed barrier skips this pass's discharge —
         // the obligations stay pending and the next pass retries — so
         // a sick mirror stalls propagation, never the mount.
-        if let Some(barrier) = &self.serving_barrier {
-            // The barrier is time-boxed by the config and further
-            // clipped to the nearest held mutation's remaining time:
-            // a slow mirror must not stretch a mounted deadline by
-            // its drain duration. "Not ready in time" skips the
-            // discharge exactly like a failure — the obligation stays
-            // pending and the next pass asks again.
-            let budget = match self.mutations.nearest_deadline(self.max_mutation_wait) {
-                Some(deadline) => self
-                    .serving_flush_budget
-                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                None => self.serving_flush_budget,
-            };
-            match barrier.flush(budget) {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::debug!(
-                        budget_ms = budget.as_millis(),
-                        "announcement discharge waits for serving readiness"
-                    );
-                    return Ok(sent);
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "announcement discharge waits for serving readiness"
-                    );
-                    return Ok(sent);
-                }
-            }
+        //
+        // Only when something is actually pending: with an empty outbox
+        // the barrier gates nothing, and a slow mirror would otherwise
+        // burn its whole budget per pass for no discharge (observed in
+        // the guest logs as ten-second publish phases that sent
+        // nothing, delaying shutdown past its budget).
+        if self.engine.has_pending_outbound()? && !self.flush_serving_barrier()? {
+            return Ok(sent);
         }
         sent += match self
             .engine
@@ -596,6 +574,47 @@ where
             Err(other) => return Err(LiveError::Engine(other)),
         };
         Ok(sent)
+    }
+
+    /// Ask the serving mirror to catch up, time-boxed by the config
+    /// and clipped to the nearest held mutation's remaining time. A
+    /// slow mirror must not stretch a mounted deadline by its drain
+    /// duration. `Ok(false)` means "not ready in time" — not an
+    /// error: the caller skips this pass's announcement discharge
+    /// exactly like a failed barrier.
+    fn flush_serving_barrier(&mut self) -> Result<bool, LiveError> {
+        let Some(barrier) = &self.serving_barrier else {
+            return Ok(true);
+        };
+        // The barrier is time-boxed by the config and further clipped
+        // to the nearest held mutation's remaining time: a slow
+        // mirror must not stretch a mounted deadline by its drain
+        // duration. "Not ready in time" skips the discharge exactly
+        // like a failure — the obligation stays pending and the next
+        // pass asks again.
+        let budget = match self.mutations.nearest_deadline(self.max_mutation_wait) {
+            Some(deadline) => self
+                .serving_flush_budget
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            None => self.serving_flush_budget,
+        };
+        match barrier.flush(budget) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                tracing::debug!(
+                    budget_ms = budget.as_millis(),
+                    "announcement discharge waits for serving readiness"
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "announcement discharge waits for serving readiness"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// One supervised pass: drain the mailbox into the engine, run a

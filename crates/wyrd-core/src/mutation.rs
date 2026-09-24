@@ -680,6 +680,10 @@ mod tests {
         // The derived `Vec<u8>` rendering: byte-list form must be gone too,
         // not just the ASCII text (derived Debug prints numbers, not text).
         let byte_list = format!("{:?}", marker.to_vec());
+        // Non-text bytes exercise the alternate representation directly:
+        // no UTF-8 decoding is involved in the absence check below.
+        let binary: &[u8] = &[0xff, 0x00, 0xfe, 0x01, 0x02, 0x7f];
+        let binary_list = format!("{binary:?}");
         let base = FileIdentity::new(1, false, Vec::new());
         let kinds = [
             MutationKind::Mkdir {
@@ -696,7 +700,7 @@ mod tests {
             },
             MutationKind::AppendFile {
                 path: "/vault/docs".into(),
-                content: marker.to_vec(),
+                content: binary.to_vec(),
             },
             MutationKind::Unlink {
                 path: "/vault/docs".into(),
@@ -726,6 +730,10 @@ mod tests {
                 "content bytes leaked as a byte list in {rendered}"
             );
             assert!(
+                !rendered.contains(&binary_list),
+                "non-text content bytes leaked as a byte list in {rendered}"
+            );
+            assert!(
                 rendered.contains("/vault/"),
                 "paths must still render in {rendered}"
             );
@@ -743,23 +751,36 @@ mod tests {
             commit.contains(&format!("content_len: {}", marker.len())),
             "content length must still render in {commit}"
         );
+        for retained in ["size: 1", "executable: false"] {
+            assert!(
+                commit.contains(retained),
+                "base identity/flags must still render ({retained}) in {commit}"
+            );
+        }
+        let append = format!(
+            "{:?}",
+            MutationKind::AppendFile {
+                path: "/vault/docs".into(),
+                content: binary.to_vec(),
+            }
+        );
+        assert!(
+            append.contains(&format!("content_len: {}", binary.len())),
+            "content length must still render in {append}"
+        );
         let queued = QueuedMutation {
             request: MutationRequest {
                 id: MutationId(7),
                 kind: MutationKind::AppendFile {
                     path: "/vault/docs".into(),
-                    content: marker.to_vec(),
+                    content: binary.to_vec(),
                 },
             },
             reply: Arc::new(Reply::default()),
         };
         let rendered = format!("{queued:?}");
         assert!(
-            !rendered.contains(marker_text),
-            "content bytes leaked as text in {rendered}"
-        );
-        assert!(
-            !rendered.contains(&byte_list),
+            !rendered.contains(&binary_list),
             "content bytes leaked as a byte list in {rendered}"
         );
         assert!(

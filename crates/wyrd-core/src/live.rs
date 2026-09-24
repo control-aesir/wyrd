@@ -538,10 +538,10 @@ where
         let mutations = Arc::clone(&self.mutations);
         let mut batch = mutations.take_batch();
         for index in 0..batch.len() {
-            // Borrow the kind: the batch (owned through the cloned
-            // queue handle, never `self`) outlives the apply, so the
-            // pass needs no copy — the content bytes live exactly as
-            // long as the submitter's owned kind, never a per-pass clone.
+            // Borrow the kind: submit moves the request into the queue,
+            // which owns it until the batch completes it, so the pass
+            // needs no copy — no per-pass clone extends the content
+            // lifetime.
             let result = self.apply_mutation(batch.request(index).kind());
             batch.record(index, result);
         }

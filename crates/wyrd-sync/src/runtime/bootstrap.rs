@@ -412,14 +412,14 @@ pub(super) fn install_invitation_keys(
         .map_err(EngineError::Crypto)?;
     // Verify everything before installing anything: a conflict leaves
     // the held keys untouched and fails closed.
-    let mut derived = Vec::with_capacity(capability.secrets.len());
+    let mut derived: Vec<(u64, Zeroizing<[u8; 32]>)> = Vec::with_capacity(capability.secrets.len());
     for (index, secret) in capability.secrets.iter().enumerate() {
         let epoch = index as u64 + 1;
-        derived.push((epoch, secret.control_key(&drive, epoch)));
+        derived.push((epoch, Zeroizing::new(secret.control_key(&drive, epoch))));
     }
     for (epoch, key) in &derived {
         if let Some(known) = keyring.secret(*epoch) {
-            if known.control_key(&drive, *epoch) != *key {
+            if known.control_key(&drive, *epoch) != **key {
                 return Err(EngineError::BootstrapKeyConflict(*epoch));
             }
         }
@@ -431,8 +431,9 @@ pub(super) fn install_invitation_keys(
     }
     for (epoch, key) in derived {
         // `add_epoch_key` overwrites, but every held key above was just
-        // proven equal, so this only fills vacant epochs.
-        engine.add_epoch_key(epoch, Zeroizing::new(key));
+        // proven equal, so this only fills vacant epochs. The
+        // provisional key moves in directly — no second copy.
+        engine.add_epoch_key(epoch, key);
     }
     Ok(())
 }
@@ -516,9 +517,9 @@ fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
         let secret = {
             let Some(root) = engine.root.as_ref() else {
                 // Unreachable: presence is checked above and nothing
-                // in this loop replaces the root. Skip restoration
-                // rather than panic on custody state.
-                return Ok(());
+                // in this loop replaces the root. Fail closed rather
+                // than report success after a partial restore.
+                return Err(EngineError::EscrowRootLost);
             };
             escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?
         };

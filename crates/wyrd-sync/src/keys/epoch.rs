@@ -20,7 +20,7 @@
 
 use super::{random_bytes, CryptoError};
 use wyrd_format::{ContentId, DriveId, ObjectKind, SnapshotId};
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 /// One epoch's uniformly random secret. Constructed only by
 /// [`EpochSecret::generate`] (minting) or [`EpochSecret::from_bytes`]
@@ -62,7 +62,10 @@ impl EpochSecret {
     /// per-snapshot manifest keys keep revocation as fine-grained as
     /// snapshots). Binds the DriveId and epoch number explicitly.
     pub fn manifest_key(&self, drive: &DriveId, epoch: u64, snapshot_id: &SnapshotId) -> [u8; 32] {
-        let mut input = Vec::with_capacity(104);
+        // The input carries the epoch secret: a `Zeroizing` buffer so
+        // the preimage is scrubbed on drop rather than lingering past
+        // the derivation.
+        let mut input = Zeroizing::new(Vec::with_capacity(104));
         input.extend_from_slice(drive.as_bytes());
         input.extend_from_slice(&epoch.to_le_bytes());
         input.extend_from_slice(&self.0);
@@ -81,7 +84,8 @@ impl EpochSecret {
         kind: ObjectKind,
         version: u8,
     ) -> [u8; 32] {
-        let mut input = Vec::with_capacity(106);
+        // Secret-bearing preimage: scrubbed on drop, as above.
+        let mut input = Zeroizing::new(Vec::with_capacity(106));
         input.extend_from_slice(drive.as_bytes());
         input.extend_from_slice(&epoch.to_le_bytes());
         input.extend_from_slice(&self.0);
@@ -97,7 +101,8 @@ impl EpochSecret {
     /// later control keys, so rotation bounds control traffic too. Binds
     /// the DriveId and epoch number explicitly.
     pub fn control_key(&self, drive: &DriveId, epoch: u64) -> [u8; 32] {
-        let mut input = Vec::with_capacity(72);
+        // Secret-bearing preimage: scrubbed on drop, as above.
+        let mut input = Zeroizing::new(Vec::with_capacity(72));
         input.extend_from_slice(drive.as_bytes());
         input.extend_from_slice(&epoch.to_le_bytes());
         input.extend_from_slice(&self.0);

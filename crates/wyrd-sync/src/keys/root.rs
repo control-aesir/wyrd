@@ -7,7 +7,7 @@
 //! passphrase (see [`crate::keys::keystore`]); changing the passphrase
 //! re-wraps it without touching the drive's cryptographic universe.
 
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 /// The random 256-bit drive root key. Owner/recovery custody only.
 ///
@@ -43,11 +43,13 @@ impl DriveRootKey {
     /// secret; no function maps the root to epoch material without the
     /// sealed record, and T4 stands.
     pub fn escrow_key(&self, drive: &wyrd_format::DriveId, epoch: u64) -> [u8; 32] {
-        let mut input = [0u8; 72];
+        // The preimage carries the root: scrubbed on drop rather than
+        // lingering on the stack past the derivation.
+        let mut input = Zeroizing::new([0u8; 72]);
         input[..32].copy_from_slice(drive.as_bytes());
         input[32..40].copy_from_slice(&epoch.to_le_bytes());
         input[40..].copy_from_slice(&self.0);
-        blake3::derive_key(ESCROW_KEY_CONTEXT, &input)
+        blake3::derive_key(ESCROW_KEY_CONTEXT, &input[..])
     }
 }
 

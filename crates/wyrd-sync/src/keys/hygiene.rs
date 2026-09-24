@@ -1,10 +1,27 @@
 //! Secret-lifetime and memory-hygiene regression locks.
 //!
-//! Inventory of every secret-holding type in `wyrd-sync` and its
-//! hygiene contract. Rust gives memory safety but no secret-lifetime
-//! guarantees, so each row below is pinned by a test in this module:
-//! removing a scrub derive or a redaction breaks the build's test
-//! gate, not just a code review.
+//! Inventory of the secret-holding types in `wyrd-sync` and their
+//! hygiene contracts. Rust gives memory safety but no secret-lifetime
+//! guarantees; the tests in this module pin what is mechanically
+//! pinnable, and the table records what still rests on review
+//! discipline. Two things this module explicitly does NOT lock (said
+//! plainly so the table is never read as a proof):
+//!
+//! - Future secret types. The assertions below name today's leaves; a
+//!   sixth secret type, or a new `Debug`/`Clone`/serde impl on an
+//!   existing one, is caught by review, not by these tests. A new leaf
+//!   must add its row and its tests together.
+//! - `serde`. `wyrd-sync` has no serde dependency, so no
+//!   `Serialize`/`Deserialize` impl on a secret type can exist today —
+//!   but nothing here fails if that dependency is added. Adding serde
+//!   to the crate must come with per-type opt-outs reviewed here.
+//!
+//! `StoreKey` (durable) is scrubbed and intentionally `Debug`-less, but
+//! it is private to its module and cannot be named here; its contract
+//! lives in `durable/store.rs` ("No `Debug`: the store key must never
+//! be printable"). The `wyrd-core` mailbox signer boundary
+//! (`LiveMailbox`'s upstream `Keys`) and CLI credential handling are
+//! outside this module's scope and need their own pass.
 //!
 //! | Type | Holds | Scrub on drop | `Debug` | `Clone` | Notes |
 //! |---|---|---|---|---|---|
@@ -25,11 +42,10 @@
 //!   its test together.
 //! - A derived `Debug` on a struct holding secrets is allowed only while
 //!   every secret leaf it can reach stays redacted — the composition
-//!   tests pin that.
-//! - `serde` is not a dependency of `wyrd-sync`: no `Serialize`/`Deserialize`
-//!   impl on a secret type can exist. Adding serde to the crate's
-//!   dependencies must come with per-type opt-outs reviewed here.
-//! - Error variants carry ids, counts, and contexts — never key material.
+//!   tests pin that for `Capability`, `DriveKeyring`, and
+//!   `AuthorizedCapability`.
+//! - Error variants carry ids, counts, and contexts — never key material
+//!   (review discipline; no exhaustive mechanism exists).
 //! - `Clone` on a secret needs a reason in the table above; anything else
 //!   is an unnecessary copy to remove.
 

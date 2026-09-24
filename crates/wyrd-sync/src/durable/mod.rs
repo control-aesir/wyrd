@@ -304,6 +304,15 @@ pub enum Fact {
     /// no-op instead of recording a route-update duplicate per attempt.
     /// First seal wins; the route rides the first send's `node_addr`.
     AnnouncementSealed(SnapshotId, Vec<u8>),
+    /// A route-specific reseal for one snapshot: when the live route
+    /// differs from the first seal's, the fresh seal (same statement,
+    /// live route, new signature) commits here keyed by its route, so
+    /// every retry under that route resends one exact durable envelope
+    /// instead of sealing afresh per attempt. First seal per
+    /// (snapshot, route) wins; the canonical first seal above is
+    /// untouched, and the receiver classifies the resend as a route
+    /// update whose retries dedupe collapses.
+    AnnouncementRouteSealed(SnapshotId, Vec<u8>, Vec<u8>),
     /// One queued obligation discharged: these exact bytes were handed
     /// to the mailbox for this recipient. Append-only like every fact —
     /// pending is derived as queued-minus-delivered, never by deletion.

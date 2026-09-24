@@ -70,6 +70,28 @@ impl Mailbox for RecordingMailbox<'_> {
     }
 }
 
+/// A mailbox that records every offered envelope then fails the send:
+/// retries stay pending, so tests prove successive resumes offer one
+/// identical durable envelope instead of sealing afresh per attempt.
+struct RecordingFailingMailbox {
+    recorded: Vec<MailboxEnvelope>,
+}
+
+impl Mailbox for RecordingFailingMailbox {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        self.recorded.push(envelope);
+        Err(MailboxError::Crypto)
+    }
+
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+        Ok(None)
+    }
+
+    fn settle(&mut self, _id: DeliveryId, _disposition: Disposition) -> Result<(), MailboxError> {
+        Ok(())
+    }
+}
+
 /// The other members of the author's membership, in send order:
 /// the pending set is deterministic, so tests name exactly which
 /// recipient a partial send discharged and which it left.
@@ -332,11 +354,13 @@ fn oversized_route_never_poisons_the_outbox() {
     assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
 }
 
-/// First seal wins across routes: an attempt that seals under one
-/// route but delivers nothing still owns the bytes, so a resume
-/// under a different route resends the original seal unchanged.
+/// A resume under a new route persists a route-specific reseal and
+/// resends it: the first seal stays canonical, but the wire carries
+/// the live route — resending the stale route would wedge the peer's
+/// fetch behind dial timeouts, and resealing per attempt would defeat
+/// the receiver's retry dedupe.
 #[test]
-fn retry_keeps_the_first_seal_despite_a_new_route() {
+fn route_resume_persists_and_resends_the_route_seal() {
     let (mut pair, _, _) = scenario();
     assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
     assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
@@ -365,8 +389,8 @@ fn retry_keeps_the_first_seal_despite_a_new_route() {
         .map(<[u8]>::to_vec)
         .expect("the first attempt seals");
 
-    // Resume under route B: both members are served the original
-    // seal, byte-identical.
+    // Resume under route B: both members are served the persisted
+    // route-B reseal, and the canonical first seal is untouched.
     let route_b = vec![0xB2; 32];
     let sent = {
         let mut mailbox = MemoryMailbox {
@@ -386,9 +410,135 @@ fn retry_keeps_the_first_seal_despite_a_new_route() {
             .unwrap()
             .announcement_sealed_bytes(&id),
         Some(sealed_a.as_slice()),
-        "the resume does not reseal under the new route"
+        "the first seal stays canonical across routes"
     );
+    let route_seal = pair
+        .a
+        .engine
+        .runtime_state()
+        .unwrap()
+        .announcement_route_sealed_bytes(&id, &route_b)
+        .map(<[u8]>::to_vec)
+        .expect("the resume persists the route-B reseal");
+    assert_ne!(
+        route_seal, sealed_a,
+        "the reseal carries the live route, not the first seal's"
+    );
+    assert!(
+        pair.a.engine.pending_announcements().unwrap().is_empty(),
+        "the route-B resend discharges the obligations"
+    );
+    // The route seal is a valid announcement at the receiver: B
+    // converges on the snapshot instead of rejecting the resend.
     assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
+    let state = pair.b.engine.runtime_state().unwrap();
+    assert!(state.announcement(&id).is_some());
+}
+
+/// Successive failed resumes under one route offer one identical
+/// durable envelope: the first resume seals and persists the route
+/// reseal, and every later resume — even after a restart — resends
+/// those exact bytes instead of sealing afresh per attempt.
+#[test]
+fn route_retry_reuses_one_durable_envelope_across_restart() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let id = authored.snapshot().snapshot_id();
+
+    // Seal under route A but deliver nothing.
+    let route_a = vec![0xA1; 32];
+    let mut mailbox = FailingMailbox {
+        sent: 0,
+        fail_after: 0,
+    };
+    assert!(pair
+        .a
+        .engine
+        .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+        .is_err());
+    let sealed_a = pair
+        .a
+        .engine
+        .runtime_state()
+        .unwrap()
+        .announcement_sealed_bytes(&id)
+        .map(<[u8]>::to_vec)
+        .expect("the first attempt seals");
+
+    // First resume under route B: seals the reseal, persists it, then
+    // the send fails — the obligation stays pending.
+    let route_b = vec![0xB2; 32];
+    let mut mailbox = RecordingFailingMailbox { recorded: vec![] };
+    assert!(matches!(
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice())),
+        Err(EngineError::Mailbox(_))
+    ));
+    assert_eq!(mailbox.recorded.len(), 1);
+    let reseal_b1 = pair
+        .a
+        .engine
+        .runtime_state()
+        .unwrap()
+        .announcement_route_sealed_bytes(&id, &route_b)
+        .map(<[u8]>::to_vec)
+        .expect("the failed resume still persists the route reseal");
+
+    // After a restart the resume reuses those exact bytes: the fact
+    // comparison proves durability, not an in-memory cache.
+    restart(&mut pair.a, &controls);
+    let mut mailbox = RecordingFailingMailbox { recorded: vec![] };
+    assert!(matches!(
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice())),
+        Err(EngineError::Mailbox(_))
+    ));
+    assert_eq!(mailbox.recorded.len(), 1);
+    let reseal_b2 = pair
+        .a
+        .engine
+        .runtime_state()
+        .unwrap()
+        .announcement_route_sealed_bytes(&id, &route_b)
+        .map(<[u8]>::to_vec)
+        .expect("the route reseal survives the restart");
+    assert_eq!(
+        reseal_b1, reseal_b2,
+        "successive resumes reuse one durable envelope"
+    );
+    assert_eq!(
+        pair.a
+            .engine
+            .runtime_state()
+            .unwrap()
+            .announcement_sealed_bytes(&id),
+        Some(sealed_a.as_slice()),
+        "the canonical first seal is untouched by route retries"
+    );
+
+    // A working relay then discharges the pending obligations with
+    // those bytes, and the receiver converges.
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 2);
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
+    let state = pair.b.engine.runtime_state().unwrap();
+    assert!(state.announcement(&id).is_some());
 }
 
 /// An orphaned queue entry — obligated but never authored — rebuilds

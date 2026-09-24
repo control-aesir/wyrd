@@ -1171,6 +1171,70 @@ fn announcement_outbox_round_trips_and_derives_pending() {
     );
 }
 
+/// Route-specific reseals round-trip keyed by (snapshot, route): the
+/// first seal per pair wins, pairs are independent, and the canonical
+/// seal is untouched by route seals.
+#[test]
+fn announcement_route_seals_round_trip_per_pair_first_wins() {
+    let dir = TestDir::new("route-outbox");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let snapshot = SnapshotId::from_bytes([0xA1; 32]);
+    let route_a = vec![0xA1; 32];
+    let route_b = vec![0xB2; 32];
+    let seal = |nonce: u8| {
+        SealedControl {
+            version: 0x00,
+            drive: drive(),
+            kind: ControlKind::SnapshotAnnouncement,
+            epoch: 2,
+            nonce: [nonce; 24],
+            ciphertext: vec![0xC2; 32],
+        }
+        .encode()
+    };
+    let sealed_a = seal(0xC1);
+    let rival_a = seal(0xD1);
+    let sealed_b = seal(0xE1);
+    store
+        .commit(&[
+            Fact::AnnouncementRouteSealed(snapshot, route_a.clone(), sealed_a.clone()),
+            // A rival seal for the same pair must not displace the first.
+            Fact::AnnouncementRouteSealed(snapshot, route_a.clone(), rival_a),
+            Fact::AnnouncementRouteSealed(snapshot, route_b.clone(), sealed_b.clone()),
+        ])
+        .unwrap();
+
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert_eq!(
+        rebuilt
+            .runtime
+            .announcement_route_sealed_bytes(&snapshot, &route_a),
+        Some(sealed_a.as_slice()),
+        "first seal per pair wins"
+    );
+    assert_eq!(
+        rebuilt
+            .runtime
+            .announcement_route_sealed_bytes(&snapshot, &route_b),
+        Some(sealed_b.as_slice()),
+        "pairs are independent"
+    );
+    assert!(
+        rebuilt
+            .runtime
+            .announcement_route_sealed_bytes(&snapshot, &[0xF0; 32])
+            .is_none(),
+        "unsealed routes stay absent"
+    );
+    assert!(
+        rebuilt
+            .runtime
+            .announcement_sealed_bytes(&snapshot)
+            .is_none(),
+        "route seals never populate the canonical seal"
+    );
+}
+
 /// A rotation-framed sealed fact commits when it names the
 /// obligation's epoch, and fails when it names another: the
 /// commit-time gate accepts either framing, with the recipient

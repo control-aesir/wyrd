@@ -315,7 +315,9 @@ A commit proceeds in this order, and the order is the contract:
 6. **Announcement discharge.** The recorded obligation is sent
    with retry through the durable outbox (`Engine::announce_snapshot`
    for one snapshot, `Engine::announce_pending` for the resume path:
-   per-recipient delivered markers, byte-identical sealed retries).
+   per-recipient delivered markers, byte-identical sealed retries per
+   route — the canonical seal when its route is live, else the
+   persisted route-specific reseal).
 
 **Objects prepared at 1; authoring prepared at 2; durable at 3 (with the
 announcement obligation recorded); visible at 4; servable at 5;
@@ -339,7 +341,8 @@ step 3, atomically with the commit**, not at step 6. Step 6 only
 announcement: if step 3 committed, the obligation is durable, and a
 restart reconciles un-discharged obligations back through the outbox
 (`Fact::AnnouncementQueued` / `AnnouncementSealed` /
-`AnnouncementDelivered`; pending derives as queued-minus-delivered).
+`AnnouncementRouteSealed` / `AnnouncementDelivered`; pending derives
+as queued-minus-delivered).
 The outbox entry is eligible for discharge only once serving readiness
 (step 5) has succeeded for that snapshot — eligibility is
 composer-ordered (announce after flush), not engine-gated.

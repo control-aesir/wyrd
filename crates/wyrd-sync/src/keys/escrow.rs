@@ -4,10 +4,12 @@
 //! The root is custody-only and epoch secrets are independent random, so
 //! recovering the root alone cannot decrypt history. The owner therefore
 //! wraps each freshly minted epoch secret under the epoch's root-derived
-//! escrow key as a per-epoch record: guardians reconstructing the root
-//! post-v0 unwrap the records and restore every historical epoch secret.
-//! This is escrow, not derivation: no root→epoch KDF exists anywhere
-//! (T4 stands); without the sealed records the root yields nothing.
+//! escrow key as a per-epoch record: the sidecars preserve every secret
+//! for the post-v0 guardian recovery, which installs the unwrapped
+//! secrets into a rebuilt keyring. v0 restore derives control keys only
+//! and does not restore historical encrypted content. This is escrow,
+//! not derivation: no root→epoch KDF exists anywhere (T4 stands);
+//! without the sealed records the root yields nothing.
 //!
 //! Record envelope (pinned: changing any byte changes every record):
 //!

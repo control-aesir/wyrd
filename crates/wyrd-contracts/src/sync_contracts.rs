@@ -2,7 +2,7 @@
 //! bounded bulk.
 
 use wyrd_core::budgets::ResourceBudgets;
-use wyrd_daemon::core::{LiveConfig, LiveError, RuntimeMaterialization, WyrdNode};
+use wyrd_daemon::core::{LiveConfig, RuntimeMaterialization, WyrdNode};
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
     membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT},
@@ -404,13 +404,14 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
 
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
-    let err = daemon.refresh_live_heads().unwrap_err();
-    assert!(
-        matches!(err, EngineError::Closure(_)),
-        "an unverifiable head fails the refresh at closure: {err:?}"
-    );
+    // B is pending (its closure is still fetching), not damaged: the
+    // refresh installs the verified head alone and leaves B for when
+    // its closure lands.
+    daemon
+        .refresh_live_heads()
+        .expect("a pending head is not a refresh failure");
 
-    // Installed heads untouched: A still serves, B never mounts.
+    // Installed heads: A serves, B never mounts.
     let node = daemon.view().lookup("keeper.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();
     assert_eq!(daemon.view().read(&file, 0, 6).unwrap(), b"keeper");
@@ -420,11 +421,11 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
     loaded.rig.teardown();
 }
 
-/// The live sync pass enforces the same all-or-nothing rule as the direct
-/// refresh: with two eligible heads where one fails closure, `sync_once`
-/// errors and the previously published generation keeps serving. This is
-/// the production mount path (`into_live` + `sync_once`, the composer
-/// startup sequence in `main.rs`), not just the direct
+/// The live sync pass applies the same rule as the direct refresh: a
+/// pending (still-fetching) head never projects — the verified head
+/// publishes alone — and a damaged closure still fails the pass. This
+/// is the production mount path (`into_live` + `sync_once`, the
+/// composer startup sequence in `main.rs`), not just the direct
 /// `WyrdNode::refresh_live_heads` API.
 #[test]
 fn live_sync_pass_never_projects_mixed_validity_heads() {
@@ -490,24 +491,23 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
         None,
     );
 
-    let err = match live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk)) {
-        // SyncReport carries no Debug; match instead of unwrap_err.
-        Ok(_) => panic!("a mixed-validity head set must fail the live pass"),
-        Err(err) => err,
-    };
-    assert!(
-        matches!(err, LiveError::Engine(EngineError::Closure(_))),
-        "an unverifiable head fails the live pass at closure: {err:?}"
-    );
-
-    // No new generation publishes: the old one keeps serving A, and B
-    // never mounts.
-    assert_eq!(live.generation(), 0, "a failed pass publishes nothing");
+    // B is pending, not damaged: its closure is still fetching, so
+    // the pass publishes the verified subset — A alone. The
+    // projection never mixes validity classes, and a pending head
+    // spends no engine-error budget.
+    let report = live
+        .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+        .expect("a pending head is not a pass failure");
+    assert!(report.published, "the verified head publishes");
+    assert_eq!(live.generation(), 1, "one new generation, A only");
     let handle = backend
         .open_at("keeper.txt")
-        .expect("old generation serves");
+        .expect("the published generation serves A");
     assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
-    assert!(backend.open_at("second.txt").is_err());
+    assert!(
+        backend.open_at("second.txt").is_err(),
+        "the pending head never mounts"
+    );
 
     drop(live);
     drop(backend);

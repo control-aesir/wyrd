@@ -733,6 +733,9 @@ main() {
   # mistake, not "all steps": without this it would run zero checks
   # and pass. An absent variable (the wrapper omits it) means all.
   if [[ -n "$only" ]]; then
+    # The grammar is a comma list; whitespace is not a separator.
+    [[ "$only" != *[[:space:]]* ]] \
+      || die "--step: '$only' is not a comma list (got whitespace)"
     [[ "$max_step" -gt 0 ]] \
       || die "--step: '$only' names no step (expected a comma list of 1-6)"
     [[ ",$only," != *,,* ]] \

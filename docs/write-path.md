@@ -369,6 +369,13 @@ before discharging announcements), not engine-gated: a failed barrier
 skips the discharge and the next pass retries, so a sick mirror stalls
 propagation, never the mount.
 
+A head whose closure is still fetching is neither a success nor a
+failure: the head installs once its records and trees land, the
+previous generation keeps serving until then, and the pass does not
+spend the fatal engine-error budget. Only a *damaged* closure (an
+identity mismatch, a non-canonical document, a contradicted mapping)
+fails the pass closed.
+
 Failure at each stage, explicitly:
 
 - **Before 3 (no durable commit):** no snapshot exists; nothing is

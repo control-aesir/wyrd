@@ -381,25 +381,36 @@ pub struct LiveParts<V: NamespaceView> {
 /// sync pass: every eligible head must verify, or the caller installs
 /// nothing. Returns the heads unchanged for installation; any failure
 /// surfaces the closure error before any publication happens, so the two
-/// production paths cannot diverge on partial head sets again.
-pub(super) fn verified_heads<S>(
+/// Partition the eligible heads by local closure state: heads whose
+/// closure verifies are publishable, heads whose closure is merely
+/// incomplete (records or trees the fetch has not landed yet) are
+/// pending, and a damaged closure fails the pass. Pending heads are
+/// not damage and must never consume the fatal engine-error budget:
+/// they install once their closure lands.
+pub(crate) fn partition_heads<S>(
     runtime: &wyrd_sync::runtime::RuntimeState,
     heads: Vec<AuthorizedSnapshot>,
     store: &S,
-) -> Result<Vec<AuthorizedSnapshot>, wyrd_sync::closure::ClosureError>
+) -> Result<(Vec<AuthorizedSnapshot>, usize), EngineError>
 where
     S: ObjectStore,
     S::Error: std::fmt::Debug,
 {
-    for head in &heads {
-        wyrd_sync::closure::verify_head_closure(
+    let mut publishable = Vec::with_capacity(heads.len());
+    let mut pending = 0usize;
+    for head in heads {
+        match wyrd_sync::closure::verify_head_closure(
             runtime,
             head.snapshot(),
             store,
             &wyrd_sync::ingest::Limits::V0,
-        )?;
+        ) {
+            Ok(()) => publishable.push(head),
+            Err(error) if error.is_pending() => pending += 1,
+            Err(error) => return Err(EngineError::Closure(error)),
+        }
     }
-    Ok(heads)
+    Ok((publishable, pending))
 }
 
 impl<V> LiveNode<V>
@@ -801,10 +812,28 @@ where
         // nothing new publishes — a damaged head fails the pass and the
         // previous generation keeps serving (see `verified_heads`).
         let heads = self.engine.live_heads()?;
-        let heads = {
+        let (heads, pending_heads) = {
             let store = self.store.read().map_err(|_| LiveError::Lock)?;
-            verified_heads(&completed_runtime, heads, &*store).map_err(EngineError::Closure)?
+            partition_heads(&completed_runtime, heads, &*store)?
         };
+        if heads.is_empty() && pending_heads > 0 {
+            // Every eligible head is still mid-fetch: keep the current
+            // generation serving and try again next pass. This is
+            // ordinary progress, not a failure — a committed mutation
+            // always authors a verified head, so no recorded reply
+            // waits on this publication.
+            batch.finish();
+            tracing::debug!(
+                pending_heads,
+                "publication deferred: closure still fetching"
+            );
+            return Ok(SyncReport {
+                drained,
+                fetched,
+                published: false,
+                generation,
+            });
+        }
         let installed_heads = heads.len();
         let next = Projection::new(
             Arc::clone(&self.store),
@@ -1349,14 +1378,14 @@ where
             Node::File { size, .. } => size,
             _ => return Err(MutationError::IsDirectory(path.to_string())),
         };
-        // Fast demand pre-check: stat every chunk before reading. A
-        // deferred retry over a partially-fetched large file would
-        // otherwise re-read and re-hash the whole served prefix every
-        // pass — minutes of store I/O inside the loop, which starves
-        // every other mutation and the deadline checks behind it. The
-        // honest read (with per-chunk verification) still runs when
-        // the file is fully present, so bitrot fails closed exactly
-        // as before.
+        // Fast demand pre-check: probe the chunks of the requested
+        // prefix before reading. A deferred retry over a
+        // partially-fetched large file would otherwise re-read and
+        // re-hash the whole served prefix every pass — minutes of
+        // store I/O inside the loop, which starves every other
+        // mutation and the deadline checks behind it. The honest read
+        // (with per-chunk verification) still runs when the file is
+        // fully present, so bitrot fails closed exactly as before.
         let len = size.min(max_len);
         {
             // Probe only the chunks the requested prefix overlaps: a
@@ -1996,6 +2025,80 @@ mod prereq_tests {
             )
             .unwrap_err();
         assert_eq!(error, MutationError::Store(StoreFailure::Transient));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A mailbox that accepts and delivers nothing: the run-loop
+    /// regression below never exercises intake.
+    struct NoopMailbox;
+
+    impl wyrd_sync::transport::mailbox::Mailbox for NoopMailbox {
+        fn send(
+            &mut self,
+            _envelope: wyrd_sync::transport::mailbox::MailboxEnvelope,
+        ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(())
+        }
+
+        fn recv(
+            &mut self,
+        ) -> Result<
+            Option<wyrd_sync::transport::mailbox::Delivery>,
+            wyrd_sync::transport::mailbox::MailboxError,
+        > {
+            Ok(None)
+        }
+
+        fn settle(
+            &mut self,
+            _id: wyrd_sync::transport::mailbox::DeliveryId,
+            _disposition: wyrd_sync::transport::mailbox::Disposition,
+        ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(())
+        }
+    }
+
+    /// An incomplete closure never spends the fatal engine-error
+    /// budget: the drive is authored into one store and served from
+    /// an empty one, so every pass finds the head's closure unfetched
+    /// — for more consecutive passes than the loop's configured cap —
+    /// and the loop still shuts down cleanly. A damaged closure would
+    /// end the run at the cap; ordinary fetch progress must not.
+    #[test]
+    fn an_incomplete_head_never_burns_the_engine_error_cap() {
+        let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("incomplete");
+        // Serve from an empty store: the head's tree and chunk are
+        // absent, so its closure is pending, not damaged.
+        let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let cap = 3u32;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let config = LiveConfig {
+            interval: Duration::from_millis(5),
+            max_consecutive_errors: cap,
+            ..LiveConfig::default()
+        };
+        let outcome = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let mut mailbox = NoopMailbox;
+                node.run_loop(
+                    &mut mailbox,
+                    None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+                    &stop,
+                    &config,
+                    &mut |_, _| {},
+                )
+            });
+            // Long enough for the cap-plus-one passes at this cadence.
+            std::thread::sleep(Duration::from_millis(300));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            handle.join().unwrap()
+        });
+        let summary = outcome.expect("the loop must not die on pending closure");
+        assert!(
+            summary.passes > u64::from(cap),
+            "the loop must keep passing an incomplete closure past the cap, saw {}",
+            summary.passes
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

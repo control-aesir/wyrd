@@ -70,7 +70,15 @@ pub(crate) enum MirrorItem {
     /// A drain barrier: the sender receives readiness once every earlier
     /// import has been handled — `Ok` when all landed, `Err` naming the
     /// first import failure (sticky until restart, see [`drain_mirror`]).
-    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
+    Flush(
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+        /// The caller's in-flight permit: cleared by the worker when
+        /// the barrier is actually handled, never by the caller's
+        /// timeout — a timed-out barrier still sits in the queue, and
+        /// a permit released early would let the next pass queue
+        /// another one behind it.
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+    ),
 }
 
 /// A cloneable readiness handle for a serving endpoint: the channel
@@ -127,7 +135,7 @@ impl ServingHandle {
         }
         let release = Arc::clone(&self.barrier_in_flight);
         let (ack, wait) = tokio::sync::oneshot::channel();
-        if let Err(error) = self.send(MirrorItem::Flush(ack)) {
+        if let Err(error) = self.send(MirrorItem::Flush(ack, Some(Arc::clone(&release)))) {
             release.store(false, Ordering::SeqCst);
             return Err(error);
         }
@@ -135,20 +143,24 @@ impl ServingHandle {
         // `Handle::block_on` drives no timer, so the deadline would
         // panic instead of firing.
         let waiter = self.runtime.spawn(async move {
-            let outcome = match tokio::time::timeout(budget, wait).await {
+            // On timeout the barrier is still queued: the permit stays
+            // held until the worker handles it (the drain clears it),
+            // so coalescing reflects actual queue consumption.
+            match tokio::time::timeout(budget, wait).await {
                 Ok(Ok(Ok(()))) => Ok(true),
                 Ok(Ok(Err(message))) => Err(std::io::Error::other(format!(
                     "serving mirror import failed: {message}"
                 ))),
                 Ok(Err(_)) => Err(std::io::Error::other("serving mirror drain stopped")),
                 Err(_) => Ok(false),
-            };
-            release.store(false, Ordering::SeqCst);
-            outcome
+            }
         });
-        self.runtime
-            .block_on(waiter)
-            .map_err(|_| std::io::Error::other("serving barrier task lost"))?
+        self.runtime.block_on(waiter).map_err(|_| {
+            // The task itself was lost (runtime gone): nothing will
+            // clear the permit, so release it here.
+            release.store(false, Ordering::SeqCst);
+            std::io::Error::other("serving barrier task lost")
+        })?
     }
 
     fn send(&self, item: MirrorItem) -> std::io::Result<()> {
@@ -396,11 +408,14 @@ async fn drain_mirror<F, Fut>(
                     failure.get_or_insert(error);
                 }
             }
-            MirrorItem::Flush(ack) => {
+            MirrorItem::Flush(ack, permit) => {
                 let _ = ack.send(match &failure {
                     Some(error) => Err(error.clone()),
                     None => Ok(()),
                 });
+                if let Some(permit) = permit {
+                    permit.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         }
     }
@@ -963,7 +978,7 @@ mod tests {
         }));
         sender.send(MirrorItem::Import(vec![1, 2, 3])).unwrap();
         let (ack, wait) = tokio::sync::oneshot::channel();
-        sender.send(MirrorItem::Flush(ack)).unwrap();
+        sender.send(MirrorItem::Flush(ack, None)).unwrap();
         assert!(
             wait.await.unwrap().is_err(),
             "flush must not claim readiness"
@@ -972,7 +987,7 @@ mod tests {
         // so the representation is never re-queued until a restart
         // rebuilds the mirror.
         let (ack, wait) = tokio::sync::oneshot::channel();
-        sender.send(MirrorItem::Flush(ack)).unwrap();
+        sender.send(MirrorItem::Flush(ack, None)).unwrap();
         assert!(wait.await.unwrap().is_err());
         drop(sender);
         worker.await.unwrap();

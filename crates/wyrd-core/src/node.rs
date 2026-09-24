@@ -11,7 +11,7 @@
 //! compose a concrete view, build backends from the split parts, and
 //! map errors at their own boundary.
 
-use crate::live::{verified_heads, LiveConfig, LiveNode, LiveParts};
+use crate::live::{partition_heads, LiveConfig, LiveNode, LiveParts};
 use crate::view::{Head, NamespaceView, RuntimeMaterialization};
 use wyrd_format::{chunk, ContentId, Entry, ObjectStore, Tree};
 use wyrd_sync::durable::AuthorizedSnapshot;
@@ -139,12 +139,15 @@ where
     pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
         let runtime = self.engine.runtime_state()?;
         let heads = self.engine.live_heads()?;
-        let heads = {
+        // Pending heads (closure still fetching) simply do not install
+        // yet — the live loop's publication gate retries; a damaged
+        // closure still fails closed here.
+        let (heads, _pending) = {
             let store = self
                 .view
                 .store_read()
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
-            verified_heads(&runtime, heads, &*store)?
+            partition_heads(&runtime, heads, &*store)?
         };
         NamespaceView::set_heads(&mut self.view, heads.into_iter().map(Head::new).collect());
         Ok(())

@@ -120,6 +120,24 @@ pub enum ClosureError {
     ObjectStore(String),
 }
 
+impl ClosureError {
+    /// Whether this failure means "the closure has not been fetched
+    /// yet" rather than "the closure is wrong". The pending arm is
+    /// ordinary fetch progress: the head installs once its records
+    /// and trees land, and callers must treat it as no-publication
+    /// state, never as a fatal engine error. Every other variant is
+    /// permanent damage — a mismatch, a non-canonical document, a
+    /// contradicted mapping — and stays fail-closed.
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            ClosureError::RootManifestMissing(_)
+                | ClosureError::TreeUnavailable(_)
+                | ClosureError::MissingChildManifestRecord { .. }
+        )
+    }
+}
+
 /// Resolves a manifest by its logical [`ContentId`].
 ///
 /// Implemented for a plain `BTreeMap<ContentId, Manifest>` (authoring builds

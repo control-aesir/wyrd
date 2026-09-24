@@ -1021,7 +1021,12 @@ where
         match view.lookup(path) {
             Ok(node) => Ok(Some(node)),
             Err(ViewError::NotFound) => Ok(None),
-            Err(_) => Err(MutationError::Engine),
+            Err(error) => {
+                // The boundary reports `EIO` for every view failure
+                // mode; keep the variant for forensics.
+                tracing::debug!(path, error = ?error, "mutation path lookup refused");
+                Err(MutationError::Engine)
+            }
         }
     }
 

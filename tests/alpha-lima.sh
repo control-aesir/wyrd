@@ -640,30 +640,61 @@ EOF
     || die "member never converged after the owner's re-announcement"
   pass "re-announcement recovers the route after owner restart"
 
+  stop_mount owner-restarted INT
+  stop_mount member-relay TERM
+  pass "peer-down pair stopped"
+
   # --- conflict siblings: divergent heads export as name@N ---------
+  # A fresh pair: the peer-down member can no longer author (its head
+  # references chunks the dead owner never delivered, and every
+  # mutation defers on that incomplete closure — correct and bounded,
+  # but not a writable drive). The conflict fixture needs writable
+  # heads, so it admits its own member on its own drive.
+  local odc="$DRIVES/owner-conflict" occ="$CREDS/owner-conflict"
+  local ndc="$DRIVES/member-conflict" ncc="$CREDS/member-conflict"
+  mkdir -p "$occ" "$ncc"
+  gen_identity "$occ/identity"; gen_passphrase "$occ/passphrase"
+  gen_identity "$ncc/identity"; gen_passphrase "$ncc/passphrase"
+  expect_exit 0 step6-conflict-init with_creds "$occ" init "$odc" >/dev/null
+  expect_exit 0 step6-conflict-pairing \
+    with_creds "$ncc" device "$ndc" pairing-request "$E2E_ROOT/pairing-c.txt" >/dev/null
+  local devc keyc
+  devc="$(awk '/^device /{print $2}' "$E2E_ROOT/pairing-c.txt")"
+  keyc="$(awk '/^encryption-key /{print $2}' "$E2E_ROOT/pairing-c.txt")"
+  expect_exit 0 step6-conflict-invite \
+    with_creds "$occ" member "$odc" invite "$devc" "$keyc" "$E2E_ROOT/invitation-c" >/dev/null
+  expect_exit 0 step6-conflict-join \
+    with_creds "$ncc" device "$ndc" join "$E2E_ROOT/invitation-c" >/dev/null
+  start_mount owner-conflict "$occ" "$odc" "$MNTS/owner-conflict" --relay "$relay"
+  start_mount member-conflict "$ncc" "$ndc" "$MNTS/member-conflict" --relay "$relay"
+  # A shared head first: divergence is two heads off one parent, not
+  # a catch-up race.
+  echo "shared" > "$MNTS/owner-conflict/shared-c.txt"
+  poll_until 90 converged "$MNTS/member-conflict/shared-c.txt" "shared" \
+    || die "conflict pair never converged before diverging"
   # Deterministic divergence: with the relay down both sides author
   # their own version of one path (announcements queue, sends fail
   # softly), then the relay returns and both heads meet. The mounts
-  # survive the outage — that is the dead-relay posture step 2 pins.
+  # survive the outage — the dead-relay posture step 2 pins.
   kill "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
   wait "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
   sleep 1
-  echo "owner-side" > "$MNTS/owner-restarted/conflict.txt"
-  echo "member-side" > "$MNTS/member-relay/conflict.txt"
-  start_relay -restarted
-  poll_until 90 test -d "$MNTS/owner-restarted/conflict.txt" \
+  echo "owner-side" > "$MNTS/owner-conflict/conflict.txt"
+  echo "member-side" > "$MNTS/member-conflict/conflict.txt"
+  start_relay -conflict
+  poll_until 90 test -d "$MNTS/owner-conflict/conflict.txt" \
     || die "the owner never resolved the divergent head into a conflict"
-  poll_until 90 test -d "$MNTS/member-relay/conflict.txt" \
+  poll_until 90 test -d "$MNTS/member-conflict/conflict.txt" \
     || die "the member never resolved the divergent head into a conflict"
   pass "concurrent writes meet as a visible conflict on both mounts"
 
   # Offline export materializes both versions as name@N siblings in
   # SnapshotId byte order, never a silent winner: the issue's
   # conflict-sibling contract, end to end.
-  stop_mount owner-restarted INT
-  stop_mount member-relay TERM
+  stop_mount owner-conflict INT
+  stop_mount member-conflict TERM
   expect_exit 0 step6-conflict-export \
-    with_creds "$oc" export "$od" "$E2E_ROOT/conflict-export" >/dev/null
+    with_creds "$occ" export "$odc" "$E2E_ROOT/conflict-export" >/dev/null
   [[ -f "$E2E_ROOT/conflict-export/conflict.txt@1" \
      && -f "$E2E_ROOT/conflict-export/conflict.txt@2" ]] \
     || die "the conflict export did not materialize name@N siblings"
@@ -681,10 +712,13 @@ EOF
   for f in "$LOGDIR"/step6-*.stderr "$LOGDIR"/mount-owner-relay.err \
           "$LOGDIR"/mount-owner-restarted.err \
           "$LOGDIR"/mount-member-relay.err "$LOGDIR"/relay.out "$LOGDIR"/relay.err \
-          "$LOGDIR"/relay-restarted.out "$LOGDIR"/relay-restarted.err; do
+          "$LOGDIR"/relay-conflict.out "$LOGDIR"/relay-conflict.err \
+          "$LOGDIR"/mount-owner-conflict.err "$LOGDIR"/mount-member-conflict.err; do
     [[ -f "$f" ]] || continue
     check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")" \
-      "$(cat "$nc/identity")" "$(cat "$nc/passphrase")"
+      "$(cat "$nc/identity")" "$(cat "$nc/passphrase")" \
+      "$(cat "$occ/identity")" "$(cat "$occ/passphrase")" \
+      "$(cat "$ncc/identity")" "$(cat "$ncc/passphrase")"
   done
 }
 main() {

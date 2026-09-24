@@ -687,9 +687,7 @@ where
                 };
                 let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::CreateFile { path } => {
@@ -717,9 +715,7 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Created(FileIdentity::new(
                     0,
                     false,
@@ -762,9 +758,7 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     content.len() as u64,
                     *executable,
@@ -811,9 +805,7 @@ where
                 if root == tree {
                     return Ok(MutationOutcome::Done);
                 }
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     image.len() as u64,
                     executable,
@@ -833,9 +825,7 @@ where
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rmdir { path } => {
@@ -844,9 +834,7 @@ where
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rename {
@@ -866,9 +854,7 @@ where
                     // Same-path rename is a no-op: no snapshot.
                     return Ok(MutationOutcome::Done);
                 }
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::SetAttrs {
@@ -930,12 +916,31 @@ where
                 if root == tree {
                     return Ok(MutationOutcome::Done);
                 }
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root)?;
                 Ok(MutationOutcome::Done)
             }
         }
+    }
+
+    /// Author one snapshot over a mutated root, tracing the engine
+    /// refusal: authoring collapses every failure to opaque `Engine`
+    /// at the boundary, and the variant tells a missing epoch key
+    /// from a failed closure self-check or a refused commit. A free
+    /// function (not a method) so callers holding the store guard can
+    /// still split-borrow the engine.
+    fn author_traced<S>(
+        engine: &mut Engine,
+        store: &S,
+        root: ContentId,
+    ) -> Result<AuthorizedSnapshot, MutationError>
+    where
+        S: ObjectStore,
+        S::Error: std::fmt::Debug,
+    {
+        engine.author_snapshot(store, root).map_err(|error| {
+            tracing::debug!(error = ?error, "mutation authoring refused");
+            MutationError::Engine
+        })
     }
 
     /// The single live head's tree, or a conflict. A headless drive has

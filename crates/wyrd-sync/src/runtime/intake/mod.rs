@@ -578,18 +578,27 @@ fn rotation_commit(
     sender: DeviceId,
     delivery: &RotationDelivery,
 ) -> Result<Outcome, EngineError> {
-    let suppress = |engine: &mut Engine| {
+    let suppress = |engine: &mut Engine, reason: &'static str| {
+        // Suppressions ack without a fact, so the reason is the only
+        // record of why a delivery died: without it a stuck peer's
+        // Accepted verdicts are indistinguishable from commits.
+        tracing::debug!(
+            kind = "rotation-delivery",
+            outcome = "suppressed",
+            reason,
+            "intake verdict"
+        );
         engine.inbox.suppress(id);
         Ok(Outcome::Accepted)
     };
     // Not for us: the mailbox routes by recipient, so a mismatch is a
     // broken sender — terminal, never healed by redelivery.
     if delivery.device != engine.device {
-        return suppress(engine);
+        return suppress(engine, "delivery-device-mismatch");
     }
     let transition = match MembershipTransition::from_canonical_bytes(&delivery.transition) {
         Ok(transition) => transition,
-        Err(_) => return suppress(engine),
+        Err(_) => return suppress(engine, "transition-decode-failed"),
     };
     // Cheap structural gates before the ECDH+AEAD unwrap: the carried
     // transition must arrive within ingest limits and name the
@@ -597,17 +606,20 @@ fn rotation_commit(
     // they never earn the unwrap — same terminal verdict, less work.
     // (The transition↔capability binding check stays after the
     // unwrap: the binding lives inside the wrap.)
-    if transition.epoch != delivery.epoch
-        || check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err()
-        || check_transition(&Limits::V0, &transition).is_err()
-    {
-        return suppress(engine);
+    if transition.epoch != delivery.epoch {
+        return suppress(engine, "delivery-epoch-mismatch");
+    }
+    if check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err() {
+        return suppress(engine, "transition-over-limits");
+    }
+    if check_transition(&Limits::V0, &transition).is_err() {
+        return suppress(engine, "transition-struct-rejected");
     }
     let capability = match WrappedCapability::from_bytes(delivery.wrapped.clone())
         .unwrap(&engine.encryption_secret)
     {
         Ok(capability) => capability,
-        Err(_) => return suppress(engine),
+        Err(_) => return suppress(engine, "capability-unwrap-failed"),
     };
     // Redundant-field agreement, mirrored from the capability arm: the
     // delivery metadata and the capability it carries must name this
@@ -615,13 +627,13 @@ fn rotation_commit(
     // alone cannot prove address — the check happens here, before
     // anything commits, and a mismatch never heals by deferring.
     if capability.device != engine.device || delivery.epoch != capability.covered_epoch() {
-        return suppress(engine);
+        return suppress(engine, "field-disagreement");
     }
     // The carried transition must be the capability's own binding —
     // a transition for another binding paired with this wrap is
     // tampering or a broken sender, never a gap that fills.
     if transition.transition_id() != capability.transition {
-        return suppress(engine);
+        return suppress(engine, "binding-mismatch");
     }
     let transition_id = transition.transition_id();
     // Authorize against a scratch observation: the live log stays
@@ -645,7 +657,7 @@ fn rotation_commit(
                 engine.inbox.forget(id);
                 return Ok(Outcome::Skipped);
             }
-            Err(_) => return suppress(engine),
+            Err(_) => return suppress(engine, "capability-unauthorized"),
         };
     // Sender-member, against the authorizing state (not the tip): the
     // delivery is authorized only from a member of the epoch it grants.
@@ -654,7 +666,7 @@ fn rotation_commit(
     // terminal state, so genuine senders always pass.
     match scratch.members_of(&transition_id) {
         Some(members) if members.contains(&sender) => {}
-        Some(_) => return suppress(engine),
+        Some(_) => return suppress(engine, "sender-not-member"),
         // Observed a moment ago, but the fresh analysis derives no
         // state for it: the same internal disagreement the
         // announcement arm fails loudly on, not sender data.

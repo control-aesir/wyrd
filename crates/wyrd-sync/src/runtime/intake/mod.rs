@@ -645,7 +645,7 @@ fn rotation_commit(
     // proof over a commitment to the unwrapped vector closes that, and
     // the signer must be an owner of this exact transition.
     let Some(proof) = crate::keys::owner_proof::OwnerProof::decode(&delivery.owner_proof) else {
-        return suppress(engine);
+        return suppress(engine, "delivery-owner-proof-undecodable");
     };
     if proof
         .verify(
@@ -657,7 +657,7 @@ fn rotation_commit(
         )
         .is_err()
     {
-        return suppress(engine);
+        return suppress(engine, "delivery-owner-proof-invalid");
     }
     // Authorize against a scratch observation: the live log stays
     // pristine until commit, so a skip leaves no volatile-only
@@ -698,7 +698,7 @@ fn rotation_commit(
     match mint_authority {
         Some(owners) if owners.contains(&proof.signer) => {}
         // Signed, but by a device without mint authority.
-        Some(_) => return suppress(engine),
+        Some(_) => return suppress(engine, "delivery-mint-authority-missing"),
         None => return Err(EngineError::TransitionUnclassified(transition_id)),
     }
     // Sender-member, against the authorizing state (not the tip): the

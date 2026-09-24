@@ -970,6 +970,82 @@ mod tests {
         }
     }
 
+    /// The queued-barrier lifetime, end to end: a barrier that times
+    /// out is still in the queue, so a second caller must coalesce
+    /// onto it (never enqueue its own) and only a worker-handled
+    /// barrier frees the permit for the next one.
+    #[test]
+    fn a_timed_out_barrier_stays_queued_until_the_worker_handles_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let import_release = Arc::clone(&release);
+        let worker = runtime.spawn(drain_mirror(receiver, move |_bytes| {
+            let import_release = Arc::clone(&import_release);
+            async move {
+                while !import_release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Ok(())
+            }
+        }));
+        let handle = ServingHandle {
+            runtime: runtime.handle().clone(),
+            sender: sender.clone(),
+            barrier_in_flight: Arc::new(AtomicBool::new(false)),
+        };
+
+        // A blocked import: the first barrier times out but stays
+        // queued behind the import.
+        sender.send(MirrorItem::Import(vec![7])).unwrap();
+        let start = Instant::now();
+        assert!(
+            !handle.flush_bounded(Duration::from_millis(30)).unwrap(),
+            "a barrier behind a blocked import reports not-ready"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(25), "it waited");
+
+        // Coalesced: the queued barrier holds the permit, so the
+        // second caller returns immediately without enqueueing.
+        let start = Instant::now();
+        assert!(
+            !handle.flush_bounded(Duration::from_secs(30)).unwrap(),
+            "the second caller coalesces onto the queued barrier"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "coalescing returns without waiting"
+        );
+
+        // The worker handles the queued barriers once the import
+        // lands; only then does a fresh barrier succeed. Until the
+        // worker gets there, callers keep coalescing.
+        release.store(true, Ordering::SeqCst);
+        let mut ready = false;
+        for _ in 0..200 {
+            if handle.flush_bounded(Duration::from_millis(200)).unwrap() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready,
+            "a fresh barrier succeeds once the worker handled the queued ones"
+        );
+        drop(handle);
+        drop(sender);
+        runtime.block_on(worker).unwrap();
+    }
+
     #[tokio::test]
     async fn mirror_flush_reports_the_first_import_failure() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();

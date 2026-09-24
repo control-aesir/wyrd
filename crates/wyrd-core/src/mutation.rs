@@ -1028,6 +1028,10 @@ mod tests {
                 },
             },
             reply: Arc::new(Reply::default()),
+            base: None,
+            first_deferred: None,
+            submitted: Instant::now(),
+            wanted: Vec::new(),
         };
         let rendered = format!("{queued:?}");
         assert!(

@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use wyrd_format::{
     ChildManifest, ContentId, EntryContent, Manifest, ManifestEntry, ObjectKind, ObjectStore,
-    Snapshot, SnapshotId, Tree,
+    Snapshot, SnapshotId, StoreError, StoreFailure, Tree,
 };
 
 use crate::ingest::{check_manifest, check_tree, IngestError, Limits};
@@ -116,8 +116,14 @@ pub enum ClosureError {
     },
     #[error(transparent)]
     Ingest(#[from] IngestError),
-    #[error("object store read failed: {0}")]
-    ObjectStore(String),
+    #[error("object store read failed: {detail}")]
+    ObjectStore {
+        /// The store's own classification: a full or unwritable
+        /// store is not closure damage, and the failure policy has a
+        /// dedicated budget for it.
+        failure: StoreFailure,
+        detail: String,
+    },
 }
 
 impl ClosureError {
@@ -263,7 +269,10 @@ where
     while let Some((tree_id, manifest)) = stack.pop() {
         let bytes = objects
             .get(&tree_id)
-            .map_err(|error| ClosureError::ObjectStore(format!("{error:?}")))?
+            .map_err(|error| ClosureError::ObjectStore {
+                failure: error.failure(),
+                detail: format!("{error:?}"),
+            })?
             .ok_or(ClosureError::TreeUnavailable(tree_id))?;
         if ContentId::derive(ObjectKind::Tree, &bytes) != tree_id {
             return Err(ClosureError::TreeIdentityMismatch(tree_id));

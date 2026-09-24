@@ -10,6 +10,7 @@ use wyrd_format::{
     chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, SnapshotId, StoreError,
     StoreFailure, Tree,
 };
+use wyrd_sync::closure::ClosureError;
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{
@@ -377,16 +378,15 @@ pub struct LiveParts<V: NamespaceView> {
     pub open_timeout: Duration,
 }
 
-/// All-or-nothing closure gate shared by the direct refresh and the live
-/// sync pass: every eligible head must verify, or the caller installs
-/// nothing. Returns the heads unchanged for installation; any failure
-/// surfaces the closure error before any publication happens, so the two
-/// Partition the eligible heads by local closure state: heads whose
-/// closure verifies are publishable, heads whose closure is merely
-/// incomplete (records or trees the fetch has not landed yet) are
-/// pending, and a damaged closure fails the pass. Pending heads are
-/// not damage and must never consume the fatal engine-error budget:
-/// they install once their closure lands.
+/// The closure gate shared by the direct refresh and the live sync
+/// pass. The projection rule is per validity class, not all-or-
+/// nothing: verified heads install, pending heads wait for their
+/// closure, and only a damaged closure fails the caller outright
+/// (before any installation happens, so the last-known-good
+/// projection keeps serving). See
+/// `partition_heads` below. Pending heads are never damage and must
+/// not consume the fatal engine-error budget: they install once
+/// their closure lands.
 pub(crate) fn partition_heads<S>(
     runtime: &wyrd_sync::runtime::RuntimeState,
     heads: Vec<AuthorizedSnapshot>,
@@ -407,6 +407,13 @@ where
         ) {
             Ok(()) => publishable.push(head),
             Err(error) if error.is_pending() => pending += 1,
+            // A store that cannot be read is not closure damage: it
+            // carries the store's own classification so the failure
+            // policy spends the store budget, not the fatal engine
+            // one.
+            Err(ClosureError::ObjectStore { failure, .. }) => {
+                return Err(EngineError::Store(failure))
+            }
             Err(error) => return Err(EngineError::Closure(error)),
         }
     }
@@ -808,9 +815,10 @@ where
                 generation,
             });
         }
-        // All-or-nothing projection: every eligible head must verify or
-        // nothing new publishes — a damaged head fails the pass and the
-        // previous generation keeps serving (see `verified_heads`).
+        // Per-class projection: verified heads publish, pending ones
+        // wait for their closure, and a damaged head fails the pass
+        // with the previous generation still serving (see
+        // `partition_heads`).
         let heads = self.engine.live_heads()?;
         let (heads, pending_heads) = {
             let store = self.store.read().map_err(|_| LiveError::Lock)?;
@@ -821,10 +829,16 @@ where
             // generation serving and try again next pass. This is
             // ordinary progress, not a failure — a committed mutation
             // always authors a verified head, so no recorded reply
-            // waits on this publication.
+            // waits on this publication. The durable outbox still
+            // runs: control-plane obligations (transitions,
+            // capabilities, announcements) are independent of head
+            // publication, and starving them here would stall
+            // delivery for as long as the fetch takes.
             batch.finish();
+            let sent = self.publish(mailbox)?;
             tracing::debug!(
                 pending_heads,
+                sent,
                 "publication deferred: closure still fetching"
             );
             return Ok(SyncReport {
@@ -2056,6 +2070,59 @@ mod prereq_tests {
         ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
             Ok(())
         }
+    }
+
+    /// A store that cannot be read during closure verification is not
+    /// closure damage: the failure carries the store's own
+    /// classification so the failure policy spends the store budget,
+    /// not the fatal engine one.
+    #[test]
+    fn a_store_read_failure_keeps_its_store_class() {
+        use wyrd_format::{StoreError, StoreFailure};
+        #[derive(Debug)]
+        struct Unreadable(StoreFailure);
+        impl StoreError for Unreadable {
+            fn failure(&self) -> StoreFailure {
+                self.0
+            }
+        }
+        struct UnreadableStore(StoreFailure);
+        impl wyrd_format::ObjectStore for UnreadableStore {
+            type Error = Unreadable;
+            fn insert(
+                &mut self,
+                _kind: ObjectKind,
+                _data: &[u8],
+            ) -> Result<ContentId, Self::Error> {
+                Err(Unreadable(self.0))
+            }
+            fn insert_verified(
+                &mut self,
+                _kind: ObjectKind,
+                _expected: &ContentId,
+                _data: &[u8],
+            ) -> Result<(), Self::Error> {
+                Err(Unreadable(self.0))
+            }
+            fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+                Err(Unreadable(self.0))
+            }
+            fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+                Err(Unreadable(self.0))
+            }
+        }
+        let (engine, dir, _store, _chunk, _root, _head) = scratch_file_drive("store-class");
+        // The authored head's root manifest record exists, so closure
+        // verification reads the store — and cannot.
+        let runtime = engine.runtime_state().unwrap();
+        let heads = engine.live_heads().unwrap();
+        let error = partition_heads(&runtime, heads, &UnreadableStore(StoreFailure::StorageFull))
+            .expect_err("an unreadable store fails the pass");
+        assert!(
+            matches!(error, EngineError::Store(StoreFailure::StorageFull)),
+            "the store class survives the closure boundary: {error:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An incomplete closure never spends the fatal engine-error

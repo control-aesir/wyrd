@@ -724,7 +724,15 @@ main() {
   # checks, and the highest entry decides the prefix.
   local max_step=0
   local entry
-  for entry in ${only//,/ }; do
+  # Split on commas into a quoted array: an unquoted expansion would
+  # glob each entry against the working directory first, so `--step
+  # '*'` could pathname-expand into a digit-named file and slip past
+  # the grammar.
+  local -a entries=()
+  if [[ -n "$only" ]]; then
+    IFS=',' read -r -a entries <<< "$only"
+  fi
+  for entry in "${entries[@]}"; do
     [[ "$entry" =~ ^[1-6]$ ]] \
       || die "--step: '$entry' is not a step (expected a comma list of 1-6)"
     if (( entry > max_step )); then max_step=$entry; fi

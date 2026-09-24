@@ -729,13 +729,15 @@ main() {
       || die "--step: '$entry' is not a step (expected a comma list of 1-6)"
     if (( entry > max_step )); then max_step=$entry; fi
   done
-  # An explicit but empty or empty-entry selection (``, `,`, `4,,5`)
-  # is a mistake, not "all steps": without this, it would run zero
-  # checks and pass.
-  [[ -n "$only" && "$max_step" -eq 0 ]] \
-    && die "--step: '$only' names no step (expected a comma list of 1-6)"
-  [[ ",$only," == *,,* ]] \
-    && die "--step: '$only' has an empty entry (expected 1-6 entries)"
+  # An empty or empty-entry selection (`,`, `4,,5`, `,4`) is a
+  # mistake, not "all steps": without this it would run zero checks
+  # and pass. An absent variable (the wrapper omits it) means all.
+  if [[ -n "$only" ]]; then
+    [[ "$max_step" -gt 0 ]] \
+      || die "--step: '$only' names no step (expected a comma list of 1-6)"
+    [[ ",$only," != *,,* ]] \
+      || die "--step: '$only' has an empty entry (expected 1-6 entries)"
+  fi
   want_step() { [[ -z "$only" ]] || (( $1 <= max_step )); }
   if want_step 1; then step1_init; fi
   if want_step 2; then step2_mount; fi

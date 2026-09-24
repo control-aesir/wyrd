@@ -17,7 +17,12 @@ ONLY_STEP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1; shift ;;
-    --step) ONLY_STEP="$2"; shift 2 ;;
+    --step)
+      # An explicit but empty value is a mistake, not "all steps".
+      [[ -n "${2:-}" ]] || { echo "error: --step needs at least one step" >&2; exit 2; }
+      ONLY_STEP="$2"
+      shift 2
+      ;;
     *) echo "error: unknown flag $1" >&2; exit 2 ;;
   esac
 done
@@ -52,7 +57,10 @@ REV="$(python3 -c "import json; print(json.load(open('$ROOT/flake.lock'))['nodes
   printf 'WYRD_BIN=%q\n' "$WYRD_BIN"
   printf 'NIXPKGS_REV=%q\n' "$REV"
   printf 'RELAY_PORT=%q\n' "18761"
-  printf 'E2E_ONLY_STEP=%q\n' "$ONLY_STEP"
+  # Omitted entirely when unset: the guest reads an absent variable as
+  # "all steps", and an empty value there would be ambiguous with the
+  # malformed list the guest must refuse.
+  [[ -z "$ONLY_STEP" ]] || printf 'E2E_ONLY_STEP=%q\n' "$ONLY_STEP"
   printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
 } > "$SHARE/e2e-env.sh"
 

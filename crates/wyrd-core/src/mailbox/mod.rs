@@ -69,49 +69,71 @@
 //!
 //! # Signer secret boundary
 //!
-//! Secret inventory for this mailbox. The holders are upstream
-//! `nostr`/`secp256k1` types, which cannot implement our scrubbing, so
-//! this boundary is documented and pinned, not scrubbed:
+//! Process-wide secret inventory for the local case. The mailbox's own
+//! holders are upstream `nostr`/`secp256k1` types, which cannot
+//! implement our scrubbing, so this boundary is documented and pinned,
+//! not scrubbed:
 //!
-//! | Holder | Lives in | Copies | Why it must exist |
+//! | Holder | Lives in | Lifetime | Why it must exist |
 //! |---|---|---|---|
-//! | signer `Keys` | `LiveMailbox.signer` (local case) | 1 | outbound seals sign through the generic `S` boundary; a remote NIP-46 session holds no local secret |
-//! | `open_keys: Keys` | `LiveMailbox` | 1 | inbound `from_gift_wrap` needs the identity key, which the generic signer cannot lend |
-//! | `DeviceIdentitySecret` | CLI composer | 1 | `Zeroizing`-backed and sync-audited; parsed once into the bare `SecretKey` `connect` takes |
+//! | `identity: DeviceIdentitySecret` | CLI composer | mount duration | `Zeroizing`-backed, sync-audited; parsed once per mailbox/engine open |
+//! | engine identity clone | `Engine` | engine duration | snapshot authoring signs with the device key; the engine cannot borrow the CLI's copy |
+//! | bare `SecretKey` × 2 | `connect` arguments | the `connect` call only | transient parse results moved into the two `Keys` below; live across construction, not after |
+//! | signer `Keys` | `LiveMailbox.signer` | mailbox duration | outbound seals sign through the generic `S` boundary; a remote NIP-46 session holds no local secret |
+//! | `open_keys: Keys` | `LiveMailbox` | mailbox duration | inbound `from_gift_wrap` needs the identity key, which the generic signer cannot lend |
 //!
-//! Two holders is the floor for the local case: signer and opener are
-//! the same key in different roles, and the generic `S` boundary
-//! forbids sharing one holder. One holder for the remote-signer case.
-//! `connect` adds no copy — `Keys::new` moves `open_secret`, and the
-//! owner id, tag, and filter carry public material only.
-//! Within-holder duplication (secret plus keypair inside each `Keys`)
-//! is upstream-controlled residual.
+//! Two mailbox holders is the floor: signer and opener are the same key
+//! in different roles, and the generic `S` boundary forbids sharing one
+//! holder. Each `Keys` additionally retains upstream secret-plus-keypair
+//! material inside the holder. The remote-signer case keeps only
+//! `open_keys` locally. `connect` adds no holder beyond these —
+//! `Keys::new` moves its argument, and the owner id, tag, and filter
+//! carry public material only.
 //!
 //! Disclosure audit (pinned by `tests_signer_boundary`, fail-closed on
 //! upstream upgrades):
 //!
-//! - `Debug`: `Keys` renders the public key only (nostr 0.45.5);
-//!   `SecretKey`'s derived `Debug` reaches only secp256k1's tagged
-//!   fingerprint, never raw bytes (secp256k1 0.30.0); `LiveMailbox`
-//!   itself has no `Debug` impl at all.
-//! - Errors: the fixed `MailboxError` variants render constant strings
-//!   (exact-output pinned); `Transport` echoes its caller payload, and
-//!   every call site passes relay or dedupe-log I/O errors, never
-//!   secret material (review discipline, verified by grep, not by test).
+//! - `Debug`: `Keys` renders the public key only and `SecretKey` its
+//!   derived struct shape with secp256k1's non-disclosing placeholder
+//!   (nostr 0.45.5, secp256k1 0.30.0 without the `hashes` feature);
+//!   both renderings are pinned exactly. `LiveMailbox` itself has no
+//!   `Debug` impl at all (review discipline: no stable mechanism
+//!   asserts the absence, so adding one must update this section) —
+//!   and a future one stays safe through these pins, since every
+//!   secret holder renders through them: local `Keys`, and the
+//!   production `NostrConnect` signer, whose pairing-secret URI field
+//!   renders `[REDACTED]` (nostr-connect 0.45.0, reviewed in source;
+//!   `nip46` is outside our feature set, so that half is documented,
+//!   not test-pinned).
+//! - Errors, three classes: `Signer` is constant — foreign signer-trait
+//!   failures (a remote NIP-46 session returns arbitrary text) have
+//!   their payload dropped at the boundary, so key material can never
+//!   enter the error channel from the signer. The other fixed variants
+//!   render constant strings (exact-output pinned). `Transport` carries
+//!   relay, client-send, and dedupe-log I/O errors — relay-influenced,
+//!   but no secret flows into the request path (wraps carry ciphertext
+//!   plus ephemeral signatures), so there is nothing of ours to echo —
+//!   plus the gift-wrap rejection, whose rendering is pinned exactly
+//!   through the mailbox API.
 //! - Tasks: supervisor and drainer contexts carry client, filter
 //!   (public owner tag), channels, and health — no secret; the signer
 //!   serves the send path behind its `Arc` and is never cloned into a
 //!   spawned task.
-//! - Conversions: no `to_secret_*`/`as_secret_bytes` call exists in our
-//!   crates; the CLI parses identity through `Zeroizing` buffers.
+//! - Conversions: the only secret-to-bytes conversions in our crates
+//!   are the two transient `from_slice` parses above; no
+//!   `to_secret_*`/`as_secret_bytes` call exists, and the CLI parses
+//!   identity through `Zeroizing` buffers.
 //!
-//! Accepted residual: upstream drops do not scrub, so both holders
-//! persist until the mailbox (and the CLI's identity) drops —
-//! process-lifetime residency, freed but not wiped. The
-//! identity-mismatch early return drops `open_keys` the same way.
-//! Adding a signer holder, a `Debug` impl on mailbox types, or a
-//! secret-bearing error variant must update this section and its
-//! tests together.
+//! Accepted residual: upstream `Drop` performs best-effort
+//! `non_secure_erase` on the secret scalar and the keypair (nostr
+//! 0.45.5) — that is not a guarantee, because compiler moves and
+//! copies (including the transient bare keys and `Keys::new`
+//! internals) can leave bytes behind. Reachable holders persist for
+//! the mailbox/engine/process duration; the identity-mismatch early
+//! return drops `open_keys` the same best-effort way. Adding a holder,
+//! a `Debug` impl on mailbox types, a secret-bearing error variant, or
+//! a secret conversion must update this section and its tests
+//! together.
 //!
 //! # Supervision
 //!
@@ -611,7 +633,7 @@ where
         // identity must fail here, not publish as a stranger.
         let signer_pk = runtime
             .block_on(signer.get_public_key_async())
-            .map_err(|error| MailboxError::Transport(error.to_string()))?;
+            .map_err(|_| MailboxError::Signer)?;
         if signer_pk != owner_pk {
             return Err(MailboxError::Identity);
         }
@@ -1347,7 +1369,7 @@ where
         let wrap = self
             .rt()
             .block_on(GiftWrapBuilder::new(recipient, rumor).finalize_async(&*self.signer))
-            .map_err(|error| MailboxError::Transport(error.to_string()))?;
+            .map_err(|_| MailboxError::Signer)?;
         self.rt()
             .block_on(async { self.client.send_event(&wrap).await })
             .map(|_| ())

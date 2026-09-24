@@ -529,12 +529,14 @@ fn mount(
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity
-    // binding `LiveMailbox` enforces. Two live holders by necessity
+    // binding `LiveMailbox` enforces. Two mailbox holders by necessity
     // (signer `Keys` plus `open_keys`): the generic signer boundary
     // forbids sharing one holder, so the clone is structural, not
-    // gratuitous — see the "Signer secret boundary" section in
-    // `wyrd-core`'s mailbox docs. Delegating signing to a NIP-46
-    // session is a separate tracked issue.
+    // gratuitous. The full process graph — this identity, its engine
+    // clone above, the two transient bare keys here, and both `Keys`
+    // — is inventoried under "Signer secret boundary" in `wyrd-core`'s
+    // mailbox docs. Delegating signing to a NIP-46 session is a
+    // separate tracked issue.
     let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
         .map_err(|_| CliError::IdentityFormat)?;
     let seen_path = drive_dir.join("mailbox.seen");

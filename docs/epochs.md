@@ -255,7 +255,7 @@ A **capability** delivered to a member of epoch N:
   wrap the new capability while the device is offline. The first
   delivery (the invitation) is ECDH-sealed to the invitee, since the
   device holds no epoch key yet; every later delivery is a *rotation
-  delivery* (envelope version `0x01`, decided): ECDH to the
+  delivery* (envelope version `0x02`, decided): ECDH to the
   recipient's registered encryption key under a fresh ephemeral key,
   carrying the wrapped capability plus the authorizing transition's
   bytes, so one drain converges without the recipient holding the
@@ -266,6 +266,26 @@ A **capability** delivered to a member of epoch N:
   transition binding are verified on every path, and installation
   stays monotonic and contiguous — secrets only extend the held
   `1..=N` prefix, never skip and never overwrite;
+- carries an **owner proof** (rotation envelope version `0x02`): the
+  owner's BIP-340 signature over `domain ‖ DriveId ‖ recipient ‖
+  transition_id ‖ epoch ‖ digest(epoch_secret_vector)`, the digest being
+  BLAKE3-derive-key over a pinned, count-prefixed concatenation of the
+  vector. The secret bytes are never the signed message, only a
+  commitment to them. This keeps the protocol's two authorities
+  distinct, which is easy to conflate and was the exploit's root:
+  **owner authorization authenticates the origin of the secret
+  material; member authorization authenticates only its delivery.**
+  Without the proof, any member could seal a well-formed delivery
+  carrying attacker-chosen secrets — every binding would agree and the
+  sender would be a member — so the recipient would commit the forged
+  vector, derive its control key from it, and fail honest epoch traffic
+  afterwards. Intake verifies the proof and requires its signer to be
+  an owner of the transition's **predecessor** state (rule 3 above), so
+  member *delivery* remains legal while member *minting* does not. The
+  pre-state matters: ownership handover is signed and minted by the
+  *outgoing* owner, so a post-state check would suppress every
+  handover while admitting the incoming owner — who could then choose
+  the vector outright.
 
 **Capability installation is monotonic:** installing a capability may only
 add secrets for epochs the device does not yet hold. It must never decrease

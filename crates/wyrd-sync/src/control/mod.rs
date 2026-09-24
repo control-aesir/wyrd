@@ -55,8 +55,8 @@ pub use message::{
 };
 pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
 pub use rotation::{
-    open_rotation, seal_rotation, RotationDelivery, RotationIngest, SealedRotation,
-    ROTATION_HEADER_LEN, ROTATION_VERSION,
+    is_superseded_rotation, open_rotation, seal_rotation, RotationDelivery, RotationIngest,
+    SealedRotation, ROTATION_HEADER_LEN, ROTATION_VERSION,
 };
 
 /// The epoch-sealed control-envelope version. Rotation deliveries use

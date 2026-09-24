@@ -3,11 +3,12 @@ use std::collections::BTreeMap;
 use wyrd_format::{DeviceId, DriveId, MembershipTransition, TransitionId};
 
 use crate::control::{
-    open as open_control, seal as seal_control, seal_rotation, Message, SealedControl,
-    SealedRotation, TransitionPayload, ROTATION_VERSION,
+    is_superseded_rotation, open as open_control, seal as seal_control, seal_rotation, Message,
+    SealedControl, SealedRotation, TransitionPayload, ROTATION_VERSION,
 };
 use crate::durable::{Fact, Rebuilt};
 use crate::keys::capability::{Capability, DriveKeyring};
+use crate::keys::owner_proof::OwnerProof;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::{seal_for_recipient, Mailbox};
 use zeroize::Zeroizing;
@@ -372,12 +373,31 @@ fn deliver_capabilities(
                     }
                 }
             }
-            // A pre-framing epoch-sealed fact: its bytes target keys the
-            // recipient may never hold, so they never send — mint fresh
-            // under rotation, which always opens. The stale fact lingers
+            // A pre-framing epoch-sealed fact, or a rotation sealed
+            // under a superseded version: its bytes can never open for
+            // the current reader (no proof blob, or keys the recipient
+            // may never hold), so it never sends — mint fresh under the
+            // current framing, which always opens. The stale fact lingers
             // durably and harmlessly; the new seal takes the overlay.
-            // Bytes decoding as neither framing fail closed: legacy or
-            // not, undecodable outbox bytes never silently heal.
+            // This is the announced re-mint recovery for the `0x01 ->
+            // 0x02` bump, and it is what keeps an upgrade from stranding
+            // a pending obligation. Bytes decoding as neither framing
+            // still fail closed: genuinely undecodable outbox bytes never
+            // silently heal.
+            Some(bytes) if is_superseded_rotation(&bytes) => {
+                let Some(bytes) = mint_fresh_rotation(
+                    engine,
+                    &rebuilt.keyring,
+                    &mut sealed_overlay,
+                    epoch,
+                    recipient,
+                    &transition_id,
+                )?
+                else {
+                    continue;
+                };
+                bytes
+            }
             Some(bytes) => {
                 if SealedControl::decode(&bytes).is_err() {
                     let obligation = format!("capability epoch {epoch} for {recipient}");
@@ -496,9 +516,23 @@ fn mint_fresh_rotation(
     let Some(registration) = state.encryption_key_of(&recipient).copied() else {
         return Ok(None);
     };
-    let Some(wrap) = mint_wrap(engine.drive, keyring, &state, transition, recipient) else {
+    let Some(secrets) = epoch_secrets(keyring, transition) else {
         return Ok(None);
     };
+    let Some(wrap) = mint_wrap(engine.drive, &state, transition, recipient, secrets.clone()) else {
+        return Ok(None);
+    };
+    // Mint authority, distinct from delivery authority: the owner signs
+    // a commitment to this exact vector, so any member may later relay
+    // the sealed bytes while only an owner can have originated them.
+    let proof = OwnerProof::sign(
+        &engine.identity_secret,
+        &engine.drive,
+        &recipient,
+        &transition.transition_id(),
+        epoch,
+        &secrets,
+    );
     let sealed = seal_rotation(
         &engine.drive,
         recipient,
@@ -506,6 +540,7 @@ fn mint_fresh_rotation(
         epoch,
         &transition.canonical_bytes(),
         &wrap,
+        &proof.encode(),
     )?;
     let bytes = sealed.encode();
     crate::transport::mailbox::check_outbound_size(&bytes)?;
@@ -513,18 +548,26 @@ fn mint_fresh_rotation(
     sealed_overlay.insert((epoch, recipient), bytes.clone());
     Ok(Some(bytes))
 }
+/// The epoch-secret vector a transition's grant carries: one secret per
+/// epoch `1..=N`, straight from the keyring.
+fn epoch_secrets(
+    keyring: &DriveKeyring,
+    transition: &MembershipTransition,
+) -> Option<Vec<crate::keys::EpochSecret>> {
+    let mut secrets = Vec::with_capacity(transition.epoch as usize);
+    for past in 1..=transition.epoch {
+        secrets.push(keyring.secret(past)?.clone());
+    }
+    Some(secrets)
+}
+
 fn mint_wrap(
     drive: DriveId,
-    keyring: &DriveKeyring,
     state: &crate::membership::MembershipState,
     transition: &MembershipTransition,
     recipient: DeviceId,
+    secrets: Vec<crate::keys::EpochSecret>,
 ) -> Option<Vec<u8>> {
-    let epoch = transition.epoch;
-    let mut secrets = Vec::with_capacity(epoch as usize);
-    for past in 1..=epoch {
-        secrets.push(keyring.secret(past)?.clone());
-    }
     let cap = Capability::mint(drive, recipient, state, transition, secrets).ok()?;
     Some(cap.wrap().ok()?.as_bytes().to_vec())
 }

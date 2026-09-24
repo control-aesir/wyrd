@@ -9,7 +9,7 @@ use wyrd_format::membership::{
 };
 use wyrd_format::{Change, DeviceId};
 
-use crate::keys::{DeviceEncryptionSecret, EpochSecret};
+use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::membership::MembershipLog;
 use crate::runtime::test_util::{
@@ -92,6 +92,38 @@ fn chain3(c: &Chain) -> Vec<MembershipTransition> {
     ]
 }
 
+/// A genuine owner proof: the genesis owner (identity 10) authorizing
+/// exactly this secret vector for this device under this transition.
+/// Every positive rotation fixture below carries one — member delivery
+/// stays legal, but only owner-minted material does.
+fn owner_proof(
+    transition: &MembershipTransition,
+    device: wyrd_format::DeviceId,
+    secrets: &[EpochSecret],
+) -> Vec<u8> {
+    let owner = DeviceIdentitySecret::from_bytes([10; 32]).expect("genesis owner scalar");
+    crate::keys::owner_proof::OwnerProof::sign(
+        &owner,
+        &member_drive(),
+        &device,
+        &transition.transition_id(),
+        transition.epoch,
+        secrets,
+    )
+    .encode()
+}
+
+/// Mint the wrap and the matching owner proof for one delivery.
+fn grant(
+    chain: &[MembershipTransition],
+    admission: &MembershipTransition,
+    device: wyrd_format::DeviceId,
+    secrets: Vec<EpochSecret>,
+) -> (Vec<u8>, Vec<u8>) {
+    let proof = owner_proof(admission, device, &secrets);
+    (mint_wrap(chain, admission, device, secrets), proof)
+}
+
 #[test]
 fn rotation_with_substituted_transition_suppresses() {
     // The wrap is genuinely bound to the epoch-3 admission, but the
@@ -125,7 +157,8 @@ fn rotation_with_substituted_transition_suppresses() {
     // No signature: the binding check precedes any chain observation,
     // so an unsigned sibling exercises exactly the refused pairing.
 
-    let rotation = rotation_delivery(&fixture, 3, &rival, wrapped);
+    let proof = owner_proof(&rival, device, &secrets(3));
+    let rotation = rotation_delivery(&fixture, 3, &rival, wrapped, proof);
     let mail = vec![
         deliver(&fixture, 1, &transition_message(&c.genesis)),
         deliver(&fixture, 2, &transition_message(&c.admit_sender)),
@@ -154,11 +187,11 @@ fn rotation_converges_without_the_epoch_key_in_one_drain() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let c = chain(device);
-    let wrapped = mint_wrap(&chain3(&c), &c.admission, device, secrets(3));
+    let (wrapped, proof) = grant(&chain3(&c), &c.admission, device, secrets(3));
 
     // Genesis and epoch 2 ride the held epoch keys; epoch 3 arrives
     // only as a rotation delivery — the device holds no epoch-3 key.
-    let rotation = rotation_delivery(&fixture, 3, &c.admission, wrapped);
+    let rotation = rotation_delivery(&fixture, 3, &c.admission, wrapped, proof);
     let mail = vec![
         deliver(&fixture, 1, &transition_message(&c.genesis)),
         deliver(&fixture, 2, &transition_message(&c.admit_sender)),
@@ -219,6 +252,7 @@ fn rotation_from_a_non_member_is_suppressed() {
             3,
             &c.admission,
             wrapped,
+            Vec::new(),
         ),
     ];
     queue(&mut fixture, mail);
@@ -260,6 +294,7 @@ fn rotation_for_another_device_is_suppressed() {
         3,
         &c.admission.canonical_bytes(),
         &wrapped,
+        &[],
     )
     .expect("seals");
     let misaddressed = seal_for_recipient(&fixture.sender_sk, device, &sealed.encode()).unwrap();
@@ -292,13 +327,13 @@ fn rotation_skips_until_its_ancestry_lands_then_converges() {
         c.admission.clone(),
         c.admission4.clone(),
     ];
-    let wrapped3 = mint_wrap(&chain3(&c), &c.admission, device, secrets(3));
-    let wrapped4 = mint_wrap(&chain4, &c.admission4, device, secrets(4));
+    let (wrapped3, proof3) = grant(&chain3(&c), &c.admission, device, secrets(3));
+    let (wrapped4, proof4) = grant(&chain4, &c.admission4, device, secrets(4));
 
     let mail = vec![
         deliver(&fixture, 1, &transition_message(&c.genesis)),
         deliver(&fixture, 2, &transition_message(&c.admit_sender)),
-        rotation_delivery(&fixture, 4, &c.admission4, wrapped4),
+        rotation_delivery(&fixture, 4, &c.admission4, wrapped4, proof4),
     ];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
@@ -307,7 +342,13 @@ fn rotation_skips_until_its_ancestry_lands_then_converges() {
     assert_eq!(fixture.engine.pending_count(), 0, "skips never park");
     assert_eq!(fixture.engine.log.known_state().map(|s| s.epoch), Some(2));
 
-    let mail = vec![rotation_delivery(&fixture, 3, &c.admission, wrapped3)];
+    let mail = vec![rotation_delivery(
+        &fixture,
+        3,
+        &c.admission,
+        wrapped3,
+        proof3,
+    )];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
     // The retained epoch-4 envelope redelivers ahead of epoch 3 (the
@@ -352,7 +393,6 @@ fn rotation_observing_a_transition_flushes_held_announcements() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let c = chain(device);
-    let wrapped = mint_wrap(&chain3(&c), &c.admission, device, secrets(3));
 
     let mail = vec![
         deliver(&fixture, 1, &transition_message(&c.genesis)),
@@ -383,7 +423,8 @@ fn rotation_observing_a_transition_flushes_held_announcements() {
     assert_eq!(report.deferred, 1);
     assert_eq!(fixture.engine.pending_count(), 1);
 
-    let mail = vec![rotation_delivery(&fixture, 3, &c.admission, wrapped)];
+    let (wrapped, proof) = grant(&chain3(&c), &c.admission, device, secrets(3));
+    let mail = vec![rotation_delivery(&fixture, 3, &c.admission, wrapped, proof)];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
     assert_eq!(
@@ -433,13 +474,13 @@ fn rotation_from_a_sender_removed_after_authorizing_still_converges() {
         admission.clone(),
         removal.clone(),
     ];
-    let wrapped3 = mint_wrap(
+    let (wrapped3, proof3) = grant(
         &chain3_from(&genesis, &admit_sender, &admission),
         &admission,
         device,
         secrets(3),
     );
-    let wrapped4 = mint_wrap(&chain4, &removal, device, secrets(4));
+    let (wrapped4, proof4) = grant(&chain4, &removal, device, secrets(4));
 
     // The device holds epoch 3's control key out-of-band (as in the
     // flush test), so the removal transition arrives epoch-sealed and
@@ -468,6 +509,7 @@ fn rotation_from_a_sender_removed_after_authorizing_still_converges() {
         4,
         &removal,
         wrapped4,
+        proof4,
     )];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
@@ -485,6 +527,7 @@ fn rotation_from_a_sender_removed_after_authorizing_still_converges() {
         3,
         &admission,
         wrapped3,
+        proof3,
     )];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
@@ -512,4 +555,280 @@ fn chain3_from(
     admission: &MembershipTransition,
 ) -> Vec<MembershipTransition> {
     vec![genesis.clone(), admit_sender.clone(), admission.clone()]
+}
+
+/// The security property, stated as one test: a member may deliver, but
+/// only an owner may originate. Member M — a legitimate delivery-
+/// authorized member of the authorizing state — forges a rotation
+/// delivery for the device carrying attacker-chosen epoch secrets. The
+/// bindings all agree and M's mailbox seal is genuine, so every
+/// pre-existing check passes. The owner's proof does not exist for
+/// those secrets, so the delivery is refused.
+///
+/// The dangerous part of the old exploit was never the eventual
+/// rejection: the recipient *committed* the forged secret, derived its
+/// control key from it, and poisoned itself against later honest
+/// traffic. So this asserts the keyring and epoch keys are untouched.
+/// The state the old exploit poisoned: control keys installed from the
+/// forged secret, and the committed authorizing transition.
+fn poisoned_state(fixture: &crate::runtime::engine::Engine) -> (Vec<u64>, Option<u64>) {
+    let keys = fixture.held_epochs().expect("rebuilds");
+    let epoch = fixture.membership_log().known_state().map(|s| s.epoch);
+    (keys, epoch)
+}
+
+#[test]
+fn member_minted_secrets_are_refused_and_change_nothing() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let c = chain(device);
+
+    // Honest history so the device holds epochs 1..=2, exactly as in
+    // the converging test; the forged delivery carries epoch 3.
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&c.genesis)),
+        deliver(&fixture, 2, &transition_message(&c.admit_sender)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+
+    let before = poisoned_state(&fixture.engine);
+
+    // The attacker's chosen vector — the wrap is genuinely bound to the
+    // real admission, so only the *provenance* of the secrets differs.
+    let forged = vec![EpochSecret::from_bytes([0x7E; 32]); 3];
+    let wrapped = mint_wrap(&chain3(&c), &c.admission, device, forged);
+    // No owner proof: M cannot sign one, and the owner never did.
+    let rotation = rotation_delivery(&fixture, 3, &c.admission, wrapped, Vec::new());
+    queue(&mut fixture, vec![rotation]);
+    let report = drain(&mut fixture);
+
+    assert_eq!(
+        report.accepted, 1,
+        "the forged delivery is consumed as poison (suppression counts as accepted)"
+    );
+    assert_eq!(
+        poisoned_state(&fixture.engine),
+        before,
+        "no epoch key and no capability fact came from the forged secret"
+    );
+    assert_eq!(
+        fixture.engine.log.known_state().map(|s| s.epoch),
+        Some(2),
+        "the authorizing transition never entered the log"
+    );
+
+    // The real owner-signed grant still converges afterwards: the
+    // refusal suppressed poison, it did not wedge the channel.
+    let (wrapped, proof) = grant(&chain3(&c), &c.admission, device, secrets(3));
+    let honest = rotation_delivery(&fixture, 3, &c.admission, wrapped, proof);
+    queue(&mut fixture, vec![honest]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "genuine owner-minted material still converges"
+    );
+}
+
+/// The same forgery, but M signs the proof itself. Signature validity
+/// is not mint authority: a non-owner signer is still refused.
+#[test]
+fn member_signed_proof_is_refused() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let c = chain(device);
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&c.genesis)),
+        deliver(&fixture, 2, &transition_message(&c.admit_sender)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+
+    // M is the admitted sender at epoch 2 — a member, never an owner.
+    let (_, member) = identity(0x01);
+    let member_identity =
+        crate::runtime::test_util::identity_secret(&crate::membership::test_util::key(0x01).0);
+    let forged = vec![EpochSecret::from_bytes([0x7F; 32]); 3];
+    let proof = crate::keys::owner_proof::OwnerProof::sign(
+        &member_identity,
+        &member_drive(),
+        &device,
+        &c.admission.transition_id(),
+        3,
+        &forged,
+    )
+    .encode();
+    assert_ne!(
+        member,
+        DeviceIdentitySecret::from_bytes([10; 32])
+            .unwrap()
+            .device_id()
+    );
+
+    let wrapped = mint_wrap(&chain3(&c), &c.admission, device, forged);
+    let rotation = rotation_delivery(&fixture, 3, &c.admission, wrapped, proof);
+    queue(&mut fixture, vec![rotation]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "consumed as poison: a valid signature from a non-owner is not mint authority"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .membership_log()
+            .known_state()
+            .map(|s| s.epoch),
+        Some(2),
+        "the non-owner-signed transition never entered the log"
+    );
+}
+
+/// Ownership handover: mint authority is the **pre-state** owner set,
+/// so the outgoing owner's proof is the legitimate one. Checking the
+/// post-state instead would suppress every handover while admitting the
+/// incoming owner — who could then choose the vector outright.
+#[test]
+fn handover_delivery_authorizes_the_outgoing_owner() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let (_, sender) = identity(0x01);
+    let sender_key =
+        DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("fixture scalar is valid");
+    let admit_sender = builder.child(vec![Change::Admit(Admission {
+        device: sender,
+        encryption_key: encryption_key(&sender_key),
+    })]);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let admission = builder.child(vec![Change::Admit(Admission {
+        device,
+        encryption_key: encryption_key(&encryption_sk),
+    })]);
+    // Epoch 4: ownership moves from the genesis owner (10) to the
+    // admitted sender (0x01). The *outgoing* owner signs this.
+    let (owner_sk, _owner_id) = crate::runtime::test_util::owner();
+    let mut handover = builder.child(vec![Change::SetOwners(vec![sender])]);
+    crate::membership::test_util::sign(&mut handover, &owner_sk, &member_drive());
+    let handover_id = handover.transition_id();
+    // The handover grant's chain must include the handover itself.
+    let chain = vec![
+        genesis.clone(),
+        admit_sender.clone(),
+        admission.clone(),
+        handover.clone(),
+    ];
+
+    // Epochs 1..=2 ride the held control keys; epoch 3 arrives as a
+    // rotation (the device holds no epoch-3 key), then the handover at
+    // epoch 4 rides on top of it.
+    let chain3 = vec![genesis.clone(), admit_sender.clone(), admission.clone()];
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 2, &transition_message(&admit_sender)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+    let (wrapped3, proof3) = grant(&chain3, &admission, device, secrets(3));
+    let first = rotation_delivery(&fixture, 3, &admission, wrapped3, proof3);
+    queue(&mut fixture, vec![first]);
+    assert_eq!(drain(&mut fixture).accepted, 1, "epoch 3 converges");
+
+    let (wrapped, proof) = grant(&chain, &handover, device, secrets(4));
+    let rotation = rotation_delivery(&fixture, 4, &handover, wrapped, proof);
+    queue(&mut fixture, vec![rotation]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "the outgoing owner's proof authorizes the handover grant"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .membership_log()
+            .known_state()
+            .map(|s| s.epoch),
+        Some(4),
+        "the handover epoch commits"
+    );
+    assert_eq!(handover_id, handover.transition_id());
+}
+
+/// The inverse of the handover case: the **incoming** owner has no mint
+/// authority over the transition that promoted it, so a vector it signs
+/// is refused even though the signature is valid.
+#[test]
+fn incoming_owner_cannot_mint_the_handover_vector() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let (_, sender) = identity(0x01);
+    let sender_key =
+        DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("fixture scalar is valid");
+    let admit_sender = builder.child(vec![Change::Admit(Admission {
+        device: sender,
+        encryption_key: encryption_key(&sender_key),
+    })]);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let admission = builder.child(vec![Change::Admit(Admission {
+        device,
+        encryption_key: encryption_key(&encryption_sk),
+    })]);
+    let (owner_sk, _owner_id) = crate::runtime::test_util::owner();
+    let mut handover = builder.child(vec![Change::SetOwners(vec![sender])]);
+    crate::membership::test_util::sign(&mut handover, &owner_sk, &member_drive());
+    // The handover grant's chain must include the handover itself.
+    let chain = vec![
+        genesis.clone(),
+        admit_sender.clone(),
+        admission.clone(),
+        handover.clone(),
+    ];
+
+    // Epochs 1..=2 ride the held control keys; epoch 3 arrives as a
+    // rotation (the device holds no epoch-3 key), then the handover at
+    // epoch 4 rides on top of it.
+    let chain3 = vec![genesis.clone(), admit_sender.clone(), admission.clone()];
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 2, &transition_message(&admit_sender)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+    let (wrapped3, proof3) = grant(&chain3, &admission, device, secrets(3));
+    let first = rotation_delivery(&fixture, 3, &admission, wrapped3, proof3);
+    queue(&mut fixture, vec![first]);
+    assert_eq!(drain(&mut fixture).accepted, 1, "epoch 3 converges");
+
+    // The incoming owner (0x01) signs an attacker-chosen vector. Valid
+    // signature, wrong authority.
+    let incoming =
+        crate::runtime::test_util::identity_secret(&crate::membership::test_util::key(0x01).0);
+    let forged = vec![EpochSecret::from_bytes([0x6D; 32]); 4];
+    let proof = crate::keys::owner_proof::OwnerProof::sign(
+        &incoming,
+        &member_drive(),
+        &device,
+        &handover.transition_id(),
+        4,
+        &forged,
+    )
+    .encode();
+    let wrapped = mint_wrap(&chain, &handover, device, forged);
+    let rotation = rotation_delivery(&fixture, 4, &handover, wrapped, proof);
+    queue(&mut fixture, vec![rotation]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "consumed as poison: the promoted owner is not yet mint authority"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .membership_log()
+            .known_state()
+            .map(|s| s.epoch),
+        Some(3),
+        "the forged handover vector never entered the log"
+    );
 }

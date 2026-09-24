@@ -606,6 +606,29 @@ fn rotation_commit(
         return suppress(engine);
     }
     let transition_id = transition.transition_id();
+    // Mint authority, checked before anything commits. The mailbox
+    // seal proved the *sender* was a member of the authorizing state —
+    // delivery authority. It says nothing about who chose the secret
+    // vector: a member could seal a well-formed delivery carrying
+    // attacker-chosen secrets, and the recipient would commit them and
+    // poison its keyring against later honest traffic. The owner's
+    // proof over a commitment to the unwrapped vector closes that, and
+    // the signer must be an owner of this exact transition.
+    let Some(proof) = crate::keys::owner_proof::OwnerProof::decode(&delivery.owner_proof) else {
+        return suppress(engine);
+    };
+    if proof
+        .verify(
+            &engine.drive(),
+            &engine.device,
+            &transition_id,
+            delivery.epoch,
+            &capability.secrets,
+        )
+        .is_err()
+    {
+        return suppress(engine);
+    }
     // Authorize against a scratch observation: the live log stays
     // pristine until commit, so a skip leaves no volatile-only
     // observation behind — volatile matches durable on every path,
@@ -629,6 +652,25 @@ fn rotation_commit(
             }
             Err(_) => return suppress(engine),
         };
+    // The signer must be an owner of the **pre-state** that authorized
+    // this transition (epochs.md rule 3), not of the state it produces.
+    // That distinction is what makes handover work: the outgoing owner
+    // signs and mints, so a check against the post-state would suppress
+    // every legitimate handover while admitting the incoming owner — who
+    // could then choose the vector outright, recreating exactly the
+    // poisoning this proof exists to stop.
+    let mint_authority = match transition.prev {
+        Some(prev) => scratch.owners_of(&prev),
+        // Genesis establishes its own owner set; there is no earlier
+        // state to consult.
+        None => scratch.owners_of(&transition_id),
+    };
+    match mint_authority {
+        Some(owners) if owners.contains(&proof.signer) => {}
+        // Signed, but by a device without mint authority.
+        Some(_) => return suppress(engine),
+        None => return Err(EngineError::TransitionUnclassified(transition_id)),
+    }
     // Sender-member, against the authorizing state (not the tip): the
     // delivery is authorized only from a member of the epoch it grants.
     // A former member removed by this very history cannot speak its

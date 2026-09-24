@@ -71,7 +71,21 @@ use crate::keys::{random_bytes, CryptoError, DeviceEncryptionSecret};
 /// epoch-sealed control version so a rotation delivery can never enter
 /// the epoch-key open path (and vice versa) — intake dispatches on
 /// this byte before decoding either framing.
-pub const ROTATION_VERSION: u8 = 0x01;
+pub const ROTATION_VERSION: u8 = 0x02;
+
+/// The rotation version before the owner proof landed. A durable
+/// outbox fact sealed under it can never open (its plaintext has no
+/// proof blob), so the send path treats it as stale and re-mints rather
+/// than letting it fail as an undecodable legacy fact. Recorded here so
+/// the recovery rule is explicit instead of implied by an unreachable
+/// byte.
+pub const ROTATION_VERSION_SUPERSEDED: u8 = 0x01;
+
+/// Whether sealed bytes carry a rotation envelope of a known but
+/// non-current version.
+pub fn is_superseded_rotation(bytes: &[u8]) -> bool {
+    bytes.first().copied() == Some(ROTATION_VERSION_SUPERSEDED)
+}
 
 /// Header length: version (1) + drive (32) + ephemeral (32) +
 /// recipient (32) + encryption key (32) + epoch (8) + nonce (24).
@@ -110,6 +124,12 @@ pub struct RotationDelivery {
     pub epoch: u64,
     pub transition: Vec<u8>,
     pub wrapped: Vec<u8>,
+    /// The owner's authorization of the secret vector `wrapped`
+    /// carries. Carried inside the AEAD plaintext, so the tag
+    /// authenticates it and it is only readable after the delivery
+    /// opens. Its digest is checked against the unwrapped secrets
+    /// before anything commits.
+    pub owner_proof: Vec<u8>,
 }
 
 /// The sealed, deliverable rotation form.
@@ -220,6 +240,7 @@ pub fn seal_rotation(
     epoch: u64,
     transition: &[u8],
     wrapped: &[u8],
+    owner_proof: &[u8],
 ) -> Result<SealedRotation, CryptoError> {
     let target = XOnlyPublicKey::from_slice(encryption_key.as_bytes())
         .map_err(|_| CryptoError::Malformed)?;
@@ -228,12 +249,14 @@ pub fn seal_rotation(
     let (ephemeral_sk, _seed, ephemeral_pk) = crate::keys::ephemeral::generate_ephemeral()?;
     let shared = ecdh_shared(&ephemeral_sk, &target)?;
     let aead_key = hkdf_rotation_key(&shared);
-    let mut plaintext = Vec::with_capacity(72 + 8 + transition.len() + wrapped.len());
+    let mut plaintext =
+        Vec::with_capacity(72 + 8 + transition.len() + wrapped.len() + owner_proof.len());
     plaintext.extend_from_slice(drive.as_bytes());
     plaintext.extend_from_slice(recipient.as_bytes());
     plaintext.extend_from_slice(&epoch.to_le_bytes());
     push_blob(&mut plaintext, transition);
     push_blob(&mut plaintext, wrapped);
+    push_blob(&mut plaintext, owner_proof);
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
     let aad = rotation_aad(ROTATION_VERSION, drive, &recipient, encryption_key, epoch);
@@ -309,6 +332,7 @@ pub fn open_rotation(
     };
     let transition = blob(&mut pos)?;
     let wrapped = blob(&mut pos)?;
+    let owner_proof = blob(&mut pos)?;
     if plaintext.len() != pos {
         return Err(CryptoError::Malformed.into());
     }
@@ -328,6 +352,7 @@ pub fn open_rotation(
         epoch: pt_epoch,
         transition,
         wrapped,
+        owner_proof,
     })
 }
 
@@ -374,7 +399,8 @@ mod tests {
         // The deadlock this framing exists to break: the opener holds no
         // epoch secret and no control key, only its encryption secret.
         let (enc_key, transition, wrapped) = delivery_parts();
-        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let sealed =
+            seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped, &[]).unwrap();
         assert_eq!(sealed.version, ROTATION_VERSION);
         let parsed = SealedRotation::decode(&sealed.encode()).unwrap();
         assert_eq!(parsed, sealed);
@@ -393,7 +419,8 @@ mod tests {
     #[test]
     fn wrong_encryption_secret_cannot_open() {
         let (enc_key, transition, wrapped) = delivery_parts();
-        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let sealed =
+            seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped, &[]).unwrap();
         let (wrong, _) = enc_pair(0x41);
         assert_eq!(
             open_rotation(&wrong, &sealed),
@@ -404,7 +431,8 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails_the_tag() {
         let (enc_key, transition, wrapped) = delivery_parts();
-        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let sealed =
+            seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped, &[]).unwrap();
         let (enc_secret, _) = enc_pair(0x40);
         let mut tampered = sealed.encode();
         tampered[ROTATION_HEADER_LEN] ^= 0x01;
@@ -420,7 +448,8 @@ mod tests {
         // The epoch rides the clear header and the AAD: flipping it
         // breaks the tag, so the machines never read a forged epoch.
         let (enc_key, transition, wrapped) = delivery_parts();
-        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let sealed =
+            seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped, &[]).unwrap();
         let (enc_secret, _) = enc_pair(0x40);
         let mut forged = sealed.encode();
         // Epoch field lives at 129..137.
@@ -437,7 +466,8 @@ mod tests {
     #[test]
     fn version_byte_is_covered_by_the_tag() {
         let (enc_key, transition, wrapped) = delivery_parts();
-        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let sealed =
+            seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped, &[]).unwrap();
         let (enc_secret, _) = enc_pair(0x40);
 
         // Reproduce exactly what `open_rotation` authenticates.
@@ -510,19 +540,30 @@ mod tests {
             Err(CryptoError::Malformed)
         );
         let (enc_key, transition, wrapped) = delivery_parts();
-        let sealed = seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped).unwrap();
+        let sealed =
+            seal_rotation(&drive(), device(), &enc_key, 3, &transition, &wrapped, &[]).unwrap();
         let mut bad_ephemeral = sealed.encode();
         bad_ephemeral[33..65].copy_from_slice(&[0xFF; 32]);
         assert_eq!(
             SealedRotation::decode(&bad_ephemeral),
             Err(CryptoError::Malformed)
         );
+        // A version past the current one: `0x02` is live since the
+        // owner proof landed, so the probe moves with it.
         let mut bad_version = sealed.clone();
-        bad_version.version = 0x02;
+        bad_version.version = ROTATION_VERSION + 1;
         let (enc_secret, _) = enc_pair(0x40);
         assert_eq!(
             open_rotation(&enc_secret, &bad_version),
-            Err(ControlError::UnknownVersion(0x02))
+            Err(ControlError::UnknownVersion(ROTATION_VERSION + 1))
+        );
+        // The superseded `0x01` document is refused, not parsed as a
+        // `0x02` one missing its third blob.
+        let mut old_version = sealed.clone();
+        old_version.version = 0x01;
+        assert_eq!(
+            open_rotation(&enc_secret, &old_version),
+            Err(ControlError::UnknownVersion(0x01))
         );
     }
 }

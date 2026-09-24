@@ -79,9 +79,21 @@ Releases are not required to write every format they read:
     file so open and resync refuse it. The exception is unknown record
     tags, which are skipped: a deliberate, bounded forward-compatibility
     rule (skip, never reinterpret — unknown bytes are never silently
-    read as something else). (This is also the pre-v1 contract: until
-    the format freezes, every alpha may break compatibility, and the
-    breakage announces itself.)
+     read as something else). (This is also the pre-v1 contract: until
+     the format freezes, every alpha may break compatibility, and the
+     breakage announces itself.)
+
+   The rotation delivery is versioned in its header byte and moved
+   `0x01 -> 0x02` when the owner proof was added (`ROTATION_VERSION`).
+   Version `0x01` plaintext carried two blobs (transition, wrapped
+   capability); `0x02` carries three (those plus the owner proof). The
+   bump is what makes a `0x01` delivery fail loudly as
+   `UnknownVersion` rather than parse as a `0x02` document missing its
+   third blob. This is a deliberate, announced incompatibility under
+   the pre-v1 rule above, not a silent reinterpretation: an old sealed
+   rotation stops being acceptable and the owner re-mints. The
+   capability *wrap* format is deliberately untouched, so
+   bootstrap/invitation delivery is unaffected.
 
 ## What this forbids
 

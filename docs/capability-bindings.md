@@ -46,8 +46,12 @@ alongside the message. The table proves the rule row by row.
 
 - Authenticates: AEAD over
   `domain ‖ version ‖ drive ‖ recipient ‖ enc_key ‖ epoch`, plaintext
-  repeating drive/device/epoch/transition/wrapped, inner↔outer
-  agreement, and a sender-is-member-of-the-authorizing-state check.
+  repeating drive/device/epoch/transition/wrapped/owner-proof,
+  inner↔outer agreement, a sender-is-member-of-the-authorizing-state
+  check, and an owner proof over a digest of the unwrapped secret
+  vector whose signer must be an owner of the transition's
+  *predecessor* state. The two are separate authorities: the sender
+  check grants delivery, the proof grants mint.
 - Transplant: inner≠outer device or epoch suppresses; a genuine wrap
   paired with a substituted same-epoch transition suppresses at the
   transition↔capability binding check; a non-member sender's delivery
@@ -55,8 +59,14 @@ alongside the message. The table proves the rule row by row.
 - Recipient provenance: the wrap key comes from chain state
   (`encryption_key_of` on the authorizing transition), documented in
   code as chain-state-never-caller.
+- Issuer provenance: a member that mints its own vector cannot produce
+  the owner's proof, so its delivery is refused without changing the
+  keyring; the outgoing owner of a handover can, because authority is
+  the pre-state, while the incoming owner cannot.
 - Pinned by: inner/outer mismatch, non-member sender, removed-sender,
-  and substituted-transition suppression (`tests_rotation.rs`).
+  and substituted-transition suppression (`tests_rotation.rs`), plus
+  member-minted and non-owner-signed refusal, handover authorization,
+  and the inverse incoming-owner refusal.
 
 ## SealedBootstrap (invitation)
 

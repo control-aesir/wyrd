@@ -1362,13 +1362,19 @@ where
     }
 
     /// Submit one mutation to the loop, mapping both channel and
-    /// application failures to the POSIX boundary.
+    /// application failures to the POSIX boundary. Refusals log the
+    /// underlying variant: several distinct failures share `EIO`, and
+    /// the errno alone cannot tell a conflicted drive from an
+    /// unavailable view or a failed authoring.
     fn submit(&self, kind: MutationKind) -> Result<MutationOutcome, fuser::Errno> {
         self.mutations
             .as_ref()
             .ok_or(fuser::Errno::EROFS)?
             .submit(kind)
-            .map_err(|error| mutation_errno(&error))
+            .map_err(|error| {
+                tracing::debug!(error = ?error, "mutation refused");
+                mutation_errno(&error)
+            })
     }
 
     /// Remove the file or symlink `name` under `parent_ino`.

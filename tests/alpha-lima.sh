@@ -157,22 +157,27 @@ start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
   pass "$name: mountpoint up"
 }
 
-stop_mount() { # <name> <signal>: signal, wait up to 15s, assert exit 0 + unmounted
-  local name="$1" sig="$2"
-  local pid
+stop_mount() { # <name> <signal> [budget-s = 15]: signal, wait for exit,
+  # assert exit 0 + unmounted. The budget is a bound, not a target: a
+  # mount holding a large vault persists its serving store on the way
+  # out, so step 6's post-bulk stop gets a larger one.
+  local name="$1" sig="$2" budget="${3:-15}"
+  local pid started elapsed
+  started=$(date +%s)
   pid="$(cat "$E2E_ROOT/mount-$name.pid")"
   kill "-$sig" "$pid"
   local i status="timeout"
-  for ((i = 0; i < 75; i++)); do
+  for ((i = 0; i < budget * 5; i++)); do
     if ! kill -0 "$pid" 2>/dev/null; then
       set +e; wait "$pid"; status=$?; set -e
       break
     fi
     sleep 0.2
   done
-  [[ "$status" == "0" ]] || die "$name: shutdown exit $status on $sig, want clean 0"
+  elapsed=$(( $(date +%s) - started ))
+  [[ "$status" == "0" ]] || die "$name: shutdown exit $status on $sig after ${elapsed}s, want clean 0"
   mountpoint -q "$MNTS/$name" && die "$name: still mounted after $sig"
-  pass "$name: clean shutdown on $sig (exit 0, unmounted)"
+  pass "$name: clean shutdown on $sig (exit 0, unmounted, ${elapsed}s)"
 }
 
 # --- step 2: local-only mount --------------------------------------------
@@ -576,16 +581,29 @@ EOF
   # Clear a qdisc stranded by a killed run before throttling.
   sudo tc qdisc del dev lo root 2>/dev/null || true
   sudo tc qdisc add dev lo root netem rate 4mbit delay 10ms
+  # An idle line before the write anchors the quiesce check below: a
+  # pass only reports idle when it short-circuits before publication,
+  # so one seen after the write means the owner's publish pass — and
+  # with it the serving-mirror flush of the whole closure — finished.
+  local idle_before
+  idle_before=$(grep -c "sync pass idle" "$LOGDIR/mount-owner-relay.err" || true)
   dd if=/dev/zero of="$MNTS/owner-relay/peer-down.bin" bs=1M count=56 \
     status=none
   poll_until 120 test -e "$MNTS/member-relay/peer-down.bin" \
     || die "member never saw the owner's file (head did not install)"
-  # Lift the throttle before the stop: the owner's graceful shutdown
-  # runs its control plane over the same loopback, and 15s is its
-  # budget. The owner dies with its serving socket within the stop, so
-  # the member cannot pull the rest of the file after this point.
+  # Let the owner quiesce first: its graceful shutdown drains the
+  # serving mirror, and stopping it mid-import of a 56MiB closure
+  # would measure the mirror, not the shutdown.
+  poll_until 120 bash -c "[[ \$(grep -c 'sync pass idle' '$LOGDIR/mount-owner-relay.err') -gt $idle_before ]]" \
+    || die "the owner never quiesced (serving-mirror drain stuck?)"
+  # Lift the throttle before the stop: the owner's control plane runs
+  # over the same loopback, and 15s is the stop's budget. The owner
+  # dies with its serving socket within the stop, so the member
+  # cannot pull the rest of the file after this point.
   sudo tc qdisc del dev lo root 2>/dev/null || true
-  stop_mount owner-relay INT
+  # 90s: the owner holds a 56MiB closure, and its exit persists the
+  # serving store — bounded, but far past the 15s small-vault budget.
+  stop_mount owner-relay INT 90
   pass "owner stopped mid-transfer (member head installed, chunks remote)"
 
   local started elapsed rc

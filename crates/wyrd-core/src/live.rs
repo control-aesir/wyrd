@@ -1192,6 +1192,29 @@ where
         ))
     }
 
+    /// Classify absent content on the mutation path, paired with the
+    /// view's own absence rule (`wyrd-fuse`'s `absent`): a remote or
+    /// fetching identity is a `NeedContent` prerequisite, anything
+    /// else — a local claim the store cannot back, unreachable, or
+    /// corrupt — fails closed as the transient store error the view
+    /// surfaces.
+    fn mutation_absent(&self, chunk: &ContentId, heads: &[AuthorizedSnapshot]) -> MutationError {
+        let status = self
+            .engine
+            .runtime_state()
+            .map(|state| state.status(chunk))
+            .unwrap_or(FetchStatus::RemoteOnly);
+        match status {
+            FetchStatus::RemoteOnly | FetchStatus::Fetching => MutationError::NeedContent {
+                chunk: *chunk,
+                base: Self::pin_head(heads),
+            },
+            FetchStatus::Unavailable | FetchStatus::Available | FetchStatus::Corrupt => {
+                MutationError::Store(StoreFailure::Transient)
+            }
+        }
+    }
+
     /// Read at most `max_len` bytes of a regular file's plaintext from
     /// the current heads. A truncate uses this to read only the prefix it
     /// keeps, and never more than the target, so shrinking an oversized
@@ -1226,6 +1249,24 @@ where
             Node::File { size, .. } => size,
             _ => return Err(MutationError::IsDirectory(path.to_string())),
         };
+        // Fast demand pre-check: stat every chunk before reading. A
+        // deferred retry over a partially-fetched large file would
+        // otherwise re-read and re-hash the whole served prefix every
+        // pass — minutes of store I/O inside the loop, which starves
+        // every other mutation and the deadline checks behind it. The
+        // honest read (with per-chunk verification) still runs when
+        // the file is fully present, so bitrot fails closed exactly
+        // as before.
+        {
+            let store = self.store.read().map_err(|_| MutationError::Lock)?;
+            for chunk in file.chunks() {
+                match store.has(chunk) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(self.mutation_absent(chunk, heads)),
+                    Err(error) => return Err(MutationError::Store(error.failure())),
+                }
+            }
+        }
         let len = size.min(max_len);
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
             .map_err(|error| match error {

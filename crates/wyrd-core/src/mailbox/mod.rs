@@ -67,6 +67,52 @@
 //! daemon composes exactly one mailbox per process (see the review note on
 //! runtime-per-mailbox cost before ever changing that).
 //!
+//! # Signer secret boundary
+//!
+//! Secret inventory for this mailbox. The holders are upstream
+//! `nostr`/`secp256k1` types, which cannot implement our scrubbing, so
+//! this boundary is documented and pinned, not scrubbed:
+//!
+//! | Holder | Lives in | Copies | Why it must exist |
+//! |---|---|---|---|
+//! | signer `Keys` | `LiveMailbox.signer` (local case) | 1 | outbound seals sign through the generic `S` boundary; a remote NIP-46 session holds no local secret |
+//! | `open_keys: Keys` | `LiveMailbox` | 1 | inbound `from_gift_wrap` needs the identity key, which the generic signer cannot lend |
+//! | `DeviceIdentitySecret` | CLI composer | 1 | `Zeroizing`-backed and sync-audited; parsed once into the bare `SecretKey` `connect` takes |
+//!
+//! Two holders is the floor for the local case: signer and opener are
+//! the same key in different roles, and the generic `S` boundary
+//! forbids sharing one holder. One holder for the remote-signer case.
+//! `connect` adds no copy — `Keys::new` moves `open_secret`, and the
+//! owner id, tag, and filter carry public material only.
+//! Within-holder duplication (secret plus keypair inside each `Keys`)
+//! is upstream-controlled residual.
+//!
+//! Disclosure audit (pinned by `tests_signer_boundary`, fail-closed on
+//! upstream upgrades):
+//!
+//! - `Debug`: `Keys` renders the public key only (nostr 0.45.5);
+//!   `SecretKey`'s derived `Debug` reaches only secp256k1's tagged
+//!   fingerprint, never raw bytes (secp256k1 0.30.0); `LiveMailbox`
+//!   itself has no `Debug` impl at all.
+//! - Errors: the fixed `MailboxError` variants render constant strings
+//!   (exact-output pinned); `Transport` echoes its caller payload, and
+//!   every call site passes relay or dedupe-log I/O errors, never
+//!   secret material (review discipline, verified by grep, not by test).
+//! - Tasks: supervisor and drainer contexts carry client, filter
+//!   (public owner tag), channels, and health — no secret; the signer
+//!   serves the send path behind its `Arc` and is never cloned into a
+//!   spawned task.
+//! - Conversions: no `to_secret_*`/`as_secret_bytes` call exists in our
+//!   crates; the CLI parses identity through `Zeroizing` buffers.
+//!
+//! Accepted residual: upstream drops do not scrub, so both holders
+//! persist until the mailbox (and the CLI's identity) drops —
+//! process-lifetime residency, freed but not wiped. The
+//! identity-mismatch early return drops `open_keys` the same way.
+//! Adding a signer holder, a `Debug` impl on mailbox types, or a
+//! secret-bearing error variant must update this section and its
+//! tests together.
+//!
 //! # Supervision
 //!
 //! The SDK owns TCP reconnects and resubscribes automatically after one,
@@ -118,6 +164,8 @@ mod tests_harness;
 mod tests_interop;
 #[cfg(test)]
 mod tests_mailbox;
+#[cfg(test)]
+mod tests_signer_boundary;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;

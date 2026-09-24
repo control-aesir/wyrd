@@ -19,9 +19,10 @@
 //! `StoreKey` (durable) is scrubbed and intentionally `Debug`-less, but
 //! it is private to its module and cannot be named here; its contract
 //! lives in `durable/store.rs` ("No `Debug`: the store key must never
-//! be printable"). The `wyrd-core` mailbox signer boundary
-//! (`LiveMailbox`'s upstream `Keys`) and CLI credential handling are
-//! outside this module's scope and need their own pass.
+//! be printable"). The `wyrd-core` mailbox signer boundary has its own
+//! pass: the "Signer secret boundary" section in the mailbox module
+//! docs, pinned by `mailbox::tests_signer_boundary`. CLI credential
+//! handling rests on the sync-audited identity types named above.
 //!
 //! | Type | Holds | Scrub on drop | `Debug` | `Clone` | Notes |
 //! |---|---|---|---|---|---|

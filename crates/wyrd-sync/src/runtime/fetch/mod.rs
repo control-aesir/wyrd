@@ -479,3 +479,5 @@ mod tests_attempts;
 mod tests_fetch;
 #[cfg(test)]
 mod tests_limits;
+#[cfg(test)]
+mod tests_limits_e2e;

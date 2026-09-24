@@ -7,7 +7,7 @@ use wyrd_format::{
     StoreFailure,
 };
 
-use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use crate::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
@@ -221,6 +221,8 @@ struct FailingTransport {
     inner: MemoryBulkSource,
     failing: BTreeSet<StorageId>,
 }
+
+impl AttemptBudget for FailingTransport {}
 
 impl BulkSource for FailingTransport {
     fn fetch_root_manifest(

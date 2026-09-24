@@ -658,6 +658,23 @@ impl MutationQueue {
     pub fn outstanding(&self) -> usize {
         self.lock_state().outstanding
     }
+
+    /// The earliest prerequisite deadline among held mutations: each
+    /// deferred entry's first hold plus `max_wait`. The fetch budget
+    /// derives from this — a pass with nothing held fetches unbounded
+    /// (today's behavior), while a pass that owes a timeout decision
+    /// stops starting new fetch work at the deadline so the decision
+    /// lands on time. `None` when nothing is held.
+    pub fn nearest_deadline(&self, max_wait: Duration) -> Option<Instant> {
+        let state = self.lock_state();
+        state
+            .pending
+            .iter()
+            .chain(state.deferred.iter())
+            .filter_map(|queued| queued.first_deferred)
+            .map(|since| since + max_wait)
+            .min()
+    }
 }
 
 /// A drained set of queued mutations that completes every request when
@@ -1223,6 +1240,60 @@ mod tests {
         }
         assert_eq!(wants.waiter_count(&chunk2), 0, "drop releases the want");
         assert_eq!(dropped.join().unwrap(), Err(MutationError::Engine));
+    }
+
+    /// The fetch budget's clock: the nearest deadline is the earliest
+    /// first-hold plus `max_wait` across pending and deferred entries,
+    /// and `None` when nothing is held. The pass reads it before
+    /// draining, so a held-then-requeued entry counts too.
+    #[test]
+    fn nearest_deadline_spans_pending_and_deferred_entries() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let max_wait = Duration::from_secs(30);
+        assert_eq!(queue.nearest_deadline(max_wait), None, "nothing held");
+
+        let held = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("held")))
+        };
+        let first_hold = Instant::now();
+        {
+            let mut batch = take_batch_blocking(&queue);
+            batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+        }
+        let deadline = queue.nearest_deadline(max_wait).expect("held");
+        assert!(
+            deadline >= first_hold + max_wait && deadline <= Instant::now() + max_wait,
+            "the deadline is the first hold plus max_wait"
+        );
+
+        // A second entry held later never moves the deadline later
+        // than the first: the queue reports the nearest.
+        let later = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("later")))
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            let mut batch = take_batch_blocking(&queue);
+            // Both entries re-hold: the first keeps its original
+            // first-hold, the later one starts its clock now.
+            for index in 0..batch.len() {
+                batch.defer(index, SnapshotId::from_bytes([0xB1; 32]));
+            }
+        }
+        assert_eq!(
+            queue.nearest_deadline(max_wait),
+            Some(deadline),
+            "the first hold still sets the budget"
+        );
+
+        queue.shutdown();
+        assert_eq!(held.join().unwrap(), Err(MutationError::Shutdown));
+        assert_eq!(later.join().unwrap(), Err(MutationError::Shutdown));
+        assert_eq!(queue.nearest_deadline(max_wait), None, "drained");
     }
 
     /// Shutdown releases held wants through the same finish path:

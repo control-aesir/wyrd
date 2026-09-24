@@ -24,7 +24,7 @@ use thiserror::Error;
 use wyrd_format::durable;
 use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
-use crate::bulk::{BulkError, BulkSource, SealedManifest};
+use crate::bulk::{AttemptBudget, BulkError, BulkSource, SealedManifest};
 use crate::runtime::RuntimeState;
 use crate::seal::blob_root;
 use crate::transport::encode_node_addr;
@@ -579,6 +579,10 @@ impl VaultSource {
         })
     }
 }
+
+/// Local vault reads: instantaneous, so the plan's per-attempt cap
+/// has nothing to bound.
+impl AttemptBudget for VaultSource {}
 
 impl BulkSource for VaultSource {
     fn fetch_root_manifest(

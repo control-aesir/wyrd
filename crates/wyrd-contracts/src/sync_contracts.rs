@@ -13,7 +13,7 @@ use wyrd_format::{
 };
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::authorization::{Classification, Rejection, SnapshotDag};
-use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use wyrd_sync::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
 use wyrd_sync::control::{CapabilityPayload, Message};
 use wyrd_sync::durable::DurableError;
@@ -564,6 +564,8 @@ fn authored_snapshots_mount_through_the_daemon_view() {
 /// a no-op: the in-process peer needs no iroh naming (no-op impls
 /// keep the in-memory fakes honest about not carrying live routes).
 struct VaultPeer(VaultSource);
+
+impl AttemptBudget for VaultPeer {}
 
 impl BulkSource for VaultPeer {
     fn fetch_root_manifest(
@@ -1305,6 +1307,8 @@ struct Bounded<'a> {
     maxes: Vec<usize>,
     hostile_root: Option<SnapshotId>,
 }
+
+impl AttemptBudget for Bounded<'_> {}
 
 impl BulkSource for Bounded<'_> {
     fn fetch_root_manifest(

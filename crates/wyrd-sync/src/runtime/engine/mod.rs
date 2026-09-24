@@ -1255,6 +1255,20 @@ impl Engine {
         super::plan::execute(self, bulk, objects)
     }
 
+    /// The same run under a wall-clock budget: the plan stops starting
+    /// fetch work at `deadline` and caps each in-flight attempt at the
+    /// remaining time, so a stalled provider cannot push a caller's
+    /// timeout decision past its bound. Unstarted work stays pending
+    /// for the next run. `None` is the unbounded run.
+    pub fn execute_plan_sliced(
+        &mut self,
+        bulk: &mut impl BulkSource,
+        objects: &mut impl ObjectStore,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<ExecuteReport, EngineError> {
+        super::plan::execute_sliced(self, bulk, objects, deadline)
+    }
+
     /// Whether a representation is fetch-eligible this run: its cooldown
     /// (if any) has expired. Cooled representations are skipped, not
     /// attempted — the item stays pending and reports unfulfilled.

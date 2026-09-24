@@ -162,9 +162,16 @@ MutationRequest {
    handle commit. The wait is bounded by `max_mutation_wait` (default
    30s, wall-clock from the first hold, checked every pass); past it
    the mutation fails `ETIMEDOUT` — retryable information, not a
-   system failure. A mutation evaluated headless or multi-head never
+   system failure.    A mutation evaluated headless or multi-head never
    holds: nothing meaningful pins, so it fails closed as before.
-   A pass that fulfills fetch objects with mutations still queued
+   The wait is a wall-clock bound on the loop, not just on the
+   check: while any mutation is held, the pass's fetch runs under the
+   nearest deadline's remaining time — each attempt is capped at what
+   remains and the plan stops starting fetch work once the budget is
+   spent, so one stalled provider cannot push the `TimedOut` decision
+   past its bound (unstarted work stays pending for the next pass).
+   With nothing held, fetching is unbounded. A pass that fulfills
+   fetch objects with mutations still queued
    wakes the loop immediately, so a held mutation retries without
    waiting out the idle pacing deadline.
 5. **Liveness consequence (named).** The daemon synchronization loop is a

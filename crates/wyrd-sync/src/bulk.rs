@@ -71,11 +71,23 @@ pub enum BulkError {
     Oversize { bytes: usize, max: usize },
 }
 
+/// Per-attempt fetch timeout knob: the plan caps each attempt at the
+/// remaining time to the nearest held-mutation deadline, so one
+/// stalled provider cannot push a timeout decision past its wall-clock
+/// bound. The default is a no-op (attempts run under the source's own
+/// built-in timeouts); sources with real per-attempt deadlines
+/// override it. Set per attempt immediately before use and restored to
+/// `None` for unbounded runs — the knob is plan-run state, not source
+/// configuration.
+pub trait AttemptBudget {
+    fn set_attempt_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
+}
+
 /// The synchronous bulk boundary: sealed manifests and sealed objects
 /// by their fetch addresses. Every fetch is size-aware: `max` is the
 /// caller's pre-decode byte ceiling, and a representation over it must
 /// fail with [`BulkError::Oversize`] rather than return bytes.
-pub trait BulkSource {
+pub trait BulkSource: AttemptBudget {
     /// The sealed root manifest a member peer holds for a snapshot, if any.
     fn fetch_root_manifest(
         &mut self,
@@ -186,6 +198,11 @@ pub struct IrohBulkSource {
     /// update replaces it (last accepted wins), so those maps stay
     /// single-valued by policy.
     transport: BTreeMap<BaoRoot, Vec<IrohBlobRef>>,
+    /// Plan-run attempt cap from [`AttemptBudget`]: the remaining time
+    /// to the nearest held-mutation deadline, or `None` for the
+    /// built-in timeouts. Plan-run state, reset by the plan — never
+    /// source configuration.
+    attempt_timeout: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -213,6 +230,7 @@ impl IrohBulkSource {
             snapshots: BTreeMap::new(),
             sealed: BTreeMap::new(),
             transport: BTreeMap::new(),
+            attempt_timeout: None,
         }
     }
 
@@ -349,13 +367,23 @@ impl IrohBulkSource {
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
+        // The plan may cap this attempt at the remaining time to the
+        // nearest held-mutation deadline: a sliced attempt reports a
+        // transport timeout (retried next pass), never a strike — the
+        // deadline belongs to the waiter, not the provider. Uncapped
+        // runs use the built-in timeouts.
+        let blob_timeout = self
+            .attempt_timeout
+            .map(|cap| cap.min(FETCH_BLOB_TIMEOUT))
+            .unwrap_or(FETCH_BLOB_TIMEOUT);
+        let dial_timeout = FETCH_DIAL_TIMEOUT.min(blob_timeout);
         self.runtime.block_on(async move {
             // One deadline for the whole attempt: dial, size discovery,
             // and streaming share it, so a peer that connects but never
             // streams cannot outlast a peer that never answers. Slow
             // passes still complete; the plan retries what they miss.
-            tokio::time::timeout(FETCH_BLOB_TIMEOUT, async move {
-                let connection = dial(&endpoint, provider, FETCH_DIAL_TIMEOUT).await?;
+            tokio::time::timeout(blob_timeout, async move {
+                let connection = dial(&endpoint, provider, dial_timeout).await?;
                 let (size, _) = get_verified_size(&connection, &hash)
                     .await
                     .map_err(|error| BulkError::Transport(error.to_string()))?;
@@ -423,6 +451,12 @@ where
     Err(BulkError::Transport(
         "blob stream ended without completion".to_string(),
     ))
+}
+
+impl AttemptBudget for IrohBulkSource {
+    fn set_attempt_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.attempt_timeout = timeout;
+    }
 }
 
 impl BulkSource for IrohBulkSource {
@@ -511,6 +545,10 @@ impl MemoryBulkSource {
         self.sealed.insert(storage, sealed);
     }
 }
+
+/// In-memory: attempts are instant, so the plan's per-attempt cap
+/// has nothing to bound.
+impl AttemptBudget for MemoryBulkSource {}
 
 impl BulkSource for MemoryBulkSource {
     fn fetch_root_manifest(

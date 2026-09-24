@@ -599,8 +599,15 @@ where
                 // observability work, separately tracked.
                 let state = self.engine.runtime_state()?;
                 let _routes = bulk.publish_routes(&state).map_err(LiveError::Engine)?;
+                // A held mutation's timeout decision must land on time:
+                // the fetch runs under the nearest deadline's remaining
+                // time, so one stalled provider cannot push the `TimedOut`
+                // check below past its wall-clock bound. With nothing
+                // held the deadline is `None` and fetching is unbounded.
+                let deadline = self.mutations.nearest_deadline(self.max_mutation_wait);
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
-                self.engine.execute_plan(bulk, &mut shared)?
+                self.engine
+                    .execute_plan_sliced(bulk, &mut shared, deadline)?
             }
             None => ExecuteReport::default(),
         };

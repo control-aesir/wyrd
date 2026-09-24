@@ -20,7 +20,7 @@ use wyrd_format::{
     MembershipTransition, ObjectKind, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
-use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use crate::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use crate::control::{
     seal, seal_rotation, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
 };
@@ -670,6 +670,8 @@ pub(crate) struct TransportFault {
     pub(crate) error: BulkError,
 }
 
+impl AttemptBudget for TransportFault {}
+
 impl BulkSource for TransportFault {
     fn fetch_root_manifest(
         &mut self,
@@ -703,6 +705,8 @@ impl BulkSource for TransportFault {
         Err(self.error.clone())
     }
 }
+
+impl AttemptBudget for TransportOnly {}
 
 impl BulkSource for TransportOnly {
     fn fetch_root_manifest(
@@ -746,6 +750,8 @@ pub(crate) struct WithoutObjects {
     pub(crate) hidden: BTreeSet<StorageId>,
     pub(crate) hidden_transport: BTreeSet<BaoRoot>,
 }
+
+impl AttemptBudget for WithoutObjects {}
 
 impl BulkSource for WithoutObjects {
     fn fetch_root_manifest(

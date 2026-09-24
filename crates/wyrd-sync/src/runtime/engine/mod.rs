@@ -1083,7 +1083,23 @@ impl Engine {
         for body in rebuilt.runtime.snapshot_bodies.values() {
             dag.observe(body.clone());
         }
-        let eligible = dag.eligible_heads(&rebuilt.log);
+        // One classification pass feeds both views: the eligible set
+        // and the per-snapshot completion predicate below.
+        let classified = dag.classify(&rebuilt.log);
+        let mut eligible: Vec<SnapshotId> = classified
+            .iter()
+            .filter(|(_, classification)| {
+                **classification == crate::authorization::Classification::Eligible
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        eligible.sort();
+        // The completion predicate is classification-aware: only an
+        // authorized child (eligible tip or accepted history) proves
+        // continuity. A same-epoch child that is rejected, pending,
+        // voided, stranded, or superseded — a reader-authored decoy,
+        // for instance — must never discharge the queue and orphan
+        // the lineage.
         for head in pending {
             if eligible.contains(&head) {
                 // Staged but the transition never landed: the head
@@ -1093,8 +1109,17 @@ impl Engine {
                 continue;
             }
             let already = dag.ids().iter().any(|id| {
-                dag.snapshot(id)
-                    .is_some_and(|s| s.parents.contains(&head) && s.epoch == known.epoch)
+                let continues = matches!(
+                    classified.get(id),
+                    Some(
+                        crate::authorization::Classification::Eligible
+                            | crate::authorization::Classification::CanonicalHistory
+                    )
+                );
+                continues
+                    && dag
+                        .snapshot(id)
+                        .is_some_and(|s| s.parents.contains(&head) && s.epoch == known.epoch)
             });
             if already {
                 // A completed carry (or its synced echo): discharge,

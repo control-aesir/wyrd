@@ -291,6 +291,34 @@ impl RuntimeState {
         true
     }
 
+    /// Apply a durable replacement: the obligation named by
+    /// `supersedes` is superseded by `replacement`.
+    ///
+    /// The identity is the whole point — a replacement applies only to
+    /// the exact sealed fact it names, so an arbitrary fact id can
+    /// never become a replacement parent. When it does apply, the new
+    /// bytes become the current obligation and the supersession is
+    /// durable: after this, retries reuse them byte-identically
+    /// instead of re-minting.
+    pub fn record_capability_replaced(
+        &mut self,
+        epoch: u64,
+        recipient: DeviceId,
+        supersedes: [u8; 32],
+        replacement: Vec<u8>,
+    ) {
+        let key = (epoch, recipient);
+        let Some(current) = self.capability_sealed.get(&key) else {
+            // Nothing to supersede: the named fact is not the current
+            // obligation for this pair, so the replacement is inert.
+            return;
+        };
+        if crate::durable::sealed_fact_id(epoch, &recipient, current) != supersedes {
+            return;
+        }
+        self.capability_sealed.insert(key, replacement);
+    }
+
     /// Record one capability obligation discharged.
     pub fn record_capability_delivered(&mut self, epoch: u64, recipient: DeviceId) -> bool {
         self.capability_delivered.insert((epoch, recipient))

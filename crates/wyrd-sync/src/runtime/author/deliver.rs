@@ -385,10 +385,21 @@ fn deliver_capabilities(
             // still fail closed: genuinely undecodable outbox bytes never
             // silently heal.
             Some(bytes) if is_superseded_rotation(&bytes) => {
-                let Some(bytes) = mint_fresh_rotation(
+                // Supersede durably, exactly once. First-seal-wins
+                // cannot express "these bytes are no longer the
+                // obligation", so the change is its own fact: a
+                // pass-local overlay would be discarded on restart,
+                // leaving the stale fact to be re-minted into *new*
+                // bytes every pass — one appended-and-fsynced,
+                // then-ignored record per obligation per pass during a
+                // relay outage, and retries that are no longer
+                // byte-identical. With the fact committed, replay makes
+                // the replacement the current obligation and every
+                // later pass reuses these exact bytes.
+                let supersedes = crate::durable::sealed_fact_id(epoch, &recipient, &bytes);
+                let Some(replacement) = mint_fresh_rotation_bytes(
                     engine,
                     &rebuilt.keyring,
-                    &mut sealed_overlay,
                     epoch,
                     recipient,
                     &transition_id,
@@ -396,7 +407,13 @@ fn deliver_capabilities(
                 else {
                     continue;
                 };
-                bytes
+                engine.commit_facts(&[Fact::CapabilitySealedReplaced {
+                    epoch,
+                    recipient,
+                    supersedes,
+                    replacement: replacement.clone(),
+                }])?;
+                replacement
             }
             Some(bytes) => {
                 if SealedControl::decode(&bytes).is_err() {
@@ -507,6 +524,25 @@ fn mint_fresh_rotation(
     recipient: DeviceId,
     transition_id: &TransitionId,
 ) -> Result<Option<Vec<u8>>, EngineError> {
+    let Some(bytes) = mint_fresh_rotation_bytes(engine, keyring, epoch, recipient, transition_id)?
+    else {
+        return Ok(None);
+    };
+    engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
+    sealed_overlay.insert((epoch, recipient), bytes.clone());
+    Ok(Some(bytes))
+}
+
+/// Mint current-framing rotation bytes for one obligation without
+/// committing anything: the caller decides whether this becomes the
+/// durable obligation (a replacement fact) or a first seal.
+fn mint_fresh_rotation_bytes(
+    engine: &mut Engine,
+    keyring: &DriveKeyring,
+    epoch: u64,
+    recipient: DeviceId,
+    transition_id: &TransitionId,
+) -> Result<Option<Vec<u8>>, EngineError> {
     let Some(state) = engine.log.state_of(transition_id) else {
         return Ok(None);
     };
@@ -544,8 +580,6 @@ fn mint_fresh_rotation(
     )?;
     let bytes = sealed.encode();
     crate::transport::mailbox::check_outbound_size(&bytes)?;
-    engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
-    sealed_overlay.insert((epoch, recipient), bytes.clone());
     Ok(Some(bytes))
 }
 /// The epoch-secret vector a transition's grant carries: one secret per

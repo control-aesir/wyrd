@@ -42,6 +42,7 @@ pub enum RuntimeFact {
     TransitionDelivered(TransitionId, DeviceId),
     CapabilityQueued(u64, DeviceId),
     CapabilitySealed(u64, DeviceId, Vec<u8>),
+    CapabilitySealedReplaced(u64, DeviceId, [u8; 32], Vec<u8>),
     CapabilityDelivered(u64, DeviceId),
     CarryQueued(SnapshotId),
     CarryDone(SnapshotId),
@@ -68,6 +69,7 @@ pub struct LoadedFacts {
     pub transition_delivered: Vec<(TransitionId, DeviceId)>,
     pub capability_queued: Vec<(u64, DeviceId)>,
     pub capability_sealed: Vec<(u64, DeviceId, Vec<u8>)>,
+    pub capability_sealed_replaced: Vec<(u64, DeviceId, [u8; 32], Vec<u8>)>,
     pub capability_delivered: Vec<(u64, DeviceId)>,
     pub bootstrap_pending: Vec<Vec<u8>>,
     pub runtime_facts: Vec<RuntimeFact>,
@@ -155,6 +157,21 @@ impl LoadedFacts {
                     .push((epoch, recipient, sealed.clone()));
                 self.runtime_facts
                     .push(RuntimeFact::CapabilitySealed(epoch, recipient, sealed));
+            }
+            DecodedFact::CapabilitySealedReplaced(epoch, recipient, supersedes, replacement) => {
+                self.capability_sealed_replaced.push((
+                    epoch,
+                    recipient,
+                    supersedes,
+                    replacement.clone(),
+                ));
+                self.runtime_facts
+                    .push(RuntimeFact::CapabilitySealedReplaced(
+                        epoch,
+                        recipient,
+                        supersedes,
+                        replacement,
+                    ));
             }
             DecodedFact::CapabilityDelivered(epoch, recipient) => {
                 self.capability_delivered.push((epoch, recipient));
@@ -279,6 +296,9 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::CapabilitySealed(epoch, recipient, sealed) => {
                 runtime.record_capability_sealed(epoch, recipient, sealed);
+            }
+            RuntimeFact::CapabilitySealedReplaced(epoch, recipient, supersedes, replacement) => {
+                runtime.record_capability_replaced(epoch, recipient, supersedes, replacement);
             }
             RuntimeFact::CapabilityDelivered(epoch, recipient) => {
                 runtime.record_capability_delivered(epoch, recipient);

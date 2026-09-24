@@ -1160,3 +1160,102 @@ fn capability_sealed_accepts_rotation_framing() {
         "sealed for a stranger, keyed at the owner"
     );
 }
+
+/// The supersession state machine, at the layer that owns it.
+///
+/// A replacement names the exact sealed fact it supersedes, so it
+/// applies to that obligation and nothing else: after replay there is
+/// exactly one current obligation, resolved deterministically to the
+/// replacement bytes, and a replacement naming any other fact is
+/// inert. This is what makes a stale obligation recoverable durably
+/// and byte-identically, rather than by re-minting per pass.
+#[test]
+fn capability_replacement_supersedes_exactly_the_named_fact() {
+    use crate::runtime::test_util::identity;
+
+    let (drive, device, epoch) = (drive(), identity(0x04).1, 2u64);
+    let stale = sealed_rotation_bytes(&drive, device, epoch, 0x01);
+    let replacement = sealed_rotation_bytes(&drive, device, epoch, 0x02);
+    let supersedes = crate::durable::sealed_fact_id(epoch, &device, &stale);
+
+    // The named fact is current: the replacement applies.
+    let mut state = RuntimeState::new(drive);
+    state.record_capability_queued(epoch, device);
+    state.record_capability_sealed(epoch, device, stale.clone());
+    state.record_capability_replaced(epoch, device, supersedes, replacement.clone());
+    assert_eq!(
+        state.capability_sealed_bytes(epoch, device),
+        Some(replacement.as_slice()),
+        "the replacement becomes the current obligation"
+    );
+
+    // A replacement naming a different fact is inert: an arbitrary
+    // fact id can never become a replacement parent.
+    let mut other = RuntimeState::new(drive);
+    other.record_capability_queued(epoch, device);
+    other.record_capability_sealed(epoch, device, stale.clone());
+    other.record_capability_replaced(epoch, device, [0xEE; 32], replacement.clone());
+    assert_eq!(
+        other.capability_sealed_bytes(epoch, device),
+        Some(stale.as_slice()),
+        "a replacement for the wrong fact changes nothing"
+    );
+
+    // Replaced twice, the second naming the first replacement: the
+    // chain resolves to the newest, deterministically.
+    let second = sealed_rotation_bytes(&drive, device, epoch, 0x03);
+    let mut chained = RuntimeState::new(drive);
+    chained.record_capability_queued(epoch, device);
+    chained.record_capability_sealed(epoch, device, stale.clone());
+    chained.record_capability_replaced(epoch, device, supersedes, replacement.clone());
+    chained.record_capability_replaced(
+        epoch,
+        device,
+        crate::durable::sealed_fact_id(epoch, &device, &replacement),
+        second.clone(),
+    );
+    assert_eq!(
+        chained.capability_sealed_bytes(epoch, device),
+        Some(second.as_slice()),
+        "a chained replacement supersedes its immediate predecessor"
+    );
+
+    // The identity is over the exact bytes: a one-byte difference is a
+    // different fact, so a replacement cannot be retargeted by
+    // mutating the payload it names.
+    assert_ne!(
+        crate::durable::sealed_fact_id(epoch, &device, &stale),
+        crate::durable::sealed_fact_id(
+            epoch,
+            &device,
+            &sealed_rotation_bytes(&drive, device, epoch, 0x01)
+        ),
+        "distinct payloads are distinct facts"
+    );
+}
+
+/// A sealed rotation envelope at a chosen version, as durable bytes.
+fn sealed_rotation_bytes(
+    drive: &wyrd_format::DriveId,
+    recipient: wyrd_format::DeviceId,
+    epoch: u64,
+    version: u8,
+) -> Vec<u8> {
+    use crate::control::seal_rotation;
+    use crate::keys::DeviceEncryptionSecret;
+    use crate::runtime::test_util::encryption_key;
+
+    let key = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    let mut sealed = seal_rotation(
+        drive,
+        recipient,
+        &encryption_key(&key),
+        epoch,
+        &[0xAA; 64],
+        &[0xCC; 64],
+        &[],
+    )
+    .expect("seals");
+    sealed.version = version;
+    sealed.encode()
+}

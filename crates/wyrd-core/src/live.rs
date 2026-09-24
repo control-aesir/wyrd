@@ -212,6 +212,12 @@ pub struct LiveConfig {
     /// mirror keeps draining in the background; a pass that ran out
     /// of budget skips the discharge and retries.
     pub serving_flush_budget: Duration,
+    /// Wall-clock budget for one pass's fetch phase when no mutation
+    /// is held (a held mutation's own deadline takes precedence and
+    /// clips this). Every pass is bounded: an unreachable route costs
+    /// at most this per pass instead of wedging the loop behind one
+    /// dial per pending item; the rest resumes next pass.
+    pub fetch_pass_budget: Duration,
 }
 
 impl Default for LiveConfig {
@@ -224,6 +230,7 @@ impl Default for LiveConfig {
             budgets: ResourceBudgets::default(),
             max_mutation_wait: Duration::from_secs(30),
             serving_flush_budget: Duration::from_secs(5),
+            fetch_pass_budget: Duration::from_secs(10),
         }
     }
 }
@@ -347,6 +354,8 @@ pub struct LiveNode<V: NamespaceView> {
     pub(super) serving_barrier: Option<Arc<dyn ServingBarrier>>,
     /// Stored copy of the config's per-pass barrier budget.
     pub(super) serving_flush_budget: Duration,
+    /// Stored copy of the config's per-pass fetch budget.
+    pub(super) fetch_pass_budget: Duration,
 }
 
 /// The live half of a split node: everything a presentation
@@ -462,6 +471,7 @@ where
                 node_addr: None,
                 serving_barrier: None,
                 serving_flush_budget: config.serving_flush_budget,
+                fetch_pass_budget: config.fetch_pass_budget,
             },
             parts,
         )
@@ -637,12 +647,19 @@ where
                 // observability work, separately tracked.
                 let state = self.engine.runtime_state()?;
                 let _routes = bulk.publish_routes(&state).map_err(LiveError::Engine)?;
-                // A held mutation's timeout decision must land on time:
-                // the fetch runs under the nearest deadline's remaining
-                // time, so one stalled provider cannot push the `TimedOut`
-                // check below past its wall-clock bound. With nothing
-                // held the deadline is `None` and fetching is unbounded.
-                let deadline = self.mutations.nearest_deadline(self.max_mutation_wait);
+                // The fetch phase is always bounded. A held mutation's
+                // deadline takes precedence and clips this: its
+                // `TimedOut` decision lands on time even when a
+                // provider stalls. With nothing held the config's
+                // per-pass budget still applies — one unreachable route
+                // costs at most this per pass instead of wedging the
+                // loop behind a dial per pending item.
+                let pass_cap = std::time::Instant::now() + self.fetch_pass_budget;
+                let deadline = Some(
+                    self.mutations
+                        .nearest_deadline(self.max_mutation_wait)
+                        .map_or(pass_cap, |held| held.min(pass_cap)),
+                );
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
                 self.engine
                     .execute_plan_sliced(bulk, &mut shared, deadline)?

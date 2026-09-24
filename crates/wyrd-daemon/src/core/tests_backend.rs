@@ -72,6 +72,7 @@ fn a_mutation_whose_budget_expired_before_evaluation_times_out() {
             &LiveConfig {
                 max_mutation_wait: Duration::from_millis(50),
                 serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
                 ..LiveConfig::default()
             },
         )
@@ -181,6 +182,7 @@ fn mkdir_through_backend_commits_and_serves() {
                 max_consecutive_errors: 10,
                 max_mutation_wait: Duration::from_secs(30),
                 serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
@@ -278,6 +280,7 @@ fn create_at_saturated_table_creates_nothing() {
         max_consecutive_errors: 10,
         max_mutation_wait: Duration::from_secs(30),
         serving_flush_budget: Duration::from_secs(5),
+        fetch_pass_budget: Duration::from_secs(10),
         budgets: ResourceBudgets {
             max_open_handles: 1,
             ..ResourceBudgets::default()

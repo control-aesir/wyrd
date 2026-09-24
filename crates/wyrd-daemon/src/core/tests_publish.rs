@@ -329,6 +329,7 @@ fn loop_announces_mounted_writes() {
                 max_consecutive_errors: 10,
                 max_mutation_wait: Duration::from_secs(30),
                 serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},

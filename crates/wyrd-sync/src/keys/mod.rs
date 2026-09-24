@@ -31,6 +31,9 @@ pub mod escrow;
 pub mod keystore;
 pub mod root;
 
+#[cfg(test)]
+mod hygiene;
+
 pub(crate) mod aead;
 pub(crate) mod ephemeral;
 

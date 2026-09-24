@@ -489,9 +489,11 @@ fn install_self_capability(
 /// outranks held material — the same rule the invitation resync
 /// applies to provisional secrets.
 fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
-    let Some(root) = engine.root.clone() else {
+    if engine.root.is_none() {
+        // Member engines and keystoreless opens hold no root and
+        // escrow nothing.
         return Ok(());
-    };
+    }
     let drive = engine.drive;
     let dir = engine.store.dir().to_path_buf();
     let tip = engine
@@ -506,7 +508,20 @@ fn restore_escrowed_epochs(engine: &mut Engine) -> Result<(), EngineError> {
         if record.drive != drive || record.epoch != epoch {
             return Err(EngineError::MalformedKeystore);
         }
-        let secret = escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?;
+        // Borrow the root for one derivation at a time: the previous
+        // shape cloned it across the whole loop. The clone scrubbed
+        // itself on drop, but a borrow holds no second copy at all —
+        // and the short borrow never crosses the `&mut` keyring
+        // install below.
+        let secret = {
+            let Some(root) = engine.root.as_ref() else {
+                // Unreachable: presence is checked above and nothing
+                // in this loop replaces the root. Skip restoration
+                // rather than panic on custody state.
+                return Ok(());
+            };
+            escrow::unwrap(&root.escrow_key(&drive, epoch), &record)?
+        };
         let key = secret.control_key(&drive, epoch);
         match engine.epoch_keys.get(&epoch) {
             // Same secret already held (e.g. keyring-derived):

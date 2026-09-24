@@ -426,6 +426,12 @@ impl Rig {
         self.engine.take().unwrap()
     }
 
+    /// The engine, mutably: for authoring between delivery steps
+    /// without giving up the rig's relay and teardown.
+    pub(crate) fn engine_mut(&mut self) -> &mut Engine {
+        self.engine.as_mut().unwrap()
+    }
+
     /// Messages currently held in the engine's pending map.
     pub(crate) fn engine_pending(&self) -> usize {
         self.engine.as_ref().unwrap().pending_count()

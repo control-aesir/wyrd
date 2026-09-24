@@ -7,7 +7,7 @@
 
 use super::tests_harness::{device_of, owner_engine};
 use crate::authorization::test_util::sign_snapshot;
-use crate::authorization::{Classification, SnapshotDag};
+use crate::authorization::{Classification, Rejection, SnapshotDag};
 use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::test_util::{drive as member_drive, key};
@@ -186,6 +186,73 @@ fn rotate_carries_the_live_tree_forward_at_the_new_epoch() {
         head_trees(&engine),
         vec![extended],
         "old files plus the new one stay served"
+    );
+}
+
+/// A reader-authored same-epoch child of a pending head must not
+/// discharge the carry: the decoy is rejected (readers author
+/// nothing), so the drain still authors the genuine carry and the
+/// lineage continues. Fails on the any-child completion predicate,
+/// which discharged the queue and orphaned the drive.
+#[test]
+fn reader_authored_child_never_discharges_a_pending_carry() {
+    let (_dir, mut engine, _genesis) = owner_engine("carry-reader-decoy");
+    let (reader_sk, reader_id) = key(0x9E);
+    let reader_encryption = DeviceEncryptionSecret::generate().unwrap();
+    engine
+        .admit_reader(reader_id, encryption_key(&reader_encryption))
+        .unwrap();
+    let mut objects = MemoryObjectStore::default();
+    let tree = file_tree(&mut objects, "kept.txt", b"carry me");
+    let first = engine.author_snapshot(&objects, tree).unwrap();
+    let first_id = first.snapshot().snapshot_id();
+
+    engine.stage_carry_heads().unwrap();
+    let transition = engine.rotate_epoch().unwrap();
+    assert_eq!(transition.epoch, 3, "reader admission plus rotation");
+    assert_eq!(engine.pending_carries().unwrap(), vec![first_id]);
+
+    // The decoy: same epoch, parented on the pending head, signed by
+    // the reader — committed directly, as a synced body would arrive.
+    let mut decoy = Snapshot::new(
+        vec![first_id],
+        tree,
+        reader_id,
+        transition.transition_id(),
+        transition.epoch,
+        0,
+        first.snapshot().timestamp,
+    )
+    .unwrap();
+    sign_snapshot(&mut decoy, &reader_sk, &member_drive());
+    let authorized = AuthorizedSnapshot::authorize(decoy, &member_drive()).unwrap();
+    let decoy_id = authorized.snapshot().snapshot_id();
+    engine
+        .commit_facts(&[Fact::SnapshotBody(authorized)])
+        .unwrap();
+    assert_eq!(
+        classify(&engine, &decoy_id),
+        Classification::Rejected(Rejection::AuthorIsReader),
+        "the decoy is rejected: readers author nothing"
+    );
+
+    let report = engine.carry_pending(&objects).unwrap();
+    assert_eq!(
+        report.authored.len(),
+        1,
+        "the rejected child discharges nothing: the genuine carry still authors"
+    );
+    let carry = report.authored[0].snapshot();
+    assert_eq!(
+        carry.parents,
+        vec![first_id],
+        "the carry extends its head despite the decoy"
+    );
+    assert!(engine.pending_carries().unwrap().is_empty());
+    assert_eq!(
+        head_trees(&engine),
+        vec![tree],
+        "the namespace continues at the new epoch"
     );
 }
 

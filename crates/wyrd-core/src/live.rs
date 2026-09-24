@@ -538,8 +538,11 @@ where
         let mutations = Arc::clone(&self.mutations);
         let mut batch = mutations.take_batch();
         for index in 0..batch.len() {
-            let kind = batch.request(index).kind().clone();
-            let result = self.apply_mutation(&kind);
+            // Borrow the kind: submit moves the request into the queue,
+            // which owns it until the batch completes it, so the pass
+            // needs no copy — no per-pass clone extends the content
+            // lifetime.
+            let result = self.apply_mutation(batch.request(index).kind());
             batch.record(index, result);
         }
         // Settle admitted wants: retire a landed fetch, and retire a fetch

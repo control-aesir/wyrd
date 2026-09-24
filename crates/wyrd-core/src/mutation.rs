@@ -197,7 +197,7 @@ impl MutationError {
 /// `CreateFile` and `CommitFile`. Later slices add unlink, rmdir,
 /// rename, and setattr. Paths are canonical components (the format
 /// layer re-validates them).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MutationKind {
     /// Create an empty directory; no intermediates (`insert_into` is the
     /// format layer's strict-parents rule).
@@ -239,6 +239,62 @@ pub enum MutationKind {
         size: Option<u64>,
         executable: Option<bool>,
     },
+}
+
+/// Diagnostic rendering for [`MutationKind`] redacts file content:
+/// `CommitFile` and `AppendFile` own the full plaintext image, and any
+/// `{:?}` of the queue (logs, error paths, panic captures) must never
+/// carry user bytes. Variant names, paths, identities, and content
+/// *lengths* still render — enough to diagnose a stuck or misrouted
+/// mutation without exposing what it carries.
+impl std::fmt::Debug for MutationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MutationKind::Mkdir { path } => f.debug_struct("Mkdir").field("path", path).finish(),
+            MutationKind::CreateFile { path } => {
+                f.debug_struct("CreateFile").field("path", path).finish()
+            }
+            MutationKind::CommitFile {
+                path,
+                base,
+                executable,
+                content,
+            } => f
+                .debug_struct("CommitFile")
+                .field("path", path)
+                .field("base", base)
+                .field("executable", executable)
+                .field("content_len", &content.len())
+                .finish(),
+            MutationKind::AppendFile { path, content } => f
+                .debug_struct("AppendFile")
+                .field("path", path)
+                .field("content_len", &content.len())
+                .finish(),
+            MutationKind::Unlink { path } => f.debug_struct("Unlink").field("path", path).finish(),
+            MutationKind::Rmdir { path } => f.debug_struct("Rmdir").field("path", path).finish(),
+            MutationKind::Rename {
+                from,
+                to,
+                no_replace,
+            } => f
+                .debug_struct("Rename")
+                .field("from", from)
+                .field("to", to)
+                .field("no_replace", no_replace)
+                .finish(),
+            MutationKind::SetAttrs {
+                path,
+                size,
+                executable,
+            } => f
+                .debug_struct("SetAttrs")
+                .field("path", path)
+                .field("size", size)
+                .field("executable", executable)
+                .finish(),
+        }
+    }
 }
 
 /// A submitted operation, opaque to callers: the id is diagnostic, the
@@ -611,6 +667,126 @@ mod tests {
             "wait_for_work returned without a request"
         );
         batch
+    }
+
+    /// Diagnostic rendering never carries file content: every variant
+    /// formats without its plaintext bytes while keeping paths and
+    /// content lengths. The queued entry (the shape logs and panic
+    /// captures actually see) is covered through the request.
+    #[test]
+    fn debug_rendering_redacts_file_content() {
+        let marker = b"plaintext-marker-9f3c";
+        let marker_text = std::str::from_utf8(marker).expect("marker is text");
+        // The derived `Vec<u8>` rendering: byte-list form must be gone too,
+        // not just the ASCII text (derived Debug prints numbers, not text).
+        let byte_list = format!("{:?}", marker.to_vec());
+        // Non-text bytes exercise the alternate representation directly:
+        // no UTF-8 decoding is involved in the absence check below.
+        let binary: &[u8] = &[0xff, 0x00, 0xfe, 0x01, 0x02, 0x7f];
+        let binary_list = format!("{binary:?}");
+        let base = FileIdentity::new(1, false, Vec::new());
+        let kinds = [
+            MutationKind::Mkdir {
+                path: "/vault/docs".into(),
+            },
+            MutationKind::CreateFile {
+                path: "/vault/docs".into(),
+            },
+            MutationKind::CommitFile {
+                path: "/vault/docs".into(),
+                base: base.clone(),
+                executable: false,
+                content: marker.to_vec(),
+            },
+            MutationKind::AppendFile {
+                path: "/vault/docs".into(),
+                content: binary.to_vec(),
+            },
+            MutationKind::Unlink {
+                path: "/vault/docs".into(),
+            },
+            MutationKind::Rmdir {
+                path: "/vault/docs".into(),
+            },
+            MutationKind::Rename {
+                from: "/vault/a".into(),
+                to: "/vault/b".into(),
+                no_replace: true,
+            },
+            MutationKind::SetAttrs {
+                path: "/vault/docs".into(),
+                size: Some(3),
+                executable: Some(true),
+            },
+        ];
+        for kind in &kinds {
+            let rendered = format!("{kind:?}");
+            assert!(
+                !rendered.contains(marker_text),
+                "content bytes leaked as text in {rendered}"
+            );
+            assert!(
+                !rendered.contains(&byte_list),
+                "content bytes leaked as a byte list in {rendered}"
+            );
+            assert!(
+                !rendered.contains(&binary_list),
+                "non-text content bytes leaked as a byte list in {rendered}"
+            );
+            assert!(
+                rendered.contains("/vault/"),
+                "paths must still render in {rendered}"
+            );
+        }
+        let commit = format!(
+            "{:?}",
+            MutationKind::CommitFile {
+                path: "/vault/docs".into(),
+                base,
+                executable: false,
+                content: marker.to_vec(),
+            }
+        );
+        assert!(
+            commit.contains(&format!("content_len: {}", marker.len())),
+            "content length must still render in {commit}"
+        );
+        for retained in ["size: 1", "executable: false"] {
+            assert!(
+                commit.contains(retained),
+                "base identity/flags must still render ({retained}) in {commit}"
+            );
+        }
+        let append = format!(
+            "{:?}",
+            MutationKind::AppendFile {
+                path: "/vault/docs".into(),
+                content: binary.to_vec(),
+            }
+        );
+        assert!(
+            append.contains(&format!("content_len: {}", binary.len())),
+            "content length must still render in {append}"
+        );
+        let queued = QueuedMutation {
+            request: MutationRequest {
+                id: MutationId(7),
+                kind: MutationKind::AppendFile {
+                    path: "/vault/docs".into(),
+                    content: binary.to_vec(),
+                },
+            },
+            reply: Arc::new(Reply::default()),
+        };
+        let rendered = format!("{queued:?}");
+        assert!(
+            !rendered.contains(&binary_list),
+            "content bytes leaked as a byte list in {rendered}"
+        );
+        assert!(
+            rendered.contains("/vault/docs"),
+            "paths must still render in {rendered}"
+        );
     }
 
     /// `submit` blocks until the loop completes the request, and the id

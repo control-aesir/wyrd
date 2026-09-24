@@ -680,3 +680,110 @@ fn reissue_selects_only_the_canonical_admission() {
         "no voided-branch epoch leaks in"
     );
 }
+
+#[test]
+fn rotate_delivers_the_new_epoch_secret_to_a_current_member() {
+    // The Lima step-6 shape, end to end through the real outbox: a
+    // member admitted at epoch 2 must open the owner's epoch-3
+    // rotation delivery and install the secret. The delivery is
+    // minted by `deliver_pending` (never a fixture), so this covers
+    // the mint/unwrap agreement both directions.
+    let (_dir, mut engine, _genesis) = owner_engine("admit-rotate");
+    let (_owner_sk, owner_id) = key(10);
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+
+    let mut relay = MemoryRelay::default();
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: owner_id,
+        };
+        let sent = engine.deliver_pending(&mut sender).unwrap();
+        assert_eq!(sent, 2, "transition plus capability");
+    }
+
+    let join_dir = TestDir::new("admit-rotate-join");
+    let joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer.clone(),
+        newcomer_encryption.clone(),
+        &outcome.invitation,
+    )
+    .unwrap();
+    joined.release_store_lock();
+    let mut joined = Engine::open(
+        join_dir.path.clone(),
+        member_drive(),
+        newcomer_id,
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+    )
+    .unwrap();
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.skipped, 0, "invitation keys open every message");
+    }
+    let state = joined.log.known_state().expect("canonical tip");
+    assert_eq!(state.epoch, 2, "catch-up reaches the admission");
+
+    // Rotate to epoch 3 and push the rotation catch-up through the
+    // same relay the member drains.
+    let rotated = engine.rotate_epoch().unwrap();
+    assert_eq!(rotated.epoch, 3, "rotation opens a new epoch");
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: owner_id,
+        };
+        let sent = engine.deliver_pending(&mut sender).unwrap();
+        assert_eq!(sent, 2, "rotation transition plus rotation delivery");
+    }
+    // First drain: the transition envelope is sealed under the new
+    // epoch key the member does not hold yet, so it skips for
+    // redelivery — while the rotation delivery (pairing-key framing)
+    // opens immediately and installs the secret.
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.accepted, 1, "rotation delivery commits");
+        assert_eq!(report.skipped, 1, "transition waits for its epoch key");
+    }
+    let held = joined.store.rebuild(newcomer_id).unwrap();
+    assert!(
+        held.keyring.secret(3).is_some(),
+        "rotation-epoch secret installed from the pushed delivery"
+    );
+    // Second drain: with the secret held, the redelivered transition
+    // opens and the tip advances — the two-pass convergence the live
+    // loop performs every few seconds.
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.skipped, 0, "nothing waits anymore");
+        assert_eq!(report.accepted, 1, "redelivered transition commits");
+    }
+    let state = joined.log.known_state().expect("canonical tip");
+    assert_eq!(state.epoch, 3, "catch-up reaches the rotation");
+    assert_eq!(
+        state.transition_id,
+        rotated.transition_id(),
+        "tip is the rotation"
+    );
+}

@@ -202,6 +202,57 @@ fn path_truncate_refused_while_append_open() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// An `O_TRUNC` open while an append handle is open is refused the
+/// same way the split `setattr` is: the open path must not bypass the
+/// append-handle truncate guard. The refused open truncates nothing —
+/// the file keeps its content, the append handle still commits onto
+/// the current end, and a later `O_TRUNC` open (handle closed) works.
+#[test]
+fn o_trunc_open_refused_while_append_open() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, _ino, _) = backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"AAAA").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+
+    let append = backend
+        .open_write("a.txt", libc::O_WRONLY | libc::O_APPEND)
+        .unwrap();
+    assert_eq!(
+        backend.open_write("a.txt", libc::O_WRONLY | libc::O_TRUNC),
+        Err(fuser::Errno::EOPNOTSUPP)
+    );
+    // Nothing truncated: the append sequence still lands on "AAAA".
+    backend.write_handle(append, 0, b"X").unwrap();
+    backend.commit_handle(append).unwrap();
+    backend.release_handle(append).unwrap();
+    let read = backend.open_at("a.txt").unwrap();
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"AAAAX");
+    backend.release_handle(read).unwrap();
+
+    // With the append handle closed the same open truncates.
+    let trunc = backend
+        .open_write("a.txt", libc::O_WRONLY | libc::O_TRUNC)
+        .unwrap();
+    backend.release_handle(trunc).unwrap();
+    let read = backend.open_at("a.txt").unwrap();
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"");
+    backend.release_handle(read).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Rename rebinds the inode table the way the kernel rebinds dentries:
 /// the dst path resolves to the moved src ino immediately, so the next
 /// open off the moved dentry does not fail `ENOENT` on the gone src

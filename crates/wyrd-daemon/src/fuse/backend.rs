@@ -849,6 +849,14 @@ where
         truncate: bool,
     ) -> Result<WriteHandle, fuser::Errno> {
         if truncate {
+            // A path-addressed truncate while an append handle is open
+            // on that path is `EOPNOTSUPP` (write-path.md): the fh-less
+            // `setattr` path enforces the same guard, and the open path
+            // must not bypass it. Checked before the side-effecting
+            // submit — a refused open truncates nothing.
+            if self.append_open_on(path) {
+                return Err(fuser::Errno::EOPNOTSUPP);
+            }
             // The truncation commits during open, not at the first
             // flush: the kernel delivers `O_TRUNC` as open plus a
             // separate fh-less `setattr`, so a handle carrying the

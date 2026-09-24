@@ -29,6 +29,7 @@ pub mod device;
 pub mod epoch;
 pub mod escrow;
 pub mod keystore;
+pub mod owner_proof;
 pub mod root;
 
 #[cfg(test)]

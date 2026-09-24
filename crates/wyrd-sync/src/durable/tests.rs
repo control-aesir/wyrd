@@ -1105,6 +1105,7 @@ fn capability_sealed_accepts_rotation_framing() {
         2,
         &child.canonical_bytes(),
         &[0xCC; 64],
+        &[],
     )
     .unwrap()
     .encode();
@@ -1147,6 +1148,7 @@ fn capability_sealed_accepts_rotation_framing() {
         2,
         &child.canonical_bytes(),
         &[0xCC; 64],
+        &[],
     )
     .unwrap()
     .encode();

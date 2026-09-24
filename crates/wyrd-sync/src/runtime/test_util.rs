@@ -351,6 +351,7 @@ pub(crate) fn rotation_delivery(
     epoch: u64,
     transition: &MembershipTransition,
     wrapped: Vec<u8>,
+    owner_proof: Vec<u8>,
 ) -> MailboxEnvelope {
     rotation_delivery_from(
         &fixture.sender_sk,
@@ -359,6 +360,7 @@ pub(crate) fn rotation_delivery(
         epoch,
         transition,
         wrapped,
+        owner_proof,
     )
 }
 
@@ -371,6 +373,7 @@ pub(crate) fn rotation_delivery_from(
     epoch: u64,
     transition: &MembershipTransition,
     wrapped: Vec<u8>,
+    owner_proof: Vec<u8>,
 ) -> MailboxEnvelope {
     let sealed = seal_rotation(
         &member_drive(),
@@ -379,6 +382,7 @@ pub(crate) fn rotation_delivery_from(
         epoch,
         &transition.canonical_bytes(),
         &wrapped,
+        &owner_proof,
     )
     .expect("seals");
     seal_for_recipient(sender, recipient, &sealed.encode()).expect("mails")

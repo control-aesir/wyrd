@@ -289,6 +289,7 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
         2,
         &child.canonical_bytes(),
         &wrap,
+        &[],
     )
     .expect("seals")
     .encode();

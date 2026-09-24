@@ -607,6 +607,17 @@ where
                 other => batch.record(index, other),
             }
         }
+        // Fast retry: a held mutation's prerequisites may have landed
+        // in this pass's fetch, so wake for an immediate next pass
+        // instead of waiting out the idle pacing deadline. Gated on
+        // actual fetch progress with queued mutations outstanding, so
+        // a prerequisite the plan cannot supply falls back to idle
+        // cadence instead of spinning.
+        if self.mutations.outstanding() > 0
+            && (fetched.objects > 0 || fetched.manifests > 0 || fetched.snapshot_bodies > 0)
+        {
+            self.waker.wake();
+        }
         // Settle admitted wants: retire a landed fetch, and retire a fetch
         // whose demand died — the engine's durable `Cached` policy keeps
         // retrying independently of the registry, so a permanently

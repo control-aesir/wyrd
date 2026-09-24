@@ -225,6 +225,14 @@ fn admit(
     // snapshots this engine can actually serve get obligations
     // (authored here, or a recorded announcement the re-announce path
     // can resend) — anything else could never discharge.
+    //
+    // Known bound (pre-alpha, review-visible): the walk is O(recorded
+    // history) in one admission and commits one obligation per closure
+    // member at the end. A very long append-only history can make a
+    // single admission allocate and commit proportionally; incremental
+    // checkpointing under the resource budget is the fix v0 owes, and
+    // no admission silently truncates the closure until it exists —
+    // partial lineage would be worse (UnknownParent at the newcomer).
     {
         use std::collections::BTreeSet;
         use wyrd_format::SnapshotId;

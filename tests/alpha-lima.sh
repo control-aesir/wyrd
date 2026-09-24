@@ -492,6 +492,11 @@ step6_relay() {
   command -v nostr-rs-relay >/dev/null \
     || die "nostr-rs-relay missing in the guest (provision.sh installs it)"
 
+  # The demand assertions below read the loop's defer/timeout lines, so
+  # the mounts run with the core trace on regardless of the outer
+  # default (the CLI's own lines are plain stderr, unaffected).
+  export E2E_RUST_LOG="${E2E_RUST_LOG:-wyrd_core=debug}"
+
   # The suite owns the port: a previous --keep run may have stranded a
   # relay, and two relays cannot share the port. Exact-name match only.
   pkill -x nostr-rs-relay 2>/dev/null || true
@@ -508,11 +513,19 @@ address = "127.0.0.1"
 port = $RELAY_PORT
 EOF
   mkdir -p "$E2E_ROOT/relay-db"
-  nostr-rs-relay -c "$E2E_ROOT/relay.toml" -d "$E2E_ROOT/relay-db" \
-    >"$LOGDIR/relay.out" 2>"$LOGDIR/relay.err" &
-  echo $! > "$E2E_ROOT/relay.pid"
-  poll_until 20 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RELAY_PORT" \
-    || die "relay never listened on $RELAY_PORT (see relay.err)"
+
+  # start_relay [log-suffix]: the mounts' control plane needs it up;
+  # a mid-step restart (the conflict fixture) reuses the same config
+  # and database under a suffixed log.
+  start_relay() {
+    nostr-rs-relay -c "$E2E_ROOT/relay.toml" -d "$E2E_ROOT/relay-db" \
+      >"$LOGDIR/relay${1:-}.out" 2>"$LOGDIR/relay${1:-}.err" &
+    echo $! > "$E2E_ROOT/relay.pid"
+    poll_until 20 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RELAY_PORT" \
+      || die "relay never listened on $RELAY_PORT (see relay${1:-}.err)"
+  }
+
+  start_relay
   pass "relay listening on $RELAY_PORT"
 
   start_mount owner-relay "$oc" "$od" "$MNTS/owner-relay" --relay "$relay"
@@ -548,15 +561,94 @@ EOF
     || die "member missed the owner's second write"
   pass "convergence holds across successive writes"
 
+  # --- peer-down demand, bounded failure, re-announcement recovery ---
+  # The owner commits a large file; its head (trees and manifests) reaches
+  # the member quickly, the bulk content streams after. Stopping the
+  # owner mid-transfer leaves the member with an installed head whose
+  # file chunks are remote-only — the exact state a mounted write must
+  # demand through. The member appends: the demand cannot be served, so
+  # the commit must fail bounded (ETIMEDOUT at the prerequisite
+  # deadline), never hang.
+  dd if=/dev/zero of="$MNTS/owner-relay/peer-down.bin" bs=1M count=56 \
+    status=none
+  poll_until 60 test -e "$MNTS/member-relay/peer-down.bin" \
+    || die "member never saw the owner's file (head did not install)"
   stop_mount owner-relay INT
+  pass "owner stopped mid-transfer (member head installed, chunks remote)"
+
+  local started elapsed rc
+  started=$(date +%s)
+  set +e
+  timeout 45 dd if=/dev/zero bs=1 count=1 of="$MNTS/member-relay/peer-down.bin" \
+    oflag=append conv=fsync status=none 2>"$LOGDIR/step6-peer-down.stderr"
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - started ))
+  [[ "$rc" -ne 124 ]] || die "peer-down append hung instead of failing bounded"
+  (( elapsed >= 20 && elapsed <= 45 )) \
+    || die "peer-down append failed after ${elapsed}s, outside the 30s bound"
+  grep -qE "Connection timed out|Input/output error" "$LOGDIR/step6-peer-down.stderr" \
+    || die "peer-down append failed without a bounded errno (see step6-peer-down.stderr)"
+  grep -q "mutation deferred for authoring content" "$LOGDIR/mount-member-relay.err" \
+    || die "the append never demanded its remote base (no defer in the log)"
+  grep -q "mutation prerequisite wait expired" "$LOGDIR/mount-member-relay.err" \
+    || die "the demand never reached its deadline (no timeout in the log)"
+  pass "peer-down demand fails bounded (${elapsed}s, prerequisite deadline)"
+
+  # The member now holds a dead route for the owner. Restarting the
+  # owner binds a fresh iroh endpoint; the live loop re-announces under
+  # the live route (the route-specific reseal), the member accepts the
+  # route update, and a new owner write converges with no manual repair.
+  start_mount owner-restarted "$oc" "$od" "$MNTS/owner-restarted" --relay "$relay"
+  grep -q "serving over iroh" "$LOGDIR/mount-owner-restarted.err" \
+    || die "restarted owner: serving endpoint never bound"
+  echo "after-restart" > "$MNTS/owner-restarted/after-restart.txt"
+  poll_until 90 converged "$MNTS/member-relay/after-restart.txt" "after-restart" \
+    || die "member never converged after the owner's re-announcement"
+  pass "re-announcement recovers the route after owner restart"
+
+  # --- conflict siblings: divergent heads export as name@N ---------
+  # Deterministic divergence: with the relay down both sides author
+  # their own version of one path (announcements queue, sends fail
+  # softly), then the relay returns and both heads meet. The mounts
+  # survive the outage — that is the dead-relay posture step 2 pins.
+  kill "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+  wait "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
+  sleep 1
+  echo "owner-side" > "$MNTS/owner-restarted/conflict.txt"
+  echo "member-side" > "$MNTS/member-relay/conflict.txt"
+  start_relay -restarted
+  poll_until 90 test -d "$MNTS/owner-restarted/conflict.txt" \
+    || die "the owner never resolved the divergent head into a conflict"
+  poll_until 90 test -d "$MNTS/member-relay/conflict.txt" \
+    || die "the member never resolved the divergent head into a conflict"
+  pass "concurrent writes meet as a visible conflict on both mounts"
+
+  # Offline export materializes both versions as name@N siblings in
+  # SnapshotId byte order, never a silent winner: the issue's
+  # conflict-sibling contract, end to end.
+  stop_mount owner-restarted INT
   stop_mount member-relay TERM
+  expect_exit 0 step6-conflict-export \
+    with_creds "$oc" export "$od" "$E2E_ROOT/conflict-export" >/dev/null
+  [[ -f "$E2E_ROOT/conflict-export/conflict.txt@1" \
+     && -f "$E2E_ROOT/conflict-export/conflict.txt@2" ]] \
+    || die "the conflict export did not materialize name@N siblings"
+  local siblings
+  siblings="$(cat "$E2E_ROOT/conflict-export/conflict.txt@"* | tr -d '\n')"
+  [[ "$siblings" == "member-sideowner-side" || "$siblings" == "owner-sidemember-side" ]] \
+    || die "the conflict siblings lost a version: '$siblings'"
+  pass "conflicting heads export as name@N siblings (both versions kept)"
+
   kill "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
   wait "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
   pass "relay stopped"
 
   local f
   for f in "$LOGDIR"/step6-*.stderr "$LOGDIR"/mount-owner-relay.err \
-          "$LOGDIR"/mount-member-relay.err "$LOGDIR"/relay.out "$LOGDIR"/relay.err; do
+          "$LOGDIR"/mount-owner-restarted.err \
+          "$LOGDIR"/mount-member-relay.err "$LOGDIR"/relay.out "$LOGDIR"/relay.err \
+          "$LOGDIR"/relay-restarted.out "$LOGDIR"/relay-restarted.err; do
     [[ -f "$f" ]] || continue
     check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")" \
       "$(cat "$nc/identity")" "$(cat "$nc/passphrase")"
@@ -576,9 +668,19 @@ main() {
   rm -rf "$E2E_ROOT"
   mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
   local only="${E2E_ONLY_STEP:-}"
-  # Comma list (`--step 1,4,6`): steps build on each other, so iteration
-  # runs a prefix-closed selection, never a lone dependent step.
-  want_step() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
+  # Comma list (`--step 1,4,6`): steps build on each other, so the run
+  # set is the prefix closure of the selection — selecting step N runs
+  # 1..N, never a lone dependent step on wiped state. Every entry must
+  # name a real step, so `--step 99` fails instead of passing zero
+  # checks, and the highest entry decides the prefix.
+  local max_step=0
+  local entry
+  for entry in ${only//,/ }; do
+    [[ "$entry" =~ ^[1-6]$ ]] \
+      || die "--step: '$entry' is not a step (expected a comma list of 1-6)"
+    if (( entry > max_step )); then max_step=$entry; fi
+  done
+  want_step() { [[ -z "$only" ]] || (( $1 <= max_step )); }
   if want_step 1; then step1_init; fi
   if want_step 2; then step2_mount; fi
   if want_step 3; then step3_matrix; fi

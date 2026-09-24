@@ -281,6 +281,15 @@ the current head under the queue's total order, so each is evaluated
 against the state its queue predecessor committed, never against the
 state visible when the FUSE syscall began.
 
+A directory rename rebinds the moved directory's own inode on both
+mounts, and fresh path lookups under the new prefix work immediately.
+Pre-opened handles to *descendants* keep addressing the old path: the
+v0 inode table rebinds the exact source mapping only, so a descendant
+handle opened before the rename goes `ENOENT` on its next path
+operation instead of silently following the subtree. Following renamed
+subtrees through open handles is a presentation-layer feature v0 does
+not claim.
+
 ## The commit pipeline and durability ordering
 
 A commit proceeds in this order, and the order is the contract:

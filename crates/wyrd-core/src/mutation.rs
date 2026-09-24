@@ -3,8 +3,9 @@
 //! Normative in `docs/write-path.md`. FUSE never authors; a committing
 //! operation submits a [`MutationRequest`] and blocks, and the live loop
 //! is the only engine user. The queue establishes the total order of
-//! local mutations and executes them serially in admission order, so
-//! each snapshot's parents are the heads the previous mutation left.
+//! local mutations and executes them serially — admission order, with
+//! held entries retried ahead of every new submission (below) — so each
+//! snapshot's parents are the heads the previous mutation left.
 //!
 //! Deliberately unlike the want registry: a mutation is not a demand that
 //! can outlive its waiter. Admission is immediate or [`MutationError::Saturated`],

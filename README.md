@@ -146,6 +146,20 @@ cargo check
 cargo nextest run
 ```
 
+For the full mount-and-sync path on a real FUSE kernel, the Lima
+end-to-end suite runs the binary in a NixOS guest (no guest
+toolchain; the host builds the guest-arch binary and exports its
+closure):
+
+```bash
+./lima/run-alpha.sh             # full run
+./lima/run-alpha.sh --keep      # leave the guest up for debugging
+./lima/run-alpha.sh --step 4    # run steps 1..4 (the prefix closure)
+```
+
+The guest script is `tests/alpha-lima.sh`; logs land in
+`/tmp/lima/logs/`.
+
 On macOS, the `wyrd-cli` and `wyrd-contracts` test binaries link the
 system FUSE library at load, and `wyrd mount` needs the kernel extension,
 so running them requires system macFUSE: `brew install --cask macfuse`,

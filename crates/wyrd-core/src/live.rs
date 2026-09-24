@@ -268,6 +268,13 @@ pub struct LiveNode<V: NamespaceView> {
     /// report-counter predicate to keep in sync with future commit
     /// paths.
     pub(super) published_revision: u64,
+    /// Eligible heads installed with the serving generation: the
+    /// mounted-write contract needs exactly one, so the count rides
+    /// every sync-pass line (0 reads stale/bootstrap, 2+ reads
+    /// conflicted). Idle passes report the last installed count — an
+    /// unchanged revision means unchanged state, hence unchanged
+    /// heads.
+    pub(super) published_heads: usize,
     /// Durable state may have changed without a republication (a pass
     /// failed after committing): the next pass republishes regardless
     /// of the revision gate, so recovery never waits for new changes.
@@ -383,6 +390,9 @@ where
             budgets,
             open_timeout,
         };
+        // Baseline observability: idle lines before the first publish
+        // report what the adopted generation serves.
+        let published_heads = engine.live_heads().map(|heads| heads.len()).unwrap_or(0);
         (
             LiveNode {
                 engine,
@@ -391,6 +401,7 @@ where
                 wants,
                 mutations,
                 published_revision: revision,
+                published_heads,
                 dirty: false,
                 budgets,
                 waker,
@@ -577,6 +588,8 @@ where
                 deferred = drained.deferred,
                 skipped = drained.skipped,
                 discarded = drained.discarded,
+                revision = revision,
+                eligible_heads = self.published_heads,
                 "sync pass idle: revision unchanged, outbox empty"
             );
             return Ok(SyncReport {
@@ -594,6 +607,7 @@ where
             let store = self.store.read().map_err(|_| LiveError::Lock)?;
             verified_heads(&completed_runtime, heads, &*store).map_err(EngineError::Closure)?
         };
+        let installed_heads = heads.len();
         let next = Projection::new(
             Arc::clone(&self.store),
             RuntimeMaterialization {
@@ -608,6 +622,7 @@ where
             *slot = Arc::new(next);
         }
         self.published_revision = revision;
+        self.published_heads = installed_heads;
         self.dirty = false;
         // Publication is done: a completed mutation's success now means
         // the new generation serves.
@@ -636,6 +651,8 @@ where
             unavailable_keys = fetched.unavailable_keys,
             local_failures = fetched.local_failures,
             sent = sent,
+            revision = revision,
+            eligible_heads = installed_heads,
             "sync pass published"
         );
         Ok(SyncReport {
@@ -673,10 +690,7 @@ where
                 Ok(MutationOutcome::Done)
             }
             MutationKind::CreateFile { path } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 // `create` requires an absent name: anything already there
                 // (file, dir, symlink) is `EEXIST`, never a silent replace.
                 if self.current_node(&heads, path)?.is_some() {
@@ -715,10 +729,7 @@ where
                 executable,
                 content,
             } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 let tree = match heads.as_slice() {
                     [] => return Err(MutationError::Stale(path.clone())),
                     [head] => head.snapshot().tree,
@@ -758,10 +769,7 @@ where
                 )))
             }
             MutationKind::AppendFile { path, content } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 // Append never creates or resurrects: a headless drive or
                 // a missing/repurposed path is stale, not `ENOENT`.
                 let tree = match heads.as_slice() {
@@ -810,10 +818,7 @@ where
                 )))
             }
             MutationKind::Unlink { path } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 let tree = self.single_tree(&heads, path)?;
                 match self.current_node(&heads, path)? {
                     Some(Node::Dir { .. } | Node::MergedDir { .. }) => {
@@ -831,10 +836,7 @@ where
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rmdir { path } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 let tree = self.single_tree(&heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
@@ -849,10 +851,7 @@ where
                 to,
                 no_replace,
             } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 let tree = self.single_tree(&heads, from)?;
                 if *no_replace && self.current_node(&heads, to)?.is_some() {
                     return Err(MutationError::AlreadyExists(to.clone()));
@@ -874,10 +873,7 @@ where
                 size,
                 executable,
             } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.live_heads_traced()?;
                 let tree = self.single_tree(&heads, path)?;
                 let (current_size, current_exec, chunks) = match self.current_node(&heads, path)? {
                     Some(Node::File {
@@ -1029,14 +1025,28 @@ where
         }
     }
 
-    /// The tree a local mutation read-modify-writes: a single live head,
-    /// `None` for the headless bootstrap, or a conflict. Mutations fail
-    /// closed on multiple heads: there is no single tree to rebuild.
-    fn live_base(&self) -> Result<Option<ContentId>, MutationError> {
+    /// The current eligible heads, traced: every mutation evaluates
+    /// against a fresh classification, and the count disambiguates the
+    /// empty (stale/bootstrap) from the conflicted refusal at the
+    /// commit boundary.
+    fn live_heads_traced(&self) -> Result<Vec<AuthorizedSnapshot>, MutationError> {
         let heads = self
             .engine
             .live_heads()
             .map_err(|_| MutationError::Engine)?;
+        tracing::debug!(
+            eligible_heads = heads.len(),
+            revision = self.engine.current(),
+            "mutation evaluated live heads"
+        );
+        Ok(heads)
+    }
+
+    /// The tree a local mutation read-modify-writes: a single live head,
+    /// `None` for the headless bootstrap, or a conflict. Mutations fail
+    /// closed on multiple heads: there is no single tree to rebuild.
+    fn live_base(&self) -> Result<Option<ContentId>, MutationError> {
+        let heads = self.live_heads_traced()?;
         match heads.as_slice() {
             [] => Ok(None),
             [head] => Ok(Some(head.snapshot().tree)),

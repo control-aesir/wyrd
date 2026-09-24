@@ -999,6 +999,19 @@ where
         }
     }
 
+    /// The pin for a demand-deferred mutation: the single head this
+    /// evaluation actually used, captured here and never re-read
+    /// later. A headless or multi-head evaluation cannot pin, so
+    /// demand sites stay opaque Engine and the defer site fails
+    /// closed. Shared by authoring and the read-before-write helpers
+    /// so every `NeedContent` names the same head.
+    fn pin_head(heads: &[AuthorizedSnapshot]) -> Option<wyrd_format::SnapshotId> {
+        match heads {
+            [head] => Some(head.snapshot().snapshot_id()),
+            _ => None,
+        }
+    }
+
     /// Author one snapshot over a mutated root, tracing the engine
     /// refusal: authoring collapses every failure to opaque `Engine`
     /// at the boundary, and the variant tells a missing epoch key
@@ -1020,14 +1033,7 @@ where
             match error {
                 EngineError::ChunkUnavailable(chunk) => MutationError::NeedContent {
                     chunk,
-                    // The pin is the head this evaluation actually
-                    // used — captured here, never re-read later. A
-                    // headless or multi-head evaluation cannot pin,
-                    // so it stays opaque Engine.
-                    base: match heads {
-                        [head] => Some(head.snapshot().snapshot_id()),
-                        _ => None,
-                    },
+                    base: Self::pin_head(heads),
                 },
                 _ => MutationError::Engine,
             }
@@ -1089,8 +1095,9 @@ where
     /// Read at most `max_len` bytes of a regular file's plaintext from
     /// the current heads. A truncate uses this to read only the prefix it
     /// keeps, and never more than the target, so shrinking an oversized
-    /// file does not materialize it. A not-materialized file is `EIO`:
-    /// the loop has no demand path to block on.
+    /// file does not materialize it. Remote-only content defers like
+    /// authoring does: the missing chunk becomes a `NeedContent`
+    /// prerequisite pinned to the evaluated head, never an EIO.
     fn read_current_file_prefix(
         &self,
         heads: &[AuthorizedSnapshot],
@@ -1101,12 +1108,20 @@ where
             return Ok(Vec::new());
         }
         let view = self.view_for(heads)?;
-        let node = view
-            .lookup(path)
-            .map_err(|_| MutationError::NotFound(path.to_string()))?;
-        let file = view
-            .open_file(&node)
-            .map_err(|_| MutationError::IsDirectory(path.to_string()))?;
+        let node = view.lookup(path).map_err(|error| match error {
+            ViewError::NotMaterialized { content } => MutationError::NeedContent {
+                chunk: content,
+                base: Self::pin_head(heads),
+            },
+            _ => MutationError::NotFound(path.to_string()),
+        })?;
+        let file = view.open_file(&node).map_err(|error| match error {
+            ViewError::NotMaterialized { content } => MutationError::NeedContent {
+                chunk: content,
+                base: Self::pin_head(heads),
+            },
+            _ => MutationError::IsDirectory(path.to_string()),
+        })?;
         let size = match node {
             Node::File { size, .. } => size,
             _ => return Err(MutationError::IsDirectory(path.to_string())),
@@ -1114,6 +1129,10 @@ where
         let len = size.min(max_len);
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
             .map_err(|error| match error {
+                ViewError::NotMaterialized { content } => MutationError::NeedContent {
+                    chunk: content,
+                    base: Self::pin_head(heads),
+                },
                 // A classified store failure keeps its errno; every
                 // other view failure stays the opaque EIO it is today.
                 ViewError::Store(failure, _) => MutationError::Store(failure),
@@ -1124,6 +1143,8 @@ where
     /// Resolve `path` against the current heads' merged view, for the
     /// create/stale checks. `None` means absent; a non-file node is
     /// returned so the caller can distinguish a kind change from absence.
+    /// Remote-only content defers: a lookup that names a missing chunk
+    /// becomes the same `NeedContent` prerequisite authoring uses.
     fn current_node(
         &self,
         heads: &[AuthorizedSnapshot],
@@ -1141,6 +1162,10 @@ where
         match view.lookup(path) {
             Ok(node) => Ok(Some(node)),
             Err(ViewError::NotFound) => Ok(None),
+            Err(ViewError::NotMaterialized { content }) => Err(MutationError::NeedContent {
+                chunk: content,
+                base: Self::pin_head(heads),
+            }),
             Err(error) => {
                 // The boundary reports `EIO` for every view failure
                 // mode; keep the variant for forensics.
@@ -1379,5 +1404,315 @@ mod backoff_tests {
             Duration::ZERO
         );
         assert_eq!(jitter_below(Duration::ZERO), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod prereq_tests {
+    use super::*;
+    use crate::view::{Attr, DirEntry, Kind, MaterializationPolicy, OpenFile, ViewLockError};
+    use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+    use wyrd_format::{EntryContent, MemoryObjectStore, ObjectKind};
+    use wyrd_sync::keys::DeviceIdentitySecret;
+
+    /// One-file view over the shared store: resolves the single head's
+    /// root tree from the store and serves its first file entry. Any
+    /// absence — a missing tree or chunk — names its identity as not
+    /// materialized, the `RemoteOnly` arm of the FUSE view's absence
+    /// rule: the fixture is a device whose residency claims remote for
+    /// everything it does not hold. Behavior derives from (store,
+    /// heads) alone, so `open_shared` needs no out-of-band config:
+    /// which prerequisite the mapping sees is a function of which
+    /// objects the store holds.
+    struct FileView {
+        store: Arc<RwLock<MemoryObjectStore>>,
+        materialization: RuntimeMaterialization,
+        heads: Vec<Head>,
+    }
+
+    impl FileView {
+        fn file_entry(&self) -> Result<(String, u64, bool, Vec<ContentId>), ViewError> {
+            let [head] = self.heads.as_slice() else {
+                return Err(ViewError::NotFound);
+            };
+            let store = self
+                .store
+                .read()
+                .map_err(|_| ViewError::Store(StoreFailure::Transient, "poisoned".into()))?;
+            let bytes = store
+                .get(&head.snapshot().tree)
+                .map_err(|error| ViewError::Store(StoreFailure::Transient, format!("{error:?}")))?
+                .ok_or(ViewError::NotMaterialized {
+                    content: head.snapshot().tree,
+                })?;
+            let tree = Tree::decode(&bytes).map_err(|_| ViewError::Corrupt)?;
+            tree.entries()
+                .iter()
+                .find_map(|entry| match &entry.content {
+                    EntryContent::File {
+                        size,
+                        executable,
+                        chunks,
+                    } => Some((
+                        entry.name.as_str().to_string(),
+                        *size,
+                        *executable,
+                        chunks.clone(),
+                    )),
+                    _ => None,
+                })
+                .ok_or(ViewError::NotFound)
+        }
+
+        fn absent(&self, id: &ContentId) -> ViewError {
+            // The fixture's whole residency posture: everything absent
+            // is remote-only, never locally failed or unreachable.
+            ViewError::NotMaterialized { content: *id }
+        }
+    }
+
+    impl NamespaceView for FileView {
+        type Store = MemoryObjectStore;
+        type Materialization = RuntimeMaterialization;
+
+        fn open(
+            _store: Self::Store,
+            _materialization: Self::Materialization,
+            _heads: Vec<Head>,
+        ) -> Self {
+            unimplemented!("tests build the view shared")
+        }
+
+        fn open_shared(
+            store: Arc<RwLock<Self::Store>>,
+            materialization: Self::Materialization,
+            heads: Vec<Head>,
+        ) -> Self {
+            Self {
+                store,
+                materialization,
+                heads,
+            }
+        }
+
+        fn store_handle(&self) -> Arc<RwLock<Self::Store>> {
+            Arc::clone(&self.store)
+        }
+
+        fn store_read(&self) -> Result<RwLockReadGuard<'_, Self::Store>, ViewLockError> {
+            self.store.read().map_err(|_| ViewLockError)
+        }
+
+        fn store_write(&self) -> Result<RwLockWriteGuard<'_, Self::Store>, ViewLockError> {
+            self.store.write().map_err(|_| ViewLockError)
+        }
+
+        fn set_heads(&mut self, heads: Vec<Head>) {
+            self.heads = heads;
+        }
+
+        fn set_materialization(&mut self, _materialization: Self::Materialization) {}
+
+        fn status(&self, id: &ContentId) -> FetchStatus {
+            self.materialization.status(id)
+        }
+
+        fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+            let (name, size, executable, chunks) = self.file_entry()?;
+            if path == name {
+                Ok(Node::File {
+                    size,
+                    executable,
+                    chunks,
+                })
+            } else {
+                Err(ViewError::NotFound)
+            }
+        }
+
+        fn stat(&self, path: &str) -> Result<Attr, ViewError> {
+            match self.lookup(path)? {
+                Node::File {
+                    size, executable, ..
+                } => Ok(Attr {
+                    kind: Kind::File,
+                    size,
+                    executable,
+                }),
+                _ => Err(ViewError::NotADirectory),
+            }
+        }
+
+        fn readdir(&self, _node: &Node) -> Result<Vec<DirEntry>, ViewError> {
+            Err(ViewError::NotADirectory)
+        }
+
+        fn open_file(&self, node: &Node) -> Result<OpenFile, ViewError> {
+            match node {
+                Node::File { chunks, size, .. } => {
+                    let store = self.store.read().map_err(|_| {
+                        ViewError::Store(StoreFailure::Transient, "poisoned".into())
+                    })?;
+                    let present = store.has(&chunks[0]).map_err(|error| {
+                        ViewError::Store(StoreFailure::Transient, format!("{error:?}"))
+                    })?;
+                    if present {
+                        Ok(OpenFile::new(chunks.clone(), *size))
+                    } else {
+                        Err(self.absent(&chunks[0]))
+                    }
+                }
+                _ => Err(ViewError::NotAFile),
+            }
+        }
+
+        fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError> {
+            let id = file.chunks()[0];
+            let store = self
+                .store
+                .read()
+                .map_err(|_| ViewError::Store(StoreFailure::Transient, "poisoned".into()))?;
+            let bytes = store
+                .get(&id)
+                .map_err(|error| ViewError::Store(StoreFailure::Transient, format!("{error:?}")))?
+                .ok_or_else(|| self.absent(&id))?;
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let end = start.saturating_add(len).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+    }
+
+    /// A scratch single-member engine with one file (`f`, eleven bytes
+    /// in one chunk) authored, plus the store and identities the live
+    /// node needs: the chunk, the root tree, and the authored head.
+    fn scratch_file_drive(
+        tag: &str,
+    ) -> (
+        Engine,
+        std::path::PathBuf,
+        MemoryObjectStore,
+        ContentId,
+        ContentId,
+        AuthorizedSnapshot,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "wyrd-core-prereq-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.clone(), "core-test-pass", identity).unwrap();
+        let mut store = MemoryObjectStore::default();
+        let chunk = store.insert(ObjectKind::Chunk, b"remote-base").unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 11, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let head = engine.author_snapshot(&store, root).unwrap();
+        (engine, dir, store, chunk, root, head)
+    }
+
+    /// A live node over the fake view: the heads cross as `Head`s like
+    /// production, and the store handle is shared like production.
+    fn live_over_fake(
+        engine: Engine,
+        store: MemoryObjectStore,
+        heads: &[AuthorizedSnapshot],
+    ) -> LiveNode<FileView> {
+        let revision = engine.current();
+        let materialization = RuntimeMaterialization {
+            runtime: engine.runtime_state().unwrap(),
+        };
+        let store = Arc::new(RwLock::new(store));
+        let baseline = FileView::open_shared(
+            Arc::clone(&store),
+            materialization,
+            heads.iter().cloned().map(Head::new).collect(),
+        );
+        LiveNode::split(
+            engine,
+            store,
+            baseline,
+            revision,
+            Duration::from_secs(30),
+            &LiveConfig::default(),
+        )
+        .0
+    }
+
+    /// Reading a prefix of a remote-only file defers on the file's
+    /// chunk (not EIO): the tree resolves locally, the chunk names its
+    /// demand, and the pin is the evaluated single head.
+    #[test]
+    fn prefix_read_on_remote_only_file_defers_with_the_evaluated_pin() {
+        let (engine, dir, mut store, chunk, root, head) = scratch_file_drive("prefix");
+        // The tree resolves; the chunk does not.
+        let tree_bytes = store.get(&root).unwrap().unwrap();
+        store = MemoryObjectStore::default();
+        store
+            .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+            .unwrap();
+        let base = head.snapshot().snapshot_id();
+        let node = live_over_fake(engine, store, &[head]);
+        let error = node
+            .read_current_file_prefix(&node.live_heads_traced().unwrap(), "f", 64)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::NeedContent {
+                chunk,
+                base: Some(base),
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Resolving a path whose subtree is remote-only defers on the
+    /// subtree identity: the lookup names its demand like a read does.
+    #[test]
+    fn lookup_on_remote_only_subtree_defers_with_the_evaluated_pin() {
+        let (engine, dir, _store, _chunk, root, head) = scratch_file_drive("lookup");
+        // Neither the tree nor the chunk is servable here.
+        let node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let base = node.live_heads_traced().unwrap()[0]
+            .snapshot()
+            .snapshot_id();
+        let error = node
+            .current_node(&node.live_heads_traced().unwrap(), "f")
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::NeedContent {
+                chunk: root,
+                base: Some(base),
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Local content keeps its mappings: a served prefix reads, a
+    /// missing path is `NotFound`, and a missing lookup is absence —
+    /// the demand mapping changes nothing for held bytes.
+    #[test]
+    fn local_content_keeps_its_mappings() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("local");
+        let node = live_over_fake(engine, store, &[head]);
+        let heads = node.live_heads_traced().unwrap();
+        assert_eq!(
+            node.read_current_file_prefix(&heads, "f", 64).unwrap(),
+            b"remote-base"
+        );
+        assert_eq!(
+            node.read_current_file_prefix(&heads, "gone", 64)
+                .unwrap_err(),
+            MutationError::NotFound("gone".to_string())
+        );
+        assert_eq!(node.current_node(&heads, "gone").unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

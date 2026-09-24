@@ -519,6 +519,67 @@ fn path_truncate_reads_only_the_kept_prefix() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Content the engine believes local but the store does not hold fails
+/// closed: the view reports `Unavailable` for the stale-locality claim
+/// (not a fetchable remote), so the append fails EIO on the next pass
+/// instead of registering a want and hanging until the prerequisite
+/// deadline. The engine marks authored closures local and production
+/// always serves the store it authors into; this pins the boundary
+/// when that invariant is broken (a store wiped under a kept engine
+/// directory), so recovery stays a fast error, never a 30s hang.
+#[test]
+fn append_to_store_absent_but_engine_local_content_fails_closed() {
+    let (mut engine, dir, _) = scratch_drive();
+    let mut author_store = MemoryObjectStore::default();
+    let chunk = author_store
+        .insert(wyrd_format::ObjectKind::Chunk, b"base")
+        .unwrap();
+    let root = wyrd_format::Tree::from_entries(vec![wyrd_format::Entry::file(
+        "remote",
+        4,
+        false,
+        vec![chunk],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut author_store)
+    .unwrap();
+    engine.author_snapshot(&author_store, root).unwrap();
+    // Serve from a store holding the tree but not the file's chunk:
+    // the tree resolves from local objects, but the file's content is
+    // absent where the engine claims it local. (Heads cannot install
+    // without the tree object, so a fully empty serving store is not
+    // the fixture.)
+    let mut serving_store = MemoryObjectStore::default();
+    let tree_bytes = author_store.get(&root).unwrap().unwrap();
+    serving_store
+        .insert_verified(wyrd_format::ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, serving_store).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (live, backend) = live_backend(daemon);
+    let wants = std::sync::Arc::clone(live.wants());
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let fh = backend
+        .open_write("remote", libc::O_WRONLY | libc::O_APPEND)
+        .unwrap();
+    backend.write_handle(fh, 0, b"!").unwrap();
+    // A fast EIO, not a held mutation: no demand exists for content
+    // the engine claims is already local.
+    assert_eq!(backend.commit_handle(fh), Err(fuser::Errno::EIO));
+    assert_eq!(wants.waiter_count(&chunk), 0);
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A mode change through a clean writable handle must not lose the
 /// file: the commit submits the buffered image, so the handle
 /// materializes the captured content before going dirty.

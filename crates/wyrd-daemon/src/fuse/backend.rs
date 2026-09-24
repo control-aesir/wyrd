@@ -112,11 +112,16 @@ pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
         MutationError::TooLarge(_) => fuser::Errno::EFBIG,
         MutationError::Store(StoreFailure::StorageFull) => fuser::Errno::ENOSPC,
         MutationError::Store(StoreFailure::PermissionDenied) => fuser::Errno::EACCES,
+        // A valid operation whose authoring prerequisite never became
+        // available in time: distinct from EIO so callers can tell
+        // "retry may succeed" from "something is wrong".
+        MutationError::TimedOut => fuser::Errno::ETIMEDOUT,
         MutationError::Conflicted { .. }
         | MutationError::Stale(_)
         | MutationError::Lock
         | MutationError::Store(_)
         | MutationError::Shutdown
+        | MutationError::NeedContent { .. }
         | MutationError::Engine => fuser::Errno::EIO,
     }
 }

@@ -135,20 +135,36 @@ MutationRequest {
    mounted mutations; mutations execute serially in admission order.
    Submission order and execution order coincide, so snapshot parent
    selection is deterministic: each mutation's snapshot parents are the
-   heads after the previous mutation.
+   heads after the previous mutation. A mutation held for authoring
+   prerequisites rejoins in submission order, so the total order
+   survives the hold.
 2. **Bounded.** `MAX_PENDING_MUTATIONS` bounds all admitted, incomplete
-   requests — including the request currently executing, not just those
-   waiting. Admission beyond it returns `EAGAIN`. The queue has its own
-   lock, never the view's or the store's. Shutdown closes admission:
+   requests — including the request currently executing and any held
+   for prerequisites, not just those waiting. Admission beyond it
+   returns `EAGAIN`. The queue has its own lock, never the view's or
+   the store's. Shutdown closes admission:
    once the live loop stops, new submissions are refused with `EIO`
-   (`Shutdown`) instead of queueing behind a loop that will never drain.
+   (`Shutdown`) instead of queueing behind a loop that will never drain,
+   and held requests resolve `Shutdown` like any other queued request.
 3. **Synchronous, no silent post-timeout commit.** Unlike a fetch want
-   (which may outlive its waiter), a mutation has no wait timeout:
-   admission is immediate (or `EAGAIN`), and once admitted the request
-   either commits or fails before the caller returns. There is no path
-   where `fsync` fails with `EIO` and the mutation nevertheless applies
-   later.
-4. **Liveness consequence (named).** The daemon synchronization loop is a
+   (which may outlive its waiter), a mutation's caller stays blocked
+   until the loop completes it — including across held passes. Once
+   admitted the request either commits or fails before the caller
+   returns. There is no path where `fsync` fails and the mutation
+   nevertheless applies later.
+4. **Held for authoring prerequisites, with a deadline.** A mutation
+   whose base closure references remote-only content cannot author:
+   the resolver (`ChunkUnavailable`) names the missing chunk, the loop
+   registers it as an ordinary fetch want, and the mutation waits —
+   pinned to the single head its first evaluation used, so the retry
+   can never silently rebase onto newer state. A changed, emptied, or
+   multiplied head set fails the retry `Stale`, exactly like a raced
+   handle commit. The wait is bounded by `max_mutation_wait` (default
+   30s, wall-clock from the first hold, checked every pass); past it
+   the mutation fails `ETIMEDOUT` — retryable information, not a
+   system failure. A mutation evaluated headless or multi-head never
+   holds: nothing meaningful pins, so it fails closed as before.
+5. **Liveness consequence (named).** The daemon synchronization loop is a
    hard liveness dependency for every committing FUSE operation: a wedged
    loop blocks the caller indefinitely. That is a daemon health failure
    bounded by the process supervisor, not a per-request cancellation, and
@@ -157,7 +173,7 @@ MutationRequest {
    resolves every admitted-but-incomplete request with `EIO`
    (`Shutdown`) instead of stranding it, and the closed queue refuses
    new submissions the same way.
-5. **Publication is the same path as fetch.** A mutation applies under
+6. **Publication is the same path as fetch.** A mutation applies under
    the store write path and publishes heads and materialization under
    one short view write lock, exactly as a fetch pass does. Neither lock
    is ever held across a network wait.

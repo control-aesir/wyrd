@@ -7,7 +7,8 @@
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
-    chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, StoreError, StoreFailure, Tree,
+    chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, SnapshotId, StoreError,
+    StoreFailure, Tree,
 };
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
@@ -199,6 +200,12 @@ pub struct LiveConfig {
     /// compose and run with the same config value, since `run_loop`
     /// takes it again for supervision.
     pub budgets: ResourceBudgets,
+    /// Wall-clock deadline for a submitted mutation held waiting on
+    /// authoring prerequisites (remote base-closure content): measured
+    /// from the first defer, checked every pass, terminal `TimedOut`
+    /// past it. Distinct from `open_timeout` (read-side demand wait):
+    /// authoring and reading tune separately.
+    pub max_mutation_wait: Duration,
 }
 
 impl Default for LiveConfig {
@@ -209,6 +216,7 @@ impl Default for LiveConfig {
             error_max_delay: Duration::from_secs(30),
             max_consecutive_errors: 10,
             budgets: ResourceBudgets::default(),
+            max_mutation_wait: Duration::from_secs(30),
         }
     }
 }
@@ -283,6 +291,9 @@ pub struct LiveNode<V: NamespaceView> {
     /// The admission cap paces demand; the registries and backend
     /// hold their own copies for their own refusals.
     pub(super) budgets: ResourceBudgets,
+    /// Deadline for deferred mutations, copied from the composition
+    /// config: a held mutation that outwaits it fails `TimedOut`.
+    pub(super) max_mutation_wait: Duration,
     /// The loop's pacing signal, created at composition and attached to
     /// the mutation queue there. The composer shares this same signal
     /// with the mailbox adapter so new mail wakes intake too: one
@@ -404,6 +415,7 @@ where
                 published_heads,
                 dirty: false,
                 budgets,
+                max_mutation_wait: config.max_mutation_wait,
                 waker,
                 node_addr: None,
             },
@@ -549,12 +561,51 @@ where
         let mutations = Arc::clone(&self.mutations);
         let mut batch = mutations.take_batch();
         for index in 0..batch.len() {
-            // Borrow the kind: submit moves the request into the queue,
-            // which owns it until the batch completes it, so the pass
-            // needs no copy — no per-pass clone extends the content
-            // lifetime.
-            let result = self.apply_mutation(batch.request(index).kind());
-            batch.record(index, result);
+            // Prerequisite deadline: wall-clock from the first defer,
+            // checked every pass. Past it the mutation fails terminal
+            // `TimedOut` — the submitter hears it and nothing applies
+            // later.
+            if let Some(since) = batch.deferred_since(index) {
+                if since.elapsed() >= self.max_mutation_wait {
+                    tracing::debug!(
+                        waited_ms = since.elapsed().as_millis(),
+                        "mutation prerequisite wait expired"
+                    );
+                    batch.record(index, Err(MutationError::TimedOut));
+                    continue;
+                }
+            }
+            let pinned = batch.pinned(index);
+            let kind = batch.request(index).kind().clone();
+            match self.apply_mutation(&kind, pinned) {
+                Err(MutationError::NeedContent { chunk, base }) => {
+                    let Some(base) = base else {
+                        // No pinnable head (headless or conflicted
+                        // evaluation): fail closed, never defer what
+                        // cannot pin.
+                        batch.record(index, Err(MutationError::Engine));
+                        continue;
+                    };
+                    match self.wants.register(chunk) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                chunk = ?chunk,
+                                base = ?base,
+                                "mutation deferred for authoring content"
+                            );
+                            batch.defer(index, base);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                error = ?error,
+                                "mutation demand refused"
+                            );
+                            batch.record(index, Err(MutationError::Engine));
+                        }
+                    }
+                }
+                other => batch.record(index, other),
+            }
         }
         // Settle admitted wants: retire a landed fetch, and retire a fetch
         // whose demand died — the engine's durable `Cached` policy keeps
@@ -673,11 +724,20 @@ where
     /// same bootstrap `put_file` performs. Returns the boundary-mapped
     /// failure without partial application: the format mutations either
     /// produce a new root or nothing.
-    fn apply_mutation(&mut self, kind: &MutationKind) -> Result<MutationOutcome, MutationError> {
+    fn apply_mutation(
+        &mut self,
+        kind: &MutationKind,
+        pinned: Option<SnapshotId>,
+    ) -> Result<MutationOutcome, MutationError> {
         match kind {
             MutationKind::Mkdir { path } => {
-                let base = self.live_base()?;
+                let heads = self.eval_heads(pinned, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let base = match heads.as_slice() {
+                    [] => None,
+                    [head] => Some(head.snapshot().tree),
+                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+                };
                 let base = match base {
                     Some(tree) => tree,
                     None => Tree::from_entries(Vec::new())
@@ -687,11 +747,11 @@ where
                 };
                 let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::CreateFile { path } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, path)?;
                 // `create` requires an absent name: anything already there
                 // (file, dir, symlink) is `EEXIST`, never a silent replace.
                 if self.current_node(&heads, path)?.is_some() {
@@ -715,7 +775,7 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Created(FileIdentity::new(
                     0,
                     false,
@@ -728,7 +788,7 @@ where
                 executable,
                 content,
             } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = match heads.as_slice() {
                     [] => return Err(MutationError::Stale(path.clone())),
                     [head] => head.snapshot().tree,
@@ -758,7 +818,7 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     content.len() as u64,
                     *executable,
@@ -766,7 +826,7 @@ where
                 )))
             }
             MutationKind::AppendFile { path, content } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, path)?;
                 // Append never creates or resurrects: a headless drive or
                 // a missing/repurposed path is stale, not `ENOENT`.
                 let tree = match heads.as_slice() {
@@ -805,7 +865,7 @@ where
                 if root == tree {
                     return Ok(MutationOutcome::Done);
                 }
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     image.len() as u64,
                     executable,
@@ -813,7 +873,7 @@ where
                 )))
             }
             MutationKind::Unlink { path } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
                 match self.current_node(&heads, path)? {
                     Some(Node::Dir { .. } | Node::MergedDir { .. }) => {
@@ -825,16 +885,16 @@ where
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rmdir { path } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rename {
@@ -842,7 +902,7 @@ where
                 to,
                 no_replace,
             } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, from)?;
                 let tree = self.single_tree(&heads, from)?;
                 if *no_replace && self.current_node(&heads, to)?.is_some() {
                     return Err(MutationError::AlreadyExists(to.clone()));
@@ -854,7 +914,7 @@ where
                     // Same-path rename is a no-op: no snapshot.
                     return Ok(MutationOutcome::Done);
                 }
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::SetAttrs {
@@ -862,7 +922,7 @@ where
                 size,
                 executable,
             } => {
-                let heads = self.live_heads_traced()?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
                 let (current_size, current_exec, chunks) = match self.current_node(&heads, path)? {
                     Some(Node::File {
@@ -916,7 +976,7 @@ where
                 if root == tree {
                     return Ok(MutationOutcome::Done);
                 }
-                Self::author_traced(&mut self.engine, &*store, root)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
         }
@@ -932,6 +992,7 @@ where
         engine: &mut Engine,
         store: &S,
         root: ContentId,
+        heads: &[AuthorizedSnapshot],
     ) -> Result<AuthorizedSnapshot, MutationError>
     where
         S: ObjectStore,
@@ -939,8 +1000,42 @@ where
     {
         engine.author_snapshot(store, root).map_err(|error| {
             tracing::debug!(error = ?error, "mutation authoring refused");
-            MutationError::Engine
+            match error {
+                EngineError::ChunkUnavailable(chunk) => MutationError::NeedContent {
+                    chunk,
+                    // The pin is the head this evaluation actually
+                    // used — captured here, never re-read later. A
+                    // headless or multi-head evaluation cannot pin,
+                    // so it stays opaque Engine.
+                    base: match heads {
+                        [head] => Some(head.snapshot().snapshot_id()),
+                        _ => None,
+                    },
+                },
+                _ => MutationError::Engine,
+            }
         })
+    }
+
+    /// Evaluate the current eligible heads against an optional pin:
+    /// a retried mutation must observe exactly the single head its
+    /// first evaluation used — an empty, changed, or multiplied head
+    /// set is `Stale`, never a silent rebase onto newer state. A
+    /// first evaluation (`None`) returns whatever classification
+    /// says; the defer site pins the single-head outcome.
+    fn eval_heads(
+        &self,
+        pinned: Option<SnapshotId>,
+        path: &str,
+    ) -> Result<Vec<AuthorizedSnapshot>, MutationError> {
+        let heads = self.live_heads_traced()?;
+        if let Some(base) = pinned {
+            match heads.as_slice() {
+                [head] if head.snapshot().snapshot_id() == base => {}
+                _ => return Err(MutationError::Stale(path.to_string())),
+            }
+        }
+        Ok(heads)
     }
 
     /// The single live head's tree, or a conflict. A headless drive has
@@ -1053,18 +1148,6 @@ where
             "mutation evaluated live heads"
         );
         Ok(heads)
-    }
-
-    /// The tree a local mutation read-modify-writes: a single live head,
-    /// `None` for the headless bootstrap, or a conflict. Mutations fail
-    /// closed on multiple heads: there is no single tree to rebuild.
-    fn live_base(&self) -> Result<Option<ContentId>, MutationError> {
-        let heads = self.live_heads_traced()?;
-        match heads.as_slice() {
-            [] => Ok(None),
-            [head] => Ok(Some(head.snapshot().tree)),
-            _ => Err(MutationError::Conflicted { heads: heads.len() }),
-        }
     }
 
     /// The served generation count. Bumps exactly when a pass

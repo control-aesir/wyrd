@@ -14,6 +14,12 @@
 //! the loop, which is a daemon-health concern bounded by the process
 //! supervisor, not per-request cancellation.
 //!
+//! One exception keeps the waiter blocked: a mutation whose authoring
+//! needs remote content holds across passes ([`MutationBatch::defer`]),
+//! pinned to its evaluated head with a wall-clock deadline. The hold
+//! never outlives the waiter and never applies after a failure — it is
+//! a prerequisite wait, not a background retry.
+//!
 //! The queue has its own lock (never the projection's or the store's).
 //! Submitting wakes the loop's idle wait immediately; the loop drains the
 //! batch, applies each request under the store write path, and completes
@@ -159,6 +165,22 @@ pub enum MutationError {
     /// Authoring, durability, or validation failed. POSIX `EIO`.
     #[error("engine failed")]
     Engine,
+    /// Authoring needs content that is not locally available: the base
+    /// closure references a chunk with no sealed representation and no
+    /// plaintext here. Never reaches the POSIX boundary — the loop
+    /// registers a want for the chunk and holds the mutation pending.
+    /// Carries the single head the mutation was evaluated against so
+    /// the retry can pin it without re-reading the head set.
+    #[error("authoring needs remote content {chunk:?}")]
+    NeedContent {
+        chunk: ContentId,
+        base: Option<wyrd_format::SnapshotId>,
+    },
+    /// A deferred mutation waited past `max_mutation_wait` for its
+    /// authoring prerequisites. POSIX `ETIMEDOUT`: the operation was
+    /// valid but its prerequisite never became available in time.
+    #[error("mutation prerequisite wait expired")]
+    TimedOut,
     /// The live loop stopped before completing the request — terminal
     /// error or shutdown — so it may never have executed. POSIX `EIO`:
     /// a distinct variant (not a bare `Engine`) so supervisors and
@@ -332,6 +354,16 @@ impl std::fmt::Display for MutationId {
 pub struct QueuedMutation {
     request: MutationRequest,
     reply: Arc<Reply>,
+    /// The single head this mutation was first evaluated against, set
+    /// by [`MutationBatch::defer`]. A retried mutation must observe
+    /// exactly this head: anything else is `Stale`, never a silent
+    /// rebase onto newer state.
+    base: Option<wyrd_format::SnapshotId>,
+    /// When the entry was first held for authoring prerequisites.
+    /// `None` until the first defer; later defers must not reset it,
+    /// so the deadline measures total prerequisite wait, not time
+    /// since the last retry.
+    first_deferred: Option<Instant>,
 }
 
 impl QueuedMutation {
@@ -475,6 +507,8 @@ impl MutationQueue {
             state.pending.push_back(QueuedMutation {
                 request: MutationRequest { id, kind },
                 reply: Arc::clone(&reply),
+                base: None,
+                first_deferred: None,
             });
         }
         self.work.notify_one();
@@ -539,6 +573,18 @@ impl MutationQueue {
         state.outstanding = state.outstanding.saturating_sub(1);
         drop(state);
         queued.reply.complete(result);
+    }
+
+    /// Return a taken entry to the pending set without touching its
+    /// reply or the admission count: the submitter stays blocked and
+    /// the saturation bound still counts exactly the queued work.
+    /// Deferred entries rejoin behind nothing taken this pass —
+    /// `push_back` preserves their submission order relative to each
+    /// other and to arrivals during the pass, so the total order
+    /// survives the hold.
+    fn requeue(&self, queued: QueuedMutation) {
+        let mut state = self.lock_state();
+        state.pending.push_back(queued);
     }
 
     /// Lock the queue state, recovering a poisoned mutex: the state is
@@ -625,9 +671,59 @@ impl MutationBatch<'_> {
         self.entries[index].result = Some(result);
     }
 
+    /// Hold the request at `index` for a later pass instead of
+    /// completing it: the entry returns to the queue with its reply
+    /// untouched, so the blocked submitter keeps waiting and the
+    /// admission slot stays consumed (no saturation leak). `base` is
+    /// the single head the mutation was evaluated against — the retry
+    /// must observe exactly it, never a silent rebase. The first-defer
+    /// instant is sticky: later defers of the same entry must not
+    /// reset the prerequisite deadline.
+    pub fn defer(&mut self, index: usize, base: wyrd_format::SnapshotId) {
+        let entry = &mut self.entries[index];
+        let mut queued = entry
+            .queued
+            .take()
+            .expect("request is present until finish");
+        entry.result = None;
+        if queued.first_deferred.is_none() {
+            queued.first_deferred = Some(Instant::now());
+        }
+        // First pin wins: the retry rule compares against the head
+        // the first evaluation used, so a later defer must not
+        // re-pin (in production the pin always matches — `eval_heads`
+        // enforced it — making this a backstop, not a path).
+        if queued.base.is_none() {
+            queued.base = Some(base);
+        }
+        self.queue.requeue(queued);
+    }
+
+    /// The pinned base head for the request at `index`, if a previous
+    /// pass deferred it.
+    pub fn pinned(&self, index: usize) -> Option<wyrd_format::SnapshotId> {
+        self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .base
+    }
+
+    /// When the request at `index` was first deferred, if ever.
+    pub fn deferred_since(&self, index: usize) -> Option<Instant> {
+        self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .first_deferred
+    }
+
     /// Complete every request with its recorded result; an unrecorded
     /// request fails closed with `Engine`. Idempotent — [`Drop`] calls
     /// it, so an explicit call just makes the timing clear.
+    ///
+    /// Deferred entries are absent by construction: [`defer`](Self::defer)
+    /// returns them to the queue, so `finish` never observes them.
     pub fn finish(&mut self) {
         for entry in &mut self.entries {
             let Some(queued) = entry.queued.take() else {
@@ -846,6 +942,85 @@ mod tests {
         }
         assert_eq!(submitter.join().unwrap(), Err(MutationError::Engine));
         assert_eq!(queue.outstanding(), 0, "the slot is released");
+    }
+
+    /// A deferred mutation keeps its submitter blocked on the same
+    /// reply, consumes no additional admission slot, and retries with
+    /// the pinned base: the guard's `finish` never observes it.
+    #[test]
+    fn deferred_mutation_keeps_one_slot_and_retries_pinned() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("docs")))
+        };
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(batch.pinned(0), None, "no pin before the first defer");
+            assert_eq!(batch.deferred_since(0), None);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(queue.outstanding(), 1, "defer consumes no extra slot");
+        let first;
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(batch.len(), 1, "the same entry retries");
+            assert_eq!(batch.pinned(0), Some(base), "the pin survives");
+            first = batch.deferred_since(0).expect("defer stamps the wait");
+            batch.defer(0, SnapshotId::from_bytes([0xCC; 32]));
+            batch.finish();
+        }
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(
+                batch.pinned(0),
+                Some(base),
+                "first pin wins, never re-pinned"
+            );
+            assert_eq!(
+                batch.deferred_since(0),
+                Some(first),
+                "a second defer must not reset the deadline"
+            );
+            batch.record(0, Ok(MutationOutcome::Done));
+            batch.finish();
+        }
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(queue.outstanding(), 0);
+    }
+
+    /// Deferred entries still count as queued work for saturation: a
+    /// held mutation plus a full queue refuses new admissions, and a
+    /// shutdown completes the held reply instead of leaking the waiter.
+    #[test]
+    fn deferred_entries_count_toward_saturation_and_shutdown() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::with_limit(1));
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("first")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue);
+            batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+            batch.finish();
+        }
+        assert_eq!(
+            queue.submit(mkdir("second")),
+            Err(MutationError::Saturated),
+            "the held entry still occupies its slot"
+        );
+        queue.shutdown();
+        assert_eq!(
+            submitter.join().unwrap(),
+            Err(MutationError::Shutdown),
+            "shutdown completes the held reply"
+        );
     }
 
     /// Admission is bounded including the executing request: past the

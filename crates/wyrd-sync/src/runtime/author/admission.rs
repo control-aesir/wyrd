@@ -212,16 +212,44 @@ fn admit(
         batch.push(Fact::CapabilityQueued(epoch, *other));
     }
     // Current heads ride the catch-up: the newcomer learns what exists
-    // before post-admission gossip reaches it. Every head is at or
-    // below the admission epoch, so the invited keys open all of them.
+    // before post-admission gossip reaches it. Heads alone are not
+    // enough — a head without its ancestry is unadoptable
+    // (UnknownParent poisons the whole chain), and pre-admission
+    // snapshots were queued for nobody, so the obligation must cover
+    // the lineage closure: each head plus every ancestor reachable
+    // through recorded bodies. Every closure member is at or below
+    // the admission epoch, so the invited keys open all of them.
     // Sending reuses the announcement outbox; the re-announce send
     // path (not the authoring one) serves snapshots this engine did
-    // not author.
-    for head in engine.live_heads()? {
-        batch.push(Fact::AnnouncementQueued(
-            head.snapshot().snapshot_id(),
-            device,
-        ));
+    // not author. Already-covered pairs stay untouched, and only
+    // snapshots this engine can actually serve get obligations
+    // (authored here, or a recorded announcement the re-announce path
+    // can resend) — anything else could never discharge.
+    {
+        use std::collections::BTreeSet;
+        use wyrd_format::SnapshotId;
+
+        let rebuilt = engine.store.rebuild(engine.device)?;
+        let mut stack: Vec<SnapshotId> = engine
+            .live_heads()?
+            .into_iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(body) = rebuilt.runtime.snapshot_body(&id) else {
+                continue;
+            };
+            let servable =
+                body.author == engine.device || rebuilt.runtime.announcement(&id).is_some();
+            if servable && !rebuilt.runtime.announcement_covered(id, device) {
+                batch.push(Fact::AnnouncementQueued(id, device));
+            }
+            stack.extend(body.parents.iter().copied());
+        }
     }
     engine.commit_facts(&batch)?;
     engine.resync()?;

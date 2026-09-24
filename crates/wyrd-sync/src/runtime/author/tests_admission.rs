@@ -915,3 +915,177 @@ fn pending_announcement_resends_with_the_live_route() {
         "resend carries the live route, not the dead seal"
     );
 }
+
+#[test]
+fn admission_queues_the_lineage_closure_for_the_newcomer() {
+    use crate::runtime::test_util::{announcement_msg_with, body_root};
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+
+    // Late-joiner catch-up is an explicit admission-time obligation:
+    // the newcomer gets the current head's full ancestry, not just
+    // the head. A head without its ancestry is unadoptable
+    // (UnknownParent poisons the whole chain), and pre-admission
+    // snapshots were queued for nobody — a lone member announces to
+    // nobody — so admission must create those obligations.
+    let (_dir, mut engine, genesis_id) = owner_engine("lineage-closure");
+    let (owner_sk, _) = key(10);
+    let mut objects = MemoryObjectStore::default();
+    let chunk_a = objects.insert(ObjectKind::Chunk, b"a").unwrap();
+    let tree_a = Tree::from_entries(vec![Entry::file("a.txt", 1, false, vec![chunk_a]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let a1 = engine.author_snapshot(&objects, tree_a).unwrap();
+    let a1_id = a1.snapshot().snapshot_id();
+    let chunk_b = objects.insert(ObjectKind::Chunk, b"bb").unwrap();
+    let tree_b = Tree::from_entries(vec![Entry::file("b.txt", 2, false, vec![chunk_b]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let a2 = engine.author_snapshot(&objects, tree_b).unwrap();
+    let a2_id = a2.snapshot().snapshot_id();
+
+    // Control: the owner holds its own pre-admit head while it is still
+    // the tip epoch.
+    let owner_heads = engine.live_heads().unwrap();
+    assert_eq!(
+        owner_heads
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![a2_id],
+        "owner adopts what it authored"
+    );
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+
+    // The head plus its ancestry, each exactly once — the queue facts
+    // are set semantics, so catch-up never duplicates obligations.
+    let pending = engine.pending_announcements().unwrap();
+    for id in [a1_id, a2_id] {
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|pair| *pair == &(id, newcomer_id))
+                .count(),
+            1,
+            "exactly one obligation per lineage member"
+        );
+    }
+
+    // Rotate, then author the leg-1 write: epoch 3, parented onto A2.
+    let rotated = engine.rotate_epoch().unwrap();
+    let rotation_id = rotated.transition_id();
+    let chunk_c = objects.insert(ObjectKind::Chunk, b"ccc").unwrap();
+    let tree_c = Tree::from_entries(vec![Entry::file("c.txt", 3, false, vec![chunk_c]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let s = engine.author_snapshot(&objects, tree_c).unwrap();
+    let s_id = s.snapshot().snapshot_id();
+    assert_eq!(
+        engine
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![s_id],
+        "owner advances onto the rotation-epoch write"
+    );
+
+    // The newcomer joins and learns the full boundary: every lineage
+    // announcement (as intake would record them) plus the fetched
+    // bodies and root manifest records.
+    let rebuilt = engine.store.rebuild(engine.device()).unwrap();
+    let record_for = |id: &wyrd_format::SnapshotId| {
+        rebuilt
+            .runtime
+            .root_manifest_record(id)
+            .cloned()
+            .expect("authoring records the root manifest")
+    };
+    let record_a1 = record_for(&a1_id);
+    let record_a2 = record_for(&a2_id);
+    let record_s = record_for(&s_id);
+    let announce_for = |snapshot: &wyrd_format::Snapshot,
+                        epoch: u64,
+                        membership: wyrd_format::TransitionId,
+                        record: &crate::runtime::ManifestRecord| {
+        let Message::SnapshotAnnouncement(announcement) = announcement_msg_with(
+            &identity_secret(&owner_sk),
+            snapshot.snapshot_id(),
+            epoch,
+            membership,
+            body_root(snapshot),
+            record.manifest_id,
+            record.transport,
+        ) else {
+            panic!("announcement helper builds announcements");
+        };
+        announcement
+    };
+    let join_dir = TestDir::new("lineage-closure-join");
+    let mut joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+        &outcome.invitation,
+    )
+    .unwrap();
+    // Catch the newcomer up on membership first: the rotation
+    // transition arrives sealed under its own epoch key, so the first
+    // drain installs the secret from the pairing-key delivery while
+    // the transition waits, and the redelivery commits on the second
+    // drain — the same two-pass shape the live loop performs.
+    let mut relay = MemoryRelay::default();
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: engine.device(),
+        };
+        engine.deliver_pending(&mut sender).unwrap();
+    }
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let first = joined.drain(&mut receiver).unwrap();
+        assert_eq!(first.accepted, 3, "chain transition, capability, delivery");
+        assert_eq!(first.skipped, 1, "transition waits for its epoch key");
+        let second = joined.drain(&mut receiver).unwrap();
+        assert_eq!(second.accepted, 1, "redelivered transition commits");
+    }
+    joined
+        .commit_facts(&[
+            Fact::SnapshotBody(a1.clone()),
+            Fact::Manifest(record_a1.clone()),
+            Fact::Announcement(announce_for(a1.snapshot(), 1, genesis_id, &record_a1)),
+            Fact::SnapshotBody(a2.clone()),
+            Fact::Manifest(record_a2.clone()),
+            Fact::Announcement(announce_for(a2.snapshot(), 1, genesis_id, &record_a2)),
+            Fact::SnapshotBody(s.clone()),
+            Fact::Manifest(record_s.clone()),
+            Fact::Announcement(announce_for(s.snapshot(), 3, rotation_id, &record_s)),
+        ])
+        .unwrap();
+
+    // Complete ancestry, complete adoption.
+    assert_eq!(
+        joined
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![s_id],
+        "late joiner with full lineage adopts the head"
+    );
+}

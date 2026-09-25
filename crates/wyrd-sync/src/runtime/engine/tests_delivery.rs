@@ -862,3 +862,114 @@ fn non_owner_stale_obligation_commits_no_replacement() {
         "the stale fact is left exactly as it was"
     );
 }
+
+/// A stale `0x01` obligation the sender can satisfy neither way: it
+/// holds no epoch secrets and has no mint authority. The obligation must
+/// stay pending with its bytes untouched, and the pass must return Ok
+/// rather than a `SealedOutboxMismatch` -- one unreachable obligation
+/// is not a broken store. This is the no-secret half that the
+/// owner/non-owner pair above does not cover: both of those populate the
+/// keyring deliberately, so neither proves a *missing* secret is benign.
+#[test]
+fn stale_obligation_without_secrets_stays_pending() {
+    use crate::control::seal_rotation;
+    use crate::keys::capability::Capability;
+    use crate::keys::owner_proof::OwnerProof;
+
+    let mut fx = fixture();
+    let engine_device = fx.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admit = admit_engine(&mut builder, engine_device);
+    let admit_id = admit.transition_id();
+    let mail = vec![
+        deliver(&fx, 1, &transition_message(&genesis)),
+        deliver(&fx, 1, &transition_message(&admit)),
+    ];
+    queue(&mut fx, mail);
+    assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
+
+    // No `Fact::Capability`: the keyring is empty, so the re-mint cannot
+    // reach an epoch secret even though the sender is a member.
+    assert!(
+        fx.engine
+            .store
+            .rebuild(engine_device)
+            .unwrap()
+            .keyring
+            .secret(2)
+            .is_none(),
+        "the keyring is genuinely empty"
+    );
+
+    let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
+    let registration = state
+        .encryption_key_of(&engine_device)
+        .copied()
+        .expect("the engine has a registered key");
+    let held = vec![secret(0xAA), secret(0xBB)];
+    let proof = OwnerProof::sign(
+        &fx.engine.identity_secret,
+        &member_drive(),
+        &engine_device,
+        &admit_id,
+        2,
+        &held,
+    )
+    .encode();
+    let wrap = Capability::mint(member_drive(), engine_device, &state, &admit, held)
+        .expect("engine is a member")
+        .wrap()
+        .expect("wraps")
+        .as_bytes()
+        .to_vec();
+    let mut stale = seal_rotation(
+        &member_drive(),
+        engine_device,
+        &registration,
+        2,
+        &admit.canonical_bytes(),
+        &wrap,
+        &proof,
+    )
+    .expect("seals")
+    .encode();
+    stale[0] = ROTATION_VERSION_SUPERSEDED;
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilityQueued(2, engine_device),
+            Fact::CapabilitySealed(2, engine_device, stale.clone()),
+        ])
+        .unwrap();
+
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: engine_device,
+    };
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "an unsatisfiable obligation skips, and the pass still succeeds"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_sealed_replaced.is_empty(),
+        "no replacement without the epoch secrets"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "nothing is marked transmitted"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_capabilities(),
+        vec![(2, engine_device)],
+        "the obligation stays pending"
+    );
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, engine_device),
+        Some(stale.as_slice()),
+        "the stale fact is left exactly as it was"
+    );
+}

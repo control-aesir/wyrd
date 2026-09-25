@@ -323,11 +323,15 @@ pub(super) fn encode_fact(
             // discharges. A mismatch fails here, durably, rather than
             // lingering as a poisoned obligation until a send pass.
             let epoch_sealed = SealedControl::decode(sealed).ok().filter(|envelope| {
-                envelope.kind == ControlKind::Capability && envelope.epoch == *epoch
+                envelope.kind == ControlKind::Capability
+                    && envelope.drive == *drive
+                    && envelope.epoch == *epoch
             });
-            let rotation_sealed = SealedRotation::decode(sealed)
-                .ok()
-                .filter(|delivery| delivery.epoch == *epoch && delivery.recipient == *recipient);
+            let rotation_sealed = SealedRotation::decode(sealed).ok().filter(|delivery| {
+                delivery.drive == *drive
+                    && delivery.epoch == *epoch
+                    && delivery.recipient == *recipient
+            });
             if epoch_sealed.is_none() && rotation_sealed.is_none() {
                 return Err(DurableError::InvalidOutbox);
             }
@@ -346,11 +350,15 @@ pub(super) fn encode_fact(
             // Same correlation gate as `CapabilitySealed`, so a
             // replacement cannot install bytes that are not a sealed
             // capability for this exact obligation.
-            let rotation_sealed = SealedRotation::decode(replacement)
-                .ok()
-                .filter(|delivery| delivery.epoch == *epoch && delivery.recipient == *recipient);
+            let rotation_sealed = SealedRotation::decode(replacement).ok().filter(|delivery| {
+                delivery.drive == *drive
+                    && delivery.epoch == *epoch
+                    && delivery.recipient == *recipient
+            });
             let epoch_sealed = SealedControl::decode(replacement).ok().filter(|envelope| {
-                envelope.kind == ControlKind::Capability && envelope.epoch == *epoch
+                envelope.kind == ControlKind::Capability
+                    && envelope.drive == *drive
+                    && envelope.epoch == *epoch
             });
             if epoch_sealed.is_none() && rotation_sealed.is_none() {
                 return Err(DurableError::InvalidOutbox);
@@ -604,12 +612,16 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             // variant: an epoch-sealed capability envelope, or a
             // rotation delivery naming this epoch and recipient.
             let sealed = &record[40..];
-            let epoch_sealed = SealedControl::decode(sealed)
-                .ok()
-                .filter(|envelope| envelope.kind == ControlKind::Capability);
-            let rotation_sealed = SealedRotation::decode(sealed)
-                .ok()
-                .filter(|delivery| delivery.epoch == epoch && delivery.recipient == recipient);
+            let epoch_sealed = SealedControl::decode(sealed).ok().filter(|envelope| {
+                envelope.kind == ControlKind::Capability
+                    && envelope.drive == *drive
+                    && envelope.epoch == epoch
+            });
+            let rotation_sealed = SealedRotation::decode(sealed).ok().filter(|delivery| {
+                delivery.drive == *drive
+                    && delivery.epoch == epoch
+                    && delivery.recipient == recipient
+            });
             if epoch_sealed.is_none() && rotation_sealed.is_none() {
                 return None;
             }
@@ -627,12 +639,16 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
             let supersedes = record[40..72].try_into().ok()?;
             let replacement = &record[72..];
-            let rotation_sealed = SealedRotation::decode(replacement)
-                .ok()
-                .filter(|delivery| delivery.epoch == epoch && delivery.recipient == recipient);
-            let epoch_sealed = SealedControl::decode(replacement)
-                .ok()
-                .filter(|envelope| envelope.kind == ControlKind::Capability);
+            let rotation_sealed = SealedRotation::decode(replacement).ok().filter(|delivery| {
+                delivery.drive == *drive
+                    && delivery.epoch == epoch
+                    && delivery.recipient == recipient
+            });
+            let epoch_sealed = SealedControl::decode(replacement).ok().filter(|envelope| {
+                envelope.kind == ControlKind::Capability
+                    && envelope.drive == *drive
+                    && envelope.epoch == epoch
+            });
             if epoch_sealed.is_none() && rotation_sealed.is_none() {
                 return None;
             }
@@ -969,6 +985,140 @@ mod tests {
         .unwrap();
         assert_eq!(tag, TAG_CAPABILITY_SEALED_REPLACED);
         assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+
+        // Decode is the exact inverse of encode: every correlation
+        // encode enforces, decode enforces too. A record that could
+        // never be encoded must not survive replay as current bytes --
+        // a foreign-drive or wrong-epoch replacement would otherwise
+        // become the obligation and wedge the send path on every pass.
+        let record = |epoch: u64, to: DeviceId, supersedes: [u8; 32], payload: &[u8]| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&epoch.to_le_bytes());
+            out.extend_from_slice(to.as_bytes());
+            out.extend_from_slice(&supersedes);
+            out.extend_from_slice(payload);
+            out
+        };
+        let good = crate::control::seal_rotation(
+            &drive,
+            recipient,
+            &wyrd_format::DeviceEncryptionKey::from_bytes([0x7C; 32]),
+            2,
+            &[0xAA; 64],
+            &[0xCC; 64],
+            &[],
+        )
+        .expect("seals")
+        .encode();
+        // Wrong drive.
+        let foreign = crate::control::seal_rotation(
+            &DriveId::from_bytes([0x77; 32]),
+            recipient,
+            &wyrd_format::DeviceEncryptionKey::from_bytes([0x7C; 32]),
+            2,
+            &[0xAA; 64],
+            &[0xCC; 64],
+            &[],
+        )
+        .expect("seals")
+        .encode();
+        for (why, epoch, to, payload) in [
+            ("foreign drive", 2u64, recipient, foreign.as_slice()),
+            ("wrong epoch", 3, recipient, good.as_slice()),
+            (
+                "wrong recipient",
+                2,
+                DeviceId::from_bytes([0x66; 32]),
+                good.as_slice(),
+            ),
+        ] {
+            assert!(
+                decode_record(
+                    &drive,
+                    &key,
+                    TAG_CAPABILITY_SEALED_REPLACED,
+                    &record(epoch, to, [0xAB; 32], payload),
+                )
+                .is_none(),
+                "a replacement with a {why} is refused"
+            );
+        }
+        // Truncated and over-long records.
+        assert!(
+            decode_record(
+                &drive,
+                &key,
+                TAG_CAPABILITY_SEALED_REPLACED,
+                &record(2, recipient, [0xAB; 32], &[]),
+            )
+            .is_none(),
+            "an empty replacement is refused"
+        );
+        // A trailing byte is deliberately *not* refused here. Structural
+        // decode is header-only -- the AEAD opens at the recipient, with
+        // its secret -- so an over-long payload is indistinguishable from
+        // a longer ciphertext at replay and is caught when it fails to
+        // open, not before. Asserting otherwise would pin a guarantee
+        // the framing cannot make.
+        let mut padded = good.clone();
+        padded.push(0);
+        assert!(
+            decode_record(
+                &drive,
+                &key,
+                TAG_CAPABILITY_SEALED_REPLACED,
+                &record(2, recipient, [0xAB; 32], &padded),
+            )
+            .is_some(),
+            "structural decode is header-only; the recipient's AEAD is the gate"
+        );
+        // The same correlations hold for the first-seal variant, so a
+        // stale fact cannot smuggle in what a replacement cannot.
+        for (why, epoch, to, payload) in [
+            ("foreign drive", 2u64, recipient, foreign.as_slice()),
+            (
+                "wrong recipient",
+                2,
+                DeviceId::from_bytes([0x66; 32]),
+                good.as_slice(),
+            ),
+        ] {
+            let mut out = Vec::new();
+            out.extend_from_slice(&epoch.to_le_bytes());
+            out.extend_from_slice(to.as_bytes());
+            out.extend_from_slice(payload);
+            assert!(
+                decode_record(&drive, &key, TAG_CAPABILITY_SEALED, &out).is_none(),
+                "a first seal with a {why} is refused"
+            );
+        }
+        // The encoder refuses the same mismatches rather than writing
+        // a record that could only be rejected on read.
+        for (why, epoch, to, payload) in [
+            ("foreign drive", 2u64, recipient, foreign.as_slice()),
+            ("wrong epoch", 3, recipient, good.as_slice()),
+            (
+                "wrong recipient",
+                2,
+                DeviceId::from_bytes([0x66; 32]),
+                good.as_slice(),
+            ),
+        ] {
+            assert!(
+                encode_fact(
+                    &key,
+                    &drive,
+                    &Fact::CapabilitySealedReplaced {
+                        epoch,
+                        recipient: to,
+                        supersedes: [0xAB; 32],
+                        replacement: payload.to_vec(),
+                    },
+                )
+                .is_err(),
+                "a replacement with a {why} is never written"
+            );
+        }
         let (tag, bytes) =
             encode_fact(&key, &drive, &Fact::BootstrapPending(vec![0xBB; 48])).unwrap();
         assert_eq!(tag, TAG_BOOTSTRAP_PENDING);

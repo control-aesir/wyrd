@@ -10,7 +10,7 @@ use super::grammar;
 use super::head::ViewHead;
 use super::merge::merge;
 use super::types::{Attr, DirEntry, Kind, Materialization, Node, OpenFile, ViewError};
-use wyrd_core::view::{Head, NamespaceView, ViewLockError};
+use wyrd_core::view::{Head, LookupResult, NamespaceView, ViewLockError};
 
 /// A mounted drive's read-only view: the head set plus the stores that
 /// serve it. Heads are whole snapshots; the walked root is always the
@@ -375,6 +375,27 @@ where
         }
     }
 
+    fn load_tree_for_resolution(
+        &self,
+        id: &ContentId,
+        max_work: u64,
+    ) -> Result<(Option<Tree>, u64), ViewError> {
+        let bytes = match self.store_read()?.get(id) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err(self.absent(id)),
+            Err(error) => return Err(ViewError::Store(error.failure(), format!("{error:?}"))),
+        };
+        let work = u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if work > max_work {
+            return Ok((None, work));
+        }
+        Tree::decode(&bytes)
+            .map(|tree| (Some(tree), work))
+            .map_err(|_| ViewError::Corrupt)
+    }
+
     /// Load one chunk's bytes.
     fn load_chunk(&self, id: &ContentId) -> Result<Vec<u8>, ViewError> {
         match self.store_read()?.get(id) {
@@ -396,6 +417,36 @@ where
             FetchStatus::Corrupt => ViewError::Corrupt,
         }
     }
+}
+
+fn child_node(tree: &Tree, name: &str) -> Option<Node> {
+    tree.entries()
+        .binary_search_by(|entry| entry.name.as_str().cmp(name))
+        .ok()
+        .map(|index| leaf(&tree.entries()[index].content))
+}
+
+fn versioned_child(
+    component: &str,
+    resolutions: Vec<(wyrd_format::SnapshotId, Option<Node>)>,
+) -> Result<Option<Node>, ViewError> {
+    let Some(component) = Component::new(component.to_owned()).ok() else {
+        return Ok(None);
+    };
+    let Some(target) = grammar::parse_ref(&[component]) else {
+        return Ok(None);
+    };
+    let node = match merge(resolutions) {
+        Ok(node) => node,
+        Err(ViewError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Node::Conflict { mut versions } = node else {
+        return Ok(None);
+    };
+    let selected =
+        grammar::select_version(&mut versions, target.version).ok_or(ViewError::NotFound)?;
+    Ok(Some(selected.node.clone()))
 }
 
 /// A single tree entry's content as a node.
@@ -529,6 +580,104 @@ where
 
     fn lookup(&self, path: &str) -> Result<Node, ViewError> {
         self.lookup(path)
+    }
+
+    fn resolve_root(&self, max_work: u64) -> Result<LookupResult, ViewError> {
+        if self.heads.is_empty() {
+            return Ok(LookupResult {
+                node: Some(Node::MergedDir {
+                    subtrees: Vec::new(),
+                }),
+                work: 1,
+                limit_exceeded: 1 > max_work,
+            });
+        }
+        let mut work: u64 = 0;
+        let mut resolutions = Vec::with_capacity(self.heads.len());
+        for head in &self.heads {
+            let remaining = max_work.saturating_sub(work);
+            let (tree, cost) = self.load_tree_for_resolution(&head.tree, remaining)?;
+            work = work.saturating_add(cost);
+            let Some(_) = tree else {
+                return Ok(LookupResult {
+                    node: None,
+                    work,
+                    limit_exceeded: true,
+                });
+            };
+            resolutions.push((head.snapshot_id(), Some(Node::Dir { subtree: head.tree })));
+        }
+        Ok(LookupResult {
+            node: Some(merge(resolutions)?),
+            work,
+            limit_exceeded: work > max_work,
+        })
+    }
+
+    fn resolve_child(
+        &self,
+        parent: &Node,
+        component: &str,
+        max_work: u64,
+    ) -> Result<LookupResult, ViewError> {
+        match parent {
+            Node::Dir { subtree } => {
+                let (tree, work) = self.load_tree_for_resolution(subtree, max_work)?;
+                let node = tree.as_ref().and_then(|tree| child_node(tree, component));
+                Ok(LookupResult {
+                    node,
+                    work,
+                    limit_exceeded: tree.is_none() || work > max_work,
+                })
+            }
+            Node::MergedDir { subtrees } => {
+                let versioned = Component::new(component.to_owned())
+                    .ok()
+                    .and_then(|component| grammar::parse_ref(&[component]));
+                let mut work: u64 = 0;
+                let mut literal_resolutions = Vec::with_capacity(subtrees.len());
+                let mut versioned_resolutions = versioned
+                    .as_ref()
+                    .map(|_| Vec::with_capacity(subtrees.len()));
+                for (snapshot, subtree) in subtrees {
+                    let remaining = max_work.saturating_sub(work);
+                    let (tree, cost) = self.load_tree_for_resolution(subtree, remaining)?;
+                    work = work.saturating_add(cost);
+                    let Some(tree) = tree else {
+                        return Ok(LookupResult {
+                            node: None,
+                            work,
+                            limit_exceeded: true,
+                        });
+                    };
+                    literal_resolutions.push((*snapshot, child_node(&tree, component)));
+                    if let (Some(target), Some(resolutions)) =
+                        (versioned.as_ref(), versioned_resolutions.as_mut())
+                    {
+                        resolutions.push((*snapshot, child_node(&tree, &target.name)));
+                    }
+                }
+                let literal = match merge(literal_resolutions) {
+                    Ok(node) => Some(node),
+                    Err(ViewError::NotFound) => None,
+                    Err(error) => return Err(error),
+                };
+                let node = if literal.is_some() {
+                    literal
+                } else if let Some(resolutions) = versioned_resolutions {
+                    versioned_child(component, resolutions)?
+                } else {
+                    None
+                };
+                Ok(LookupResult {
+                    node,
+                    work,
+                    limit_exceeded: work > max_work,
+                })
+            }
+            Node::Conflict { .. } => Err(ViewError::Conflict),
+            Node::File { .. } | Node::Symlink { .. } => Err(ViewError::NotADirectory),
+        }
     }
 
     fn stat(&self, path: &str) -> Result<Attr, ViewError> {

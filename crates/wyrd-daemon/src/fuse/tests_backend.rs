@@ -1,8 +1,8 @@
-use super::backend::{current_owner, symlink_target};
+use super::backend::current_owner;
 use super::tests_harness::{backend, evolving_backend, heads, snapshot_of, NoMaterialization};
 use super::*;
 
-use fuser::FileHandle;
+use fuser::{FileHandle, INodeNo};
 use std::sync::Arc;
 
 use wyrd_format::ObjectStore;
@@ -128,7 +128,7 @@ fn first_write_over_the_handle_budget_does_not_materialize() {
 }
 
 #[test]
-fn symlink_targets_are_confined_to_the_mount() {
+fn mounted_readlink_refuses_symlink_traversal() {
     use wyrd_format::Entry;
 
     fn view_with(entries: Vec<Entry>) -> DriveView<MemoryObjectStore, NoMaterialization> {
@@ -140,30 +140,22 @@ fn symlink_targets_are_confined_to_the_mount() {
         DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]))
     }
 
-    // Absolute targets resolve in the host namespace: never served.
-    let view = view_with(vec![Entry::symlink("link", "/etc/passwd").unwrap()]);
-    assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
-    // A root-level `..` already escapes the mount.
-    let view = view_with(vec![Entry::symlink("link", "../target").unwrap()]);
-    assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
+    fn readlink_error(
+        view: DriveView<MemoryObjectStore, NoMaterialization>,
+        path: &str,
+    ) -> fuser::Errno {
+        let backend = FuseBackend::new(view);
+        let ino = backend.resolve_inode(path).unwrap().0;
+        backend.readlink_error_at(INodeNo(ino))
+    }
 
-    // Nested escapes: the walk is lexical from the link's parent.
+    for target in ["/etc/passwd", "../target", "safe"] {
+        let view = view_with(vec![Entry::symlink("link", target).unwrap()]);
+        assert_eq!(readlink_error(view, "link"), fuser::Errno::EOPNOTSUPP);
+    }
+
     let mut store = MemoryObjectStore::default();
     let inner = Tree::from_entries(vec![Entry::symlink("link", "../../evil").unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-    let root = Tree::from_entries(vec![Entry::dir("sub", inner).unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-    assert_eq!(symlink_target(&view, "sub/link"), Err(fuser::Errno::EACCES));
-
-    // In-drive targets still serve verbatim: the kernel resolves
-    // them inside the mount.
-    let mut store = MemoryObjectStore::default();
-    let inner = Tree::from_entries(vec![Entry::symlink("link", "../sibling").unwrap()])
         .unwrap()
         .insert_into(&mut store)
         .unwrap();
@@ -175,11 +167,51 @@ fn symlink_targets_are_confined_to_the_mount() {
     .insert_into(&mut store)
     .unwrap();
     let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-    assert_eq!(symlink_target(&view, "sub/link"), Ok("../sibling".into()));
+    assert_eq!(readlink_error(view, "sub/link"), fuser::Errno::EOPNOTSUPP);
 
-    // Non-target paths keep their existing mapping.
-    assert_eq!(symlink_target(&view, "missing"), Err(fuser::Errno::ENOENT));
-    assert_eq!(symlink_target(&view, "sibling"), Err(fuser::Errno::EINVAL));
+    let backend = FuseBackend::new(view_with(Vec::new()));
+    assert_eq!(
+        backend.readlink_error_at(INodeNo(999)),
+        fuser::Errno::ENOENT
+    );
+    assert_eq!(
+        readlink_error(
+            view_with(vec![Entry::file("sibling", 1, false, Vec::new()).unwrap()]),
+            "sibling",
+        ),
+        fuser::Errno::EINVAL
+    );
+}
+
+#[test]
+fn mounted_chained_symlink_traversal_is_refused() {
+    let mut store = MemoryObjectStore::default();
+    let leaf = Tree::from_entries(vec![
+        Entry::symlink("s", "../..").unwrap(),
+        Entry::symlink("link", "s/../../outside").unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let a = Tree::from_entries(vec![Entry::dir("b", leaf).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let root = Tree::from_entries(vec![Entry::dir("a", a).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let backend = FuseBackend::new(DriveView::new(
+        store,
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    ));
+    let ino = backend.resolve_inode("a/b/link").unwrap().0;
+
+    assert_eq!(
+        backend.readlink_error_at(INodeNo(ino)),
+        fuser::Errno::EOPNOTSUPP
+    );
 }
 
 #[test]

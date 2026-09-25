@@ -472,6 +472,25 @@ where
             .map(|guard| Arc::clone(&guard))
     }
 
+    pub(super) fn readlink_error_at(&self, ino: INodeNo) -> fuser::Errno {
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        let Ok(projection) = self.projection() else {
+            return fuser::Errno::EIO;
+        };
+        let node = match projection.view().lookup(&path) {
+            Ok(node) => node,
+            Err(ViewError::NotFound) => return fuser::Errno::ENOENT,
+            Err(error) => return errno_of(&error),
+        };
+        if let Err(error) = self.validate_inode(ino.0, &path, &node, projection.generation()) {
+            return error;
+        }
+        mounted_symlink_traversal_error(projection.view(), &path)
+    }
+
     /// Open the file at `path`: the view's immutable file identity is
     /// captured at open and keyed by a fresh handle, so later reads
     /// serve the opened version even after heads advance. The
@@ -1898,37 +1917,11 @@ where
 
     fn readlink(&self, _req: &fuser::Request, ino: INodeNo, reply: fuser::ReplyData) {
         let _log = RequestLog::new("readlink");
-        let path = match self.inode_path(ino.0) {
-            Ok(path) => path,
-            Err(error) => {
-                reply.error(_log.fail(error));
-                return;
-            }
-        };
-        let Ok(projection) = self.projection() else {
-            reply.error(_log.fail(fuser::Errno::EIO));
-            return;
-        };
-        let node = match projection.view().lookup(&path) {
-            Ok(node) => node,
-            Err(ViewError::NotFound) => {
-                self.retire_inode(ino.0);
-                reply.error(_log.fail(fuser::Errno::ENOENT));
-                return;
-            }
-            Err(error) => {
-                reply.error(_log.fail(errno_of(&error)));
-                return;
-            }
-        };
-        if let Err(error) = self.validate_inode(ino.0, &path, &node, projection.generation()) {
-            reply.error(_log.fail(error));
-            return;
+        let error = self.readlink_error_at(ino);
+        if error == fuser::Errno::ENOENT {
+            self.retire_inode(ino.0);
         }
-        match symlink_target(projection.view(), &path) {
-            Ok(target) => reply.data(target.as_bytes()),
-            Err(error) => reply.error(_log.fail(error)),
-        }
+        reply.error(_log.fail(error));
     }
 
     /// Create a directory: submit the mutation to the loop and, on
@@ -2299,25 +2292,16 @@ where
     }
 }
 
-pub(super) fn symlink_target<S: ObjectStore, M: Materialization>(
+pub(super) fn mounted_symlink_traversal_error<S: ObjectStore, M: Materialization>(
     view: &DriveView<S, M>,
     path: &str,
-) -> Result<String, fuser::Errno>
+) -> fuser::Errno
 where
     S::Error: std::fmt::Debug,
 {
     match view.lookup(path) {
-        Ok(Node::Symlink { target }) => {
-            // The kernel follows this target in the host namespace, so
-            // an escaping target must never reach it: fail closed with
-            // EACCES (sandbox convention) rather than serving bytes the
-            // kernel would resolve outside the mount.
-            match wyrd_fuse::confine_symlink_target(path, &target) {
-                Ok(()) => Ok(target),
-                Err(_) => Err(fuser::Errno::EACCES),
-            }
-        }
-        Ok(_) => Err(fuser::Errno::EINVAL),
-        Err(error) => Err(errno_of(&error)),
+        Ok(Node::Symlink { .. }) => fuser::Errno::EOPNOTSUPP,
+        Ok(_) => fuser::Errno::EINVAL,
+        Err(error) => errno_of(&error),
     }
 }

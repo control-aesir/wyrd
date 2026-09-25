@@ -28,15 +28,16 @@
 //! `DestinationNotEmpty`, and `dest` always holds one complete tree,
 //! never a mix.
 //!
-//! Symlinks pass the same confinement policy as the mount
-//! ([`confine_symlink_target`](crate::view::confine_symlink_target)):
-//! absolute and root-escaping targets are refused, because the plain
-//! copy must stay self-contained. Multi-head conflicts materialize as
-//! `name@N` siblings, numbered in SnapshotId byte order exactly like
-//! the version-selection grammar, so `doc@1` on disk is `doc@1` in
-//! the mount. Export never picks a winner silently; a stored name
-//! colliding with a versioned sibling fails closed as
-//! [`ExportError::NameCollision`].
+//! Symlinks are validated against the one immutable view used by this
+//! export ([`confine_symlink_target`](crate::view::confine_symlink_target)):
+//! absolute, root-escaping, compositionally escaping, conflicting,
+//! cyclic, and over-budget targets are refused, because the plain copy
+//! must stay self-contained. Mounted FUSE views do not follow symlinks
+//! in v0. Multi-head conflicts materialize as `name@N` siblings,
+//! numbered in SnapshotId byte order exactly like the version-selection
+//! grammar, so `doc@1` on disk is `doc@1` in the mount. Export never
+//! picks a winner silently; a stored name colliding with a versioned
+//! sibling fails closed as [`ExportError::NameCollision`].
 //!
 //! Walk depth is bounded by the format's [`MAX_PATH_DEPTH`](wyrd_format::MAX_PATH_DEPTH):
 //! the mutation layer never authors deeper trees, so a deeper walk
@@ -51,7 +52,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wyrd_format::MAX_PATH_DEPTH;
 
 use crate::view::{
-    confine_symlink_target, ConfinementError, NamespaceView, Node, OpenFile, ViewError,
+    confine_symlink_target_with_budget, ConfinementError, NamespaceView, Node, OpenFile,
+    SymlinkResolutionBudget, ViewError,
 };
 
 /// What one export produced, for logs and tests.
@@ -80,7 +82,7 @@ pub enum ExportError {
     },
     #[error("export name collision at {0}: a stored name meets a versioned sibling")]
     NameCollision(PathBuf),
-    #[error("symlink at {path} escapes the drive and is refused: {source}")]
+    #[error("symlink at {path} cannot be proven confined and is refused: {source}")]
     Symlink {
         path: String,
         source: ConfinementError,
@@ -167,7 +169,13 @@ fn run_export<V: NamespaceView>(
         source,
     })?;
     let mut report = ExportReport::default();
-    export_node(view, &root, "", staging, 0, heartbeat, &mut report)?;
+    let mut budget = SymlinkResolutionBudget::default();
+    let mut state = ExportState {
+        heartbeat,
+        report: &mut report,
+        budget: &mut budget,
+    };
+    export_node(view, &root, "", staging, 0, &mut state)?;
     fs::remove_file(staging.join(HEARTBEAT_FILE)).map_err(|source| ExportError::Io {
         path: staging.to_path_buf(),
         source,
@@ -476,6 +484,12 @@ impl Heartbeat {
 /// call per chunk.
 const READ_WINDOW: usize = 128 * 1024;
 
+struct ExportState<'a> {
+    heartbeat: &'a mut Heartbeat,
+    report: &'a mut ExportReport,
+    budget: &'a mut SymlinkResolutionBudget,
+}
+
 /// Write one resolved node to `dest`. `vpath` is the drive path for
 /// error context (`""` at the root, whose destination — the staging
 /// directory — already exists). `depth` counts directory levels from
@@ -490,8 +504,7 @@ fn export_node<V: NamespaceView>(
     vpath: &str,
     dest: &Path,
     depth: usize,
-    heartbeat: &mut Heartbeat,
-    report: &mut ExportReport,
+    state: &mut ExportState<'_>,
 ) -> Result<(), ExportError> {
     match node {
         Node::File { executable, .. } => {
@@ -506,10 +519,10 @@ fn export_node<V: NamespaceView>(
                 path: dest.to_path_buf(),
                 source,
             })?;
-            let bytes = stream_file(view, &file, vpath, &mut out, heartbeat)?;
+            let bytes = stream_file(view, &file, vpath, &mut out, state.heartbeat)?;
             set_executable(&out, *executable, dest)?;
-            report.files += 1;
-            report.bytes += bytes;
+            state.report.files += 1;
+            state.report.bytes += bytes;
             Ok(())
         }
         Node::Dir { .. } | Node::MergedDir { .. } => {
@@ -525,7 +538,7 @@ fn export_node<V: NamespaceView>(
                     source,
                 })?;
             }
-            report.dirs += 1;
+            state.report.dirs += 1;
             let entries = view.readdir(node).map_err(|source| ExportError::View {
                 path: vpath.to_owned(),
                 source,
@@ -542,13 +555,12 @@ fn export_node<V: NamespaceView>(
                     &child_vpath,
                     &dest.join(&entry.name),
                     depth + 1,
-                    heartbeat,
-                    report,
+                    state,
                 )?;
                 // Progress heartbeat per entry too: a tree of millions
                 // of tiny entries streams no windows, and must still
                 // look live to a later export's sweep.
-                heartbeat.beat().map_err(|source| ExportError::Io {
+                state.heartbeat.beat().map_err(|source| ExportError::Io {
                     path: PathBuf::from(vpath),
                     source,
                 })?;
@@ -557,17 +569,18 @@ fn export_node<V: NamespaceView>(
         }
         Node::Symlink { target } => {
             // The plain copy must stay self-contained: the same
-            // targets the mount refuses (absolute, root-escaping)
-            // never land on disk either.
-            confine_symlink_target(vpath, target).map_err(|source| ExportError::Symlink {
-                path: vpath.to_owned(),
-                source,
-            })?;
+            // targets the mount refuses never land on disk either.
+            confine_symlink_target_with_budget(view, vpath, target, state.budget).map_err(
+                |source| ExportError::Symlink {
+                    path: vpath.to_owned(),
+                    source,
+                },
+            )?;
             if dest.exists() {
                 return Err(ExportError::NameCollision(dest.to_path_buf()));
             }
             create_symlink(target, dest)?;
-            report.symlinks += 1;
+            state.report.symlinks += 1;
             Ok(())
         }
         Node::Conflict { versions } => {
@@ -576,7 +589,7 @@ fn export_node<V: NamespaceView>(
             // version address agree by construction.
             let mut ordered = versions.clone();
             ordered.sort_by(|a, b| a.snapshot.cmp(&b.snapshot));
-            report.conflicts += 1;
+            state.report.conflicts += 1;
             for (index, version) in ordered.iter().enumerate() {
                 let stem = dest
                     .file_name()
@@ -587,15 +600,7 @@ fn export_node<V: NamespaceView>(
                     return Err(ExportError::NameCollision(sibling));
                 }
                 let child_vpath = format!("{vpath}@{}", index + 1);
-                export_node(
-                    view,
-                    &version.node,
-                    &child_vpath,
-                    &sibling,
-                    depth,
-                    heartbeat,
-                    report,
-                )?;
+                export_node(view, &version.node, &child_vpath, &sibling, depth, state)?;
             }
             Ok(())
         }
@@ -682,14 +687,15 @@ fn create_symlink(_target: &str, _dest: &Path) -> Result<(), ExportError> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
     use wyrd_format::{ContentId, FetchStatus, MemoryObjectStore, SnapshotId};
 
     use crate::view::{
-        Attr, ConfinementError, ConflictVersion, DirEntry, Head, Kind, MaterializationPolicy,
+        confine_symlink_target, Attr, ConfinementError, ConflictVersion, DirEntry, Head, Kind,
+        LookupResult, MaterializationPolicy, MAX_SYMLINK_WORK,
     };
 
     /// Residency that serves everything local. Export is offline by
@@ -718,6 +724,10 @@ mod tests {
         /// When set, the root lookup fails: the export must clean up
         /// staging it already claimed and report the view error.
         fail_root: bool,
+        lookup_error: Option<(String, ViewError)>,
+        lookup_count: AtomicUsize,
+        child_work: Option<u64>,
+        child_lookup_count: AtomicUsize,
         /// When set, the first `read` signals parked and blocks until
         /// the test releases it: the test overlaps two exports
         /// deterministically, holding one parked while the other runs
@@ -874,7 +884,13 @@ mod tests {
         }
 
         fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+            self.lookup_count.fetch_add(1, Ordering::Relaxed);
             let key = path.trim_start_matches('/');
+            if let Some((failed_path, error)) = &self.lookup_error {
+                if key == failed_path {
+                    return Err(error.clone());
+                }
+            }
             if key.is_empty() {
                 if self.fail_root {
                     return Err(ViewError::InvalidPath);
@@ -903,6 +919,35 @@ mod tests {
                 node = self.node(child);
             }
             Ok(node)
+        }
+
+        fn resolve_child(
+            &self,
+            parent: &Node,
+            component: &str,
+            max_work: u64,
+        ) -> Result<LookupResult, ViewError> {
+            self.child_lookup_count.fetch_add(1, Ordering::Relaxed);
+            if let Some((failed_path, error)) = &self.lookup_error {
+                if failed_path == component {
+                    return Err(error.clone());
+                }
+            }
+            let entries = self.readdir(parent)?;
+            let work = self.child_work.unwrap_or_else(|| {
+                u64::try_from(entries.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1)
+            });
+            let node = entries
+                .into_iter()
+                .find(|entry| entry.name == component)
+                .map(|entry| entry.node);
+            Ok(LookupResult {
+                node,
+                work,
+                limit_exceeded: work > max_work,
+            })
         }
 
         fn stat(&self, path: &str) -> Result<Attr, ViewError> {
@@ -1433,6 +1478,110 @@ mod tests {
             ),
             "unexpected: {error:?}"
         );
+        assert_no_staging(&dest.join("out"));
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn refuses_chained_symlink_escape() {
+        let mut view = FakeView::default();
+        let b = view.dir(vec![
+            ("s".to_owned(), FakeNode::Symlink("../..".to_owned())),
+            (
+                "link".to_owned(),
+                FakeNode::Symlink("s/../../outside".to_owned()),
+            ),
+        ]);
+        let a = view.dir(vec![("b".to_owned(), b)]);
+        view.set_root(vec![("a".to_owned(), a)]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExportError::Symlink {
+                    source: ConfinementError::EscapesRoot,
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_no_staging(&dest.join("out"));
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn preserves_symlink_lookup_failures_in_export_diagnostics() {
+        let mut view = FakeView {
+            lookup_error: Some(("target".to_owned(), ViewError::Corrupt)),
+            ..FakeView::default()
+        };
+        view.set_root(vec![(
+            "link".to_owned(),
+            FakeNode::Symlink("target".to_owned()),
+        )]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExportError::Symlink {
+                    source: ConfinementError::Lookup {
+                        source: ViewError::Corrupt
+                    },
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_no_staging(&dest.join("out"));
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn pathological_symlink_target_is_work_bounded() {
+        let mut view = FakeView {
+            child_work: Some(MAX_SYMLINK_WORK),
+            ..FakeView::default()
+        };
+        view.set_root(Vec::new());
+        let before = view.child_lookup_count.load(Ordering::Relaxed);
+
+        assert!(matches!(
+            confine_symlink_target(&view, "link", "z"),
+            Err(ConfinementError::WorkLimit {
+                observed,
+                max: MAX_SYMLINK_WORK,
+            }) if observed > MAX_SYMLINK_WORK
+        ));
+        assert_eq!(view.child_lookup_count.load(Ordering::Relaxed) - before, 1);
+    }
+
+    #[test]
+    fn export_shares_symlink_work_budget_across_entries() {
+        let mut view = FakeView {
+            child_work: Some(MAX_SYMLINK_WORK / 2),
+            ..FakeView::default()
+        };
+        view.set_root(vec![
+            ("one".to_owned(), FakeNode::Symlink("x".to_owned())),
+            ("two".to_owned(), FakeNode::Symlink("x".to_owned())),
+        ]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(matches!(
+            error,
+            ExportError::Symlink {
+                source: ConfinementError::WorkLimit {
+                    observed,
+                    max: MAX_SYMLINK_WORK,
+                },
+                ..
+            } if observed > MAX_SYMLINK_WORK
+        ));
         assert_no_staging(&dest.join("out"));
         std::fs::remove_dir_all(dest).unwrap();
     }

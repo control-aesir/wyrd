@@ -148,14 +148,19 @@ fn resolution_selects_the_named_winner() {
     assert_eq!(log2.known_state().unwrap().epoch, 4);
 }
 
-/// Resolution authority is final with respect to the conflict it
-/// resolves. A device that keeps writing on a branch the resolution
-/// already voided holds valid links on that branch, but branch validity
-/// grants no authority to reopen a resolved conflict: the drive stays
-/// live on the resolution's chain and the later work is retained as
-/// historical evidence.
-#[test]
-fn post_resolution_losing_work_cannot_reopen_the_conflict() {
+/// A conflict at epoch 2, the owner-signed resolution R that heals it,
+/// and the valid work the fork's author writes afterwards: x admits a
+/// device on the losing branch, x2 continues from x. Returned in one
+/// piece so the arrival-order tests can feed the same set in any order.
+#[allow(clippy::type_complexity)]
+fn resolution_with_losing_work() -> (
+    MembershipTransition,
+    MembershipTransition,
+    MembershipTransition,
+    MembershipTransition,
+    MembershipTransition,
+    MembershipTransition,
+) {
     let (b, genesis, a, fork, second) = forked_chain();
     let owner = *b.owners.iter().next().unwrap();
     let (_sk3, third) = key(3);
@@ -168,8 +173,6 @@ fn post_resolution_losing_work_cannot_reopen_the_conflict() {
         &[owner],
         &[owner],
     );
-    // The fork's author never learns it lost: x is a valid epoch-3
-    // transition on the now-voided branch, admitting a device there.
     let x = signed(
         &b,
         3,
@@ -188,6 +191,18 @@ fn post_resolution_losing_work_cannot_reopen_the_conflict() {
         &[owner, second, third],
         &[owner],
     );
+    (genesis, a, fork, r, x, x2)
+}
+
+/// Resolution authority is final with respect to the conflict it
+/// resolves. A device that keeps writing on a branch the resolution
+/// already voided holds valid links on that branch, but branch validity
+/// grants no authority to reopen a resolved conflict: the drive stays
+/// live on the resolution's chain and the later work is retained as
+/// historical evidence.
+#[test]
+fn post_resolution_losing_work_cannot_reopen_the_conflict() {
+    let (genesis, a, fork, r, x, x2) = resolution_with_losing_work();
     let mut log = MembershipLog::new(drive());
     observe_all(&mut log, &[&genesis, &a, &fork, &r]);
     assert_eq!(log.frozen_at(), None, "the resolution heals the conflict");
@@ -221,6 +236,35 @@ fn post_resolution_losing_work_cannot_reopen_the_conflict() {
     assert_eq!(known.transition_id, r.transition_id());
     assert_eq!(known.members_root, r.members_root);
     assert_ne!(known.members_root, x_members_root);
+}
+
+/// The adversarial arrival order: the losing branch advances *before* the
+/// resolution is observed. Classification is a pure function of the
+/// observed set, so the outcome must be the resolution's, not the losing
+/// branch's.
+#[test]
+fn losing_work_observed_first_does_not_block_the_resolution() {
+    let (genesis, a, fork, r, x, x2) = resolution_with_losing_work();
+    let mut log = MembershipLog::new(drive());
+    observe_all(&mut log, &[&genesis, &a, &fork, &x, &x2]);
+    assert_eq!(
+        log.frozen_at(),
+        Some(2),
+        "unresolved conflict: the losing work alone resolves nothing"
+    );
+    let (x_id, x2_id) = (x.transition_id(), x2.transition_id());
+    let x_members_root = x.members_root;
+    let (r_id, r_members_root) = (r.transition_id(), r.members_root);
+    log.observe(r);
+
+    assert_eq!(log.frozen_at(), None);
+    let known = log.known_state().unwrap();
+    assert_eq!(known.epoch, 3, "the resolution is the canonical successor");
+    assert_eq!(known.transition_id, r_id);
+    assert_eq!(known.members_root, r_members_root);
+    assert_ne!(known.members_root, x_members_root);
+    assert_eq!(log.status(&x_id), Some(TransitionStatus::Voided));
+    assert_eq!(log.status(&x2_id), Some(TransitionStatus::Voided));
 }
 
 /// The mirror case on the winning side: the resolution designates the

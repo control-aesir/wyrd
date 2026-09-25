@@ -29,6 +29,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Write buffers aggregate | `write_aggregate_bytes` (256 MiB) | reservation refused; `ENOSPC` |
 | Dirty (buffered) handles | `write_dirty_handles` (64) | new dirty handle refused; `ENOSPC` |
 | Open file handles (read + write) | `max_open_handles` (4096) | open refused; `EMFILE` |
+| Mailbox relay event | 256 KiB event payload (const) | rejected before NIP-59 unwrap; the relay retains it for redelivery |
 | Mailbox notification channel | 1024 events (const) | backpressure stalls the relay stream; the relay retains everything |
 | Mailbox held handovers | 1024 unacked (const) | `recv` stops pulling; held mail rotates so the engine drains free |
 | Engine intake held messages | `MAX_PENDING_MESSAGES` 1024 (const) | over-limit deferrals shed without consuming; relay redelivers |
@@ -128,5 +129,7 @@ held mail rotates so the engine drains room free; nothing is ever
 consumed-and-dropped, because the live stream has no cursor and a
 dropped event would wait for a resubscribe that may never come. The
 bounded seen-id log (65,536 acks) and poison cache (4096 entries)
-bound the durable and in-memory dedupe state. Proven by the
-`mailbox::tests_backpressure` suite.
+bound the durable and in-memory dedupe state. The relay-event ceiling is
+checked before an event enters the notification channel; an
+oversized event is discarded without acknowledgement, so the relay retains
+it for redelivery. Proven by the `mailbox::tests_backpressure` suite.

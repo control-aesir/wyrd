@@ -57,11 +57,13 @@
 //! not negotiable in v0. Retention itself has an operational cost worth
 //! knowing: every 65,536 acks rewrites the ~4 MB log plus file and
 //! directory fsyncs on the settlement path — fine for low-rate control
-//! traffic, to be measured on supported filesystems. Payload bounds are enforced
-//! at the sync mailbox boundary (`wyrd-sync` `open_from_sender` rejects
-//! ciphertext over `MAX_MAILBOX_CIPHERTEXT_LEN` before NIP-44 decryption
-//! and decrypted bytes over `MAX_MAILBOX_OPEN_BYTES` before ingest), so a
-//! flood of oversized wraps is discarded per redelivery rather than queued.
+//! traffic, to be measured on supported filesystems. The live adapter
+//! rejects a relay event over `MAX_MAILBOX_RELAY_EVENT_BYTES` before it
+//! enters the notification channel or NIP-59 unwrap. The sync mailbox
+//! boundary then rejects ciphertext over `MAX_MAILBOX_CIPHERTEXT_LEN`
+//! before NIP-44 decryption and decrypted bytes over
+//! `MAX_MAILBOX_OPEN_BYTES` before ingest, so a flood of oversized
+//! wraps is discarded per redelivery rather than queued.
 //!
 //! One `LiveMailbox` owns one Tokio runtime and one relay client: the
 //! daemon composes exactly one mailbox per process (see the review note on
@@ -233,6 +235,34 @@ const RUMOR_KIND: u16 = 9_501;
 /// client's notification stream (redelivery comes from relay history), so
 /// an event flood cannot grow daemon memory without limit.
 const INCOMING_CAPACITY: usize = 1024;
+
+const MAX_MAILBOX_RELAY_EVENT_BYTES: usize = 256 * 1024;
+const RELAY_EVENT_FIXED_BYTES: usize = 512;
+
+fn check_relay_event_size(event: &Event) -> Result<(), MailboxError> {
+    let mut bytes = RELAY_EVENT_FIXED_BYTES
+        .saturating_add(event.content.len())
+        .saturating_add(2);
+    if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
+        return Err(MailboxError::Oversize {
+            bytes,
+            max: MAX_MAILBOX_RELAY_EVENT_BYTES,
+        });
+    }
+    for tag in event.tags.iter() {
+        bytes = bytes.saturating_add(tag.len()).saturating_add(2);
+        for value in tag.as_slice() {
+            bytes = bytes.saturating_add(value.len()).saturating_add(2);
+        }
+        if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
+            return Err(MailboxError::Oversize {
+                bytes,
+                max: MAX_MAILBOX_RELAY_EVENT_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Most handovers held unacked at once. Mirrors the engine's
 /// `MAX_PENDING_MESSAGES` intake bound: the mailbox is upstream of it,
@@ -832,6 +862,7 @@ where
     /// and rejects rumors whose author differs from the seal author, so a
     /// passing wrap authenticates the sender identity it reports.
     fn envelope_from_wrap(&self, wrap: &Event) -> Result<MailboxEnvelope, MailboxError> {
+        check_relay_event_size(wrap)?;
         let owner_pk = self.open_keys.public_key();
         if !wrap.tags.public_keys().any(|pk| pk == owner_pk) {
             return Err(MailboxError::Transport(
@@ -963,6 +994,9 @@ async fn drain_notifications(
             ClientNotification::Shutdown => None,
         };
         if let Some(event) = event {
+            if check_relay_event_size(&event).is_err() {
+                continue;
+            }
             let forwarded = match sender.try_send(*event) {
                 Ok(()) => true,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {

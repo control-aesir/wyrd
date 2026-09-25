@@ -196,6 +196,36 @@ fn garbage_and_duplicate_wraps_collapse() {
     assert_quiet(&mut mailbox);
 }
 
+#[test]
+fn oversized_gift_wrap_is_rejected_before_drainer_queue() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let mut mailbox = live_mailbox(&receiver, &[url], temp_path("seen-oversized-wrap"));
+
+    let oversized = seal_rumor(&sender, receiver.public_key(), "x".repeat(512 * 1024));
+    assert!(oversized.content.len() > MAX_MAILBOX_RELAY_EVENT_BYTES);
+    relay.inject(oversized);
+    relay.inject(seal_rumor(
+        &sender,
+        receiver.public_key(),
+        "small-after-oversized".to_string(),
+    ));
+
+    let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("small mail arrives");
+    assert_eq!(delivery.envelope().ciphertext, "small-after-oversized");
+    assert_eq!(
+        mailbox.poison_len(),
+        0,
+        "oversized wraps stop before the inbox"
+    );
+    mailbox
+        .settle(delivery.id(), Disposition::Ack)
+        .expect("ack");
+    assert_quiet(&mut mailbox);
+}
+
 /// Relay outage and reboot: killing the relay surfaces as an unhealthy
 /// mailbox (not a silently idle one), and restarting on the same URL
 /// resumes delivery — the relay replays history on resubscribe, and the

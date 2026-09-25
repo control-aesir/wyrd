@@ -192,9 +192,17 @@ and never by snapshot DAG state:
   claiming the next epoch — a *second, contradictory* resolution (naming
   the other sibling) is itself a conflict at the resolution epoch and
   re-freezes evaluation there, pending a further resolution.
-- Transitions with a non-empty `resolves` where no conflict exists at
-  `prev` are invalid. Voided transitions are retained forever; they cannot
-  be deleted or re-signed.
+- Transitions with a non-empty `resolves` are valid only if `prev` was a
+  contender in a conflict at `prev`'s own epoch and this transition resolves
+  exactly that conflict. A `resolves` with no such conflict behind it is
+  invalid.
+- **`prev` of a resolution is a contender, not a parent.** The conflict a
+  resolution settles sits one epoch below the resolution, among the
+  children of the contender *before* the fork, so `prev` is one of the
+  competing branches in it. A resolution therefore neither needs nor is
+  blocked by a conflict among `prev`'s own children.
+- Voided transitions are retained forever; they cannot be deleted or
+  re-signed.
 - **Resolution authority is final with respect to the conflict it
   resolves.** A resolution is recognized at the epoch immediately above the
   conflict (its `resolves` entries sit at the conflict epoch). Once a valid

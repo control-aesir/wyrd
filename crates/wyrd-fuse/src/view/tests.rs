@@ -1,6 +1,6 @@
 use super::*;
 
-use wyrd_core::view::{MAX_SYMLINK_HOPS, MAX_SYMLINK_WORK};
+use wyrd_core::view::{NamespaceView, MAX_SYMLINK_COMPONENTS, MAX_SYMLINK_HOPS};
 
 use std::collections::HashMap;
 use wyrd_format::store::MemoryStoreError;
@@ -687,25 +687,31 @@ fn symlink_confinement_resolves_nested_links_and_rejects_cycles() {
 }
 
 #[test]
-fn symlink_confinement_enforces_total_work_budget() {
+fn symlink_confinement_enforces_component_budget() {
     let view = view(small_drive());
-    let within_budget = vec!["x"; MAX_SYMLINK_WORK].join("/");
+    let within_budget = vec!["x"; MAX_SYMLINK_COMPONENTS].join("/");
     assert_eq!(
         confine_symlink_target(&view, "link", &within_budget),
         Ok(())
     );
 
-    let over_budget = vec!["x"; MAX_SYMLINK_WORK + 1].join("/");
+    let over_budget = vec!["x"; MAX_SYMLINK_COMPONENTS + 1].join("/");
     assert_eq!(
         confine_symlink_target(&view, "link", &over_budget),
-        Err(ConfinementError::WorkLimit)
+        Err(ConfinementError::ComponentLimit {
+            observed: MAX_SYMLINK_COMPONENTS + 1,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
     );
+}
 
-    let repeated = "z/../".repeat(MAX_SYMLINK_WORK / 2 + 1);
-    assert_eq!(
-        confine_symlink_target(&view, "link", &repeated),
-        Err(ConfinementError::WorkLimit)
-    );
+#[test]
+fn drive_resolution_refuses_over_budget_tree_before_decode() {
+    let view = view(small_drive());
+    let result = NamespaceView::resolve_root(&view, 0).unwrap();
+    assert!(result.limit_exceeded);
+    assert!(result.node.is_none());
+    assert!(result.work > 0);
 }
 
 #[test]
@@ -736,7 +742,10 @@ fn symlink_confinement_enforces_hop_budget() {
     );
     assert_eq!(
         confine_symlink_target(&chain(MAX_SYMLINK_HOPS + 1), "link", "s0"),
-        Err(ConfinementError::HopLimit)
+        Err(ConfinementError::HopLimit {
+            observed: MAX_SYMLINK_HOPS + 1,
+            max: MAX_SYMLINK_HOPS,
+        })
     );
 }
 

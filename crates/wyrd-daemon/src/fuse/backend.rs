@@ -472,6 +472,25 @@ where
             .map(|guard| Arc::clone(&guard))
     }
 
+    pub(super) fn readlink_error_at(&self, ino: INodeNo) -> fuser::Errno {
+        let path = match self.inode_path(ino.0) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        let Ok(projection) = self.projection() else {
+            return fuser::Errno::EIO;
+        };
+        let node = match projection.view().lookup(&path) {
+            Ok(node) => node,
+            Err(ViewError::NotFound) => return fuser::Errno::ENOENT,
+            Err(error) => return errno_of(&error),
+        };
+        if let Err(error) = self.validate_inode(ino.0, &path, &node, projection.generation()) {
+            return error;
+        }
+        mounted_symlink_traversal_error(projection.view(), &path)
+    }
+
     /// Open the file at `path`: the view's immutable file identity is
     /// captured at open and keyed by a fresh handle, so later reads
     /// serve the opened version even after heads advance. The
@@ -1898,34 +1917,10 @@ where
 
     fn readlink(&self, _req: &fuser::Request, ino: INodeNo, reply: fuser::ReplyData) {
         let _log = RequestLog::new("readlink");
-        let path = match self.inode_path(ino.0) {
-            Ok(path) => path,
-            Err(error) => {
-                reply.error(_log.fail(error));
-                return;
-            }
-        };
-        let Ok(projection) = self.projection() else {
-            reply.error(_log.fail(fuser::Errno::EIO));
-            return;
-        };
-        let node = match projection.view().lookup(&path) {
-            Ok(node) => node,
-            Err(ViewError::NotFound) => {
-                self.retire_inode(ino.0);
-                reply.error(_log.fail(fuser::Errno::ENOENT));
-                return;
-            }
-            Err(error) => {
-                reply.error(_log.fail(errno_of(&error)));
-                return;
-            }
-        };
-        if let Err(error) = self.validate_inode(ino.0, &path, &node, projection.generation()) {
-            reply.error(_log.fail(error));
-            return;
+        let error = self.readlink_error_at(ino);
+        if error == fuser::Errno::ENOENT {
+            self.retire_inode(ino.0);
         }
-        let error = symlink_target(projection.view(), &path);
         reply.error(_log.fail(error));
     }
 
@@ -2297,7 +2292,7 @@ where
     }
 }
 
-pub(super) fn symlink_target<S: ObjectStore, M: Materialization>(
+pub(super) fn mounted_symlink_traversal_error<S: ObjectStore, M: Materialization>(
     view: &DriveView<S, M>,
     path: &str,
 ) -> fuser::Errno

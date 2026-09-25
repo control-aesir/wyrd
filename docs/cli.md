@@ -69,7 +69,9 @@ any format break.
   links whose complete target is statically confined; absolute targets,
   root escapes, conflicts, cycles, and hop/work-limit failures are
   refused. Export permits at most 40 followed links and 256 expanded
-  work units, while the plain copy stays self-contained.
+  components per link, plus a 64 MiB weighted resolution-work budget
+  (tree reads are charged by encoded bytes) shared across the export,
+  while the plain copy stays self-contained.
 - `<out_dir>` must not exist or must be empty; export never merges
   into a populated tree. The walk lands in a uniquely named staging
   sibling and renames it into place only after the whole tree

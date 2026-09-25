@@ -1,8 +1,8 @@
-use super::backend::{current_owner, symlink_target};
+use super::backend::current_owner;
 use super::tests_harness::{backend, evolving_backend, heads, snapshot_of, NoMaterialization};
 use super::*;
 
-use fuser::FileHandle;
+use fuser::{FileHandle, INodeNo};
 use std::sync::Arc;
 
 use wyrd_format::ObjectStore;
@@ -128,7 +128,7 @@ fn first_write_over_the_handle_budget_does_not_materialize() {
 }
 
 #[test]
-fn mounted_symlinks_are_non_traversable() {
+fn mounted_readlink_refuses_symlink_traversal() {
     use wyrd_format::Entry;
 
     fn view_with(entries: Vec<Entry>) -> DriveView<MemoryObjectStore, NoMaterialization> {
@@ -140,9 +140,18 @@ fn mounted_symlinks_are_non_traversable() {
         DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]))
     }
 
+    fn readlink_error(
+        view: DriveView<MemoryObjectStore, NoMaterialization>,
+        path: &str,
+    ) -> fuser::Errno {
+        let backend = FuseBackend::new(view);
+        let ino = backend.resolve_inode(path).unwrap().0;
+        backend.readlink_error_at(INodeNo(ino))
+    }
+
     for target in ["/etc/passwd", "../target", "safe"] {
         let view = view_with(vec![Entry::symlink("link", target).unwrap()]);
-        assert_eq!(symlink_target(&view, "link"), fuser::Errno::EOPNOTSUPP);
+        assert_eq!(readlink_error(view, "link"), fuser::Errno::EOPNOTSUPP);
     }
 
     let mut store = MemoryObjectStore::default();
@@ -158,9 +167,20 @@ fn mounted_symlinks_are_non_traversable() {
     .insert_into(&mut store)
     .unwrap();
     let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-    assert_eq!(symlink_target(&view, "sub/link"), fuser::Errno::EOPNOTSUPP);
-    assert_eq!(symlink_target(&view, "missing"), fuser::Errno::ENOENT);
-    assert_eq!(symlink_target(&view, "sibling"), fuser::Errno::EINVAL);
+    assert_eq!(readlink_error(view, "sub/link"), fuser::Errno::EOPNOTSUPP);
+
+    let backend = FuseBackend::new(view_with(Vec::new()));
+    assert_eq!(
+        backend.readlink_error_at(INodeNo(999)),
+        fuser::Errno::ENOENT
+    );
+    assert_eq!(
+        readlink_error(
+            view_with(vec![Entry::file("sibling", 1, false, Vec::new()).unwrap()]),
+            "sibling",
+        ),
+        fuser::Errno::EINVAL
+    );
 }
 
 #[test]
@@ -181,9 +201,17 @@ fn mounted_chained_symlink_traversal_is_refused() {
         .unwrap()
         .insert_into(&mut store)
         .unwrap();
-    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+    let backend = FuseBackend::new(DriveView::new(
+        store,
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    ));
+    let ino = backend.resolve_inode("a/b/link").unwrap().0;
 
-    assert_eq!(symlink_target(&view, "a/b/link"), fuser::Errno::EOPNOTSUPP);
+    assert_eq!(
+        backend.readlink_error_at(INodeNo(ino)),
+        fuser::Errno::EOPNOTSUPP
+    );
 }
 
 #[test]

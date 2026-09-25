@@ -19,7 +19,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use wyrd_format::{ContentId, FetchStatus, ObjectStore, Snapshot, StoreFailure};
+use wyrd_format::{Component, ContentId, FetchStatus, ObjectStore, Snapshot, StoreFailure};
 use wyrd_sync::durable::AuthorizedSnapshot;
 
 /// The residency policy for content the local store does not hold: a
@@ -146,6 +146,13 @@ pub struct DirEntry {
     pub node: Node,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupResult {
+    pub node: Option<Node>,
+    pub work: u64,
+    pub limit_exceeded: bool,
+}
+
 /// An opened file: the chunk list plus the declared size reads verify
 /// against. Constructed by the view on open; backends carry it
 /// opaquely and hand it back to `read`.
@@ -258,6 +265,35 @@ pub trait NamespaceView: Sized {
     /// Resolve a path to its node, merging across heads.
     fn lookup(&self, path: &str) -> Result<Node, ViewError>;
 
+    fn resolve_root(&self, max_work: u64) -> Result<LookupResult, ViewError> {
+        self.lookup("").map(|node| LookupResult {
+            node: Some(node),
+            work: 1,
+            limit_exceeded: 1 > max_work,
+        })
+    }
+
+    fn resolve_child(
+        &self,
+        parent: &Node,
+        component: &str,
+        max_work: u64,
+    ) -> Result<LookupResult, ViewError> {
+        let entries = self.readdir(parent)?;
+        let work = u64::try_from(entries.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let node = entries
+            .into_iter()
+            .find(|entry| entry.name == component)
+            .map(|entry| entry.node);
+        Ok(LookupResult {
+            node,
+            work,
+            limit_exceeded: work > max_work,
+        })
+    }
+
     /// Attributes for a path: `lookup` plus the attr projection.
     fn stat(&self, path: &str) -> Result<Attr, ViewError>;
 
@@ -289,23 +325,60 @@ pub enum ConfinementError {
     Conflict,
     #[error("symlink target contains a resolution cycle")]
     Cycle,
-    #[error("symlink target exceeds the hop limit")]
-    HopLimit,
-    #[error("symlink target exceeds the resolution work limit")]
-    WorkLimit,
+    #[error("symlink target exceeds the hop limit ({observed} > {max})")]
+    HopLimit { observed: usize, max: usize },
+    #[error("symlink target exceeds the component limit ({observed} > {max})")]
+    ComponentLimit { observed: usize, max: usize },
+    #[error("symlink target exceeds the weighted resolution work limit ({observed} > {max})")]
+    WorkLimit { observed: u64, max: u64 },
     #[error("symlink target lookup failed: {source}")]
     Lookup { source: ViewError },
 }
 
 pub const MAX_SYMLINK_HOPS: usize = 40;
-pub const MAX_SYMLINK_WORK: usize = 256;
+pub const MAX_SYMLINK_COMPONENTS: usize = 256;
+pub const MAX_SYMLINK_WORK: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SymlinkResolutionBudget {
+    work: u64,
+}
+
+impl SymlinkResolutionBudget {
+    fn remaining(&self) -> u64 {
+        MAX_SYMLINK_WORK.saturating_sub(self.work)
+    }
+
+    fn consume(&mut self, work: u64, limit_exceeded: bool) -> Result<(), ConfinementError> {
+        let observed = self.work.saturating_add(work);
+        self.work = observed;
+        if limit_exceeded || observed > MAX_SYMLINK_WORK {
+            Err(ConfinementError::WorkLimit {
+                observed,
+                max: MAX_SYMLINK_WORK,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct SymlinkResolutionState<'a> {
+    root: &'a Node,
+    current: Option<Node>,
+    stack: Vec<(String, Option<Node>)>,
+    pending: VecDeque<String>,
+    followed: HashSet<Vec<String>>,
+    hops: usize,
+    components: usize,
+}
 
 /// Confine a symlink target to the drive namespace: the v0 policy for
 /// untrusted member-authored targets. `link_path` is the symlink's own
 /// drive path (`""`-joined components); `target` is the stored target
 /// bytes. The view is consulted for every resolved component so nested
 /// symlinks are followed before the root boundary is checked. Both
-/// followed-link count and total expanded-component work are bounded.
+/// followed-link count and total weighted resolution work are bounded.
 ///
 /// Absolute targets are refused outright. Relative targets resolve
 /// against the link's parent directory; `.` and empty segments are
@@ -319,88 +392,184 @@ pub fn confine_symlink_target<V: NamespaceView>(
     link_path: &str,
     target: &str,
 ) -> Result<(), ConfinementError> {
+    let mut budget = SymlinkResolutionBudget::default();
+    confine_symlink_target_with_budget(view, link_path, target, &mut budget)
+}
+
+pub(crate) fn confine_symlink_target_with_budget<V: NamespaceView>(
+    view: &V,
+    link_path: &str,
+    target: &str,
+    budget: &mut SymlinkResolutionBudget,
+) -> Result<(), ConfinementError> {
     if target.starts_with('/') {
         return Err(ConfinementError::Absolute);
     }
 
-    let mut resolved = link_path
+    let root = view
+        .resolve_root(budget.remaining())
+        .map_err(|source| ConfinementError::Lookup { source })?;
+    budget.consume(root.work, root.limit_exceeded)?;
+    let Some(root) = root.node else {
+        return Err(ConfinementError::Lookup {
+            source: ViewError::NotFound,
+        });
+    };
+
+    let mut state = SymlinkResolutionState {
+        root: &root,
+        current: Some(root.clone()),
+        stack: Vec::new(),
+        pending: target.split('/').map(str::to_owned).collect(),
+        followed: HashSet::new(),
+        hops: 0,
+        components: 0,
+    };
+    let mut parent_components = link_path
         .split('/')
         .filter(|component| !component.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    resolved.pop();
-    let mut pending = target
-        .split('/')
-        .map(str::to_owned)
-        .collect::<VecDeque<_>>();
-    let mut followed = HashSet::new();
-    let mut hops = 0;
-    let mut work = 0;
+    parent_components.pop();
+    for component in parent_components {
+        consume_symlink_components(&mut state.components)?;
+        resolve_literal_component(view, &mut state, component, budget)?;
+    }
 
-    resolve_symlink_components(
-        view,
-        &mut resolved,
-        &mut pending,
-        &mut followed,
-        &mut hops,
-        &mut work,
-    )
+    resolve_symlink_components(view, &mut state, budget)
 }
 
-fn consume_symlink_work(work: &mut usize) -> Result<(), ConfinementError> {
-    *work = work.saturating_add(1);
-    if *work > MAX_SYMLINK_WORK {
-        Err(ConfinementError::WorkLimit)
+fn consume_symlink_components(components: &mut usize) -> Result<(), ConfinementError> {
+    *components = components.saturating_add(1);
+    if *components > MAX_SYMLINK_COMPONENTS {
+        Err(ConfinementError::ComponentLimit {
+            observed: *components,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
     } else {
         Ok(())
     }
 }
 
+fn validate_symlink_component(component: &str) -> Result<(), ConfinementError> {
+    Component::new(component.to_owned())
+        .map(|_| ())
+        .map_err(|_| ConfinementError::Lookup {
+            source: ViewError::InvalidPath,
+        })
+}
+
+fn resolve_child<V: NamespaceView>(
+    view: &V,
+    parent: &Node,
+    component: &str,
+    budget: &mut SymlinkResolutionBudget,
+) -> Result<Option<Node>, ConfinementError> {
+    let result = match view.resolve_child(parent, component, budget.remaining()) {
+        Ok(result) => result,
+        Err(ViewError::NotFound | ViewError::NotADirectory | ViewError::NotAFile) => LookupResult {
+            node: None,
+            work: 0,
+            limit_exceeded: false,
+        },
+        Err(ViewError::Conflict) => return Err(ConfinementError::Conflict),
+        Err(source) => return Err(ConfinementError::Lookup { source }),
+    };
+    budget.consume(result.work, result.limit_exceeded)?;
+    Ok(result.node)
+}
+
+fn resolve_literal_component<V: NamespaceView>(
+    view: &V,
+    state: &mut SymlinkResolutionState<'_>,
+    component: String,
+    budget: &mut SymlinkResolutionBudget,
+) -> Result<(), ConfinementError> {
+    validate_symlink_component(&component)?;
+    let Some(parent) = state.current.clone() else {
+        state.stack.push((component, None));
+        state.current = None;
+        return Ok(());
+    };
+    match resolve_child(view, &parent, &component, budget)? {
+        Some(Node::Conflict { .. }) => Err(ConfinementError::Conflict),
+        Some(node) => {
+            state.stack.push((component, Some(node.clone())));
+            state.current = Some(node);
+            Ok(())
+        }
+        None => {
+            state.stack.push((component, None));
+            state.current = None;
+            Ok(())
+        }
+    }
+}
+
 fn resolve_symlink_components<V: NamespaceView>(
     view: &V,
-    resolved: &mut Vec<String>,
-    pending: &mut VecDeque<String>,
-    followed: &mut HashSet<Vec<String>>,
-    hops: &mut usize,
-    work: &mut usize,
+    state: &mut SymlinkResolutionState<'_>,
+    budget: &mut SymlinkResolutionBudget,
 ) -> Result<(), ConfinementError> {
-    while let Some(component) = pending.pop_front() {
-        consume_symlink_work(work)?;
+    while let Some(component) = state.pending.pop_front() {
+        consume_symlink_components(&mut state.components)?;
         match component.as_str() {
             "" | "." => {}
             ".." => {
-                if resolved.pop().is_none() {
+                if state.stack.pop().is_none() {
                     return Err(ConfinementError::EscapesRoot);
                 }
+                state.current = match state.stack.last() {
+                    Some((_, node)) => node.clone(),
+                    None => Some(state.root.clone()),
+                };
             }
             _ => {
-                resolved.push(component);
-                match view.lookup(&resolved.join("/")) {
-                    Ok(Node::Symlink { target: next }) => {
-                        consume_symlink_work(work)?;
-                        *hops += 1;
-                        if *hops > MAX_SYMLINK_HOPS {
-                            return Err(ConfinementError::HopLimit);
+                validate_symlink_component(&component)?;
+                let Some(parent) = state.current.clone() else {
+                    state.stack.push((component, None));
+                    state.current = None;
+                    continue;
+                };
+                let Some(child) = resolve_child(view, &parent, &component, budget)? else {
+                    state.stack.push((component, None));
+                    state.current = None;
+                    continue;
+                };
+                match child {
+                    Node::Conflict { .. } => return Err(ConfinementError::Conflict),
+                    Node::Symlink { target: next } => {
+                        state.hops = state.hops.saturating_add(1);
+                        if state.hops > MAX_SYMLINK_HOPS {
+                            return Err(ConfinementError::HopLimit {
+                                observed: state.hops,
+                                max: MAX_SYMLINK_HOPS,
+                            });
                         }
-                        let symlink_path = resolved.clone();
-                        if !followed.insert(symlink_path.clone()) {
+                        let symlink_path = state
+                            .stack
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .chain(std::iter::once(component.clone()))
+                            .collect::<Vec<_>>();
+                        if !state.followed.insert(symlink_path.clone()) {
                             return Err(ConfinementError::Cycle);
                         }
-                        resolved.pop();
                         if next.starts_with('/') {
+                            state.followed.remove(&symlink_path);
                             return Err(ConfinementError::Absolute);
                         }
                         for next_component in next.split('/').rev() {
-                            pending.push_front(next_component.to_owned());
+                            state.pending.push_front(next_component.to_owned());
                         }
-                        resolve_symlink_components(view, resolved, pending, followed, hops, work)?;
-                        followed.remove(&symlink_path);
+                        let result = resolve_symlink_components(view, state, budget);
+                        state.followed.remove(&symlink_path);
+                        result?;
                     }
-                    Ok(Node::Conflict { .. }) => return Err(ConfinementError::Conflict),
-                    Ok(_) => {}
-                    Err(ViewError::NotFound | ViewError::NotADirectory | ViewError::NotAFile) => {}
-                    Err(ViewError::Conflict) => return Err(ConfinementError::Conflict),
-                    Err(source) => return Err(ConfinementError::Lookup { source }),
+                    child => {
+                        state.stack.push((component, Some(child.clone())));
+                        state.current = Some(child);
+                    }
                 }
             }
         }

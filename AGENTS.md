@@ -79,7 +79,7 @@ guest. Operate it, never babysit it blind:
 - **A repeated `FAIL:` line is a stop, not patience.** The harness exits on
   the first failed check, so two identical polls mean the run is over —
   read the log, pull the failing mount's stderr out of the guest
-  (`limactl shell wyrd-alpha -- grep ... "$HOME/e2e/logs/mount-*.err"`), fix,
+  (`limactl shell wyrd-alpha -- grep ... "/tmp/wyrd-e2e/logs/mount-*.err"`), fix,
   rerun. Ten identical polls have happened; none were productive.
 - **Check liveness where it lives:** the guest contract process
   (`limactl shell wyrd-alpha -- pgrep -f alpha-lima.sh`). A host `pgrep` for
@@ -90,8 +90,9 @@ guest. Operate it, never babysit it blind:
   stdout, so a `die` that leaves one running makes the host wrapper wait on a
   pipe that never closes. The harness reaps them in an EXIT trap; keep it that
   way when adding steps.
-- The guest's drive state is under `$HOME/e2e` (not `/tmp/lima`); logs per run
-  in `$HOME/e2e/logs`.
+- The guest's drive state is under `/tmp/wyrd-e2e` (guest-local disk, never
+  the 9p share: FUSE mountpoints and drive dirs over 9p are unsupported);
+  logs per run in `/tmp/wyrd-e2e/logs`.
 - Failures here are usually product bugs, not harness bugs — the suite exists
   to find them. Diagnose from the phase timings in the mount logs
   (`wyrd_core=debug` is on for step 6) before touching the script.

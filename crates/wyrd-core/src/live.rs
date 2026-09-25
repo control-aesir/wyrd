@@ -648,7 +648,7 @@ where
                 // trace — that lands at warn so it is visible at the
                 // default info filter; a merely slow mirror stays debug.
                 let stats = barrier.queue_stats();
-                if stats.map_or(false, |s| s.rejected_full > 0 || s.failed_imports > 0) {
+                if stats.is_some_and(|s| s.rejected_full > 0 || s.failed_imports > 0) {
                     tracing::warn!(
                         budget_ms = budget.as_millis(),
                         queue = ?stats,
@@ -665,7 +665,7 @@ where
             }
             Err(error) => {
                 let stats = barrier.queue_stats();
-                if stats.map_or(false, |s| s.rejected_full > 0 || s.failed_imports > 0) {
+                if stats.is_some_and(|s| s.rejected_full > 0 || s.failed_imports > 0) {
                     tracing::warn!(
                         error = %error,
                         queue = ?stats,

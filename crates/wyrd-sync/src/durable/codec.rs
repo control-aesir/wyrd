@@ -68,8 +68,10 @@ const TAG_CARRY_QUEUED: u8 = 0x14;
 /// One discharged carry obligation: head SnapshotId (32).
 const TAG_CARRY_DONE: u8 = 0x15;
 /// One route-specific announcement reseal: snapshot (32) ‖ route length
-/// u32 LE ‖ route ‖ sealed announcement envelope.
-const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x16;
+/// u32 LE ‖ route ‖ sealed announcement envelope. Tag 0x17: 0x16 is
+/// the capability-sealed-replaced record, and the tag space is
+/// append-only.
+const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x17;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
 const KNOWN_TAGS: [u8; 23] = [

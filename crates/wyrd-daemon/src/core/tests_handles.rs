@@ -70,7 +70,6 @@ fn getattr_uses_open_handles_after_unlink() {
     let writer = backend.open_write("removed.txt", libc::O_RDWR).unwrap();
 
     backend.unlink_at(1, "removed.txt").unwrap();
-    assert_eq!(backend.getattr_at(ino, None), Err(fuser::Errno::ENOENT));
     for handle in [reader, writer] {
         let attr = backend.getattr_at(ino, Some(handle)).unwrap();
         assert_eq!(attr.ino.0, ino);
@@ -78,8 +77,48 @@ fn getattr_uses_open_handles_after_unlink() {
         assert_eq!(attr.kind, fuser::FileType::RegularFile);
         assert_eq!(attr.perm, 0o755);
     }
+    let (recreated, recreated_ino, _) = backend.create_at(1, "removed.txt", libc::O_RDWR).unwrap();
+    assert_ne!(recreated_ino, ino);
+    assert_eq!(
+        backend.getattr_at(ino, Some(recreated)),
+        Err(fuser::Errno::EBADF)
+    );
+    let attr = backend.getattr_at(ino, Some(reader)).unwrap();
+    assert_eq!(attr.ino.0, ino);
+    assert_eq!(attr.size, 5);
+    assert_eq!(backend.getattr_at(ino, None), Err(fuser::Errno::ENOENT));
+    backend.release_handle(recreated).unwrap();
     backend.release_handle(reader).unwrap();
     backend.release_handle(writer).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rmdir_retires_the_inode_before_recreation() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (old_ino, _) = backend.mkdir_at(1, "old").unwrap();
+    let directory = backend.open_dir(old_ino, "old").unwrap();
+    backend.rmdir_at(1, "old").unwrap();
+    let attr = backend
+        .getattr_at(old_ino, Some(fuser::FileHandle(directory)))
+        .unwrap();
+    assert_eq!(attr.ino.0, old_ino);
+    assert_eq!(attr.kind, fuser::FileType::Directory);
+    let (new_ino, _) = backend.mkdir_at(1, "old").unwrap();
+    assert_ne!(new_ino, old_ino);
+    backend.release_dir(directory).unwrap();
 
     stop.store(true, Ordering::Relaxed);
     loop_handle

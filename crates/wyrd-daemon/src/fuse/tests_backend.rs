@@ -437,6 +437,32 @@ fn directory_handles_pin_their_enumeration_generation() {
     assert!(after.contains(&"new.txt".to_string()));
 }
 
+#[test]
+fn getattr_distinguishes_directory_and_file_handles() {
+    let (backend, _, _, _) = kind_changing_backend();
+    let (file_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+    let (dir_ino, _, _) = backend.resolve_inode("sub").unwrap();
+    let file = backend.open_at("f.txt").unwrap();
+    let directory = backend.open_dir(dir_ino, "sub").unwrap();
+
+    assert_ne!(file.0, directory);
+    assert_eq!(
+        backend.getattr_at(file_ino, Some(file)).unwrap().kind,
+        fuser::FileType::RegularFile
+    );
+    assert_eq!(
+        backend
+            .getattr_at(dir_ino, Some(FileHandle(directory)))
+            .unwrap()
+            .kind,
+        fuser::FileType::Directory
+    );
+    assert_eq!(
+        backend.getattr_at(file_ino, Some(FileHandle(directory))),
+        Err(fuser::Errno::EBADF)
+    );
+}
+
 /// Past the open-handle cap, opens refuse `EMFILE` and the refused
 /// handle holds nothing — while already-open handles keep serving
 /// and a release drains room for the next open.

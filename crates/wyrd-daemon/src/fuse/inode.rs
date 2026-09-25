@@ -88,9 +88,12 @@ pub(crate) type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
 /// a listing never mixes generations mid-stream; a fresh opendir
 /// picks up the new generation.
 pub(super) struct OpenDir {
+    pub(super) ino: u64,
     pub(super) generation: u64,
     pub(super) entries: DirectoryEntries,
 }
+
+pub(super) const DIRECTORY_HANDLE_BASE: u64 = 1 << 63;
 
 pub(super) struct DirectoryState {
     pub(super) entries: HashMap<u64, OpenDir>,
@@ -99,6 +102,7 @@ pub(super) struct DirectoryState {
 
 #[derive(Clone)]
 pub(super) struct ReadHandle {
+    pub(super) ino: Option<u64>,
     pub(super) capture: OpenFile,
     pub(super) executable: bool,
 }
@@ -125,6 +129,7 @@ pub(super) enum Handle {
 /// the image and mapping every later operation to `EIO`.
 pub(super) struct WriteHandle {
     pub(super) path: String,
+    pub(super) ino: Option<u64>,
     /// The open-time capture: clean reads serve exactly these bytes, so
     /// head advancement never changes what an open descriptor returns.
     pub(super) capture: OpenFile,

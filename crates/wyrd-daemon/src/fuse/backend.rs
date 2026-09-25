@@ -10,7 +10,7 @@ use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
 use super::inode::{
     statfs_capacity, DirectoryEntries, DirectoryState, Handle, InodeError, InodeTable, OpenDir,
-    OpenFiles, ReadHandle, WriteHandle, MOUNT_TIME, TTL,
+    OpenFiles, ReadHandle, WriteHandle, DIRECTORY_HANDLE_BASE, MOUNT_TIME, TTL,
 };
 use wyrd_core::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
 use wyrd_core::mutation::{
@@ -268,7 +268,7 @@ where
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),
-                next_handle: 1,
+                next_handle: DIRECTORY_HANDLE_BASE,
             }),
             files: Mutex::new(OpenFiles {
                 by_handle: HashMap::new(),
@@ -297,7 +297,7 @@ where
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),
-                next_handle: 1,
+                next_handle: DIRECTORY_HANDLE_BASE,
             }),
             files: Mutex::new(OpenFiles {
                 by_handle: HashMap::new(),
@@ -333,7 +333,7 @@ where
             inodes: RwLock::new(InodeTable::new()),
             directories: RwLock::new(DirectoryState {
                 entries: HashMap::new(),
-                next_handle: 1,
+                next_handle: DIRECTORY_HANDLE_BASE,
             }),
             files: Mutex::new(OpenFiles {
                 by_handle: HashMap::new(),
@@ -513,6 +513,10 @@ where
     /// blocks bounded (the same deadline for the whole chain), then
     /// retries. A deadline expiry is `EIO`, never a partial file.
     pub fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
+        self.open_at_with_inode(path, None)
+    }
+
+    fn open_at_with_inode(&self, path: &str, ino: Option<u64>) -> Result<FileHandle, fuser::Errno> {
         let attempt = |this: &Self| -> Result<(OpenFile, bool), (ViewError, fuser::Errno)> {
             let projection = this.projection().map_err(|error| {
                 (
@@ -543,11 +547,11 @@ where
         if files.by_handle.len() + files.reserved >= self.max_open_handles {
             return Err(fuser::Errno::EMFILE);
         }
-        let handle = files.next;
-        files.next = handle.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
+        let handle = Self::next_file_handle(&mut files)?;
         files.by_handle.insert(
             handle,
             Handle::Read(ReadHandle {
+                ino,
                 capture: file,
                 executable,
             }),
@@ -607,10 +611,18 @@ where
             return Err(fuser::Errno::EIO);
         }
         files.reserved -= 1;
-        let fh = files.next;
-        files.next = fh.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
+        let fh = Self::next_file_handle(&mut files)?;
         files.by_handle.insert(fh, handle);
         Ok(FileHandle(fh))
+    }
+
+    fn next_file_handle(files: &mut OpenFiles) -> Result<u64, fuser::Errno> {
+        let handle = files.next;
+        if handle >= DIRECTORY_HANDLE_BASE {
+            return Err(fuser::Errno::EOVERFLOW);
+        }
+        files.next = handle.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
+        Ok(handle)
     }
 
     /// Clone the handle entry out of the table, keeping the table lock
@@ -846,6 +858,15 @@ where
     /// already empty). `O_SYNC`/`O_DSYNC` make every successful write
     /// its own commit. `O_APPEND` buffers an ordered append sequence.
     pub fn open_write(&self, path: &str, flags: i32) -> Result<FileHandle, fuser::Errno> {
+        self.open_write_with_inode(path, flags, None)
+    }
+
+    fn open_write_with_inode(
+        &self,
+        path: &str,
+        flags: i32,
+        ino: Option<u64>,
+    ) -> Result<FileHandle, fuser::Errno> {
         if self.mutations.is_none() {
             return Err(fuser::Errno::EROFS);
         }
@@ -869,7 +890,7 @@ where
         // it — except a failed `insert_reserved` itself, which keeps
         // create_at's accounting (the promise is consumed there).
         self.reserve_slot()?;
-        let handle = match self.build_write_handle(path, flags, append, truncate) {
+        let handle = match self.build_write_handle(path, flags, append, truncate, ino) {
             Ok(handle) => handle,
             Err(error) => {
                 self.release_slot();
@@ -888,6 +909,7 @@ where
         flags: i32,
         append: bool,
         truncate: bool,
+        ino: Option<u64>,
     ) -> Result<WriteHandle, fuser::Errno> {
         if truncate {
             // A path-addressed truncate while an append handle is open
@@ -933,6 +955,7 @@ where
         let executable = base.executable();
         Ok(WriteHandle {
             path: path.to_string(),
+            ino,
             capture,
             base,
             executable,
@@ -1037,6 +1060,7 @@ where
         let executable = identity.executable();
         let handle = WriteHandle {
             path: child_path.clone(),
+            ino: Some(ino),
             capture,
             base: identity,
             executable,
@@ -1331,16 +1355,24 @@ where
     fn attr_for_handle(&self, ino: u64, fh: FileHandle) -> Result<fuser::FileAttr, fuser::Errno> {
         let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
         match files.by_handle.get(&fh.0) {
-            Some(Handle::Read(handle)) => Ok(self.attr_parts(
-                ino,
-                fuser::FileType::RegularFile,
-                handle.capture.size(),
-                handle.executable,
-            )),
+            Some(Handle::Read(handle)) => {
+                if handle.ino.is_some_and(|bound| bound != ino) {
+                    return Err(fuser::Errno::EBADF);
+                }
+                Ok(self.attr_parts(
+                    ino,
+                    fuser::FileType::RegularFile,
+                    handle.capture.size(),
+                    handle.executable,
+                ))
+            }
             Some(Handle::Write(handle)) => {
                 let handle = Arc::clone(handle);
                 drop(files);
                 let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+                if write.ino.is_some_and(|bound| bound != ino) {
+                    return Err(fuser::Errno::EBADF);
+                }
                 if write.failed {
                     return Err(fuser::Errno::EIO);
                 }
@@ -1358,7 +1390,19 @@ where
         }
     }
 
-    /// The path an ino was minted for. A poisoned lock is a local
+    fn attr_for_directory_handle(
+        &self,
+        ino: u64,
+        fh: FileHandle,
+    ) -> Result<fuser::FileAttr, fuser::Errno> {
+        let directories = self.directories.read().map_err(|_| fuser::Errno::EIO)?;
+        let opened = directories.entries.get(&fh.0).ok_or(fuser::Errno::EBADF)?;
+        if opened.ino != ino {
+            return Err(fuser::Errno::EBADF);
+        }
+        Ok(self.attr_parts(ino, fuser::FileType::Directory, 0, false))
+    }
+
     /// data-path failure: EIO, never a panic inside a kernel callback.
     pub(super) fn inode_path(&self, ino: u64) -> Result<String, fuser::Errno> {
         let inodes = self.inodes.read().map_err(|_| fuser::Errno::EIO)?;
@@ -1461,6 +1505,7 @@ where
         // The listing is pinned to its enumeration generation: a
         // stable snapshot, never a mix of generations mid-stream.
         let opened = OpenDir {
+            ino,
             generation: projection.generation(),
             entries: all,
         };
@@ -1511,14 +1556,16 @@ where
     /// Remove the file or symlink `name` under `parent_ino`.
     pub fn unlink_at(&self, parent_ino: u64, name: &str) -> Result<(), fuser::Errno> {
         let path = join(&self.inode_path(parent_ino)?, name);
-        self.submit(MutationKind::Unlink { path })?;
+        self.submit(MutationKind::Unlink { path: path.clone() })?;
+        self.retire_path(&path);
         Ok(())
     }
 
     /// Remove the empty directory `name` under `parent_ino`.
     pub fn rmdir_at(&self, parent_ino: u64, name: &str) -> Result<(), fuser::Errno> {
         let path = join(&self.inode_path(parent_ino)?, name);
-        self.submit(MutationKind::Rmdir { path })?;
+        self.submit(MutationKind::Rmdir { path: path.clone() })?;
+        self.retire_path(&path);
         Ok(())
     }
 
@@ -1694,7 +1741,11 @@ where
         fh: Option<FileHandle>,
     ) -> Result<fuser::FileAttr, fuser::Errno> {
         if let Some(fh) = fh {
-            return self.attr_for_handle(ino, fh);
+            return if fh.0 & DIRECTORY_HANDLE_BASE != 0 {
+                self.attr_for_directory_handle(ino, fh)
+            } else {
+                self.attr_for_handle(ino, fh)
+            };
         }
         let path = self.inode_path(ino)?;
         let projection = self.projection()?;
@@ -1986,9 +2037,9 @@ where
             }
         }
         let opened = match flags.acc_mode() {
-            fuser::OpenAccMode::O_RDONLY => self.open_at(&path),
+            fuser::OpenAccMode::O_RDONLY => self.open_at_with_inode(&path, Some(ino.0)),
             fuser::OpenAccMode::O_WRONLY | fuser::OpenAccMode::O_RDWR => {
-                self.open_write(&path, flags.0)
+                self.open_write_with_inode(&path, flags.0, Some(ino.0))
             }
         };
         match opened {

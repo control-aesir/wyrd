@@ -148,17 +148,24 @@ impl RuntimeState {
         self.local_objects.contains(id)
     }
 
+    /// The durable residency policy for one content object: the
+    /// recorded state, defaulting to `RemoteOnly` for never-wanted
+    /// identities. Admission paths compare against this before
+    /// committing, so a retry of an unchanged policy is a no-op
+    /// instead of another append-only fact.
+    pub fn materialization(&self, id: &ContentId) -> MaterializationState {
+        self.materialization
+            .get(id)
+            .copied()
+            .unwrap_or(MaterializationState::RemoteOnly)
+    }
+
     /// The durable materialization state projected into the view boundary.
     pub fn status(&self, id: &ContentId) -> FetchStatus {
         if self.is_local(id) {
             FetchStatus::Available
         } else {
-            match self
-                .materialization
-                .get(id)
-                .copied()
-                .unwrap_or(MaterializationState::RemoteOnly)
-            {
+            match self.materialization(id) {
                 MaterializationState::RemoteOnly => FetchStatus::RemoteOnly,
                 MaterializationState::Cached | MaterializationState::Pinned => {
                     FetchStatus::Fetching
@@ -716,11 +723,7 @@ impl RuntimeState {
                 // policy.
                 let structural = entry.kind == ObjectKind::Tree;
                 if !structural {
-                    let desired = self
-                        .materialization
-                        .get(&entry.content_id)
-                        .copied()
-                        .unwrap_or(MaterializationState::RemoteOnly);
+                    let desired = self.materialization(&entry.content_id);
                     if matches!(desired, MaterializationState::RemoteOnly) {
                         continue;
                     }

@@ -55,6 +55,55 @@ fn into_live_shares_view_with_backend() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A mutation whose budget ran out before the loop ever evaluated it
+/// fails terminal `TimedOut` on its first pass — no defer, no want,
+/// no second wait. The prerequisite clock runs from admission (the
+/// caller has been blocked since), so a loop that spent longer than
+/// `max_mutation_wait` fetching cannot extend the caller's wait.
+#[test]
+fn a_mutation_whose_budget_expired_before_evaluation_times_out() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon.put_file("wait.txt", b"base").unwrap();
+    let (mut live, parts) = daemon
+        .into_live(
+            Duration::from_secs(30),
+            &LiveConfig {
+                max_mutation_wait: Duration::from_millis(50),
+                serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
+                ..LiveConfig::default()
+            },
+        )
+        .unwrap();
+    drop(parts);
+    let mutations = std::sync::Arc::clone(live.mutations());
+    let submitter = std::thread::spawn(move || {
+        mutations.submit(wyrd_core::mutation::MutationKind::AppendFile {
+            path: "wait.txt".to_string(),
+            content: b"x".to_vec(),
+        })
+    });
+    // The loop is idle well past the budget, then runs its first pass.
+    std::thread::sleep(Duration::from_millis(120));
+    live.sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(wyrd_core::mutation::MutationError::TimedOut),
+        "the first evaluation must not start a fresh wait"
+    );
+    assert_eq!(
+        live.wants()
+            .waiter_count(&wyrd_format::ContentId::from_bytes([0; 32])),
+        0,
+        "an expired budget registers no want"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// The dirty backlog is the one case the revision gate cannot see:
 /// a pass that failed after committing leaves serving behind, so
 /// the next pass republishes even with zero new changes. Forced
@@ -131,6 +180,9 @@ fn mkdir_through_backend_commits_and_serves() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                max_mutation_wait: Duration::from_secs(30),
+                serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
@@ -226,6 +278,9 @@ fn create_at_saturated_table_creates_nothing() {
         error_base_delay: Duration::from_millis(5),
         error_max_delay: Duration::from_millis(20),
         max_consecutive_errors: 10,
+        max_mutation_wait: Duration::from_secs(30),
+        serving_flush_budget: Duration::from_secs(5),
+        fetch_pass_budget: Duration::from_secs(10),
         budgets: ResourceBudgets {
             max_open_handles: 1,
             ..ResourceBudgets::default()

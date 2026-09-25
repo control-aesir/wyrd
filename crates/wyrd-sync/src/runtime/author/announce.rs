@@ -1,6 +1,9 @@
-use super::deliver::{seal_fresh_for, send_sealed_to, verify_reused_sealed};
+use super::deliver::{
+    control_key_for, open_reused_sealed, seal_fresh_for, send_sealed_to, verify_reused_sealed,
+};
 use crate::control::{seal as seal_control, Message, SnapshotAnnouncement};
 use crate::durable::{AuthorizedSnapshot, Fact, Rebuilt};
+use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::Mailbox;
 
@@ -133,7 +136,9 @@ pub(crate) fn announce(
 /// without re-authoring anything. Snapshots with no persisted sealed
 /// bytes are sealed now (the epoch key must be held; the root manifest
 /// must be recorded) under the given `node_addr`; already-sealed
-/// snapshots resend their exact bytes. Snapshots this device did not
+/// snapshots resend their exact bytes when the persisted route is
+/// live, else the persisted route-specific reseal for the live route
+/// (sealed and committed on first use). Snapshots this device did not
 /// author — queued as newcomer catch-up at admit time — go through
 /// [`reannounce_one`], which re-sends the known signed announcement
 /// instead of authoring.
@@ -172,50 +177,27 @@ pub(crate) fn announce_pending(
         match rebuilt.runtime.announcement_sealed_bytes(&snapshot_id) {
             Some(bytes) => {
                 // Reused sealed bytes are verified against the
-                // obligation before use: the fact's key must name the
-                // snapshot the bytes actually announce, or the send
-                // would discharge one obligation while delivering
-                // another.
+                // obligation before use; a stale route reuses or
+                // persists the route-specific reseal — see
+                // `send_with_live_route`.
                 let obligation = format!("announcement {snapshot_id:?}");
-                let Some(bytes) = verify_reused_sealed(
+                match send_with_live_route(
                     engine,
+                    &rebuilt,
                     &rebuilt.keyring,
-                    bytes.to_vec(),
+                    snapshot_id,
+                    bytes,
+                    node_addr,
+                    body.epoch,
                     &obligation,
-                    |sealed_epoch, message| {
-                        let Message::SnapshotAnnouncement(announcement) = message else {
-                            return Err(EngineError::SealedOutboxMismatch(format!(
-                                "{obligation}: sealed bytes carry {:?}, not an announcement",
-                                message.kind()
-                            )));
-                        };
-                        if announcement.snapshot != snapshot_id {
-                            return Err(EngineError::SealedOutboxMismatch(format!(
-                                "{obligation}: sealed bytes announce {:?}, not the obligated snapshot",
-                                announcement.snapshot
-                            )));
-                        }
-                        // The envelope epoch must be the body's own
-                        // epoch, as for transitions: a correct
-                        // announcement under a foreign epoch key would
-                        // send to recipients that cannot open it and
-                        // discharge the obligation anyway.
-                        if sealed_epoch != body.epoch {
-                            return Err(EngineError::SealedOutboxMismatch(format!(
-                                "{obligation}: sealed under epoch {sealed_epoch}, not the body's epoch {}",
-                                body.epoch
-                            )));
-                        }
-                        Ok(())
-                    },
-                )?
-                else {
+                    mailbox,
+                )? {
+                    Some(sent_now) => sent += sent_now,
                     // No sealing key: retain the obligation for a later
                     // pass instead of failing the whole pass on every
                     // drain.
-                    continue;
-                };
-                sent += send_pending_for(engine, snapshot_id, &bytes, mailbox)?;
+                    None => continue,
+                }
             }
             None => {
                 match announce(engine, &authorized, mailbox, node_addr) {
@@ -232,6 +214,163 @@ pub(crate) fn announce_pending(
         }
     }
     Ok(sent)
+}
+
+/// Send one snapshot's pending announcement obligations, reusing the
+/// persisted seal when its route is live and reusing or persisting a
+/// route-specific reseal otherwise. Returns the envelopes sent, or
+/// `None` when the sealing key is not held (the obligation stays
+/// pending for a later pass).
+///
+/// Seals are first-wins: a snapshot sealed by an earlier mount keeps
+/// that mount's serving address in its bytes, but every mount binds a
+/// fresh iroh endpoint — the old address is undialable once that mount
+/// stops, and resending it wedges the peer's fetch behind dial
+/// timeouts. The obligation's identity fields are immutable, but the
+/// route is mutable metadata by design (a reannouncement that differs
+/// only in `node_addr` is a route update, last route wins), so a seal
+/// whose route differs from this mount's is replaced by the persisted
+/// reseal for the live route — same statement, live route — or sealed
+/// afresh and persisted when no reseal for that route exists yet. A
+/// matching route resends the exact persisted bytes. Either way every
+/// retry under one route resends one exact durable envelope, and the
+/// receiver's intake classifies the resend as a route update whose own
+/// retries dedupe collapses. The first seal stays canonical throughout.
+#[allow(clippy::too_many_arguments)]
+fn send_with_live_route(
+    engine: &mut Engine,
+    rebuilt: &Rebuilt,
+    keyring: &DriveKeyring,
+    snapshot: wyrd_format::SnapshotId,
+    sealed_bytes: &[u8],
+    node_addr: Option<&[u8]>,
+    epoch: u64,
+    obligation: &str,
+    mailbox: &mut impl Mailbox,
+) -> Result<Option<usize>, EngineError> {
+    let Some((sealed_epoch, message)) =
+        open_reused_sealed(engine, keyring, sealed_bytes, obligation)?
+    else {
+        return Ok(None);
+    };
+    let Message::SnapshotAnnouncement(announcement) = message else {
+        return Err(EngineError::SealedOutboxMismatch(format!(
+            "{obligation}: sealed bytes carry a non-announcement, not the obligated snapshot"
+        )));
+    };
+    if announcement.snapshot != snapshot {
+        return Err(EngineError::SealedOutboxMismatch(format!(
+            "{obligation}: sealed bytes announce {:?}, not the obligated snapshot",
+            announcement.snapshot
+        )));
+    }
+    // The envelope epoch must be the body's own epoch, as for
+    // transitions: a correct announcement under a foreign epoch key
+    // would send to recipients that cannot open it and discharge the
+    // obligation anyway.
+    if sealed_epoch != epoch {
+        return Err(EngineError::SealedOutboxMismatch(format!(
+            "{obligation}: sealed under epoch {sealed_epoch}, not the body's epoch {epoch}"
+        )));
+    }
+    let bytes = if announcement.node_addr.as_deref() == node_addr {
+        sealed_bytes.to_vec()
+    } else {
+        let Some(bytes) = reuse_or_seal_route(
+            engine,
+            rebuilt,
+            keyring,
+            snapshot,
+            epoch,
+            node_addr,
+            obligation,
+            announcement,
+        )?
+        else {
+            return Ok(None);
+        };
+        bytes
+    };
+    Ok(Some(send_pending_for(engine, snapshot, &bytes, mailbox)?))
+}
+
+/// Reuse the persisted route-specific reseal for one snapshot under
+/// the live route, or seal one afresh and persist it. Returns the
+/// bytes to send, or `None` when the sealing key is not held (the
+/// obligation stays pending for a later pass).
+///
+/// The canonical seal above already opened under a held key by the
+/// time this runs, so a missing key here is unreachable in practice —
+/// `open_reused_sealed` still reports it as `None` rather than
+/// assuming, and the fresh-seal commit validates size before
+/// committing, exactly as the first seal does: persisting oversize
+/// bytes would poison the route past retry.
+#[allow(clippy::too_many_arguments)]
+fn reuse_or_seal_route(
+    engine: &mut Engine,
+    rebuilt: &Rebuilt,
+    keyring: &DriveKeyring,
+    snapshot: wyrd_format::SnapshotId,
+    epoch: u64,
+    node_addr: Option<&[u8]>,
+    obligation: &str,
+    announcement: SnapshotAnnouncement,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let route = node_addr.unwrap_or_default();
+    if let Some(persisted) = rebuilt
+        .runtime
+        .announcement_route_sealed_bytes(&snapshot, route)
+    {
+        let persisted = persisted.to_vec();
+        let Some((sealed_epoch, message)) =
+            open_reused_sealed(engine, keyring, &persisted, obligation)?
+        else {
+            return Ok(None);
+        };
+        let Message::SnapshotAnnouncement(resealed) = message else {
+            return Err(EngineError::SealedOutboxMismatch(format!(
+                "{obligation}: route seal carries a non-announcement, not the obligated snapshot"
+            )));
+        };
+        if resealed.snapshot != snapshot {
+            return Err(EngineError::SealedOutboxMismatch(format!(
+                "{obligation}: route seal announces {:?}, not the obligated snapshot",
+                resealed.snapshot
+            )));
+        }
+        if sealed_epoch != epoch {
+            return Err(EngineError::SealedOutboxMismatch(format!(
+                "{obligation}: route seal sealed under epoch {sealed_epoch}, not the body's epoch {epoch}"
+            )));
+        }
+        if resealed.node_addr.as_deref() != node_addr {
+            return Err(EngineError::SealedOutboxMismatch(format!(
+                "{obligation}: route seal carries a different route, not the obligated one"
+            )));
+        }
+        return Ok(Some(persisted));
+    }
+    let mut announcement = announcement;
+    announcement.node_addr = node_addr.map(<[u8]>::to_vec);
+    crate::control::sign_announcement(&mut announcement, &engine.identity_secret, &engine.drive);
+    let key = control_key_for(engine, keyring, epoch)?;
+    let bytes = seal_control(
+        &key,
+        &engine.drive,
+        epoch,
+        &Message::SnapshotAnnouncement(announcement),
+    )?
+    .encode();
+    // Validate before committing: oversize bytes would discharge the
+    // obligation while delivering nothing, exactly as for the
+    // first seal.
+    crate::transport::mailbox::check_outbound_size(&bytes)?;
+    engine.commit_facts(&[Fact::AnnouncementRouteSealed(
+        snapshot,
+        route.to_vec(),
+        bytes.clone(),
+    )])?;
+    Ok(Some(bytes))
 }
 
 /// Re-send a snapshot this engine did not author to its pending
@@ -329,7 +468,12 @@ fn send_pending_for(
         .filter(|(id, _)| *id == snapshot)
         .map(|(_, recipient)| recipient)
         .collect();
-    send_sealed_to(engine, mailbox, sealed_bytes, recipients, |recipient| {
-        Fact::AnnouncementDelivered(snapshot, recipient)
-    })
+    send_sealed_to(
+        engine,
+        mailbox,
+        "announcement",
+        sealed_bytes,
+        recipients,
+        |recipient| Fact::AnnouncementDelivered(snapshot, recipient),
+    )
 }

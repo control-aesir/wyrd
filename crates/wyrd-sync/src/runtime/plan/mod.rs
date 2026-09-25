@@ -32,6 +32,42 @@ pub(super) fn execute(
     bulk: &mut impl BulkSource,
     objects: &mut impl ObjectStore,
 ) -> Result<ExecuteReport, EngineError> {
+    execute_inner(engine, bulk, objects, None)
+}
+
+/// The same run under a wall-clock budget: the plan stops starting
+/// fetch work once `deadline` passes, and every attempt started before
+/// it is capped at the remaining time, so a stalled provider cannot
+/// push a caller's timeout decision past its bound. Work not started
+/// stays pending and the next run picks it up; the attempt cap is
+/// cleared on the way out, including on error.
+pub(super) fn execute_sliced(
+    engine: &mut Engine,
+    bulk: &mut impl BulkSource,
+    objects: &mut impl ObjectStore,
+    deadline: Option<std::time::Instant>,
+) -> Result<ExecuteReport, EngineError> {
+    bulk.set_attempt_deadline(deadline);
+    let result = execute_inner(engine, bulk, objects, deadline);
+    bulk.set_attempt_deadline(None);
+    result
+}
+
+/// Whether a wall-clock budget is spent: every start point checks, so
+/// a run owes at most the one in-flight attempt (itself capped) past
+/// the deadline.
+fn spent(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+/// Execute the current fetch plan to convergence, optionally under a
+/// wall-clock budget.
+fn execute_inner(
+    engine: &mut Engine,
+    bulk: &mut impl BulkSource,
+    objects: &mut impl ObjectStore,
+    deadline: Option<std::time::Instant>,
+) -> Result<ExecuteReport, EngineError> {
     let mut report = ExecuteReport::default();
     engine.fetch_run += 1;
     loop {
@@ -39,8 +75,20 @@ pub(super) fn execute(
         let mut runtime = rebuilt.runtime;
         let keyring = rebuilt.keyring;
         let plan = runtime.reconcile();
+        // Items this pass has not yet fulfilled, counted down as work
+        // lands: the unfulfilled total covers everything planned and
+        // not delivered, whether the run exhausted the plan or stopped
+        // at the wall-clock budget.
+        let mut remaining = plan.pending_snapshot_bodies.len()
+            + plan.pending_snapshots.len()
+            + plan.pending_manifests.len()
+            + plan.pending_objects.len();
         let mut facts = Vec::new();
         for snapshot in &plan.pending_snapshot_bodies {
+            if spent(deadline) {
+                report.unfulfilled = remaining;
+                return Ok(report);
+            }
             // Backoff: a repeatedly invalid body stops being attempted
             // while cooled. Bodies strike by snapshot: the announcement
             // carries only the id.
@@ -78,6 +126,7 @@ pub(super) fn execute(
                                     runtime.record_snapshot_body(authorized.snapshot().clone())?;
                                     facts.push(crate::durable::Fact::SnapshotBody(authorized));
                                     report.snapshot_bodies += 1;
+                                    remaining -= 1;
                                     engine.note_fetch_fulfilled(&body_key);
                                 }
                                 Err(error) => {
@@ -103,12 +152,19 @@ pub(super) fn execute(
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
-                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Transport => {
+                    report.transport_errors += 1;
+                    engine.note_fetch_transport_failure(&body_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
         for snapshot in &plan.pending_snapshots {
+            if spent(deadline) {
+                report.unfulfilled = remaining;
+                return Ok(report);
+            }
             // Backoff: a repeatedly invalid root stops being attempted
             // while cooled (the snapshot stays pending). Roots strike by
             // snapshot: no storage address exists before the fetch.
@@ -128,6 +184,7 @@ pub(super) fn execute(
                     runtime.record_manifest(record.clone())?;
                     facts.push(crate::durable::Fact::Manifest(record));
                     report.manifests += 1;
+                    remaining -= 1;
                     engine.note_fetch_fulfilled(&root_key);
                 }
                 FetchOutcome::Invalid => {
@@ -136,12 +193,19 @@ pub(super) fn execute(
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
-                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Transport => {
+                    report.transport_errors += 1;
+                    engine.note_fetch_transport_failure(&root_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
         for (id, link) in &plan.pending_manifests {
+            if spent(deadline) {
+                report.unfulfilled = remaining;
+                return Ok(report);
+            }
             // Backoff: a repeatedly invalid child representation is
             // skipped while cooled — no attempt, item stays pending.
             let child_key = FetchKey::Storage(link.storage);
@@ -161,6 +225,7 @@ pub(super) fn execute(
                     runtime.record_manifest(record.clone())?;
                     facts.push(crate::durable::Fact::Manifest(record));
                     report.manifests += 1;
+                    remaining -= 1;
                     engine.note_fetch_fulfilled(&child_key);
                 }
                 FetchOutcome::Invalid => {
@@ -169,12 +234,19 @@ pub(super) fn execute(
                 }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
-                FetchOutcome::Transport => report.transport_errors += 1,
+                FetchOutcome::Transport => {
+                    report.transport_errors += 1;
+                    engine.note_fetch_transport_failure(&child_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
         }
         for (content, candidates) in &plan.pending_objects {
+            if spent(deadline) {
+                report.unfulfilled = remaining;
+                return Ok(report);
+            }
             // Backoff: cooled representations are not attempted. A
             // content with every representation cooled makes no attempt
             // at all — the item just stays pending.
@@ -198,16 +270,23 @@ pub(super) fn execute(
             // Strike representations whose bytes arrived and failed
             // validation regardless of the aggregate verdict: a corrupt
             // candidate keeps earning strikes even when a later
-            // candidate fulfilled. Absent, key-less, transport-failed,
-            // and locally-refused candidates never strike.
+            // candidate fulfilled. Transport failures strike on the
+            // same ledger (an unreachable route backs off instead of
+            // retrying every pass and starving the items behind it).
+            // Absent, key-less, and locally-refused candidates never
+            // strike: they are not evidence against the representation.
             for storage in &attempt.invalid {
                 engine.note_fetch_invalid(&FetchKey::Storage(*storage));
+            }
+            for storage in &attempt.transport_failed {
+                engine.note_fetch_transport_failure(&FetchKey::Storage(*storage));
             }
             match attempt.aggregate {
                 FetchOutcome::Fulfilled(()) => {
                     runtime.mark_local_object(*content);
                     facts.push(crate::durable::Fact::LocalObject(*content));
                     report.objects += 1;
+                    remaining -= 1;
                     // Only the representation that served valid bytes
                     // clears its backoff state; other candidates keep
                     // their accumulated strikes.
@@ -227,15 +306,19 @@ pub(super) fn execute(
         }
 
         if facts.is_empty() {
-            report.unfulfilled = plan.pending_snapshot_bodies.len()
-                + plan.pending_snapshots.len()
-                + plan.pending_manifests.len()
-                + plan.pending_objects.len();
+            report.unfulfilled = remaining;
             return Ok(report);
         }
         if let Err(error) = engine.commit_facts(&facts) {
             let _ = engine.resync();
             return Err(error.into());
+        }
+        // The convergence pass the commits unlocked starts only if the
+        // budget allows: stopping here leaves the rest planned and
+        // pending for the next run.
+        if spent(deadline) {
+            report.unfulfilled = remaining;
+            return Ok(report);
         }
     }
 }

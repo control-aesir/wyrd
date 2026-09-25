@@ -13,7 +13,7 @@ use wyrd_format::{
 };
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::authorization::{Classification, Rejection, SnapshotDag};
-use wyrd_sync::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use wyrd_sync::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
 use wyrd_sync::control::{CapabilityPayload, Message};
 use wyrd_sync::durable::DurableError;
@@ -291,8 +291,8 @@ fn failed_pass_recovers_serving_on_retry() {
 /// durable store is damaged (the commit watermark rots) and
 /// `refresh_live_heads` fails closed — the engine refuses to rebuild
 /// rather than projecting from untrustworthy state. The view keeps
-/// serving exactly what it served before: refresh is all-or-nothing,
-/// never a partial head set, never a clear.
+/// serving exactly what it served before: a failed refresh installs
+/// nothing, never a partial head set, never a clear.
 ///
 /// This pins the decided v0 post-corruption policy (`docs/epochs.md`,
 /// Heads: projection failure ⇒ installed heads unchanged ⇒ failure
@@ -336,12 +336,14 @@ fn failed_projection_leaves_installed_heads_untouched() {
     loaded.rig.teardown();
 }
 
-/// A mixed-validity head set never partially projects: with two eligible
-/// heads where one fails closure, `refresh_live_heads` errors and the
-/// previously installed heads stay installed. This is the per-head path
-/// the all-or-nothing contract above does not cover on its own: that
-/// test damages the commit watermark (engine-level failure), while here
-/// the engine is healthy and exactly one head's closure is unverifiable.
+/// A mixed-validity head set projects only its verified class: with two
+/// eligible heads where one is still fetching, `refresh_live_heads`
+/// installs the verified head and leaves the pending one for later,
+/// and an all-pending set leaves the installed head untouched. This is
+/// the per-head path the whole-set contract above does not cover on
+/// its own: that test damages the commit watermark (engine-level
+/// failure), while here the engine is healthy and exactly one head's
+/// closure is still arriving.
 #[test]
 fn partial_head_set_never_projects_mixed_validity_heads() {
     // Head A fully published and installed first.
@@ -404,13 +406,14 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
 
     daemon.drain(&mut loaded.rig.relay).unwrap();
     daemon.execute_plan(&mut loaded.bulk).unwrap();
-    let err = daemon.refresh_live_heads().unwrap_err();
-    assert!(
-        matches!(err, EngineError::Closure(_)),
-        "an unverifiable head fails the refresh at closure: {err:?}"
-    );
+    // B is pending (its closure is still fetching), not damaged: the
+    // refresh installs the verified head alone and leaves B for when
+    // its closure lands.
+    daemon
+        .refresh_live_heads()
+        .expect("a pending head is not a refresh failure");
 
-    // Installed heads untouched: A still serves, B never mounts.
+    // Installed heads: A serves, B never mounts.
     let node = daemon.view().lookup("keeper.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();
     assert_eq!(daemon.view().read(&file, 0, 6).unwrap(), b"keeper");
@@ -420,11 +423,11 @@ fn partial_head_set_never_projects_mixed_validity_heads() {
     loaded.rig.teardown();
 }
 
-/// The live sync pass enforces the same all-or-nothing rule as the direct
-/// refresh: with two eligible heads where one fails closure, `sync_once`
-/// errors and the previously published generation keeps serving. This is
-/// the production mount path (`into_live` + `sync_once`, the composer
-/// startup sequence in `main.rs`), not just the direct
+/// The live sync pass applies the same rule as the direct refresh: a
+/// pending (still-fetching) head never projects — the verified head
+/// publishes alone — and a damaged closure still fails the pass. This
+/// is the production mount path (`into_live` + `sync_once`, the
+/// composer startup sequence in `main.rs`), not just the direct
 /// `WyrdNode::refresh_live_heads` API.
 #[test]
 fn live_sync_pass_never_projects_mixed_validity_heads() {
@@ -490,27 +493,322 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
         None,
     );
 
-    let err = match live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk)) {
-        // SyncReport carries no Debug; match instead of unwrap_err.
-        Ok(_) => panic!("a mixed-validity head set must fail the live pass"),
-        Err(err) => err,
-    };
-    assert!(
-        matches!(err, LiveError::Engine(EngineError::Closure(_))),
-        "an unverifiable head fails the live pass at closure: {err:?}"
-    );
-
-    // No new generation publishes: the old one keeps serving A, and B
-    // never mounts.
-    assert_eq!(live.generation(), 0, "a failed pass publishes nothing");
+    // B is pending, not damaged: its closure is still fetching, so
+    // the pass publishes the verified subset — A alone. The
+    // projection never mixes validity classes, and a pending head
+    // spends no engine-error budget.
+    let report = live
+        .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+        .expect("a pending head is not a pass failure");
+    assert!(report.published, "the verified head publishes");
+    assert_eq!(live.generation(), 1, "one new generation, A only");
     let handle = backend
         .open_at("keeper.txt")
-        .expect("old generation serves");
+        .expect("the published generation serves A");
+    assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
+    assert!(
+        backend.open_at("second.txt").is_err(),
+        "the pending head never mounts"
+    );
+
+    drop(live);
+    drop(backend);
+    loaded.rig.teardown();
+}
+
+/// An installed head survives a pending successor. The direct
+/// refresh path (`WyrdNode::refresh_live_heads`, the API non-live
+/// hosts call) must not replace a healthy projection with an empty
+/// one because the current eligible set is still mid-fetch: head A is
+/// installed and serving, head B supersedes it but its closure has
+/// not arrived, and A keeps serving until B can.
+#[test]
+fn an_installed_head_survives_a_pending_successor_refresh() {
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    assert!(daemon.view().lookup("keeper.txt").is_ok(), "A installs");
+
+    // A superseding head: B extends A's tree (a "successor" that
+    // dropped A's files would be a fork, and A would stay eligible
+    // beside it), but only its root manifest is published — the head
+    // record commits while its tree and chunks stay remote, so the
+    // closure is pending.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk_b = scratch.insert(ObjectKind::Chunk, b"second").unwrap();
+    let tree_b = Tree::from_entries(vec![
+        Entry::file(
+            "keeper.txt",
+            6,
+            false,
+            vec![ContentId::derive(ObjectKind::Chunk, b"keeper")],
+        )
+        .unwrap(),
+        Entry::file("second.txt", 6, false, vec![chunk_b]).unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut scratch)
+    .unwrap();
+    let snapshot_b = signed_snapshot(
+        vec![loaded.snapshot.snapshot_id()],
+        tree_b,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        2_000,
+    );
+    let snapshot_b_id = snapshot_b.snapshot_id();
+    let content_b = seal_flat_drive(
+        &drive(),
+        &loaded.rig.epoch2,
+        2,
+        &snapshot_b_id,
+        &[("second.txt", b"second")],
+    );
+    let body_b = snapshot_b.encode();
+    loaded.bulk.publish_snapshot(snapshot_b_id, body_b.clone());
+    loaded.bulk.publish_transport(body_b.clone());
+    // Only B's root manifest is published: the head record commits,
+    // but its tree and chunks stay remote, so the closure is
+    // pending.
+    loaded
+        .bulk
+        .publish_root(snapshot_b_id, content_b.root.clone());
+    loaded.rig.enqueue_announcement(
+        snapshot_b_id,
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body_b).as_bytes()),
+            root_manifest: content_b.manifest_id,
+            root_transport: BaoRoot::from_bytes(*blake3::hash(&content_b.root.sealed).as_bytes()),
+        },
+        None,
+    );
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon
+        .refresh_live_heads()
+        .expect("a pending successor is not a refresh failure");
+
+    let node = daemon.view().lookup("keeper.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(
+        daemon.view().read(&file, 0, 6).unwrap(),
+        b"keeper",
+        "the last-known-good head keeps serving"
+    );
+    assert!(daemon.view().lookup("second.txt").is_err());
+
+    drop(daemon);
+    loaded.rig.teardown();
+}
+
+/// A damaged head fails the pass closed. With an installed valid
+/// head serving and a superseding head whose sealed closure
+/// contradicts its tree, the live pass errors and the previous
+/// generation keeps serving: unlike a pending closure (ordinary
+/// progress), damage is not retried into existence.
+#[test]
+fn a_damaged_head_beside_an_installed_one_fails_the_pass_closed() {
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+
+    // B extends A, and everything of B is published — but B's sealed
+    // closure describes a different tree than B commits to, so the
+    // closure is damaged, not pending.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk_b = scratch.insert(ObjectKind::Chunk, b"second").unwrap();
+    let tree_value = Tree::from_entries(vec![
+        Entry::file(
+            "keeper.txt",
+            6,
+            false,
+            vec![ContentId::derive(ObjectKind::Chunk, b"keeper")],
+        )
+        .unwrap(),
+        Entry::file("second.txt", 6, false, vec![chunk_b]).unwrap(),
+    ])
+    .unwrap();
+    let tree_b = tree_value.clone().insert_into(&mut scratch).unwrap();
+    let snapshot_b = signed_snapshot(
+        vec![loaded.snapshot.snapshot_id()],
+        tree_b,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        2_000,
+    );
+    let snapshot_b_id = snapshot_b.snapshot_id();
+    let content_b = seal_flat_drive(
+        &drive(),
+        &loaded.rig.epoch2,
+        2,
+        &snapshot_b_id,
+        &[("keeper.txt", b"keeper"), ("other.txt", b"other")],
+    );
+    let body_b = snapshot_b.encode();
+    loaded.bulk.publish_snapshot(snapshot_b_id, body_b.clone());
+    loaded.bulk.publish_transport(body_b.clone());
+    loaded
+        .bulk
+        .publish_root(snapshot_b_id, content_b.root.clone());
+    for (storage, sealed) in &content_b.objects {
+        loaded.bulk.publish_sealed(*storage, sealed.clone());
+    }
+    loaded.rig.enqueue_announcement(
+        snapshot_b_id,
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body_b).as_bytes()),
+            root_manifest: content_b.manifest_id,
+            root_transport: BaoRoot::from_bytes(*blake3::hash(&content_b.root.sealed).as_bytes()),
+        },
+        None,
+    );
+
+    // B's plain tree is in the store (its sealed representation is
+    // what the wrong manifest maps), so verification reaches the
+    // contradiction instead of stopping at an unfetched tree.
+    {
+        let mut store = daemon.view().store_write().unwrap();
+        store
+            .insert(ObjectKind::Tree, &tree_value.encode())
+            .unwrap();
+    }
+
+    let (mut live, parts) = daemon
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let backend = serving_backend(parts);
+    let handle = backend.open_at("keeper.txt").expect("A serves");
+    assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
+
+    // The pass drains the announcement and fetches B's body itself;
+    // once B is recorded, its damaged closure fails the pass. A pass
+    // that has not finished fetching B yet may still succeed.
+    let mut err = None;
+    for _ in 0..3 {
+        if let Err(error) = live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk)) {
+            err = Some(error);
+            break;
+        }
+    }
+    let err = err.expect("a damaged head must fail the live pass");
+    assert!(
+        matches!(err, LiveError::Engine(EngineError::Closure(_))),
+        "a damaged head fails the pass at closure: {err:?}"
+    );
+
+    // Nothing new published: the old generation keeps serving A.
+    assert_eq!(live.generation(), 0, "a failed pass publishes nothing");
+    let handle = backend.open_at("keeper.txt").expect("A still serves");
     assert_eq!(backend.read_handle(handle, 0, 1024).unwrap(), b"keeper");
     assert!(backend.open_at("second.txt").is_err());
 
     drop(live);
     drop(backend);
+    loaded.rig.teardown();
+}
+
+/// A pending-only pass still delivers the durable outbox. The
+/// control plane (here: the durable announcement of a freshly
+/// authored head) is independent of head publication: a mount whose
+/// every eligible head is still mid-fetch must keep moving the
+/// outbox, or a slow transfer stalls delivery for as long as it
+/// takes — and indefinitely, if the fetch never completes.
+#[test]
+fn a_pending_only_pass_still_delivers_the_durable_outbox() {
+    use wyrd_sync::transport::mailbox::{Disposition, Mailbox, MailboxEnvelope, MailboxError};
+
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    let mut engine = loaded.rig.take_engine();
+    engine.drain(&mut loaded.rig.relay).unwrap();
+
+    // Author a head whose objects live in a scratch store, not in the
+    // daemon's serving store: every eligible head's closure is
+    // unfetched, so no pass can publish.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"mine").unwrap();
+    let tree = Tree::from_entries(vec![Entry::file("mine.txt", 4, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut scratch)
+        .unwrap();
+    let local = engine.author_snapshot(&scratch, tree).unwrap();
+
+    // A refused announcement leaves its obligation durable: the
+    // outbox the pending-only pass must still drain.
+    struct OfflineMailbox;
+    impl Mailbox for OfflineMailbox {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            Err(MailboxError::Transport("offline".into()))
+        }
+        fn recv(
+            &mut self,
+        ) -> Result<Option<wyrd_sync::transport::mailbox::Delivery>, MailboxError> {
+            Ok(None)
+        }
+        fn settle(
+            &mut self,
+            _id: wyrd_sync::transport::mailbox::DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+    assert!(
+        engine
+            .announce_snapshot(&local, &mut OfflineMailbox, None)
+            .is_err(),
+        "the refused announcement reports the failure"
+    );
+    assert!(
+        engine.has_pending_outbound().unwrap(),
+        "the refused announcement stays a durable obligation"
+    );
+
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (mut live, _parts) = daemon
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let report = live
+        .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+        .expect("a pending closure is not a pass failure");
+    assert!(!report.published, "a pending head publishes nothing");
+
+    let mut delivered = 0usize;
+    while let Some(delivery) = loaded.rig.relay.recv().unwrap() {
+        loaded
+            .rig
+            .relay
+            .settle(delivery.id(), Disposition::Ack)
+            .unwrap();
+        delivered += 1;
+    }
+    assert!(
+        delivered > 0,
+        "the pending-only pass delivers the durable outbox"
+    );
+
+    drop(live);
     loaded.rig.teardown();
 }
 
@@ -564,6 +862,8 @@ fn authored_snapshots_mount_through_the_daemon_view() {
 /// a no-op: the in-process peer needs no iroh naming (no-op impls
 /// keep the in-memory fakes honest about not carrying live routes).
 struct VaultPeer(VaultSource);
+
+impl AttemptBudget for VaultPeer {}
 
 impl BulkSource for VaultPeer {
     fn fetch_root_manifest(
@@ -1306,6 +1606,8 @@ struct Bounded<'a> {
     hostile_root: Option<SnapshotId>,
 }
 
+impl AttemptBudget for Bounded<'_> {}
+
 impl BulkSource for Bounded<'_> {
     fn fetch_root_manifest(
         &mut self,
@@ -1484,6 +1786,9 @@ fn conflicted_drive_rejects_mounted_writes() {
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
                 budgets: ResourceBudgets::default(),
+                max_mutation_wait: Duration::from_secs(30),
+                serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
             },
             &mut |_, _| {},
         )
@@ -1797,7 +2102,6 @@ fn recovery_grafts_content_only_and_voided_transitions_never_authorize() {
     // view; nothing voided-derived does.
     assert_eq!(dag.eligible_heads(&log), vec![id_recovery]);
 }
-
 /// Recovery rebuilds explicitly identified historical content and
 /// mounts it: the owner authors a tree, supersedes it across a
 /// rotation (carry keeps continuity, so the snapshot becomes

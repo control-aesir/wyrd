@@ -219,6 +219,18 @@ impl WantRegistry {
             .map(|state| state.admitted.contains(content))
             .unwrap_or(false)
     }
+
+    /// Introspection for tests: the waiter count currently held for
+    /// `content`. Asymmetric register/release pairs leak here — one
+    /// waiter per registration, exactly one release per completion —
+    /// so this is the leak detector for demand lifecycles that span
+    /// loop passes.
+    pub fn waiter_count(&self, content: &ContentId) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.waiting.get(content).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
 }
 
 /// Block the caller until `content` materializes or the deadline

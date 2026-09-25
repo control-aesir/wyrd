@@ -19,6 +19,7 @@ use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxE
 
 const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
+#[derive(Debug)]
 enum Action {
     Commit(Vec<Fact>),
     /// Deterministic suppression verdict: the message is invalid and
@@ -32,6 +33,7 @@ enum Action {
     Defer(DeferredWait),
 }
 
+#[derive(Debug)]
 enum Outcome {
     Accepted,
     Duplicate,
@@ -112,7 +114,13 @@ fn accept_envelope(
         // too: the mailbox already rejected them before ingest, and the
         // relay retains nothing for an acked handover.
         Ok(bytes) => bytes,
-        Err(_) => return Ok(Outcome::Discarded),
+        Err(error) => {
+            // Per-envelope forensics: a stuck peer shows identical
+            // silence for poison, missing keys, and deferral — the
+            // verdict line names which one each delivery met.
+            tracing::debug!(outcome = "discarded", reason = %error, "intake verdict");
+            return Ok(Outcome::Discarded);
+        }
     };
     // Rotation deliveries ride their own framing under a distinct
     // version: dispatch on the version byte before either framing
@@ -120,17 +128,25 @@ fn accept_envelope(
     // rotation header's ephemeral bytes would otherwise land where the
     // control envelope keeps its kind tag).
     if bytes.first() == Some(&ROTATION_VERSION) {
-        return accept_rotation(engine, envelope, &bytes);
+        let outcome = accept_rotation(engine, envelope, &bytes)?;
+        tracing::debug!(kind = "rotation-delivery", outcome = ?outcome, "intake verdict");
+        return Ok(outcome);
     }
     match engine.inbox.ingest(&bytes) {
         // Only a missing epoch key can heal: the bytes are well-formed
         // for our drive and may become openable when the key arrives.
-        Err(ControlError::UnknownEpoch(_)) => Ok(Outcome::Skipped),
+        Err(ControlError::UnknownEpoch(epoch)) => {
+            tracing::debug!(outcome = "skipped", epoch, "intake verdict");
+            Ok(Outcome::Skipped)
+        }
         // Decode, version, drive, and crypto failures under a held key
         // are terminal: the bytes can never become a processable
         // message. Consume without a fact so poison cannot accumulate
         // in the relay.
-        Err(_) => Ok(Outcome::Discarded),
+        Err(error) => {
+            tracing::debug!(outcome = "discarded", reason = %error, "intake verdict");
+            Ok(Outcome::Discarded)
+        }
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
             Some(id) => match engine.take_pending(&id) {
                 Some(entry) => commit_action(engine, &id, &entry.message, false, Some(entry.wait)),
@@ -156,7 +172,9 @@ fn commit_action(
     // several pending messages into one commit, and a fork must never
     // reach the fact log merely because two deferrals resolved together.
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
-    let mut facts = match message_action(engine, id, message, &mut staged) {
+    let action = message_action(engine, id, message, &mut staged);
+    tracing::debug!(kind = ?message.kind(), id = ?id, action = ?action, "intake verdict");
+    let mut facts = match action {
         Ok(Action::Commit(facts)) => facts,
         Ok(Action::Suppress) => {
             engine.inbox.suppress(id);
@@ -560,18 +578,27 @@ fn rotation_commit(
     sender: DeviceId,
     delivery: &RotationDelivery,
 ) -> Result<Outcome, EngineError> {
-    let suppress = |engine: &mut Engine| {
+    let suppress = |engine: &mut Engine, reason: &'static str| {
+        // Suppressions ack without a fact, so the reason is the only
+        // record of why a delivery died: without it a stuck peer's
+        // Accepted verdicts are indistinguishable from commits.
+        tracing::debug!(
+            kind = "rotation-delivery",
+            outcome = "suppressed",
+            reason,
+            "intake verdict"
+        );
         engine.inbox.suppress(id);
         Ok(Outcome::Accepted)
     };
     // Not for us: the mailbox routes by recipient, so a mismatch is a
     // broken sender — terminal, never healed by redelivery.
     if delivery.device != engine.device {
-        return suppress(engine);
+        return suppress(engine, "delivery-device-mismatch");
     }
     let transition = match MembershipTransition::from_canonical_bytes(&delivery.transition) {
         Ok(transition) => transition,
-        Err(_) => return suppress(engine),
+        Err(_) => return suppress(engine, "transition-decode-failed"),
     };
     // Cheap structural gates before the ECDH+AEAD unwrap: the carried
     // transition must arrive within ingest limits and name the
@@ -579,17 +606,20 @@ fn rotation_commit(
     // they never earn the unwrap — same terminal verdict, less work.
     // (The transition↔capability binding check stays after the
     // unwrap: the binding lives inside the wrap.)
-    if transition.epoch != delivery.epoch
-        || check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err()
-        || check_transition(&Limits::V0, &transition).is_err()
-    {
-        return suppress(engine);
+    if transition.epoch != delivery.epoch {
+        return suppress(engine, "delivery-epoch-mismatch");
+    }
+    if check_total_len(&Limits::V0, "transition", delivery.transition.len()).is_err() {
+        return suppress(engine, "transition-over-limits");
+    }
+    if check_transition(&Limits::V0, &transition).is_err() {
+        return suppress(engine, "transition-struct-rejected");
     }
     let capability = match WrappedCapability::from_bytes(delivery.wrapped.clone())
         .unwrap(&engine.encryption_secret)
     {
         Ok(capability) => capability,
-        Err(_) => return suppress(engine),
+        Err(_) => return suppress(engine, "capability-unwrap-failed"),
     };
     // Redundant-field agreement, mirrored from the capability arm: the
     // delivery metadata and the capability it carries must name this
@@ -597,13 +627,13 @@ fn rotation_commit(
     // alone cannot prove address — the check happens here, before
     // anything commits, and a mismatch never heals by deferring.
     if capability.device != engine.device || delivery.epoch != capability.covered_epoch() {
-        return suppress(engine);
+        return suppress(engine, "field-disagreement");
     }
     // The carried transition must be the capability's own binding —
     // a transition for another binding paired with this wrap is
     // tampering or a broken sender, never a gap that fills.
     if transition.transition_id() != capability.transition {
-        return suppress(engine);
+        return suppress(engine, "binding-mismatch");
     }
     let transition_id = transition.transition_id();
     // Mint authority, checked before anything commits. The mailbox
@@ -615,7 +645,7 @@ fn rotation_commit(
     // proof over a commitment to the unwrapped vector closes that, and
     // the signer must be an owner of this exact transition.
     let Some(proof) = crate::keys::owner_proof::OwnerProof::decode(&delivery.owner_proof) else {
-        return suppress(engine);
+        return suppress(engine, "delivery-owner-proof-undecodable");
     };
     if proof
         .verify(
@@ -627,7 +657,7 @@ fn rotation_commit(
         )
         .is_err()
     {
-        return suppress(engine);
+        return suppress(engine, "delivery-owner-proof-invalid");
     }
     // Authorize against a scratch observation: the live log stays
     // pristine until commit, so a skip leaves no volatile-only
@@ -650,7 +680,7 @@ fn rotation_commit(
                 engine.inbox.forget(id);
                 return Ok(Outcome::Skipped);
             }
-            Err(_) => return suppress(engine),
+            Err(_) => return suppress(engine, "capability-unauthorized"),
         };
     // The signer must be an owner of the **pre-state** that authorized
     // this transition (epochs.md rule 3), not of the state it produces.
@@ -668,7 +698,7 @@ fn rotation_commit(
     match mint_authority {
         Some(owners) if owners.contains(&proof.signer) => {}
         // Signed, but by a device without mint authority.
-        Some(_) => return suppress(engine),
+        Some(_) => return suppress(engine, "delivery-mint-authority-missing"),
         None => return Err(EngineError::TransitionUnclassified(transition_id)),
     }
     // Sender-member, against the authorizing state (not the tip): the
@@ -678,7 +708,7 @@ fn rotation_commit(
     // terminal state, so genuine senders always pass.
     match scratch.members_of(&transition_id) {
         Some(members) if members.contains(&sender) => {}
-        Some(_) => return suppress(engine),
+        Some(_) => return suppress(engine, "sender-not-member"),
         // Observed a moment ago, but the fresh analysis derives no
         // state for it: the same internal disagreement the
         // announcement arm fails loudly on, not sender data.

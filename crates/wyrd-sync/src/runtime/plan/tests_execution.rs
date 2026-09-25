@@ -10,7 +10,7 @@ use wyrd_format::{
     SharedStore, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
-use crate::bulk::{BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use crate::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use crate::durable::CrashStage;
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
@@ -590,6 +590,8 @@ struct CountingBulk {
     fetches: BTreeMap<StorageId, usize>,
 }
 
+impl AttemptBudget for CountingBulk {}
+
 impl BulkSource for CountingBulk {
     fn fetch_root_manifest(
         &mut self,
@@ -748,6 +750,8 @@ impl BlockingBulk {
     }
 }
 
+impl AttemptBudget for BlockingBulk {}
+
 impl BulkSource for BlockingBulk {
     fn fetch_root_manifest(
         &mut self,
@@ -854,4 +858,226 @@ fn serving_reads_proceed_while_fetch_waits_on_bulk() {
         let report = fetch.join().expect("fetch thread").unwrap();
         assert_eq!(report.snapshot_bodies, 1);
     });
+}
+
+/// A bulk peer that stalls every attempt for a fixed duration — or
+/// the plan's per-attempt cap, whichever is shorter — and fails the
+/// attempt as transport trouble: the model of a provider that never
+/// answers. Records the caps the plan installs, so tests see both the
+/// slice machinery and the per-attempt bound.
+struct StallingBulk {
+    stall: Duration,
+    attempts: usize,
+    deadlines: Vec<Option<Instant>>,
+    current: Option<Instant>,
+}
+
+impl StallingBulk {
+    fn new(stall: Duration) -> Self {
+        Self {
+            stall,
+            attempts: 0,
+            deadlines: Vec::new(),
+            current: None,
+        }
+    }
+
+    fn stall_once<T>(&mut self) -> Result<Option<T>, BulkError> {
+        self.attempts += 1;
+        // Clamp at attempt time, exactly like the live source: a later
+        // attempt in the same pass sees the time actually remaining.
+        let sleep = match self.current {
+            Some(deadline) => self
+                .stall
+                .min(deadline.saturating_duration_since(Instant::now())),
+            None => self.stall,
+        };
+        std::thread::sleep(sleep);
+        Err(BulkError::Transport("provider stalled".to_string()))
+    }
+}
+
+impl AttemptBudget for StallingBulk {
+    fn set_attempt_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadlines.push(deadline);
+        self.current = deadline;
+    }
+}
+
+impl BulkSource for StallingBulk {
+    fn fetch_root_manifest(
+        &mut self,
+        _snapshot: &SnapshotId,
+        _max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.stall_once()
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        _snapshot: &SnapshotId,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.stall_once()
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        _storage: &StorageId,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.stall_once()
+    }
+
+    fn fetch_transport(
+        &mut self,
+        _root: &BaoRoot,
+        _max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.stall_once()
+    }
+}
+
+/// A stalled provider cannot push a deadline-bound run past it: the
+/// plan caps each attempt at the remaining time and stops starting
+/// work once the budget is spent. The unstarted items stay pending
+/// and unfulfilled, the cap reaches the source (and shrinks as the
+/// budget drains), a run at an expired deadline attempts nothing, and
+/// the unbounded run still attempts everything — the budget bounds
+/// one pass, never the work itself.
+#[test]
+fn a_stalled_provider_cannot_outlast_the_runs_deadline() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut inner = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    // One manifest, three pinned objects: the plan holds five items
+    // (one root, three objects) behind a provider that stalls.
+    let drive = member_drive();
+    let mut entries = Vec::new();
+    for index in 0..3u8 {
+        let plaintext = [index, b'-', b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        let content = ContentId::derive(ObjectKind::Chunk, &plaintext);
+        let object_key =
+            epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, &plaintext).unwrap();
+        entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, &plaintext)
+            .map(|entry| entries.push(entry))
+            .unwrap();
+        fixture
+            .engine
+            .set_materialization(content, MaterializationState::Pinned)
+            .unwrap();
+    }
+    let snapshot = body.snapshot_id();
+    let manifest = Manifest::new(snapshot, entries, Vec::new()).unwrap();
+    let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+    let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+    inner.publish_root(
+        snapshot,
+        SealedManifest {
+            content_id: id,
+            sealed: sealed.encode(),
+        },
+    );
+    intake_published(
+        &mut fixture,
+        &mut inner,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: id,
+            transport: crate::seal::transport_root(&sealed),
+        },
+    );
+
+    // The root fetch lands first, so the plan holds the three pinned
+    // objects (their manifest mappings now exist) and every attempt
+    // below is one of them.
+    let mut objects = MemoryObjectStore::default();
+    let seeded = fixture
+        .engine
+        .execute_plan(&mut inner, &mut objects)
+        .unwrap();
+    assert_eq!(seeded.manifests, 1, "the root is recorded");
+    assert_eq!(seeded.unfulfilled, 3, "the objects stay pending");
+
+    // A 150ms budget against a 120ms per-attempt stall: attempts run
+    // at the cap, then at what remains, and the pass stops starting
+    // work once the budget is spent. The unbounded run attempts all
+    // three (360ms). How many attempts fit depends on how far the
+    // first sleep overran — one or two — but never three, and the
+    // untouched items stay pending and unfulfilled.
+    let mut bulk = StallingBulk::new(Duration::from_millis(120));
+    let deadline = Instant::now() + Duration::from_millis(150);
+    let started = Instant::now();
+    let report = fixture
+        .engine
+        .execute_plan_sliced(&mut bulk, &mut objects, Some(deadline))
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "the deadline-bound run overran: {elapsed:?}"
+    );
+    assert!(
+        (1..=2).contains(&report.transport_errors),
+        "only the budgeted attempts ran: {}",
+        report.transport_errors
+    );
+    assert!(
+        bulk.attempts >= report.transport_errors,
+        "attempts count per candidate, errors per item"
+    );
+    assert_eq!(
+        report.unfulfilled, 3,
+        "nothing landed: every item stays pending and unfulfilled"
+    );
+    assert_eq!(report.objects, 0, "a stalled provider delivers nothing");
+    assert_eq!(
+        bulk.deadlines.last(),
+        Some(&None),
+        "the deadline is cleared on the way out"
+    );
+    assert!(
+        matches!(bulk.deadlines.first(), Some(Some(armed)) if *armed <= deadline + Duration::from_millis(5)),
+        "the run's deadline reached the source: {:?}",
+        bulk.deadlines
+    );
+
+    // A run whose deadline has passed attempts nothing.
+    let mut bulk = StallingBulk::new(Duration::from_millis(120));
+    let report = fixture
+        .engine
+        .execute_plan_sliced(
+            &mut bulk,
+            &mut objects,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .unwrap();
+    assert_eq!(
+        report.transport_errors, 0,
+        "an expired budget attempts nothing"
+    );
+    assert_eq!(report.unfulfilled, 3, "everything planned stays pending");
+    assert_eq!(bulk.attempts, 0);
+
+    // The unbounded run still attempts everything: the budget bounds
+    // one pass, not the work.
+    let mut bulk = StallingBulk::new(Duration::from_millis(120));
+    let report = fixture
+        .engine
+        .execute_plan(&mut bulk, &mut objects)
+        .unwrap();
+    assert_eq!(
+        report.transport_errors, 3,
+        "the unbounded run attempts all items"
+    );
+    assert_eq!(report.unfulfilled, 3);
 }

@@ -170,9 +170,9 @@ fn concurrent_handles_isolate_and_second_commit_is_stale() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// `O_TRUNC` is immediately dirty: opening with no later write still
-/// commits an empty snapshot at the boundary, so closing cannot
-/// silently leave the old content.
+/// `O_TRUNC` commits during open: opening with no later write still
+/// leaves an empty file, so closing cannot silently leave the old
+/// content. The handle starts clean on the empty base.
 #[test]
 fn o_trunc_without_writes_commits_an_empty_file() {
     let (engine, dir, _) = scratch_drive();
@@ -519,6 +519,129 @@ fn path_truncate_reads_only_the_kept_prefix() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Content the engine believes local but the store does not hold fails
+/// closed: the view reports `Unavailable` for the stale-locality claim
+/// (not a fetchable remote), so the append fails EIO on the next pass
+/// instead of registering a want and hanging until the prerequisite
+/// deadline. The engine marks authored closures local and production
+/// always serves the store it authors into; this pins the boundary
+/// when that invariant is broken (a store wiped under a kept engine
+/// directory), so recovery stays a fast error, never a 30s hang.
+#[test]
+fn append_to_store_absent_but_engine_local_content_fails_closed() {
+    let (mut engine, dir, _) = scratch_drive();
+    let mut author_store = MemoryObjectStore::default();
+    let chunk = author_store
+        .insert(wyrd_format::ObjectKind::Chunk, b"base")
+        .unwrap();
+    let root = wyrd_format::Tree::from_entries(vec![wyrd_format::Entry::file(
+        "remote",
+        4,
+        false,
+        vec![chunk],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut author_store)
+    .unwrap();
+    engine.author_snapshot(&author_store, root).unwrap();
+    // Serve from a store holding the tree but not the file's chunk:
+    // the tree resolves from local objects, but the file's content is
+    // absent where the engine claims it local. (Heads cannot install
+    // without the tree object, so a fully empty serving store is not
+    // the fixture.)
+    let mut serving_store = MemoryObjectStore::default();
+    let tree_bytes = author_store.get(&root).unwrap().unwrap();
+    serving_store
+        .insert_verified(wyrd_format::ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, serving_store).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (live, backend) = live_backend(daemon);
+    let wants = std::sync::Arc::clone(live.wants());
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let fh = backend
+        .open_write("remote", libc::O_WRONLY | libc::O_APPEND)
+        .unwrap();
+    backend.write_handle(fh, 0, b"!").unwrap();
+    // A fast EIO, not a held mutation: no demand exists for content
+    // the engine claims is already local.
+    assert_eq!(backend.commit_handle(fh), Err(fuser::Errno::EIO));
+    assert_eq!(wants.waiter_count(&chunk), 0);
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A shrink reads only its kept prefix: a file whose head chunk is
+/// local and whose tail chunk is absent from the store truncates to a
+/// size inside the head chunk anyway. The prerequisite probe follows
+/// the requested prefix, so a remote-only tail never turns the
+/// truncate into a demand (and the shrink's own commit is local).
+#[test]
+fn path_truncate_over_a_remote_tail_reads_only_the_kept_prefix() {
+    use wyrd_format::{Entry, ObjectKind, Tree};
+
+    let (mut engine, dir, _) = scratch_drive();
+    let mut author_store = MemoryObjectStore::default();
+    // Two chunks: the chunker splits well past MAX_CHUNK.
+    let body = vec![b'z'; 400 * 1024];
+    let chunks = wyrd_format::chunk::insert_chunks(&mut author_store, &body).unwrap();
+    assert!(chunks.len() >= 2, "the fixture needs a tail chunk");
+    let tree = Tree::from_entries(vec![Entry::file(
+        "tail",
+        body.len() as u64,
+        false,
+        chunks.clone(),
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut author_store)
+    .unwrap();
+    engine.author_snapshot(&author_store, tree).unwrap();
+
+    // Serve with the tree and the head chunk only.
+    let mut serving = MemoryObjectStore::default();
+    let tree_bytes = author_store.get(&tree).unwrap().unwrap();
+    serving
+        .insert_verified(ObjectKind::Tree, &tree, &tree_bytes)
+        .unwrap();
+    let head_bytes = author_store.get(&chunks[0]).unwrap().unwrap();
+    serving
+        .insert_verified(ObjectKind::Chunk, &chunks[0], &head_bytes)
+        .unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, serving).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let ino = backend.attr_at("tail").unwrap().ino.0;
+    // Target inside the head chunk.
+    backend.set_size_at(ino, head_bytes.len() as u64).unwrap();
+    let read = backend.open_at("tail").unwrap();
+    assert_eq!(
+        backend.read_handle(read, 0, 1024).unwrap(),
+        head_bytes[..1024].to_vec()
+    );
+    backend.release_handle(read).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A mode change through a clean writable handle must not lose the
 /// file: the commit submits the buffered image, so the handle
 /// materializes the captured content before going dirty.
@@ -551,6 +674,72 @@ fn handle_mode_change_preserves_content() {
     );
     backend.release_handle(read).unwrap();
     assert_eq!(backend.attr_at("m.txt").unwrap().perm, 0o755);
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A path truncate while a clean handle is open re-pins it instead of
+/// stranding it stale: the handle holds no uncommitted state, so the
+/// concurrent change is lossless. (The kernel's `O_TRUNC` split lands
+/// here — open arrives trunc-less and the fh-less followup `setattr`
+/// truncates while the opening handle is still clean.) A dirty handle
+/// keeps the stale rule.
+#[test]
+fn path_truncate_repins_a_clean_handle() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, ino, _) = backend.create_at(1, "r.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"hello").unwrap();
+    backend.commit_handle(fh).unwrap();
+    backend.release_handle(fh).unwrap();
+
+    let clean = backend.open_write("r.txt", libc::O_RDWR).unwrap();
+    backend.set_size_at(ino, 0).unwrap();
+    backend.write_handle(clean, 0, b"new").unwrap();
+    backend.commit_handle(clean).unwrap();
+    backend.release_handle(clean).unwrap();
+
+    let read = backend.open_at("r.txt").unwrap();
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"new");
+    backend.release_handle(read).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Offset-plus-length overflow fails at the API boundary (`EFBIG`).
+/// Through real syscalls the kernel preempts with `EINVAL` before FUSE
+/// is reached, so the Lima suite pins `EINVAL` while this test pins the
+/// mount's own checked arithmetic.
+#[test]
+fn write_offset_overflow_is_efbig() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (fh, _ino, _) = backend.create_at(1, "o.txt", libc::O_RDWR).unwrap();
+    assert_eq!(
+        backend.write_handle(fh, u64::MAX - 4, b"12345678"),
+        Err(fuser::Errno::EFBIG)
+    );
+    backend.release_handle(fh).unwrap();
 
     stop.store(true, Ordering::Relaxed);
     loop_handle

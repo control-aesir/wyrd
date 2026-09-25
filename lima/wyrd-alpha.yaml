@@ -1,0 +1,57 @@
+# Lima guest for the wyrd v0.2.0-alpha end-to-end scenario on macOS.
+#
+# NixOS, not Ubuntu: the guest provisions nothing imperative. The `wyrd`
+# binary is built on the host (`nix build .#packages.aarch64-linux.wyrd`
+# via the linux-builder) and its closure is imported into the guest; guest
+# tools (fuse3 userspace, python3, the local test relay) come from the same
+# nixpkgs revision pinned in the repo flake.lock, substituted from the
+# binary cache. Rebuilding the guest from this file plus the lockfile
+# reproduces the same environment.
+#
+# Based on the nixos-lima v0.2.1 template (pinned digest release image).
+# The QEMU driver is deliberate: the vz driver is less trodden for
+# FUSE-in-guest plus shared-dir mounts.
+images:
+- location: "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.1/nixos-lima-v0.2.1-aarch64.qcow2"
+  arch: "aarch64"
+  digest: "sha512:748c723b69dbdec40a9acaf78cc9070ae784dcb64b0856ab906efdac822d9abcc65565b8f8dfa4cf8b49cc6c12c372072e83bb5ed9247330a7c22675d9e141ce"
+- location: "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.1/nixos-lima-v0.2.1-x86_64.qcow2"
+  arch: "x86_64"
+  digest: "sha512:636c9c24d7aea340c808e72802cd05589d18c1bbeda45242e3c4725cdfdcc497cfdfd4dfecd76e4be7b8de3a688a1046f269c072bce487c0b06a60515262995e"
+
+vmType: "qemu"
+cpus: 4
+memory: "4GiB"
+disk: "30GiB"
+
+mounts:
+# The repo, read-only: the guest runs the checked-in guest script and
+# imports the host-built closure from it, but never builds or writes here.
+# The host wrapper (lima/run-alpha.sh) overrides `location` with the actual
+# checkout path, so contributors can check out anywhere; starting this file
+# directly uses the placeholder below and only warns.
+- location: "/path/to/wyrd-checkout"
+  mountPoint: "/mnt/wyrd"
+  writable: false
+  9p:
+    # The guest executes scripts straight off this share; any attribute
+    # or page caching serves stale files after host-side edits.
+    cache: "none"
+# Scratch space shared host<->guest for log collection. Drive dirs,
+# mountpoints, and test state all live on guest-local disk, never here:
+# FUSE mounts over a 9p share are unsupported.
+- location: "/tmp/lima"
+  writable: true
+
+portForwards:
+  # Tell Lima's port-forwarding to ignore port 68 to prevent interception of host DHCP packets
+  # Apparently this is an issue with NixOS that does not occur on other Linux distros
+  # See: https://github.com/nixos-lima/nixos-lima/issues/50
+  - proto: udp
+    guestPort: 68
+    guestIP: 0.0.0.0
+    ignore: true
+
+containerd:
+  system: false
+  user: false

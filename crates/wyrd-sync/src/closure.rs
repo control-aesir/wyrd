@@ -45,15 +45,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use wyrd_format::{
     ChildManifest, ContentId, EntryContent, Manifest, ManifestEntry, ObjectKind, ObjectStore,
-    Snapshot, SnapshotId, Tree,
+    Snapshot, SnapshotId, StoreError, StoreFailure, Tree,
 };
 
 use crate::ingest::{check_manifest, check_tree, IngestError, Limits};
 
 /// Why a snapshot's manifest closure does not correspond to its tree closure.
 ///
-/// Every variant is a fail-closed verdict on evidence, never a transport or
-/// cryptographic failure; the bytes involved already authenticated.
+/// Every variant except `ObjectStore` is a fail-closed verdict on
+/// evidence, never a transport or cryptographic failure; the bytes
+/// involved already authenticated. `ObjectStore` is a store I/O
+/// failure carrying its own classification: it is neither pending
+/// progress nor permanent damage, and callers route it to the store
+/// failure policy.
 #[derive(Debug, Error)]
 pub enum ClosureError {
     #[error("root manifest describes snapshot {found}, not {expected}")]
@@ -116,8 +120,34 @@ pub enum ClosureError {
     },
     #[error(transparent)]
     Ingest(#[from] IngestError),
-    #[error("object store read failed: {0}")]
-    ObjectStore(String),
+    #[error("object store read failed: {detail}")]
+    ObjectStore {
+        /// The store's own classification: a full or unwritable
+        /// store is not closure damage, and the failure policy has a
+        /// dedicated budget for it.
+        failure: StoreFailure,
+        detail: String,
+    },
+}
+
+impl ClosureError {
+    /// Whether this failure means "the closure has not been fetched
+    /// yet" rather than "the closure is wrong". The pending arm is
+    /// ordinary fetch progress: the head installs once its records
+    /// and trees land, and callers must treat it as no-publication
+    /// state, never as a fatal engine error. Every other variant
+    /// except `ObjectStore` is permanent damage — a mismatch, a
+    /// non-canonical document, a contradicted mapping — and stays
+    /// fail-closed; `ObjectStore` is neither, and callers classify it
+    /// through its own `StoreFailure`.
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            ClosureError::RootManifestMissing(_)
+                | ClosureError::TreeUnavailable(_)
+                | ClosureError::MissingChildManifestRecord { .. }
+        )
+    }
 }
 
 /// Resolves a manifest by its logical [`ContentId`].
@@ -245,7 +275,10 @@ where
     while let Some((tree_id, manifest)) = stack.pop() {
         let bytes = objects
             .get(&tree_id)
-            .map_err(|error| ClosureError::ObjectStore(format!("{error:?}")))?
+            .map_err(|error| ClosureError::ObjectStore {
+                failure: error.failure(),
+                detail: format!("{error:?}"),
+            })?
             .ok_or(ClosureError::TreeUnavailable(tree_id))?;
         if ContentId::derive(ObjectKind::Tree, &bytes) != tree_id {
             return Err(ClosureError::TreeIdentityMismatch(tree_id));

@@ -67,9 +67,14 @@ const TAG_BOOTSTRAP_PENDING: u8 = 0x13;
 const TAG_CARRY_QUEUED: u8 = 0x14;
 /// One discharged carry obligation: head SnapshotId (32).
 const TAG_CARRY_DONE: u8 = 0x15;
+/// One route-specific announcement reseal: snapshot (32) ‖ route length
+/// u32 LE ‖ route ‖ sealed announcement envelope. Tag 0x17: 0x16 is
+/// the capability-sealed-replaced record, and the tag space is
+/// append-only.
+const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x17;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 22] = [
+const KNOWN_TAGS: [u8; 23] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -92,6 +97,7 @@ const KNOWN_TAGS: [u8; 22] = [
     TAG_BOOTSTRAP_PENDING,
     TAG_CARRY_QUEUED,
     TAG_CARRY_DONE,
+    TAG_ANNOUNCEMENT_ROUTE_SEALED,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -274,6 +280,26 @@ pub(super) fn encode_fact(
             bytes.extend_from_slice(snapshot.as_bytes());
             bytes.extend_from_slice(recipient.as_bytes());
             Ok((TAG_ANNOUNCEMENT_DELIVERED, bytes))
+        }
+        Fact::AnnouncementRouteSealed(snapshot, route, sealed) => {
+            // Same structural gate as the canonical seal, at commit
+            // time: only a decodable announcement-kind envelope
+            // commits, so a malformed route seal fails here with the
+            // store untouched instead of poisoning a later rebuild.
+            // (The size gate lives in the outbox call path, which
+            // checks before committing.)
+            let decoded = SealedControl::decode(sealed)
+                .ok()
+                .filter(|envelope| envelope.kind == ControlKind::SnapshotAnnouncement);
+            if decoded.is_none() {
+                return Err(DurableError::InvalidOutbox);
+            }
+            let mut bytes = Vec::with_capacity(36 + route.len() + sealed.len());
+            bytes.extend_from_slice(snapshot.as_bytes());
+            bytes.extend_from_slice(&(route.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(route);
+            bytes.extend_from_slice(sealed);
+            Ok((TAG_ANNOUNCEMENT_ROUTE_SEALED, bytes))
         }
         Fact::TransitionQueued(id, recipient) => {
             let mut bytes = Vec::with_capacity(64);
@@ -564,6 +590,33 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
             Some(DecodedFact::AnnouncementDelivered(snapshot, recipient))
         }
+        TAG_ANNOUNCEMENT_ROUTE_SEALED => {
+            if record.len() <= 36 {
+                return None;
+            }
+            let snapshot = SnapshotId::from_bytes(record[..32].try_into().ok()?);
+            let route_len = u32::from_le_bytes(record[32..36].try_into().ok()?) as usize;
+            let sealed_at = 36usize.checked_add(route_len)?;
+            // `get` fails closed on a corrupt length: no panics, no
+            // over-allocation (the slices borrow the record).
+            let sealed = record.get(sealed_at..)?;
+            if sealed.is_empty() {
+                return None;
+            }
+            // Structural check only, mirroring the canonical seal:
+            // the bytes must decode as a sealed announcement
+            // envelope. Opening needs epoch keys Replay does not
+            // hold.
+            let envelope = SealedControl::decode(sealed).ok()?;
+            if envelope.kind != ControlKind::SnapshotAnnouncement {
+                return None;
+            }
+            Some(DecodedFact::AnnouncementRouteSealed(
+                snapshot,
+                record[36..sealed_at].to_vec(),
+                sealed.to_vec(),
+            ))
+        }
         TAG_TRANSITION_QUEUED => {
             if record.len() != 64 {
                 return None;
@@ -753,6 +806,7 @@ pub(super) enum DecodedFact {
     ControlMessage(ControlMessageId),
     AnnouncementQueued(SnapshotId, DeviceId),
     AnnouncementSealed(SnapshotId, Vec<u8>),
+    AnnouncementRouteSealed(SnapshotId, Vec<u8>, Vec<u8>),
     AnnouncementDelivered(SnapshotId, DeviceId),
     TransitionQueued(TransitionId, DeviceId),
     TransitionSealed(TransitionId, Vec<u8>),

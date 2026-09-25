@@ -680,3 +680,412 @@ fn reissue_selects_only_the_canonical_admission() {
         "no voided-branch epoch leaks in"
     );
 }
+
+#[test]
+fn rotate_delivers_the_new_epoch_secret_to_a_current_member() {
+    // The Lima step-6 shape, end to end through the real outbox: a
+    // member admitted at epoch 2 must open the owner's epoch-3
+    // rotation delivery and install the secret. The delivery is
+    // minted by `deliver_pending` (never a fixture), so this covers
+    // the mint/unwrap agreement both directions.
+    let (_dir, mut engine, _genesis) = owner_engine("admit-rotate");
+    let (_owner_sk, owner_id) = key(10);
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+
+    let mut relay = MemoryRelay::default();
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: owner_id,
+        };
+        let sent = engine.deliver_pending(&mut sender).unwrap();
+        assert_eq!(sent, 2, "transition plus capability");
+    }
+
+    let join_dir = TestDir::new("admit-rotate-join");
+    let joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer.clone(),
+        newcomer_encryption.clone(),
+        &outcome.invitation,
+    )
+    .unwrap();
+    joined.release_store_lock();
+    let mut joined = Engine::open(
+        join_dir.path.clone(),
+        member_drive(),
+        newcomer_id,
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+    )
+    .unwrap();
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.skipped, 0, "invitation keys open every message");
+    }
+    let state = joined.log.known_state().expect("canonical tip");
+    assert_eq!(state.epoch, 2, "catch-up reaches the admission");
+
+    // Rotate to epoch 3 and push the rotation catch-up through the
+    // same relay the member drains.
+    let rotated = engine.rotate_epoch().unwrap();
+    assert_eq!(rotated.epoch, 3, "rotation opens a new epoch");
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: owner_id,
+        };
+        let sent = engine.deliver_pending(&mut sender).unwrap();
+        assert_eq!(sent, 2, "rotation transition plus rotation delivery");
+    }
+    // First drain: the transition envelope is sealed under the new
+    // epoch key the member does not hold yet, so it skips for
+    // redelivery — while the rotation delivery (pairing-key framing)
+    // opens immediately and installs the secret.
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.accepted, 1, "rotation delivery commits");
+        assert_eq!(report.skipped, 1, "transition waits for its epoch key");
+    }
+    let held = joined.store.rebuild(newcomer_id).unwrap();
+    assert!(
+        held.keyring.secret(3).is_some(),
+        "rotation-epoch secret installed from the pushed delivery"
+    );
+    // Second drain: with the secret held, the redelivered transition
+    // opens and the tip advances — the two-pass convergence the live
+    // loop performs every few seconds.
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.skipped, 0, "nothing waits anymore");
+        assert_eq!(report.accepted, 1, "redelivered transition commits");
+    }
+    let state = joined.log.known_state().expect("canonical tip");
+    assert_eq!(state.epoch, 3, "catch-up reaches the rotation");
+    assert_eq!(
+        state.transition_id,
+        rotated.transition_id(),
+        "tip is the rotation"
+    );
+}
+
+#[test]
+fn pending_announcement_resends_with_the_live_route() {
+    use crate::transport::mailbox::{
+        Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    };
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+
+    // A mount with no relay: the seal commits, nothing travels — the
+    // Lima shape, where local/matrix/export mounts sealed announcements
+    // their relay mount later replayed with dead routes.
+    struct UnreachableMailbox;
+    impl Mailbox for UnreachableMailbox {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            Err(MailboxError::Transport("no relay".into()))
+        }
+
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Ok(None)
+        }
+
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
+    let (_dir, mut engine, _genesis) = owner_engine("announce-route-refresh");
+    // Author (not intake-commit) so the announcement travels the
+    // authored, re-sealable path.
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"route").unwrap();
+    let tree = Tree::from_entries(vec![
+        Entry::file("route.txt", 5, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    let authorized = engine.author_snapshot(&objects, tree).unwrap();
+    let snapshot = authorized.snapshot().snapshot_id();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    assert!(
+        engine
+            .pending_announcements()
+            .unwrap()
+            .contains(&(snapshot, newcomer_id)),
+        "admit queues the live head for the newcomer"
+    );
+
+    // First mount seals with its (soon dead) route but sends nothing.
+    let dead = vec![0xD0, 0xEA, 0xD0];
+    let mut offline = UnreachableMailbox;
+    assert!(
+        engine
+            .announce_snapshot(&authorized, &mut offline, Some(&dead))
+            .is_err(),
+        "no relay, no send"
+    );
+    assert!(
+        engine
+            .pending_announcements()
+            .unwrap()
+            .contains(&(snapshot, newcomer_id)),
+        "failed send leaves the obligation pending"
+    );
+
+    // Second mount binds a fresh endpoint: the resend must carry its
+    // live route, not the persisted dead one.
+    let live = vec![0x11, 0x1E];
+    let mut relay = MemoryRelay::default();
+    let mut sender = MemoryMailbox {
+        relay: &mut relay,
+        owner: engine.device(),
+    };
+    let sent = engine.announce_pending(&mut sender, Some(&live)).unwrap();
+    assert_eq!(sent, 1, "the pending head announcement");
+
+    // The newcomer joins and learns the live route.
+    let join_dir = TestDir::new("announce-route-join");
+    let joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer.clone(),
+        newcomer_encryption.clone(),
+        &outcome.invitation,
+    )
+    .unwrap();
+    joined.release_store_lock();
+    let mut joined = Engine::open(
+        join_dir.path.clone(),
+        member_drive(),
+        newcomer_id,
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+    )
+    .unwrap();
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let report = joined.drain(&mut receiver).unwrap();
+        assert_eq!(report.skipped, 0, "invitation keys open every message");
+    }
+    let recorded = joined
+        .store
+        .rebuild(newcomer_id)
+        .unwrap()
+        .runtime
+        .announcement(&snapshot)
+        .cloned()
+        .expect("newcomer learns the head snapshot");
+    assert_eq!(
+        recorded.node_addr,
+        Some(live),
+        "resend carries the live route, not the dead seal"
+    );
+}
+
+#[test]
+fn admission_queues_the_lineage_closure_for_the_newcomer() {
+    use crate::runtime::test_util::{announcement_msg_with, body_root};
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+
+    // Late-joiner catch-up is an explicit admission-time obligation:
+    // the newcomer gets the current head's full ancestry, not just
+    // the head. A head without its ancestry is unadoptable
+    // (UnknownParent poisons the whole chain), and pre-admission
+    // snapshots were queued for nobody — a lone member announces to
+    // nobody — so admission must create those obligations.
+    let (_dir, mut engine, genesis_id) = owner_engine("lineage-closure");
+    let (owner_sk, _) = key(10);
+    let mut objects = MemoryObjectStore::default();
+    let chunk_a = objects.insert(ObjectKind::Chunk, b"a").unwrap();
+    let tree_a = Tree::from_entries(vec![Entry::file("a.txt", 1, false, vec![chunk_a]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let a1 = engine.author_snapshot(&objects, tree_a).unwrap();
+    let a1_id = a1.snapshot().snapshot_id();
+    let chunk_b = objects.insert(ObjectKind::Chunk, b"bb").unwrap();
+    let tree_b = Tree::from_entries(vec![Entry::file("b.txt", 2, false, vec![chunk_b]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let a2 = engine.author_snapshot(&objects, tree_b).unwrap();
+    let a2_id = a2.snapshot().snapshot_id();
+
+    // Control: the owner holds its own pre-admit head while it is still
+    // the tip epoch.
+    let owner_heads = engine.live_heads().unwrap();
+    assert_eq!(
+        owner_heads
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![a2_id],
+        "owner adopts what it authored"
+    );
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+
+    // The head plus its ancestry, each exactly once — the queue facts
+    // are set semantics, so catch-up never duplicates obligations.
+    let pending = engine.pending_announcements().unwrap();
+    for id in [a1_id, a2_id] {
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|pair| *pair == &(id, newcomer_id))
+                .count(),
+            1,
+            "exactly one obligation per lineage member"
+        );
+    }
+
+    // Rotate, then author the leg-1 write: epoch 3, parented onto A2.
+    let rotated = engine.rotate_epoch().unwrap();
+    let rotation_id = rotated.transition_id();
+    let chunk_c = objects.insert(ObjectKind::Chunk, b"ccc").unwrap();
+    let tree_c = Tree::from_entries(vec![Entry::file("c.txt", 3, false, vec![chunk_c]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let s = engine.author_snapshot(&objects, tree_c).unwrap();
+    let s_id = s.snapshot().snapshot_id();
+    assert_eq!(
+        engine
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![s_id],
+        "owner advances onto the rotation-epoch write"
+    );
+
+    // The newcomer joins and learns the full boundary: every lineage
+    // announcement (as intake would record them) plus the fetched
+    // bodies and root manifest records.
+    let rebuilt = engine.store.rebuild(engine.device()).unwrap();
+    let record_for = |id: &wyrd_format::SnapshotId| {
+        rebuilt
+            .runtime
+            .root_manifest_record(id)
+            .cloned()
+            .expect("authoring records the root manifest")
+    };
+    let record_a1 = record_for(&a1_id);
+    let record_a2 = record_for(&a2_id);
+    let record_s = record_for(&s_id);
+    let announce_for = |snapshot: &wyrd_format::Snapshot,
+                        epoch: u64,
+                        membership: wyrd_format::TransitionId,
+                        record: &crate::runtime::ManifestRecord| {
+        let Message::SnapshotAnnouncement(announcement) = announcement_msg_with(
+            &identity_secret(&owner_sk),
+            snapshot.snapshot_id(),
+            epoch,
+            membership,
+            body_root(snapshot),
+            record.manifest_id,
+            record.transport,
+        ) else {
+            panic!("announcement helper builds announcements");
+        };
+        announcement
+    };
+    let join_dir = TestDir::new("lineage-closure-join");
+    let mut joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+        &outcome.invitation,
+    )
+    .unwrap();
+    // Catch the newcomer up on membership first: the rotation
+    // transition arrives sealed under its own epoch key, so the first
+    // drain installs the secret from the pairing-key delivery while
+    // the transition waits, and the redelivery commits on the second
+    // drain — the same two-pass shape the live loop performs.
+    let mut relay = MemoryRelay::default();
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: engine.device(),
+        };
+        engine.deliver_pending(&mut sender).unwrap();
+    }
+    {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: newcomer_id,
+        };
+        let first = joined.drain(&mut receiver).unwrap();
+        assert_eq!(first.accepted, 3, "chain transition, capability, delivery");
+        assert_eq!(first.skipped, 1, "transition waits for its epoch key");
+        let second = joined.drain(&mut receiver).unwrap();
+        assert_eq!(second.accepted, 1, "redelivered transition commits");
+    }
+    joined
+        .commit_facts(&[
+            Fact::SnapshotBody(a1.clone()),
+            Fact::Manifest(record_a1.clone()),
+            Fact::Announcement(announce_for(a1.snapshot(), 1, genesis_id, &record_a1)),
+            Fact::SnapshotBody(a2.clone()),
+            Fact::Manifest(record_a2.clone()),
+            Fact::Announcement(announce_for(a2.snapshot(), 1, genesis_id, &record_a2)),
+            Fact::SnapshotBody(s.clone()),
+            Fact::Manifest(record_s.clone()),
+            Fact::Announcement(announce_for(s.snapshot(), 3, rotation_id, &record_s)),
+        ])
+        .unwrap();
+
+    // Complete ancestry, complete adoption.
+    assert_eq!(
+        joined
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![s_id],
+        "late joiner with full lineage adopts the head"
+    );
+}

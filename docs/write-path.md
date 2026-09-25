@@ -135,20 +135,49 @@ MutationRequest {
    mounted mutations; mutations execute serially in admission order.
    Submission order and execution order coincide, so snapshot parent
    selection is deterministic: each mutation's snapshot parents are the
-   heads after the previous mutation.
+   heads after the previous mutation. A mutation held for authoring
+   prerequisites rejoins in submission order, so the total order
+   survives the hold.
 2. **Bounded.** `MAX_PENDING_MUTATIONS` bounds all admitted, incomplete
-   requests — including the request currently executing, not just those
-   waiting. Admission beyond it returns `EAGAIN`. The queue has its own
-   lock, never the view's or the store's. Shutdown closes admission:
+   requests — including the request currently executing and any held
+   for prerequisites, not just those waiting. Admission beyond it
+   returns `EAGAIN`. The queue has its own lock, never the view's or
+   the store's. Shutdown closes admission:
    once the live loop stops, new submissions are refused with `EIO`
-   (`Shutdown`) instead of queueing behind a loop that will never drain.
+   (`Shutdown`) instead of queueing behind a loop that will never drain,
+   and held requests resolve `Shutdown` like any other queued request.
 3. **Synchronous, no silent post-timeout commit.** Unlike a fetch want
-   (which may outlive its waiter), a mutation has no wait timeout:
-   admission is immediate (or `EAGAIN`), and once admitted the request
-   either commits or fails before the caller returns. There is no path
-   where `fsync` fails with `EIO` and the mutation nevertheless applies
-   later.
-4. **Liveness consequence (named).** The daemon synchronization loop is a
+   (which may outlive its waiter), a mutation's caller stays blocked
+   until the loop completes it — including across held passes. Once
+   admitted the request either commits or fails before the caller
+   returns. There is no path where `fsync` fails and the mutation
+   nevertheless applies later.
+4. **Held for authoring prerequisites, with a deadline.** A mutation
+   whose base closure references remote-only content cannot author:
+   the resolver (`ChunkUnavailable`) names the missing chunk, the loop
+   registers it as an ordinary fetch want, and the mutation waits —
+   pinned to the single head its first evaluation used, so the retry
+   can never silently rebase onto newer state. A changed, emptied, or
+   multiplied head set fails the retry `Stale`, exactly like a raced
+   handle commit. The wait is bounded by `max_mutation_wait` (default
+   30s, wall-clock from admission — the caller has been blocked since
+   then — checked on the first evaluation and every pass after); past
+   it the mutation fails `ETIMEDOUT` — retryable information, not a
+   system failure. A first evaluation that arrives after the budget
+   already ran out fails the same way instead of starting a fresh
+   wait. A mutation evaluated headless or multi-head never
+   holds: nothing meaningful pins, so it fails closed as before.
+   The wait is a wall-clock bound on the loop, not just on the
+   check: while any mutation is held, the pass's fetch runs under the
+   nearest deadline's remaining time — each attempt is capped at what
+   remains and the plan stops starting fetch work once the budget is
+   spent, so one stalled provider cannot push the `TimedOut` decision
+   past its bound (unstarted work stays pending for the next pass).
+   With nothing held, fetching is unbounded. A pass that fulfills
+   fetch objects with mutations still queued
+   wakes the loop immediately, so a held mutation retries without
+   waiting out the idle pacing deadline.
+5. **Liveness consequence (named).** The daemon synchronization loop is a
    hard liveness dependency for every committing FUSE operation: a wedged
    loop blocks the caller indefinitely. That is a daemon health failure
    bounded by the process supervisor, not a per-request cancellation, and
@@ -157,7 +186,7 @@ MutationRequest {
    resolves every admitted-but-incomplete request with `EIO`
    (`Shutdown`) instead of stranding it, and the closed queue refuses
    new submissions the same way.
-5. **Publication is the same path as fetch.** A mutation applies under
+6. **Publication is the same path as fetch.** A mutation applies under
    the store write path and publishes heads and materialization under
    one short view write lock, exactly as a fetch pass does. Neither lock
    is ever held across a network wait.
@@ -243,8 +272,10 @@ Append is the only content mutation with this privilege, and it exists
 because POSIX defines append against the current end. In v0 the mounted
 write path refuses `O_APPEND | O_TRUNC` together (`EOPNOTSUPP`): the
 append model has no committed empty base to truncate to, and neither flag
-is silently ignored. A path-addressed `truncate` on an open append handle
-is likewise `EOPNOTSUPP`; an exec change through an append handle is a
+is silently ignored. Enforcement covers both the open-time flags and the
+kernel's split delivery (open arrives append-only, the truncation follows
+as a separate `setattr`): a path-addressed truncate while an append handle
+is open on that path is likewise `EOPNOTSUPP`. An exec change through an append handle is a
 path-addressed mutation.
 
 Namespace mutations (`mkdir`, `unlink`, `rmdir`, `rename`, and
@@ -252,6 +283,15 @@ path-addressed `set-exec`) carry no handle base: they read-modify-write
 the current head under the queue's total order, so each is evaluated
 against the state its queue predecessor committed, never against the
 state visible when the FUSE syscall began.
+
+A directory rename rebinds the moved directory's own inode on both
+mounts, and fresh path lookups under the new prefix work immediately.
+Pre-opened handles to *descendants* keep addressing the old path: the
+v0 inode table rebinds the exact source mapping only, so a descendant
+handle opened before the rename goes `ENOENT` on its next path
+operation instead of silently following the subtree. Following renamed
+subtrees through open handles is a presentation-layer feature v0 does
+not claim.
 
 ## The commit pipeline and durability ordering
 
@@ -294,7 +334,9 @@ A commit proceeds in this order, and the order is the contract:
 6. **Announcement discharge.** The recorded obligation is sent
    with retry through the durable outbox (`Engine::announce_snapshot`
    for one snapshot, `Engine::announce_pending` for the resume path:
-   per-recipient delivered markers, byte-identical sealed retries).
+   per-recipient delivered markers, byte-identical sealed retries per
+   route — the canonical seal when its route is live, else the
+   persisted route-specific reseal).
 
 **Objects prepared at 1; authoring prepared at 2; durable at 3 (with the
 announcement obligation recorded); visible at 4; servable at 5;
@@ -318,10 +360,21 @@ step 3, atomically with the commit**, not at step 6. Step 6 only
 announcement: if step 3 committed, the obligation is durable, and a
 restart reconciles un-discharged obligations back through the outbox
 (`Fact::AnnouncementQueued` / `AnnouncementSealed` /
-`AnnouncementDelivered`; pending derives as queued-minus-delivered).
+`AnnouncementRouteSealed` / `AnnouncementDelivered`; pending derives
+as queued-minus-delivered).
 The outbox entry is eligible for discharge only once serving readiness
 (step 5) has succeeded for that snapshot — eligibility is
-composer-ordered (announce after flush), not engine-gated.
+barrier-gated per publish pass (the loop flushes the serving mirror
+before discharging announcements), not engine-gated: a failed barrier
+skips the discharge and the next pass retries, so a sick mirror stalls
+propagation, never the mount.
+
+A head whose closure is still fetching is neither a success nor a
+failure: the head installs once its records and trees land, the
+previous generation keeps serving until then, and the pass does not
+spend the fatal engine-error budget. Only a *damaged* closure (an
+identity mismatch, a non-canonical document, a contradicted mapping)
+fails the pass closed.
 
 Failure at each stage, explicitly:
 
@@ -453,7 +506,7 @@ merely implementation properties.
 | `O_CREAT` | Create the file if absent (its own empty-file snapshot, per `create`). |
 | `O_EXCL` | With `O_CREAT`, `EEXIST` if the name exists. |
 | `O_APPEND` | Appends at the current end at commit time (see handles); the target must remain a regular file. |
-| `O_TRUNC` | The handle's overlay starts **empty**; the truncation commits at the next `flush`/`fsync`/`release`, not at open. It captures the opened file's base identity and **obeys the normal stale-handle rule**: if another commit changed the file before the truncation commits, the handle is stale (`EIO`). |
+| `O_TRUNC` | The truncation commits **during open** and the handle starts clean on the empty base. It must: the kernel delivers `O_TRUNC` as open plus a separate fh-less `setattr`, so a handle carrying the pre-truncate base would go stale before its first commit. A concurrent change *after* open still stales the handle (`EIO`); a path truncate that lands while the opening handle is still clean re-pins it instead (the handle holds nothing to lose). |
 | `O_SYNC` / `O_DSYNC` | Accepted; every write is its own durable snapshot (see flush/fsync). |
 | `O_DIRECT`, `O_PATH` | `EOPNOTSUPP` (not representable). |
 
@@ -642,9 +695,10 @@ Each row locks a decided invariant.
   after either; it may be lost after `write` without a commit boundary.
 - **`O_SYNC` per write**: each successful `write` produces its own
   durable snapshot before returning.
-- **`O_TRUNC`**: open truncates nothing; the empty commit happens at the
-  committing boundary; a concurrent change to the file makes the
-  truncation commit stale (`EIO`).
+- **`O_TRUNC`**: the truncation is visible to other opens immediately
+  (it commits during open); a concurrent change after open makes the
+  handle stale (`EIO`), while a truncate landing on a still-clean
+  handle re-pins it.
 - **`create` then content**: two snapshots, both roots readable; a crash
   after `create` leaves the empty file.
 - **Failed commit is terminal**: after a stale/`EIO` commit the overlay is

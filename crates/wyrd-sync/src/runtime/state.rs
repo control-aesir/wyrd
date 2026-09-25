@@ -67,6 +67,11 @@ pub struct RuntimeState {
     pub(super) announcement_queued: BTreeSet<(SnapshotId, DeviceId)>,
     pub(super) announcement_sealed: BTreeMap<SnapshotId, Vec<u8>>,
     pub(super) announcement_delivered: BTreeSet<(SnapshotId, DeviceId)>,
+    /// Route-specific announcement reseals: one sealed envelope per
+    /// (snapshot, route) for resumes whose live route differs from the
+    /// first seal's. First seal per pair wins, like the canonical map
+    /// above; retries under a route resend its exact bytes.
+    pub(super) announcement_route_sealed: BTreeMap<(SnapshotId, Vec<u8>), Vec<u8>>,
     /// Transition-delivery outbox: the same queued/sealed/delivered
     /// triple keyed by transition id. Carries gossip to existing
     /// members and the chain suffix to newcomers with one mechanism.
@@ -120,6 +125,7 @@ impl RuntimeState {
             materialization: BTreeMap::new(),
             announcement_queued: BTreeSet::new(),
             announcement_sealed: BTreeMap::new(),
+            announcement_route_sealed: BTreeMap::new(),
             announcement_delivered: BTreeSet::new(),
             transition_queued: BTreeSet::new(),
             transition_sealed: BTreeMap::new(),
@@ -191,6 +197,25 @@ impl RuntimeState {
         true
     }
 
+    /// Record a route-specific reseal for one (snapshot, route) pair.
+    /// First seal per pair wins, like the canonical seal above, so a
+    /// retry under a route always resends the exact bytes the first
+    /// send under that route used. Returns `true` if this sealed the
+    /// pair.
+    pub fn record_announcement_route_sealed(
+        &mut self,
+        snapshot: SnapshotId,
+        route: Vec<u8>,
+        sealed: Vec<u8>,
+    ) -> bool {
+        let key = (snapshot, route);
+        if self.announcement_route_sealed.contains_key(&key) {
+            return false;
+        }
+        self.announcement_route_sealed.insert(key, sealed);
+        true
+    }
+
     /// Record one queued obligation discharged. Returns `true` if this
     /// was the first delivery marker for the pair.
     pub fn record_announcement_delivered(
@@ -206,6 +231,19 @@ impl RuntimeState {
     /// ever read or re-send the bytes.
     pub fn announcement_sealed_bytes(&self, snapshot: &SnapshotId) -> Option<&[u8]> {
         self.announcement_sealed.get(snapshot).map(Vec::as_slice)
+    }
+
+    /// The persisted route-specific reseal for one (snapshot, route)
+    /// pair, if a send under that route sealed one. A slice, like the
+    /// canonical bytes above: callers only ever re-send the bytes.
+    pub fn announcement_route_sealed_bytes(
+        &self,
+        snapshot: &SnapshotId,
+        route: &[u8],
+    ) -> Option<&[u8]> {
+        self.announcement_route_sealed
+            .get(&(*snapshot, route.to_vec()))
+            .map(Vec::as_slice)
     }
 
     /// Every still-undischarged obligation, in `(snapshot, recipient)`

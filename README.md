@@ -146,6 +146,20 @@ cargo check
 cargo nextest run
 ```
 
+For the full mount-and-sync path on a real FUSE kernel, the Lima
+end-to-end suite runs the binary in a NixOS guest (no guest
+toolchain; the host builds the guest-arch binary and exports its
+closure):
+
+```bash
+./lima/run-alpha.sh             # full run
+./lima/run-alpha.sh --keep      # leave the guest up for debugging
+./lima/run-alpha.sh --step 4    # run steps 1..4 (the prefix closure)
+```
+
+The guest script is `tests/alpha-lima.sh`; logs land in
+`/tmp/lima/logs/`.
+
 On macOS, the `wyrd-cli` and `wyrd-contracts` test binaries link the
 system FUSE library at load, and `wyrd mount` needs the kernel extension,
 so running them requires system macFUSE: `brew install --cask macfuse`,
@@ -221,7 +235,8 @@ peers can fetch from.
 
 What it is not: peer sync is not hardened (signer-session wiring and
 multi-relay supervision are still open), there is no garbage collection
-(the store grows forever), writes are whole-file (append/truncate flags
-are refused), there is no auto-update, and drives
-created by one alpha may not open under the next. Bugs go to the
-repository's ngit issues.
+(the store grows forever), `O_APPEND` and `O_TRUNC` are supported but
+`O_APPEND|O_TRUNC` together is refused (`EOPNOTSUPP`), there is no
+auto-update, and drives created by one alpha may not open under the
+next (the `docs/write-path.md` contract is the reference). Bugs go to
+the repository's ngit issues.

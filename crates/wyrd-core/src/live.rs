@@ -7,8 +7,10 @@
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
-    chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, StoreError, StoreFailure, Tree,
+    chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, SnapshotId, StoreError,
+    StoreFailure, Tree,
 };
+use wyrd_sync::closure::ClosureError;
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{
@@ -199,6 +201,24 @@ pub struct LiveConfig {
     /// compose and run with the same config value, since `run_loop`
     /// takes it again for supervision.
     pub budgets: ResourceBudgets,
+    /// Wall-clock deadline for a submitted mutation held waiting on
+    /// authoring prerequisites (remote base-closure content): measured
+    /// from the first defer, checked every pass, terminal `TimedOut`
+    /// past it. Distinct from `open_timeout` (read-side demand wait):
+    /// authoring and reading tune separately.
+    pub max_mutation_wait: Duration,
+    /// Wall-clock budget for one serving-mirror readiness barrier
+    /// (announcement discharge waits at most this per pass, further
+    /// clipped to the nearest held mutation's remaining time). The
+    /// mirror keeps draining in the background; a pass that ran out
+    /// of budget skips the discharge and retries.
+    pub serving_flush_budget: Duration,
+    /// Wall-clock budget for one pass's fetch phase when no mutation
+    /// is held (a held mutation's own deadline takes precedence and
+    /// clips this). Every pass is bounded: an unreachable route costs
+    /// at most this per pass instead of wedging the loop behind one
+    /// dial per pending item; the rest resumes next pass.
+    pub fetch_pass_budget: Duration,
 }
 
 impl Default for LiveConfig {
@@ -209,7 +229,39 @@ impl Default for LiveConfig {
             error_max_delay: Duration::from_secs(30),
             max_consecutive_errors: 10,
             budgets: ResourceBudgets::default(),
+            max_mutation_wait: Duration::from_secs(30),
+            serving_flush_budget: Duration::from_secs(5),
+            fetch_pass_budget: Duration::from_secs(10),
         }
+    }
+}
+
+/// Serving-mirror readiness barrier: the loop programs against this,
+/// never any one mirror implementation, so every provider's passes
+/// gate announcement discharge the same way. `flush` waits until every
+/// mirror import enqueued so far has landed; a failed import fails the
+/// barrier — announcing a transport root the mirror cannot serve would
+/// strand the peer until a restart. The composer installs its serving
+/// endpoint's barrier; without one (tests, mirror-less compositions)
+/// announcements discharge ungated, as before.
+pub trait ServingBarrier: Send + Sync {
+    /// Wait for readiness under `budget`: `Ok(true)` once every
+    /// earlier import landed, `Ok(false)` when the budget ran out
+    /// first (the drain continues; the next pass asks again),
+    /// `Err` when the mirror failed or is gone. Callers gate
+    /// announcement discharge on `true`.
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error>;
+}
+
+impl ServingBarrier for wyrd_sync::serving::ServingEndpoint {
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
+        wyrd_sync::serving::ServingEndpoint::flush_bounded(self, budget)
+    }
+}
+
+impl ServingBarrier for wyrd_sync::serving::ServingHandle {
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
+        wyrd_sync::serving::ServingHandle::flush_bounded(self, budget)
     }
 }
 
@@ -268,6 +320,13 @@ pub struct LiveNode<V: NamespaceView> {
     /// report-counter predicate to keep in sync with future commit
     /// paths.
     pub(super) published_revision: u64,
+    /// Eligible heads installed with the serving generation: the
+    /// mounted-write contract needs exactly one, so the count rides
+    /// every sync-pass line (0 reads stale/bootstrap, 2+ reads
+    /// conflicted). Idle passes report the last installed count — an
+    /// unchanged revision means unchanged state, hence unchanged
+    /// heads.
+    pub(super) published_heads: usize,
     /// Durable state may have changed without a republication (a pass
     /// failed after committing): the next pass republishes regardless
     /// of the revision gate, so recovery never waits for new changes.
@@ -276,6 +335,9 @@ pub struct LiveNode<V: NamespaceView> {
     /// The admission cap paces demand; the registries and backend
     /// hold their own copies for their own refusals.
     pub(super) budgets: ResourceBudgets,
+    /// Deadline for deferred mutations, copied from the composition
+    /// config: a held mutation that outwaits it fails `TimedOut`.
+    pub(super) max_mutation_wait: Duration,
     /// The loop's pacing signal, created at composition and attached to
     /// the mutation queue there. The composer shares this same signal
     /// with the mailbox adapter so new mail wakes intake too: one
@@ -287,6 +349,14 @@ pub struct LiveNode<V: NamespaceView> {
     /// endpoint is flushed; `None` sends routeless announcements, as
     /// the loopback contracts do.
     pub(super) node_addr: Option<Vec<u8>>,
+    /// Serving-mirror readiness gate for announcement discharge,
+    /// installed by the composer alongside the route. `None` discharges
+    /// ungated (tests, mirror-less compositions).
+    pub(super) serving_barrier: Option<Arc<dyn ServingBarrier>>,
+    /// Stored copy of the config's per-pass barrier budget.
+    pub(super) serving_flush_budget: Duration,
+    /// Stored copy of the config's per-pass fetch budget.
+    pub(super) fetch_pass_budget: Duration,
 }
 
 /// The live half of a split node: everything a presentation
@@ -308,29 +378,46 @@ pub struct LiveParts<V: NamespaceView> {
     pub open_timeout: Duration,
 }
 
-/// All-or-nothing closure gate shared by the direct refresh and the live
-/// sync pass: every eligible head must verify, or the caller installs
-/// nothing. Returns the heads unchanged for installation; any failure
-/// surfaces the closure error before any publication happens, so the two
-/// production paths cannot diverge on partial head sets again.
-pub(super) fn verified_heads<S>(
+/// The closure gate shared by the direct refresh and the live sync
+/// pass. The projection rule is per validity class, not all-or-
+/// nothing: verified heads install, pending heads wait for their
+/// closure, and only a damaged closure fails the caller outright
+/// (before any installation happens, so the last-known-good
+/// projection keeps serving). See
+/// `partition_heads` below. Pending heads are never damage and must
+/// not consume the fatal engine-error budget: they install once
+/// their closure lands.
+pub(crate) fn partition_heads<S>(
     runtime: &wyrd_sync::runtime::RuntimeState,
     heads: Vec<AuthorizedSnapshot>,
     store: &S,
-) -> Result<Vec<AuthorizedSnapshot>, wyrd_sync::closure::ClosureError>
+) -> Result<(Vec<AuthorizedSnapshot>, usize), EngineError>
 where
     S: ObjectStore,
     S::Error: std::fmt::Debug,
 {
-    for head in &heads {
-        wyrd_sync::closure::verify_head_closure(
+    let mut publishable = Vec::with_capacity(heads.len());
+    let mut pending = 0usize;
+    for head in heads {
+        match wyrd_sync::closure::verify_head_closure(
             runtime,
             head.snapshot(),
             store,
             &wyrd_sync::ingest::Limits::V0,
-        )?;
+        ) {
+            Ok(()) => publishable.push(head),
+            Err(error) if error.is_pending() => pending += 1,
+            // A store that cannot be read is not closure damage: it
+            // carries the store's own classification so the failure
+            // policy spends the store budget, not the fatal engine
+            // one.
+            Err(ClosureError::ObjectStore { failure, .. }) => {
+                return Err(EngineError::Store(failure))
+            }
+            Err(error) => return Err(EngineError::Closure(error)),
+        }
     }
-    Ok(heads)
+    Ok((publishable, pending))
 }
 
 impl<V> LiveNode<V>
@@ -383,6 +470,9 @@ where
             budgets,
             open_timeout,
         };
+        // Baseline observability: idle lines before the first publish
+        // report what the adopted generation serves.
+        let published_heads = engine.live_heads().map(|heads| heads.len()).unwrap_or(0);
         (
             LiveNode {
                 engine,
@@ -391,10 +481,15 @@ where
                 wants,
                 mutations,
                 published_revision: revision,
+                published_heads,
                 dirty: false,
                 budgets,
+                max_mutation_wait: config.max_mutation_wait,
                 waker,
                 node_addr: None,
+                serving_barrier: None,
+                serving_flush_budget: config.serving_flush_budget,
+                fetch_pass_budget: config.fetch_pass_budget,
             },
             parts,
         )
@@ -417,6 +512,15 @@ where
     /// first send.
     pub fn set_node_addr(&mut self, node_addr: Option<Vec<u8>>) {
         self.node_addr = node_addr;
+    }
+
+    /// Install the serving-mirror readiness barrier for announcement
+    /// discharge: the composer passes its serving endpoint (shared
+    /// ownership — the endpoint lifecycle stays with the composer).
+    /// Every publish pass flushes before discharging announcements, so
+    /// a peer acting on an announcement never races the write-through.
+    pub fn set_serving_barrier(&mut self, barrier: Arc<dyn ServingBarrier>) {
+        self.serving_barrier = Some(barrier);
     }
 
     /// Send every undischarged outbound obligation: transitions and
@@ -444,6 +548,28 @@ where
             Err(EngineError::Mailbox(_)) => 0,
             Err(other) => return Err(LiveError::Engine(other)),
         };
+        // Serving readiness gates announcement discharge, never local
+        // publication (the projection above already swapped) and never
+        // the control plane (transitions and capabilities above already
+        // sent): a peer acting on an announcement fetches bulk
+        // representations by transport root, so the mirror must hold
+        // them first. A failed barrier skips this pass's discharge —
+        // the obligations stay pending and the next pass retries — so
+        // a sick mirror stalls propagation, never the mount.
+        //
+        // Only when announcements are actually pending: with no
+        // announcement to discharge the barrier gates nothing, and a
+        // slow mirror would otherwise burn its whole budget per pass
+        // for nothing (observed in the guest logs as ten-second
+        // publish phases that sent nothing, delaying shutdown past
+        // its budget).
+        // The barrier gates announcement discharge specifically: with
+        // only transitions or capabilities pending, a slow mirror
+        // must not consume the serving budget (deliver_pending above
+        // already tried those, and they are not mirror-gated).
+        if !self.engine.pending_announcements()?.is_empty() && !self.flush_serving_barrier()? {
+            return Ok(sent);
+        }
         sent += match self
             .engine
             .announce_pending(mailbox, self.node_addr.as_deref())
@@ -453,6 +579,47 @@ where
             Err(other) => return Err(LiveError::Engine(other)),
         };
         Ok(sent)
+    }
+
+    /// Ask the serving mirror to catch up, time-boxed by the config
+    /// and clipped to the nearest held mutation's remaining time. A
+    /// slow mirror must not stretch a mounted deadline by its drain
+    /// duration. `Ok(false)` means "not ready in time" — not an
+    /// error: the caller skips this pass's announcement discharge
+    /// exactly like a failed barrier.
+    fn flush_serving_barrier(&mut self) -> Result<bool, LiveError> {
+        let Some(barrier) = &self.serving_barrier else {
+            return Ok(true);
+        };
+        // The barrier is time-boxed by the config and further clipped
+        // to the nearest held mutation's remaining time: a slow
+        // mirror must not stretch a mounted deadline by its drain
+        // duration. "Not ready in time" skips the discharge exactly
+        // like a failure — the obligation stays pending and the next
+        // pass asks again.
+        let budget = match self.mutations.nearest_deadline(self.max_mutation_wait) {
+            Some(deadline) => self
+                .serving_flush_budget
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            None => self.serving_flush_budget,
+        };
+        match barrier.flush(budget) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                tracing::debug!(
+                    budget_ms = budget.as_millis(),
+                    "announcement discharge waits for serving readiness"
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "announcement discharge waits for serving readiness"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// One supervised pass: drain the mailbox into the engine, run a
@@ -509,6 +676,7 @@ where
             self.engine
                 .set_materialization(want, MaterializationState::Cached)
         })?;
+        let phase = std::time::Instant::now();
         let fetched = match bulk {
             Some(bulk) => {
                 // Route publication precedes every pass: routes come
@@ -521,11 +689,29 @@ where
                 // observability work, separately tracked.
                 let state = self.engine.runtime_state()?;
                 let _routes = bulk.publish_routes(&state).map_err(LiveError::Engine)?;
+                // The fetch phase is always bounded. A held mutation's
+                // deadline takes precedence and clips this: its
+                // `TimedOut` decision lands on time even when a
+                // provider stalls. With nothing held the config's
+                // per-pass budget still applies — one unreachable route
+                // costs at most this per pass instead of wedging the
+                // loop behind a dial per pending item.
+                let pass_cap = std::time::Instant::now() + self.fetch_pass_budget;
+                let deadline = Some(
+                    self.mutations
+                        .nearest_deadline(self.max_mutation_wait)
+                        .map_or(pass_cap, |held| held.min(pass_cap)),
+                );
                 let mut shared = SharedStore::from(Arc::clone(&self.store));
-                self.engine.execute_plan(bulk, &mut shared)?
+                self.engine
+                    .execute_plan_sliced(bulk, &mut shared, deadline)?
             }
             None => ExecuteReport::default(),
         };
+        tracing::debug!(
+            elapsed_ms = phase.elapsed().as_millis(),
+            "pass phase fetch done"
+        );
         // Apply mounted mutations in admission order (the queue's total
         // order): each is evaluated against the state its predecessor
         // committed, never against what the syscall saw. Submitters block
@@ -536,14 +722,76 @@ where
         // Clone the queue handle so the batch borrow does not pin `self`
         // while mutations apply (the engine borrow is mutable).
         let mutations = Arc::clone(&self.mutations);
-        let mut batch = mutations.take_batch();
+        let mut batch = mutations.take_batch().with_wants(Arc::clone(&self.wants));
         for index in 0..batch.len() {
-            // Borrow the kind: submit moves the request into the queue,
-            // which owns it until the batch completes it, so the pass
-            // needs no copy — no per-pass clone extends the content
-            // lifetime.
-            let result = self.apply_mutation(batch.request(index).kind());
-            batch.record(index, result);
+            // Prerequisite deadline: wall-clock from admission (the
+            // caller has been blocked since), checked every pass and
+            // on the first evaluation too — a request whose budget
+            // ran out while the loop was fetching fails terminal
+            // `TimedOut` without starting a wait. The submitter hears
+            // it and nothing applies later.
+            let since = batch.wait_since(index);
+            if since.elapsed() >= self.max_mutation_wait {
+                tracing::debug!(
+                    waited_ms = since.elapsed().as_millis(),
+                    "mutation prerequisite wait expired"
+                );
+                batch.record(index, Err(MutationError::TimedOut));
+                continue;
+            }
+            let pinned = batch.pinned(index);
+            let kind = batch.request(index).kind().clone();
+            match self.apply_mutation(&kind, pinned) {
+                Err(MutationError::NeedContent { chunk, base }) => {
+                    let Some(base) = base else {
+                        // No pinnable head (headless or conflicted
+                        // evaluation): fail closed, never defer what
+                        // cannot pin.
+                        batch.record(index, Err(MutationError::Engine));
+                        continue;
+                    };
+                    // One waiter per chunk: retries name new chunks as
+                    // the walk advances, but re-registering a held
+                    // chunk would accumulate counts against one
+                    // release.
+                    if !batch.wanted(index).contains(&chunk) {
+                        match self.wants.register(chunk) {
+                            Ok(()) => batch.note_want(index, chunk),
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = ?error,
+                                    "mutation demand refused"
+                                );
+                                batch.record(index, Err(MutationError::Engine));
+                                continue;
+                            }
+                        }
+                    }
+                    tracing::debug!(
+                        chunk = ?chunk,
+                        base = ?base,
+                        "mutation deferred for authoring content"
+                    );
+                    // Total order: the held entry owns the front of
+                    // the queue, so everything after it in this batch
+                    // goes back untouched — never executed past the
+                    // defer. The pass then ends.
+                    batch.defer_and_release_rest(index, base);
+                    break;
+                }
+                other => batch.record(index, other),
+            }
+        }
+        // Fast retry: a held mutation's prerequisites may have landed
+        // in this pass's fetch, so wake for an immediate next pass
+        // instead of waiting out the idle pacing deadline. Gated on
+        // actual fetch progress with queued mutations outstanding, so
+        // a prerequisite the plan cannot supply falls back to idle
+        // cadence instead of spinning.
+        if self.mutations.outstanding() > 0
+            && (fetched.objects > 0 || fetched.manifests > 0 || fetched.snapshot_bodies > 0)
+        {
+            self.waker.wake();
         }
         // Settle admitted wants: retire a landed fetch, and retire a fetch
         // whose demand died — the engine's durable `Cached` policy keeps
@@ -569,6 +817,21 @@ where
         let outbound = self.engine.has_pending_outbound()?;
         if !self.dirty && revision == self.published_revision && !outbound {
             batch.finish();
+            // Idle passes report too: accepted-without-commit means a
+            // memory-only suppression verdict, nonzero skipped means
+            // mail waiting on an epoch key, and nonzero discarded means
+            // terminal poison — each a different operator conclusion
+            // from the same silent symptom (a peer that never converges).
+            tracing::debug!(
+                accepted = drained.accepted,
+                duplicates = drained.duplicates,
+                deferred = drained.deferred,
+                skipped = drained.skipped,
+                discarded = drained.discarded,
+                revision = revision,
+                eligible_heads = self.published_heads,
+                "sync pass idle: revision unchanged, outbox empty"
+            );
             return Ok(SyncReport {
                 drained,
                 fetched,
@@ -576,14 +839,40 @@ where
                 generation,
             });
         }
-        // All-or-nothing projection: every eligible head must verify or
-        // nothing new publishes — a damaged head fails the pass and the
-        // previous generation keeps serving (see `verified_heads`).
+        // Per-class projection: verified heads publish, pending ones
+        // wait for their closure, and a damaged head fails the pass
+        // with the previous generation still serving (see
+        // `partition_heads`).
         let heads = self.engine.live_heads()?;
-        let heads = {
+        let (heads, pending_heads) = {
             let store = self.store.read().map_err(|_| LiveError::Lock)?;
-            verified_heads(&completed_runtime, heads, &*store).map_err(EngineError::Closure)?
+            partition_heads(&completed_runtime, heads, &*store)?
         };
+        if heads.is_empty() && pending_heads > 0 {
+            // Every eligible head is still mid-fetch: keep the current
+            // generation serving and try again next pass. This is
+            // ordinary progress, not a failure — a committed mutation
+            // always authors a verified head, so no recorded reply
+            // waits on this publication. The durable outbox still
+            // runs: control-plane obligations (transitions,
+            // capabilities, announcements) are independent of head
+            // publication, and starving them here would stall
+            // delivery for as long as the fetch takes.
+            batch.finish();
+            let sent = self.publish(mailbox)?;
+            tracing::debug!(
+                pending_heads,
+                sent,
+                "publication deferred: closure still fetching"
+            );
+            return Ok(SyncReport {
+                drained,
+                fetched,
+                published: false,
+                generation,
+            });
+        }
+        let installed_heads = heads.len();
         let next = Projection::new(
             Arc::clone(&self.store),
             RuntimeMaterialization {
@@ -598,6 +887,7 @@ where
             *slot = Arc::new(next);
         }
         self.published_revision = revision;
+        self.published_heads = installed_heads;
         self.dirty = false;
         // Publication is done: a completed mutation's success now means
         // the new generation serves.
@@ -609,7 +899,35 @@ where
         // here advance the sequence, so the next pass republishes the
         // (semantically unchanged) generation and retries whatever is
         // still pending.
-        let _sent = self.publish(mailbox)?;
+        tracing::debug!(
+            elapsed_ms = phase.elapsed().as_millis(),
+            "pass phase mutations done"
+        );
+        let sent = self.publish(mailbox)?;
+        tracing::debug!(
+            elapsed_ms = phase.elapsed().as_millis(),
+            "pass phase publish done"
+        );
+        tracing::debug!(
+            accepted = drained.accepted,
+            duplicates = drained.duplicates,
+            deferred = drained.deferred,
+            skipped = drained.skipped,
+            discarded = drained.discarded,
+            manifests = fetched.manifests,
+            snapshot_bodies = fetched.snapshot_bodies,
+            objects = fetched.objects,
+            unfulfilled = fetched.unfulfilled,
+            transport_errors = fetched.transport_errors,
+            missing = fetched.missing,
+            invalid = fetched.invalid,
+            unavailable_keys = fetched.unavailable_keys,
+            local_failures = fetched.local_failures,
+            sent = sent,
+            revision = revision,
+            eligible_heads = installed_heads,
+            "sync pass published"
+        );
         Ok(SyncReport {
             drained,
             fetched,
@@ -625,11 +943,21 @@ where
     /// same bootstrap `put_file` performs. Returns the boundary-mapped
     /// failure without partial application: the format mutations either
     /// produce a new root or nothing.
-    fn apply_mutation(&mut self, kind: &MutationKind) -> Result<MutationOutcome, MutationError> {
+    fn apply_mutation(
+        &mut self,
+        kind: &MutationKind,
+        pinned: Option<SnapshotId>,
+    ) -> Result<MutationOutcome, MutationError> {
         match kind {
             MutationKind::Mkdir { path } => {
-                let base = self.live_base()?;
+                let heads = self.eval_heads(pinned, path)?;
+                self.demand_path_trees(&heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let base = match heads.as_slice() {
+                    [] => None,
+                    [head] => Some(head.snapshot().tree),
+                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+                };
                 let base = match base {
                     Some(tree) => tree,
                     None => Tree::from_entries(Vec::new())
@@ -639,16 +967,11 @@ where
                 };
                 let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::CreateFile { path } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, path)?;
                 // `create` requires an absent name: anything already there
                 // (file, dir, symlink) is `EEXIST`, never a silent replace.
                 if self.current_node(&heads, path)?.is_some() {
@@ -672,9 +995,7 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Created(FileIdentity::new(
                     0,
                     false,
@@ -687,10 +1008,7 @@ where
                 executable,
                 content,
             } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = match heads.as_slice() {
                     [] => return Err(MutationError::Stale(path.clone())),
                     [head] => head.snapshot().tree,
@@ -720,9 +1038,7 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     content.len() as u64,
                     *executable,
@@ -730,10 +1046,7 @@ where
                 )))
             }
             MutationKind::AppendFile { path, content } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, path)?;
                 // Append never creates or resurrects: a headless drive or
                 // a missing/repurposed path is stale, not `ENOENT`.
                 let tree = match heads.as_slice() {
@@ -772,9 +1085,7 @@ where
                 if root == tree {
                     return Ok(MutationOutcome::Done);
                 }
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Committed(FileIdentity::new(
                     image.len() as u64,
                     executable,
@@ -782,10 +1093,7 @@ where
                 )))
             }
             MutationKind::Unlink { path } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
                 match self.current_node(&heads, path)? {
                     Some(Node::Dir { .. } | Node::MergedDir { .. }) => {
@@ -797,23 +1105,17 @@ where
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rmdir { path } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
+                self.demand_path_trees(&heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rename {
@@ -821,11 +1123,10 @@ where
                 to,
                 no_replace,
             } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, from)?;
                 let tree = self.single_tree(&heads, from)?;
+                self.demand_path_trees(&heads, from)?;
+                self.demand_path_trees(&heads, to)?;
                 if *no_replace && self.current_node(&heads, to)?.is_some() {
                     return Err(MutationError::AlreadyExists(to.clone()));
                 }
@@ -836,9 +1137,7 @@ where
                     // Same-path rename is a no-op: no snapshot.
                     return Ok(MutationOutcome::Done);
                 }
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
             MutationKind::SetAttrs {
@@ -846,10 +1145,7 @@ where
                 size,
                 executable,
             } => {
-                let heads = self
-                    .engine
-                    .live_heads()
-                    .map_err(|_| MutationError::Engine)?;
+                let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
                 let (current_size, current_exec, chunks) = match self.current_node(&heads, path)? {
                     Some(Node::File {
@@ -903,12 +1199,72 @@ where
                 if root == tree {
                     return Ok(MutationOutcome::Done);
                 }
-                self.engine
-                    .author_snapshot(&*store, root)
-                    .map_err(|_| MutationError::Engine)?;
+                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
         }
+    }
+
+    /// The pin for a demand-deferred mutation: the single head this
+    /// evaluation actually used, captured here and never re-read
+    /// later. A headless or multi-head evaluation cannot pin, so
+    /// demand sites stay opaque Engine and the defer site fails
+    /// closed. Shared by authoring and the read-before-write helpers
+    /// so every `NeedContent` names the same head.
+    fn pin_head(heads: &[AuthorizedSnapshot]) -> Option<wyrd_format::SnapshotId> {
+        match heads {
+            [head] => Some(head.snapshot().snapshot_id()),
+            _ => None,
+        }
+    }
+
+    /// Author one snapshot over a mutated root, tracing the engine
+    /// refusal: authoring collapses every failure to opaque `Engine`
+    /// at the boundary, and the variant tells a missing epoch key
+    /// from a failed closure self-check or a refused commit. A free
+    /// function (not a method) so callers holding the store guard can
+    /// still split-borrow the engine.
+    fn author_traced<S>(
+        engine: &mut Engine,
+        store: &S,
+        root: ContentId,
+        heads: &[AuthorizedSnapshot],
+    ) -> Result<AuthorizedSnapshot, MutationError>
+    where
+        S: ObjectStore,
+        S::Error: std::fmt::Debug,
+    {
+        engine.author_snapshot(store, root).map_err(|error| {
+            tracing::debug!(error = ?error, "mutation authoring refused");
+            match error {
+                EngineError::ChunkUnavailable(chunk) => MutationError::NeedContent {
+                    chunk,
+                    base: Self::pin_head(heads),
+                },
+                _ => MutationError::Engine,
+            }
+        })
+    }
+
+    /// Evaluate the current eligible heads against an optional pin:
+    /// a retried mutation must observe exactly the single head its
+    /// first evaluation used — an empty, changed, or multiplied head
+    /// set is `Stale`, never a silent rebase onto newer state. A
+    /// first evaluation (`None`) returns whatever classification
+    /// says; the defer site pins the single-head outcome.
+    fn eval_heads(
+        &self,
+        pinned: Option<SnapshotId>,
+        path: &str,
+    ) -> Result<Vec<AuthorizedSnapshot>, MutationError> {
+        let heads = self.live_heads_traced()?;
+        if let Some(base) = pinned {
+            match heads.as_slice() {
+                [head] if head.snapshot().snapshot_id() == base => {}
+                _ => return Err(MutationError::Stale(path.to_string())),
+            }
+        }
+        Ok(heads)
     }
 
     /// The single live head's tree, or a conflict. A headless drive has
@@ -942,11 +1298,96 @@ where
         ))
     }
 
+    /// Classify absent content on the mutation path, paired with the
+    /// view's own absence rule (`wyrd-fuse`'s `absent`): a remote or
+    /// fetching identity is a `NeedContent` prerequisite, anything
+    /// else — a local claim the store cannot back, unreachable, or
+    /// corrupt — fails closed as the transient store error the view
+    /// surfaces.
+    fn mutation_absent(&self, chunk: &ContentId, heads: &[AuthorizedSnapshot]) -> MutationError {
+        let status = self
+            .engine
+            .runtime_state()
+            .map(|state| state.status(chunk))
+            .unwrap_or(FetchStatus::RemoteOnly);
+        match status {
+            FetchStatus::RemoteOnly | FetchStatus::Fetching => MutationError::NeedContent {
+                chunk: *chunk,
+                base: Self::pin_head(heads),
+            },
+            FetchStatus::Unavailable | FetchStatus::Available | FetchStatus::Corrupt => {
+                MutationError::Store(StoreFailure::Transient)
+            }
+        }
+    }
+
+    /// Demand every structural tree `path` needs before a namespace
+    /// mutation reads or rewrites it: the single head's root tree plus
+    /// each directory subtree along the path. The format mutations
+    /// walk those trees directly, so a missing one must become the
+    /// same typed prerequisite authoring uses — a registered want and
+    /// a pinned retry — never an opaque store failure. The walk stops
+    /// where the path stops resolving (a missing entry, a file in the
+    /// middle, a decode failure): the operation then reports its own
+    /// precise error.
+    fn demand_path_trees(
+        &self,
+        heads: &[AuthorizedSnapshot],
+        path: &str,
+    ) -> Result<(), MutationError> {
+        // A headless drive bootstraps from an empty tree — nothing to
+        // demand; a multi-head drive still refuses the operation.
+        let tree = match heads {
+            [] => return Ok(()),
+            [head] => head.snapshot().tree,
+            _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+        };
+        let store = self.store.read().map_err(|_| MutationError::Lock)?;
+        let mut current = tree;
+        for component in path.split('/').filter(|part| !part.is_empty()) {
+            if !store
+                .has(&current)
+                .map_err(|error| MutationError::Store(error.failure()))?
+            {
+                return Err(self.mutation_absent(&current, heads));
+            }
+            let Ok(Some(bytes)) = store.get(&current) else {
+                return Ok(());
+            };
+            let Ok(decoded) = Tree::decode(&bytes) else {
+                return Ok(());
+            };
+            let Some(subtree) = decoded
+                .entries()
+                .iter()
+                .find_map(|entry| (entry.name.as_str() == component).then_some(&entry.content))
+            else {
+                return Ok(());
+            };
+            let wyrd_format::EntryContent::Dir { subtree } = subtree else {
+                return Ok(());
+            };
+            current = *subtree;
+        }
+        // The last component's own subtree is needed only when the
+        // path descends further; the loop's final check covers it when
+        // the path names the directory itself and a deeper mutation
+        // follows.
+        if !store
+            .has(&current)
+            .map_err(|error| MutationError::Store(error.failure()))?
+        {
+            return Err(self.mutation_absent(&current, heads));
+        }
+        Ok(())
+    }
+
     /// Read at most `max_len` bytes of a regular file's plaintext from
     /// the current heads. A truncate uses this to read only the prefix it
     /// keeps, and never more than the target, so shrinking an oversized
-    /// file does not materialize it. A not-materialized file is `EIO`:
-    /// the loop has no demand path to block on.
+    /// file does not materialize it. Remote-only content defers like
+    /// authoring does: the missing chunk becomes a `NeedContent`
+    /// prerequisite pinned to the evaluated head, never an EIO.
     fn read_current_file_prefix(
         &self,
         heads: &[AuthorizedSnapshot],
@@ -957,19 +1398,74 @@ where
             return Ok(Vec::new());
         }
         let view = self.view_for(heads)?;
-        let node = view
-            .lookup(path)
-            .map_err(|_| MutationError::NotFound(path.to_string()))?;
-        let file = view
-            .open_file(&node)
-            .map_err(|_| MutationError::IsDirectory(path.to_string()))?;
+        let node = view.lookup(path).map_err(|error| match error {
+            ViewError::NotMaterialized { content } => MutationError::NeedContent {
+                chunk: content,
+                base: Self::pin_head(heads),
+            },
+            _ => MutationError::NotFound(path.to_string()),
+        })?;
+        let file = view.open_file(&node).map_err(|error| match error {
+            ViewError::NotMaterialized { content } => MutationError::NeedContent {
+                chunk: content,
+                base: Self::pin_head(heads),
+            },
+            _ => MutationError::IsDirectory(path.to_string()),
+        })?;
         let size = match node {
             Node::File { size, .. } => size,
             _ => return Err(MutationError::IsDirectory(path.to_string())),
         };
+        // Fast demand pre-check: probe the chunks of the requested
+        // prefix before reading. A deferred retry over a
+        // partially-fetched large file would otherwise re-read and
+        // re-hash the whole served prefix every pass — minutes of
+        // store I/O inside the loop, which starves every other
+        // mutation and the deadline checks behind it. The honest read
+        // (with per-chunk verification) still runs when the file is
+        // fully present, so bitrot fails closed exactly as before.
         let len = size.min(max_len);
+        {
+            // Probe only the chunks the requested prefix overlaps: a
+            // shrink needs its kept head, never the tail, so a
+            // remote-only tail must not time the operation out
+            // (write-path.md's bounded-prefix rule). Chunk extents
+            // come from the recorded manifest mappings — plaintext
+            // sizes, a memory lookup, no store reads — and an
+            // unrecorded mapping ends the probe, leaving the view's
+            // sequential read to classify.
+            let runtime = self
+                .engine
+                .runtime_state()
+                .map_err(|_| MutationError::Engine)?;
+            let store = self.store.read().map_err(|_| MutationError::Lock)?;
+            let mut start = 0u64;
+            for chunk in file.chunks() {
+                if start >= len {
+                    break;
+                }
+                let Some(chunk_len) = runtime
+                    .recorded_mappings(chunk)
+                    .first()
+                    .map(|entry| entry.size)
+                    .filter(|size| *size > 0)
+                else {
+                    break;
+                };
+                match store.has(chunk) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(self.mutation_absent(chunk, heads)),
+                    Err(error) => return Err(MutationError::Store(error.failure())),
+                }
+                start = start.saturating_add(chunk_len);
+            }
+        }
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
             .map_err(|error| match error {
+                ViewError::NotMaterialized { content } => MutationError::NeedContent {
+                    chunk: content,
+                    base: Self::pin_head(heads),
+                },
                 // A classified store failure keeps its errno; every
                 // other view failure stays the opaque EIO it is today.
                 ViewError::Store(failure, _) => MutationError::Store(failure),
@@ -980,6 +1476,8 @@ where
     /// Resolve `path` against the current heads' merged view, for the
     /// create/stale checks. `None` means absent; a non-file node is
     /// returned so the caller can distinguish a kind change from absence.
+    /// Remote-only content defers: a lookup that names a missing chunk
+    /// becomes the same `NeedContent` prerequisite authoring uses.
     fn current_node(
         &self,
         heads: &[AuthorizedSnapshot],
@@ -997,23 +1495,47 @@ where
         match view.lookup(path) {
             Ok(node) => Ok(Some(node)),
             Err(ViewError::NotFound) => Ok(None),
-            Err(_) => Err(MutationError::Engine),
+            Err(ViewError::NotMaterialized { content }) => Err(MutationError::NeedContent {
+                chunk: content,
+                base: Self::pin_head(heads),
+            }),
+            Err(error) => {
+                // The boundary reports `EIO` for every view failure
+                // mode; keep the variant for forensics.
+                tracing::debug!(path, error = ?error, "mutation path lookup refused");
+                Err(MutationError::Engine)
+            }
         }
     }
 
-    /// The tree a local mutation read-modify-writes: a single live head,
-    /// `None` for the headless bootstrap, or a conflict. Mutations fail
-    /// closed on multiple heads: there is no single tree to rebuild.
-    fn live_base(&self) -> Result<Option<ContentId>, MutationError> {
+    /// The current eligible heads, traced: every mutation evaluates
+    /// against a fresh classification, and the count disambiguates the
+    /// empty (stale/bootstrap) from the conflicted refusal at the
+    /// commit boundary.
+    fn live_heads_traced(&self) -> Result<Vec<AuthorizedSnapshot>, MutationError> {
         let heads = self
             .engine
             .live_heads()
             .map_err(|_| MutationError::Engine)?;
-        match heads.as_slice() {
-            [] => Ok(None),
-            [head] => Ok(Some(head.snapshot().tree)),
-            _ => Err(MutationError::Conflicted { heads: heads.len() }),
-        }
+        tracing::debug!(
+            eligible_heads = heads.len(),
+            revision = self.engine.current(),
+            "mutation evaluated live heads"
+        );
+        Ok(heads)
+    }
+
+    /// Every still-undischarged announcement obligation, in
+    /// `(snapshot, recipient)` order: queued pairs minus delivered
+    /// ones. Lets supervisors and tests observe the announcement
+    /// backlog — the delivery backlog's source of truth — without
+    /// touching the engine.
+    pub fn pending_announcements(
+        &self,
+    ) -> Result<Vec<(wyrd_format::SnapshotId, wyrd_format::DeviceId)>, LiveError> {
+        self.engine
+            .pending_announcements()
+            .map_err(LiveError::Engine)
     }
 
     /// The served generation count. Bumps exactly when a pass
@@ -1108,7 +1630,9 @@ where
                         // Terminal: no further pass will drain, so complete
                         // still-queued submitters now — returning first
                         // would strand every admitted caller forever.
-                        self.mutations.shutdown();
+                        // Held entries release their fetch wants through
+                        // the same finish path as every terminal outcome.
+                        self.mutations.shutdown_with(Some(Arc::clone(&self.wants)));
                         return Err(error);
                     }
                     // The backoff sleeps on the pacing signal, so a stop
@@ -1125,7 +1649,7 @@ where
         }
         // Stopped with demand possibly in flight: same guarantee as the
         // terminal path — resolve, never strand.
-        self.mutations.shutdown();
+        self.mutations.shutdown_with(Some(Arc::clone(&self.wants)));
         Ok(summary)
     }
 
@@ -1226,5 +1750,467 @@ mod backoff_tests {
             Duration::ZERO
         );
         assert_eq!(jitter_below(Duration::ZERO), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod prereq_tests {
+    use super::*;
+    use crate::view::{Attr, DirEntry, Kind, MaterializationPolicy, OpenFile, ViewLockError};
+    use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+    use wyrd_format::{EntryContent, MemoryObjectStore, ObjectKind};
+    use wyrd_sync::keys::DeviceIdentitySecret;
+
+    /// One-file view over the shared store: resolves the single head's
+    /// root tree from the store and serves its first file entry. Any
+    /// absence — a missing tree or chunk — names its identity as not
+    /// materialized, the `RemoteOnly` arm of the FUSE view's absence
+    /// rule: the fixture is a device whose residency claims remote for
+    /// everything it does not hold. Behavior derives from (store,
+    /// heads) alone, so `open_shared` needs no out-of-band config:
+    /// which prerequisite the mapping sees is a function of which
+    /// objects the store holds.
+    struct FileView {
+        store: Arc<RwLock<MemoryObjectStore>>,
+        materialization: RuntimeMaterialization,
+        heads: Vec<Head>,
+    }
+
+    impl FileView {
+        fn file_entry(&self) -> Result<(String, u64, bool, Vec<ContentId>), ViewError> {
+            let [head] = self.heads.as_slice() else {
+                return Err(ViewError::NotFound);
+            };
+            let store = self
+                .store
+                .read()
+                .map_err(|_| ViewError::Store(StoreFailure::Transient, "poisoned".into()))?;
+            let bytes = store
+                .get(&head.snapshot().tree)
+                .map_err(|error| ViewError::Store(StoreFailure::Transient, format!("{error:?}")))?
+                .ok_or(ViewError::NotMaterialized {
+                    content: head.snapshot().tree,
+                })?;
+            let tree = Tree::decode(&bytes).map_err(|_| ViewError::Corrupt)?;
+            tree.entries()
+                .iter()
+                .find_map(|entry| match &entry.content {
+                    EntryContent::File {
+                        size,
+                        executable,
+                        chunks,
+                    } => Some((
+                        entry.name.as_str().to_string(),
+                        *size,
+                        *executable,
+                        chunks.clone(),
+                    )),
+                    _ => None,
+                })
+                .ok_or(ViewError::NotFound)
+        }
+
+        fn absent(&self, id: &ContentId) -> ViewError {
+            // The fixture's whole residency posture: everything absent
+            // is remote-only, never locally failed or unreachable.
+            ViewError::NotMaterialized { content: *id }
+        }
+    }
+
+    impl NamespaceView for FileView {
+        type Store = MemoryObjectStore;
+        type Materialization = RuntimeMaterialization;
+
+        fn open(
+            _store: Self::Store,
+            _materialization: Self::Materialization,
+            _heads: Vec<Head>,
+        ) -> Self {
+            unimplemented!("tests build the view shared")
+        }
+
+        fn open_shared(
+            store: Arc<RwLock<Self::Store>>,
+            materialization: Self::Materialization,
+            heads: Vec<Head>,
+        ) -> Self {
+            Self {
+                store,
+                materialization,
+                heads,
+            }
+        }
+
+        fn store_handle(&self) -> Arc<RwLock<Self::Store>> {
+            Arc::clone(&self.store)
+        }
+
+        fn store_read(&self) -> Result<RwLockReadGuard<'_, Self::Store>, ViewLockError> {
+            self.store.read().map_err(|_| ViewLockError)
+        }
+
+        fn store_write(&self) -> Result<RwLockWriteGuard<'_, Self::Store>, ViewLockError> {
+            self.store.write().map_err(|_| ViewLockError)
+        }
+
+        fn set_heads(&mut self, heads: Vec<Head>) {
+            self.heads = heads;
+        }
+
+        fn set_materialization(&mut self, _materialization: Self::Materialization) {}
+
+        fn status(&self, id: &ContentId) -> FetchStatus {
+            self.materialization.status(id)
+        }
+
+        fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+            let (name, size, executable, chunks) = self.file_entry()?;
+            if path == name {
+                Ok(Node::File {
+                    size,
+                    executable,
+                    chunks,
+                })
+            } else {
+                Err(ViewError::NotFound)
+            }
+        }
+
+        fn stat(&self, path: &str) -> Result<Attr, ViewError> {
+            match self.lookup(path)? {
+                Node::File {
+                    size, executable, ..
+                } => Ok(Attr {
+                    kind: Kind::File,
+                    size,
+                    executable,
+                }),
+                _ => Err(ViewError::NotADirectory),
+            }
+        }
+
+        fn readdir(&self, _node: &Node) -> Result<Vec<DirEntry>, ViewError> {
+            Err(ViewError::NotADirectory)
+        }
+
+        fn open_file(&self, node: &Node) -> Result<OpenFile, ViewError> {
+            match node {
+                Node::File { chunks, size, .. } => {
+                    let store = self.store.read().map_err(|_| {
+                        ViewError::Store(StoreFailure::Transient, "poisoned".into())
+                    })?;
+                    let present = store.has(&chunks[0]).map_err(|error| {
+                        ViewError::Store(StoreFailure::Transient, format!("{error:?}"))
+                    })?;
+                    if present {
+                        Ok(OpenFile::new(chunks.clone(), *size))
+                    } else {
+                        Err(self.absent(&chunks[0]))
+                    }
+                }
+                _ => Err(ViewError::NotAFile),
+            }
+        }
+
+        fn read(&self, file: &OpenFile, offset: u64, len: usize) -> Result<Vec<u8>, ViewError> {
+            let id = file.chunks()[0];
+            let store = self
+                .store
+                .read()
+                .map_err(|_| ViewError::Store(StoreFailure::Transient, "poisoned".into()))?;
+            let bytes = store
+                .get(&id)
+                .map_err(|error| ViewError::Store(StoreFailure::Transient, format!("{error:?}")))?
+                .ok_or_else(|| self.absent(&id))?;
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let end = start.saturating_add(len).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+    }
+
+    /// A scratch single-member engine with one file (`f`, eleven bytes
+    /// in one chunk) authored, plus the store and identities the live
+    /// node needs: the chunk, the root tree, and the authored head.
+    fn scratch_file_drive(
+        tag: &str,
+    ) -> (
+        Engine,
+        std::path::PathBuf,
+        MemoryObjectStore,
+        ContentId,
+        ContentId,
+        AuthorizedSnapshot,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "wyrd-core-prereq-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.clone(), "core-test-pass", identity).unwrap();
+        let mut store = MemoryObjectStore::default();
+        let chunk = store.insert(ObjectKind::Chunk, b"remote-base").unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 11, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let head = engine.author_snapshot(&store, root).unwrap();
+        (engine, dir, store, chunk, root, head)
+    }
+
+    /// A live node over the fake view: the heads cross as `Head`s like
+    /// production, and the store handle is shared like production.
+    fn live_over_fake(
+        engine: Engine,
+        store: MemoryObjectStore,
+        heads: &[AuthorizedSnapshot],
+    ) -> LiveNode<FileView> {
+        let revision = engine.current();
+        let materialization = RuntimeMaterialization {
+            runtime: engine.runtime_state().unwrap(),
+        };
+        let store = Arc::new(RwLock::new(store));
+        let baseline = FileView::open_shared(
+            Arc::clone(&store),
+            materialization,
+            heads.iter().cloned().map(Head::new).collect(),
+        );
+        LiveNode::split(
+            engine,
+            store,
+            baseline,
+            revision,
+            Duration::from_secs(30),
+            &LiveConfig::default(),
+        )
+        .0
+    }
+
+    /// Reading a prefix of a remote-only file defers on the file's
+    /// chunk (not EIO): the tree resolves locally, the chunk names its
+    /// demand, and the pin is the evaluated single head.
+    #[test]
+    fn prefix_read_on_remote_only_file_defers_with_the_evaluated_pin() {
+        let (engine, dir, mut store, chunk, root, head) = scratch_file_drive("prefix");
+        // The tree resolves; the chunk does not.
+        let tree_bytes = store.get(&root).unwrap().unwrap();
+        store = MemoryObjectStore::default();
+        store
+            .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+            .unwrap();
+        let base = head.snapshot().snapshot_id();
+        let node = live_over_fake(engine, store, &[head]);
+        let error = node
+            .read_current_file_prefix(&node.live_heads_traced().unwrap(), "f", 64)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::NeedContent {
+                chunk,
+                base: Some(base),
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Resolving a path whose subtree is remote-only defers on the
+    /// subtree identity: the lookup names its demand like a read does.
+    #[test]
+    fn lookup_on_remote_only_subtree_defers_with_the_evaluated_pin() {
+        let (engine, dir, _store, _chunk, root, head) = scratch_file_drive("lookup");
+        // Neither the tree nor the chunk is servable here.
+        let node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let base = node.live_heads_traced().unwrap()[0]
+            .snapshot()
+            .snapshot_id();
+        let error = node
+            .current_node(&node.live_heads_traced().unwrap(), "f")
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::NeedContent {
+                chunk: root,
+                base: Some(base),
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Structural trees go through the same absence rule as chunks:
+    /// `mkdir` against a head whose root tree is missing from the
+    /// store but claimed local by the engine fails closed
+    /// (`Store(Transient)` → EIO, no want), exactly like a chunk in
+    /// that state — the paired rule in `mutation_absent`, not the
+    /// format mutation's own error. When the engine calls the tree
+    /// remote, the same helper names it a `NeedContent` prerequisite
+    /// (the chunk tests pin that arm).
+    #[test]
+    fn namespace_mutation_on_absent_claimed_local_tree_fails_closed() {
+        let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("root-tree");
+        // Serve from an empty store: even the root tree is absent.
+        let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let error = node
+            .apply_mutation(
+                &crate::mutation::MutationKind::Mkdir {
+                    path: "newdir".to_string(),
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error, MutationError::Store(StoreFailure::Transient));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A mailbox that accepts and delivers nothing: the run-loop
+    /// regression below never exercises intake.
+    struct NoopMailbox;
+
+    impl wyrd_sync::transport::mailbox::Mailbox for NoopMailbox {
+        fn send(
+            &mut self,
+            _envelope: wyrd_sync::transport::mailbox::MailboxEnvelope,
+        ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(())
+        }
+
+        fn recv(
+            &mut self,
+        ) -> Result<
+            Option<wyrd_sync::transport::mailbox::Delivery>,
+            wyrd_sync::transport::mailbox::MailboxError,
+        > {
+            Ok(None)
+        }
+
+        fn settle(
+            &mut self,
+            _id: wyrd_sync::transport::mailbox::DeliveryId,
+            _disposition: wyrd_sync::transport::mailbox::Disposition,
+        ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            Ok(())
+        }
+    }
+
+    /// A store that cannot be read during closure verification is not
+    /// closure damage: the failure carries the store's own
+    /// classification so the failure policy spends the store budget,
+    /// not the fatal engine one.
+    #[test]
+    fn a_store_read_failure_keeps_its_store_class() {
+        use wyrd_format::{StoreError, StoreFailure};
+        #[derive(Debug)]
+        struct Unreadable(StoreFailure);
+        impl StoreError for Unreadable {
+            fn failure(&self) -> StoreFailure {
+                self.0
+            }
+        }
+        struct UnreadableStore(StoreFailure);
+        impl wyrd_format::ObjectStore for UnreadableStore {
+            type Error = Unreadable;
+            fn insert(
+                &mut self,
+                _kind: ObjectKind,
+                _data: &[u8],
+            ) -> Result<ContentId, Self::Error> {
+                Err(Unreadable(self.0))
+            }
+            fn insert_verified(
+                &mut self,
+                _kind: ObjectKind,
+                _expected: &ContentId,
+                _data: &[u8],
+            ) -> Result<(), Self::Error> {
+                Err(Unreadable(self.0))
+            }
+            fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+                Err(Unreadable(self.0))
+            }
+            fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+                Err(Unreadable(self.0))
+            }
+        }
+        let (engine, dir, _store, _chunk, _root, _head) = scratch_file_drive("store-class");
+        // The authored head's root manifest record exists, so closure
+        // verification reads the store — and cannot.
+        let runtime = engine.runtime_state().unwrap();
+        let heads = engine.live_heads().unwrap();
+        let error = partition_heads(&runtime, heads, &UnreadableStore(StoreFailure::StorageFull))
+            .expect_err("an unreadable store fails the pass");
+        assert!(
+            matches!(error, EngineError::Store(StoreFailure::StorageFull)),
+            "the store class survives the closure boundary: {error:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An incomplete closure never spends the fatal engine-error
+    /// budget: the drive is authored into one store and served from
+    /// an empty one, so every pass finds the head's closure unfetched
+    /// — for more consecutive passes than the loop's configured cap —
+    /// and the loop still shuts down cleanly. A damaged closure would
+    /// end the run at the cap; ordinary fetch progress must not.
+    #[test]
+    fn an_incomplete_head_never_burns_the_engine_error_cap() {
+        let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("incomplete");
+        // Serve from an empty store: the head's tree and chunk are
+        // absent, so its closure is pending, not damaged.
+        let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let cap = 3u32;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let config = LiveConfig {
+            interval: Duration::from_millis(5),
+            max_consecutive_errors: cap,
+            ..LiveConfig::default()
+        };
+        let outcome = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let mut mailbox = NoopMailbox;
+                node.run_loop(
+                    &mut mailbox,
+                    None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+                    &stop,
+                    &config,
+                    &mut |_, _| {},
+                )
+            });
+            // Long enough for the cap-plus-one passes at this cadence.
+            std::thread::sleep(Duration::from_millis(300));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            handle.join().unwrap()
+        });
+        let summary = outcome.expect("the loop must not die on pending closure");
+        assert!(
+            summary.passes > u64::from(cap),
+            "the loop must keep passing an incomplete closure past the cap, saw {}",
+            summary.passes
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Local content keeps its mappings: a served prefix reads, a
+    /// missing path is `NotFound`, and a missing lookup is absence —
+    /// the demand mapping changes nothing for held bytes.
+    #[test]
+    fn local_content_keeps_its_mappings() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("local");
+        let node = live_over_fake(engine, store, &[head]);
+        let heads = node.live_heads_traced().unwrap();
+        assert_eq!(
+            node.read_current_file_prefix(&heads, "f", 64).unwrap(),
+            b"remote-base"
+        );
+        assert_eq!(
+            node.read_current_file_prefix(&heads, "gone", 64)
+                .unwrap_err(),
+            MutationError::NotFound("gone".to_string())
+        );
+        assert_eq!(node.current_node(&heads, "gone").unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

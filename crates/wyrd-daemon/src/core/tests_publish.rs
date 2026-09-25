@@ -2,11 +2,14 @@ use super::*;
 
 use wyrd_fuse::DriveView;
 
-use wyrd_format::{DeviceId, FsObjectStore, MemoryObjectStore};
+use wyrd_format::{
+    DeviceId, Entry, FsObjectStore, MemoryObjectStore, ObjectKind, ObjectStore, Tree,
+};
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use wyrd_sync::transport::mailbox::{Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope};
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -126,6 +129,180 @@ fn loop_publishes_admission_catch_up() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A serving barrier under test control: fails while `fail` is set,
+/// counts every flush. A deterministic mirror outage and recovery.
+struct ControllableBarrier {
+    fail: AtomicBool,
+    /// When set, the barrier burns its whole budget and reports
+    /// "not ready yet" — the slow-mirror case, which must skip the
+    /// discharge exactly like the failed one.
+    stall: AtomicBool,
+    flushes: AtomicUsize,
+}
+
+impl ServingBarrier for ControllableBarrier {
+    fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("mirror down"));
+        }
+        if self.stall.load(Ordering::SeqCst) {
+            let start = Instant::now();
+            while start.elapsed() < budget.min(Duration::from_millis(50)) {
+                std::thread::yield_now();
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// Announcement discharge waits for serving readiness: while the
+/// mirror barrier fails, publish passes swap the projection (local
+/// liveness) and discharge control-plane obligations, but the
+/// announcement obligation stays pending and no announcement envelope
+/// goes out. Once the barrier passes, the next pass discharges it.
+/// Idle passes never touch the barrier.
+#[test]
+fn announcement_discharge_waits_for_serving_readiness() {
+    let (mut engine, dir, _) = scratch_drive();
+    let member = admit_member(&mut engine);
+    // One authored file: exactly one announcement obligation, so the
+    // envelope counts below are exact, not lower bounds.
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"hello").unwrap();
+    let root = Tree::from_entries(vec![Entry::file("h.txt", 5, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let authored = engine.author_snapshot(&objects, root).unwrap();
+    let id = authored.snapshot().snapshot_id();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, objects).unwrap();
+    let (mut live, backend) = live_backend(daemon);
+    assert_eq!(
+        live.pending_announcements().unwrap(),
+        vec![(id, member)],
+        "one announcement obligation before the first pass"
+    );
+
+    let barrier = Arc::new(ControllableBarrier {
+        fail: AtomicBool::new(true),
+        stall: AtomicBool::new(false),
+        flushes: AtomicUsize::new(0),
+    });
+    live.set_serving_barrier(barrier.clone());
+
+    // Mirror down: the pass publishes locally and discharges the
+    // control plane, but the announcement stays pending.
+    let mut mailbox = ThreadRecordingMailbox::new();
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(
+        report.published,
+        "local publication proceeds on mirror failure"
+    );
+    // The file serves from the new generation despite the outage.
+    let read = backend.open_at("h.txt").unwrap();
+    assert_eq!(backend.read_handle(read, 0, 64).unwrap(), b"hello");
+    backend.release_handle(read).unwrap();
+    assert_eq!(
+        live.pending_announcements().unwrap(),
+        vec![(id, member)],
+        "announcement discharge waits for the barrier"
+    );
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 1);
+    let control_sent = mailbox.drained().len();
+    assert!(
+        control_sent >= 2,
+        "transition plus capability still discharge, got {control_sent}"
+    );
+    for envelope in mailbox.drained() {
+        assert_eq!(envelope.recipient, member);
+    }
+
+    // Still down: the next pass retries the barrier instead of idling
+    // on the unchanged obligations.
+    let mut mailbox = ThreadRecordingMailbox::new();
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(
+        report.published,
+        "undischarged obligations force republication"
+    );
+    assert_eq!(
+        live.pending_announcements().unwrap(),
+        vec![(id, member)],
+        "the retry still discharges nothing while the mirror is down"
+    );
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 2);
+
+    // Slow mirror: burning the budget is "not ready yet", which skips
+    // the discharge the same way a failure does.
+    barrier.fail.store(false, Ordering::SeqCst);
+    barrier.stall.store(true, Ordering::SeqCst);
+    let mut mailbox = ThreadRecordingMailbox::new();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(
+        live.pending_announcements().unwrap(),
+        vec![(id, member)],
+        "a slow mirror holds the announcement too"
+    );
+    assert!(mailbox.drained().is_empty(), "a slow mirror sends nothing");
+
+    // Mirror recovered: the next pass discharges the announcement.
+    barrier.stall.store(false, Ordering::SeqCst);
+    let mut mailbox = ThreadRecordingMailbox::new();
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(report.published);
+    assert!(
+        live.pending_announcements().unwrap().is_empty(),
+        "the recovered barrier discharges the announcement"
+    );
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 4);
+    let sent = mailbox.drained();
+    assert_eq!(
+        sent.len(),
+        1,
+        "exactly the announcement discharges, got {}",
+        sent.len()
+    );
+    assert_eq!(sent[0].recipient, member);
+
+    // The delivered markers from that discharge advance the durable
+    // sequence, so one republication follows: it sends nothing, then
+    // the loop idles without touching the barrier.
+    let mut mailbox = ThreadRecordingMailbox::new();
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(report.published, "delivered markers republicate once");
+    assert!(mailbox.drained().is_empty(), "nothing left to send");
+    // The outbox is drained, so the barrier is not asked: it gates
+    // discharge, and there is nothing to discharge. (A slow mirror
+    // would otherwise burn its whole budget for nothing — and delay
+    // shutdown past its deadline.)
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 4);
+    let quiet = live
+        .sync_once(&mut NoopMailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(!quiet.published, "a drained outbox idles");
+    assert_eq!(
+        barrier.flushes.load(Ordering::SeqCst),
+        4,
+        "idle passes never touch the barrier"
+    );
+
+    drop(live);
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// The full mounted path publishes: a write through the backend,
 /// applied by the threaded loop, announces on top of the drained
 /// catch-up — every post-baseline envelope belongs to the write and
@@ -154,6 +331,9 @@ fn loop_announces_mounted_writes() {
                 error_base_delay: Duration::from_millis(5),
                 error_max_delay: Duration::from_millis(20),
                 max_consecutive_errors: 10,
+                max_mutation_wait: Duration::from_secs(30),
+                serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
                 budgets: ResourceBudgets::default(),
             },
             &mut |_, _| {},
@@ -205,6 +385,61 @@ fn loop_announces_mounted_writes() {
         assert_eq!(envelope.recipient, member);
     }
 
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A control-plane-only outbox never touches the serving mirror. The
+/// barrier gates announcement discharge: with transitions (or
+/// capabilities) pending and no announcement, a slow mirror must not
+/// consume the serving budget — that wait bounds the pass and delays
+/// shutdown for a gate that gates nothing.
+#[test]
+fn a_control_plane_only_outbox_never_flushes_the_serving_barrier() {
+    let (mut engine, dir, _) = scratch_drive();
+    let member = admit_member(&mut engine);
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (mut live, backend) = live_backend(daemon);
+
+    // The first pass cannot deliver (dead relay), so the admission's
+    // transition and capability obligations stay pending — and
+    // nothing is announced.
+    live.sync_once(&mut SendFailingMailbox, None::<&mut MemoryBulkSource>)
+        .expect("unsendable control-plane work never fails the pass");
+    assert!(
+        live.pending_announcements().unwrap().is_empty(),
+        "control-plane-only backlog: nothing announced"
+    );
+
+    // The relay is still down on the next pass, so the obligations
+    // are pending when the publish step reaches the barrier gate —
+    // and a slow mirror must not be asked.
+    let barrier = Arc::new(ControllableBarrier {
+        fail: AtomicBool::new(false),
+        stall: AtomicBool::new(true),
+        flushes: AtomicUsize::new(0),
+    });
+    live.set_serving_barrier(barrier.clone());
+    live.sync_once(&mut SendFailingMailbox, None::<&mut MemoryBulkSource>)
+        .expect("unsendable control-plane work never fails the pass");
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 0);
+
+    // With the relay recovered, the control plane discharges — still
+    // without the mirror, which gates nothing here.
+    let mut mailbox = ThreadRecordingMailbox::new();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .expect("control-plane work never fails the pass");
+    assert!(
+        !mailbox.drained().is_empty(),
+        "the transition and capability still discharge"
+    );
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 0);
+    for envelope in mailbox.drained() {
+        assert_eq!(envelope.recipient, member);
+    }
+
+    drop(live);
     drop(backend);
     std::fs::remove_dir_all(dir).unwrap();
 }

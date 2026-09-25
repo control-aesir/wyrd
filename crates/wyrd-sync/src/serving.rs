@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr};
@@ -24,7 +24,7 @@ use thiserror::Error;
 use wyrd_format::durable;
 use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
-use crate::bulk::{BulkError, BulkSource, SealedManifest};
+use crate::bulk::{AttemptBudget, BulkError, BulkSource, SealedManifest};
 use crate::runtime::RuntimeState;
 use crate::seal::blob_root;
 use crate::transport::encode_node_addr;
@@ -70,7 +70,104 @@ pub(crate) enum MirrorItem {
     /// A drain barrier: the sender receives readiness once every earlier
     /// import has been handled — `Ok` when all landed, `Err` naming the
     /// first import failure (sticky until restart, see [`drain_mirror`]).
-    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
+    Flush(
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+        /// The caller's in-flight permit: cleared by the worker when
+        /// the barrier is actually handled, never by the caller's
+        /// timeout — a timed-out barrier still sits in the queue, and
+        /// a permit released early would let the next pass queue
+        /// another one behind it.
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+    ),
+}
+
+/// A cloneable readiness handle for a serving endpoint: the channel
+/// and runtime the [`flush`](ServingEndpoint::flush) barrier needs,
+/// without the owned router and runtime the endpoint's shutdown
+/// consumes. The composer hands one to the live loop's serving
+/// barrier, so every publish pass gates announcement discharge on
+/// mirror readiness while endpoint ownership (and shutdown) stays
+/// with the composer.
+#[derive(Debug, Clone)]
+pub struct ServingHandle {
+    runtime: tokio::runtime::Handle,
+    sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+    /// At most one barrier is in flight: a caller whose timed-out
+    /// barrier is still queued behind a slow import must not pile
+    /// more barriers onto the unbounded channel (they would only
+    /// queue more stale acks). While set, a second caller reports
+    /// "not ready" instead of enqueueing its own.
+    barrier_in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ServingHandle {
+    /// Wait until every import enqueued so far has landed in the
+    /// serving mirror. A mirror import that failed makes the barrier
+    /// fail — announcing over a representation the mirror cannot
+    /// serve would strand the peer until a restart.
+    pub fn flush(&self) -> std::io::Result<()> {
+        match self.flush_bounded(std::time::Duration::MAX) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(std::io::Error::other("serving mirror drain stopped")),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The barrier under a time budget: `Ok(true)` once every earlier
+    /// import landed, `Ok(false)` when the budget ran out first (the
+    /// drain continues in the background and the next barrier sees
+    /// it), `Err` when the mirror failed or is gone. A caller gating
+    /// discharge treats "not ready" exactly like failure: skip the
+    /// send, retry next pass — the readiness ordering never weakens,
+    /// and a slow mirror can no longer stretch the caller's pass.
+    pub fn flush_bounded(&self, budget: std::time::Duration) -> Result<bool, std::io::Error> {
+        use std::sync::atomic::Ordering;
+        // One outstanding barrier: a caller that finds one in flight
+        // (the previous pass timed out but its item is still queued
+        // behind a slow import) reports "not ready" instead of
+        // queueing another onto the unbounded channel.
+        if self
+            .barrier_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let release = Arc::clone(&self.barrier_in_flight);
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        if let Err(error) = self.send(MirrorItem::Flush(ack, Some(Arc::clone(&release)))) {
+            release.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        // The timeout runs as a task on the runtime: a bare
+        // `Handle::block_on` drives no timer, so the deadline would
+        // panic instead of firing.
+        let waiter = self.runtime.spawn(async move {
+            // On timeout the barrier is still queued: the permit stays
+            // held until the worker handles it (the drain clears it),
+            // so coalescing reflects actual queue consumption.
+            match tokio::time::timeout(budget, wait).await {
+                Ok(Ok(Ok(()))) => Ok(true),
+                Ok(Ok(Err(message))) => Err(std::io::Error::other(format!(
+                    "serving mirror import failed: {message}"
+                ))),
+                Ok(Err(_)) => Err(std::io::Error::other("serving mirror drain stopped")),
+                Err(_) => Ok(false),
+            }
+        });
+        self.runtime.block_on(waiter).map_err(|_| {
+            // The task itself was lost (runtime gone): nothing will
+            // clear the permit, so release it here.
+            release.store(false, Ordering::SeqCst);
+            std::io::Error::other("serving barrier task lost")
+        })?
+    }
+
+    fn send(&self, item: MirrorItem) -> std::io::Result<()> {
+        self.sender
+            .send(item)
+            .map_err(|_| std::io::Error::other("serving mirror closed"))
+    }
 }
 
 /// Unique temp-file suffix so concurrent imports of the same root never
@@ -311,11 +408,14 @@ async fn drain_mirror<F, Fut>(
                     failure.get_or_insert(error);
                 }
             }
-            MirrorItem::Flush(ack) => {
+            MirrorItem::Flush(ack, permit) => {
                 let _ = ack.send(match &failure {
                     Some(error) => Err(error.clone()),
                     None => Ok(()),
                 });
+                if let Some(permit) = permit {
+                    permit.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         }
     }
@@ -411,27 +511,30 @@ impl ServingEndpoint {
         encode_node_addr(&self.addr())
     }
 
+    /// A cloneable readiness handle for the live loop's serving
+    /// barrier: shares this endpoint's mirror channel and runtime, so
+    /// per-pass announcement gating does not move the endpoint.
+    pub fn handle(&self) -> ServingHandle {
+        ServingHandle {
+            runtime: self.runtime.handle().clone(),
+            sender: self.sender.clone(),
+            barrier_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
     /// Wait until every import enqueued so far has landed in the serving
     /// mirror. Publication paths flush before announcing, so a peer acting
     /// on the announcement never races the write-through. A mirror import
     /// that failed makes the barrier fail — announcing over a representation
     /// the mirror cannot serve would strand the peer until a restart.
     pub fn flush(&self) -> std::io::Result<()> {
-        let (ack, wait) = tokio::sync::oneshot::channel();
-        self.send(MirrorItem::Flush(ack))?;
-        match self.runtime.block_on(wait) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(std::io::Error::other(format!(
-                "serving mirror import failed: {message}"
-            ))),
-            Err(_) => Err(std::io::Error::other("serving mirror drain stopped")),
-        }
+        self.handle().flush()
     }
 
-    fn send(&self, item: MirrorItem) -> std::io::Result<()> {
-        self.sender
-            .send(item)
-            .map_err(|_| std::io::Error::other("serving mirror closed"))
+    /// The endpoint's barrier under a time budget: see
+    /// [`ServingHandle::flush_bounded`].
+    pub fn flush_bounded(&self, budget: std::time::Duration) -> Result<bool, std::io::Error> {
+        self.handle().flush_bounded(budget)
     }
 
     /// Stop serving and join the runtime. The vault's write-through slot
@@ -546,6 +649,10 @@ impl VaultSource {
         })
     }
 }
+
+/// Local vault reads: instantaneous, so the plan's per-attempt cap
+/// has nothing to bound.
+impl AttemptBudget for VaultSource {}
 
 impl BulkSource for VaultSource {
     fn fetch_root_manifest(
@@ -863,6 +970,82 @@ mod tests {
         }
     }
 
+    /// The queued-barrier lifetime, end to end: a barrier that times
+    /// out is still in the queue, so a second caller must coalesce
+    /// onto it (never enqueue its own) and only a worker-handled
+    /// barrier frees the permit for the next one.
+    #[test]
+    fn a_timed_out_barrier_stays_queued_until_the_worker_handles_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let import_release = Arc::clone(&release);
+        let worker = runtime.spawn(drain_mirror(receiver, move |_bytes| {
+            let import_release = Arc::clone(&import_release);
+            async move {
+                while !import_release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Ok(())
+            }
+        }));
+        let handle = ServingHandle {
+            runtime: runtime.handle().clone(),
+            sender: sender.clone(),
+            barrier_in_flight: Arc::new(AtomicBool::new(false)),
+        };
+
+        // A blocked import: the first barrier times out but stays
+        // queued behind the import.
+        sender.send(MirrorItem::Import(vec![7])).unwrap();
+        let start = Instant::now();
+        assert!(
+            !handle.flush_bounded(Duration::from_millis(30)).unwrap(),
+            "a barrier behind a blocked import reports not-ready"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(25), "it waited");
+
+        // Coalesced: the queued barrier holds the permit, so the
+        // second caller returns immediately without enqueueing.
+        let start = Instant::now();
+        assert!(
+            !handle.flush_bounded(Duration::from_secs(30)).unwrap(),
+            "the second caller coalesces onto the queued barrier"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "coalescing returns without waiting"
+        );
+
+        // The worker handles the queued barriers once the import
+        // lands; only then does a fresh barrier succeed. Until the
+        // worker gets there, callers keep coalescing.
+        release.store(true, Ordering::SeqCst);
+        let mut ready = false;
+        for _ in 0..200 {
+            if handle.flush_bounded(Duration::from_millis(200)).unwrap() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready,
+            "a fresh barrier succeeds once the worker handled the queued ones"
+        );
+        drop(handle);
+        drop(sender);
+        runtime.block_on(worker).unwrap();
+    }
+
     #[tokio::test]
     async fn mirror_flush_reports_the_first_import_failure() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -871,7 +1054,7 @@ mod tests {
         }));
         sender.send(MirrorItem::Import(vec![1, 2, 3])).unwrap();
         let (ack, wait) = tokio::sync::oneshot::channel();
-        sender.send(MirrorItem::Flush(ack)).unwrap();
+        sender.send(MirrorItem::Flush(ack, None)).unwrap();
         assert!(
             wait.await.unwrap().is_err(),
             "flush must not claim readiness"
@@ -880,7 +1063,7 @@ mod tests {
         // so the representation is never re-queued until a restart
         // rebuilds the mirror.
         let (ack, wait) = tokio::sync::oneshot::channel();
-        sender.send(MirrorItem::Flush(ack)).unwrap();
+        sender.send(MirrorItem::Flush(ack, None)).unwrap();
         assert!(wait.await.unwrap().is_err());
         drop(sender);
         worker.await.unwrap();

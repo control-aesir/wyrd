@@ -1227,7 +1227,9 @@ impl Engine {
     ///
     /// ```text
     /// bulk bytes absent ........... unfulfilled plus missing, retried next run
-    /// bulk transport error ........ unfulfilled plus transport_errors, retried next run
+    /// bulk transport error ........ unfulfilled plus transport_errors, retried
+    ///                               next run; repeated failures back the
+    ///                               representation off like invalid data
     /// epoch capability unheld ..... unfulfilled plus unavailable_keys, retried next run
     /// over fetch ceiling .......... unfulfilled plus invalid, never committed
     /// over ingest limits .......... unfulfilled plus invalid, never committed
@@ -1255,6 +1257,20 @@ impl Engine {
         super::plan::execute(self, bulk, objects)
     }
 
+    /// The same run under a wall-clock budget: the plan stops starting
+    /// fetch work at `deadline` and caps each in-flight attempt at the
+    /// remaining time, so a stalled provider cannot push a caller's
+    /// timeout decision past its bound. Unstarted work stays pending
+    /// for the next run. `None` is the unbounded run.
+    pub fn execute_plan_sliced(
+        &mut self,
+        bulk: &mut impl BulkSource,
+        objects: &mut impl ObjectStore,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<ExecuteReport, EngineError> {
+        super::plan::execute_sliced(self, bulk, objects, deadline)
+    }
+
     /// Whether a representation is fetch-eligible this run: its cooldown
     /// (if any) has expired. Cooled representations are skipped, not
     /// attempted — the item stays pending and reports unfulfilled.
@@ -1277,6 +1293,29 @@ impl Engine {
     /// the strike threshold puts the representation in cooldown starting
     /// after this run. A later fulfillment clears everything.
     pub(super) fn note_fetch_invalid(&mut self, key: &FetchKey) {
+        let (strikes, last_run) = self.fetch_strikes.entry(*key).or_insert((0, 0));
+        if *last_run == self.fetch_run {
+            return;
+        }
+        *last_run = self.fetch_run;
+        *strikes = strikes.saturating_add(1);
+        if *strikes >= FETCH_MAX_STRIKES {
+            self.fetch_cool_until
+                .insert(*key, self.fetch_run + FETCH_COOLDOWN_PASSES);
+        }
+    }
+
+    /// Record a transport-failed fetch attempt, on the same
+    /// one-strike-per-run ledger as invalid data: a representation
+    /// whose provider is repeatedly unreachable backs off into
+    /// cooldown, exactly like a corrupt one. Without it an unreachable
+    /// route is retried every pass forever, and (under a per-pass
+    /// budget) those retries can starve every item sorted behind the
+    /// dead route — the plan would livelock instead of progressing.
+    /// Absence, missing keys, and local refusals never strike (they
+    /// are not evidence about the representation); a fulfillment
+    /// clears the ledger.
+    pub(super) fn note_fetch_transport_failure(&mut self, key: &FetchKey) {
         let (strikes, last_run) = self.fetch_strikes.entry(*key).or_insert((0, 0));
         if *last_run == self.fetch_run {
             return;

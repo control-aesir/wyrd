@@ -60,8 +60,41 @@ cargo test --workspace --doc  # doctests; nextest skips these
 cargo nextest run --profile slow
                             # >10s live-relay tests; excluded from
                             # regular runs, gated on master CI
+cargo test -p wyrd-cli      # CLI suite (argument parsing, exit codes)
 devenv shell                # enter the dev environment (rust, git-hooks)
 ```
+
+## Running the Lima e2e suite
+
+`./lima/run-alpha.sh [--keep] [--step N[,N...]]` is long (minutes) and lives in a
+guest. Operate it, never babysit it blind:
+
+- **Never pipe it through `tail`.** A foreground pipe buffers everything, so
+  a twenty-minute run looks like a hang. Run it detached with the output to a
+  log (`(./lima/run-alpha.sh --keep > /tmp/lima/run.log 2>&1 &)`) and poll the
+  log in bounded chunks (~8 minutes per poll so the session never times out).
+- `--step` takes a comma list and runs the prefix closure (steps build on
+  each other): `--step 4` runs steps 1–4, `--step 4,6` runs 1–6. An empty
+  entry or a non-step is refused; an empty value means all steps.
+- **A repeated `FAIL:` line is a stop, not patience.** The harness exits on
+  the first failed check, so two identical polls mean the run is over —
+  read the log, pull the failing mount's stderr out of the guest
+  (`limactl shell wyrd-alpha -- grep ... "$HOME/e2e/logs/mount-*.err"`), fix,
+  rerun. Ten identical polls have happened; none were productive.
+- **Check liveness where it lives:** the guest contract process
+  (`limactl shell wyrd-alpha -- pgrep -f alpha-lima.sh`). A host `pgrep` for
+  the wrapper matches short-lived subshells and lies about liveness.
+- `limactl shell` prints a harmless `cd: <host path>: No such file` when the
+  host cwd does not exist in the guest. It is noise; the command still runs.
+- Any background process the harness starts (mounts, the relay) inherits its
+  stdout, so a `die` that leaves one running makes the host wrapper wait on a
+  pipe that never closes. The harness reaps them in an EXIT trap; keep it that
+  way when adding steps.
+- The guest's drive state is under `$HOME/e2e` (not `/tmp/lima`); logs per run
+  in `$HOME/e2e/logs`.
+- Failures here are usually product bugs, not harness bugs — the suite exists
+  to find them. Diagnose from the phase timings in the mount logs
+  (`wyrd_core=debug` is on for step 6) before touching the script.
 
 ## Conventions
 

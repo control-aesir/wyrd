@@ -71,11 +71,26 @@ pub enum BulkError {
     Oversize { bytes: usize, max: usize },
 }
 
+/// Per-attempt fetch deadline knob: the plan hands the source the
+/// absolute instant its budget runs out (the nearest held-mutation
+/// deadline), and the source clamps **every** attempt to the time
+/// remaining at that attempt — a deadline, not a duration, so a later
+/// attempt in the same pass cannot re-arm with a stale budget after an
+/// earlier attempt burned its share. One stalled provider can no
+/// longer push a timeout decision past its wall-clock bound. The
+/// default is a no-op (attempts run under the source's own built-in
+/// timeouts); sources with real per-attempt deadlines override it.
+/// The knob is plan-run state: the plan sets it at entry and clears
+/// it on the way out.
+pub trait AttemptBudget {
+    fn set_attempt_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
+}
+
 /// The synchronous bulk boundary: sealed manifests and sealed objects
 /// by their fetch addresses. Every fetch is size-aware: `max` is the
 /// caller's pre-decode byte ceiling, and a representation over it must
 /// fail with [`BulkError::Oversize`] rather than return bytes.
-pub trait BulkSource {
+pub trait BulkSource: AttemptBudget {
     /// The sealed root manifest a member peer holds for a snapshot, if any.
     fn fetch_root_manifest(
         &mut self,
@@ -140,6 +155,14 @@ fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
 /// transport failure, so the plan retries it on the next pass.
 const FETCH_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Upper bound for one whole blob fetch (dial plus verified transfer):
+/// the dial bound alone still leaves the size discovery and the Bao
+/// stream unbounded, and a peer that connects but never streams wedges
+/// the pass exactly the same way. Must exceed the dial bound with room
+/// for a slow-but-moving transfer; oversize and verified-invalid still
+/// short-circuit before any bytes buffer.
+const FETCH_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Dial one provider with a deadline: the timeout above is the live
 /// value; the parameter exists so tests can prove boundedness fast
 /// against an unroutable provider.
@@ -178,6 +201,11 @@ pub struct IrohBulkSource {
     /// update replaces it (last accepted wins), so those maps stay
     /// single-valued by policy.
     transport: BTreeMap<BaoRoot, Vec<IrohBlobRef>>,
+    /// Plan-run deadline from [`AttemptBudget`]: the instant the pass's
+    /// budget runs out, re-clamped to the remaining time on every
+    /// attempt. `None` runs under the built-in timeouts. Plan-run
+    /// state, reset by the plan — never source configuration.
+    attempt_deadline: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -205,6 +233,7 @@ impl IrohBulkSource {
             snapshots: BTreeMap::new(),
             sealed: BTreeMap::new(),
             transport: BTreeMap::new(),
+            attempt_deadline: None,
         }
     }
 
@@ -341,18 +370,41 @@ impl IrohBulkSource {
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
+        // The plan may cap this attempt at the time remaining to its
+        // deadline, re-read here so every attempt in the pass clamps
+        // to the live remaining: a sliced attempt reports a transport
+        // timeout (retried next pass), never a strike — the deadline
+        // belongs to the waiter, not the provider. Unbudgeted runs
+        // use the built-in timeouts.
+        let blob_timeout = self
+            .attempt_deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(FETCH_BLOB_TIMEOUT)
+            })
+            .unwrap_or(FETCH_BLOB_TIMEOUT);
+        let dial_timeout = FETCH_DIAL_TIMEOUT.min(blob_timeout);
         self.runtime.block_on(async move {
-            let connection = dial(&endpoint, provider, FETCH_DIAL_TIMEOUT).await?;
-            let (size, _) = get_verified_size(&connection, &hash)
-                .await
-                .map_err(|error| BulkError::Transport(error.to_string()))?;
-            if size > max as u64 {
-                return Err(BulkError::Oversize {
-                    bytes: usize::try_from(size).unwrap_or(usize::MAX),
-                    max,
-                });
-            }
-            bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
+            // One deadline for the whole attempt: dial, size discovery,
+            // and streaming share it, so a peer that connects but never
+            // streams cannot outlast a peer that never answers. Slow
+            // passes still complete; the plan retries what they miss.
+            tokio::time::timeout(blob_timeout, async move {
+                let connection = dial(&endpoint, provider, dial_timeout).await?;
+                let (size, _) = get_verified_size(&connection, &hash)
+                    .await
+                    .map_err(|error| BulkError::Transport(error.to_string()))?;
+                if size > max as u64 {
+                    return Err(BulkError::Oversize {
+                        bytes: usize::try_from(size).unwrap_or(usize::MAX),
+                        max,
+                    });
+                }
+                bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
+            })
+            .await
+            .map_err(|_| BulkError::Transport("blob fetch timed out".to_string()))?
         })
     }
 }
@@ -407,6 +459,12 @@ where
     Err(BulkError::Transport(
         "blob stream ended without completion".to_string(),
     ))
+}
+
+impl AttemptBudget for IrohBulkSource {
+    fn set_attempt_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.attempt_deadline = deadline;
+    }
 }
 
 impl BulkSource for IrohBulkSource {
@@ -495,6 +553,10 @@ impl MemoryBulkSource {
         self.sealed.insert(storage, sealed);
     }
 }
+
+/// In-memory: attempts are instant, so the plan's per-attempt cap
+/// has nothing to bound.
+impl AttemptBudget for MemoryBulkSource {}
 
 impl BulkSource for MemoryBulkSource {
     fn fetch_root_manifest(

@@ -40,9 +40,16 @@
 //!    projection mounts the drive (`architecture.md` invariant 3).
 //! 10. `failed_projection_leaves_installed_heads_untouched` — a
 //!     damaged durable store fails the projection closed and the view
-//!     keeps serving what it served before; refresh is all-or-nothing.
-//!     Pins the decided v0 policy: failure ⇒ heads unchanged ⇒ error
-//!     surfaced ⇒ no automatic repair, resync, or clear (`docs/epochs.md`).
+//!     keeps serving what it served before. Pins the decided v0
+//!     policy: failure ⇒ heads unchanged ⇒ error surfaced ⇒ no
+//!     automatic repair, resync, or clear (`docs/epochs.md`). The
+//!     projection itself is per validity class, not all-or-nothing:
+//!     verified heads install, heads still fetching wait (never
+//!     blanking a serving view), damaged heads fail — pinned by
+//!     `a_pending_only_pass_still_delivers_the_durable_outbox`,
+//!     `an_installed_head_survives_a_pending_successor_refresh`,
+//!     `a_damaged_head_beside_an_installed_one_fails_the_pass_closed`,
+//!     and the two mixed-validity head contracts.
 //! 11. `authored_snapshots_mount_through_the_daemon_view` — the local
 //!     write path: a member authors a snapshot and the daemon's
 //!     classified projection serves its tree (`docs/epochs.md`).

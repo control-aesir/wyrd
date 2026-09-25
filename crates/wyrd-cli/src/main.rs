@@ -517,6 +517,12 @@ fn mount(
     // transition, and capability obligations to the relay.
     serving.flush().map_err(CliError::Serving)?;
     live.set_node_addr(Some(serving.node_addr_bytes()));
+    // Gate every publish pass's announcement discharge on mirror
+    // readiness: a peer acting on an announcement must find every
+    // announced representation importable, not just the first seal's.
+    // Endpoint ownership (and shutdown below) stays here; the loop
+    // holds only the cloneable readiness handle.
+    live.set_serving_barrier(std::sync::Arc::new(serving.handle()));
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
     let backend = FuseBackend::shared_with_wants(

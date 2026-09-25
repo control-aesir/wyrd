@@ -3,8 +3,9 @@
 //! Normative in `docs/write-path.md`. FUSE never authors; a committing
 //! operation submits a [`MutationRequest`] and blocks, and the live loop
 //! is the only engine user. The queue establishes the total order of
-//! local mutations and executes them serially in admission order, so
-//! each snapshot's parents are the heads the previous mutation left.
+//! local mutations and executes them serially — admission order, with
+//! held entries retried ahead of every new submission (below) — so each
+//! snapshot's parents are the heads the previous mutation left.
 //!
 //! Deliberately unlike the want registry: a mutation is not a demand that
 //! can outlive its waiter. Admission is immediate or [`MutationError::Saturated`],
@@ -13,6 +14,14 @@
 //! the mutation applies later. The price is a hard liveness dependency on
 //! the loop, which is a daemon-health concern bounded by the process
 //! supervisor, not per-request cancellation.
+//!
+//! One exception keeps the waiter blocked: a mutation whose authoring
+//! needs remote content holds across passes ([`MutationBatch::defer`]),
+//! pinned to its evaluated head with a wall-clock deadline measured
+//! from admission ([`MutationQueue::nearest_deadline`] feeds the
+//! fetch budget). The hold never outlives the waiter and never
+//! applies after a failure — it is a prerequisite wait, not a
+//! background retry.
 //!
 //! The queue has its own lock (never the projection's or the store's).
 //! Submitting wakes the loop's idle wait immediately; the loop drains the
@@ -159,6 +168,22 @@ pub enum MutationError {
     /// Authoring, durability, or validation failed. POSIX `EIO`.
     #[error("engine failed")]
     Engine,
+    /// Authoring needs content that is not locally available: the base
+    /// closure references a chunk with no sealed representation and no
+    /// plaintext here. Never reaches the POSIX boundary — the loop
+    /// registers a want for the chunk and holds the mutation pending.
+    /// Carries the single head the mutation was evaluated against so
+    /// the retry can pin it without re-reading the head set.
+    #[error("authoring needs remote content {chunk:?}")]
+    NeedContent {
+        chunk: ContentId,
+        base: Option<wyrd_format::SnapshotId>,
+    },
+    /// A deferred mutation waited past `max_mutation_wait` for its
+    /// authoring prerequisites. POSIX `ETIMEDOUT`: the operation was
+    /// valid but its prerequisite never became available in time.
+    #[error("mutation prerequisite wait expired")]
+    TimedOut,
     /// The live loop stopped before completing the request — terminal
     /// error or shutdown — so it may never have executed. POSIX `EIO`:
     /// a distinct variant (not a bare `Engine`) so supervisors and
@@ -332,6 +357,25 @@ impl std::fmt::Display for MutationId {
 pub struct QueuedMutation {
     request: MutationRequest,
     reply: Arc<Reply>,
+    /// The single head this mutation was first evaluated against, set
+    /// by [`MutationBatch::defer`]. A retried mutation must observe
+    /// exactly this head: anything else is `Stale`, never a silent
+    /// rebase onto newer state.
+    base: Option<wyrd_format::SnapshotId>,
+    /// When the entry was first held for authoring prerequisites.
+    /// `None` until the first defer; later defers must not reset it.
+    first_deferred: Option<Instant>,
+    /// When the request was admitted. The prerequisite clock runs
+    /// from admission — the caller has been blocked since — so the
+    /// pass that first evaluates the request is inside the budget
+    /// too; a first evaluation that arrives after the budget expires
+    /// fails terminal `TimedOut` instead of starting a new wait.
+    submitted: Instant,
+    /// Fetch wants this entry registered while held, in registration
+    /// order. Released when the entry completes on any path — commit,
+    /// failure, timeout, drop, or shutdown — so deferred retries never
+    /// accumulate waiter counts against the registry bound.
+    wanted: Vec<ContentId>,
 }
 
 impl QueuedMutation {
@@ -384,6 +428,13 @@ impl Reply {
 #[derive(Debug, Default)]
 struct QueueState {
     pending: VecDeque<QueuedMutation>,
+    /// Held entries retry before every new submission: a deferred
+    /// mutation pinned to head H must be served before later
+    /// mutations commit descendants of H, or the retry would fork the
+    /// lineage it was pinned to. The price is head-of-line blocking —
+    /// an unsatisfiable prerequisite holds the queue until its
+    /// deadline — which is why the deadline exists and is short.
+    deferred: VecDeque<QueuedMutation>,
     /// Admitted-but-incomplete, including executing requests: the bound
     /// covers every request whose caller is still blocked.
     outstanding: usize,
@@ -475,6 +526,10 @@ impl MutationQueue {
             state.pending.push_back(QueuedMutation {
                 request: MutationRequest { id, kind },
                 reply: Arc::clone(&reply),
+                base: None,
+                first_deferred: None,
+                submitted: Instant::now(),
+                wanted: Vec::new(),
             });
         }
         self.work.notify_one();
@@ -495,17 +550,22 @@ impl MutationQueue {
     /// other unfinished request.
     pub fn take_batch(&self) -> MutationBatch<'_> {
         let mut state = self.lock_state();
-        let entries = state
-            .pending
+        let mut entries: Vec<BatchEntry> = state
+            .deferred
             .drain(..)
             .map(|queued| BatchEntry {
                 queued: Some(queued),
                 result: None,
             })
             .collect();
+        entries.extend(state.pending.drain(..).map(|queued| BatchEntry {
+            queued: Some(queued),
+            result: None,
+        }));
         MutationBatch {
             queue: self,
             entries,
+            wants: None,
         }
     }
 
@@ -517,11 +577,25 @@ impl MutationQueue {
     /// queue closed with nothing pending and does nothing. Taken-but-
     /// unfinished requests are the batch guard's duty, not this.
     pub fn shutdown(&self) {
+        self.shutdown_with(None);
+    }
+
+    /// [`shutdown`](Self::shutdown) with fetch-want release: held
+    /// entries complete `Shutdown` through the normal `finish` path,
+    /// so their wants release exactly like any other terminal
+    /// outcome. Pass the loop's registry; teardown paths without one
+    /// (the daemon supervisor's belt-and-braces drain, which only ever
+    /// sees entries that never ran a pass and hence hold no wants)
+    /// use plain `shutdown`.
+    pub fn shutdown_with(&self, wants: Option<Arc<crate::want::WantRegistry>>) {
         {
             let mut state = self.lock_state();
             state.closed = true;
         }
         let mut batch = self.take_batch();
+        if let Some(wants) = wants {
+            batch = batch.with_wants(wants);
+        }
         for index in 0..batch.len() {
             batch.record(index, Err(MutationError::Shutdown));
         }
@@ -539,6 +613,29 @@ impl MutationQueue {
         state.outstanding = state.outstanding.saturating_sub(1);
         drop(state);
         queued.reply.complete(result);
+    }
+
+    /// Return a taken entry to the held set without touching its
+    /// reply or the admission count: the submitter stays blocked and
+    /// the saturation bound still counts exactly the queued work.
+    /// Held entries retry ahead of every new submission (see
+    /// [`QueueState::deferred`]), preserving both submission order
+    /// among held entries and the total order the write path
+    /// promises.
+    fn requeue(&self, queued: QueuedMutation) {
+        let mut state = self.lock_state();
+        state.deferred.push_back(queued);
+    }
+
+    /// Return a run of entries to the held set in order, behind
+    /// whatever is already held: the batch's total order continues on
+    /// the next pass.
+    fn requeue_all(&self, queued: Vec<QueuedMutation>) {
+        if queued.is_empty() {
+            return;
+        }
+        let mut state = self.lock_state();
+        state.deferred.extend(queued);
     }
 
     /// Lock the queue state, recovering a poisoned mutex: the state is
@@ -564,7 +661,7 @@ impl MutationQueue {
             }
             let slice = (deadline - now).min(WAIT_SLICE);
             let state = self.lock_state();
-            if !state.pending.is_empty() {
+            if !state.pending.is_empty() || !state.deferred.is_empty() {
                 return;
             }
             match self.work.wait_timeout(state, slice) {
@@ -580,6 +677,23 @@ impl MutationQueue {
     pub fn outstanding(&self) -> usize {
         self.lock_state().outstanding
     }
+
+    /// The earliest prerequisite deadline among outstanding
+    /// mutations: each entry's wait start (admission, or its first
+    /// defer) plus `max_wait`. The fetch budget derives from this —
+    /// a pass with nothing outstanding fetches unbounded, while a
+    /// pass that owes a mutation a decision stops starting new fetch
+    /// work at the deadline so the decision lands on time. `None`
+    /// when nothing is outstanding.
+    pub fn nearest_deadline(&self, max_wait: Duration) -> Option<Instant> {
+        let state = self.lock_state();
+        state
+            .pending
+            .iter()
+            .chain(state.deferred.iter())
+            .map(|queued| queued.first_deferred.unwrap_or(queued.submitted) + max_wait)
+            .min()
+    }
 }
 
 /// A drained set of queued mutations that completes every request when
@@ -593,6 +707,10 @@ impl MutationQueue {
 pub struct MutationBatch<'a> {
     queue: &'a MutationQueue,
     entries: Vec<BatchEntry>,
+    /// Fetch registry for releasing entry wants on completion. Set by
+    /// the loop ([`with_wants`](Self::with_wants)); `None` in bare
+    /// queue tests, where no wants can exist.
+    wants: Option<Arc<crate::want::WantRegistry>>,
 }
 
 struct BatchEntry {
@@ -601,6 +719,15 @@ struct BatchEntry {
 }
 
 impl MutationBatch<'_> {
+    /// Attach the fetch registry whose wants this batch's entries may
+    /// hold: [`finish`](Self::finish) releases them on every
+    /// completion path. The live loop sets this; bare queue use leaves
+    /// it empty.
+    pub fn with_wants(mut self, wants: Arc<crate::want::WantRegistry>) -> Self {
+        self.wants = Some(wants);
+        self
+    }
+
     /// The number of requests in the batch.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -625,14 +752,138 @@ impl MutationBatch<'_> {
         self.entries[index].result = Some(result);
     }
 
+    /// Hold the request at `index` for a later pass instead of
+    /// completing it: the entry returns to the queue with its reply
+    /// untouched, so the blocked submitter keeps waiting and the
+    /// admission slot stays consumed (no saturation leak). `base` is
+    /// the single head the mutation was evaluated against — the retry
+    /// must observe exactly it, never a silent rebase. The first-defer
+    /// instant is sticky: later defers of the same entry must not
+    /// reset the prerequisite deadline.
+    ///
+    /// The queue's total order is why a defer must also **stop the
+    /// batch**: [`defer_and_release_rest`](Self::defer_and_release_rest)
+    /// is the only variant the loop uses, because a later entry
+    /// committing on top of a held one would invert the order the
+    /// write path promises. This primitive stays available for
+    /// tests that drive entries out of order.
+    pub fn defer(&mut self, index: usize, base: wyrd_format::SnapshotId) {
+        let entry = &mut self.entries[index];
+        let mut queued = entry
+            .queued
+            .take()
+            .expect("request is present until finish");
+        entry.result = None;
+        if queued.first_deferred.is_none() {
+            queued.first_deferred = Some(Instant::now());
+        }
+        // First pin wins: the retry rule compares against the head
+        // the first evaluation used, so a later defer must not
+        // re-pin (in production the pin always matches — `eval_heads`
+        // enforced it — making this a backstop, not a path).
+        if queued.base.is_none() {
+            queued.base = Some(base);
+        }
+        self.queue.requeue(queued);
+    }
+
+    /// Hold the request at `index` and return every entry after it to
+    /// the queue, untouched and in order. The batch ends here: the
+    /// later requests are re-executed from scratch on the next pass,
+    /// in their original admission order behind the held entry —
+    /// never completed with a synthetic error, and never committed
+    /// past the defer. This is the loop's only defer path; it is what
+    /// keeps the total order when a prerequisite is missing.
+    pub fn defer_and_release_rest(&mut self, index: usize, base: wyrd_format::SnapshotId) {
+        self.defer(index, base);
+        // Drain the rest back to the front of the pending queue,
+        // preserving order. They are still outstanding: their reply
+        // slots wait, their admission slots stay consumed, and their
+        // wants (none yet — never executed) need no release.
+        let mut released: Vec<QueuedMutation> = Vec::with_capacity(self.entries.len() - index - 1);
+        for entry in self.entries.iter_mut().skip(index + 1) {
+            if let Some(queued) = entry.queued.take() {
+                released.push(queued);
+            }
+        }
+        self.queue.requeue_all(released);
+    }
+
+    /// The pinned base head for the request at `index`, if a previous
+    /// pass deferred it.
+    pub fn pinned(&self, index: usize) -> Option<wyrd_format::SnapshotId> {
+        self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .base
+    }
+
+    /// When the request at `index` was first deferred, if ever.
+    pub fn deferred_since(&self, index: usize) -> Option<Instant> {
+        self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .first_deferred
+    }
+
+    /// When the request at `index` started waiting: its first defer,
+    /// or its admission when never deferred. The deadline measures
+    /// total wait from there, so the first evaluation is bounded and
+    /// later defers never reset the clock.
+    pub fn wait_since(&self, index: usize) -> Instant {
+        let queued = self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish");
+        queued.first_deferred.unwrap_or(queued.submitted)
+    }
+
+    /// Fetch wants the request at `index` already holds, in
+    /// registration order.
+    pub fn wanted(&self, index: usize) -> Vec<ContentId> {
+        self.entries[index]
+            .queued
+            .as_ref()
+            .expect("request is present until finish")
+            .wanted
+            .clone()
+    }
+
+    /// Remember a newly registered fetch want for the request at
+    /// `index`, for release when the entry completes on any path.
+    pub fn note_want(&mut self, index: usize, chunk: ContentId) {
+        let queued = self.entries[index]
+            .queued
+            .as_mut()
+            .expect("request is present until finish");
+        if !queued.wanted.contains(&chunk) {
+            queued.wanted.push(chunk);
+        }
+    }
+
     /// Complete every request with its recorded result; an unrecorded
     /// request fails closed with `Engine`. Idempotent — [`Drop`] calls
     /// it, so an explicit call just makes the timing clear.
+    ///
+    /// Deferred entries are absent by construction: [`defer`](Self::defer)
+    /// returns them to the queue, so `finish` never observes them.
+    ///
+    /// Every completed entry releases the fetch wants it registered
+    /// while held, on every path — recorded results and unrecorded
+    /// drop alike — so retries never accumulate waiter counts and a
+    /// shutdown cannot strand registry slots.
     pub fn finish(&mut self) {
         for entry in &mut self.entries {
-            let Some(queued) = entry.queued.take() else {
+            let Some(mut queued) = entry.queued.take() else {
                 continue;
             };
+            if let Some(wants) = &self.wants {
+                for chunk in queued.wanted.drain(..) {
+                    wants.release(&chunk);
+                }
+            }
             let result = entry.result.take().unwrap_or(Err(MutationError::Engine));
             self.queue.complete(queued, result);
         }
@@ -777,6 +1028,10 @@ mod tests {
                 },
             },
             reply: Arc::new(Reply::default()),
+            base: None,
+            first_deferred: None,
+            submitted: Instant::now(),
+            wanted: Vec::new(),
         };
         let rendered = format!("{queued:?}");
         assert!(
@@ -846,6 +1101,388 @@ mod tests {
         }
         assert_eq!(submitter.join().unwrap(), Err(MutationError::Engine));
         assert_eq!(queue.outstanding(), 0, "the slot is released");
+    }
+
+    /// A deferred mutation keeps its submitter blocked on the same
+    /// reply, consumes no additional admission slot, and retries with
+    /// the pinned base: the guard's `finish` never observes it.
+    #[test]
+    fn deferred_mutation_keeps_one_slot_and_retries_pinned() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("docs")))
+        };
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(batch.pinned(0), None, "no pin before the first defer");
+            assert_eq!(batch.deferred_since(0), None);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(queue.outstanding(), 1, "defer consumes no extra slot");
+        let first;
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(batch.len(), 1, "the same entry retries");
+            assert_eq!(batch.pinned(0), Some(base), "the pin survives");
+            first = batch.deferred_since(0).expect("defer stamps the wait");
+            batch.defer(0, SnapshotId::from_bytes([0xCC; 32]));
+            batch.finish();
+        }
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(
+                batch.pinned(0),
+                Some(base),
+                "first pin wins, never re-pinned"
+            );
+            assert_eq!(
+                batch.deferred_since(0),
+                Some(first),
+                "a second defer must not reset the deadline"
+            );
+            batch.record(0, Ok(MutationOutcome::Done));
+            batch.finish();
+        }
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(queue.outstanding(), 0);
+    }
+
+    /// Deferred entries retry ahead of new submissions: M1 defers,
+    /// M2 arrives, and the next batch serves M1 first. Otherwise M2
+    /// could commit a descendant of the head M1 is pinned to, forking
+    /// the lineage the pin protects.
+    #[test]
+    fn deferred_entries_retry_ahead_of_new_submissions() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let first = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("first")))
+        };
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        {
+            let mut batch = take_batch_blocking(&queue);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        let second = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("second")))
+        };
+        // Wait for the second admission: the held entry already counts
+        // as work, so the blocking take would return with M1 alone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while queue.outstanding() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second submission never admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        {
+            let mut batch = take_batch_blocking(&queue);
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch.request(0).kind(), &mkdir("first"), "held entry first");
+            assert_eq!(batch.request(1).kind(), &mkdir("second"));
+            assert_eq!(batch.pinned(0), Some(base));
+            assert_eq!(batch.pinned(1), None);
+            batch.record(0, Ok(MutationOutcome::Done));
+            batch.record(1, Ok(MutationOutcome::Done));
+            batch.finish();
+        }
+        assert_eq!(first.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(second.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(queue.outstanding(), 0);
+    }
+
+    /// One waiter per held chunk across retries: the loop registers
+    /// once (skipping chunks the entry already holds) and `finish`
+    /// releases exactly once, so repeated defers never accumulate
+    /// waiter counts against the registry bound.
+    #[test]
+    fn held_wants_release_exactly_once_across_retries() {
+        use wyrd_format::{ContentId, SnapshotId};
+
+        use crate::want::WantRegistry;
+
+        let queue = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::default());
+        let chunk = ContentId::from_bytes([0xC0; 32]);
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("held")))
+        };
+        // First defer: register, note, hold.
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk).unwrap();
+            batch.note_want(0, chunk);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 1);
+        // Second defer of the same entry: the loop skips re-registering
+        // a held chunk (mirroring sync_pass), so the count stays one.
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            assert_eq!(batch.wanted(0), vec![chunk]);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(
+            wants.waiter_count(&chunk),
+            1,
+            "no accumulation across retries"
+        );
+        // Terminal commit releases.
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            batch.record(0, Ok(MutationOutcome::Done));
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 0, "commit releases the want");
+        assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+    }
+
+    /// Timeout and drop both release held wants: the deadline path
+    /// records `TimedOut` and an early return drops the batch, and
+    /// either way `finish` settles the registry.
+    #[test]
+    fn timeout_and_drop_release_held_wants() {
+        use wyrd_format::{ContentId, SnapshotId};
+
+        use crate::want::WantRegistry;
+
+        let queue = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::default());
+        let chunk = ContentId::from_bytes([0xC1; 32]);
+        let base = SnapshotId::from_bytes([0xB0; 32]);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("timed-out")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk).unwrap();
+            batch.note_want(0, chunk);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 1);
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            batch.record(0, Err(MutationError::TimedOut));
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 0, "timeout releases the want");
+        assert_eq!(submitter.join().unwrap(), Err(MutationError::TimedOut));
+
+        // The drop path: an unrecorded entry fails Engine and still
+        // releases.
+        let chunk2 = ContentId::from_bytes([0xC2; 32]);
+        let dropped = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("dropped")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk2).unwrap();
+            batch.note_want(0, chunk2);
+            batch.defer(0, base);
+            batch.finish();
+        }
+        {
+            let _batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            // Dropped with no recorded result.
+        }
+        assert_eq!(wants.waiter_count(&chunk2), 0, "drop releases the want");
+        assert_eq!(dropped.join().unwrap(), Err(MutationError::Engine));
+    }
+
+    /// A defer stops the batch: the held entry and every entry behind
+    /// it return to the queue in order, with nothing completed and no
+    /// entry executed past the defer. The next pass sees the same
+    /// total order — the held entry first — so M2 can never commit on
+    /// top of held M1.
+    #[test]
+    fn a_defer_returns_the_rest_of_the_batch_untouched() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let first = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("first")))
+        };
+        let second = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("second")))
+        };
+        // Both submitters must be admitted before the batch is taken,
+        // or the second one lands in a later batch.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.outstanding() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.len(), 2, "both requests in one batch");
+        // Admission order is whichever submitter won the race; the
+        // contract is that the batch keeps THAT order across the
+        // defer, not that it matches spawn order.
+        let head_kind = batch.request(0).kind().clone();
+        let tail_kind = batch.request(1).kind().clone();
+        assert!(matches!(head_kind, MutationKind::Mkdir { .. }));
+        batch.defer_and_release_rest(0, SnapshotId::from_bytes([0xB0; 32]));
+        // Nothing ran behind the defer: dropping the batch completes
+        // nothing (the held entry and the released one are back in
+        // the queue with their replies pending).
+        drop(batch);
+        assert_eq!(queue.outstanding(), 2, "both callers still blocked");
+        assert!(queue.nearest_deadline(Duration::from_secs(30)).is_some());
+
+        // The next pass holds the first entry again — and the second
+        // sits behind it in the same batch, still in admission order.
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch.request(0).kind(),
+            &head_kind,
+            "the held entry leads again"
+        );
+        assert_eq!(
+            batch.request(1).kind(),
+            &tail_kind,
+            "the rest follows in order"
+        );
+        assert_eq!(
+            batch.pinned(0),
+            Some(SnapshotId::from_bytes([0xB0; 32])),
+            "the retry keeps the head the first evaluation used"
+        );
+        batch.record(0, Ok(MutationOutcome::Done));
+        batch.record(1, Ok(MutationOutcome::Done));
+        batch.finish();
+        assert_eq!(first.join().unwrap(), Ok(MutationOutcome::Done));
+        assert_eq!(second.join().unwrap(), Ok(MutationOutcome::Done));
+    }
+
+    /// The fetch budget's clock: the nearest deadline is the earliest
+    /// first-hold plus `max_wait` across pending and deferred entries,
+    /// and `None` when nothing is held. The pass reads it before
+    /// draining, so a held-then-requeued entry counts too.
+    #[test]
+    fn nearest_deadline_spans_pending_and_deferred_entries() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::default());
+        let max_wait = Duration::from_secs(30);
+        assert_eq!(queue.nearest_deadline(max_wait), None, "nothing held");
+
+        let held = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("held")))
+        };
+        let first_hold = Instant::now();
+        {
+            let mut batch = take_batch_blocking(&queue);
+            batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+        }
+        let deadline = queue.nearest_deadline(max_wait).expect("held");
+        assert!(
+            deadline >= first_hold + max_wait && deadline <= Instant::now() + max_wait,
+            "the deadline is the first hold plus max_wait"
+        );
+
+        // A second entry held later never moves the deadline later
+        // than the first: the queue reports the nearest.
+        let later = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("later")))
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            let mut batch = take_batch_blocking(&queue);
+            // Both entries re-hold: the first keeps its original
+            // first-hold, the later one starts its clock now.
+            for index in 0..batch.len() {
+                batch.defer(index, SnapshotId::from_bytes([0xB1; 32]));
+            }
+        }
+        assert_eq!(
+            queue.nearest_deadline(max_wait),
+            Some(deadline),
+            "the first hold still sets the budget"
+        );
+
+        queue.shutdown();
+        assert_eq!(held.join().unwrap(), Err(MutationError::Shutdown));
+        assert_eq!(later.join().unwrap(), Err(MutationError::Shutdown));
+        assert_eq!(queue.nearest_deadline(max_wait), None, "drained");
+    }
+
+    /// Shutdown releases held wants through the same finish path:
+    /// a deferred entry completes `Shutdown` and its waiter count
+    /// returns to zero instead of stranding a registry slot.
+    #[test]
+    fn shutdown_with_registry_releases_held_wants() {
+        use wyrd_format::{ContentId, SnapshotId};
+
+        use crate::want::WantRegistry;
+
+        let queue = Arc::new(MutationQueue::default());
+        let wants = Arc::new(WantRegistry::default());
+        let chunk = ContentId::from_bytes([0xC3; 32]);
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("held")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue).with_wants(Arc::clone(&wants));
+            wants.register(chunk).unwrap();
+            batch.note_want(0, chunk);
+            batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+            batch.finish();
+        }
+        assert_eq!(wants.waiter_count(&chunk), 1);
+        queue.shutdown_with(Some(Arc::clone(&wants)));
+        assert_eq!(wants.waiter_count(&chunk), 0, "shutdown releases the want");
+        assert_eq!(submitter.join().unwrap(), Err(MutationError::Shutdown));
+    }
+
+    /// Deferred entries still count as queued work for saturation: a
+    /// held mutation plus a full queue refuses new admissions, and a
+    /// shutdown completes the held reply instead of leaking the waiter.
+    #[test]
+    fn deferred_entries_count_toward_saturation_and_shutdown() {
+        use wyrd_format::SnapshotId;
+
+        let queue = Arc::new(MutationQueue::with_limit(1));
+        let submitter = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.submit(mkdir("first")))
+        };
+        {
+            let mut batch = take_batch_blocking(&queue);
+            batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+            batch.finish();
+        }
+        assert_eq!(
+            queue.submit(mkdir("second")),
+            Err(MutationError::Saturated),
+            "the held entry still occupies its slot"
+        );
+        queue.shutdown();
+        assert_eq!(
+            submitter.join().unwrap(),
+            Err(MutationError::Shutdown),
+            "shutdown completes the held reply"
+        );
     }
 
     /// Admission is bounded including the executing request: past the

@@ -36,6 +36,7 @@ pub enum RuntimeFact {
     ControlMessage(ControlMessageId),
     AnnouncementQueued(SnapshotId, DeviceId),
     AnnouncementSealed(SnapshotId, Vec<u8>),
+    AnnouncementRouteSealed(SnapshotId, Vec<u8>, Vec<u8>),
     AnnouncementDelivered(SnapshotId, DeviceId),
     TransitionQueued(TransitionId, DeviceId),
     TransitionSealed(TransitionId, Vec<u8>),
@@ -68,6 +69,7 @@ pub struct LoadedFacts {
     pub seen: Vec<ControlMessageId>,
     pub announcement_queued: Vec<(SnapshotId, DeviceId)>,
     pub announcement_sealed: Vec<(SnapshotId, Vec<u8>)>,
+    pub announcement_route_sealed: Vec<(SnapshotId, Vec<u8>, Vec<u8>)>,
     pub announcement_delivered: Vec<(SnapshotId, DeviceId)>,
     pub transition_queued: Vec<(TransitionId, DeviceId)>,
     pub transition_sealed: Vec<(TransitionId, Vec<u8>)>,
@@ -133,6 +135,14 @@ impl LoadedFacts {
                 self.announcement_sealed.push((snapshot, sealed.clone()));
                 self.runtime_facts
                     .push(RuntimeFact::AnnouncementSealed(snapshot, sealed));
+            }
+            DecodedFact::AnnouncementRouteSealed(snapshot, route, sealed) => {
+                self.announcement_route_sealed
+                    .push((snapshot, route.clone(), sealed.clone()));
+                self.runtime_facts
+                    .push(RuntimeFact::AnnouncementRouteSealed(
+                        snapshot, route, sealed,
+                    ));
             }
             DecodedFact::AnnouncementDelivered(snapshot, recipient) => {
                 self.announcement_delivered.push((snapshot, recipient));
@@ -288,6 +298,9 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::AnnouncementSealed(snapshot, sealed) => {
                 runtime.record_announcement_sealed(snapshot, sealed);
+            }
+            RuntimeFact::AnnouncementRouteSealed(snapshot, route, sealed) => {
+                runtime.record_announcement_route_sealed(snapshot, route, sealed);
             }
             RuntimeFact::AnnouncementDelivered(snapshot, recipient) => {
                 runtime.record_announcement_delivered(snapshot, recipient);

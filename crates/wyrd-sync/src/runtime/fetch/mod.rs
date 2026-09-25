@@ -306,6 +306,10 @@ fn open_record(
 pub(super) struct ObjectAttempt {
     pub aggregate: FetchOutcome<()>,
     pub invalid: Vec<StorageId>,
+    /// Candidates whose transfer failed in transport: the plan backs
+    /// these off like invalid data so an unreachable route cannot
+    /// starve the items behind it.
+    pub transport_failed: Vec<StorageId>,
     pub fulfilled: Option<StorageId>,
 }
 
@@ -326,6 +330,7 @@ pub(super) fn object(
 ) -> ObjectAttempt {
     let mut aggregate = FetchOutcome::Missing;
     let mut invalid = Vec::new();
+    let mut transport_failed = Vec::new();
     for candidate in candidates {
         let Some(secret) = keyring.secret(candidate.encryption_epoch) else {
             aggregate = worse(aggregate, FetchOutcome::UnavailableKey);
@@ -360,6 +365,7 @@ pub(super) fn object(
             }
             Err(_) => {
                 aggregate = worse(aggregate, FetchOutcome::Transport);
+                transport_failed.push(candidate.storage_id);
                 continue;
             }
         };
@@ -389,6 +395,7 @@ pub(super) fn object(
                 return ObjectAttempt {
                     aggregate: FetchOutcome::Store(fatal),
                     invalid,
+                    transport_failed,
                     fulfilled: None,
                 };
             }
@@ -400,6 +407,7 @@ pub(super) fn object(
                 return ObjectAttempt {
                     aggregate: FetchOutcome::Fulfilled(()),
                     invalid,
+                    transport_failed,
                     fulfilled: Some(candidate.storage_id),
                 };
             }
@@ -408,6 +416,7 @@ pub(super) fn object(
                     return ObjectAttempt {
                         aggregate: FetchOutcome::Store(fatal),
                         invalid,
+                        transport_failed,
                         fulfilled: None,
                     };
                 }
@@ -418,6 +427,7 @@ pub(super) fn object(
     ObjectAttempt {
         aggregate,
         invalid,
+        transport_failed,
         fulfilled: None,
     }
 }

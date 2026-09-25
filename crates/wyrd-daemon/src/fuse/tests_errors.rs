@@ -47,8 +47,9 @@ fn view_errors_map_to_posix_errors() {
 }
 
 /// The mutation errno mapping is pinned the same way: saturation is
-/// retryable, malformed names are caller errors, everything else —
-/// including a loop shutdown mid-syscall — is EIO, never a hang.
+/// retryable, malformed names are caller errors, an expired
+/// prerequisite wait is ETIMEDOUT, and everything else — including a
+/// loop shutdown mid-syscall — is EIO, never a hang.
 #[test]
 fn mutation_errors_map_to_posix_errors() {
     assert_eq!(
@@ -70,9 +71,19 @@ fn mutation_errors_map_to_posix_errors() {
         MutationError::Store(StoreFailure::Transient),
         MutationError::Engine,
         MutationError::Shutdown,
+        MutationError::NeedContent {
+            chunk: ContentId::from_bytes([0; 32]),
+            base: None,
+        },
     ] {
         assert_eq!(mutation_errno(&fatal), fuser::Errno::EIO);
     }
+    // A prerequisite wait that outlasts its deadline is retryable
+    // information, not a system failure: ETIMEDOUT, never EIO.
+    assert_eq!(
+        mutation_errno(&MutationError::TimedOut),
+        fuser::Errno::ETIMEDOUT
+    );
     // A classified store failure keeps its errno on the mutation
     // path too: full reads as no-space, unwritable as denied.
     assert_eq!(

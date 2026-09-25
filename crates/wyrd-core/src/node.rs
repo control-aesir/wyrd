@@ -11,7 +11,7 @@
 //! compose a concrete view, build backends from the split parts, and
 //! map errors at their own boundary.
 
-use crate::live::{verified_heads, LiveConfig, LiveNode, LiveParts};
+use crate::live::{partition_heads, LiveConfig, LiveNode, LiveParts};
 use crate::view::{Head, NamespaceView, RuntimeMaterialization};
 use wyrd_format::{chunk, ContentId, Entry, ObjectStore, Tree};
 use wyrd_sync::durable::AuthorizedSnapshot;
@@ -132,20 +132,35 @@ where
     /// classified inside `wyrd-sync` (see [`Engine::live_heads`]). This
     /// is the only production projection into the view.
     ///
-    /// All-or-nothing: every eligible head's closure is verified before
-    /// anything is installed, so a damaged head fails the refresh and
-    /// leaves the previously installed set untouched instead of
-    /// silently projecting a partial namespace.
+    /// Per validity class: verified heads install; heads whose closure
+    /// is still fetching wait (an all-pending set leaves the installed
+    /// heads untouched — a head mid-transfer must never blank a
+    /// serving view); a damaged head fails the refresh and leaves the
+    /// previously installed set untouched.
     pub fn refresh_live_heads(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
         let runtime = self.engine.runtime_state()?;
         let heads = self.engine.live_heads()?;
-        let heads = {
+        // Pending heads (closure still fetching) simply do not install
+        // yet — the live loop's publication gate retries; a damaged
+        // closure still fails closed here.
+        let (heads, pending) = {
             let store = self
                 .view
                 .store_read()
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
-            verified_heads(&runtime, heads, &*store)?
+            partition_heads(&runtime, heads, &*store)?
         };
+        // All-pending keeps the last-known-good projection: a head
+        // still fetching must never blank the view a healthy head is
+        // serving. (The live loop defers publication for the same
+        // reason.)
+        if heads.is_empty() && pending > 0 {
+            tracing::debug!(
+                pending,
+                "refresh kept the installed heads: closure still fetching"
+            );
+            return Ok(());
+        }
         NamespaceView::set_heads(&mut self.view, heads.into_iter().map(Head::new).collect());
         Ok(())
     }

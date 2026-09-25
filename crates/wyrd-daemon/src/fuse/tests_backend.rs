@@ -8,7 +8,9 @@ use std::sync::Arc;
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node};
 
-use wyrd_core::mutation::{FileIdentity, MutationOutcome, MutationQueue};
+use wyrd_core::mutation::{
+    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue, ParentIdentity,
+};
 use wyrd_core::session::WriteBudget;
 
 use fuser::Filesystem as _;
@@ -571,6 +573,56 @@ fn failed_resolve_returns_its_slot_and_inserts_nothing() {
     // Plain drop: only clean read handles are open, so no commit
     // path runs at teardown.
     drop(backend);
+}
+
+#[test]
+fn create_queues_the_observed_parent_identity() {
+    let mut store = MemoryObjectStore::default();
+    let parent = Tree::empty().insert_into(&mut store).unwrap();
+    let root = Tree::from_entries(vec![Entry::dir("parent", parent).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let mut backend = FuseBackend::new(DriveView::new(
+        store,
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    ));
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let (parent_ino, parent_node, _) = backend.resolve_inode("parent").unwrap();
+    let expected_parent = match parent_node {
+        Node::Dir { subtree } => ParentIdentity::Tree(subtree),
+        _ => panic!("fixture parent is not a directory"),
+    };
+    let backend = Arc::new(backend);
+    let helper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while queue.outstanding() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the create submission never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut batch = queue.take_batch();
+        assert_eq!(batch.len(), 1);
+        match batch.request(0).kind() {
+            MutationKind::CreateFile { path, parent } => {
+                assert_eq!(path, "parent/child");
+                assert_eq!(parent, &expected_parent);
+            }
+            other => panic!("unexpected mutation: {other:?}"),
+        }
+        batch.record(0, Err(MutationError::StaleParent("parent".to_string())));
+        batch.finish();
+    });
+
+    assert_eq!(
+        backend.create_at(parent_ino, "child", libc::O_RDWR),
+        Err(fuser::Errno::ESTALE)
+    );
+    helper.join().expect("the servicing thread finishes");
 }
 
 /// Unknown handles are EBADF, and a released handle stops

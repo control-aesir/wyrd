@@ -26,7 +26,9 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
-use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
+use crate::mutation::{
+    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue, ParentIdentity,
+};
 use crate::projection::{Projection, SharedProjection};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
@@ -970,10 +972,12 @@ where
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Done)
             }
-            MutationKind::CreateFile { path } => {
+            MutationKind::CreateFile { path, parent } => {
                 let heads = self.eval_heads(pinned, path)?;
-                // `create` requires an absent name: anything already there
-                // (file, dir, symlink) is `EEXIST`, never a silent replace.
+                let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                if self.current_parent_identity(&heads, parent_path)? != *parent {
+                    return Err(MutationError::StaleParent(parent_path.to_string()));
+                }
                 if self.current_node(&heads, path)?.is_some() {
                     return Err(MutationError::AlreadyExists(path.clone()));
                 }
@@ -993,7 +997,7 @@ where
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, 0, false, Vec::new())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
-                let root = wyrd_format::mutation::put(&mut *store, base, path, entry)
+                let root = wyrd_format::mutation::put_strict(&mut *store, base, path, entry)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
                 Ok(MutationOutcome::Created(FileIdentity::new(
@@ -1499,12 +1503,29 @@ where
                 chunk: content,
                 base: Self::pin_head(heads),
             }),
+            Err(ViewError::NotADirectory) => Err(MutationError::NotADirectory(path.to_string())),
             Err(error) => {
                 // The boundary reports `EIO` for every view failure
                 // mode; keep the variant for forensics.
                 tracing::debug!(path, error = ?error, "mutation path lookup refused");
                 Err(MutationError::Engine)
             }
+        }
+    }
+
+    fn current_parent_identity(
+        &self,
+        heads: &[AuthorizedSnapshot],
+        path: &str,
+    ) -> Result<ParentIdentity, MutationError> {
+        match self.current_node(heads, path)? {
+            None => Err(MutationError::NotFound(path.to_string())),
+            Some(Node::Dir { subtree }) => Ok(ParentIdentity::Tree(subtree)),
+            Some(Node::MergedDir { subtrees }) if subtrees.is_empty() => Ok(ParentIdentity::Root),
+            Some(Node::MergedDir { .. } | Node::Conflict { .. }) => {
+                Err(MutationError::Conflicted { heads: heads.len() })
+            }
+            Some(_) => Err(MutationError::NotADirectory(path.to_string())),
         }
     }
 
@@ -2211,6 +2232,312 @@ mod prereq_tests {
             MutationError::NotFound("gone".to_string())
         );
         assert_eq!(node.current_node(&heads, "gone").unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parent_mutation_tests {
+    use super::*;
+    use crate::view::{DirEntry, Kind, MaterializationPolicy, OpenFile, ViewLockError};
+    use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+    use wyrd_format::{Entry, EntryContent, MemoryObjectStore};
+    use wyrd_sync::keys::DeviceIdentitySecret;
+
+    struct TreeView {
+        store: Arc<RwLock<MemoryObjectStore>>,
+        materialization: RuntimeMaterialization,
+        heads: Vec<Head>,
+    }
+
+    impl TreeView {
+        fn load(&self, id: &ContentId) -> Result<Tree, ViewError> {
+            let bytes = self
+                .store
+                .read()
+                .map_err(|_| ViewError::Store(StoreFailure::Transient, "poisoned".into()))?
+                .get(id)
+                .map_err(|error| ViewError::Store(StoreFailure::Transient, format!("{error:?}")))?
+                .ok_or(ViewError::NotMaterialized { content: *id })?;
+            Tree::decode(&bytes).map_err(|_| ViewError::Corrupt)
+        }
+
+        fn node_for(entry: &Entry) -> Node {
+            match &entry.content {
+                EntryContent::File {
+                    size,
+                    executable,
+                    chunks,
+                } => Node::File {
+                    size: *size,
+                    executable: *executable,
+                    chunks: chunks.clone(),
+                },
+                EntryContent::Dir { subtree } => Node::Dir { subtree: *subtree },
+                EntryContent::Symlink { target } => Node::Symlink {
+                    target: target.clone(),
+                },
+            }
+        }
+    }
+
+    impl NamespaceView for TreeView {
+        type Store = MemoryObjectStore;
+        type Materialization = RuntimeMaterialization;
+
+        fn open(
+            store: Self::Store,
+            materialization: Self::Materialization,
+            heads: Vec<Head>,
+        ) -> Self {
+            Self::open_shared(Arc::new(RwLock::new(store)), materialization, heads)
+        }
+
+        fn open_shared(
+            store: Arc<RwLock<Self::Store>>,
+            materialization: Self::Materialization,
+            heads: Vec<Head>,
+        ) -> Self {
+            Self {
+                store,
+                materialization,
+                heads,
+            }
+        }
+
+        fn store_handle(&self) -> Arc<RwLock<Self::Store>> {
+            Arc::clone(&self.store)
+        }
+
+        fn store_read(&self) -> Result<RwLockReadGuard<'_, Self::Store>, ViewLockError> {
+            self.store.read().map_err(|_| ViewLockError)
+        }
+
+        fn store_write(&self) -> Result<RwLockWriteGuard<'_, Self::Store>, ViewLockError> {
+            self.store.write().map_err(|_| ViewLockError)
+        }
+
+        fn set_heads(&mut self, heads: Vec<Head>) {
+            self.heads = heads;
+        }
+
+        fn set_materialization(&mut self, materialization: Self::Materialization) {
+            self.materialization = materialization;
+        }
+
+        fn status(&self, id: &ContentId) -> FetchStatus {
+            self.materialization.status(id)
+        }
+
+        fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+            let Some(head) = self.heads.first() else {
+                return Ok(Node::MergedDir {
+                    subtrees: Vec::new(),
+                });
+            };
+            let mut node = Node::Dir {
+                subtree: head.snapshot().tree,
+            };
+            for component in path.split('/').filter(|component| !component.is_empty()) {
+                let Node::Dir { subtree } = node else {
+                    return Err(ViewError::NotADirectory);
+                };
+                let tree = self.load(&subtree)?;
+                let entry = tree
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name.as_str() == component)
+                    .ok_or(ViewError::NotFound)?;
+                node = Self::node_for(entry);
+            }
+            Ok(node)
+        }
+
+        fn stat(&self, path: &str) -> Result<crate::view::Attr, ViewError> {
+            Ok(match self.lookup(path)? {
+                Node::File {
+                    size, executable, ..
+                } => crate::view::Attr {
+                    kind: Kind::File,
+                    size,
+                    executable,
+                },
+                Node::Dir { .. } | Node::MergedDir { .. } => crate::view::Attr {
+                    kind: Kind::Dir,
+                    size: 0,
+                    executable: false,
+                },
+                Node::Symlink { .. } => crate::view::Attr {
+                    kind: Kind::Symlink,
+                    size: 0,
+                    executable: false,
+                },
+                Node::Conflict { .. } => crate::view::Attr {
+                    kind: Kind::Conflict,
+                    size: 0,
+                    executable: false,
+                },
+            })
+        }
+
+        fn readdir(&self, _node: &Node) -> Result<Vec<DirEntry>, ViewError> {
+            Err(ViewError::NotADirectory)
+        }
+
+        fn open_file(&self, _node: &Node) -> Result<OpenFile, ViewError> {
+            Err(ViewError::NotAFile)
+        }
+
+        fn read(&self, _file: &OpenFile, _offset: u64, _len: usize) -> Result<Vec<u8>, ViewError> {
+            Err(ViewError::NotAFile)
+        }
+    }
+
+    fn scratch_parent_drive(
+        tag: &str,
+    ) -> (
+        Engine,
+        std::path::PathBuf,
+        MemoryObjectStore,
+        ContentId,
+        AuthorizedSnapshot,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "wyrd-core-parent-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.clone(), "parent-test-pass", identity).unwrap();
+        let mut store = MemoryObjectStore::default();
+        let parent = Tree::empty().insert_into(&mut store).unwrap();
+        let root = Tree::from_entries(vec![Entry::dir("parent", parent).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let head = engine.author_snapshot(&store, root).unwrap();
+        (engine, dir, store, root, head)
+    }
+
+    fn live_over_tree(
+        engine: Engine,
+        store: MemoryObjectStore,
+        heads: &[AuthorizedSnapshot],
+    ) -> LiveNode<TreeView> {
+        let revision = engine.current();
+        let materialization = RuntimeMaterialization {
+            runtime: engine.runtime_state().unwrap(),
+        };
+        let store = Arc::new(RwLock::new(store));
+        let baseline = TreeView::open_shared(
+            Arc::clone(&store),
+            materialization,
+            heads.iter().cloned().map(Head::new).collect(),
+        );
+        LiveNode::split(
+            engine,
+            store,
+            baseline,
+            revision,
+            Duration::from_secs(30),
+            &LiveConfig::default(),
+        )
+        .0
+    }
+
+    #[test]
+    fn create_does_not_recreate_a_removed_parent() {
+        let (engine, dir, store, root, head) = scratch_parent_drive("removed");
+        let mut live = live_over_tree(engine, store, &[head]);
+        let parent = match live
+            .current_node(&live.live_heads_traced().unwrap(), "parent")
+            .unwrap()
+            .unwrap()
+        {
+            Node::Dir { subtree } => ParentIdentity::Tree(subtree),
+            _ => panic!("fixture parent is not a directory"),
+        };
+        let new_root = {
+            let mut store = live.store.write().unwrap();
+            wyrd_format::mutation::remove(&mut *store, root, "parent").unwrap()
+        };
+        live.engine
+            .author_snapshot(&*live.store.read().unwrap(), new_root)
+            .unwrap();
+
+        let result = live.apply_mutation(
+            &MutationKind::CreateFile {
+                path: "parent/child".to_string(),
+                parent,
+            },
+            None,
+        );
+        assert_eq!(result, Err(MutationError::NotFound("parent".to_string())));
+        assert_eq!(
+            live.current_node(&live.live_heads_traced().unwrap(), "parent")
+                .unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn create_rejects_a_replaced_parent() {
+        let (engine, dir, store, root, head) = scratch_parent_drive("replaced");
+        let mut live = live_over_tree(engine, store, &[head]);
+        let parent = match live
+            .current_node(&live.live_heads_traced().unwrap(), "parent")
+            .unwrap()
+            .unwrap()
+        {
+            Node::Dir { subtree } => ParentIdentity::Tree(subtree),
+            _ => panic!("fixture parent is not a directory"),
+        };
+        let new_root = {
+            let mut store = live.store.write().unwrap();
+            let without_parent =
+                wyrd_format::mutation::remove(&mut *store, root, "parent").unwrap();
+            let replacement =
+                Tree::from_entries(vec![Entry::file("marker", 0, false, Vec::new()).unwrap()])
+                    .unwrap()
+                    .insert_into(&mut *store)
+                    .unwrap();
+            wyrd_format::mutation::put(
+                &mut *store,
+                without_parent,
+                "parent",
+                Entry::dir("parent", replacement).unwrap(),
+            )
+            .unwrap()
+        };
+        live.engine
+            .author_snapshot(&*live.store.read().unwrap(), new_root)
+            .unwrap();
+
+        let result = live.apply_mutation(
+            &MutationKind::CreateFile {
+                path: "parent/child".to_string(),
+                parent,
+            },
+            None,
+        );
+        assert_eq!(
+            result,
+            Err(MutationError::StaleParent("parent".to_string()))
+        );
+        assert!(matches!(
+            live.current_node(&live.live_heads_traced().unwrap(), "parent")
+                .unwrap(),
+            Some(Node::Dir { .. })
+        ));
+        assert!(live
+            .current_node(&live.live_heads_traced().unwrap(), "parent/child")
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

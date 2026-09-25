@@ -84,6 +84,10 @@ fn mutation_errors_map_to_posix_errors() {
         mutation_errno(&MutationError::TimedOut),
         fuser::Errno::ETIMEDOUT
     );
+    assert_eq!(
+        mutation_errno(&MutationError::StaleParent("parent".into())),
+        fuser::Errno::ESTALE
+    );
     // A classified store failure keeps its errno on the mutation
     // path too: full reads as no-space, unwritable as denied.
     assert_eq!(

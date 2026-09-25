@@ -593,6 +593,7 @@ and ignored (the format does not represent them). There are no ACLs.
 | store full (disk or quota) | `ENOSPC` |
 | store not writable | `EACCES` |
 | stale handle, conflicted heads | `EIO` |
+| queued create parent changed | `ESTALE` |
 | unsupported feature operation (symlink/link/xattr) | `EOPNOTSUPP` |
 | name exists | `EEXIST` |
 | name absent | `ENOENT` |

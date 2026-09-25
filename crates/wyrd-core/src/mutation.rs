@@ -91,6 +91,12 @@ impl FileIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentIdentity {
+    Root,
+    Tree(ContentId),
+}
+
 /// What an applied mutation produced. Namespace mutations report `Done`;
 /// file mutations return the new identity so the caller can advance its
 /// handle's base without a second resolution pass.
@@ -156,6 +162,8 @@ pub enum MutationError {
     /// commit performs no merge and authors no snapshot. POSIX `EIO`.
     #[error("stale handle for {0:?}: the path changed since it opened")]
     Stale(String),
+    #[error("stale parent for {0:?}: the directory changed before create")]
+    StaleParent(String),
     /// The operation exceeds a representable or budgeted size. POSIX
     /// `EFBIG`.
     #[error("resulting size {0} exceeds the supported bound")]
@@ -229,7 +237,10 @@ pub enum MutationKind {
     Mkdir { path: String },
     /// Create an empty regular file as its own snapshot (the `create`
     /// op's namespace half). `EEXIST` when the name is taken.
-    CreateFile { path: String },
+    CreateFile {
+        path: String,
+        parent: ParentIdentity,
+    },
     /// Commit a writable handle's full logical image onto the current
     /// head, accepted only if the path still carries `base`. `executable`
     /// is the handle's buffered exec bit for the committed entry.
@@ -276,9 +287,11 @@ impl std::fmt::Debug for MutationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MutationKind::Mkdir { path } => f.debug_struct("Mkdir").field("path", path).finish(),
-            MutationKind::CreateFile { path } => {
-                f.debug_struct("CreateFile").field("path", path).finish()
-            }
+            MutationKind::CreateFile { path, parent } => f
+                .debug_struct("CreateFile")
+                .field("path", path)
+                .field("parent", parent)
+                .finish(),
             MutationKind::CommitFile {
                 path,
                 base,
@@ -942,6 +955,7 @@ mod tests {
             },
             MutationKind::CreateFile {
                 path: "/vault/docs".into(),
+                parent: ParentIdentity::Root,
             },
             MutationKind::CommitFile {
                 path: "/vault/docs".into(),

@@ -14,7 +14,7 @@ use super::inode::{
 };
 use wyrd_core::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
 use wyrd_core::mutation::{
-    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
+    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue, ParentIdentity,
 };
 use wyrd_core::projection::Projection;
 use wyrd_core::session::WriteBudget;
@@ -116,6 +116,7 @@ pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
         // available in time: distinct from EIO so callers can tell
         // "retry may succeed" from "something is wrong".
         MutationError::TimedOut => fuser::Errno::ETIMEDOUT,
+        MutationError::StaleParent(_) => fuser::Errno::ESTALE,
         MutationError::Conflicted { .. }
         | MutationError::Stale(_)
         | MutationError::Lock
@@ -936,9 +937,20 @@ where
         if unsupported_open_flags(flags) {
             return Err(fuser::Errno::EOPNOTSUPP);
         }
-        let parent_path = self.inode_path(parent_ino)?;
-        let child_path = join(&parent_path, name);
         let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
+        let parent_path = self.inode_path(parent_ino)?;
+        let (resolved_parent_ino, parent, parent_generation) = self.resolve_inode(&parent_path)?;
+        if resolved_parent_ino != parent_ino {
+            return Err(fuser::Errno::ESTALE);
+        }
+        self.validate_inode(parent_ino, &parent_path, &parent, parent_generation)?;
+        let parent = match parent {
+            Node::Dir { subtree } => ParentIdentity::Tree(subtree),
+            Node::MergedDir { subtrees } if subtrees.is_empty() => ParentIdentity::Root,
+            Node::MergedDir { .. } | Node::Conflict { .. } => return Err(fuser::Errno::EIO),
+            _ => return Err(fuser::Errno::ENOTDIR),
+        };
+        let child_path = join(&parent_path, name);
         // Reserve the handle slot before the namespace mutation: a
         // saturated table fails here, before the create commits a
         // snapshot the caller will never open, and the promise holds
@@ -950,6 +962,7 @@ where
         let identity = match mutations
             .submit(MutationKind::CreateFile {
                 path: child_path.clone(),
+                parent,
             })
             .map_err(|error| {
                 log_refused(&error);

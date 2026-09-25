@@ -75,7 +75,21 @@ where
 {
     let components = parse_path(path)?;
     let tree = load_tree(store, &root)?;
-    put_node(store, tree, &components, entry)
+    put_node(store, tree, &components, entry, true)
+}
+
+pub fn put_strict<S: ObjectStore>(
+    store: &mut S,
+    root: ContentId,
+    path: &str,
+    entry: Entry,
+) -> Result<ContentId, MutationError<S::Error>>
+where
+    S::Error: std::fmt::Debug,
+{
+    let components = parse_path(path)?;
+    let tree = load_tree(store, &root)?;
+    put_node(store, tree, &components, entry, false)
 }
 
 /// Remove the entry at `path` and return the new root `ContentId`.
@@ -256,6 +270,7 @@ fn put_node<S: ObjectStore>(
     tree: Tree,
     rest: &[Component],
     entry: Entry,
+    create_intermediates: bool,
 ) -> Result<ContentId, MutationError<S::Error>>
 where
     S::Error: std::fmt::Debug,
@@ -277,9 +292,10 @@ where
                 EntryContent::Dir { subtree } => load_tree(store, subtree)?,
                 _ => return Err(MutationError::NotADirectory(head.as_str().to_string())),
             },
-            None => Tree::empty(),
+            None if create_intermediates => Tree::empty(),
+            None => return Err(MutationError::NotFound(head.as_str().to_string())),
         };
-        let new_subtree = put_node(store, child, tail, entry)?;
+        let new_subtree = put_node(store, child, tail, entry, create_intermediates)?;
         upsert(
             &mut entries,
             Entry {
@@ -645,6 +661,16 @@ mod tests {
         let a = put(&mut store, root, "a.txt", file("a.txt", b"same")).unwrap();
         let b = put(&mut store, root, "a.txt", file("a.txt", b"same")).unwrap();
         assert_eq!(a, b, "identical content yields the same root");
+    }
+
+    #[test]
+    fn put_strict_does_not_create_intermediate_directories() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        assert!(matches!(
+            put_strict(&mut store, root, "a/b", file("b", b"x")),
+            Err(MutationError::NotFound(path)) if path == "a"
+        ));
     }
 
     #[test]

@@ -181,6 +181,22 @@ the vault rename/dir-sync reconciliation tests (`serving.rs`),
 `torn_plan_commit_is_ignored_on_reopen`, and
 `fetched_representations_serve_after_restart_and_reauthoring`.
 
+The vault-to-mirror write-through after the rename runs over a
+bounded queue (64 items / 64 MiB; `MAX_MIRROR_QUEUE_ITEMS` /
+`MAX_MIRROR_QUEUE_BYTES` in `serving.rs`). A crash between the
+rename and the write-through heals via the held-root path
+(`reconcile_held`: re-sync the directory, re-import into the
+mirror), and a full queue is backpressure (`VaultError::MirrorFull`,
+naming the refused root), never a silent drop: the vault file is
+already durable, the readiness barrier stays not-ready so no
+announcement discharges over an unserved representation, and a
+restart rebuilds the mirror from the vault. Queue depth travels
+with the not-ready report in the pass logs, and a queue that is
+actually rejecting warns at the default log level. Pinned by
+`a_full_mirror_queue_applies_backpressure_without_losing_the_vault`,
+`serving_reopen_rebuilds_the_mirror_from_the_vault`, and
+`reimport_reconciles_a_vault_file_the_mirror_never_saw`.
+
 ## Mailbox ack and intake
 
 Commit precedes settle per envelope: accepted/duplicates/discards ack,

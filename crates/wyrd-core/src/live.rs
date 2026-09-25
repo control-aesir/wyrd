@@ -251,17 +251,34 @@ pub trait ServingBarrier: Send + Sync {
     /// `Err` when the mirror failed or is gone. Callers gate
     /// announcement discharge on `true`.
     fn flush(&self, budget: Duration) -> Result<bool, std::io::Error>;
+
+    /// Live mirror-queue depth, if the barrier fronts a queue that
+    /// reports one. Defaults to `None` (test doubles, mirror-less
+    /// compositions); the live pass logs whatever it gets whenever
+    /// discharge waits, so a mirror slower than authoring is visible
+    /// in the pass logs instead of only in the queue's own counters.
+    fn queue_stats(&self) -> Option<wyrd_sync::serving::MirrorStats> {
+        None
+    }
 }
 
 impl ServingBarrier for wyrd_sync::serving::ServingEndpoint {
     fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
         wyrd_sync::serving::ServingEndpoint::flush_bounded(self, budget)
     }
+
+    fn queue_stats(&self) -> Option<wyrd_sync::serving::MirrorStats> {
+        Some(wyrd_sync::serving::ServingEndpoint::stats(self))
+    }
 }
 
 impl ServingBarrier for wyrd_sync::serving::ServingHandle {
     fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
         wyrd_sync::serving::ServingHandle::flush_bounded(self, budget)
+    }
+
+    fn queue_stats(&self) -> Option<wyrd_sync::serving::MirrorStats> {
+        Some(wyrd_sync::serving::ServingHandle::stats(self))
     }
 }
 
@@ -623,17 +640,44 @@ where
         match barrier.flush(budget) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                tracing::debug!(
-                    budget_ms = budget.as_millis(),
-                    "announcement discharge waits for serving readiness"
-                );
+                // The queue stats travel with the not-ready report: a
+                // mirror slower than authoring shows up here as depth
+                // against the bounds plus the rejection count, in the
+                // pass logs the guest already collects. A queue that is
+                // actually rejecting is an operational fault, not a
+                // trace — that lands at warn so it is visible at the
+                // default info filter; a merely slow mirror stays debug.
+                let stats = barrier.queue_stats();
+                if stats.is_some_and(|s| s.rejected_full > 0 || s.failed_imports > 0) {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis(),
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness: mirror queue rejecting"
+                    );
+                } else {
+                    tracing::debug!(
+                        budget_ms = budget.as_millis(),
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness"
+                    );
+                }
                 Ok(false)
             }
             Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    "announcement discharge waits for serving readiness"
-                );
+                let stats = barrier.queue_stats();
+                if stats.is_some_and(|s| s.rejected_full > 0 || s.failed_imports > 0) {
+                    tracing::warn!(
+                        error = %error,
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness: mirror queue rejecting"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %error,
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness"
+                    );
+                }
                 Ok(false)
             }
         }

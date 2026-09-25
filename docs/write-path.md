@@ -347,7 +347,11 @@ A commit proceeds in this order, and the order is the contract:
    step.
 5. **Serving readiness.** The vault write-through to the serving mirror
    is flushed (`ServingEndpoint::flush`) so the new representations are
-   servable by transport root.
+   servable by transport root. The write-through queue is bounded
+   (64 items / 64 MiB); a full queue fails the import with
+   `VaultError::MirrorFull` while the vault file stays durable, and
+   the flush barrier reports not-ready, so the discharge at step 6
+   waits exactly like a failed barrier.
 6. **Announcement discharge.** The recorded obligation is sent
    with retry through the durable outbox (`Engine::announce_snapshot`
    for one snapshot, `Engine::announce_pending` for the resume path:

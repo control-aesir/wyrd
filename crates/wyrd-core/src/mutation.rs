@@ -385,10 +385,20 @@ pub enum MutationKind {
     /// single namespace mutation, publishing exactly one root or none.
     /// `size` on a non-file is `EISDIR`; an exec change on a non-file is
     /// a no-op. At least one field is set.
+    ///
+    /// `base` is an optional precondition, never a merge: when it is
+    /// set the path must still carry exactly that file identity or the
+    /// mutation is [`MutationError::Stale`]. A `setattr` addressed by
+    /// path alone stays path-addressed (`None`) — POSIX `truncate` and
+    /// `chmod` act on whatever the path names now — while the `O_TRUNC`
+    /// half of an open is bound to the identity that open observed, so
+    /// a same-path replacement can never have the truncation applied to
+    /// it.
     SetAttrs {
         path: String,
         size: Option<u64>,
         executable: Option<bool>,
+        base: Option<FileIdentity>,
     },
 }
 
@@ -440,11 +450,13 @@ impl std::fmt::Debug for MutationKind {
                 path,
                 size,
                 executable,
+                base,
             } => f
                 .debug_struct("SetAttrs")
                 .field("path", path)
                 .field("size", size)
                 .field("executable", executable)
+                .field("base", base)
                 .finish(),
         }
     }
@@ -1202,6 +1214,7 @@ mod tests {
                 path: "/vault/docs".into(),
                 size: Some(3),
                 executable: Some(true),
+                base: None,
             },
         ];
         for kind in &kinds {

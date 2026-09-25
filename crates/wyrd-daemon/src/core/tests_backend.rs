@@ -561,6 +561,50 @@ fn queued_create_rejects_same_content_parent_replacement() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A real unlink through the live loop, so the post-removal state the
+/// mount serves is the published one rather than a hand-recorded
+/// outcome: the ino the kernel is holding stops resolving, and a
+/// same-kind recreation mints a fresh identity instead of reusing the
+/// removed one. The FUSE-level removal tests cover the interleavings;
+/// this one covers the real publication.
+#[test]
+fn live_unlink_publishes_and_recreation_mints_a_fresh_ino() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon.put_file("f.txt", b"content").unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let old_ino = backend.attr_at("f.txt").unwrap().ino.0;
+    backend
+        .unlink_at(1, "f.txt")
+        .expect("the unlink commits through the loop");
+    assert_eq!(
+        backend.getattr_at(old_ino, None).unwrap_err(),
+        fuser::Errno::ENOENT,
+        "a published removal retires the ino the kernel holds"
+    );
+    assert_eq!(backend.attr_at("f.txt").unwrap_err(), fuser::Errno::ENOENT);
+
+    let (handle, recreated, _) = backend
+        .create_at(1, "f.txt", libc::O_RDWR)
+        .expect("a same-kind recreation commits");
+    assert_ne!(
+        recreated, old_ino,
+        "a recreation never reuses the removed identity"
+    );
+    assert!(backend.release_handle(handle).is_ok());
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn refused_create_stays_absent_after_reopen() {
     let (engine, dir, identity) = scratch_drive();

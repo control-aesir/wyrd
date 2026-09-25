@@ -525,7 +525,7 @@ merely implementation properties.
 | `O_CREAT` | Create the file if absent (its own empty-file snapshot, per `create`). |
 | `O_EXCL` | With `O_CREAT`, `EEXIST` if the name exists. |
 | `O_APPEND` | Appends at the current end at commit time (see handles); the target must remain a regular file. |
-| `O_TRUNC` | The truncation commits **during open** and the handle starts clean on the empty base. It must: the kernel delivers `O_TRUNC` as open plus a separate fh-less `setattr`, so a handle carrying the pre-truncate base would go stale before its first commit. A concurrent change *after* open still stales the handle (`EIO`); a path truncate that lands while the opening handle is still clean re-pins it instead (the handle holds nothing to lose). |
+| `O_TRUNC` | The truncation commits **during open** and the handle starts clean on the empty base. It must: the kernel delivers `O_TRUNC` as open plus a separate fh-less `setattr`, so a handle carrying the pre-truncate base would go stale before its first commit. The commit is bound to the identity the open observed, and the handle binds exactly the identity the loop committed: a same-path replacement that lands before the commit fails the open (`EIO`), and one that lands between the commit and the open's capture fails it `ESTALE`. The follow-up fh-less `setattr(size=0)` is the one part that stays path-addressed, like any other `setattr`: it is a no-op here because the truncation already committed. A concurrent change *after* open still stales the handle (`EIO`); a path truncate that lands while the opening handle is still clean re-pins it instead (the handle holds nothing to lose). |
 | `O_SYNC` / `O_DSYNC` | Accepted; every write is its own durable snapshot (see flush/fsync). |
 | `O_DIRECT`, `O_PATH` | `EOPNOTSUPP` (not representable). |
 
@@ -612,7 +612,9 @@ and ignored (the format does not represent them). There are no ACLs.
 | store not writable | `EACCES` |
 | stale handle, conflicted heads | `EIO` |
 | queued create parent replaced, rotated, or unavailable at admission | `ESTALE` |
-| parent inode retired or re-minted during create admission | `ESTALE` |
+| parent inode retired (kind change, committed removal) or re-minted during create admission | `ESTALE` |
+| parent removal queued but unpublished during create admission | admitted; the loop settles the race (`ENOENT`/`ENOTDIR`/`ESTALE`) |
+| `O_TRUNC` open whose path was replaced between the truncation and the open's capture | `ESTALE` |
 | unsupported feature operation (symlink/link/xattr) | `EOPNOTSUPP` |
 | name exists | `EEXIST` |
 | name absent | `ENOENT` |
@@ -718,9 +720,11 @@ Each row locks a decided invariant.
 - **`O_SYNC` per write**: each successful `write` produces its own
   durable snapshot before returning.
 - **`O_TRUNC`**: the truncation is visible to other opens immediately
-  (it commits during open); a concurrent change after open makes the
-  handle stale (`EIO`), while a truncate landing on a still-clean
-  handle re-pins it.
+  (it commits during open) and applies only to the file the open
+  observed — a same-path replacement that lands first fails the open
+  (`EIO`) with the replacement's content intact. A concurrent change
+  after open makes the handle stale (`EIO`), while a truncate landing on
+  a still-clean handle re-pins it.
 - **`create` then content**: two snapshots, both roots readable; a crash
   after `create` leaves the empty file.
 - **Failed commit is terminal**: after a stale/`EIO` commit the overlay is

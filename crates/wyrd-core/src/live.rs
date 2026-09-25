@@ -26,9 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
-use crate::mutation::{
-    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue, ParentIdentity,
-};
+use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
 use crate::projection::{Projection, SharedProjection};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
@@ -329,6 +327,10 @@ pub struct LiveNode<V: NamespaceView> {
     /// unchanged revision means unchanged state, hence unchanged
     /// heads.
     pub(super) published_heads: usize,
+    /// Head IDs observed before the current mutation batch. A change here
+    /// invalidates parent tokens because the durable history may have
+    /// replaced a path without exposing a local namespace event.
+    pub(super) observed_heads: Vec<SnapshotId>,
     /// Durable state may have changed without a republication (a pass
     /// failed after committing): the next pass republishes regardless
     /// of the revision gate, so recovery never waits for new changes.
@@ -474,7 +476,16 @@ where
         };
         // Baseline observability: idle lines before the first publish
         // report what the adopted generation serves.
-        let published_heads = engine.live_heads().map(|heads| heads.len()).unwrap_or(0);
+        let observed_heads: Vec<SnapshotId> = engine
+            .live_heads()
+            .map(|heads| {
+                heads
+                    .iter()
+                    .map(|head| head.snapshot().snapshot_id())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let published_heads = observed_heads.len();
         (
             LiveNode {
                 engine,
@@ -484,6 +495,7 @@ where
                 mutations,
                 published_revision: revision,
                 published_heads,
+                observed_heads,
                 dirty: false,
                 budgets,
                 max_mutation_wait: config.max_mutation_wait,
@@ -721,6 +733,16 @@ where
         // exit, so no later failure can strand a blocked caller. In the
         // success path completion is deferred past publication below so a
         // returned success means the state serves.
+        let observed_heads = self
+            .engine
+            .live_heads()?
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect::<Vec<_>>();
+        if observed_heads != self.observed_heads {
+            self.mutations.invalidate_parent_tokens();
+            self.observed_heads = observed_heads;
+        }
         // Clone the queue handle so the batch borrow does not pin `self`
         // while mutations apply (the engine borrow is mutable).
         let mutations = Arc::clone(&self.mutations);
@@ -875,6 +897,12 @@ where
             });
         }
         let installed_heads = heads.len();
+        let observed_head_ids = self
+            .engine
+            .live_heads()?
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect::<Vec<_>>();
         let next = Projection::new(
             Arc::clone(&self.store),
             RuntimeMaterialization {
@@ -890,6 +918,8 @@ where
         }
         self.published_revision = revision;
         self.published_heads = installed_heads;
+        self.observed_heads = observed_head_ids;
+        self.mutations.publish_parent_tokens();
         self.dirty = false;
         // Publication is done: a completed mutation's success now means
         // the new generation serves.
@@ -970,12 +1000,21 @@ where
                 let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
+                self.mutations.invalidate_parent_subtree(path);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::CreateFile { path, parent } => {
                 let heads = self.eval_heads(pinned, path)?;
+                if heads.len() > 1 {
+                    return Err(MutationError::Conflicted { heads: heads.len() });
+                }
                 let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
-                if self.current_parent_identity(&heads, parent_path)? != *parent {
+                match self.current_node(&heads, parent_path)? {
+                    None => return Err(MutationError::NotFound(parent_path.to_string())),
+                    Some(Node::Dir { .. } | Node::MergedDir { .. }) => {}
+                    Some(_) => return Err(MutationError::NotADirectory(parent_path.to_string())),
+                }
+                if !self.mutations.validate_parent(parent_path, *parent) {
                     return Err(MutationError::StaleParent(parent_path.to_string()));
                 }
                 if self.current_node(&heads, path)?.is_some() {
@@ -1110,6 +1149,7 @@ where
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
+                self.mutations.invalidate_parent_subtree(path);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rmdir { path } => {
@@ -1120,6 +1160,7 @@ where
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
+                self.mutations.invalidate_parent_subtree(path);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rename {
@@ -1142,6 +1183,8 @@ where
                     return Ok(MutationOutcome::Done);
                 }
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
+                self.mutations.invalidate_parent_subtree(from);
+                self.mutations.invalidate_parent_subtree(to);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::SetAttrs {
@@ -1510,22 +1553,6 @@ where
                 tracing::debug!(path, error = ?error, "mutation path lookup refused");
                 Err(MutationError::Engine)
             }
-        }
-    }
-
-    fn current_parent_identity(
-        &self,
-        heads: &[AuthorizedSnapshot],
-        path: &str,
-    ) -> Result<ParentIdentity, MutationError> {
-        match self.current_node(heads, path)? {
-            None => Err(MutationError::NotFound(path.to_string())),
-            Some(Node::Dir { subtree }) => Ok(ParentIdentity::Tree(subtree)),
-            Some(Node::MergedDir { subtrees }) if subtrees.is_empty() => Ok(ParentIdentity::Root),
-            Some(Node::MergedDir { .. } | Node::Conflict { .. }) => {
-                Err(MutationError::Conflicted { heads: heads.len() })
-            }
-            Some(_) => Err(MutationError::NotADirectory(path.to_string())),
         }
     }
 
@@ -2453,14 +2480,7 @@ mod parent_mutation_tests {
     fn create_does_not_recreate_a_removed_parent() {
         let (engine, dir, store, root, head) = scratch_parent_drive("removed");
         let mut live = live_over_tree(engine, store, &[head]);
-        let parent = match live
-            .current_node(&live.live_heads_traced().unwrap(), "parent")
-            .unwrap()
-            .unwrap()
-        {
-            Node::Dir { subtree } => ParentIdentity::Tree(subtree),
-            _ => panic!("fixture parent is not a directory"),
-        };
+        let parent = live.mutations().capture_parent("parent").unwrap();
         let new_root = {
             let mut store = live.store.write().unwrap();
             wyrd_format::mutation::remove(&mut *store, root, "parent").unwrap()
@@ -2489,14 +2509,7 @@ mod parent_mutation_tests {
     fn create_rejects_a_replaced_parent() {
         let (engine, dir, store, root, head) = scratch_parent_drive("replaced");
         let mut live = live_over_tree(engine, store, &[head]);
-        let parent = match live
-            .current_node(&live.live_heads_traced().unwrap(), "parent")
-            .unwrap()
-            .unwrap()
-        {
-            Node::Dir { subtree } => ParentIdentity::Tree(subtree),
-            _ => panic!("fixture parent is not a directory"),
-        };
+        let parent = live.mutations().capture_parent("parent").unwrap();
         let new_root = {
             let mut store = live.store.write().unwrap();
             let without_parent =
@@ -2517,6 +2530,7 @@ mod parent_mutation_tests {
         live.engine
             .author_snapshot(&*live.store.read().unwrap(), new_root)
             .unwrap();
+        live.mutations().invalidate_parent_subtree("parent");
 
         let result = live.apply_mutation(
             &MutationKind::CreateFile {

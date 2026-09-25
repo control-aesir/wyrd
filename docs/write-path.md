@@ -128,6 +128,7 @@ MutationRequest {
     kind: MutationKind,    // file commit, create, mkdir, unlink, ...
     path(s): …
     base: Option<FileIdentity>,  // handle commits only
+    parent: Option<ParentToken>, // create only; session-local
 }
 ```
 
@@ -175,9 +176,22 @@ MutationRequest {
    past its bound (unstarted work stays pending for the next pass).
    With nothing held, fetching is unbounded. A pass that fulfills
    fetch objects with mutations still queued
-   wakes the loop immediately, so a held mutation retries without
-   waiting out the idle pacing deadline.
-5. **Liveness consequence (named).** The daemon synchronization loop is a
+    wakes the loop immediately, so a held mutation retries without
+    waiting out the idle pacing deadline.
+5. **Create parent precondition.** FUSE captures an opaque, session-local
+   `ParentToken` when `create` observes its parent directory. The live loop
+   checks that token immediately before authoring. Tokens are stable across
+   changes to descendants and siblings, so ordinary serialized mutations
+   do not invalidate a create. A successful local namespace operation that
+   removes, replaces, or moves a path invalidates that path and its
+   descendants; captures are held closed until the new projection publishes.
+   A head-set change outside the local queue invalidates all tokens
+   conservatively because the current object model carries no path-incarnation
+   metadata. A missing parent is `ENOENT`, a non-directory parent is
+   `ENOTDIR`, and an invalidated parent is `ESTALE`. Conflict classification
+   is checked before these path-specific results. Tokens are not durable,
+   portable, or authorization values.
+6. **Liveness consequence (named).** The daemon synchronization loop is a
    hard liveness dependency for every committing FUSE operation: a wedged
    loop blocks the caller indefinitely. That is a daemon health failure
    bounded by the process supervisor, not a per-request cancellation, and
@@ -186,7 +200,7 @@ MutationRequest {
    resolves every admitted-but-incomplete request with `EIO`
    (`Shutdown`) instead of stranding it, and the closed queue refuses
    new submissions the same way.
-6. **Publication is the same path as fetch.** A mutation applies under
+7. **Publication is the same path as fetch.** A mutation applies under
    the store write path and publishes heads and materialization under
    one short view write lock, exactly as a fetch pass does. Neither lock
    is ever held across a network wait.
@@ -593,7 +607,7 @@ and ignored (the format does not represent them). There are no ACLs.
 | store full (disk or quota) | `ENOSPC` |
 | store not writable | `EACCES` |
 | stale handle, conflicted heads | `EIO` |
-| queued create parent changed | `ESTALE` |
+| queued create parent replaced or rotated | `ESTALE` |
 | unsupported feature operation (symlink/link/xattr) | `EOPNOTSUPP` |
 | name exists | `EEXIST` |
 | name absent | `ENOENT` |

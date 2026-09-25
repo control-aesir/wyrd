@@ -7,9 +7,9 @@
 //! up, inserts the rebuilt nodes into the store, and returns the new root
 //! `ContentId`. Nothing is mutated in place; the previous root keeps
 //! resolving to the previous bytes (objects are immutable and
-//! content-addressed). Intermediate directories are created on `put` (but
-//! never on `mkdir`/`rename`, which resolve the parent strictly), and
-//! empty directories are not pruned on `remove`.
+//! content-addressed). Intermediate directories are created on `put` but
+//! never on `put_strict`, `mkdir`, or `rename`, which resolve the parent
+//! strictly. Empty directories are not pruned on `remove`.
 
 use crate::identity::ContentId;
 use crate::store::ObjectStore;
@@ -78,6 +78,10 @@ where
     put_node(store, tree, &components, entry, true)
 }
 
+/// Insert or replace the entry at `path` without creating intermediate
+/// directories. Every parent component must already exist and be a
+/// directory; otherwise the operation returns `NotFound` or
+/// `NotADirectory`.
 pub fn put_strict<S: ObjectStore>(
     store: &mut S,
     root: ContentId,

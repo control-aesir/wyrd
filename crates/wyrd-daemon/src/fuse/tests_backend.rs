@@ -9,7 +9,7 @@ use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node};
 
 use wyrd_core::mutation::{
-    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue, ParentIdentity,
+    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
 };
 use wyrd_core::session::WriteBudget;
 
@@ -590,11 +590,8 @@ fn create_queues_the_observed_parent_identity() {
     ));
     let queue = Arc::new(MutationQueue::default());
     backend.mutations = Some(Arc::clone(&queue));
-    let (parent_ino, parent_node, _) = backend.resolve_inode("parent").unwrap();
-    let expected_parent = match parent_node {
-        Node::Dir { subtree } => ParentIdentity::Tree(subtree),
-        _ => panic!("fixture parent is not a directory"),
-    };
+    let (parent_ino, _, _) = backend.resolve_inode("parent").unwrap();
+    let expected_parent = queue.capture_parent("parent").unwrap();
     let backend = Arc::new(backend);
     let helper = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

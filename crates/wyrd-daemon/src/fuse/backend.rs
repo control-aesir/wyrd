@@ -14,7 +14,7 @@ use super::inode::{
 };
 use wyrd_core::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
 use wyrd_core::mutation::{
-    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue, ParentIdentity,
+    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
 };
 use wyrd_core::projection::Projection;
 use wyrd_core::session::WriteBudget;
@@ -944,12 +944,15 @@ where
             return Err(fuser::Errno::ESTALE);
         }
         self.validate_inode(parent_ino, &parent_path, &parent, parent_generation)?;
-        let parent = match parent {
-            Node::Dir { subtree } => ParentIdentity::Tree(subtree),
-            Node::MergedDir { subtrees } if subtrees.is_empty() => ParentIdentity::Root,
+        match parent {
+            Node::Dir { .. } => {}
+            Node::MergedDir { subtrees } if subtrees.is_empty() => {}
             Node::MergedDir { .. } | Node::Conflict { .. } => return Err(fuser::Errno::EIO),
             _ => return Err(fuser::Errno::ENOTDIR),
-        };
+        }
+        let parent = mutations
+            .capture_parent(&parent_path)
+            .ok_or(fuser::Errno::EIO)?;
         let child_path = join(&parent_path, name);
         // Reserve the handle slot before the namespace mutation: a
         // saturated table fails here, before the create commits a

@@ -5,13 +5,28 @@ use wyrd_fuse::DriveView;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
 
-use super::tests_harness::{live_backend, scratch_drive, NoopMailbox, SettlementFailingMailbox};
+use super::tests_harness::{
+    live_backend, scratch_drive, spawn_live_loop, NoopMailbox, SettlementFailingMailbox,
+};
 
 use crate::fuse::FuseBackend;
+
+use wyrd_core::mutation::MutationQueue;
 
 use wyrd_format::MemoryObjectStore;
 
 use wyrd_sync::bulk::MemoryBulkSource;
+
+fn wait_for_outstanding(queue: &Arc<MutationQueue>, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mutation queue did not reach {count} outstanding requests"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 /// The live handoff publishes a baseline generation: a file
 /// projected before the split is served by the backend after it —
@@ -325,6 +340,285 @@ fn create_at_saturated_table_creates_nothing() {
         fuser::Errno::ENOENT,
         "the refused create left no file behind"
     );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_create_after_parent_removal_returns_enoent() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon
+        .put_file("parent/placeholder", b"placeholder")
+        .unwrap();
+    daemon.remove("parent/placeholder").unwrap();
+    let (live, backend) = live_backend(daemon);
+    let parent_ino = backend.attr_at("parent").unwrap().ino.0;
+    let queue = Arc::clone(live.mutations());
+    let backend = Arc::new(backend);
+
+    let rmdir_backend = Arc::clone(&backend);
+    let rmdir = std::thread::spawn(move || rmdir_backend.rmdir_at(1, "parent"));
+    wait_for_outstanding(&queue, 1);
+
+    let create_backend = Arc::clone(&backend);
+    let create =
+        std::thread::spawn(move || create_backend.create_at(parent_ino, "child", libc::O_RDWR));
+    wait_for_outstanding(&queue, 2);
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    assert_eq!(rmdir.join().unwrap(), Ok(()));
+    assert_eq!(create.join().unwrap().unwrap_err(), fuser::Errno::ENOENT);
+    assert_eq!(backend.attr_at("parent").unwrap_err(), fuser::Errno::ENOENT);
+    assert_eq!(
+        backend.attr_at("parent/child").unwrap_err(),
+        fuser::Errno::ENOENT
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_create_after_parent_becomes_a_file_returns_enotdir() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon
+        .put_file("parent/placeholder", b"placeholder")
+        .unwrap();
+    daemon.remove("parent/placeholder").unwrap();
+    let (live, backend) = live_backend(daemon);
+    let parent_ino = backend.attr_at("parent").unwrap().ino.0;
+    let queue = Arc::clone(live.mutations());
+    let backend = Arc::new(backend);
+
+    let rmdir_backend = Arc::clone(&backend);
+    let rmdir = std::thread::spawn(move || rmdir_backend.rmdir_at(1, "parent"));
+    wait_for_outstanding(&queue, 1);
+
+    let replacement_backend = Arc::clone(&backend);
+    let replacement =
+        std::thread::spawn(move || replacement_backend.create_at(1, "parent", libc::O_RDWR));
+    wait_for_outstanding(&queue, 2);
+
+    let create_backend = Arc::clone(&backend);
+    let create =
+        std::thread::spawn(move || create_backend.create_at(parent_ino, "child", libc::O_RDWR));
+    wait_for_outstanding(&queue, 3);
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    assert_eq!(rmdir.join().unwrap(), Ok(()));
+    let (replacement_handle, _, _) = replacement.join().unwrap().expect("replacement commits");
+    assert!(backend.release_handle(replacement_handle).is_ok());
+    assert_eq!(create.join().unwrap().unwrap_err(), fuser::Errno::ENOTDIR);
+    assert_eq!(
+        backend.attr_at("parent").unwrap().kind,
+        fuser::FileType::RegularFile
+    );
+    assert_eq!(
+        backend.attr_at("parent/child").unwrap_err(),
+        fuser::Errno::ENOTDIR
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_root_creates_keep_the_root_parent_token() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let queue = Arc::clone(live.mutations());
+    let backend = Arc::new(backend);
+
+    let first_backend = Arc::clone(&backend);
+    let first = std::thread::spawn(move || first_backend.create_at(1, "first", libc::O_RDWR));
+    wait_for_outstanding(&queue, 1);
+
+    let second_backend = Arc::clone(&backend);
+    let second = std::thread::spawn(move || second_backend.create_at(1, "second", libc::O_RDWR));
+    wait_for_outstanding(&queue, 2);
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    let (first_handle, _, _) = first.join().unwrap().expect("first root create commits");
+    let (second_handle, _, _) = second.join().unwrap().expect("second root create commits");
+    assert!(backend.release_handle(first_handle).is_ok());
+    assert!(backend.release_handle(second_handle).is_ok());
+    assert!(backend.attr_at("first").is_ok());
+    assert!(backend.attr_at("second").is_ok());
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_create_rejects_same_content_parent_replacement() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon
+        .put_file("parent/placeholder", b"placeholder")
+        .unwrap();
+    daemon.remove("parent/placeholder").unwrap();
+    let (live, backend) = live_backend(daemon);
+    let parent_ino = backend.attr_at("parent").unwrap().ino.0;
+    let queue = Arc::clone(live.mutations());
+    let parent_token = queue.capture_parent("parent").unwrap();
+    let backend = Arc::new(backend);
+
+    let rmdir_backend = Arc::clone(&backend);
+    let rmdir = std::thread::spawn(move || rmdir_backend.rmdir_at(1, "parent"));
+    wait_for_outstanding(&queue, 1);
+
+    let mkdir_backend = Arc::clone(&backend);
+    let mkdir = std::thread::spawn(move || mkdir_backend.mkdir_at(1, "parent"));
+    wait_for_outstanding(&queue, 2);
+
+    let create_backend = Arc::clone(&backend);
+    let create =
+        std::thread::spawn(move || create_backend.create_at(parent_ino, "child", libc::O_RDWR));
+    wait_for_outstanding(&queue, 3);
+    assert!(queue.validate_parent("parent", parent_token));
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    let create_result = create.join().unwrap();
+    let rmdir_result = rmdir.join().unwrap();
+    let mkdir_result = mkdir.join().unwrap().map(|_| ());
+    assert!(
+        !queue.validate_parent("parent", parent_token),
+        "rmdir={rmdir_result:?}, mkdir={mkdir_result:?}"
+    );
+    assert!(
+        matches!(create_result, Err(fuser::Errno::ESTALE)),
+        "unexpected create result: {create_result:?}"
+    );
+    assert_eq!(rmdir_result, Ok(()));
+    assert_eq!(mkdir_result, Ok(()));
+    assert!(backend.attr_at("parent").is_ok());
+    assert_eq!(
+        backend.attr_at("parent/child").unwrap_err(),
+        fuser::Errno::ENOENT
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_create_rejects_different_content_parent_replacement() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon
+        .put_file("parent/placeholder", b"placeholder")
+        .unwrap();
+    daemon.remove("parent/placeholder").unwrap();
+    daemon
+        .put_file("replacement/marker", b"replacement")
+        .unwrap();
+    let (live, backend) = live_backend(daemon);
+    let parent_ino = backend.attr_at("parent").unwrap().ino.0;
+    let queue = Arc::clone(live.mutations());
+    let backend = Arc::new(backend);
+
+    let move_old_backend = Arc::clone(&backend);
+    let move_old =
+        std::thread::spawn(move || move_old_backend.rename_at(1, "parent", 1, "old", true));
+    wait_for_outstanding(&queue, 1);
+
+    let move_new_backend = Arc::clone(&backend);
+    let move_new =
+        std::thread::spawn(move || move_new_backend.rename_at(1, "replacement", 1, "parent", true));
+    wait_for_outstanding(&queue, 2);
+
+    let create_backend = Arc::clone(&backend);
+    let create =
+        std::thread::spawn(move || create_backend.create_at(parent_ino, "child", libc::O_RDWR));
+    wait_for_outstanding(&queue, 3);
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    assert_eq!(move_old.join().unwrap(), Ok(()));
+    assert_eq!(move_new.join().unwrap(), Ok(()));
+    assert!(matches!(create.join().unwrap(), Err(fuser::Errno::ESTALE)));
+    assert!(backend.attr_at("parent/marker").is_ok());
+    assert_eq!(
+        backend.attr_at("parent/child").unwrap_err(),
+        fuser::Errno::ENOENT
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_sibling_creates_share_a_parent_token() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    daemon
+        .put_file("parent/placeholder", b"placeholder")
+        .unwrap();
+    daemon.remove("parent/placeholder").unwrap();
+    let (live, backend) = live_backend(daemon);
+    let parent_ino = backend.attr_at("parent").unwrap().ino.0;
+    let queue = Arc::clone(live.mutations());
+    let backend = Arc::new(backend);
+
+    let first_backend = Arc::clone(&backend);
+    let first =
+        std::thread::spawn(move || first_backend.create_at(parent_ino, "first", libc::O_RDWR));
+    wait_for_outstanding(&queue, 1);
+
+    let second_backend = Arc::clone(&backend);
+    let second =
+        std::thread::spawn(move || second_backend.create_at(parent_ino, "second", libc::O_RDWR));
+    wait_for_outstanding(&queue, 2);
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    let (first_handle, _, _) = first.join().unwrap().expect("first sibling create commits");
+    let (second_handle, _, _) = second
+        .join()
+        .unwrap()
+        .expect("second sibling create commits");
+    assert!(backend.release_handle(first_handle).is_ok());
+    assert!(backend.release_handle(second_handle).is_ok());
+    assert!(backend.attr_at("parent/first").is_ok());
+    assert!(backend.attr_at("parent/second").is_ok());
 
     stop.store(true, Ordering::Relaxed);
     loop_handle

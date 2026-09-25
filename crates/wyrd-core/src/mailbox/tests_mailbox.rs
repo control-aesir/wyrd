@@ -1,6 +1,10 @@
 use super::tests_harness::{device_id, envelope, keys, offline_mailbox, temp_path};
 use super::*;
 use nostr::event::FinalizeEvent;
+use wyrd_sync::keys::DeviceIdentitySecret;
+use wyrd_sync::transport::mailbox::{
+    open_from_sender, seal_for_recipient, MAX_MAILBOX_CIPHERTEXT_LEN, MAX_MAILBOX_OPEN_BYTES,
+};
 
 use std::time::Duration;
 
@@ -168,6 +172,165 @@ fn well_formed_wrap_yields_envelope() {
     assert_eq!(envelope.sender, device_id(&sender));
     assert_eq!(envelope.recipient, device_id(&open));
     assert_eq!(envelope.ciphertext, "sealed control bytes");
+}
+
+#[test]
+fn oversized_gift_wrap_is_rejected_before_unwrap() {
+    let sender = keys();
+    let open = keys();
+    let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), "x".repeat(512 * 1024))
+        .tag(Tag::public_key(open.public_key()))
+        .finalize_unsigned(sender.public_key());
+    let wrap = GiftWrapBuilder::new(open.public_key(), rumor)
+        .finalize(&sender)
+        .unwrap();
+    assert!(
+        wrap.content.len() > MAX_MAILBOX_RELAY_EVENT_BYTES,
+        "fixture must exceed the outer gift-wrap ceiling"
+    );
+    let mailbox = offline_mailbox(&open);
+    assert!(matches!(
+        mailbox.envelope_from_wrap(&wrap),
+        Err(MailboxError::Oversize { .. })
+    ));
+}
+
+#[test]
+fn oversized_relay_metadata_is_rejected_before_unwrap() {
+    let sender = keys();
+    let open = keys();
+    let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), "small")
+        .tag(Tag::public_key(open.public_key()))
+        .finalize_unsigned(sender.public_key());
+    let wrap = GiftWrapBuilder::new(open.public_key(), rumor)
+        .extra_tags([Tag::custom(
+            "oversized",
+            ["x".repeat(MAX_MAILBOX_RELAY_EVENT_BYTES)],
+        )])
+        .finalize(&sender)
+        .unwrap();
+    assert!(wrap.content.len() <= MAX_MAILBOX_RELAY_EVENT_BYTES);
+    let mailbox = offline_mailbox(&open);
+    assert!(matches!(
+        mailbox.envelope_from_wrap(&wrap),
+        Err(MailboxError::Oversize { .. })
+    ));
+}
+
+#[test]
+fn relay_event_ceiling_is_a_decoded_boundary() {
+    let pattern = "\"\\\n";
+    let decoded = |len: usize| {
+        let mut value = pattern.repeat(len / pattern.len());
+        value.push_str(&pattern[..len % pattern.len()]);
+        value
+    };
+    let content_len = MAX_MAILBOX_RELAY_EVENT_BYTES - RELAY_EVENT_FIXED_BYTES - 2;
+    let content = decoded(content_len);
+    let event = EventBuilder::new(Kind::Custom(RUMOR_KIND), content.clone())
+        .finalize(&keys())
+        .unwrap();
+    assert!(check_relay_event_size(&event).is_ok());
+
+    let over = EventBuilder::new(Kind::Custom(RUMOR_KIND), format!("{content}x"))
+        .finalize(&keys())
+        .unwrap();
+    assert!(matches!(
+        check_relay_event_size(&over),
+        Err(MailboxError::Oversize { .. })
+    ));
+
+    let tag_value_len = 1024;
+    let tagged_content_len = MAX_MAILBOX_RELAY_EVENT_BYTES
+        - RELAY_EVENT_FIXED_BYTES
+        - 2
+        - 2
+        - (1 + 2)
+        - (tag_value_len + 2);
+    let tagged_content = decoded(tagged_content_len);
+    let tag_value = decoded(tag_value_len);
+    let tagged = EventBuilder::new(Kind::Custom(RUMOR_KIND), tagged_content)
+        .tag(Tag::custom("k", [tag_value.clone()]))
+        .finalize(&keys())
+        .unwrap();
+    assert!(check_relay_event_size(&tagged).is_ok());
+    let tagged_over = EventBuilder::new(Kind::Custom(RUMOR_KIND), decoded(tagged_content_len))
+        .tag(Tag::custom("k", [format!("{tag_value}x")]))
+        .finalize(&keys())
+        .unwrap();
+    assert!(matches!(
+        check_relay_event_size(&tagged_over),
+        Err(MailboxError::Oversize { .. })
+    ));
+}
+
+#[test]
+fn oversized_inner_ciphertext_is_rejected_before_holding() {
+    let sender = keys();
+    let open = keys();
+    let rumor = EventBuilder::new(
+        Kind::Custom(RUMOR_KIND),
+        "x".repeat(MAX_MAILBOX_CIPHERTEXT_LEN + 1),
+    )
+    .tag(Tag::public_key(open.public_key()))
+    .finalize_unsigned(sender.public_key());
+    let wrap = GiftWrapBuilder::new(open.public_key(), rumor)
+        .finalize(&sender)
+        .unwrap();
+    assert!(wrap.content.len() <= MAX_MAILBOX_RELAY_EVENT_BYTES);
+
+    let mailbox = offline_mailbox(&open);
+    assert!(matches!(
+        mailbox.envelope_from_wrap(&wrap),
+        Err(MailboxError::Oversize { .. })
+    ));
+}
+
+#[test]
+fn maximum_inner_ciphertext_is_accepted_at_boundary() {
+    let sender = keys();
+    let open = keys();
+    let rumor = EventBuilder::new(
+        Kind::Custom(RUMOR_KIND),
+        "x".repeat(MAX_MAILBOX_CIPHERTEXT_LEN),
+    )
+    .tag(Tag::public_key(open.public_key()))
+    .finalize_unsigned(sender.public_key());
+    let wrap = GiftWrapBuilder::new(open.public_key(), rumor)
+        .finalize(&sender)
+        .unwrap();
+    assert!(wrap.content.len() <= MAX_MAILBOX_RELAY_EVENT_BYTES);
+    let mailbox = offline_mailbox(&open);
+    assert!(mailbox.envelope_from_wrap(&wrap).is_ok());
+}
+
+#[test]
+fn maximum_transport_payload_wrap_stays_within_relay_ceiling() {
+    let sender = keys();
+    let recipient = keys();
+    let sender_identity =
+        DeviceIdentitySecret::from_bytes(sender.secret_key().secret_bytes()).unwrap();
+    let recipient_identity =
+        DeviceIdentitySecret::from_bytes(recipient.secret_key().secret_bytes()).unwrap();
+    let control_bytes = vec![0x42; MAX_MAILBOX_OPEN_BYTES];
+    let envelope = seal_for_recipient(&sender_identity, device_id(&recipient), &control_bytes)
+        .expect("maximum control bytes seal");
+    let rumor = EventBuilder::new(Kind::Custom(RUMOR_KIND), envelope.ciphertext.clone())
+        .tag(Tag::public_key(recipient.public_key()))
+        .finalize_unsigned(sender.public_key());
+    let wrap = GiftWrapBuilder::new(recipient.public_key(), rumor)
+        .finalize(&sender)
+        .unwrap();
+    assert!(wrap.content.len() <= MAX_MAILBOX_RELAY_EVENT_BYTES);
+
+    let mailbox = offline_mailbox(&recipient);
+    let received = mailbox
+        .envelope_from_wrap(&wrap)
+        .expect("maximum wrap opens");
+    assert_eq!(received, envelope);
+    let opened = open_from_sender(&recipient_identity, device_id(&recipient), &received)
+        .expect("maximum control bytes open");
+    assert_eq!(opened.as_slice(), control_bytes);
 }
 
 #[test]

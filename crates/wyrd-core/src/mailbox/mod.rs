@@ -57,11 +57,13 @@
 //! not negotiable in v0. Retention itself has an operational cost worth
 //! knowing: every 65,536 acks rewrites the ~4 MB log plus file and
 //! directory fsyncs on the settlement path — fine for low-rate control
-//! traffic, to be measured on supported filesystems. Payload bounds are enforced
-//! at the sync mailbox boundary (`wyrd-sync` `open_from_sender` rejects
-//! ciphertext over `MAX_MAILBOX_CIPHERTEXT_LEN` before NIP-44 decryption
-//! and decrypted bytes over `MAX_MAILBOX_OPEN_BYTES` before ingest), so a
-//! flood of oversized wraps is discarded per redelivery rather than queued.
+//! traffic, to be measured on supported filesystems. The live adapter
+//! rejects a relay event over `MAX_MAILBOX_RELAY_EVENT_BYTES` before it
+//! enters the notification channel or NIP-59 unwrap. The sync mailbox
+//! boundary then rejects ciphertext over `MAX_MAILBOX_CIPHERTEXT_LEN`
+//! before NIP-44 decryption and decrypted bytes over
+//! `MAX_MAILBOX_OPEN_BYTES` before ingest, so a flood of oversized
+//! wraps is discarded per redelivery rather than queued.
 //!
 //! One `LiveMailbox` owns one Tokio runtime and one relay client: the
 //! daemon composes exactly one mailbox per process (see the review note on
@@ -213,10 +215,11 @@ use nostr::prelude::{AsyncGetPublicKey, AsyncNip44};
 use nostr::prelude::{
     Event, EventBuilder, EventId, Keys, Kind, PublicKey, SubscriptionId, Tag, UnsignedEvent,
 };
-use nostr_sdk::prelude::{Client, ClientNotification, Filter};
+use nostr_sdk::prelude::{Client, ClientNotification, Filter, RelayLimits};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc as tokio_mpsc;
 use wyrd_format::DeviceId;
+use wyrd_sync::transport::mailbox::MAX_MAILBOX_CIPHERTEXT_LEN;
 use wyrd_sync::transport::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
@@ -233,6 +236,49 @@ const RUMOR_KIND: u16 = 9_501;
 /// client's notification stream (redelivery comes from relay history), so
 /// an event flood cannot grow daemon memory without limit.
 const INCOMING_CAPACITY: usize = 1024;
+
+/// Ceiling on the decoded relay event's payload estimate: content plus
+/// every tag value, with per-value and per-tag structural allowances and
+/// a fixed allowance for the remaining event fields. The SDK has already
+/// parsed the event when this runs; it is not a wire-frame or exact
+/// serialized-length cap.
+const MAX_MAILBOX_RELAY_EVENT_BYTES: usize = 256 * 1024;
+/// SDK transport backstop for normalized relay JSON. The message limit
+/// is applied before the SDK parses a frame; the per-kind event limit is
+/// applied before it broadcasts the parsed event to the mailbox drainer.
+const MAX_MAILBOX_RELAY_WIRE_BYTES: usize = 512 * 1024;
+const RELAY_EVENT_FIXED_BYTES: usize = 512;
+
+fn check_relay_event_size(event: &Event) -> Result<(), MailboxError> {
+    let mut bytes = RELAY_EVENT_FIXED_BYTES
+        .saturating_add(event.content.len())
+        .saturating_add(2);
+    if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
+        return Err(MailboxError::Oversize {
+            bytes,
+            max: MAX_MAILBOX_RELAY_EVENT_BYTES,
+        });
+    }
+    for tag in event.tags.iter() {
+        bytes = bytes.saturating_add(2);
+        if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
+            return Err(MailboxError::Oversize {
+                bytes,
+                max: MAX_MAILBOX_RELAY_EVENT_BYTES,
+            });
+        }
+        for value in tag.as_slice() {
+            bytes = bytes.saturating_add(value.len()).saturating_add(2);
+            if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
+                return Err(MailboxError::Oversize {
+                    bytes,
+                    max: MAX_MAILBOX_RELAY_EVENT_BYTES,
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Most handovers held unacked at once. Mirrors the engine's
 /// `MAX_PENDING_MESSAGES` intake bound: the mailbox is upstream of it,
@@ -633,7 +679,13 @@ where
             .enable_all()
             .build()
             .map_err(|error| MailboxError::Transport(error.to_string()))?;
-        let client = Arc::new(Client::default());
+        let mut relay_limits = RelayLimits::default();
+        relay_limits.messages.max_size = Some(MAX_MAILBOX_RELAY_WIRE_BYTES as u32);
+        relay_limits
+            .events
+            .max_size_per_kind
+            .insert(Kind::GiftWrap, Some(MAX_MAILBOX_RELAY_WIRE_BYTES as u32));
+        let client = Arc::new(Client::builder().relay_limits(relay_limits).build());
         let signer = Arc::new(signer);
         let open_keys = Keys::new(open_secret);
         let owner_pk = open_keys.public_key();
@@ -832,6 +884,7 @@ where
     /// and rejects rumors whose author differs from the seal author, so a
     /// passing wrap authenticates the sender identity it reports.
     fn envelope_from_wrap(&self, wrap: &Event) -> Result<MailboxEnvelope, MailboxError> {
+        check_relay_event_size(wrap)?;
         let owner_pk = self.open_keys.public_key();
         if !wrap.tags.public_keys().any(|pk| pk == owner_pk) {
             return Err(MailboxError::Transport(
@@ -850,6 +903,12 @@ where
             return Err(MailboxError::Transport(
                 "rumor is not addressed to this device".into(),
             ));
+        }
+        if rumor.content.len() > MAX_MAILBOX_CIPHERTEXT_LEN {
+            return Err(MailboxError::Oversize {
+                bytes: rumor.content.len(),
+                max: MAX_MAILBOX_CIPHERTEXT_LEN,
+            });
         }
         Ok(MailboxEnvelope {
             sender: DeviceId::from_bytes(unwrapped.sender.to_bytes()),
@@ -963,6 +1022,9 @@ async fn drain_notifications(
             ClientNotification::Shutdown => None,
         };
         if let Some(event) = event {
+            if check_relay_event_size(&event).is_err() {
+                continue;
+            }
             let forwarded = match sender.try_send(*event) {
                 Ok(()) => true,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {

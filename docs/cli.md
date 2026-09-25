@@ -62,9 +62,14 @@ any format break.
 - Multi-head conflicts export as `name@N` siblings, numbered in
   SnapshotId byte order — the same numbering the mounted `foo@N`
   grammar selects by. Export never picks a winner silently.
-- Symlinks pass the same confinement policy as the mount: absolute
-  and root-escaping targets are refused, so the plain copy stays
-  self-contained.
+- Symlinks remain representable in the drive, but mounted FUSE views do
+  not provide transparent symlink traversal in v0: `readlink` fails with
+  `EOPNOTSUPP` because a host pathname walk can span live projection
+  generations. Offline export uses one immutable view and emits only
+  links whose complete target is statically confined; absolute targets,
+  root escapes, conflicts, cycles, and hop/work-limit failures are
+  refused. Export permits at most 40 followed links and 256 expanded
+  work units, while the plain copy stays self-contained.
 - `<out_dir>` must not exist or must be empty; export never merges
   into a populated tree. The walk lands in a uniquely named staging
   sibling and renames it into place only after the whole tree

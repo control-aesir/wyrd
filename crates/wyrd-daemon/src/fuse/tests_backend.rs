@@ -128,7 +128,7 @@ fn first_write_over_the_handle_budget_does_not_materialize() {
 }
 
 #[test]
-fn symlink_targets_are_confined_to_the_mount() {
+fn mounted_symlinks_are_non_traversable() {
     use wyrd_format::Entry;
 
     fn view_with(entries: Vec<Entry>) -> DriveView<MemoryObjectStore, NoMaterialization> {
@@ -140,30 +140,13 @@ fn symlink_targets_are_confined_to_the_mount() {
         DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]))
     }
 
-    // Absolute targets resolve in the host namespace: never served.
-    let view = view_with(vec![Entry::symlink("link", "/etc/passwd").unwrap()]);
-    assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
-    // A root-level `..` already escapes the mount.
-    let view = view_with(vec![Entry::symlink("link", "../target").unwrap()]);
-    assert_eq!(symlink_target(&view, "link"), Err(fuser::Errno::EACCES));
+    for target in ["/etc/passwd", "../target", "safe"] {
+        let view = view_with(vec![Entry::symlink("link", target).unwrap()]);
+        assert_eq!(symlink_target(&view, "link"), fuser::Errno::EOPNOTSUPP);
+    }
 
-    // Nested escapes: the walk is lexical from the link's parent.
     let mut store = MemoryObjectStore::default();
     let inner = Tree::from_entries(vec![Entry::symlink("link", "../../evil").unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-    let root = Tree::from_entries(vec![Entry::dir("sub", inner).unwrap()])
-        .unwrap()
-        .insert_into(&mut store)
-        .unwrap();
-    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-    assert_eq!(symlink_target(&view, "sub/link"), Err(fuser::Errno::EACCES));
-
-    // In-drive targets still serve verbatim: the kernel resolves
-    // them inside the mount.
-    let mut store = MemoryObjectStore::default();
-    let inner = Tree::from_entries(vec![Entry::symlink("link", "../sibling").unwrap()])
         .unwrap()
         .insert_into(&mut store)
         .unwrap();
@@ -175,15 +158,13 @@ fn symlink_targets_are_confined_to_the_mount() {
     .insert_into(&mut store)
     .unwrap();
     let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
-    assert_eq!(symlink_target(&view, "sub/link"), Ok("../sibling".into()));
-
-    // Non-target paths keep their existing mapping.
-    assert_eq!(symlink_target(&view, "missing"), Err(fuser::Errno::ENOENT));
-    assert_eq!(symlink_target(&view, "sibling"), Err(fuser::Errno::EINVAL));
+    assert_eq!(symlink_target(&view, "sub/link"), fuser::Errno::EOPNOTSUPP);
+    assert_eq!(symlink_target(&view, "missing"), fuser::Errno::ENOENT);
+    assert_eq!(symlink_target(&view, "sibling"), fuser::Errno::EINVAL);
 }
 
 #[test]
-fn chained_symlink_escape_is_refused() {
+fn mounted_chained_symlink_traversal_is_refused() {
     let mut store = MemoryObjectStore::default();
     let leaf = Tree::from_entries(vec![
         Entry::symlink("s", "../..").unwrap(),
@@ -202,7 +183,7 @@ fn chained_symlink_escape_is_refused() {
         .unwrap();
     let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
 
-    assert_eq!(symlink_target(&view, "a/b/link"), Err(fuser::Errno::EACCES));
+    assert_eq!(symlink_target(&view, "a/b/link"), fuser::Errno::EOPNOTSUPP);
 }
 
 #[test]

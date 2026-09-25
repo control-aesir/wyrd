@@ -28,16 +28,16 @@
 //! `DestinationNotEmpty`, and `dest` always holds one complete tree,
 //! never a mix.
 //!
-//! Symlinks pass the same confinement policy as the mount
-//! ([`confine_symlink_target`](crate::view::confine_symlink_target)):
-//! absolute, root-escaping, and compositionally escaping targets are
-//! refused, because the plain copy must stay self-contained. Multi-head
-//! conflicts materialize as `name@N` siblings, numbered in SnapshotId byte
-//! order exactly like
-//! the version-selection grammar, so `doc@1` on disk is `doc@1` in
-//! the mount. Export never picks a winner silently; a stored name
-//! colliding with a versioned sibling fails closed as
-//! [`ExportError::NameCollision`].
+//! Symlinks are validated against the one immutable view used by this
+//! export ([`confine_symlink_target`](crate::view::confine_symlink_target)):
+//! absolute, root-escaping, compositionally escaping, conflicting,
+//! cyclic, and over-budget targets are refused, because the plain copy
+//! must stay self-contained. Mounted FUSE views do not follow symlinks
+//! in v0. Multi-head conflicts materialize as `name@N` siblings,
+//! numbered in SnapshotId byte order exactly like the version-selection
+//! grammar, so `doc@1` on disk is `doc@1` in the mount. Export never
+//! picks a winner silently; a stored name colliding with a versioned
+//! sibling fails closed as [`ExportError::NameCollision`].
 //!
 //! Walk depth is bounded by the format's [`MAX_PATH_DEPTH`](wyrd_format::MAX_PATH_DEPTH):
 //! the mutation layer never authors deeper trees, so a deeper walk
@@ -682,7 +682,7 @@ fn create_symlink(_target: &str, _dest: &Path) -> Result<(), ExportError> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -690,6 +690,7 @@ mod tests {
 
     use crate::view::{
         Attr, ConfinementError, ConflictVersion, DirEntry, Head, Kind, MaterializationPolicy,
+        MAX_SYMLINK_WORK,
     };
 
     /// Residency that serves everything local. Export is offline by
@@ -718,6 +719,8 @@ mod tests {
         /// When set, the root lookup fails: the export must clean up
         /// staging it already claimed and report the view error.
         fail_root: bool,
+        lookup_error: Option<(String, ViewError)>,
+        lookup_count: AtomicUsize,
         /// When set, the first `read` signals parked and blocks until
         /// the test releases it: the test overlaps two exports
         /// deterministically, holding one parked while the other runs
@@ -874,7 +877,13 @@ mod tests {
         }
 
         fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+            self.lookup_count.fetch_add(1, Ordering::Relaxed);
             let key = path.trim_start_matches('/');
+            if let Some((failed_path, error)) = &self.lookup_error {
+                if key == failed_path {
+                    return Err(error.clone());
+                }
+            }
             if key.is_empty() {
                 if self.fail_root {
                     return Err(ViewError::InvalidPath);
@@ -1464,6 +1473,53 @@ mod tests {
         );
         assert_no_staging(&dest.join("out"));
         std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn preserves_symlink_lookup_failures_in_export_diagnostics() {
+        let mut view = FakeView {
+            lookup_error: Some(("target".to_owned(), ViewError::Corrupt)),
+            ..FakeView::default()
+        };
+        view.set_root(vec![(
+            "link".to_owned(),
+            FakeNode::Symlink("target".to_owned()),
+        )]);
+        let dest = tmp();
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExportError::Symlink {
+                    source: ConfinementError::Lookup {
+                        source: ViewError::Corrupt
+                    },
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_no_staging(&dest.join("out"));
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn pathological_symlink_target_is_work_bounded() {
+        let mut view = FakeView::default();
+        view.set_root(Vec::new());
+        let before = view.lookup_count.load(Ordering::Relaxed);
+        let target = "z/../".repeat(MAX_SYMLINK_WORK / 2 + 1);
+
+        assert_eq!(
+            confine_symlink_target(&view, "link", &target),
+            Err(ConfinementError::WorkLimit)
+        );
+        let lookups = view.lookup_count.load(Ordering::Relaxed) - before;
+        assert!(
+            lookups <= MAX_SYMLINK_WORK,
+            "resolver exceeded its lookup budget: {lookups}"
+        );
     }
 
     #[test]

@@ -39,12 +39,11 @@
 //!   [`ViewError::Corrupt`] triggers scrub/repair before surfacing.
 //! - Symlink targets are untrusted member-authored bytes. The view
 //!   never follows a symlink (an intermediate symlink is
-//!   [`ViewError::NotADirectory`]); only the kernel follows, via
-//!   `readlink` — so the backend serves a target only when
-//!   [`confine_symlink_target`] resolves observed intermediate links and
-//!   proves the complete path cannot escape the mount. Absolute targets,
-//!   root escapes, conflicts, cycles, and unavailable intermediates fail
-//!   closed. There is no trusted-drive opt-out in v0.
+//!   [`ViewError::NotADirectory`]). Mounted FUSE views are non-traversable
+//!   for symlinks in v0 because a host pathname walk can span live
+//!   projection generations; `readlink` fails with `EOPNOTSUPP`.
+//!   Static export uses [`confine_symlink_target`] with bounded
+//!   compositional resolution. There is no trusted-drive opt-out in v0.
 
 mod drive;
 mod grammar;

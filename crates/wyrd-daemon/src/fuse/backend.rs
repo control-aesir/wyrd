@@ -1925,10 +1925,8 @@ where
             reply.error(_log.fail(error));
             return;
         }
-        match symlink_target(projection.view(), &path) {
-            Ok(target) => reply.data(target.as_bytes()),
-            Err(error) => reply.error(_log.fail(error)),
-        }
+        let error = symlink_target(projection.view(), &path);
+        reply.error(_log.fail(error));
     }
 
     /// Create a directory: submit the mutation to the loop and, on
@@ -2302,22 +2300,13 @@ where
 pub(super) fn symlink_target<S: ObjectStore, M: Materialization>(
     view: &DriveView<S, M>,
     path: &str,
-) -> Result<String, fuser::Errno>
+) -> fuser::Errno
 where
     S::Error: std::fmt::Debug,
 {
     match view.lookup(path) {
-        Ok(Node::Symlink { target }) => {
-            // The kernel follows this target in the host namespace, so
-            // an escaping target must never reach it: fail closed with
-            // EACCES (sandbox convention) rather than serving bytes the
-            // kernel would resolve outside the mount.
-            match wyrd_fuse::confine_symlink_target(view, path, &target) {
-                Ok(()) => Ok(target),
-                Err(_) => Err(fuser::Errno::EACCES),
-            }
-        }
-        Ok(_) => Err(fuser::Errno::EINVAL),
-        Err(error) => Err(errno_of(&error)),
+        Ok(Node::Symlink { .. }) => fuser::Errno::EOPNOTSUPP,
+        Ok(_) => fuser::Errno::EINVAL,
+        Err(error) => errno_of(&error),
     }
 }

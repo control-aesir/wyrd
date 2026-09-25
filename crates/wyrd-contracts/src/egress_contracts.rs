@@ -14,9 +14,9 @@
 //! the order the `foo@N` grammar selects by, and the multi-version
 //! rendering itself is pinned in `wyrd-core`'s walk tests.
 
-use wyrd_core::export::export_tree;
+use wyrd_core::export::{export_tree, ExportError};
 use wyrd_core::node::WyrdNode;
-use wyrd_core::view::RuntimeMaterialization;
+use wyrd_core::view::{ConfinementError, RuntimeMaterialization};
 use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_fuse::DriveView;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -141,6 +141,52 @@ fn export_round_trips_a_real_drive_to_a_plain_tree() {
         ]
     );
 
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn export_rejects_a_chained_symlink_escape_from_the_real_view() {
+    let dir = egress_dir("chained-escape");
+    let mut engine = Engine::create(
+        dir.clone(),
+        "egress-chain-pass",
+        DeviceIdentitySecret::generate().unwrap(),
+    )
+    .unwrap();
+    let mut store = MemoryObjectStore::default();
+    let leaf = Tree::from_entries(vec![
+        Entry::symlink("s", "../..").unwrap(),
+        Entry::symlink("link", "s/../../outside").unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let a = Tree::from_entries(vec![Entry::dir("b", leaf).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let root = Tree::from_entries(vec![Entry::dir("a", a).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    engine.author_snapshot(&store, root).unwrap();
+    let mut node: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    node.refresh_live_heads().unwrap();
+
+    let out = dir.join("out");
+    let error = export_tree(node.view(), &out).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ExportError::Symlink {
+                source: ConfinementError::EscapesRoot,
+                ..
+            }
+        ),
+        "unexpected: {error:?}"
+    );
+    assert!(!out.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

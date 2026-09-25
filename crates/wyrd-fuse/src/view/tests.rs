@@ -1,5 +1,7 @@
 use super::*;
 
+use wyrd_core::view::{MAX_SYMLINK_HOPS, MAX_SYMLINK_WORK};
+
 use std::collections::HashMap;
 use wyrd_format::store::MemoryStoreError;
 use wyrd_format::{
@@ -680,7 +682,101 @@ fn symlink_confinement_resolves_nested_links_and_rejects_cycles() {
     );
     assert_eq!(
         confine_symlink_target(&view, "a", "b"),
-        Err(ConfinementError::Unresolvable)
+        Err(ConfinementError::Cycle)
+    );
+}
+
+#[test]
+fn symlink_confinement_enforces_total_work_budget() {
+    let view = view(small_drive());
+    let within_budget = vec!["x"; MAX_SYMLINK_WORK].join("/");
+    assert_eq!(
+        confine_symlink_target(&view, "link", &within_budget),
+        Ok(())
+    );
+
+    let over_budget = vec!["x"; MAX_SYMLINK_WORK + 1].join("/");
+    assert_eq!(
+        confine_symlink_target(&view, "link", &over_budget),
+        Err(ConfinementError::WorkLimit)
+    );
+
+    let repeated = "z/../".repeat(MAX_SYMLINK_WORK / 2 + 1);
+    assert_eq!(
+        confine_symlink_target(&view, "link", &repeated),
+        Err(ConfinementError::WorkLimit)
+    );
+}
+
+#[test]
+fn symlink_confinement_enforces_hop_budget() {
+    fn chain(links: usize) -> DriveView<MemoryObjectStore, FakeMaterialization> {
+        let mut store = MemoryObjectStore::default();
+        let mut entries = Vec::with_capacity(links + 1);
+        for index in 0..links {
+            let target = if index + 1 == links {
+                "file".to_owned()
+            } else {
+                format!("s{}", index + 1)
+            };
+            entries.push(Entry::symlink(format!("s{index}"), target).unwrap());
+        }
+        entries.push(Entry::file("file", 0, false, Vec::new()).unwrap());
+        let root = tree_of(&mut store, entries);
+        DriveView::new(
+            store,
+            FakeMaterialization::empty(),
+            heads(vec![snapshot(root)]),
+        )
+    }
+
+    assert_eq!(
+        confine_symlink_target(&chain(MAX_SYMLINK_HOPS), "link", "s0"),
+        Ok(())
+    );
+    assert_eq!(
+        confine_symlink_target(&chain(MAX_SYMLINK_HOPS + 1), "link", "s0"),
+        Err(ConfinementError::HopLimit)
+    );
+}
+
+#[test]
+fn symlink_confinement_preserves_conflicts_and_lookup_failures() {
+    let mut store = MemoryObjectStore::default();
+    let root_a = tree_of(
+        &mut store,
+        vec![Entry::file("conflict", 0, false, Vec::new()).unwrap()],
+    );
+    let root_b = tree_of(&mut store, Vec::new());
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(root_a), snapshot(root_b)]),
+    );
+    assert_eq!(
+        confine_symlink_target(&view, "link", "conflict/child"),
+        Err(ConfinementError::Conflict)
+    );
+
+    let missing = ContentId::from_bytes([0xEE; 32]);
+    let mut store = MemoryObjectStore::default();
+    let root = tree_of(&mut store, vec![Entry::dir("remote", missing).unwrap()]);
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(root)]),
+    );
+    assert_eq!(
+        confine_symlink_target(&view, "link", "remote/child"),
+        Err(ConfinementError::Lookup {
+            source: ViewError::NotMaterialized { content: missing },
+        })
+    );
+    assert_eq!(
+        confine_symlink_target(&view, "link", "bad\0name"),
+        Err(ConfinementError::Lookup {
+            source: ViewError::InvalidPath,
+        })
     );
 }
 

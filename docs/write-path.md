@@ -480,8 +480,10 @@ spelling.
 
 **Final-component symlinks are never followed.** `unlink`, `rmdir`,
 `rename`, and metadata operations target the directory entry itself, not
-a target it names. Paths are handled as canonical components, not raw
-strings.
+a target it names. Mounted symlink traversal is also unavailable in v0:
+`readlink` returns `EOPNOTSUPP` because a host pathname walk can span
+live projection generations. Paths are handled as canonical components,
+not raw strings.
 
 ### Namespace mutation atomicity (contract)
 

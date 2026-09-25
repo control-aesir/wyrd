@@ -274,36 +274,44 @@ pub trait NamespaceView: Sized {
 }
 
 /// Why a symlink target cannot leave the drive. Targets are
-/// member-authored and untrusted; any backend that materializes a
-/// link — the kernel via `readlink`, `wyrd export` onto a plain
-/// filesystem, a future mobile provider — would otherwise resolve
-/// bytes outside the drive. The check is namespace policy, so it
-/// lives with the namespace model; each backend keeps its own
-/// refusal mapping (EACCES at the FUSE boundary, a typed export
-/// error) but shares this decision.
+/// member-authored and untrusted; static materializers such as
+/// `wyrd export` would otherwise resolve bytes outside the drive. The
+/// check is namespace policy, so it lives with the namespace model.
+/// Mounted FUSE refuses symlink traversal separately because a host
+/// pathname walk can span multiple live projection generations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfinementError {
     #[error("symlink target is absolute; absolute targets resolve in the host namespace")]
     Absolute,
     #[error("symlink target escapes the drive root")]
     EscapesRoot,
-    #[error("symlink target cannot be proven confined")]
-    Unresolvable,
+    #[error("symlink target crosses a conflicted namespace node")]
+    Conflict,
+    #[error("symlink target contains a resolution cycle")]
+    Cycle,
+    #[error("symlink target exceeds the hop limit")]
+    HopLimit,
+    #[error("symlink target exceeds the resolution work limit")]
+    WorkLimit,
+    #[error("symlink target lookup failed: {source}")]
+    Lookup { source: ViewError },
 }
 
-const MAX_SYMLINK_HOPS: usize = 40;
+pub const MAX_SYMLINK_HOPS: usize = 40;
+pub const MAX_SYMLINK_WORK: usize = 256;
 
 /// Confine a symlink target to the drive namespace: the v0 policy for
 /// untrusted member-authored targets. `link_path` is the symlink's own
 /// drive path (`""`-joined components); `target` is the stored target
 /// bytes. The view is consulted for every resolved component so nested
-/// symlinks are followed before the root boundary is checked.
+/// symlinks are followed before the root boundary is checked. Both
+/// followed-link count and total expanded-component work are bounded.
 ///
 /// Absolute targets are refused outright. Relative targets resolve
 /// against the link's parent directory; `.` and empty segments are
 /// skipped, `..` pops, and a `..` that pops above the drive root is
-/// refused. A conflicting, cyclic, or unavailable intermediate node
-/// cannot be proven safe and is refused.
+/// refused. Conflicts, cycles, hop/work exhaustion, and unexpected
+/// lookup failures are reported as typed errors.
 ///
 /// There is no trusted-drive opt-out in v0: confinement is always on.
 pub fn confine_symlink_target<V: NamespaceView>(
@@ -327,8 +335,25 @@ pub fn confine_symlink_target<V: NamespaceView>(
         .collect::<VecDeque<_>>();
     let mut followed = HashSet::new();
     let mut hops = 0;
+    let mut work = 0;
 
-    resolve_symlink_components(view, &mut resolved, &mut pending, &mut followed, &mut hops)
+    resolve_symlink_components(
+        view,
+        &mut resolved,
+        &mut pending,
+        &mut followed,
+        &mut hops,
+        &mut work,
+    )
+}
+
+fn consume_symlink_work(work: &mut usize) -> Result<(), ConfinementError> {
+    *work = work.saturating_add(1);
+    if *work > MAX_SYMLINK_WORK {
+        Err(ConfinementError::WorkLimit)
+    } else {
+        Ok(())
+    }
 }
 
 fn resolve_symlink_components<V: NamespaceView>(
@@ -337,8 +362,10 @@ fn resolve_symlink_components<V: NamespaceView>(
     pending: &mut VecDeque<String>,
     followed: &mut HashSet<Vec<String>>,
     hops: &mut usize,
+    work: &mut usize,
 ) -> Result<(), ConfinementError> {
     while let Some(component) = pending.pop_front() {
+        consume_symlink_work(work)?;
         match component.as_str() {
             "" | "." => {}
             ".." => {
@@ -350,10 +377,14 @@ fn resolve_symlink_components<V: NamespaceView>(
                 resolved.push(component);
                 match view.lookup(&resolved.join("/")) {
                     Ok(Node::Symlink { target: next }) => {
+                        consume_symlink_work(work)?;
                         *hops += 1;
+                        if *hops > MAX_SYMLINK_HOPS {
+                            return Err(ConfinementError::HopLimit);
+                        }
                         let symlink_path = resolved.clone();
-                        if *hops > MAX_SYMLINK_HOPS || !followed.insert(symlink_path.clone()) {
-                            return Err(ConfinementError::Unresolvable);
+                        if !followed.insert(symlink_path.clone()) {
+                            return Err(ConfinementError::Cycle);
                         }
                         resolved.pop();
                         if next.starts_with('/') {
@@ -362,13 +393,14 @@ fn resolve_symlink_components<V: NamespaceView>(
                         for next_component in next.split('/').rev() {
                             pending.push_front(next_component.to_owned());
                         }
-                        resolve_symlink_components(view, resolved, pending, followed, hops)?;
+                        resolve_symlink_components(view, resolved, pending, followed, hops, work)?;
                         followed.remove(&symlink_path);
                     }
-                    Ok(Node::Conflict { .. }) => return Err(ConfinementError::Unresolvable),
+                    Ok(Node::Conflict { .. }) => return Err(ConfinementError::Conflict),
                     Ok(_) => {}
                     Err(ViewError::NotFound | ViewError::NotADirectory | ViewError::NotAFile) => {}
-                    Err(_) => return Err(ConfinementError::Unresolvable),
+                    Err(ViewError::Conflict) => return Err(ConfinementError::Conflict),
+                    Err(source) => return Err(ConfinementError::Lookup { source }),
                 }
             }
         }

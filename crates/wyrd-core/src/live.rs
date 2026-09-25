@@ -557,12 +557,17 @@ where
         // the obligations stay pending and the next pass retries — so
         // a sick mirror stalls propagation, never the mount.
         //
-        // Only when something is actually pending: with an empty outbox
-        // the barrier gates nothing, and a slow mirror would otherwise
-        // burn its whole budget per pass for no discharge (observed in
-        // the guest logs as ten-second publish phases that sent
-        // nothing, delaying shutdown past its budget).
-        if self.engine.has_pending_outbound()? && !self.flush_serving_barrier()? {
+        // Only when announcements are actually pending: with no
+        // announcement to discharge the barrier gates nothing, and a
+        // slow mirror would otherwise burn its whole budget per pass
+        // for nothing (observed in the guest logs as ten-second
+        // publish phases that sent nothing, delaying shutdown past
+        // its budget).
+        // The barrier gates announcement discharge specifically: with
+        // only transitions or capabilities pending, a slow mirror
+        // must not consume the serving budget (deliver_pending above
+        // already tried those, and they are not mirror-gated).
+        if !self.engine.pending_announcements()?.is_empty() && !self.flush_serving_barrier()? {
             return Ok(sent);
         }
         sent += match self

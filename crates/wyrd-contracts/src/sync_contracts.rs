@@ -291,8 +291,8 @@ fn failed_pass_recovers_serving_on_retry() {
 /// durable store is damaged (the commit watermark rots) and
 /// `refresh_live_heads` fails closed — the engine refuses to rebuild
 /// rather than projecting from untrustworthy state. The view keeps
-/// serving exactly what it served before: refresh is all-or-nothing,
-/// never a partial head set, never a clear.
+/// serving exactly what it served before: a failed refresh installs
+/// nothing, never a partial head set, never a clear.
 ///
 /// This pins the decided v0 post-corruption policy (`docs/epochs.md`,
 /// Heads: projection failure ⇒ installed heads unchanged ⇒ failure
@@ -340,8 +340,8 @@ fn failed_projection_leaves_installed_heads_untouched() {
 /// eligible heads where one is still fetching, `refresh_live_heads`
 /// installs the verified head and leaves the pending one for later,
 /// and an all-pending set leaves the installed head untouched. This is
-/// the per-head path the all-or-nothing contract above does not cover
-/// on its own: that test damages the commit watermark (engine-level
+/// the per-head path the whole-set contract above does not cover on
+/// its own: that test damages the commit watermark (engine-level
 /// failure), while here the engine is healthy and exactly one head's
 /// closure is still arriving.
 #[test]
@@ -522,187 +522,6 @@ fn live_sync_pass_never_projects_mixed_validity_heads() {
 /// one because the current eligible set is still mid-fetch: head A is
 /// installed and serving, head B supersedes it but its closure has
 /// not arrived, and A keeps serving until B can.
-#[test]
-fn probe_pending_head_construction() {
-    let mut loaded = Loaded::new("keeper.txt", b"keeper");
-    loaded.publish_body_and_announcement(None);
-    loaded.publish_all();
-    let mut engine = loaded.rig.take_engine();
-    loaded.want_all(&mut engine);
-    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
-        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
-    daemon.drain(&mut loaded.rig.relay).unwrap();
-    daemon.execute_plan(&mut loaded.bulk).unwrap();
-    println!(
-        "after A: keeper={}",
-        daemon.view().lookup("keeper.txt").is_ok()
-    );
-    println!("heads after A: {:?}", daemon_refresh_probe(&mut daemon));
-
-    let mut scratch = MemoryObjectStore::default();
-    let chunk_b = scratch.insert(ObjectKind::Chunk, b"second").unwrap();
-    let tree_b = Tree::from_entries(vec![
-        Entry::file("second.txt", 6, false, vec![chunk_b]).unwrap()
-    ])
-    .unwrap()
-    .insert_into(&mut scratch)
-    .unwrap();
-    let snapshot_b = signed_snapshot(
-        vec![loaded.snapshot.snapshot_id()],
-        tree_b,
-        &loaded.rig.owner,
-        loaded.rig.admit_id,
-        2,
-        2_000,
-    );
-    let snapshot_b_id = snapshot_b.snapshot_id();
-    let content_b = seal_flat_drive(
-        &drive(),
-        &loaded.rig.epoch2,
-        2,
-        &snapshot_b_id,
-        &[("second.txt", b"second")],
-    );
-    let body_b = snapshot_b.encode();
-    loaded.bulk.publish_snapshot(snapshot_b_id, body_b.clone());
-    loaded.bulk.publish_transport(body_b.clone());
-    loaded.rig.enqueue_announcement(
-        snapshot_b_id,
-        loaded.rig.admit_id,
-        2,
-        AnnouncedRoots {
-            body_root: BaoRoot::from_bytes(*blake3::hash(&body_b).as_bytes()),
-            root_manifest: content_b.manifest_id,
-            root_transport: BaoRoot::from_bytes(*blake3::hash(&content_b.root.sealed).as_bytes()),
-        },
-        None,
-    );
-    println!(
-        "engine heads after B announce+drain+plan: {:?}",
-        engine_heads_probe()
-    );
-
-    // Variant 2: publish all of B but keep its objects unwanted.
-    loaded
-        .bulk
-        .publish_root(snapshot_b_id, content_b.root.clone());
-    for (storage, sealed) in &content_b.objects {
-        loaded.bulk.publish_sealed(*storage, sealed.clone());
-    }
-    daemon.drain(&mut loaded.rig.relay).unwrap();
-    daemon.execute_plan(&mut loaded.bulk).unwrap();
-    println!(
-        "after B (published, unwanted): keeper={} second={}",
-        daemon.view().lookup("keeper.txt").is_ok(),
-        daemon.view().lookup("second.txt").is_ok()
-    );
-    let refreshed = daemon.refresh_live_heads();
-    println!(
-        "refresh ok={} keeper={} second={}",
-        refreshed.is_ok(),
-        daemon.view().lookup("keeper.txt").is_ok(),
-        daemon.view().lookup("second.txt").is_ok()
-    );
-    println!(
-        "keeper lookup: {:?}",
-        daemon.view().lookup("keeper.txt").is_ok()
-    );
-    drop(daemon);
-    loaded.rig.teardown();
-}
-
-#[test]
-fn probe_successor_head_visibility() {
-    let mut loaded = Loaded::new("keeper.txt", b"keeper");
-    loaded.publish_body_and_announcement(None);
-    loaded.publish_all();
-    let mut engine = loaded.rig.take_engine();
-    loaded.want_all(&mut engine);
-    engine.drain(&mut loaded.rig.relay).unwrap();
-    engine
-        .execute_plan(&mut loaded.bulk, &mut loaded.objects)
-        .unwrap();
-    let a = loaded.snapshot.snapshot_id();
-    println!(
-        "heads after A: {:?}",
-        engine
-            .live_heads()
-            .unwrap()
-            .iter()
-            .map(|h| h.snapshot().snapshot_id())
-            .collect::<Vec<_>>()
-    );
-
-    let mut scratch = MemoryObjectStore::default();
-    let chunk_b = scratch.insert(ObjectKind::Chunk, b"second").unwrap();
-    let tree_b = Tree::from_entries(vec![
-        Entry::file("second.txt", 6, false, vec![chunk_b]).unwrap()
-    ])
-    .unwrap()
-    .insert_into(&mut scratch)
-    .unwrap();
-    let snapshot_b = signed_snapshot(
-        vec![a],
-        tree_b,
-        &loaded.rig.owner,
-        loaded.rig.admit_id,
-        2,
-        2_000,
-    );
-    let snapshot_b_id = snapshot_b.snapshot_id();
-    let content_b = seal_flat_drive(
-        &drive(),
-        &loaded.rig.epoch2,
-        2,
-        &snapshot_b_id,
-        &[("second.txt", b"second")],
-    );
-    let body_b = snapshot_b.encode();
-    loaded.bulk.publish_snapshot(snapshot_b_id, body_b.clone());
-    loaded.bulk.publish_transport(body_b.clone());
-    loaded.rig.enqueue_announcement(
-        snapshot_b_id,
-        loaded.rig.admit_id,
-        2,
-        AnnouncedRoots {
-            body_root: BaoRoot::from_bytes(*blake3::hash(&body_b).as_bytes()),
-            root_manifest: content_b.manifest_id,
-            root_transport: BaoRoot::from_bytes(*blake3::hash(&content_b.root.sealed).as_bytes()),
-        },
-        None,
-    );
-    engine.drain(&mut loaded.rig.relay).unwrap();
-    println!(
-        "heads after B drain: {:?}",
-        engine
-            .live_heads()
-            .unwrap()
-            .iter()
-            .map(|h| h.snapshot().snapshot_id())
-            .collect::<Vec<_>>()
-    );
-    engine
-        .execute_plan(&mut loaded.bulk, &mut loaded.objects)
-        .unwrap();
-    println!(
-        "heads after B plan: {:?}",
-        engine
-            .live_heads()
-            .unwrap()
-            .iter()
-            .map(|h| h.snapshot().snapshot_id())
-            .collect::<Vec<_>>()
-    );
-    let state = engine.runtime_state().unwrap();
-    println!(
-        "root record for B: {:?}",
-        state.root_manifest_record(&snapshot_b_id).is_some()
-    );
-    println!("fork probe...");
-    drop(engine);
-    loaded.rig.teardown();
-}
-
 #[test]
 fn an_installed_head_survives_a_pending_successor_refresh() {
     let mut loaded = Loaded::new("keeper.txt", b"keeper");
@@ -2283,7 +2102,6 @@ fn recovery_grafts_content_only_and_voided_transitions_never_authorize() {
     // view; nothing voided-derived does.
     assert_eq!(dag.eligible_heads(&log), vec![id_recovery]);
 }
-
 /// Recovery rebuilds explicitly identified historical content and
 /// mounts it: the owner authors a tree, supersedes it across a
 /// rotation (carry keeps continuity, so the snapshot becomes
@@ -2564,13 +2382,4 @@ fn recovery_resurrects_bytes_from_a_voided_branch_and_mounts() {
 
     drop(daemon);
     rig.teardown();
-}
-
-fn engine_heads_probe() -> usize {
-    0
-}
-fn daemon_refresh_probe(
-    _daemon: &mut WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>>,
-) -> usize {
-    0
 }

@@ -52,8 +52,12 @@ use crate::ingest::{check_manifest, check_tree, IngestError, Limits};
 
 /// Why a snapshot's manifest closure does not correspond to its tree closure.
 ///
-/// Every variant is a fail-closed verdict on evidence, never a transport or
-/// cryptographic failure; the bytes involved already authenticated.
+/// Every variant except `ObjectStore` is a fail-closed verdict on
+/// evidence, never a transport or cryptographic failure; the bytes
+/// involved already authenticated. `ObjectStore` is a store I/O
+/// failure carrying its own classification: it is neither pending
+/// progress nor permanent damage, and callers route it to the store
+/// failure policy.
 #[derive(Debug, Error)]
 pub enum ClosureError {
     #[error("root manifest describes snapshot {found}, not {expected}")]
@@ -131,9 +135,11 @@ impl ClosureError {
     /// yet" rather than "the closure is wrong". The pending arm is
     /// ordinary fetch progress: the head installs once its records
     /// and trees land, and callers must treat it as no-publication
-    /// state, never as a fatal engine error. Every other variant is
-    /// permanent damage — a mismatch, a non-canonical document, a
-    /// contradicted mapping — and stays fail-closed.
+    /// state, never as a fatal engine error. Every other variant
+    /// except `ObjectStore` is permanent damage — a mismatch, a
+    /// non-canonical document, a contradicted mapping — and stays
+    /// fail-closed; `ObjectStore` is neither, and callers classify it
+    /// through its own `StoreFailure`.
     pub fn is_pending(&self) -> bool {
         matches!(
             self,

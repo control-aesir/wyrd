@@ -389,6 +389,61 @@ fn loop_announces_mounted_writes() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A control-plane-only outbox never touches the serving mirror. The
+/// barrier gates announcement discharge: with transitions (or
+/// capabilities) pending and no announcement, a slow mirror must not
+/// consume the serving budget — that wait bounds the pass and delays
+/// shutdown for a gate that gates nothing.
+#[test]
+fn a_control_plane_only_outbox_never_flushes_the_serving_barrier() {
+    let (mut engine, dir, _) = scratch_drive();
+    let member = admit_member(&mut engine);
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (mut live, backend) = live_backend(daemon);
+
+    // The first pass cannot deliver (dead relay), so the admission's
+    // transition and capability obligations stay pending — and
+    // nothing is announced.
+    live.sync_once(&mut SendFailingMailbox, None::<&mut MemoryBulkSource>)
+        .expect("unsendable control-plane work never fails the pass");
+    assert!(
+        live.pending_announcements().unwrap().is_empty(),
+        "control-plane-only backlog: nothing announced"
+    );
+
+    // The relay is still down on the next pass, so the obligations
+    // are pending when the publish step reaches the barrier gate —
+    // and a slow mirror must not be asked.
+    let barrier = Arc::new(ControllableBarrier {
+        fail: AtomicBool::new(false),
+        stall: AtomicBool::new(true),
+        flushes: AtomicUsize::new(0),
+    });
+    live.set_serving_barrier(barrier.clone());
+    live.sync_once(&mut SendFailingMailbox, None::<&mut MemoryBulkSource>)
+        .expect("unsendable control-plane work never fails the pass");
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 0);
+
+    // With the relay recovered, the control plane discharges — still
+    // without the mirror, which gates nothing here.
+    let mut mailbox = ThreadRecordingMailbox::new();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .expect("control-plane work never fails the pass");
+    assert!(
+        !mailbox.drained().is_empty(),
+        "the transition and capability still discharge"
+    );
+    assert_eq!(barrier.flushes.load(Ordering::SeqCst), 0);
+    for envelope in mailbox.drained() {
+        assert_eq!(envelope.recipient, member);
+    }
+
+    drop(live);
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A dead relay stalls delivery without failing the mount: sends that
 /// cannot leave keep their obligations pending, the pass succeeds,
 /// and a later pass with a working mailbox drains them.

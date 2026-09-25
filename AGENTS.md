@@ -54,13 +54,13 @@ to. The README carries the vision; `docs/` carries the current design contract.
 ## Commands
 
 ```
-cargo check                 # workspace build/validation
-cargo nextest run           # workspace tests (unit + integration)
-cargo test --workspace --doc  # doctests; nextest skips these
-cargo nextest run --profile slow
-                            # >10s live-relay tests; excluded from
-                            # regular runs, gated on master CI
-cargo test -p wyrd-cli      # CLI suite (argument parsing, exit codes)
+devenv shell -- cargo check                 # workspace build/validation
+devenv shell -- cargo nextest run           # workspace tests (unit + integration)
+devenv shell -- cargo test --workspace --doc  # doctests; nextest skips these
+devenv shell -- cargo nextest run --profile slow
+                                            # >10s live-relay tests; excluded from
+                                            # regular runs, gated on master CI
+devenv shell -- cargo test -p wyrd-cli      # CLI suite (argument parsing, exit codes)
 devenv shell                # enter the dev environment (rust, git-hooks)
 ```
 
@@ -107,3 +107,5 @@ guest. Operate it, never babysit it blind:
   `P4`), and one `release:*` milestone.
 - Comments explain how code is used, not what it does line-by-line. Keep them
   in sync with the code.
+- Run outside an active devenv with `devenv shell -- ...`; bare commands 
+  assume you are already inside `devenv shell`.

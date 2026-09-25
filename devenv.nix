@@ -5,8 +5,6 @@ let
   unstable = import inputs.nixpkgs-unstable { system = pkgs.stdenv.system; };
 in
 {
-  dotenv.enable = true;
-
   languages.deno.enable = true;
   languages.rust.enable = true;
   languages.rust.toolchainFile = ./rust-toolchain.toml;

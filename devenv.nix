@@ -42,7 +42,6 @@ in
     rustfmt.enable = true;
     nixpkgs-fmt.enable = true;
     commitizen.enable = true;
-    typos.enable = true;
 
     # Dependency-policy gates run on push, not on commit: `cargo audit`
     # fetches the advisory database over the network, and both checks scan

@@ -63,10 +63,16 @@ fn drain_until(
     expected: usize,
 ) -> DrainReport {
     let start = Instant::now();
+    let mut total = DrainReport::default();
     loop {
         let report = engine.drain(mailbox).unwrap();
-        if report.accepted >= expected {
-            return report;
+        total.accepted += report.accepted;
+        total.duplicates += report.duplicates;
+        total.deferred += report.deferred;
+        total.skipped += report.skipped;
+        total.discarded += report.discarded;
+        if total.accepted >= expected {
+            return total;
         }
         assert!(
             start.elapsed() < DELIVERY_TIMEOUT,
@@ -77,7 +83,7 @@ fn drain_until(
 }
 
 #[test]
-fn oversized_inner_ciphertext_is_rejected_before_drainer_queue() {
+fn oversized_inner_ciphertext_is_rejected_before_holding() {
     let relay = MiniRelay::spawn();
     let url = relay.url().to_string();
     let sender = sender_keys();

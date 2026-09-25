@@ -723,11 +723,7 @@ impl RuntimeState {
                 // policy.
                 let structural = entry.kind == ObjectKind::Tree;
                 if !structural {
-                    let desired = self
-                        .materialization
-                        .get(&entry.content_id)
-                        .copied()
-                        .unwrap_or(MaterializationState::RemoteOnly);
+                    let desired = self.materialization(&entry.content_id);
                     if matches!(desired, MaterializationState::RemoteOnly) {
                         continue;
                     }

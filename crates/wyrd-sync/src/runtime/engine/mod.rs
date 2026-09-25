@@ -1207,6 +1207,12 @@ impl Engine {
     /// retry re-registers the same identity must not grow the
     /// append-only log (or burn an fsync) per retry. A genuine
     /// transition still commits exactly once.
+    ///
+    /// The guard reads the log first, so the failure surface includes
+    /// read errors: a damaged historical commit fails the write
+    /// closed. Inside the loop pass this changes nothing, since the
+    /// fetch phase and the settlement sweep already rebuild the same
+    /// log in the same pass.
     pub fn set_materialization(
         &mut self,
         content: ContentId,
@@ -1223,6 +1229,32 @@ impl Engine {
         }
         self.store
             .commit(&[Fact::Materialization(content, state)])?;
+        Ok(())
+    }
+
+    /// Set the residency policy against a caller-owned durable
+    /// snapshot, committing only on a genuine transition and
+    /// refreshing the snapshot in memory so a pass pays one rebuild
+    /// for N admissions instead of one per admission. The loop's
+    /// admission path; direct callers use [`Engine::set_materialization`],
+    /// which is the same comparison against a fresh rebuild.
+    ///
+    /// The snapshot must come from this store (a pass-owned
+    /// [`RuntimeState`]); the in-memory refresh mirrors exactly what
+    /// a rebuild would show for the materialization map, since the
+    /// commit appends only this fact.
+    pub fn set_materialization_from(
+        &mut self,
+        snapshot: &mut super::RuntimeState,
+        content: ContentId,
+        state: MaterializationState,
+    ) -> Result<(), EngineError> {
+        if snapshot.materialization(&content) == state {
+            return Ok(());
+        }
+        self.store
+            .commit(&[Fact::Materialization(content, state)])?;
+        snapshot.set_materialization(content, state);
         Ok(())
     }
 

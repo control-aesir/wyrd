@@ -690,26 +690,29 @@ where
         // a demand flood: leftover pending demand is not dropped, it
         // waits for the next pass.
         //
-        // Retries of an already-`Cached` identity admit without a
-        // commit: one durable snapshot per pass filters them, so a
-        // retry storm costs a single replay instead of a rebuild plus
-        // an fsync per want. The engine's own commit-time guard stays
-        // the authority for direct `want()` callers; returning `Ok`
-        // here still marks the identity admitted, and the fetch plan
-        // picks it up from the durable `Cached` policy.
-        let admitted = if self.wants.peek_pending().is_empty() {
+        // One durable snapshot feeds the whole admission: retries of
+        // an already-`Cached` identity admit with no commit, and each
+        // genuinely new identity commits once while refreshing the
+        // snapshot in memory — N admissions cost one replay for the
+        // admission step (routes and settlement still take their own).
+        // The engine's commit-time guard stays the authority for
+        // direct `want()` callers; returning `Ok` here still marks
+        // the identity admitted, and the fetch plan picks it up from
+        // the durable `Cached` policy.
+        let mut admission = if self.wants.peek_pending().is_empty() {
             None
         } else {
             Some(self.engine.runtime_state()?)
         };
         admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
-            if admitted.as_ref().map(|state| state.materialization(&want))
-                == Some(MaterializationState::Cached)
-            {
+            let Some(snapshot) = admission.as_mut() else {
+                // Unreachable: the gate above took the snapshot exactly
+                // when pending was non-empty, and nothing else touches
+                // the registry between the gate and this closure.
                 return Ok(());
-            }
+            };
             self.engine
-                .set_materialization(want, MaterializationState::Cached)
+                .set_materialization_from(snapshot, want, MaterializationState::Cached)
         })?;
         let phase = std::time::Instant::now();
         let fetched = match bulk {
@@ -1788,19 +1791,24 @@ where
 }
 
 /// Persist pending wants into durable `Cached` materialization,
-/// atomically from the registry's perspective: each identity's fact is
-/// written first, and only the committed prefix is marked admitted. A
-/// failing commit leaves the failing identity and everything after it
-/// pending — the next pass retries them, and no waiter ever coalesces
-/// onto a fetch that was never admitted. Admission commits advance the
-/// engine's durable sequence, which is what the publication gate
-/// observes — the returned identities are for callers that need the
-/// admitted set itself.
+/// atomically from the registry's perspective: the commit closure runs
+/// per identity oldest-first, and only the successfully processed
+/// prefix is marked admitted. A failing commit leaves the failing
+/// identity and everything after it pending — the next pass retries
+/// them, and no waiter ever coalesces onto a fetch that was never
+/// admitted.
 ///
-/// At most `limit` identities commit per call: the registry's peek is
-/// oldest-first, so capping paces a flood deterministically while the
-/// remainder waits for the next pass. A zero limit admits nothing and
-/// still reports the empty set.
+/// The closure may admit without writing: when the durable state
+/// already matches, success marks the identity admitted with no fact
+/// appended and no sequence advance. The publication gate already
+/// treats a locally-unchanged pass as skippable, so duplicate-only
+/// passes cost no republication. The returned identities are for
+/// callers that need the admitted set itself.
+///
+/// At most `limit` identities are processed per call: the registry's
+/// peek is oldest-first, so capping paces a flood deterministically
+/// while the remainder waits for the next pass. A zero limit admits
+/// nothing and still reports the empty set.
 ///
 /// Public because host-side tests pin the admission atomicity directly;
 /// the loop is the only production caller.
@@ -1811,18 +1819,18 @@ pub fn admit_wants<E>(
 ) -> Result<Vec<ContentId>, E> {
     let pending = registry.peek_pending();
     let take = pending.len().min(limit);
-    let mut committed = Vec::with_capacity(take);
+    let mut admitted = Vec::with_capacity(take);
     for want in pending.into_iter().take(take) {
         match commit(want) {
-            Ok(()) => committed.push(want),
+            Ok(()) => admitted.push(want),
             Err(error) => {
-                registry.mark_admitted(&committed);
+                registry.mark_admitted(&admitted);
                 return Err(error);
             }
         }
     }
-    registry.mark_admitted(&committed);
-    Ok(committed)
+    registry.mark_admitted(&admitted);
+    Ok(admitted)
 }
 
 #[cfg(test)]
@@ -2314,6 +2322,98 @@ mod prereq_tests {
             summary.passes > u64::from(cap),
             "the loop must keep passing an incomplete closure past the cap, saw {}",
             summary.passes
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reported bug cycle end to end: a want for unavailable
+    /// content is admitted, its waiter times out, the sweep retires
+    /// the admitted mark, and a later retry re-registers — the next
+    /// pass must admit it with no new fact, while the durable
+    /// `Cached` policy keeps the fetch queued.
+    #[test]
+    fn retry_after_timeout_admits_without_a_new_fact() {
+        use crate::want::{wait_for_materialization, WantError};
+
+        let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("retry-dedup");
+        // Serve from an empty store and want an identity nothing
+        // holds: the waiter never observes success and always times
+        // out, and the engine never considers it landed (the file's
+        // own chunk is engine-local from authoring, so wanting it
+        // would retire as landed instead of exercising the retry).
+        let wanted = ContentId::derive(ObjectKind::Chunk, b"unavailable");
+        let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        // The demand cycle with a real waiter: register, admit while
+        // it polls, expire, then sweep the admitted mark.
+        std::thread::scope(|scope| {
+            let wants = Arc::clone(node.wants());
+            // Generous deadline: expiry must not interleave with the
+            // pass itself, or the pass-end sweep would retire the
+            // admitted mark before the assertions below.
+            let waiter = scope.spawn(move || {
+                wait_for_materialization(&wants, wanted, Duration::from_secs(5), || false)
+            });
+            // The pass must run after the waiter registers: polling
+            // for the pending demand keeps a slow spawn from turning
+            // the admission into a vacuous no-op.
+            let registered_by = std::time::Instant::now() + Duration::from_secs(5);
+            while node.wants().peek_pending().is_empty() {
+                assert!(
+                    std::time::Instant::now() < registered_by,
+                    "the waiter never registered its demand"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            node.sync_once(
+                &mut NoopMailbox,
+                None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+            )
+            .unwrap();
+            assert!(
+                node.wants().is_admitted(&wanted),
+                "the pass admitted while the waiter polled"
+            );
+            assert_eq!(
+                node.engine
+                    .runtime_state()
+                    .unwrap()
+                    .materialization(&wanted),
+                MaterializationState::Cached,
+                "the admission committed while the waiter polled"
+            );
+            let error = waiter.join().unwrap().unwrap_err();
+            assert_eq!(error, WantError::TimedOut);
+        });
+        node.wants().retire_where(|_, waiters| waiters == 0);
+        assert!(!node.wants().is_admitted(&wanted));
+        let committed = node.engine.current();
+        // The retry: re-register and pass again — admitted with no
+        // new fact, the durable `Cached` policy survives, and the
+        // plan still queues the object.
+        node.wants().register(wanted).unwrap();
+        node.sync_once(
+            &mut NoopMailbox,
+            None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+        )
+        .unwrap();
+        assert!(
+            node.wants().is_admitted(&wanted),
+            "the retry coalesces onto the durable policy"
+        );
+        assert_eq!(
+            node.engine.current(),
+            committed,
+            "the retry admits with no new fact"
+        );
+        let runtime = node.engine.runtime_state().unwrap();
+        assert_eq!(
+            runtime.materialization(&wanted),
+            MaterializationState::Cached
+        );
+        assert_eq!(
+            runtime.status(&wanted),
+            FetchStatus::Fetching,
+            "the fetch plan still queues the retry"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

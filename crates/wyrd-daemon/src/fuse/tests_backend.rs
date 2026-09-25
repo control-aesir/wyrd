@@ -4,6 +4,7 @@ use super::*;
 
 use fuser::{FileHandle, INodeNo};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node};
@@ -391,6 +392,32 @@ fn same_kind_recreate_mints_fresh_ino() {
         backend.validate_inode(first_ino, "f.txt", &second_node, 2),
         Err(fuser::Errno::ENOENT)
     );
+}
+
+#[test]
+fn pending_unlink_retires_the_inode_before_completion() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let (old_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || worker_backend.unlink_at(1, "f.txt"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(Instant::now() < deadline, "unlink was not admitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (pending_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+    assert_ne!(pending_ino, old_ino);
+
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1);
+    batch.record(0, Ok(MutationOutcome::Done));
+    batch.finish();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+    assert_eq!(backend.resolve_inode("f.txt").unwrap().0, pending_ino);
 }
 
 /// Directory handles pin their enumeration generation: a listing

@@ -471,6 +471,20 @@ where
         }
     }
 
+    fn begin_remove(&self, path: &str) -> Result<u64, fuser::Errno> {
+        self.inodes
+            .write()
+            .map_err(|_| fuser::Errno::EIO)?
+            .begin_remove(path)
+            .map_err(inode_error)
+    }
+
+    fn finish_remove(&self, path: &str, token: u64, success: bool) {
+        if let Ok(mut inodes) = self.inodes.write() {
+            inodes.finish_remove(path, token, success);
+        }
+    }
+
     /// A shared borrow of the current published generation: the
     /// [`Arc`](std::sync::Arc) is cloned under a short read lock and
     /// served lock-free after the guard drops, so callers hold an
@@ -502,6 +516,20 @@ where
         mounted_symlink_traversal_error(projection.view(), &path)
     }
 
+    fn capture_from_projection(
+        projection: &Arc<Projection<DriveView<S, M>>>,
+        path: &str,
+    ) -> Result<(Node, OpenFile, bool), ViewError> {
+        let view = projection.view();
+        let node = view.lookup(path)?;
+        let file = view.open(&node)?;
+        let executable = match &node {
+            Node::File { executable, .. } => *executable,
+            _ => false,
+        };
+        Ok((node, file, executable))
+    }
+
     /// Open the file at `path`: the view's immutable file identity is
     /// captured at open and keyed by a fresh handle, so later reads
     /// serve the opened version even after heads advance. The
@@ -517,28 +545,30 @@ where
     }
 
     fn open_at_with_inode(&self, path: &str, ino: Option<u64>) -> Result<FileHandle, fuser::Errno> {
-        let attempt = |this: &Self| -> Result<(OpenFile, bool), (ViewError, fuser::Errno)> {
+        let attempt = |this: &Self| -> Result<_, (ViewError, fuser::Errno)> {
             let projection = this.projection().map_err(|error| {
                 (
                     ViewError::Store(StoreFailure::Transient, "projection lock".into()),
                     error,
                 )
             })?;
-            let view = projection.view();
-            let node = view
-                .lookup(path)
-                .map_err(|error| (error.clone(), errno_of(&error)))?;
-            let file = view
-                .open(&node)
-                .map_err(|error| (error.clone(), errno_of(&error)))?;
-            let executable = match &node {
-                Node::File { executable, .. } => *executable,
-                _ => false,
+            let (node, file, executable) = match Self::capture_from_projection(&projection, path) {
+                Ok(captured) => captured,
+                Err(ViewError::NotFound) => {
+                    if let Some(ino) = ino {
+                        this.retire_inode(ino);
+                    }
+                    return Err((ViewError::NotFound, fuser::Errno::ENOENT));
+                }
+                Err(error) => return Err((error.clone(), errno_of(&error))),
             };
-            Ok((file, executable))
+            Ok((projection, node, file, executable))
         };
-        let (file, executable) =
+        let (projection, node, file, executable) =
             self.with_demand(|| attempt(self), |attempted| attempted.map_err(|e| e.1))?;
+        if let Some(ino) = ino {
+            self.validate_inode(ino, path, &node, projection.generation())?;
+        }
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
@@ -900,6 +930,19 @@ where
         self.insert_reserved(Handle::Write(Arc::new(Mutex::new(handle))))
     }
 
+    fn validate_open_inode(&self, ino: u64, path: &str) -> Result<(), fuser::Errno> {
+        let projection = self.projection()?;
+        let node = match projection.view().lookup(path) {
+            Ok(node) => node,
+            Err(ViewError::NotFound) => {
+                self.retire_inode(ino);
+                return Err(fuser::Errno::ENOENT);
+            }
+            Err(error) => return Err(errno_of(&error)),
+        };
+        self.validate_inode(ino, path, &node, projection.generation())
+    }
+
     /// Build the writable handle for [`open_write`](Self::open_write):
     /// resolve the node, commit an `O_TRUNC` truncation up front, and
     /// capture the identity the handle commits against.
@@ -912,6 +955,9 @@ where
         ino: Option<u64>,
     ) -> Result<WriteHandle, fuser::Errno> {
         if truncate {
+            if let Some(ino) = ino {
+                self.validate_open_inode(ino, path)?;
+            }
             // A path-addressed truncate while an append handle is open
             // on that path is `EOPNOTSUPP` (write-path.md): the fh-less
             // `setattr` path enforces the same guard, and the open path
@@ -933,14 +979,19 @@ where
             })?;
         }
         let projection = self.projection()?;
-        let node = projection
-            .view()
-            .lookup(path)
-            .map_err(|error| errno_of(&error))?;
-        let capture = projection
-            .view()
-            .open(&node)
-            .map_err(|error| errno_of(&error))?;
+        let (node, capture, _) = match Self::capture_from_projection(&projection, path) {
+            Ok(captured) => captured,
+            Err(ViewError::NotFound) => {
+                if let Some(ino) = ino {
+                    self.retire_inode(ino);
+                }
+                return Err(fuser::Errno::ENOENT);
+            }
+            Err(error) => return Err(errno_of(&error)),
+        };
+        if let Some(ino) = ino {
+            self.validate_inode(ino, path, &node, projection.generation())?;
+        }
         let base = match &node {
             Node::File {
                 size,
@@ -1556,17 +1607,25 @@ where
     /// Remove the file or symlink `name` under `parent_ino`.
     pub fn unlink_at(&self, parent_ino: u64, name: &str) -> Result<(), fuser::Errno> {
         let path = join(&self.inode_path(parent_ino)?, name);
-        self.submit(MutationKind::Unlink { path: path.clone() })?;
-        self.retire_path(&path);
-        Ok(())
+        if self.mutations.is_none() {
+            return Err(fuser::Errno::EROFS);
+        }
+        let token = self.begin_remove(&path)?;
+        let result = self.submit(MutationKind::Unlink { path: path.clone() });
+        self.finish_remove(&path, token, result.is_ok());
+        result.map(|_| ())
     }
 
     /// Remove the empty directory `name` under `parent_ino`.
     pub fn rmdir_at(&self, parent_ino: u64, name: &str) -> Result<(), fuser::Errno> {
         let path = join(&self.inode_path(parent_ino)?, name);
-        self.submit(MutationKind::Rmdir { path: path.clone() })?;
-        self.retire_path(&path);
-        Ok(())
+        if self.mutations.is_none() {
+            return Err(fuser::Errno::EROFS);
+        }
+        let token = self.begin_remove(&path)?;
+        let result = self.submit(MutationKind::Rmdir { path: path.clone() });
+        self.finish_remove(&path, token, result.is_ok());
+        result.map(|_| ())
     }
 
     /// Move `name` under `parent_ino` to `new_name` under `new_parent`.
@@ -1735,6 +1794,8 @@ where
         Ok(self.attr(ino, &node))
     }
 
+    /// `fh` is a kernel correlation handle: its tagged domain and bound
+    /// inode are validated before any metadata is served.
     pub fn getattr_at(
         &self,
         ino: u64,
@@ -2009,33 +2070,6 @@ where
                 return;
             }
         };
-        // The ino must still name this path at its kind: a retired
-        // mapping (kind change since the dentry was cached) fails
-        // here so the kernel re-resolves instead of opening the
-        // path's new occupant under stale identity.
-        let Ok(projection) = self.projection() else {
-            reply.error(_log.fail(fuser::Errno::EIO));
-            return;
-        };
-        match projection.view().lookup(&path) {
-            Ok(node) => {
-                if let Err(error) =
-                    self.validate_inode(ino.0, &path, &node, projection.generation())
-                {
-                    reply.error(_log.fail(error));
-                    return;
-                }
-            }
-            Err(ViewError::NotFound) => {
-                self.retire_inode(ino.0);
-                reply.error(_log.fail(fuser::Errno::ENOENT));
-                return;
-            }
-            Err(error) => {
-                reply.error(_log.fail(errno_of(&error)));
-                return;
-            }
-        }
         let opened = match flags.acc_mode() {
             fuser::OpenAccMode::O_RDONLY => self.open_at_with_inode(&path, Some(ino.0)),
             fuser::OpenAccMode::O_WRONLY | fuser::OpenAccMode::O_RDWR => {

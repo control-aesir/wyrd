@@ -65,6 +65,8 @@ pub(super) struct InodeTable {
     pub(super) by_ino: HashMap<u64, InodeEntry>,
     pub(super) by_path: HashMap<String, u64>,
     pub(super) next: u64,
+    pending_removals: HashMap<String, RetiredPath>,
+    next_removal: u64,
 }
 
 /// One minted mapping: the path, the node kind it resolved to, and
@@ -79,13 +81,20 @@ pub(super) struct InodeEntry {
     pub(super) generation: u64,
 }
 
+struct RetiredPath {
+    token: u64,
+    ino: Option<u64>,
+    entry: Option<InodeEntry>,
+}
+
 pub(crate) type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
 
 /// One open directory: the listing pinned at opendir plus the
 /// projection generation it was enumerated from. Readdir serves the
 /// pinned listing — a stable snapshot of its generation — while
-/// lookup/getattr always resolve against the current projection, so
-/// a listing never mixes generations mid-stream; a fresh opendir
+/// handle-less lookup/getattr resolve against the current projection;
+/// a directory file handle keeps its bound inode metadata, so a
+/// listing never mixes generations mid-stream and a fresh opendir
 /// picks up the new generation.
 pub(super) struct OpenDir {
     pub(super) ino: u64,
@@ -191,6 +200,8 @@ impl InodeTable {
             by_ino,
             by_path,
             next: 2,
+            pending_removals: HashMap::new(),
+            next_removal: 1,
         }
     }
 
@@ -216,6 +227,47 @@ impl InodeTable {
     pub(super) fn retire_path(&mut self, path: &str) {
         if let Some(ino) = self.by_path.remove(path) {
             self.by_ino.remove(&ino);
+        }
+    }
+
+    pub(super) fn begin_remove(&mut self, path: &str) -> Result<u64, InodeError> {
+        if let Some(pending) = self.pending_removals.get(path) {
+            return Ok(pending.token);
+        }
+        let token = self.next_removal;
+        self.next_removal = self
+            .next_removal
+            .checked_add(1)
+            .ok_or(InodeError::Exhausted)?;
+        let removed = self
+            .by_path
+            .remove(path)
+            .and_then(|ino| self.by_ino.remove(&ino).map(|entry| (ino, entry)));
+        let (ino, entry) = removed
+            .map(|(ino, entry)| (Some(ino), Some(entry)))
+            .unwrap_or((None, None));
+        self.pending_removals
+            .insert(path.to_string(), RetiredPath { token, ino, entry });
+        Ok(token)
+    }
+
+    pub(super) fn finish_remove(&mut self, path: &str, token: u64, success: bool) {
+        if self
+            .pending_removals
+            .get(path)
+            .is_none_or(|pending| pending.token != token)
+        {
+            return;
+        }
+        let pending = self
+            .pending_removals
+            .remove(path)
+            .expect("pending removal was checked above");
+        if !success && !self.by_path.contains_key(path) {
+            if let (Some(ino), Some(entry)) = (pending.ino, pending.entry) {
+                self.by_path.insert(path.to_string(), ino);
+                self.by_ino.insert(ino, entry);
+            }
         }
     }
 
@@ -264,15 +316,22 @@ impl InodeTable {
         }
         if let Some(ino) = self.by_path.get(path) {
             let ino = *ino;
-            let matches = self
-                .by_ino
-                .get(&ino)
-                .is_some_and(|entry| entry.kind == kind);
-            if matches {
-                if let Some(entry) = self.by_ino.get_mut(&ino) {
-                    entry.generation = generation;
+            let retiring_old = self
+                .pending_removals
+                .get(path)
+                .and_then(|pending| pending.ino)
+                == Some(ino);
+            if !retiring_old {
+                let matches = self
+                    .by_ino
+                    .get(&ino)
+                    .is_some_and(|entry| entry.kind == kind);
+                if matches {
+                    if let Some(entry) = self.by_ino.get_mut(&ino) {
+                        entry.generation = generation;
+                    }
+                    return Ok(ino);
                 }
-                return Ok(ino);
             }
             self.retire(ino);
         }

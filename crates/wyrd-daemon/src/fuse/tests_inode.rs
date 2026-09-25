@@ -77,6 +77,24 @@ fn inode_table_rejects_unknown_inos() {
 }
 
 #[test]
+fn pending_removal_prevents_inode_reuse_and_restores_on_failure() {
+    use fuser::FileType;
+    let mut table = InodeTable::new();
+    let old = table.intern("x", FileType::RegularFile, 0).unwrap();
+    let token = table.begin_remove("x").unwrap();
+    let fresh = table.intern("x", FileType::RegularFile, 1).unwrap();
+    assert_ne!(fresh, old);
+    assert_eq!(table.intern("x", FileType::RegularFile, 1), Ok(fresh));
+    table.finish_remove("x", token, true);
+    assert_eq!(table.intern("x", FileType::RegularFile, 1), Ok(fresh));
+
+    let old = table.intern("y", FileType::RegularFile, 0).unwrap();
+    let token = table.begin_remove("y").unwrap();
+    table.finish_remove("y", token, false);
+    assert_eq!(table.intern("y", FileType::RegularFile, 0), Ok(old));
+}
+
+#[test]
 fn child_paths_join_without_double_slashes() {
     assert_eq!(join("", "a.txt"), "a.txt");
     assert_eq!(join("sub", "a.txt"), "sub/a.txt");

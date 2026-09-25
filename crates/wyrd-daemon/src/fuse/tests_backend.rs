@@ -554,6 +554,56 @@ fn o_trunc_open_refuses_a_same_path_replacement() {
     );
 }
 
+/// The other `O_TRUNC` guard: the truncation committed on the file the
+/// open observed, and a same-path replacement published in the gap
+/// before the open's post-commit capture. The capture no longer
+/// matches what the loop committed, so the open fails `ESTALE` instead
+/// of binding a handle to content it never truncated. The loop-level
+/// refusal is covered separately; this is the adapter-side comparison.
+#[test]
+fn o_trunc_open_refuses_a_replacement_published_after_the_commit() {
+    let (mut backend, replacement) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || {
+        worker_backend.open_write("f.txt", libc::O_RDWR | libc::O_TRUNC)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(Instant::now() < deadline, "the truncation was not admitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1);
+    // The truncation lands on the file the open observed: an empty
+    // file, which is what a committed truncate-to-zero leaves behind.
+    publish(&backend, replacement);
+    batch.record(
+        0,
+        Ok(MutationOutcome::Committed(FileIdentity::new(
+            0,
+            false,
+            Vec::new(),
+        ))),
+    );
+    batch.finish();
+
+    assert_eq!(
+        worker.join().unwrap(),
+        Err(fuser::Errno::ESTALE),
+        "the handle would have been bound to the replacement"
+    );
+    let handle = backend.open_at("f.txt").unwrap();
+    assert_eq!(
+        backend.read_handle(handle, 0, 64).unwrap(),
+        b"second",
+        "the replacement's content was never truncated"
+    );
+}
+
 /// Directory handles pin their enumeration generation: a listing
 /// opened before a publication keeps serving its own snapshot
 /// while a fresh open picks up the new generation. The two never

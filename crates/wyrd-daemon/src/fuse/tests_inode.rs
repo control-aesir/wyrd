@@ -175,6 +175,41 @@ fn retirement_defers_to_the_committed_outcome() {
     assert_ne!(mid, old);
 }
 
+/// A failed removal that raced a lookup leaves two live inos for the
+/// path, and only one of them owns the path. A later committed removal
+/// must reap both: the restored ino is unreachable by any other route,
+/// so restoring it without recording it stranded it in `by_ino` with no
+/// owner, growing the table and leaving a surviving dentry able to be
+/// served a same-kind recreation.
+#[test]
+fn a_committed_removal_reaps_what_a_failed_one_restored() {
+    use fuser::FileType;
+    let mut table = InodeTable::new();
+    let held = table.intern("x", FileType::RegularFile, 0).unwrap();
+    let failed = table.begin_remove("x").unwrap();
+    let raced = table.intern("x", FileType::RegularFile, 1).unwrap();
+    table.finish_remove("x", failed, false);
+    assert_eq!(table.path(held), Some("x"), "the file never left");
+    assert_eq!(table.path(raced), Some("x"));
+
+    let committed = table.begin_remove("x").unwrap();
+    let latest = table.intern("x", FileType::RegularFile, 2).unwrap();
+    table.finish_remove("x", committed, true);
+
+    for ino in [held, raced, latest] {
+        assert_eq!(table.path(ino), None, "ino {ino} outlived the removal");
+    }
+    let recreated = table.intern("x", FileType::RegularFile, 3).unwrap();
+    assert_ne!(recreated, held);
+    assert_ne!(recreated, raced);
+    assert_ne!(recreated, latest);
+    assert_eq!(
+        table.by_ino.len(),
+        2,
+        "the root and one fresh mapping: nothing is stranded"
+    );
+}
+
 #[test]
 fn child_paths_join_without_double_slashes() {
     assert_eq!(join("", "a.txt"), "a.txt");

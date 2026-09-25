@@ -68,6 +68,13 @@ pub(super) struct InodeTable {
     /// Removals admitted for a path but not yet completed. See
     /// [`RemovalFlight`](RemovalFlight).
     removals: HashMap<String, RemovalFlight>,
+    /// Inos that name a path in `by_ino` without owning its `by_path`
+    /// slot. Only a failed removal produces one: it restores the ino
+    /// the kernel is holding, and a racing lookup that already took the
+    /// slot keeps it. Nothing else can reach such an ino, since no
+    /// lookup is ever handed one and no `by_path` entry points at it,
+    /// so a committed removal of that path reaps them from here.
+    unowned: HashMap<String, HashSet<u64>>,
     next_removal: u64,
 }
 
@@ -220,6 +227,7 @@ impl InodeTable {
             by_path,
             next: 2,
             removals: HashMap::new(),
+            unowned: HashMap::new(),
             next_removal: 1,
         }
     }
@@ -239,6 +247,13 @@ impl InodeTable {
         if let Some(entry) = self.by_ino.remove(&ino) {
             if self.by_path.get(&entry.path) == Some(&ino) {
                 self.by_path.remove(&entry.path);
+            }
+            let bucket_empty = self.unowned.get_mut(&entry.path).is_some_and(|bucket| {
+                bucket.remove(&ino);
+                bucket.is_empty()
+            });
+            if bucket_empty {
+                self.unowned.remove(&entry.path);
             }
         }
     }
@@ -293,16 +308,20 @@ impl InodeTable {
 
     /// Complete the removal `token` names.
     ///
-    /// A success retires the ino the flight marked together with
-    /// whatever else names the path — a replacement a racing lookup
-    /// interned while the removal was in flight dies with it — and
-    /// marks the flight committed, so a sibling removal that later
-    /// fails cannot resurrect the marked ino and no lookup reuses it
-    /// until the flight drains. A failure with nothing committed in
-    /// the flight leaves the marked ino bound, restoring it only if a
-    /// racing lookup displaced it: the file never left, and the kernel
-    /// may still be holding that ino. Unknown or duplicated tokens are
-    /// stale completions and do nothing.
+    /// A success retires the ino marked at admission, whatever binds
+    /// the path now, and every unowned ino a previously failed removal
+    /// of this path restored (see [`InodeTable::unowned`]). All of them
+    /// are dead the moment the removal publishes, and reaping them
+    /// together is what keeps one from being stranded in `by_ino` with
+    /// nothing pointing at it. The flight is marked committed, so a
+    /// sibling removal that later fails cannot resurrect the marked ino
+    /// and no lookup reuses it until the flight drains.
+    ///
+    /// A failure with nothing committed in the flight leaves the marked
+    /// ino bound, restoring it only if a racing lookup displaced it:
+    /// the file never left, and the kernel may still be holding that
+    /// ino. The replacements stay live either way. Unknown or
+    /// duplicated tokens are stale completions and do nothing.
     pub(super) fn finish_remove(&mut self, path: &str, token: u64, success: bool) {
         let Some(mut flight) = self.removals.remove(path) else {
             return;
@@ -313,11 +332,18 @@ impl InodeTable {
         }
         if success {
             flight.committed = true;
-        }
-        if success {
             if let Some((ino, _)) = &flight.retiring {
                 self.retire(*ino);
             }
+            // Inos earlier failed removals restored while a racing
+            // lookup held the slot: nothing else can reach them.
+            if let Some(bucket) = self.unowned.remove(path) {
+                for ino in bucket {
+                    self.retire(ino);
+                }
+            }
+            // Whoever binds the path now, including an ino a rename
+            // moved onto it, died with the removal.
             self.retire_path(path);
         } else if !flight.committed {
             if let Some((ino, entry)) = &flight.retiring {
@@ -325,6 +351,16 @@ impl InodeTable {
                     self.by_ino.insert(*ino, entry.clone());
                 }
                 self.by_path.entry(path.to_string()).or_insert(*ino);
+                if self.by_path.get(path) != Some(ino) {
+                    // A racing lookup owns the slot, so the restored ino
+                    // is reachable only through `by_ino`. Record it, or
+                    // a later committed removal of this path would
+                    // never learn it exists.
+                    self.unowned
+                        .entry(path.to_string())
+                        .or_default()
+                        .insert(*ino);
+                }
             }
         }
         if !flight.tokens.is_empty() {

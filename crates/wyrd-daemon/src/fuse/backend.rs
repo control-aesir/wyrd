@@ -553,6 +553,24 @@ where
         Ok((node, file, executable))
     }
 
+    /// The identity a mutation's `base` guard and a handle's `base`
+    /// compare: exactly what `docs/write-path.md` names as a file's
+    /// identity, kind aside. Derived in one place so the identity an
+    /// open observes before its truncating submit and the one it
+    /// re-captures afterwards are the same function of the node.
+    fn file_identity(node: &Node) -> Result<FileIdentity, fuser::Errno> {
+        match node {
+            Node::File {
+                size,
+                executable,
+                chunks,
+            } => Ok(FileIdentity::new(*size, *executable, chunks.clone())),
+            // `view.open` rejects non-files before either caller; this
+            // arm is unreachable but keeps the derivation total.
+            _ => Err(fuser::Errno::EISDIR),
+        }
+    }
+
     /// Open the file at `path`: the view's immutable file identity is
     /// captured at open and keyed by a fresh handle, so later reads
     /// serve the opened version even after heads advance. The
@@ -994,16 +1012,7 @@ where
             if let Some(ino) = ino {
                 self.validate_inode(ino, path, &node, projection.generation())?;
             }
-            let observed = match &node {
-                Node::File {
-                    size,
-                    executable,
-                    chunks,
-                } => FileIdentity::new(*size, *executable, chunks.clone()),
-                // `view.open` below rejects non-files; this arm is
-                // unreachable but keeps the identity derivation total.
-                _ => return Err(fuser::Errno::EISDIR),
-            };
+            let observed = Self::file_identity(&node)?;
             // The truncation commits during open, not at the first
             // flush: the kernel delivers `O_TRUNC` as open plus a
             // separate fh-less `setattr`, so a handle carrying the
@@ -1042,16 +1051,7 @@ where
         if let Some(ino) = ino {
             self.validate_inode(ino, path, &node, projection.generation())?;
         }
-        let base = match &node {
-            Node::File {
-                size,
-                executable,
-                chunks,
-            } => FileIdentity::new(*size, *executable, chunks.clone()),
-            // `view.open` above already rejected non-files; this arm is
-            // unreachable but keeps the identity derivation total.
-            _ => return Err(fuser::Errno::EISDIR),
-        };
+        let base = Self::file_identity(&node)?;
         // The open is bound to the identity its own truncation
         // committed, not to whatever answers at the path now: a
         // replacement that publishes in the gap between the commit and

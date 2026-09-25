@@ -167,12 +167,17 @@ and never by snapshot DAG state:
 - `canonical(1)` = the unique valid genesis. Two valid genesis transitions
   (same epoch, same predecessor `None`) conflict at epoch 1 like any other.
 - Absent a conflict, `canonical(N+1)` = the unique valid transition whose
-  `prev` is `canonical(N)`.
+  `prev` is `canonical(N)`, or the resolution a recognized conflict just
+  designated for that slot.
 - **A conflict exists** iff two or more valid transitions share the same
   canonical predecessor (`prev` both = the same canonical transition, same
-  epoch). Competition among children of *different* predecessors is never a
-  conflict: a child of a noncanonical or void branch is voided (or
-  orphaned) by ancestry — it is historical evidence, not a rival.
+  epoch) **and no valid resolution has already designated the canonical
+  successor of that predecessor.** Competition among children of
+  *different* predecessors is never a conflict: a child of a noncanonical or
+  void branch is voided (or orphaned) by ancestry — it is historical evidence,
+  not a rival. A branch that a resolution has already voided never becomes a
+  contender again, and a valid child of the winning tip that is not the
+  designated resolution is not a contender either.
 - A conflict **freezes** membership evaluation at that epoch: snapshots
   bound to any contested transition are PENDING; a drive-level error is
   surfaced for the owner. Peers never pick a side themselves, and arrival
@@ -187,15 +192,39 @@ and never by snapshot DAG state:
   claiming the next epoch — a *second, contradictory* resolution (naming
   the other sibling) is itself a conflict at the resolution epoch and
   re-freezes evaluation there, pending a further resolution.
-- Transitions with a non-empty `resolves` where no conflict exists at
-  `prev` are invalid. Voided transitions are retained forever; they cannot
-  be deleted or re-signed.
-- **A resolution is only recognized at the epoch immediately above the
-  conflict** (its `resolves` entries sit at the conflict epoch). A
-  contested branch that accumulates valid descendants past the conflict
-  epoch therefore makes the freeze permanent for v0: no conformant
-  resolution can ever name the siblings. Peers surface that as a
-  drive-level error for the owner.
+- Transitions with a non-empty `resolves` are valid only if `prev` was a
+  contender in a conflict at `prev`'s own epoch and this transition resolves
+  exactly that conflict. A `resolves` with no such conflict behind it is
+  invalid.
+- **`prev` of a resolution is a contender, not a parent.** The conflict a
+  resolution settles sits one epoch below the resolution, among the
+  children of the contender *before* the fork, so `prev` is one of the
+  competing branches in it. A resolution therefore neither needs nor is
+  blocked by a conflict among `prev`'s own children.
+- Voided transitions are retained forever; they cannot be deleted or
+  re-signed.
+- **Resolution authority is final with respect to the conflict it
+  resolves.** A resolution is recognized at the epoch immediately above the
+  conflict (its `resolves` entries sit at the conflict epoch). Once a valid
+  resolution is recognized, it is the designated successor of the winning
+  tip, the named siblings are voided permanently, and nothing that arrives
+  later reopens that conflict.
+- **What "does not reopen" means, per side.** Later valid work on a voided
+  branch is voided by ancestry, like any other child of a void branch. A
+  valid child of the winning tip that is not the designated resolution is
+  voided because the resolution, not that child, is the canonical successor
+  of the winning tip: the canonical walk steps winning tip → resolution in a
+  single move and never enumerates the winning tip's other children as
+  contenders. Neither side is ever canonical, and neither authorizes
+  anything — branch validity authorizes that branch alone.
+- **Recognition is arrival-order independent.** Classification is a pure
+  function of the observed set, so a later transition never invalidates an
+  already-recognized resolution, and a resolution still heals a conflict
+  whose losing branch advanced first.
+- **The evidence stays visible.** `wyrd member log` reports every such
+  transition with its voided status, so an operator can see that a device is
+  still writing on a branch it lost. That is a report, not a state: nothing
+  about the canonical chain changes because such work arrived.
 
 v0 has exactly one owner ⇒ a single writer ⇒ conflicts indicate device
 duplication or a bug and are treated as errors, not tolerated forks.
@@ -465,6 +494,8 @@ single sanctioned remedy.
 | receive valid transition extending the canonical tip, empty `resolves` | verify; known membership state = N+1; deliver/await capability (knowledge and key material are separate — knowing N+1 does not mean holding N+1 secrets yet) |
 | receive valid transition with `resolves` matching an active conflict at `prev` | mark named siblings voided; the winning branch becomes canonical; recompute; reclassify snapshots |
 | receive valid transition that conflicts (same canonical predecessor, same epoch) or contradicts an existing resolution | retain; freeze evaluation at that epoch; surface drive-level error |
+| receive valid transition on a branch a resolution already voided | retain; VOIDED by ancestry; the resolved conflict does not reopen; canonical chain continues from the resolution |
+| receive valid child of the winning tip that is not the designated resolution | retain; VOIDED (the resolution is the designated successor of the winning tip); no re-freeze |
 | receive valid but unrooted transition | retain as orphaned; drive-level error |
 | receive snapshot bound to unknown/orphaned/contested transition | PENDING |
 | receive snapshot bound to a voided transition | VOIDED (retained, never eligible) |
@@ -591,7 +622,12 @@ predecessor (conflict); conflicting transitions with different predecessors
 (voided-by-ancestry, not a conflict); conflict resolution by explicit
 resolution transition; contradictory resolutions (re-freeze); unrooted
 transition (orphan); resolution delivery order independence (winner named
-by the resolution, not by arrival).
+by the resolution, not by arrival); valid work on a branch the resolution
+voided (conflict does not reopen, chain stays live, work is voided by
+ancestry, and none of it reaches the canonical state); the same with the
+losing work observed *before* the resolution (arrival-order independence); a
+second valid child of the winning tip besides the resolution (voided, not a
+rival).
 
 **Snapshots:** valid snapshot; bad signature; wrong DriveId; invalid pubkey
 (fails `lift_x`); unknown membership transition; transition from a voided

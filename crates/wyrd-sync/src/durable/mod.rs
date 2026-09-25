@@ -223,6 +223,50 @@ impl AuthorizedSnapshot {
         &self.snapshot
     }
 }
+/// The durable identity of one `CapabilitySealed` fact: a
+/// domain-separated digest over its epoch, recipient, and sealed bytes.
+///
+/// This is what a `CapabilitySealedReplaced` names. Naming the exact
+/// fact — rather than just the `(epoch, recipient)` pair — means a
+/// replacement applies only to the obligation it actually supersedes,
+/// and the superseded ciphertext never has to be duplicated inside the
+/// replacement.
+///
+/// A distinct type rather than `[u8; 32]`: this id is only ever
+/// meaningful against a *sealed capability* fact, and the store is full
+/// of other 32-byte identifiers (snapshot ids, transition ids,
+/// content ids). Interchange between any two of them is a durable-state
+/// bug that type-checks, so the boundary is made explicit here rather
+/// than left to review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedCapabilityFactId([u8; 32]);
+
+impl SealedCapabilityFactId {
+    /// The identity of the sealed fact carrying these exact bytes for
+    /// this exact obligation.
+    pub fn of(epoch: u64, recipient: &DeviceId, sealed: &[u8]) -> Self {
+        let mut preimage = Vec::with_capacity(SUPERSEDE_ID_CONTEXT.len() + 8 + 32 + sealed.len());
+        preimage.extend_from_slice(SUPERSEDE_ID_CONTEXT.as_bytes());
+        preimage.extend_from_slice(&epoch.to_le_bytes());
+        preimage.extend_from_slice(recipient.as_bytes());
+        preimage.extend_from_slice(sealed);
+        Self(blake3::derive_key(SUPERSEDE_ID_CONTEXT, &preimage))
+    }
+
+    /// The 32 wire bytes. Only the codec needs these; nothing in the
+    /// protocol reasons over the digest directly.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Read the 32 wire bytes back. Only the codec needs this.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Domain context for the durable sealed-fact identity.
+const SUPERSEDE_ID_CONTEXT: &str = "wyrd capability supersede id v1";
 
 /// One durable mutation. All variants carry canonical records; the commit
 /// envelope frames them with type tags and lengths.
@@ -290,7 +334,38 @@ pub enum Fact {
     /// is ECDH-sealed to the recipient, so unlike transitions the
     /// sealed bytes are per-recipient: first seal wins per pair.
     CapabilitySealed(u64, DeviceId, Vec<u8>),
+    /// The durable obligation represented by a specific
+    /// `CapabilitySealed` fact has been superseded by new bytes.
+    ///
+    /// `supersedes` is the identity of the sealed fact it replaces (a
+    /// domain-separated digest over its epoch, recipient, and bytes),
+    /// so the transition is explicit and auditable without duplicating
+    /// the superseded ciphertext. Replay applies a replacement only to
+    /// the exact fact it names, so an arbitrary fact id can never
+    /// become a replacement parent.
+    ///
+    /// This is what lets a stale obligation (e.g. a rotation sealed
+    /// under a superseded framing) be superseded *durably and once*:
+    /// first-seal-wins cannot express the change, so the change is its
+    /// own fact. Retries then reuse the replacement bytes
+    /// byte-identically instead of re-minting every pass.
+    CapabilitySealedReplaced {
+        epoch: u64,
+        recipient: DeviceId,
+        supersedes: SealedCapabilityFactId,
+        replacement: Vec<u8>,
+    },
     /// One capability obligation discharged for one recipient.
+    /// The sender durably recorded that this obligation was
+    /// **transmitted**.
+    ///
+    /// It does not mean the recipient accepted or installed anything,
+    /// and it never will: the owner proof lives inside the encrypted
+    /// rotation payload, so a sender generally cannot inspect it and
+    /// must not be recorded as having validated what it cannot see.
+    /// Sender-local verification is a diagnostic, never a change to
+    /// this fact's meaning. Recipient acceptance, if the protocol ever
+    /// needs it, belongs in a separate recipient-authenticated fact.
     CapabilityDelivered(u64, DeviceId),
     /// Pending invitation material: the invitation's wrapped
     /// capability bytes, committed at accept time. The grant inside

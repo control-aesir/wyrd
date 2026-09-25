@@ -30,11 +30,12 @@ pub(crate) fn deliver_pending(
     mailbox: &mut impl Mailbox,
 ) -> Result<usize, EngineError> {
     // One validated delivery snapshot per pass: every read below comes
-    // from this rebuild. Mid-pass commits only append Sealed and
-    // Delivered facts — never new Queued pairs — so the frozen pending
-    // lists stay exact, and an in-memory overlay absorbs newly sealed
-    // bytes. No re-read per pair: a newcomer catch-up or a large
-    // fan-out costs one log decode, not one per obligation.
+    // from this rebuild. Mid-pass commits only append Sealed,
+    // SealedReplaced, and Delivered facts — never new Queued pairs — so
+    // the frozen pending lists stay exact, and an in-memory overlay
+    // absorbs newly sealed bytes. No re-read per pair: a newcomer
+    // catch-up or a large fan-out costs one log decode, not one per
+    // obligation.
     let rebuilt = engine.store.rebuild(engine.device)?;
     let mut sent = 0usize;
     sent += deliver_transitions(engine, mailbox, &rebuilt)?;
@@ -385,10 +386,22 @@ fn deliver_capabilities(
             // still fail closed: genuinely undecodable outbox bytes never
             // silently heal.
             Some(bytes) if is_superseded_rotation(&bytes) => {
-                let Some(bytes) = mint_fresh_rotation(
+                // Supersede durably, exactly once. First-seal-wins
+                // cannot express "these bytes are no longer the
+                // obligation", so the change is its own fact: a
+                // pass-local overlay would be discarded on restart,
+                // leaving the stale fact to be re-minted into *new*
+                // bytes every pass — one appended-and-fsynced,
+                // then-ignored record per obligation per pass during a
+                // relay outage, and retries that are no longer
+                // byte-identical. With the fact committed, replay makes
+                // the replacement the current obligation and every
+                // later pass reuses these exact bytes.
+                let supersedes =
+                    crate::durable::SealedCapabilityFactId::of(epoch, &recipient, &bytes);
+                let Some(replacement) = mint_fresh_rotation_bytes(
                     engine,
                     &rebuilt.keyring,
-                    &mut sealed_overlay,
                     epoch,
                     recipient,
                     &transition_id,
@@ -396,7 +409,13 @@ fn deliver_capabilities(
                 else {
                     continue;
                 };
-                bytes
+                engine.commit_facts(&[Fact::CapabilitySealedReplaced {
+                    epoch,
+                    recipient,
+                    supersedes,
+                    replacement: replacement.clone(),
+                }])?;
+                replacement
             }
             Some(bytes) => {
                 if SealedControl::decode(&bytes).is_err() {
@@ -507,6 +526,25 @@ fn mint_fresh_rotation(
     recipient: DeviceId,
     transition_id: &TransitionId,
 ) -> Result<Option<Vec<u8>>, EngineError> {
+    let Some(bytes) = mint_fresh_rotation_bytes(engine, keyring, epoch, recipient, transition_id)?
+    else {
+        return Ok(None);
+    };
+    engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
+    sealed_overlay.insert((epoch, recipient), bytes.clone());
+    Ok(Some(bytes))
+}
+
+/// Mint current-framing rotation bytes for one obligation without
+/// committing anything: the caller decides whether this becomes the
+/// durable obligation (a replacement fact) or a first seal.
+fn mint_fresh_rotation_bytes(
+    engine: &mut Engine,
+    keyring: &DriveKeyring,
+    epoch: u64,
+    recipient: DeviceId,
+    transition_id: &TransitionId,
+) -> Result<Option<Vec<u8>>, EngineError> {
     let Some(state) = engine.log.state_of(transition_id) else {
         return Ok(None);
     };
@@ -516,6 +554,26 @@ fn mint_fresh_rotation(
     let Some(registration) = state.encryption_key_of(&recipient).copied() else {
         return Ok(None);
     };
+    // Mint authority, checked before anything is sealed or committed
+    // (epochs.md rule 3). The recipient enforces this at intake: a proof
+    // signed outside the transition's pre-state owner set is suppressed.
+    // A sender without it would append a replacement, mark it
+    // transmitted, and deliver bytes the recipient discards — a durable
+    // fact claiming an obligation discharged that no recipient ever
+    // honours. Leave the obligation pending for an authorized signer
+    // instead; the relay reaches the owner.
+    let mint_authority = match transition.prev {
+        Some(prev) => engine.log.owners_of(&prev),
+        // Genesis establishes its own owner set; there is no earlier
+        // state to consult.
+        None => engine.log.owners_of(transition_id),
+    };
+    match mint_authority {
+        Some(owners) if owners.contains(&engine.device) => {}
+        // Signed, but by a device without mint authority.
+        Some(_) => return Ok(None),
+        None => return Err(EngineError::TransitionUnclassified(*transition_id)),
+    }
     let Some(secrets) = epoch_secrets(keyring, transition) else {
         return Ok(None);
     };
@@ -544,8 +602,6 @@ fn mint_fresh_rotation(
     )?;
     let bytes = sealed.encode();
     crate::transport::mailbox::check_outbound_size(&bytes)?;
-    engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
-    sealed_overlay.insert((epoch, recipient), bytes.clone());
     Ok(Some(bytes))
 }
 /// The epoch-secret vector a transition's grant carries: one secret per

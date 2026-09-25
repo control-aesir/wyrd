@@ -402,8 +402,14 @@ the *origin* of the secret material (mint authority, held only by an
 owner of the pre-state). Intake verifies the proof against the
 unwrapped secrets and requires its signer to be an owner of the
 transition's predecessor, so member delivery stays legal while member
-minting does not. Version `0x01` (no proof) is superseded: a durable
-outbox fact sealed under it is re-minted rather than sent.
+minting does not. A sender checks that same authority before it mints,
+not only the recipient: a sender without it leaves the obligation
+pending for an authorized signer, rather than committing a
+transmission no recipient would ever install. Version `0x01` (no
+proof) is superseded: a durable outbox fact sealed under it is
+re-minted rather than sent, and the re-mint commits a
+`CapabilitySealedReplaced` naming the fact it retires, so the
+superseded record is durably replaced rather than merely ignored.
 The AEAD key derives under `"wyrd rotation delivery key v1"` — a
 context distinct from the capability-wrap and bootstrap contexts, so
 one shared secret never yields two framings' keys. Message ids derive

@@ -92,8 +92,27 @@ Releases are not required to write every format they read:
    third blob. This is a deliberate, announced incompatibility under
    the pre-v1 rule above, not a silent reinterpretation: an old sealed
    rotation stops being acceptable and the owner re-mints. The
-   capability *wrap* format is deliberately untouched, so
-   bootstrap/invitation delivery is unaffected.
+    capability *wrap* format is deliberately untouched, so
+    bootstrap/invitation delivery is unaffected.
+
+    Outbox retirement is a new record tag, not a version bump.
+    `CapabilitySealedReplaced` (`0x16`) names the sealed fact it
+    supersedes and carries its replacement, so the `0x01 -> 0x02`
+    obligation stays recoverable instead of stuck: replay resolves
+    the chain to the newest bytes and leaves the superseded record
+    inert. An old node skips the unknown tag (invariant 10's
+    exception), so a store written by a new node still opens there —
+    it simply keeps treating the superseded bytes as the obligation.
+    `0x16` was chosen after `0x13`, which is
+    `BootstrapPending`: a tag collision decodes as the wrong fact kind
+    rather than skipping, so tag allocation is checked against the
+    full set, not against the last value.
+
+    The tag boundary is pinned by
+    `the_replacement_tag_is_a_clean_upgrade_boundary`: `0x16` sits
+    outside the enumerated pre-replacement set, a commit carrying a
+    real replacement loads rather than poisoning the file, and a
+    current reader resolves the chain to the replacement bytes.
 
 ## What this forbids
 

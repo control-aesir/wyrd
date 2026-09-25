@@ -38,25 +38,198 @@ const VAULT_DIR: &str = "vault";
 /// [`VaultSource`] offers only representations durably recorded by the
 /// runtime machines, and every fetch still passes the AEAD/identity
 /// admission checks before plaintext is trusted.
+/// Bound for the serving mirror write-through queue: at most this many
+/// representations wait for the drain task, and at most this many bytes
+/// across them. A single representation can reach `Limits::V0`
+/// `max_object_bytes` (64 MiB), so the byte bound admits one max-size
+/// item while the item bound absorbs bursts of small manifests; the
+/// pair caps queued memory near 64 MiB plus one in-flight import.
+/// Overflow applies backpressure at [`Vault::import`] (a typed
+/// [`VaultError::MirrorFull`], retried on a later pass) instead of
+/// growing without bound, and [`ServingHandle::flush_bounded`] reports
+/// a full queue as not-ready so announcements never discharge over
+/// representations the mirror has not served.
+pub const MAX_MIRROR_QUEUE_ITEMS: usize = 64;
+pub const MAX_MIRROR_QUEUE_BYTES: usize = 64 << 20;
+
 #[derive(Debug, Error)]
 pub enum VaultError {
     #[error("vault I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// The serving mirror queue is full: the vault file is durable
+    /// (the rename happened before write-through), but the mirror has
+    /// not accepted these bytes. Retry the import on a later pass;
+    /// the readiness barrier reports not-ready until the drain
+    /// catches up, and a restart rebuilds the mirror from the vault.
+    /// Per-item backpressure, never a batch wedge (see
+    /// `docs/error-conventions.md`).
+    #[error("serving mirror queue full: {queued_bytes}/{max_bytes} bytes in {queued_items} items, rejected {rejected}")]
+    MirrorFull {
+        queued_items: usize,
+        queued_bytes: usize,
+        max_bytes: usize,
+        rejected: u64,
+    },
+}
+
+/// Shared accounting for one serving mirror queue: queued depth in
+/// items and bytes plus rejection/failure counters. One `Arc` is held
+/// by the write-through sender, the drain worker, and every readiness
+/// handle, so [`MirrorStats`] reads the live queue without locking.
+#[derive(Debug, Default)]
+struct MirrorAccounting {
+    queued_items: std::sync::atomic::AtomicUsize,
+    queued_bytes: std::sync::atomic::AtomicUsize,
+    rejected_full: std::sync::atomic::AtomicU64,
+    failed_imports: std::sync::atomic::AtomicU64,
+}
+
+/// Point-in-time serving mirror queue observability: depth against the
+/// [`MAX_MIRROR_QUEUE_ITEMS`] / [`MAX_MIRROR_QUEUE_BYTES`] bounds plus
+/// the rejection and failure counters. A rising `rejected_full` names
+/// a mirror slower than authoring; a nonzero `failed_imports` names a
+/// mirror store that cannot land what the vault holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorStats {
+    pub queued_items: usize,
+    pub queued_bytes: usize,
+    pub capacity_items: usize,
+    pub capacity_bytes: usize,
+    pub rejected_full: u64,
+    pub failed_imports: u64,
+}
+
+/// The bounded write-through sender for one serving mirror: a
+/// [`tokio::sync::mpsc::Sender`] plus the shared [`MirrorAccounting`].
+/// Cloned into the vault slot, the endpoint, and every readiness
+/// handle; the drain worker holds the accounting half.
+#[derive(Debug, Clone)]
+pub(crate) struct MirrorSender {
+    inner: tokio::sync::mpsc::Sender<MirrorItem>,
+    accounting: std::sync::Arc<MirrorAccounting>,
+}
+
+pub(crate) fn mirror_channel() -> (MirrorSender, tokio::sync::mpsc::Receiver<MirrorItem>) {
+    let (inner, receiver) = tokio::sync::mpsc::channel::<MirrorItem>(MAX_MIRROR_QUEUE_ITEMS);
+    (
+        MirrorSender {
+            inner,
+            accounting: std::sync::Arc::new(MirrorAccounting::default()),
+        },
+        receiver,
+    )
+}
+
+impl MirrorSender {
+    /// Enqueue one sealed representation, reserving its bytes first so
+    /// the aggregate stays under [`MAX_MIRROR_QUEUE_BYTES`] even when
+    /// many small senders race. A closed channel (mirror detached)
+    /// releases the reservation and reports `Ok`: serving heals on the
+    /// next boot rebuild, never by failing the publication.
+    fn send_import(&self, bytes: Vec<u8>) -> Result<(), VaultError> {
+        use std::sync::atomic::Ordering;
+        let len = bytes.len();
+        loop {
+            let queued = self.accounting.queued_bytes.load(Ordering::SeqCst);
+            let Some(total) = queued.checked_add(len) else {
+                let rejected = self.accounting.rejected_full.fetch_add(1, Ordering::SeqCst) + 1;
+                return Err(VaultError::MirrorFull {
+                    queued_items: self.accounting.queued_items.load(Ordering::SeqCst),
+                    queued_bytes: queued,
+                    max_bytes: MAX_MIRROR_QUEUE_BYTES,
+                    rejected,
+                });
+            };
+            if total > MAX_MIRROR_QUEUE_BYTES {
+                let rejected = self.accounting.rejected_full.fetch_add(1, Ordering::SeqCst) + 1;
+                return Err(VaultError::MirrorFull {
+                    queued_items: self.accounting.queued_items.load(Ordering::SeqCst),
+                    queued_bytes: queued,
+                    max_bytes: MAX_MIRROR_QUEUE_BYTES,
+                    rejected,
+                });
+            }
+            if self
+                .accounting
+                .queued_bytes
+                .compare_exchange(queued, total, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.accounting.queued_items.fetch_add(1, Ordering::SeqCst);
+        match self.inner.try_send(MirrorItem::Import(bytes)) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(MirrorItem::Import(returned))) => {
+                self.accounting.queued_items.fetch_sub(1, Ordering::SeqCst);
+                self.accounting
+                    .queued_bytes
+                    .fetch_sub(returned.len(), Ordering::SeqCst);
+                let rejected = self.accounting.rejected_full.fetch_add(1, Ordering::SeqCst) + 1;
+                Err(VaultError::MirrorFull {
+                    queued_items: self.accounting.queued_items.load(Ordering::SeqCst),
+                    queued_bytes: self.accounting.queued_bytes.load(Ordering::SeqCst),
+                    max_bytes: MAX_MIRROR_QUEUE_BYTES,
+                    rejected,
+                })
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // A Flush item shares the item bound but carries no
+                // import bytes: release the byte reservation taken
+                // above and report backpressure. Unreachable through
+                // this path today (imports are the only callers), but
+                // the accounting must stay exact if that changes.
+                self.accounting.queued_items.fetch_sub(1, Ordering::SeqCst);
+                self.accounting
+                    .queued_bytes
+                    .fetch_sub(len, Ordering::SeqCst);
+                let rejected = self.accounting.rejected_full.fetch_add(1, Ordering::SeqCst) + 1;
+                Err(VaultError::MirrorFull {
+                    queued_items: self.accounting.queued_items.load(Ordering::SeqCst),
+                    queued_bytes: self.accounting.queued_bytes.load(Ordering::SeqCst),
+                    max_bytes: MAX_MIRROR_QUEUE_BYTES,
+                    rejected,
+                })
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.accounting.queued_items.fetch_sub(1, Ordering::SeqCst);
+                self.accounting
+                    .queued_bytes
+                    .fetch_sub(len, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    fn stats(&self) -> MirrorStats {
+        use std::sync::atomic::Ordering;
+        MirrorStats {
+            queued_items: self.accounting.queued_items.load(Ordering::SeqCst),
+            queued_bytes: self.accounting.queued_bytes.load(Ordering::SeqCst),
+            capacity_items: MAX_MIRROR_QUEUE_ITEMS,
+            capacity_bytes: MAX_MIRROR_QUEUE_BYTES,
+            rejected_full: self.accounting.rejected_full.load(Ordering::SeqCst),
+            failed_imports: self.accounting.failed_imports.load(Ordering::SeqCst),
+        }
+    }
 }
 
 /// The drive's sealed representation store: one file per transport root,
 /// named by the root's hex, written atomically and never rewritten.
 pub struct Vault {
     dir: PathBuf,
-    /// The live serving mirror's write-through channel, attached by
-    /// [`ServingEndpoint::open`] and replaced (never co-held) on reopen.
-    /// Imports enqueue after the durable rename, so the vault stays the
-    /// source of truth and the mirror is a derived, self-healing cache:
-    /// a dropped channel or a failed mirror import only delays serving
-    /// until the next boot rebuild. The slot is shared (`Arc`) so the
-    /// endpoint can detach it on shutdown: an import after shutdown must
-    /// not silently enqueue into a channel nobody will drain.
-    mirror: std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MirrorItem>>>>,
+    /// The live serving mirror's bounded write-through sender, attached
+    /// by [`ServingEndpoint::open`] and replaced (never co-held) on
+    /// reopen. Imports enqueue after the durable rename, so the vault
+    /// stays the source of truth and the mirror is a derived,
+    /// self-healing cache: a detached channel or a failed mirror import
+    /// only delays serving until the next boot rebuild, while a full
+    /// queue applies backpressure at import time (never a silent drop).
+    /// The slot is shared (`Arc`) so the endpoint can detach it on
+    /// shutdown: an import after shutdown must not enqueue into a
+    /// channel nobody will drain.
+    mirror: std::sync::Arc<Mutex<Option<MirrorSender>>>,
     /// Publication durability and its pending-directory recovery state.
     /// Production uses [`durable::fsync_dir`]; tests replace it to inject
     /// a post-rename durability failure and exercise the recovery path.
@@ -91,10 +264,10 @@ pub(crate) enum MirrorItem {
 #[derive(Debug, Clone)]
 pub struct ServingHandle {
     runtime: tokio::runtime::Handle,
-    sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+    sender: MirrorSender,
     /// At most one barrier is in flight: a caller whose timed-out
     /// barrier is still queued behind a slow import must not pile
-    /// more barriers onto the unbounded channel (they would only
+    /// more barriers onto the bounded channel (they would only
     /// queue more stale acks). While set, a second caller reports
     /// "not ready" instead of enqueueing its own.
     barrier_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -116,7 +289,8 @@ impl ServingHandle {
     /// The barrier under a time budget: `Ok(true)` once every earlier
     /// import landed, `Ok(false)` when the budget ran out first (the
     /// drain continues in the background and the next barrier sees
-    /// it), `Err` when the mirror failed or is gone. A caller gating
+    /// it) or the bounded queue is full behind a slow mirror, `Err`
+    /// when the mirror failed or is gone. A caller gating
     /// discharge treats "not ready" exactly like failure: skip the
     /// send, retry next pass — the readiness ordering never weakens,
     /// and a slow mirror can no longer stretch the caller's pass.
@@ -125,7 +299,7 @@ impl ServingHandle {
         // One outstanding barrier: a caller that finds one in flight
         // (the previous pass timed out but its item is still queued
         // behind a slow import) reports "not ready" instead of
-        // queueing another onto the unbounded channel.
+        // queueing another onto the bounded channel.
         if self
             .barrier_in_flight
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -135,9 +309,20 @@ impl ServingHandle {
         }
         let release = Arc::clone(&self.barrier_in_flight);
         let (ack, wait) = tokio::sync::oneshot::channel();
-        if let Err(error) = self.send(MirrorItem::Flush(ack, Some(Arc::clone(&release)))) {
-            release.store(false, Ordering::SeqCst);
-            return Err(error);
+        match self.try_send_flush(MirrorItem::Flush(ack, Some(Arc::clone(&release)))) {
+            Ok(()) => {}
+            Err(FlushSend::Full) => {
+                // The queue is full of imports behind a slow drain:
+                // no room for the barrier either. Release the permit
+                // (nothing was enqueued, so no worker will clear it)
+                // and report not-ready; the next pass retries.
+                release.store(false, Ordering::SeqCst);
+                return Ok(false);
+            }
+            Err(FlushSend::Closed(error)) => {
+                release.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
         }
         // The timeout runs as a task on the runtime: a bare
         // `Handle::block_on` drives no timer, so the deadline would
@@ -163,11 +348,52 @@ impl ServingHandle {
         })?
     }
 
-    fn send(&self, item: MirrorItem) -> std::io::Result<()> {
-        self.sender
-            .send(item)
-            .map_err(|_| std::io::Error::other("serving mirror closed"))
+    /// Live queue observability: depth against the item/byte bounds
+    /// plus rejection and failure counters.
+    pub fn stats(&self) -> MirrorStats {
+        self.sender.stats()
     }
+
+    /// Enqueue a drain barrier without blocking: `Full` (no room
+    /// behind a slow drain) is a distinct, non-error outcome the
+    /// caller maps to not-ready; `Closed` (mirror detached) is an
+    /// I/O error like before.
+    fn try_send_flush(&self, item: MirrorItem) -> Result<(), FlushSend> {
+        // Barriers carry no import bytes, so they bypass the byte
+        // reservation and only contend for the item bound. Account
+        // the item while queued so `stats` stays exact.
+        use std::sync::atomic::Ordering;
+        self.sender
+            .accounting
+            .queued_items
+            .fetch_add(1, Ordering::SeqCst);
+        match self.sender.inner.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.sender
+                    .accounting
+                    .queued_items
+                    .fetch_sub(1, Ordering::SeqCst);
+                Err(FlushSend::Full)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.sender
+                    .accounting
+                    .queued_items
+                    .fetch_sub(1, Ordering::SeqCst);
+                Err(FlushSend::Closed(std::io::Error::other(
+                    "serving mirror closed",
+                )))
+            }
+        }
+    }
+}
+
+/// The non-blocking barrier-send outcome: a full queue is backpressure
+/// (report not-ready), a closed channel is a gone mirror (error).
+enum FlushSend {
+    Full,
+    Closed(std::io::Error),
 }
 
 /// Unique temp-file suffix so concurrent imports of the same root never
@@ -189,9 +415,7 @@ impl Vault {
 
     /// The mirror slot, shared with the serving endpoint that owns the
     /// drain task. The endpoint clears it on shutdown.
-    pub(crate) fn mirror_slot(
-        &self,
-    ) -> std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MirrorItem>>>> {
+    pub(crate) fn mirror_slot(&self) -> std::sync::Arc<Mutex<Option<MirrorSender>>> {
         std::sync::Arc::clone(&self.mirror)
     }
 
@@ -269,30 +493,41 @@ impl Vault {
         Ok(())
     }
 
-    /// Write-through to the serving mirror. A dead channel only delays
-    /// serving until the next boot rebuild, never the publication — but a
-    /// poisoned slot lock fails the import: poison means a thread
-    /// panicked mid-critical-section, so the operation fails instead of
-    /// the process.
+    /// Write-through to the serving mirror. A detached channel only
+    /// delays serving until the next boot rebuild, never the
+    /// publication — but a poisoned slot lock fails the import, and a
+    /// full bounded queue applies backpressure (`VaultError::MirrorFull`):
+    /// the vault file is already durable, so the caller retries the
+    /// import on a later pass and the readiness barrier stays not-ready
+    /// until the drain catches up. Poison means a thread panicked
+    /// mid-critical-section, so the operation fails instead of the
+    /// process.
     fn notify_mirror(&self, sealed: &[u8]) -> Result<(), VaultError> {
-        if let Some(sender) = self
+        let sender = self
             .mirror
             .lock()
             .map_err(|_| std::io::Error::other("vault mirror lock poisoned"))?
-            .as_ref()
-        {
-            let _ = sender.send(MirrorItem::Import(sealed.to_vec()));
+            .clone();
+        if let Some(sender) = sender {
+            sender.send_import(sealed.to_vec())?;
         }
         Ok(())
+    }
+
+    /// Live queue observability, if a mirror is attached: `None` when
+    /// serving is detached (shutdown or never opened).
+    pub fn mirror_stats(&self) -> Option<MirrorStats> {
+        self.mirror
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|sender| sender.stats())
     }
 
     /// Attach the write-through channel of a serving mirror. Replacing
     /// an already-attached channel strands the old one (its sends fail
     /// and are ignored); a serving restart is the normal replacement.
-    pub(crate) fn attach_mirror(
-        &self,
-        sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
-    ) -> Result<(), VaultError> {
+    pub(crate) fn attach_mirror(&self, sender: MirrorSender) -> Result<(), VaultError> {
         *self
             .mirror
             .lock()
@@ -380,10 +615,10 @@ pub struct ServingEndpoint {
     runtime: tokio::runtime::Runtime,
     router: Router,
     endpoint: Endpoint,
-    /// Clone of the write-through channel, for [`flush`](Self::flush).
-    sender: tokio::sync::mpsc::UnboundedSender<MirrorItem>,
+    /// Clone of the bounded write-through sender, for [`flush`](Self::flush).
+    sender: MirrorSender,
     /// The vault's mirror slot, cleared on shutdown so imports stop.
-    mirror: std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<MirrorItem>>>>,
+    mirror: std::sync::Arc<Mutex<Option<MirrorSender>>>,
 }
 
 /// The serving mirror's write-through worker: import each queued
@@ -393,18 +628,33 @@ pub struct ServingEndpoint {
 /// representation is never re-queued, and the boot rebuild is the healing
 /// path. Extracted so tests can inject an import that fails and prove
 /// `flush` reports it instead of claiming readiness.
+///
+/// The worker owns the accounting half: it releases the byte/item
+/// reservation on receipt (the bound covers waiting bytes, not the one
+/// in-flight import) and counts landed failures for [`MirrorStats`].
 async fn drain_mirror<F, Fut>(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<MirrorItem>,
+    mut receiver: tokio::sync::mpsc::Receiver<MirrorItem>,
+    accounting: std::sync::Arc<MirrorAccounting>,
     mut import: F,
 ) where
     F: FnMut(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
+    use std::sync::atomic::Ordering;
     let mut failure: Option<String> = None;
     while let Some(item) = receiver.recv().await {
+        // Every queued item held one item permit, released as it is
+        // handled so `stats` tracks waiting work, not history. A
+        // barrier that timed out still sits in the queue and still
+        // holds its permit until handled here.
+        accounting.queued_items.fetch_sub(1, Ordering::SeqCst);
         match item {
             MirrorItem::Import(bytes) => {
+                accounting
+                    .queued_bytes
+                    .fetch_sub(bytes.len(), Ordering::SeqCst);
                 if let Err(error) = import(bytes).await {
+                    accounting.failed_imports.fetch_add(1, Ordering::SeqCst);
                     failure.get_or_insert(error);
                 }
             }
@@ -469,10 +719,11 @@ impl ServingEndpoint {
                 .block_on(async { store.blobs().add_bytes(sealed).await })
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
         }
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<MirrorItem>();
+        let (sender, receiver) = mirror_channel();
         let blobs = store.blobs().clone();
+        let accounting = std::sync::Arc::clone(&sender.accounting);
         let router = runtime.block_on(async {
-            tokio::spawn(drain_mirror(receiver, move |bytes| {
+            tokio::spawn(drain_mirror(receiver, accounting, move |bytes| {
                 let blobs = blobs.clone();
                 async move {
                     blobs
@@ -535,6 +786,11 @@ impl ServingEndpoint {
     /// [`ServingHandle::flush_bounded`].
     pub fn flush_bounded(&self, budget: std::time::Duration) -> Result<bool, std::io::Error> {
         self.handle().flush_bounded(budget)
+    }
+
+    /// Live queue observability for this endpoint's mirror.
+    pub fn stats(&self) -> MirrorStats {
+        self.sender.stats()
     }
 
     /// Stop serving and join the runtime. The vault's write-through slot
@@ -789,7 +1045,7 @@ mod tests {
     #[test]
     fn poisoned_mirror_lock_fails_attach() {
         let vault = poisoned_vault();
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = mirror_channel();
         assert!(
             matches!(vault.attach_mirror(sender), Err(VaultError::Io(_))),
             "a poisoned mirror slot must fail the attach, not panic"
@@ -985,10 +1241,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = mirror_channel();
         let release = Arc::new(AtomicBool::new(false));
         let import_release = Arc::clone(&release);
-        let worker = runtime.spawn(drain_mirror(receiver, move |_bytes| {
+        let accounting = std::sync::Arc::clone(&sender.accounting);
+        let worker = runtime.spawn(drain_mirror(receiver, accounting, move |_bytes| {
             let import_release = Arc::clone(&import_release);
             async move {
                 while !import_release.load(Ordering::SeqCst) {
@@ -1005,7 +1262,7 @@ mod tests {
 
         // A blocked import: the first barrier times out but stays
         // queued behind the import.
-        sender.send(MirrorItem::Import(vec![7])).unwrap();
+        sender.send_import(vec![7]).unwrap();
         let start = Instant::now();
         assert!(
             !handle.flush_bounded(Duration::from_millis(30)).unwrap(),
@@ -1048,13 +1305,18 @@ mod tests {
 
     #[tokio::test]
     async fn mirror_flush_reports_the_first_import_failure() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let worker = tokio::spawn(drain_mirror(receiver, |_bytes| async {
+        let (sender, receiver) = mirror_channel();
+        let accounting = std::sync::Arc::clone(&sender.accounting);
+        let worker = tokio::spawn(drain_mirror(receiver, accounting, |_bytes| async {
             Err::<(), String>("disk full".to_string())
         }));
-        sender.send(MirrorItem::Import(vec![1, 2, 3])).unwrap();
+        sender.send_import(vec![1, 2, 3]).unwrap();
         let (ack, wait) = tokio::sync::oneshot::channel();
-        sender.send(MirrorItem::Flush(ack, None)).unwrap();
+        sender
+            .inner
+            .send(MirrorItem::Flush(ack, None))
+            .await
+            .unwrap();
         assert!(
             wait.await.unwrap().is_err(),
             "flush must not claim readiness"
@@ -1063,10 +1325,140 @@ mod tests {
         // so the representation is never re-queued until a restart
         // rebuilds the mirror.
         let (ack, wait) = tokio::sync::oneshot::channel();
-        sender.send(MirrorItem::Flush(ack, None)).unwrap();
+        sender
+            .inner
+            .send(MirrorItem::Flush(ack, None))
+            .await
+            .unwrap();
         assert!(wait.await.unwrap().is_err());
         drop(sender);
         worker.await.unwrap();
+    }
+
+    /// The item bound, end to end through the vault: an undrained
+    /// mirror holds at most [`MAX_MIRROR_QUEUE_ITEMS`] imports; the
+    /// next import keeps its vault file but reports
+    /// [`VaultError::MirrorFull`] instead of growing the queue, and a
+    /// retry after the drain catches up lands in the mirror.
+    #[test]
+    fn a_full_mirror_queue_applies_backpressure_without_losing_the_vault() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let (sender, mut receiver) = mirror_channel();
+        vault.attach_mirror(sender).unwrap();
+
+        // Fill the queue without draining: distinct roots so every
+        // import is a fresh publication, not a held-root no-op.
+        for i in 0..MAX_MIRROR_QUEUE_ITEMS {
+            let sealed = format!("queued representation {i}").into_bytes();
+            vault.import(&sealed).unwrap();
+        }
+        let stats = vault.mirror_stats().expect("mirror attached");
+        assert_eq!(stats.queued_items, MAX_MIRROR_QUEUE_ITEMS);
+        assert_eq!(stats.rejected_full, 0);
+
+        // One more publication: the vault file lands (the vault is the
+        // source of truth) but the mirror reports backpressure.
+        let overflow = b"overflow representation".to_vec();
+        let root = blob_root(&overflow);
+        let error = vault.import(&overflow).expect_err("queue is full");
+        assert!(
+            matches!(error, VaultError::MirrorFull { .. }),
+            "a full queue must report backpressure, got {error:?}"
+        );
+        assert_eq!(
+            vault.sealed(&root).unwrap(),
+            Some(overflow.clone()),
+            "the vault stays durable even when the mirror is full"
+        );
+        let stats = vault.mirror_stats().expect("mirror attached");
+        assert_eq!(stats.queued_items, MAX_MIRROR_QUEUE_ITEMS);
+        assert!(stats.queued_bytes <= MAX_MIRROR_QUEUE_BYTES);
+        assert_eq!(stats.rejected_full, 1);
+
+        // The drain catches up: every queued item arrives exactly once.
+        // The test drains synchronously, so it releases the worker's
+        // reservation on receipt to match `drain_mirror`.
+        let mut drained = 0;
+        while let Ok(item) = receiver.try_recv() {
+            use std::sync::atomic::Ordering;
+            let accounting = vault
+                .mirror
+                .lock()
+                .expect("mirror lock")
+                .as_ref()
+                .expect("mirror attached")
+                .accounting
+                .clone();
+            accounting.queued_items.fetch_sub(1, Ordering::SeqCst);
+            match item {
+                MirrorItem::Import(bytes) => {
+                    accounting
+                        .queued_bytes
+                        .fetch_sub(bytes.len(), Ordering::SeqCst);
+                    drained += 1;
+                }
+                MirrorItem::Flush(..) => panic!("no barriers were enqueued"),
+            }
+        }
+        assert_eq!(drained, MAX_MIRROR_QUEUE_ITEMS);
+
+        // Retry the overflow: the held-root path re-enqueues now that
+        // the drain has room, and the vault still serves it.
+        assert_eq!(vault.import(&overflow).unwrap(), root);
+        assert_eq!(vault.sealed(&root).unwrap(), Some(overflow));
+    }
+
+    /// The byte bound rejects one oversize reservation up front: no
+    /// queue growth, no worker needed, and the rejection is counted.
+    #[test]
+    fn an_oversize_reservation_fails_before_queueing() {
+        let (sender, _receiver) = mirror_channel();
+        let oversize = vec![0xA5u8; MAX_MIRROR_QUEUE_BYTES + 1];
+        let error = sender
+            .send_import(oversize)
+            .expect_err("over the byte bound");
+        assert!(
+            matches!(error, VaultError::MirrorFull { .. }),
+            "a reservation past the byte bound must report backpressure"
+        );
+        let stats = sender.stats();
+        assert_eq!(stats.queued_items, 0);
+        assert_eq!(stats.queued_bytes, 0);
+        assert_eq!(stats.rejected_full, 1);
+        assert_eq!(stats.capacity_items, MAX_MIRROR_QUEUE_ITEMS);
+        assert_eq!(stats.capacity_bytes, MAX_MIRROR_QUEUE_BYTES);
+    }
+
+    /// A full queue has no room for the readiness barrier either: the
+    /// barrier reports not-ready (never an over-announcement), and the
+    /// stats name the condition.
+    #[test]
+    fn a_full_queue_reports_not_ready_instead_of_a_barrier() {
+        use std::time::Duration;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sender, _receiver) = mirror_channel();
+        // Fill every item permit with imports; the receiver is held but
+        // never drained, so the queue stays full.
+        for _ in 0..MAX_MIRROR_QUEUE_ITEMS {
+            sender.send_import(vec![1, 2, 3]).unwrap();
+        }
+        let handle = ServingHandle {
+            runtime: runtime.handle().clone(),
+            sender: sender.clone(),
+            barrier_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        assert!(
+            !handle.flush_bounded(Duration::from_secs(5)).unwrap(),
+            "a barrier behind a full queue reports not-ready"
+        );
+        let stats = sender.stats();
+        assert_eq!(stats.queued_items, MAX_MIRROR_QUEUE_ITEMS);
+        assert_eq!(stats.rejected_full, 0, "the barrier is not an import");
     }
 
     #[test]

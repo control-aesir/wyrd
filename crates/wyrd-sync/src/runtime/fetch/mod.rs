@@ -52,6 +52,10 @@ pub(super) fn fatal_vault(error: &crate::serving::VaultError) -> Option<StoreFai
             StoreFailure::Transient => None,
             fatal => Some(fatal),
         },
+        // Bounded mirror backpressure: the vault file is durable and
+        // the import retries on a later pass once the drain catches
+        // up. Never a pass-aborting store failure.
+        crate::serving::VaultError::MirrorFull { .. } => None,
     }
 }
 

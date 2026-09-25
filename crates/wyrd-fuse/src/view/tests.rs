@@ -1,5 +1,6 @@
 use super::*;
 
+use wyrd_core::export::{export_tree, ExportError};
 use wyrd_core::view::{NamespaceView, MAX_SYMLINK_COMPONENTS, MAX_SYMLINK_HOPS};
 
 use std::collections::HashMap;
@@ -684,6 +685,55 @@ fn symlink_confinement_resolves_nested_links_and_rejects_cycles() {
         confine_symlink_target(&view, "a", "b"),
         Err(ConfinementError::Cycle)
     );
+}
+
+#[test]
+fn export_rejects_conflict_version_composed_escape() {
+    let mut store = MemoryObjectStore::default();
+    let a = tree_of(&mut store, vec![Entry::symlink("s", "..").unwrap()]);
+    let root_a = tree_of(
+        &mut store,
+        vec![
+            Entry::dir("a", a).unwrap(),
+            Entry::symlink("escape", "a@1/s/../../outside").unwrap(),
+        ],
+    );
+    let root_b = tree_of(
+        &mut store,
+        vec![Entry::symlink("escape", "a@1/s/../../outside").unwrap()],
+    );
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![
+            Snapshot::new(vec![], root_a, device(), transition(), 1, 0, 1).unwrap(),
+            Snapshot::new(vec![], root_b, device(), transition(), 1, 0, 2).unwrap(),
+        ]),
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-conflict-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("out");
+
+    let error = export_tree(&view, &out).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ExportError::Symlink {
+                source: ConfinementError::EscapesRoot,
+                ..
+            }
+        ),
+        "unexpected: {error:?}"
+    );
+    assert!(!out.exists());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

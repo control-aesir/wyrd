@@ -419,6 +419,36 @@ where
     }
 }
 
+fn child_node(tree: &Tree, name: &str) -> Option<Node> {
+    tree.entries()
+        .binary_search_by(|entry| entry.name.as_str().cmp(name))
+        .ok()
+        .map(|index| leaf(&tree.entries()[index].content))
+}
+
+fn versioned_child(
+    component: &str,
+    resolutions: Vec<(wyrd_format::SnapshotId, Option<Node>)>,
+) -> Result<Option<Node>, ViewError> {
+    let Some(component) = Component::new(component.to_owned()).ok() else {
+        return Ok(None);
+    };
+    let Some(target) = grammar::parse_ref(&[component]) else {
+        return Ok(None);
+    };
+    let node = match merge(resolutions) {
+        Ok(node) => node,
+        Err(ViewError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Node::Conflict { mut versions } = node else {
+        return Ok(None);
+    };
+    let selected =
+        grammar::select_version(&mut versions, target.version).ok_or(ViewError::NotFound)?;
+    Ok(Some(selected.node.clone()))
+}
+
 /// A single tree entry's content as a node.
 fn leaf(content: &EntryContent) -> Node {
     match content {
@@ -593,12 +623,7 @@ where
         match parent {
             Node::Dir { subtree } => {
                 let (tree, work) = self.load_tree_for_resolution(subtree, max_work)?;
-                let node = tree.as_ref().and_then(|tree| {
-                    tree.entries()
-                        .binary_search_by(|entry| entry.name.as_str().cmp(component))
-                        .ok()
-                        .map(|index| leaf(&tree.entries()[index].content))
-                });
+                let node = tree.as_ref().and_then(|tree| child_node(tree, component));
                 Ok(LookupResult {
                     node,
                     work,
@@ -606,8 +631,14 @@ where
                 })
             }
             Node::MergedDir { subtrees } => {
+                let versioned = Component::new(component.to_owned())
+                    .ok()
+                    .and_then(|component| grammar::parse_ref(&[component]));
                 let mut work: u64 = 0;
-                let mut resolutions = Vec::with_capacity(subtrees.len());
+                let mut literal_resolutions = Vec::with_capacity(subtrees.len());
+                let mut versioned_resolutions = versioned
+                    .as_ref()
+                    .map(|_| Vec::with_capacity(subtrees.len()));
                 for (snapshot, subtree) in subtrees {
                     let remaining = max_work.saturating_sub(work);
                     let (tree, cost) = self.load_tree_for_resolution(subtree, remaining)?;
@@ -619,17 +650,24 @@ where
                             limit_exceeded: true,
                         });
                     };
-                    let node = tree
-                        .entries()
-                        .binary_search_by(|entry| entry.name.as_str().cmp(component))
-                        .ok()
-                        .map(|index| leaf(&tree.entries()[index].content));
-                    resolutions.push((*snapshot, node));
+                    literal_resolutions.push((*snapshot, child_node(&tree, component)));
+                    if let (Some(target), Some(resolutions)) =
+                        (versioned.as_ref(), versioned_resolutions.as_mut())
+                    {
+                        resolutions.push((*snapshot, child_node(&tree, &target.name)));
+                    }
                 }
-                let node = match merge(resolutions) {
+                let literal = match merge(literal_resolutions) {
                     Ok(node) => Some(node),
                     Err(ViewError::NotFound) => None,
                     Err(error) => return Err(error),
+                };
+                let node = if literal.is_some() {
+                    literal
+                } else if let Some(resolutions) = versioned_resolutions {
+                    versioned_child(component, resolutions)?
+                } else {
+                    None
                 };
                 Ok(LookupResult {
                     node,

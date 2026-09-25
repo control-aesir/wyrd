@@ -460,7 +460,7 @@ impl Vault {
         // fsync before deciding the import is a no-op.
         self.durability.reconcile()?;
         if path.is_file() {
-            self.reconcile_held(sealed)?;
+            self.reconcile_held(root, sealed)?;
             return Ok(root);
         }
         let tmp = self.dir.join(format!(
@@ -479,7 +479,7 @@ impl Vault {
                 // existing file is the winner and this call reconciles
                 // instead of failing.
                 if path.is_file() {
-                    self.reconcile_held(sealed)?;
+                    self.reconcile_held(root, sealed)?;
                     return Ok(root);
                 }
                 return Err(error.into());
@@ -490,11 +490,11 @@ impl Vault {
                 // failure does not also strand serving readiness, then
                 // surface the durability error; a retry re-syncs the
                 // directory. Best-effort is literal here: even a full
-                // queue must not outrank the error the caller was
-                // promised, and the retry's held-root path re-imports
-                // into the mirror once the drain has room.
-                // A poisoned mirror slot still fails the op — poison
-                // outranks the durability error.
+                // queue — and even a poisoned slot — must not outrank
+                // the error the caller was promised. The retry's
+                // held-root path re-imports into the mirror once the
+                // drain has room, and still surfaces a poisoned slot
+                // through that path.
                 let _ = self.notify_mirror(root, sealed);
                 return Err(error.into());
             }
@@ -508,9 +508,11 @@ impl Vault {
     /// are idempotent, so this heals a prior post-rename `fsync` failure
     /// (including across a restart), a crash before the mirror
     /// write-through, or a concurrent winner this process never observed.
-    fn reconcile_held(&self, sealed: &[u8]) -> Result<(), VaultError> {
+    /// Takes the already-computed root: rehashing here would pay a full
+    /// pass over the representation on exactly the degraded path this
+    /// queue exists to keep cheap.
+    fn reconcile_held(&self, root: BaoRoot, sealed: &[u8]) -> Result<(), VaultError> {
         self.durability.verify_dir(&self.dir)?;
-        let root = blob_root(sealed);
         self.notify_mirror(root, sealed)?;
         Ok(())
     }
@@ -1435,6 +1437,98 @@ mod tests {
         assert_eq!(vault.sealed(&root).unwrap(), Some(overflow));
     }
 
+    /// A `MirrorFull` rejection heals through the real worker: the
+    /// refused representation is retried once the drain has room, and
+    /// a barrier afterward proves every accepted byte landed in the
+    /// mirror. This closes the issue's "later flush makes every
+    /// accepted representation servable" leg as the outcome of a
+    /// backpressure rejection, not just generically.
+    #[test]
+    fn a_rejected_import_lands_once_the_drain_catches_up() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let (sender, receiver) = mirror_channel();
+        vault.attach_mirror(sender.clone()).unwrap();
+
+        // Fill the queue with the drain held: distinct roots so every
+        // import is a fresh publication, not a held-root no-op.
+        for i in 0..MAX_MIRROR_QUEUE_ITEMS {
+            let sealed = format!("drain queued {i}").into_bytes();
+            vault.import(&sealed).unwrap();
+        }
+        let overflow = b"rejected then landed".to_vec();
+        let root = blob_root(&overflow);
+        assert!(
+            matches!(vault.import(&overflow), Err(VaultError::MirrorFull { .. })),
+            "the undrained queue must reject the overflow"
+        );
+
+        // Start the real worker over the held receiver: it lands every
+        // byte into the mirror store.
+        let landed = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let worker_landed = Arc::clone(&landed);
+        let accounting = std::sync::Arc::clone(&sender.accounting);
+        let worker = runtime.spawn(drain_mirror(receiver, accounting, move |bytes| {
+            let worker_landed = Arc::clone(&worker_landed);
+            async move {
+                worker_landed.lock().expect("landed lock").push(bytes);
+                Ok(())
+            }
+        }));
+
+        // Retry until the drain makes room: the held-root path
+        // re-enqueues, and the vault serves the bytes throughout.
+        let mut accepted = false;
+        for _ in 0..1000 {
+            match vault.import(&overflow) {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(VaultError::MirrorFull { .. }) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(other) => panic!("unexpected import error: {other:?}"),
+            }
+        }
+        assert!(accepted, "the retry lands once the drain has room");
+        assert_eq!(vault.sealed(&root).unwrap(), Some(overflow.clone()));
+
+        // A barrier proves every accepted byte — including the retry —
+        // landed in the mirror.
+        let handle = ServingHandle {
+            runtime: runtime.handle().clone(),
+            sender: sender.clone(),
+            barrier_in_flight: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(
+            handle.flush_bounded(Duration::from_secs(30)).unwrap(),
+            "the barrier lands once the drain catches up"
+        );
+        let landed = landed.lock().expect("landed lock");
+        assert_eq!(landed.len(), MAX_MIRROR_QUEUE_ITEMS + 1);
+        assert!(
+            landed.contains(&overflow),
+            "the refused representation serves after reconciliation"
+        );
+        drop(handle);
+        drop(sender);
+        // The vault holds the third sender clone in its mirror slot:
+        // detach it (by dropping the vault) so the worker sees the
+        // channel close and the join below terminates.
+        drop(vault);
+        runtime.block_on(worker).unwrap();
+    }
+
     /// The byte bound rejects one oversize reservation up front: no
     /// queue growth, no worker needed, and the rejection is counted.
     #[test]
@@ -1491,16 +1585,20 @@ mod tests {
     /// The byte reservation holds under concurrency: many senders
     /// racing `send_import` can never push the aggregate past
     /// [`MAX_MIRROR_QUEUE_BYTES`], and every attempt is either queued
-    /// or counted as rejected — never lost between the two.
+    /// or counted as rejected — never lost between the two. Each item
+    /// is 2 MiB, so the byte bound bites at 32 items, well inside the
+    /// 64-item bound: only the reservation can be holding back the
+    /// other half of the attempts.
     #[test]
     fn concurrent_senders_never_exceed_the_byte_bound() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (sender, _receiver) = mirror_channel();
-        // 8 senders × 16 one-MiB representations = 128 MiB attempted
-        // against the 64 MiB bound: roughly half must be rejected.
+        // 8 senders × 16 two-MiB representations = 256 MiB attempted
+        // against the 64 MiB bound: three quarters must be rejected,
+        // by the byte reservation alone.
         const SENDERS: usize = 8;
         const PER_SENDER: usize = 16;
-        const ITEM_BYTES: usize = 1 << 20;
+        const ITEM_BYTES: usize = 2 << 20;
         let admitted = AtomicUsize::new(0);
         let rejected = AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -1536,7 +1634,24 @@ mod tests {
         assert_eq!(stats.queued_bytes, admitted * ITEM_BYTES);
         assert!(stats.queued_bytes <= MAX_MIRROR_QUEUE_BYTES);
         assert_eq!(stats.rejected_full, rejected as u64);
-        assert!(rejected > 0, "128 MiB against a 64 MiB bound must reject");
+        assert!(
+            admitted <= MAX_MIRROR_QUEUE_BYTES / ITEM_BYTES,
+            "the byte bound must bite at 32 items, inside the 64-item bound"
+        );
+        assert!(rejected > 0, "256 MiB against a 64 MiB bound must reject");
+    }
+
+    /// Releases clamp instead of wrapping: a miscount decays the
+    /// counters, never turns them into nonsense the observability
+    /// surface then reports.
+    #[test]
+    fn releases_saturate_instead_of_wrapping() {
+        let (sender, _receiver) = mirror_channel();
+        sender.accounting.release_item();
+        sender.accounting.release_bytes(usize::MAX);
+        let stats = sender.stats();
+        assert_eq!(stats.queued_items, 0);
+        assert_eq!(stats.queued_bytes, 0);
     }
 
     #[test]

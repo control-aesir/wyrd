@@ -190,7 +190,9 @@ mirror), and a full queue is backpressure (`VaultError::MirrorFull`,
 naming the refused root), never a silent drop: the vault file is
 already durable, the readiness barrier stays not-ready so no
 announcement discharges over an unserved representation, and a
-restart rebuilds the mirror from the vault. Pinned by
+restart rebuilds the mirror from the vault. Queue depth travels
+with the not-ready report in the pass logs, and a queue that is
+actually rejecting warns at the default log level. Pinned by
 `a_full_mirror_queue_applies_backpressure_without_losing_the_vault`,
 `serving_reopen_rebuilds_the_mirror_from_the_vault`, and
 `reimport_reconciles_a_vault_file_the_mirror_never_saw`.

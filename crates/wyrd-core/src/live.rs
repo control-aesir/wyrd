@@ -643,20 +643,41 @@ where
                 // The queue stats travel with the not-ready report: a
                 // mirror slower than authoring shows up here as depth
                 // against the bounds plus the rejection count, in the
-                // pass logs the guest already collects.
-                tracing::debug!(
-                    budget_ms = budget.as_millis(),
-                    queue = ?barrier.queue_stats(),
-                    "announcement discharge waits for serving readiness"
-                );
+                // pass logs the guest already collects. A queue that is
+                // actually rejecting is an operational fault, not a
+                // trace — that lands at warn so it is visible at the
+                // default info filter; a merely slow mirror stays debug.
+                let stats = barrier.queue_stats();
+                if stats.map_or(false, |s| s.rejected_full > 0 || s.failed_imports > 0) {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis(),
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness: mirror queue rejecting"
+                    );
+                } else {
+                    tracing::debug!(
+                        budget_ms = budget.as_millis(),
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness"
+                    );
+                }
                 Ok(false)
             }
             Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    queue = ?barrier.queue_stats(),
-                    "announcement discharge waits for serving readiness"
-                );
+                let stats = barrier.queue_stats();
+                if stats.map_or(false, |s| s.rejected_full > 0 || s.failed_imports > 0) {
+                    tracing::warn!(
+                        error = %error,
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness: mirror queue rejecting"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %error,
+                        queue = ?stats,
+                        "announcement discharge waits for serving readiness"
+                    );
+                }
                 Ok(false)
             }
         }

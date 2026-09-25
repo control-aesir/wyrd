@@ -109,3 +109,9 @@ guest. Operate it, never babysit it blind:
   in sync with the code.
 - Run outside an active devenv with `devenv shell -- ...`; bare commands 
   assume you are already inside `devenv shell`.
+
+## Remote publication authorization
+
+- Treat authorization to push, force-push, or `ngit send` as single-use and separate from authorization to edit, rebase, or commit.
+- After any failed, timed-out, or aborted remote publication, stop immediately. Do not retry, force, switch signer or server, use an alternate command, or delete refs without fresh explicit approval.
+- Report the exact local and remote state and ask before any further remote mutation.

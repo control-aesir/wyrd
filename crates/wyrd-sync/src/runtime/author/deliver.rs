@@ -397,7 +397,8 @@ fn deliver_capabilities(
                 // byte-identical. With the fact committed, replay makes
                 // the replacement the current obligation and every
                 // later pass reuses these exact bytes.
-                let supersedes = crate::durable::sealed_fact_id(epoch, &recipient, &bytes);
+                let supersedes =
+                    crate::durable::SealedCapabilityFactId::of(epoch, &recipient, &bytes);
                 let Some(replacement) = mint_fresh_rotation_bytes(
                     engine,
                     &rebuilt.keyring,

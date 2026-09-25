@@ -304,7 +304,7 @@ impl RuntimeState {
         &mut self,
         epoch: u64,
         recipient: DeviceId,
-        supersedes: [u8; 32],
+        supersedes: crate::durable::SealedCapabilityFactId,
         replacement: Vec<u8>,
     ) {
         let key = (epoch, recipient);
@@ -313,7 +313,7 @@ impl RuntimeState {
             // obligation for this pair, so the replacement is inert.
             return;
         };
-        if crate::durable::sealed_fact_id(epoch, &recipient, current) != supersedes {
+        if crate::durable::SealedCapabilityFactId::of(epoch, &recipient, current) != supersedes {
             return;
         }
         self.capability_sealed.insert(key, replacement);

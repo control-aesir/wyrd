@@ -16,7 +16,7 @@ use wyrd_format::{
     SnapshotId, StorageId, TransitionId,
 };
 
-use super::{DurableError, Fact};
+use super::{DurableError, Fact, SealedCapabilityFactId};
 use crate::control::message::{ControlKind, Message};
 use crate::control::{ControlMessageId, SealedControl, SealedRotation, SnapshotAnnouncement};
 use crate::keys::capability::{encoding, Capability};
@@ -60,7 +60,7 @@ const TAG_CAPABILITY_SEALED: u8 = 0x11;
 const TAG_CAPABILITY_DELIVERED: u8 = 0x12;
 /// `0x16`, not `0x13`: that byte is `TAG_BOOTSTRAP_PENDING`, and a tag
 /// collision silently decodes as the wrong fact kind.
-const TAG_CAPABILITY_SEALED_REPLACED: u8 = 0x16;
+pub(super) const TAG_CAPABILITY_SEALED_REPLACED: u8 = 0x16;
 /// Pending invitation material: raw wrapped-capability bytes (non-empty).
 const TAG_BOOTSTRAP_PENDING: u8 = 0x13;
 /// One namespace-carry obligation: head SnapshotId (32).
@@ -366,7 +366,7 @@ pub(super) fn encode_fact(
             let mut bytes = Vec::with_capacity(72 + replacement.len());
             bytes.extend_from_slice(&epoch.to_le_bytes());
             bytes.extend_from_slice(recipient.as_bytes());
-            bytes.extend_from_slice(supersedes);
+            bytes.extend_from_slice(supersedes.as_bytes());
             bytes.extend_from_slice(replacement);
             Ok((TAG_CAPABILITY_SEALED_REPLACED, bytes))
         }
@@ -637,7 +637,7 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             }
             let epoch = u64::from_le_bytes(record[..8].try_into().ok()?);
             let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
-            let supersedes = record[40..72].try_into().ok()?;
+            let supersedes = SealedCapabilityFactId::from_bytes(record[40..72].try_into().ok()?);
             let replacement = &record[72..];
             let rotation_sealed = SealedRotation::decode(replacement).ok().filter(|delivery| {
                 delivery.drive == *drive
@@ -759,7 +759,12 @@ pub(super) enum DecodedFact {
     TransitionDelivered(TransitionId, DeviceId),
     CapabilityQueued(u64, DeviceId),
     CapabilitySealed(u64, DeviceId, Vec<u8>),
-    CapabilitySealedReplaced(u64, DeviceId, [u8; 32], Vec<u8>),
+    CapabilitySealedReplaced(
+        u64,
+        DeviceId,
+        crate::durable::SealedCapabilityFactId,
+        Vec<u8>,
+    ),
     CapabilityDelivered(u64, DeviceId),
     BootstrapPending(Vec<u8>),
     CarryQueued(SnapshotId),
@@ -968,7 +973,7 @@ mod tests {
             &Fact::CapabilitySealedReplaced {
                 epoch: 2,
                 recipient,
-                supersedes: [0xAB; 32],
+                supersedes: SealedCapabilityFactId::from_bytes([0xAB; 32]),
                 replacement: crate::control::seal_rotation(
                     &drive,
                     recipient,
@@ -991,14 +996,15 @@ mod tests {
         // never be encoded must not survive replay as current bytes --
         // a foreign-drive or wrong-epoch replacement would otherwise
         // become the obligation and wedge the send path on every pass.
-        let record = |epoch: u64, to: DeviceId, supersedes: [u8; 32], payload: &[u8]| {
-            let mut out = Vec::new();
-            out.extend_from_slice(&epoch.to_le_bytes());
-            out.extend_from_slice(to.as_bytes());
-            out.extend_from_slice(&supersedes);
-            out.extend_from_slice(payload);
-            out
-        };
+        let record =
+            |epoch: u64, to: DeviceId, supersedes: SealedCapabilityFactId, payload: &[u8]| {
+                let mut out = Vec::new();
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(to.as_bytes());
+                out.extend_from_slice(supersedes.as_bytes());
+                out.extend_from_slice(payload);
+                out
+            };
         let good = crate::control::seal_rotation(
             &drive,
             recipient,
@@ -1037,7 +1043,12 @@ mod tests {
                     &drive,
                     &key,
                     TAG_CAPABILITY_SEALED_REPLACED,
-                    &record(epoch, to, [0xAB; 32], payload),
+                    &record(
+                        epoch,
+                        to,
+                        SealedCapabilityFactId::from_bytes([0xAB; 32]),
+                        payload
+                    ),
                 )
                 .is_none(),
                 "a replacement with a {why} is refused"
@@ -1049,7 +1060,12 @@ mod tests {
                 &drive,
                 &key,
                 TAG_CAPABILITY_SEALED_REPLACED,
-                &record(2, recipient, [0xAB; 32], &[]),
+                &record(
+                    2,
+                    recipient,
+                    SealedCapabilityFactId::from_bytes([0xAB; 32]),
+                    &[]
+                ),
             )
             .is_none(),
             "an empty replacement is refused"
@@ -1067,7 +1083,12 @@ mod tests {
                 &drive,
                 &key,
                 TAG_CAPABILITY_SEALED_REPLACED,
-                &record(2, recipient, [0xAB; 32], &padded),
+                &record(
+                    2,
+                    recipient,
+                    SealedCapabilityFactId::from_bytes([0xAB; 32]),
+                    &padded
+                ),
             )
             .is_some(),
             "structural decode is header-only; the recipient's AEAD is the gate"
@@ -1111,7 +1132,7 @@ mod tests {
                     &Fact::CapabilitySealedReplaced {
                         epoch,
                         recipient: to,
-                        supersedes: [0xAB; 32],
+                        supersedes: SealedCapabilityFactId::from_bytes([0xAB; 32]),
                         replacement: payload.to_vec(),
                     },
                 )

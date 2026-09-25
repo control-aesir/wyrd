@@ -1,6 +1,9 @@
 use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
 use super::store::{atomic_write, commit_name, DurableStore};
-use super::{AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact};
+use super::{
+    AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact,
+    SealedCapabilityFactId,
+};
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
 use crate::control::{seal, CapabilityPayload, Message};
@@ -256,6 +259,96 @@ fn orphan_files_are_ignored() {
         reloaded.transitions.len(),
         1,
         "only the committed prefix replays"
+    );
+}
+
+/// The `0x16` upgrade boundary, stated as a test.
+///
+/// Three things have to hold for the old-reader promise to be worth
+/// anything, and none of them is "we tested the skip" — the generic
+/// unknown-tag skip is already covered. The tag must sit outside the
+/// pre-`0x16` set, a commit carrying a *real* replacement must load
+/// without error rather than poisoning the file, and a current reader
+/// must actually apply it. The difference between an old and a current
+/// reader is then exactly the tag set, which is the property the
+/// upgrade contract relies on.
+#[test]
+fn the_replacement_tag_is_a_clean_upgrade_boundary() {
+    use crate::durable::codec::TAG_CAPABILITY_SEALED_REPLACED;
+
+    // Every tag that predates the replacement, as enumerated by the
+    // codec. `0x16` must be outside it — including `0x13`, which is
+    // `BootstrapPending` and which a careless allocator would reuse.
+    let pre_replacement_tags = [
+        0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15,
+    ];
+    assert!(
+        !pre_replacement_tags.contains(&TAG_CAPABILITY_SEALED_REPLACED),
+        "the replacement tag must be new, or an old reader would decode it as another fact"
+    );
+    assert_eq!(
+        TAG_CAPABILITY_SEALED_REPLACED, 0x16,
+        "the tag is pinned: a different value is a different format"
+    );
+
+    let (genesis, child) = chain();
+    let recipient = DeviceId::from_bytes([0x04; 32]);
+    let dir = TestDir::new("upgrade-boundary");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&[Fact::Transition(genesis)]).unwrap();
+    store.commit(&[Fact::Transition(child)]).unwrap();
+    let stale = sealed_rotation_bytes(&drive(), recipient, 2, 0x01);
+    let replacement = sealed_rotation_bytes(&drive(), recipient, 2, 0x02);
+    store
+        .commit(&[
+            Fact::CapabilityQueued(2, recipient),
+            Fact::CapabilitySealed(2, recipient, stale.clone()),
+        ])
+        .unwrap();
+
+    // Before the replacement, the stale fact is the obligation.
+    let before = store.load().unwrap();
+    assert!(
+        before.capability_sealed_replaced.is_empty(),
+        "nothing has replaced it yet"
+    );
+
+    store
+        .commit(&[Fact::CapabilitySealedReplaced {
+            epoch: 2,
+            recipient,
+            supersedes: SealedCapabilityFactId::of(2, &recipient, &stale),
+            replacement: replacement.clone(),
+        }])
+        .unwrap();
+
+    // The commit loads: a new tag is skippable, never poison.
+    let after = store.load().unwrap();
+    assert_eq!(
+        after.transitions.len(),
+        2,
+        "a commit carrying the new tag still replays its other facts"
+    );
+    assert_eq!(
+        after.capability_sealed_replaced.len(),
+        1,
+        "a current reader applies the replacement"
+    );
+    assert_eq!(
+        after.capability_sealed_replaced[0].3, replacement,
+        "and the replacement becomes the obligation"
+    );
+    assert_eq!(
+        after.capability_sealed_replaced[0].2,
+        SealedCapabilityFactId::of(2, &recipient, &stale),
+        "naming the fact it retires, so an old reader ignoring it is the only difference"
+    );
+    let rebuilt = crate::durable::replay::rebuild_facts(&drive(), after, recipient).unwrap();
+    assert_eq!(
+        rebuilt.runtime.capability_sealed_bytes(2, recipient),
+        Some(replacement.as_slice()),
+        "replay resolves the chain to the newest bytes"
     );
 }
 
@@ -1176,7 +1269,7 @@ fn capability_replacement_supersedes_exactly_the_named_fact() {
     let (drive, device, epoch) = (drive(), identity(0x04).1, 2u64);
     let stale = sealed_rotation_bytes(&drive, device, epoch, 0x01);
     let replacement = sealed_rotation_bytes(&drive, device, epoch, 0x02);
-    let supersedes = crate::durable::sealed_fact_id(epoch, &device, &stale);
+    let supersedes = crate::durable::SealedCapabilityFactId::of(epoch, &device, &stale);
 
     // The named fact is current: the replacement applies.
     let mut state = RuntimeState::new(drive);
@@ -1194,7 +1287,12 @@ fn capability_replacement_supersedes_exactly_the_named_fact() {
     let mut other = RuntimeState::new(drive);
     other.record_capability_queued(epoch, device);
     other.record_capability_sealed(epoch, device, stale.clone());
-    other.record_capability_replaced(epoch, device, [0xEE; 32], replacement.clone());
+    other.record_capability_replaced(
+        epoch,
+        device,
+        crate::durable::SealedCapabilityFactId::from_bytes([0xEE; 32]),
+        replacement.clone(),
+    );
     assert_eq!(
         other.capability_sealed_bytes(epoch, device),
         Some(stale.as_slice()),
@@ -1211,7 +1309,7 @@ fn capability_replacement_supersedes_exactly_the_named_fact() {
     chained.record_capability_replaced(
         epoch,
         device,
-        crate::durable::sealed_fact_id(epoch, &device, &replacement),
+        crate::durable::SealedCapabilityFactId::of(epoch, &device, &replacement),
         second.clone(),
     );
     assert_eq!(
@@ -1224,8 +1322,8 @@ fn capability_replacement_supersedes_exactly_the_named_fact() {
     // different fact, so a replacement cannot be retargeted by
     // mutating the payload it names.
     assert_ne!(
-        crate::durable::sealed_fact_id(epoch, &device, &stale),
-        crate::durable::sealed_fact_id(
+        crate::durable::SealedCapabilityFactId::of(epoch, &device, &stale),
+        crate::durable::SealedCapabilityFactId::of(
             epoch,
             &device,
             &sealed_rotation_bytes(&drive, device, epoch, 0x01)

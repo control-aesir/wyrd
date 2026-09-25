@@ -116,9 +116,34 @@ per pass for the whole outage. Minting is gated on the engine holding
 mint authority for the transition's pre-state, so a sender without it
 appends no replacement and leaves the obligation pending rather than
 recording a transmission the recipient would suppress. Pinned by
-`stale_capability_obligation_recovers_byte_identically_across_restart`
-and `non_owner_stale_obligation_commits_no_replacement`
+`stale_capability_obligation_recovers_byte_identically_across_restart`,
+`non_owner_stale_obligation_commits_no_replacement`,
+`stale_obligation_without_secrets_stays_pending`, and
+`replacement_commit_is_atomic_at_every_crash_stage`
 (`engine/tests_delivery.rs`).
+
+### The obligation invariant
+
+> A durable obligation must replay to the same obligation, or to an
+> explicitly recorded durable successor. A retry pass must never
+> manufacture an ignored durable fact.
+
+This is the rule, and it is deliberately broader than the one mechanism
+currently satisfying it. `CapabilitySealedReplaced` discharges it for
+the `0x01` → `0x02` proof-format transition — the case the owner proof
+actually creates. Two sibling paths do **not** yet satisfy it:
+
+- **stale registration** — a recipient re-registered under a new
+  encryption key, so the sealed bytes can never open for them;
+- **pre-framing epoch-sealed** capability facts.
+
+Both currently re-mint through a pass-local `CapabilitySealed` overlay,
+so they retain the original defect: one appended, then-ignored record
+per obligation per pass for the duration of an outage. That is tracked
+as follow-up work, not waived — the point of writing the invariant here
+is that the scope decision reads as a decision, rather than as having
+forgotten. Converting them is a separate change so the replacement
+semantics are established on the case that motivated them first.
 
 ## Keystore and custody
 

@@ -108,6 +108,12 @@ Releases are not required to write every format they read:
     rather than skipping, so tag allocation is checked against the
     full set, not against the last value.
 
+    The tag boundary is pinned by
+    `the_replacement_tag_is_a_clean_upgrade_boundary`: `0x16` sits
+    outside the enumerated pre-replacement set, a commit carrying a
+    real replacement loads rather than poisoning the file, and a
+    current reader resolves the chain to the replacement bytes.
+
 ## What this forbids
 
 - In-place object rewrites (`old object -> rewrite -> new object`).

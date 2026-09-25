@@ -231,13 +231,38 @@ impl AuthorizedSnapshot {
 /// replacement applies only to the obligation it actually supersedes,
 /// and the superseded ciphertext never has to be duplicated inside the
 /// replacement.
-pub fn sealed_fact_id(epoch: u64, recipient: &DeviceId, sealed: &[u8]) -> [u8; 32] {
-    let mut preimage = Vec::with_capacity(SUPERSEDE_ID_CONTEXT.len() + 8 + 32 + sealed.len());
-    preimage.extend_from_slice(SUPERSEDE_ID_CONTEXT.as_bytes());
-    preimage.extend_from_slice(&epoch.to_le_bytes());
-    preimage.extend_from_slice(recipient.as_bytes());
-    preimage.extend_from_slice(sealed);
-    blake3::derive_key(SUPERSEDE_ID_CONTEXT, &preimage)
+///
+/// A distinct type rather than `[u8; 32]`: this id is only ever
+/// meaningful against a *sealed capability* fact, and the store is full
+/// of other 32-byte identifiers (snapshot ids, transition ids,
+/// content ids). Interchange between any two of them is a durable-state
+/// bug that type-checks, so the boundary is made explicit here rather
+/// than left to review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedCapabilityFactId([u8; 32]);
+
+impl SealedCapabilityFactId {
+    /// The identity of the sealed fact carrying these exact bytes for
+    /// this exact obligation.
+    pub fn of(epoch: u64, recipient: &DeviceId, sealed: &[u8]) -> Self {
+        let mut preimage = Vec::with_capacity(SUPERSEDE_ID_CONTEXT.len() + 8 + 32 + sealed.len());
+        preimage.extend_from_slice(SUPERSEDE_ID_CONTEXT.as_bytes());
+        preimage.extend_from_slice(&epoch.to_le_bytes());
+        preimage.extend_from_slice(recipient.as_bytes());
+        preimage.extend_from_slice(sealed);
+        Self(blake3::derive_key(SUPERSEDE_ID_CONTEXT, &preimage))
+    }
+
+    /// The 32 wire bytes. Only the codec needs these; nothing in the
+    /// protocol reasons over the digest directly.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Read the 32 wire bytes back. Only the codec needs this.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// Domain context for the durable sealed-fact identity.
@@ -327,7 +352,7 @@ pub enum Fact {
     CapabilitySealedReplaced {
         epoch: u64,
         recipient: DeviceId,
-        supersedes: [u8; 32],
+        supersedes: SealedCapabilityFactId,
         replacement: Vec<u8>,
     },
     /// One capability obligation discharged for one recipient.

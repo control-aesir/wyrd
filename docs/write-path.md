@@ -175,17 +175,20 @@ MutationRequest {
    spent, so one stalled provider cannot push the `TimedOut` decision
    past its bound (unstarted work stays pending for the next pass).
    With nothing held, fetching is unbounded. A pass that fulfills
-   fetch objects with mutations still queued
-    wakes the loop immediately, so a held mutation retries without
-    waiting out the idle pacing deadline.
+    fetch objects with mutations still queued
+   wakes the loop immediately, so a held mutation retries without
+   waiting out the idle pacing deadline.
 5. **Create parent precondition.** FUSE captures an opaque, session-local
    `ParentToken` when `create` observes its parent directory. The live loop
    checks that token immediately before authoring. Tokens are stable across
    changes to descendants and siblings, so ordinary serialized mutations
    do not invalidate a create. A successful local namespace operation that
    removes, replaces, or moves a path invalidates that path and its
-   descendants; captures are held closed until the new projection publishes.
-   A head-set change outside the local queue invalidates all tokens
+    descendants; captures are held closed until the new projection publishes.
+    If publication is deferred because a new head's closure is still
+    fetching, captures reopen against the still-served projection; the
+    execution-time head and strict-parent checks remain authoritative.
+    A head-set change outside the local queue invalidates all tokens
    conservatively because the current object model carries no path-incarnation
    metadata. A missing parent is `ENOENT`, a non-directory parent is
    `ENOTDIR`, and an invalidated parent is `ESTALE`. Conflict classification
@@ -563,8 +566,8 @@ heads.
 
 ## Resource bounds
 
-All live-operation bounds (write budgets, mutation queue, open
-handles, demand admission, disk classification) are normative in
+All live-operation bounds (write budgets, mutation queue, parent
+create tokens, open handles, demand admission, disk classification) are normative in
 `resource-limits.md`; this section keeps only the write-path summary:
 
 | Bound | Exceeded → |
@@ -573,6 +576,7 @@ handles, demand admission, disk classification) are normative in
 | `write_aggregate_bytes` aggregate across handles (default 256 MiB) | `ENOSPC` |
 | `write_dirty_handles` (default 64) | `ENOSPC` |
 | `max_pending_mutations` (default 4096, including the executing one) | `EAGAIN` |
+| `max_parent_tokens` (default 4096 distinct parent paths) | `ESTALE` |
 
 Buffered state is memory, so these are daemon-write budgets; overflow
 fails closed rather than allocating without limit. Total open handles
@@ -607,7 +611,8 @@ and ignored (the format does not represent them). There are no ACLs.
 | store full (disk or quota) | `ENOSPC` |
 | store not writable | `EACCES` |
 | stale handle, conflicted heads | `EIO` |
-| queued create parent replaced or rotated | `ESTALE` |
+| queued create parent replaced, rotated, or unavailable at admission | `ESTALE` |
+| parent inode retired or re-minted during create admission | `ESTALE` |
 | unsupported feature operation (symlink/link/xattr) | `EOPNOTSUPP` |
 | name exists | `EEXIST` |
 | name absent | `ENOENT` |

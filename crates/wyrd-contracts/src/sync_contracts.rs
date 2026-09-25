@@ -1807,6 +1807,17 @@ fn conflicted_drive_rejects_mounted_writes() {
         Err(fuser::Errno::EIO)
     );
     assert_eq!(
+        backend.create_at(1, "missing/child", libc::O_RDWR),
+        Err(fuser::Errno::EIO),
+        "conflict classification precedes a missing-parent error"
+    );
+    let file_parent = backend.attr_at("a.txt").unwrap().ino.0;
+    assert_eq!(
+        backend.create_at(file_parent, "child", libc::O_RDWR),
+        Err(fuser::Errno::EIO),
+        "conflict classification precedes a file-parent error"
+    );
+    assert_eq!(
         backend.generation().unwrap(),
         before,
         "a conflicted mutation authors no snapshot"

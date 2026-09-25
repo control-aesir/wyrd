@@ -7,14 +7,15 @@
 //! constants as defaults, so embedders tune numbers without touching
 //! code and tests pin the defaults to the historical behavior. Two
 //! exceptions are new, not legacy: `max_admit_per_pass` (admission was
-//! previously uncapped per pass) and `max_open_handles` (the table was
-//! previously bounded only by the kernel descriptor limit) — both are
-//! intentional new bounds, sized generously (see each default). The
-//! `wyrd` binary itself takes no tuning flags today and runs defaults;
-//! these are library-level settings until a configuration surface
-//! lands. The sync-engine bounds (`MAX_PENDING_MESSAGES`, fetch
-//! backoff) stay constants: they are protocol-adjacent, not
-//! operational.
+//! previously uncapped per pass), `max_open_handles` (the table was
+//! previously bounded only by the kernel descriptor limit), and
+//! `max_parent_tokens` (the create-parent registry was new in the
+//! parent-race fix) — all are intentional new bounds, sized generously
+//! (see each default). The `wyrd` binary itself takes no tuning flags
+//! today and runs defaults; these are library-level settings until a
+//! configuration surface lands. The sync-engine bounds
+//! (`MAX_PENDING_MESSAGES`, fetch backoff) stay constants: they are
+//! protocol-adjacent, not operational.
 //!
 //! The per-pass fetch admission bound deserves a note on bytes: fetch
 //! execution is single-threaded per pass, so "bytes in flight" is the
@@ -26,7 +27,7 @@
 //! This module depends only on the sibling bound owners and std: it is
 //! the `wyrd-core` coordination surface.
 
-use crate::mutation::MAX_PENDING_MUTATIONS;
+use crate::mutation::{DEFAULT_MAX_PARENT_TOKENS, MAX_PENDING_MUTATIONS};
 use crate::session::{MAX_BUFFERED_BYTES, MAX_DIRTY_HANDLES, MAX_WRITE_BUFFER_BYTES};
 use crate::want::MAX_PENDING_WANTS;
 
@@ -59,6 +60,9 @@ pub struct ResourceBudgets {
     /// Admitted-but-incomplete mutations; overflow fails submission
     /// (`EAGAIN`).
     pub max_pending_mutations: usize,
+    /// Distinct parent paths whose create tokens are retained; overflow
+    /// fails admission closed (`ESTALE` at the FUSE boundary).
+    pub max_parent_tokens: usize,
     /// Wants admitted per sync pass (see the module note on bytes).
     pub max_admit_per_pass: usize,
     /// Largest logical image one writable handle may buffer (`ENOSPC`
@@ -78,6 +82,7 @@ impl Default for ResourceBudgets {
         ResourceBudgets {
             max_pending_wants: MAX_PENDING_WANTS,
             max_pending_mutations: MAX_PENDING_MUTATIONS,
+            max_parent_tokens: DEFAULT_MAX_PARENT_TOKENS,
             max_admit_per_pass: DEFAULT_MAX_ADMIT_PER_PASS,
             write_per_handle_bytes: MAX_WRITE_BUFFER_BYTES,
             write_aggregate_bytes: MAX_BUFFERED_BYTES,

@@ -9,9 +9,10 @@ doc bounds the live process holding and moving it.
 All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-core/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the
 backend at composition time. Defaults are the historical hardcoded
-bounds — with two intentional new ones: the per-pass admission cap
-(admission was previously uncapped per pass) and the open-handle cap
-(the table previously relied on the kernel descriptor limit alone).
+bounds — with three intentional new ones: the per-pass admission cap
+(admission was previously uncapped per pass), the open-handle cap
+(the table previously relied on the kernel descriptor limit alone),
+and the parent-token retention cap for the create-parent registry.
 4096 handles is far above plausible interactive use (tens of open
 descriptors) while bounding pinned-capture memory, so it does not
 regress supported workloads. `ResourceBudgets::default()` is the
@@ -25,6 +26,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Want registry identities (pending + admitted) | `max_pending_wants` (4096) | registration fails; `EIO` at the POSIX boundary, never a silent drop |
 | Want admission per sync pass | `max_admit_per_pass` (1024) | remainder stays pending for the next pass — paced, never dropped |
 | Mutation queue (admitted-but-incomplete) | `max_pending_mutations` (4096) | submission fails `Saturated`; `EAGAIN` |
+| Parent create tokens (distinct retained paths) | `max_parent_tokens` (4096) | new parent capture fails closed; `ESTALE` at the FUSE boundary |
 | Write buffer per dirty handle | `write_per_handle_bytes` (64 MiB) | reservation refused; `ENOSPC`, handle unchanged |
 | Write buffers aggregate | `write_aggregate_bytes` (256 MiB) | reservation refused; `ENOSPC` |
 | Dirty (buffered) handles | `write_dirty_handles` (64) | new dirty handle refused; `ENOSPC` |

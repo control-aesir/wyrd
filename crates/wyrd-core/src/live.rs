@@ -461,7 +461,10 @@ where
         let projection = Arc::new(RwLock::new(Arc::new(baseline)));
         let budgets = config.budgets;
         let wants = Arc::new(WantRegistry::with_limit(budgets.max_pending_wants));
-        let mutations = Arc::new(MutationQueue::with_limit(budgets.max_pending_mutations));
+        let mutations = Arc::new(MutationQueue::with_limits(
+            budgets.max_pending_mutations,
+            budgets.max_parent_tokens,
+        ));
         // One pacing signal for the whole live session: created here,
         // attached to the queue now, and shared with the backend's
         // callers (mailbox intake) so every producer wakes the loop.
@@ -741,6 +744,7 @@ where
             .collect::<Vec<_>>();
         if observed_heads != self.observed_heads {
             self.mutations.invalidate_parent_tokens();
+            tracing::debug!("parent token captures blocked by a head-set change");
             self.observed_heads = observed_heads;
         }
         // Clone the queue handle so the batch borrow does not pin `self`
@@ -883,6 +887,11 @@ where
             // publication, and starving them here would stall
             // delivery for as long as the fetch takes.
             batch.finish();
+            self.mutations.publish_parent_tokens();
+            tracing::debug!(
+                pending_heads,
+                "parent captures reopened while publication remains deferred"
+            );
             let sent = self.publish(mailbox)?;
             tracing::debug!(
                 pending_heads,
@@ -1000,7 +1009,7 @@ where
                 let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.mutations.invalidate_parent_subtree(path);
+                self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::CreateFile { path, parent } => {
@@ -1020,11 +1029,7 @@ where
                 if self.current_node(&heads, path)?.is_some() {
                     return Err(MutationError::AlreadyExists(path.clone()));
                 }
-                let base = match heads.as_slice() {
-                    [] => None,
-                    [head] => Some(head.snapshot().tree),
-                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
-                };
+                let base = heads.first().map(|head| head.snapshot().tree);
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let base = match base {
                     Some(tree) => tree,
@@ -1149,7 +1154,7 @@ where
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.mutations.invalidate_parent_subtree(path);
+                self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rmdir { path } => {
@@ -1160,7 +1165,7 @@ where
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.mutations.invalidate_parent_subtree(path);
+                self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::Rename {
@@ -1183,8 +1188,7 @@ where
                     return Ok(MutationOutcome::Done);
                 }
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.mutations.invalidate_parent_subtree(from);
-                self.mutations.invalidate_parent_subtree(to);
+                self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(MutationOutcome::Done)
             }
             MutationKind::SetAttrs {
@@ -1343,6 +1347,22 @@ where
             RuntimeMaterialization { runtime },
             heads.iter().cloned().map(Head::new).collect(),
         ))
+    }
+
+    fn invalidate_parent_for_namespace_mutation(&self, kind: &MutationKind) {
+        match kind {
+            MutationKind::Mkdir { path }
+            | MutationKind::Unlink { path }
+            | MutationKind::Rmdir { path } => self.mutations.invalidate_parent_subtree(path),
+            MutationKind::Rename { from, to, .. } => {
+                self.mutations.invalidate_parent_subtree(from);
+                self.mutations.invalidate_parent_subtree(to);
+            }
+            MutationKind::CreateFile { .. }
+            | MutationKind::CommitFile { .. }
+            | MutationKind::AppendFile { .. }
+            | MutationKind::SetAttrs { .. } => {}
+        }
     }
 
     /// Classify absent content on the mutation path, paired with the
@@ -2204,6 +2224,28 @@ mod prereq_tests {
     /// and the loop still shuts down cleanly. A damaged closure would
     /// end the run at the cap; ordinary fetch progress must not.
     #[test]
+    fn deferred_publication_reopens_parent_captures() {
+        let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("deferred-parent");
+        let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+        let queue = Arc::clone(node.mutations());
+        let token = queue.capture_parent("f").unwrap();
+        queue.invalidate_parent_tokens();
+        node.dirty = true;
+
+        let report = node
+            .sync_once(
+                &mut NoopMailbox,
+                None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+            )
+            .unwrap();
+        assert!(!report.published, "the incomplete closure remains deferred");
+        assert!(!queue.validate_parent("f", token));
+        assert!(queue.capture_parent("f").is_some());
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn an_incomplete_head_never_burns_the_engine_error_cap() {
         let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("incomplete");
         // Serve from an empty store: the head's tree and chunk are
@@ -2268,7 +2310,7 @@ mod parent_mutation_tests {
     use super::*;
     use crate::view::{DirEntry, Kind, MaterializationPolicy, OpenFile, ViewLockError};
     use std::sync::{RwLockReadGuard, RwLockWriteGuard};
-    use wyrd_format::{Entry, EntryContent, MemoryObjectStore};
+    use wyrd_format::{Entry, EntryContent, MemoryObjectStore, ObjectStore, Tree};
     use wyrd_sync::keys::DeviceIdentitySecret;
 
     struct TreeView {
@@ -2474,6 +2516,48 @@ mod parent_mutation_tests {
             &LiveConfig::default(),
         )
         .0
+    }
+
+    #[test]
+    fn deferred_create_fails_when_its_evaluated_head_changes() {
+        let (engine, dir, source_store, root, head) = scratch_parent_drive("deferred-head");
+        let root_bytes = source_store.get(&root).unwrap().unwrap();
+        let root_tree = Tree::decode(&root_bytes).unwrap();
+        let parent_subtree = match &root_tree.entries().first().unwrap().content {
+            EntryContent::Dir { subtree } => *subtree,
+            _ => panic!("fixture root does not contain a directory"),
+        };
+        let old_head = head.snapshot().snapshot_id();
+        let mut serving_store = MemoryObjectStore::default();
+        let _ = Tree::from_entries(vec![Entry::dir("parent", parent_subtree).unwrap()])
+            .unwrap()
+            .insert_into(&mut serving_store)
+            .unwrap();
+        let mut live = live_over_tree(engine, serving_store, &[head]);
+        let parent = live.mutations().capture_parent("parent").unwrap();
+        let create = MutationKind::CreateFile {
+            path: "parent/child".to_string(),
+            parent,
+        };
+
+        let deferred = live.apply_mutation(&create, None);
+        assert!(matches!(
+            deferred,
+            Err(MutationError::NeedContent { base: Some(base), .. }) if base == old_head
+        ));
+
+        let new_root = {
+            let mut store = live.store.write().unwrap();
+            Tree::empty().insert_into(&mut *store).unwrap()
+        };
+        live.engine
+            .author_snapshot(&*live.store.read().unwrap(), new_root)
+            .unwrap();
+        assert_eq!(
+            live.apply_mutation(&create, Some(old_head)),
+            Err(MutationError::Stale("parent/child".to_string()))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

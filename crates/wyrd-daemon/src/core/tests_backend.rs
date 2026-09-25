@@ -1,6 +1,6 @@
 use super::*;
 
-use wyrd_fuse::DriveView;
+use wyrd_fuse::{DriveView, ViewError};
 
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
@@ -13,9 +13,10 @@ use crate::fuse::FuseBackend;
 
 use wyrd_core::mutation::MutationQueue;
 
-use wyrd_format::MemoryObjectStore;
+use wyrd_format::{FsObjectStore, MemoryObjectStore};
 
 use wyrd_sync::bulk::MemoryBulkSource;
+use wyrd_sync::runtime::Engine;
 
 fn wait_for_outstanding(queue: &Arc<MutationQueue>, count: usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -257,6 +258,7 @@ fn into_live_stores_the_composition_config_budgets() {
         budgets: ResourceBudgets {
             max_admit_per_pass: 2,
             max_open_handles: 7,
+            max_parent_tokens: 11,
             ..ResourceBudgets::default()
         },
         ..LiveConfig::default()
@@ -269,6 +271,7 @@ fn into_live_stores_the_composition_config_budgets() {
     );
     assert_eq!(live.budgets().max_admit_per_pass, 2);
     assert_eq!(live.budgets().max_open_handles, 7);
+    assert_eq!(live.budgets().max_parent_tokens, 11);
     drop(live);
     drop(parts);
     std::fs::remove_dir_all(dir).unwrap();
@@ -477,6 +480,30 @@ fn queued_root_creates_keep_the_root_parent_token() {
 }
 
 #[test]
+fn headless_create_bootstraps_the_root_parent() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (handle, _, attr) = backend
+        .create_at(1, "headless.txt", libc::O_RDWR)
+        .expect("a headless root can bootstrap a create");
+    assert_eq!(attr.kind, fuser::FileType::RegularFile);
+    assert!(backend.release_handle(handle).is_ok());
+    assert!(backend.attr_at("headless.txt").is_ok());
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn queued_create_rejects_same_content_parent_replacement() {
     let (engine, dir, _) = scratch_drive();
     let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
@@ -531,6 +558,57 @@ fn queued_create_rejects_same_content_parent_replacement() {
         .unwrap()
         .expect("loop shuts down cleanly");
     drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn refused_create_stays_absent_after_reopen() {
+    let (engine, dir, identity) = scratch_drive();
+    let store = FsObjectStore::open(dir.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    daemon
+        .put_file("parent/placeholder", b"placeholder")
+        .unwrap();
+    daemon.remove("parent/placeholder").unwrap();
+    let (live, backend) = live_backend(daemon);
+    let parent_ino = backend.attr_at("parent").unwrap().ino.0;
+    let queue = Arc::clone(live.mutations());
+    let backend = Arc::new(backend);
+
+    let rmdir_backend = Arc::clone(&backend);
+    let rmdir = std::thread::spawn(move || rmdir_backend.rmdir_at(1, "parent"));
+    wait_for_outstanding(&queue, 1);
+    let mkdir_backend = Arc::clone(&backend);
+    let mkdir = std::thread::spawn(move || mkdir_backend.mkdir_at(1, "parent"));
+    wait_for_outstanding(&queue, 2);
+    let create_backend = Arc::clone(&backend);
+    let create =
+        std::thread::spawn(move || create_backend.create_at(parent_ino, "child", libc::O_RDWR));
+    wait_for_outstanding(&queue, 3);
+
+    let (stop, loop_handle) = spawn_live_loop(live);
+    assert_eq!(rmdir.join().unwrap(), Ok(()));
+    assert_eq!(mkdir.join().unwrap().map(|_| ()), Ok(()));
+    assert!(matches!(create.join().unwrap(), Err(fuser::Errno::ESTALE)));
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+
+    let reopened = Engine::open_keystore(dir.clone(), "daemon-test-pass", identity).unwrap();
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(reopened, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    assert!(daemon.view().lookup("parent").is_ok());
+    assert_eq!(
+        daemon.view().lookup("parent/child"),
+        Err(ViewError::NotFound)
+    );
+
+    drop(daemon);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

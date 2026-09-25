@@ -47,6 +47,11 @@ use crate::wake::WakeSignal;
 /// bound keeps it bounded.
 pub const MAX_PENDING_MUTATIONS: usize = 4096;
 
+/// Most distinct parent paths whose session-local create tokens are retained.
+/// Once full, new parent observations fail closed until an invalidation
+/// removes entries.
+pub const DEFAULT_MAX_PARENT_TOKENS: usize = 4096;
+
 /// The base identity a writable handle opened against, and the identity
 /// the loop compares against the current head at commit. A commit is
 /// accepted only if the path still carries exactly this identity;
@@ -102,6 +107,8 @@ impl FileIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParentToken(u64);
 
+// Parent state is part of the mutation precondition, so poisoning fails
+// closed here instead of recovering a possibly inconsistent token table.
 #[derive(Debug, Default)]
 struct ParentState {
     next: u64,
@@ -110,31 +117,50 @@ struct ParentState {
     block_all: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ParentRegistry {
     state: Mutex<ParentState>,
+    limit: usize,
 }
 
-fn is_blocked(blocked: &str, path: &str) -> bool {
-    path == blocked
-        || path
-            .strip_prefix(blocked)
-            .is_some_and(|remainder| remainder.starts_with('/'))
+impl Default for ParentRegistry {
+    fn default() -> Self {
+        Self::with_limit(DEFAULT_MAX_PARENT_TOKENS)
+    }
+}
+
+fn is_blocked(blocked: &HashSet<String>, path: &str) -> bool {
+    if blocked.contains(path) {
+        return true;
+    }
+    let mut ancestor = path;
+    while let Some((parent, _)) = ancestor.rsplit_once('/') {
+        ancestor = parent;
+        if blocked.contains(ancestor) {
+            return true;
+        }
+    }
+    false
 }
 
 impl ParentRegistry {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(ParentState::default()),
+            limit,
+        }
+    }
+
     pub fn capture(&self, path: &str) -> Option<ParentToken> {
         let mut state = self.state.lock().ok()?;
-        if state.block_all
-            || state
-                .blocked
-                .iter()
-                .any(|blocked| is_blocked(blocked, path))
-        {
+        if state.block_all || is_blocked(&state.blocked, path) {
             return None;
         }
         if let Some(token) = state.tokens.get(path) {
             return Some(*token);
+        }
+        if state.tokens.len() >= self.limit {
+            return None;
         }
         let next = state.next.checked_add(1)?;
         let token = ParentToken(next);
@@ -575,13 +601,19 @@ impl MutationQueue {
     /// Production passes its budget at composition; tests use small
     /// bounds to exercise saturation without thousands of threads.
     pub fn with_limit(limit: usize) -> Self {
+        Self::with_limits(limit, DEFAULT_MAX_PARENT_TOKENS)
+    }
+
+    /// Construct a queue with independent mutation-admission and
+    /// parent-token retention bounds.
+    pub fn with_limits(limit: usize, parent_token_limit: usize) -> Self {
         MutationQueue {
             state: Mutex::new(QueueState::default()),
             work: Condvar::new(),
             next_id: AtomicU64::new(0),
             limit,
             waker: Mutex::new(None),
-            parents: Arc::new(ParentRegistry::default()),
+            parents: Arc::new(ParentRegistry::with_limit(parent_token_limit)),
         }
     }
 
@@ -1094,6 +1126,18 @@ mod tests {
         queue.publish_parent_tokens();
         assert_ne!(queue.capture_parent(""), Some(root));
         assert_ne!(queue.capture_parent("child"), Some(child));
+    }
+
+    #[test]
+    fn parent_tokens_fail_closed_at_the_configured_bound() {
+        let queue = MutationQueue::with_limits(1, 1);
+        let first = queue.capture_parent("first").unwrap();
+        assert_eq!(queue.capture_parent("first"), Some(first));
+        assert_eq!(queue.capture_parent("second"), None);
+
+        queue.invalidate_parent_subtree("first");
+        queue.publish_parent_tokens();
+        assert!(queue.capture_parent("second").is_some());
     }
 
     #[test]

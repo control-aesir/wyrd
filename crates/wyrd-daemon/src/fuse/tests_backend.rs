@@ -622,6 +622,46 @@ fn create_queues_the_observed_parent_identity() {
     helper.join().expect("the servicing thread finishes");
 }
 
+#[test]
+fn create_admission_does_not_reintern_a_retired_parent_inode() {
+    let (mut backend, as_dir, _, _) = kind_changing_backend();
+    let (old_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+    publish(&backend, as_dir);
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+
+    assert_eq!(
+        backend.create_at(old_ino, "child", libc::O_RDWR),
+        Err(fuser::Errno::ESTALE)
+    );
+    assert_eq!(queue.outstanding(), 0, "the stale inode is not re-interned");
+}
+
+#[test]
+fn create_refuses_a_closed_parent_registry_with_estale() {
+    let mut store = MemoryObjectStore::default();
+    let parent = Tree::empty().insert_into(&mut store).unwrap();
+    let root = Tree::from_entries(vec![Entry::dir("parent", parent).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let mut backend = FuseBackend::new(DriveView::new(
+        store,
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    ));
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let (parent_ino, _, _) = backend.resolve_inode("parent").unwrap();
+    queue.invalidate_parent_tokens();
+
+    assert_eq!(
+        backend.create_at(parent_ino, "child", libc::O_RDWR),
+        Err(fuser::Errno::ESTALE)
+    );
+    assert_eq!(queue.outstanding(), 0, "a closed capture is not admitted");
+}
+
 /// Unknown handles are EBADF, and a released handle stops
 /// serving. A duplicate release stays quiet.
 #[test]

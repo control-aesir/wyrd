@@ -68,7 +68,9 @@ pub struct MailboxEnvelope {
 /// relay/event ceiling at the mailbox boundary: the ciphertext is the
 /// only attacker-sized field in the handover (sender and recipient are
 /// fixed 32-byte identities). The live NIP-59 adapter applies a separate
-/// outer relay-event ceiling before unwrap.
+/// outer relay-event ceiling before unwrap and bounds decoded rumor content
+/// before holding the envelope; this gate remains the transport-layer
+/// ceiling immediately before NIP-44 decryption.
 pub const MAX_MAILBOX_CIPHERTEXT_LEN: usize = 96 * 1024;
 
 /// Max decrypted control bytes accepted from the mailbox, checked after

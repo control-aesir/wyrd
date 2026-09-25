@@ -215,10 +215,11 @@ use nostr::prelude::{AsyncGetPublicKey, AsyncNip44};
 use nostr::prelude::{
     Event, EventBuilder, EventId, Keys, Kind, PublicKey, SubscriptionId, Tag, UnsignedEvent,
 };
-use nostr_sdk::prelude::{Client, ClientNotification, Filter};
+use nostr_sdk::prelude::{Client, ClientNotification, Filter, RelayLimits};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc as tokio_mpsc;
 use wyrd_format::DeviceId;
+use wyrd_sync::transport::mailbox::MAX_MAILBOX_CIPHERTEXT_LEN;
 use wyrd_sync::transport::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
 };
@@ -236,7 +237,16 @@ const RUMOR_KIND: u16 = 9_501;
 /// an event flood cannot grow daemon memory without limit.
 const INCOMING_CAPACITY: usize = 1024;
 
+/// Ceiling on the decoded relay event's payload estimate: content plus
+/// every tag value, with per-value and per-tag structural allowances and
+/// a fixed allowance for the remaining event fields. The SDK has already
+/// parsed the event when this runs; it is not a wire-frame or exact
+/// serialized-length cap.
 const MAX_MAILBOX_RELAY_EVENT_BYTES: usize = 256 * 1024;
+/// SDK transport backstop for normalized relay JSON. The message limit
+/// is applied before the SDK parses a frame; the per-kind event limit is
+/// applied before it broadcasts the parsed event to the mailbox drainer.
+const MAX_MAILBOX_RELAY_WIRE_BYTES: usize = 512 * 1024;
 const RELAY_EVENT_FIXED_BYTES: usize = 512;
 
 fn check_relay_event_size(event: &Event) -> Result<(), MailboxError> {
@@ -250,15 +260,21 @@ fn check_relay_event_size(event: &Event) -> Result<(), MailboxError> {
         });
     }
     for tag in event.tags.iter() {
-        bytes = bytes.saturating_add(tag.len()).saturating_add(2);
-        for value in tag.as_slice() {
-            bytes = bytes.saturating_add(value.len()).saturating_add(2);
-        }
+        bytes = bytes.saturating_add(2);
         if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
             return Err(MailboxError::Oversize {
                 bytes,
                 max: MAX_MAILBOX_RELAY_EVENT_BYTES,
             });
+        }
+        for value in tag.as_slice() {
+            bytes = bytes.saturating_add(value.len()).saturating_add(2);
+            if bytes > MAX_MAILBOX_RELAY_EVENT_BYTES {
+                return Err(MailboxError::Oversize {
+                    bytes,
+                    max: MAX_MAILBOX_RELAY_EVENT_BYTES,
+                });
+            }
         }
     }
     Ok(())
@@ -663,7 +679,13 @@ where
             .enable_all()
             .build()
             .map_err(|error| MailboxError::Transport(error.to_string()))?;
-        let client = Arc::new(Client::default());
+        let mut relay_limits = RelayLimits::default();
+        relay_limits.messages.max_size = Some(MAX_MAILBOX_RELAY_WIRE_BYTES as u32);
+        relay_limits
+            .events
+            .max_size_per_kind
+            .insert(Kind::GiftWrap, Some(MAX_MAILBOX_RELAY_WIRE_BYTES as u32));
+        let client = Arc::new(Client::builder().relay_limits(relay_limits).build());
         let signer = Arc::new(signer);
         let open_keys = Keys::new(open_secret);
         let owner_pk = open_keys.public_key();
@@ -881,6 +903,12 @@ where
             return Err(MailboxError::Transport(
                 "rumor is not addressed to this device".into(),
             ));
+        }
+        if rumor.content.len() > MAX_MAILBOX_CIPHERTEXT_LEN {
+            return Err(MailboxError::Oversize {
+                bytes: rumor.content.len(),
+                max: MAX_MAILBOX_CIPHERTEXT_LEN,
+            });
         }
         Ok(MailboxEnvelope {
             sender: DeviceId::from_bytes(unwrapped.sender.to_bytes()),

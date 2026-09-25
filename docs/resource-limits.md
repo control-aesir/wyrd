@@ -29,7 +29,8 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Write buffers aggregate | `write_aggregate_bytes` (256 MiB) | reservation refused; `ENOSPC` |
 | Dirty (buffered) handles | `write_dirty_handles` (64) | new dirty handle refused; `ENOSPC` |
 | Open file handles (read + write) | `max_open_handles` (4096) | open refused; `EMFILE` |
-| Mailbox relay event | 256 KiB event payload (const) | rejected before NIP-59 unwrap; the relay retains it for redelivery |
+| Mailbox relay wire message | 512 KiB normalized JSON (SDK) | SDK transport backstop before the parsed event reaches Wyrd |
+| Mailbox relay event | 256 KiB decoded event-payload estimate (const; content plus tag values, after SDK parsing) | rejected before NIP-59 unwrap; the relay retains it for redelivery |
 | Mailbox notification channel | 1024 events (const) | backpressure stalls the relay stream; the relay retains everything |
 | Mailbox held handovers | 1024 unacked (const) | `recv` stops pulling; held mail rotates so the engine drains free |
 | Engine intake held messages | `MAX_PENDING_MESSAGES` 1024 (const) | over-limit deferrals shed without consuming; relay redelivers |
@@ -49,7 +50,7 @@ the one unbounded walk. Per-stage worst case for one hostile message:
 
 | Stage | At most | Enforcement |
 |---|---|---|
-| Mailbox handover | 96 KiB ciphertext, 64 KiB opened bytes | `MAX_MAILBOX_CIPHERTEXT_LEN` / `MAX_MAILBOX_OPEN_BYTES` reject pre-ingest; unopenable envelopes discard with no fact |
+| Mailbox handover | 96 KiB NIP-44 ciphertext, 64 KiB opened bytes | `MAX_MAILBOX_CIPHERTEXT_LEN` rejects before NIP-44 decryption and before the envelope is held; `MAX_MAILBOX_OPEN_BYTES` rejects opened bytes before ingest; unopenable envelopes discard with no fact |
 | Control framing | 82-byte floor, then version / drive / epoch-key lookups | `SealedControl::decode` + `ControlInbox::ingest` reject before any crypto |
 | Suppression redelivery | one hash over the sealed bytes, never an AEAD open | remembered verdicts apply before `open`; the id covers the sealed bytes so the verdict is stable across the open boundary |
 | Announcement | two hash-map reads before one BIP-340 verify | membership lookup + epoch agreement precede `verify_announcement`; unseen transitions defer, mismatches suppress, verification still gates every commit |
@@ -129,7 +130,11 @@ held mail rotates so the engine drains room free; nothing is ever
 consumed-and-dropped, because the live stream has no cursor and a
 dropped event would wait for a resubscribe that may never come. The
 bounded seen-id log (65,536 acks) and poison cache (4096 entries)
-bound the durable and in-memory dedupe state. The relay-event ceiling is
-checked before an event enters the notification channel; an
-oversized event is discarded without acknowledgement, so the relay retains
-it for redelivery. Proven by the `mailbox::tests_backpressure` suite.
+bound the durable and in-memory dedupe state. The SDK applies a 512 KiB
+normalized-JSON wire backstop, and the relay-event ceiling is checked
+before an event enters the notification channel. The latter bounds the
+decoded event payload estimate (content plus tag values), not the raw
+wire frame: the SDK has already parsed the event at this point, so JSON
+escaping is outside the metric. An oversized event is discarded without
+acknowledgement, so the relay retains it for redelivery. Proven by the
+`mailbox::tests_delivery` and `mailbox::tests_mailbox` suites.

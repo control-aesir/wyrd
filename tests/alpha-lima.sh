@@ -15,7 +15,7 @@ set -euo pipefail
 # shellcheck source=/dev/null
 source /tmp/lima/e2e-env.sh
 
-E2E_ROOT="$HOME/e2e"
+E2E_ROOT="/tmp/wyrd-e2e"
 DRIVES="$E2E_ROOT/drives"
 CREDS="$E2E_ROOT/creds"
 MNTS="$E2E_ROOT/mnt"

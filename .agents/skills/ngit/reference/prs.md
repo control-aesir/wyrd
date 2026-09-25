@@ -138,6 +138,23 @@ Before adding maintainer fixes or merging, inspect PR-only merge commits with
 history is intentional, rebase or cherry-pick the PR commits onto the current
 target branch before updating the PR.
 
+### Environment notes
+
+- Run the merge from a worktree where the target branch is checked
+  out. `ngit merge` / `ngit pr merge` refuse when the target is
+  checked out in another worktree — the fix is the location, not the
+  subcommand.
+- The git transport does not support `--force-with-lease` (it fails
+  with "stale info"). Plain `--force` only, only on explicit
+  instruction, only on `pr/` branches, never on the target.
+- The merge check is
+  `ngit ci status <pr> --require-ci-trust <level> --json`: it passes
+  only when the final revision is green. Runs may classify as
+  "No known context" — a trust-floor caveat, not a result failure;
+  `conclusion: success` with `revision_matched: true` is green.
+  Validate any CI query's output shape with one manual run before
+  polling on it.
+
 ## Lifecycle
 
 ```bash

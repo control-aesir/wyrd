@@ -76,22 +76,103 @@ fn inode_table_rejects_unknown_inos() {
     table.retire(999);
 }
 
+/// A failed removal leaves the table exactly as it was, even when a
+/// lookup during the flight already interned its own ino: the file
+/// never left, so the ino the kernel is still holding must keep
+/// resolving. Restoring only into a vacant `by_path` orphaned that ino
+/// and made a still-present file unreachable.
 #[test]
-fn pending_removal_prevents_inode_reuse_and_restores_on_failure() {
+fn failed_removal_restores_the_ino_a_racing_lookup_left_bound() {
     use fuser::FileType;
     let mut table = InodeTable::new();
     let old = table.intern("x", FileType::RegularFile, 0).unwrap();
     let token = table.begin_remove("x").unwrap();
-    let fresh = table.intern("x", FileType::RegularFile, 1).unwrap();
-    assert_ne!(fresh, old);
-    assert_eq!(table.intern("x", FileType::RegularFile, 1), Ok(fresh));
-    table.finish_remove("x", token, true);
-    assert_eq!(table.intern("x", FileType::RegularFile, 1), Ok(fresh));
+    // A lookup landing mid-flight mints its own ino and takes `by_path`.
+    let raced = table.intern("x", FileType::RegularFile, 1).unwrap();
+    assert_ne!(raced, old);
 
+    table.finish_remove("x", token, false);
+
+    assert_eq!(
+        table.path(old),
+        Some("x"),
+        "the ino the kernel still holds must resolve again"
+    );
+    assert_eq!(
+        table.validate(old, "x", FileType::RegularFile, 1),
+        Ok(()),
+        "and it must still validate against the still-present file"
+    );
+    assert_eq!(
+        table.intern("x", FileType::RegularFile, 1),
+        Ok(raced),
+        "the racing lookup keeps the path binding it interned"
+    );
+}
+
+/// Two removals of one path act on their own outcomes, in either
+/// order. A committed sibling kills the retired ino for good: the
+/// later failure must not resurrect it, and a same-kind recreation
+/// must mint a fresh ino. This is the ABA a shared token plus
+/// first-finisher-wins produced — the second operation consumed the
+/// first one's completion and its success retired nothing.
+#[test]
+fn concurrent_removals_settle_in_either_order() {
+    use fuser::FileType;
+    for fail_first in [true, false] {
+        let mut table = InodeTable::new();
+        let old = table.intern("x", FileType::RegularFile, 0).unwrap();
+        let first = table.begin_remove("x").unwrap();
+        let second = table.begin_remove("x").unwrap();
+        assert_ne!(first, second, "each operation carries its own token");
+        let raced = table.intern("x", FileType::RegularFile, 1).unwrap();
+        assert_ne!(raced, old);
+
+        if fail_first {
+            table.finish_remove("x", first, false);
+            table.finish_remove("x", second, true);
+        } else {
+            table.finish_remove("x", second, true);
+            table.finish_remove("x", first, false);
+        }
+
+        assert_eq!(table.path(old), None, "the committed removal is fatal");
+        assert_eq!(table.path(raced), None, "the raced ino dies with it");
+        let recreated = table.intern("x", FileType::RegularFile, 2).unwrap();
+        assert_ne!(recreated, old);
+        assert_ne!(recreated, raced);
+    }
+}
+
+/// Retirement is deferred to the removal's outcome, and a committed
+/// removal keeps the path unmappable for as long as the flight is
+/// open: a lookup that lands after the removal published is looking at
+/// a recreation, and must never be handed the dead ino.
+#[test]
+fn retirement_defers_to_the_committed_outcome() {
+    use fuser::FileType;
+    let mut table = InodeTable::new();
+    let old = table.intern("x", FileType::RegularFile, 0).unwrap();
+    let token = table.begin_remove("x").unwrap();
+    let mid = table.intern("x", FileType::RegularFile, 1).unwrap();
+    assert_ne!(mid, old, "the in-flight ino is never handed out again");
+
+    table.finish_remove("x", token, true);
+
+    let after = table.intern("x", FileType::RegularFile, 2).unwrap();
+    assert_ne!(after, old);
+    assert_ne!(after, mid, "a committed removal retires what raced it");
+
+    // Same rule while the flight is still open: commit one removal
+    // with a sibling admitted, and the path stays unmappable for the
+    // whole flight.
+    let mut table = InodeTable::new();
     let old = table.intern("y", FileType::RegularFile, 0).unwrap();
-    let token = table.begin_remove("y").unwrap();
-    table.finish_remove("y", token, false);
-    assert_eq!(table.intern("y", FileType::RegularFile, 0), Ok(old));
+    let first = table.begin_remove("y").unwrap();
+    let _second = table.begin_remove("y").unwrap();
+    table.finish_remove("y", first, true);
+    let mid = table.intern("y", FileType::RegularFile, 1).unwrap();
+    assert_ne!(mid, old);
 }
 
 #[test]

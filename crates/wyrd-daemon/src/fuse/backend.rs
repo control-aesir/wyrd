@@ -451,6 +451,29 @@ where
             .map_err(inode_error)
     }
 
+    /// Confirm an operation carrying `ino` still addresses `path` at
+    /// `kind`, in-flight parents included. See
+    /// [`InodeTable::claims`](crate::fuse::inode::InodeTable::claims).
+    /// A refused claim is `ESTALE` here, not the `ENOENT` a read-side
+    /// validation reports: the parent identity no longer names the
+    /// path, which is what the create contract calls stale.
+    fn claims_inode(
+        &self,
+        ino: u64,
+        path: &str,
+        kind: fuser::FileType,
+        generation: u64,
+    ) -> Result<(), fuser::Errno> {
+        self.inodes
+            .write()
+            .map_err(|_| fuser::Errno::EIO)?
+            .claims(ino, path, kind, generation)
+            .map_err(|error| match error {
+                InodeError::Stale => fuser::Errno::ESTALE,
+                other => inode_error(other),
+            })
+    }
+
     /// Forget a mapping on the deletion path. Best-effort: this runs
     /// where the operation already fails, so poison is ignored — the
     /// primary locks fail closed on their own, and the next
@@ -930,19 +953,6 @@ where
         self.insert_reserved(Handle::Write(Arc::new(Mutex::new(handle))))
     }
 
-    fn validate_open_inode(&self, ino: u64, path: &str) -> Result<(), fuser::Errno> {
-        let projection = self.projection()?;
-        let node = match projection.view().lookup(path) {
-            Ok(node) => node,
-            Err(ViewError::NotFound) => {
-                self.retire_inode(ino);
-                return Err(fuser::Errno::ENOENT);
-            }
-            Err(error) => return Err(errno_of(&error)),
-        };
-        self.validate_inode(ino, path, &node, projection.generation())
-    }
-
     /// Build the writable handle for [`open_write`](Self::open_write):
     /// resolve the node, commit an `O_TRUNC` truncation up front, and
     /// capture the identity the handle commits against.
@@ -954,10 +964,9 @@ where
         truncate: bool,
         ino: Option<u64>,
     ) -> Result<WriteHandle, fuser::Errno> {
-        if truncate {
-            if let Some(ino) = ino {
-                self.validate_open_inode(ino, path)?;
-            }
+        // What the `O_TRUNC` truncation actually committed, when one
+        // was requested. See the guarded submit below.
+        let truncated_to: Option<FileIdentity> = if truncate {
             // A path-addressed truncate while an append handle is open
             // on that path is `EOPNOTSUPP` (write-path.md): the fh-less
             // `setattr` path enforces the same guard, and the open path
@@ -966,18 +975,59 @@ where
             if self.append_open_on(path) {
                 return Err(fuser::Errno::EOPNOTSUPP);
             }
+            // One projection read both validates the inode and reads
+            // the identity the truncation must land on. The commit is
+            // guarded by that identity: a same-path replacement that
+            // publishes before the loop applies the mutation fails the
+            // open instead of truncating somebody else's file.
+            let projection = self.projection()?;
+            let node = match projection.view().lookup(path) {
+                Ok(node) => node,
+                Err(ViewError::NotFound) => {
+                    if let Some(ino) = ino {
+                        self.retire_inode(ino);
+                    }
+                    return Err(fuser::Errno::ENOENT);
+                }
+                Err(error) => return Err(errno_of(&error)),
+            };
+            if let Some(ino) = ino {
+                self.validate_inode(ino, path, &node, projection.generation())?;
+            }
+            let observed = match &node {
+                Node::File {
+                    size,
+                    executable,
+                    chunks,
+                } => FileIdentity::new(*size, *executable, chunks.clone()),
+                // `view.open` below rejects non-files; this arm is
+                // unreachable but keeps the identity derivation total.
+                _ => return Err(fuser::Errno::EISDIR),
+            };
             // The truncation commits during open, not at the first
             // flush: the kernel delivers `O_TRUNC` as open plus a
             // separate fh-less `setattr`, so a handle carrying the
             // pre-truncate base would go stale before its first
             // commit. The followup `setattr` short-circuits as a
             // no-op in `set_size_at`.
-            self.submit(MutationKind::SetAttrs {
-                path: path.to_string(),
-                size: Some(0),
-                executable: None,
-            })?;
-        }
+            Some(
+                match self.submit(MutationKind::SetAttrs {
+                    path: path.to_string(),
+                    size: Some(0),
+                    executable: None,
+                    base: Some(observed.clone()),
+                })? {
+                    MutationOutcome::Committed(committed) => committed,
+                    // Already empty: the guarded commit authored no root,
+                    // so the observed identity is what stands.
+                    MutationOutcome::Done => observed,
+                    // `SetAttrs` never creates; keeps the match total.
+                    MutationOutcome::Created(_) => return Err(fuser::Errno::EIO),
+                },
+            )
+        } else {
+            None
+        };
         let projection = self.projection()?;
         let (node, capture, _) = match Self::capture_from_projection(&projection, path) {
             Ok(captured) => captured,
@@ -1002,6 +1052,13 @@ where
             // unreachable but keeps the identity derivation total.
             _ => return Err(fuser::Errno::EISDIR),
         };
+        // The open is bound to the identity its own truncation
+        // committed, not to whatever answers at the path now: a
+        // replacement that publishes in the gap between the commit and
+        // this capture fails the open.
+        if truncated_to.is_some_and(|committed| committed != base) {
+            return Err(fuser::Errno::ESTALE);
+        }
         let id = self.budget.next_handle();
         let executable = base.executable();
         Ok(WriteHandle {
@@ -1036,18 +1093,12 @@ where
         let parent_path = self.inode_path(parent_ino)?;
         // Admission must not intern or re-mint the path: a retired parent
         // inode needs to remain observable as ESTALE instead of being
-        // silently rebound before the queue sees the request.
+        // silently rebound before the queue sees the request. A parent
+        // whose removal is queued but unpublished is neither retired nor
+        // rebound — the request is admitted and the loop settles the race.
         let (parent, parent_generation) = self.lookup_current(&parent_path)?;
         let (parent_kind, _, _) = attr_of(&parent);
-        let parent_is_current = {
-            let inodes = self.inodes.read().map_err(|_| fuser::Errno::EIO)?;
-            inodes.ino_for_path(&parent_path) == Some(parent_ino)
-                && inodes.matches(parent_ino, &parent_path, parent_kind)
-        };
-        if !parent_is_current {
-            return Err(fuser::Errno::ESTALE);
-        }
-        self.validate_inode(parent_ino, &parent_path, &parent, parent_generation)?;
+        self.claims_inode(parent_ino, &parent_path, parent_kind, parent_generation)?;
         match parent {
             Node::Dir { .. } => {}
             Node::MergedDir { subtrees } if subtrees.is_empty() => {}
@@ -1682,6 +1733,10 @@ where
             path: path.clone(),
             size: Some(size),
             executable: None,
+            // A `truncate` syscall is path-addressed by POSIX: it acts
+            // on whatever the path names now. Only the `O_TRUNC` half
+            // of an open is identity-bound.
+            base: None,
         })?;
         for handle in &clean {
             let _ = self.repin_handle(handle, &path);
@@ -1697,6 +1752,7 @@ where
             path,
             size: None,
             executable: Some(executable),
+            base: None,
         })?;
         Ok(())
     }
@@ -1736,6 +1792,7 @@ where
                             path,
                             size: None,
                             executable: Some(executable),
+                            base: None,
                         })?;
                     }
                     return Ok(());
@@ -1760,6 +1817,7 @@ where
                         path,
                         size: None,
                         executable: Some(executable),
+                        base: None,
                     })?,
                     None => return Ok(()),
                 };
@@ -1779,6 +1837,7 @@ where
                             path,
                             size,
                             executable,
+                            base: None,
                         })?;
                         Ok(())
                     }

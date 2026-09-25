@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -65,7 +65,9 @@ pub(super) struct InodeTable {
     pub(super) by_ino: HashMap<u64, InodeEntry>,
     pub(super) by_path: HashMap<String, u64>,
     pub(super) next: u64,
-    pending_removals: HashMap<String, RetiredPath>,
+    /// Removals admitted for a path but not yet completed. See
+    /// [`RemovalFlight`](RemovalFlight).
+    removals: HashMap<String, RemovalFlight>,
     next_removal: u64,
 }
 
@@ -75,16 +77,33 @@ pub(super) struct InodeTable {
 /// whether a mapping predates a commit); validation correctness
 /// itself comes from re-resolving against one cloned immutable
 /// projection, not from comparing this field.
+#[derive(Clone)]
 pub(super) struct InodeEntry {
     pub(super) path: String,
     pub(super) kind: fuser::FileType,
     pub(super) generation: u64,
 }
 
-struct RetiredPath {
-    token: u64,
-    ino: Option<u64>,
-    entry: Option<InodeEntry>,
+/// The removals of one path that are still in flight.
+///
+/// The mapping the path had when its first removal was admitted is
+/// marked in flight: it stays bound, so an operation that carries the
+/// ino (a `create` naming this parent) still reaches the queue, where
+/// the loop settles the race against the queued removal — but no
+/// lookup is handed it, because a removal that publishes kills it.
+/// Nothing is unbound at admission, so a failure restores nothing it
+/// did not have to take away: the table is exactly as it was.
+///
+/// `tokens` gives every admitted operation its own identity, so a
+/// completion acts only on its own operation and two concurrent
+/// removals of one path cannot consume each other's outcome.
+/// `committed` records that some operation of the flight has
+/// published: from then on the marked ino is dead, so a later failure
+/// never resurrects it and no lookup reuses it.
+struct RemovalFlight {
+    tokens: HashSet<u64>,
+    retiring: Option<(u64, InodeEntry)>,
+    committed: bool,
 }
 
 pub(crate) type DirectoryEntries = Vec<(u64, fuser::FileType, String)>;
@@ -200,7 +219,7 @@ impl InodeTable {
             by_ino,
             by_path,
             next: 2,
-            pending_removals: HashMap::new(),
+            removals: HashMap::new(),
             next_removal: 1,
         }
     }
@@ -212,10 +231,15 @@ impl InodeTable {
     /// Forget a mapping on both indexes. Deletion and kind changes
     /// retire the ino; a later lookup mints a fresh one, so a retired
     /// ino never silently reattaches to recreated or repurposed
-    /// content.
+    /// content. Only the `by_path` slot this ino itself holds is
+    /// cleared: a racing lookup may already have interned a second
+    /// live ino for the same path, and unbinding that one would
+    /// strand it.
     pub(super) fn retire(&mut self, ino: u64) {
         if let Some(entry) = self.by_ino.remove(&ino) {
-            self.by_path.remove(&entry.path);
+            if self.by_path.get(&entry.path) == Some(&ino) {
+                self.by_path.remove(&entry.path);
+            }
         }
     }
 
@@ -230,44 +254,81 @@ impl InodeTable {
         }
     }
 
+    /// Admit one removal of `path`, returning the token that
+    /// identifies this operation alone.
+    ///
+    /// The mapping the path currently has is marked in flight, not
+    /// unbound: lookups stop being handed it (a removal that publishes
+    /// kills it, and a lookup racing one would otherwise be serving an
+    /// identity nobody may use again), while operations that carry the
+    /// ino still address the path. A second concurrent removal of the
+    /// same path joins the flight with its own token.
     pub(super) fn begin_remove(&mut self, path: &str) -> Result<u64, InodeError> {
-        if let Some(pending) = self.pending_removals.get(path) {
-            return Ok(pending.token);
-        }
-        let token = self.next_removal;
-        self.next_removal = self
+        let token = self
             .next_removal
             .checked_add(1)
             .ok_or(InodeError::Exhausted)?;
-        let removed = self
-            .by_path
-            .remove(path)
-            .and_then(|ino| self.by_ino.remove(&ino).map(|entry| (ino, entry)));
-        let (ino, entry) = removed
-            .map(|(ino, entry)| (Some(ino), Some(entry)))
-            .unwrap_or((None, None));
-        self.pending_removals
-            .insert(path.to_string(), RetiredPath { token, ino, entry });
+        self.next_removal = token;
+        match self.removals.get_mut(path) {
+            Some(flight) => {
+                flight.tokens.insert(token);
+            }
+            None => {
+                let retiring = self
+                    .by_path
+                    .get(path)
+                    .and_then(|ino| self.by_ino.get(ino).map(|entry| (*ino, entry.clone())));
+                self.removals.insert(
+                    path.to_string(),
+                    RemovalFlight {
+                        tokens: HashSet::from([token]),
+                        retiring,
+                        committed: false,
+                    },
+                );
+            }
+        }
         Ok(token)
     }
 
+    /// Complete the removal `token` names.
+    ///
+    /// A success retires the ino the flight marked together with
+    /// whatever else names the path — a replacement a racing lookup
+    /// interned while the removal was in flight dies with it — and
+    /// marks the flight committed, so a sibling removal that later
+    /// fails cannot resurrect the marked ino and no lookup reuses it
+    /// until the flight drains. A failure with nothing committed in
+    /// the flight leaves the marked ino bound, restoring it only if a
+    /// racing lookup displaced it: the file never left, and the kernel
+    /// may still be holding that ino. Unknown or duplicated tokens are
+    /// stale completions and do nothing.
     pub(super) fn finish_remove(&mut self, path: &str, token: u64, success: bool) {
-        if self
-            .pending_removals
-            .get(path)
-            .is_none_or(|pending| pending.token != token)
-        {
+        let Some(mut flight) = self.removals.remove(path) else {
+            return;
+        };
+        if !flight.tokens.remove(&token) {
+            self.removals.insert(path.to_string(), flight);
             return;
         }
-        let pending = self
-            .pending_removals
-            .remove(path)
-            .expect("pending removal was checked above");
-        if !success && !self.by_path.contains_key(path) {
-            if let (Some(ino), Some(entry)) = (pending.ino, pending.entry) {
-                self.by_path.insert(path.to_string(), ino);
-                self.by_ino.insert(ino, entry);
+        if success {
+            flight.committed = true;
+        }
+        if success {
+            if let Some((ino, _)) = &flight.retiring {
+                self.retire(*ino);
             }
+            self.retire_path(path);
+        } else if !flight.committed {
+            if let Some((ino, entry)) = &flight.retiring {
+                if !self.by_ino.contains_key(ino) {
+                    self.by_ino.insert(*ino, entry.clone());
+                }
+                self.by_path.entry(path.to_string()).or_insert(*ino);
+            }
+        }
+        if !flight.tokens.is_empty() {
+            self.removals.insert(path.to_string(), flight);
         }
     }
 
@@ -291,20 +352,45 @@ impl InodeTable {
         }
     }
 
-    pub(super) fn ino_for_path(&self, path: &str) -> Option<u64> {
-        self.by_path.get(path).copied()
-    }
-
-    pub(super) fn matches(&self, ino: u64, path: &str, kind: fuser::FileType) -> bool {
-        self.by_ino
-            .get(&ino)
-            .is_some_and(|entry| entry.path == path && entry.kind == kind)
+    /// Confirm an operation carrying `ino` may still address `path`
+    /// as `kind`: either the ino owns the path, or a removal of that
+    /// path has it in flight and has not published. The in-flight case
+    /// matters because the file is still in the projection
+    /// — the caller just resolved it there — and such an operation
+    /// only has to reach the queue, where the loop settles the race
+    /// against the queued removal. Refusing it here would answer a
+    /// race the loop owns, and silently rebinding the path instead
+    /// would hand the operation an identity nobody asked for. A
+    /// committed removal, a kind change, or an unknown ino is stale.
+    pub(super) fn claims(
+        &mut self,
+        ino: u64,
+        path: &str,
+        kind: fuser::FileType,
+        generation: u64,
+    ) -> Result<(), InodeError> {
+        if self.validate(ino, path, kind, generation).is_ok() {
+            return Ok(());
+        }
+        let limbo = self.removals.iter().any(|(_, flight)| {
+            !flight.committed
+                && flight.retiring.as_ref().is_some_and(|(retiring, entry)| {
+                    *retiring == ino && entry.path == path && entry.kind == kind
+                })
+        });
+        if limbo {
+            return Ok(());
+        }
+        Err(InodeError::Stale)
     }
 
     /// The ino for a freshly resolved path: reuse the mapping when it
     /// still names the same kind (refreshing its validated
     /// generation), otherwise retire the stale ino and mint a new one.
-    /// The root path (`""`) always maps to ino 1.
+    /// A removal of that path in flight also retires it: the ino is
+    /// marked, so it is never handed out — not to a lookup racing the
+    /// removal, and not to a same-kind recreation once the removal has
+    /// published. The root path (`""`) always maps to ino 1.
     pub(super) fn intern(
         &mut self,
         path: &str,
@@ -316,22 +402,23 @@ impl InodeTable {
         }
         if let Some(ino) = self.by_path.get(path) {
             let ino = *ino;
-            let retiring_old = self
-                .pending_removals
-                .get(path)
-                .and_then(|pending| pending.ino)
-                == Some(ino);
-            if !retiring_old {
-                let matches = self
+            let removal_in_flight = self.removals.get(path).is_some_and(|flight| {
+                flight.committed
+                    || flight
+                        .retiring
+                        .as_ref()
+                        .is_some_and(|(retiring, _)| *retiring == ino)
+            });
+            let reusable = !removal_in_flight
+                && self
                     .by_ino
                     .get(&ino)
                     .is_some_and(|entry| entry.kind == kind);
-                if matches {
-                    if let Some(entry) = self.by_ino.get_mut(&ino) {
-                        entry.generation = generation;
-                    }
-                    return Ok(ino);
+            if reusable {
+                if let Some(entry) = self.by_ino.get_mut(&ino) {
+                    entry.generation = generation;
                 }
+                return Ok(ino);
             }
             self.retire(ino);
         }

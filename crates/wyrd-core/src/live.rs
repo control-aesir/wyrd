@@ -1195,6 +1195,7 @@ where
                 path,
                 size,
                 executable,
+                base,
             } => {
                 let heads = self.eval_heads(pinned, path)?;
                 let tree = self.single_tree(&heads, path)?;
@@ -1212,6 +1213,17 @@ where
                     Some(_) => return Ok(MutationOutcome::Done),
                     None => return Err(MutationError::NotFound(path.clone())),
                 };
+                // The identity guard, checked before anything is
+                // read or written: an identity-bound `setattr` (the
+                // `O_TRUNC` half of an open) applies only to the exact
+                // file that open observed. A same-path replacement that
+                // committed in between fails closed with no snapshot,
+                // so the truncation never lands on different content.
+                if let Some(base) = base {
+                    if FileIdentity::new(current_size, current_exec, chunks.clone()) != *base {
+                        return Err(MutationError::Stale(path.clone()));
+                    }
+                }
                 let want_exec = executable.unwrap_or(current_exec);
                 // Decide everything before reading: an over-budget target
                 // fails closed without materializing, and a shrink only
@@ -1243,7 +1255,7 @@ where
                 };
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let name = path.rsplit('/').next().unwrap_or(path);
-                let entry = Entry::file(name, new_size, want_exec, new_chunks)
+                let entry = Entry::file(name, new_size, want_exec, new_chunks.clone())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
@@ -1251,7 +1263,12 @@ where
                     return Ok(MutationOutcome::Done);
                 }
                 Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                Ok(MutationOutcome::Done)
+                // The identity the mutation landed on, so an
+                // identity-bound caller (the `O_TRUNC` open) binds its
+                // captures to exactly what was committed.
+                Ok(MutationOutcome::Committed(FileIdentity::new(
+                    new_size, want_exec, new_chunks,
+                )))
             }
         }
     }
@@ -2636,6 +2653,99 @@ mod parent_mutation_tests {
             .current_node(&live.live_heads_traced().unwrap(), "parent/child")
             .unwrap()
             .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The `O_TRUNC` half of an open carries the identity it observed;
+    /// the loop applies it only to that exact file. A same-path
+    /// replacement that published in between fails the truncation
+    /// closed — `Stale`, no snapshot — instead of emptying the
+    /// replacement's content, and a guard naming the identity the
+    /// path does carry applies and hands the committed identity back.
+    #[test]
+    fn guarded_setattrs_refuses_a_replaced_path() {
+        let (engine, dir, store, root, head) = scratch_parent_drive("guarded");
+        let mut live = live_over_tree(engine, store, &[head]);
+        let (first_root, first_identity) = {
+            let mut store = live.store.write().unwrap();
+            let chunk = store
+                .insert(wyrd_format::ObjectKind::Chunk, b"original")
+                .unwrap();
+            let entry = Entry::file("child", 8, false, vec![chunk]).unwrap();
+            let next =
+                wyrd_format::mutation::put(&mut *store, root, "parent/child", entry).unwrap();
+            (next, FileIdentity::new(8, false, vec![chunk]))
+        };
+        live.engine
+            .author_snapshot(&*live.store.read().unwrap(), first_root)
+            .unwrap();
+        let (second_root, second_identity) = {
+            let mut store = live.store.write().unwrap();
+            let chunk = store
+                .insert(wyrd_format::ObjectKind::Chunk, b"replacement")
+                .unwrap();
+            let entry = Entry::file("child", 11, false, vec![chunk]).unwrap();
+            let next =
+                wyrd_format::mutation::put(&mut *store, first_root, "parent/child", entry).unwrap();
+            (next, FileIdentity::new(11, false, vec![chunk]))
+        };
+        live.engine
+            .author_snapshot(&*live.store.read().unwrap(), second_root)
+            .unwrap();
+        let head_after = live.live_heads_traced().unwrap()[0]
+            .snapshot()
+            .snapshot_id();
+
+        // The open observed `original`; the path carries the
+        // replacement now, so the guarded truncation fails closed.
+        assert_eq!(
+            live.apply_mutation(
+                &MutationKind::SetAttrs {
+                    path: "parent/child".to_string(),
+                    size: Some(0),
+                    executable: None,
+                    base: Some(first_identity),
+                },
+                None,
+            ),
+            Err(MutationError::Stale("parent/child".to_string()))
+        );
+        match live
+            .current_node(&live.live_heads_traced().unwrap(), "parent/child")
+            .unwrap()
+        {
+            Some(Node::File { size, .. }) => {
+                assert_eq!(size, 11, "the replacement was not truncated")
+            }
+            other => panic!("the replacement was disturbed: {other:?}"),
+        }
+        assert_eq!(
+            live.live_heads_traced().unwrap()[0]
+                .snapshot()
+                .snapshot_id(),
+            head_after,
+            "a refused truncation publishes no snapshot"
+        );
+
+        match live.apply_mutation(
+            &MutationKind::SetAttrs {
+                path: "parent/child".to_string(),
+                size: Some(0),
+                executable: None,
+                base: Some(second_identity),
+            },
+            None,
+        ) {
+            Ok(MutationOutcome::Committed(committed)) => {
+                assert_eq!(committed.size(), 0, "the loop returns what it committed")
+            }
+            other => panic!("a matching guard did not apply: {other:?}"),
+        }
+        assert!(matches!(
+            live.current_node(&live.live_heads_traced().unwrap(), "parent/child")
+                .unwrap(),
+            Some(Node::File { size: 0, .. })
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

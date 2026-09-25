@@ -394,8 +394,13 @@ fn same_kind_recreate_mints_fresh_ino() {
     );
 }
 
+/// Retirement is deferred to the removal's outcome: while the unlink
+/// is in flight a lookup mints its own ino rather than reusing the
+/// one a published removal would kill, and once the removal commits
+/// that raced ino dies with it — a lookup then binds a fresh
+/// identity, never the one that crossed the removal.
 #[test]
-fn pending_unlink_retires_the_inode_before_completion() {
+fn pending_unlink_defers_retirement_until_the_removal_commits() {
     let (mut backend, _) = evolving_backend(b"first", b"second");
     let queue = Arc::new(MutationQueue::default());
     backend.mutations = Some(Arc::clone(&queue));
@@ -409,15 +414,144 @@ fn pending_unlink_retires_the_inode_before_completion() {
         assert!(Instant::now() < deadline, "unlink was not admitted");
         std::thread::sleep(Duration::from_millis(1));
     }
-    let (pending_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
-    assert_ne!(pending_ino, old_ino);
+    let (raced, _, _) = backend.resolve_inode("f.txt").unwrap();
+    assert_ne!(raced, old_ino, "the in-flight ino is never reissued");
 
     let mut batch = queue.take_batch();
     assert_eq!(batch.len(), 1);
     batch.record(0, Ok(MutationOutcome::Done));
     batch.finish();
     assert_eq!(worker.join().unwrap(), Ok(()));
-    assert_eq!(backend.resolve_inode("f.txt").unwrap().0, pending_ino);
+
+    let (after, _, _) = backend.resolve_inode("f.txt").unwrap();
+    assert_ne!(after, old_ino);
+    assert_ne!(
+        after, raced,
+        "a committed removal retires what raced it, so a same-kind path binds fresh"
+    );
+}
+
+/// A removal that fails before it publishes leaves the still-present
+/// file reachable through the inode the kernel is holding, even when
+/// a lookup during the flight interned a second ino for the path. The
+/// earlier protocol restored the retired mapping only into a vacant
+/// `by_path`, so that lookup orphaned the held ino: `getattr` on a
+/// live file failed with ENOENT until the kernel's entry cache
+/// expired.
+#[test]
+fn failed_unlink_keeps_the_held_ino_resolvable() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let (held, _, _) = backend.resolve_inode("f.txt").unwrap();
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || worker_backend.unlink_at(1, "f.txt"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(Instant::now() < deadline, "unlink was not admitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (raced, _, _) = backend.resolve_inode("f.txt").unwrap();
+    assert_ne!(raced, held);
+
+    // Injected failure before publication: the file never left. A
+    // stale refusal is EIO at this boundary (`ESTALE` is reserved for
+    // `StaleParent`), which is beside the point here — what matters is
+    // that the table kept the held ino.
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1);
+    batch.record(0, Err(MutationError::Stale("f.txt".to_string())));
+    batch.finish();
+    assert_eq!(worker.join().unwrap(), Err(fuser::Errno::EIO));
+
+    assert_eq!(
+        backend.inode_path(held).as_deref(),
+        Ok("f.txt"),
+        "the ino the kernel still holds must resolve to the file"
+    );
+    assert_eq!(
+        backend.getattr_at(held, None).unwrap().size,
+        5,
+        "and it must serve the still-present content"
+    );
+    assert_eq!(
+        backend.resolve_inode("f.txt").unwrap().0,
+        raced,
+        "the raced lookup keeps the binding it interned"
+    );
+}
+
+/// The `O_TRUNC` half of an open is bound to the identity that open
+/// observed. A same-path replacement publishing before the loop
+/// applies the truncation fails the open with ESTALE instead of
+/// emptying somebody else's file, and the replacement's bytes are
+/// untouched. Without the guard the path-addressed `SetAttrs` landed
+/// on the new occupant and the handle's post-validation capture bound
+/// to content it never opened.
+#[test]
+fn o_trunc_open_refuses_a_same_path_replacement() {
+    let (mut backend, replacement) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let (_, node, _) = backend.resolve_inode("f.txt").unwrap();
+    let observed = match &node {
+        Node::File {
+            size,
+            executable,
+            chunks,
+        } => FileIdentity::new(*size, *executable, chunks.clone()),
+        other => panic!("fixture is not a file: {other:?}"),
+    };
+    let backend = Arc::new(backend);
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || {
+        worker_backend.open_write("f.txt", libc::O_RDWR | libc::O_TRUNC)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(Instant::now() < deadline, "the truncation was not admitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1);
+    match batch.request(0).kind() {
+        MutationKind::SetAttrs {
+            path,
+            size,
+            executable,
+            base,
+        } => {
+            assert_eq!(path, "f.txt");
+            assert_eq!(*size, Some(0));
+            assert_eq!(*executable, None);
+            assert_eq!(
+                base.as_ref(),
+                Some(&observed),
+                "the truncation is guarded by the identity the open observed"
+            );
+        }
+        other => panic!("unexpected mutation: {other:?}"),
+    }
+
+    // The replacement publishes while the open is still in flight.
+    publish(&backend, replacement);
+    batch.record(0, Err(MutationError::Stale("f.txt".to_string())));
+    batch.finish();
+    assert_eq!(
+        worker.join().unwrap(),
+        Err(fuser::Errno::EIO),
+        "the guarded truncation was refused, so the open never binds the replacement"
+    );
+
+    let handle = backend.open_at("f.txt").unwrap();
+    assert_eq!(
+        backend.read_handle(handle, 0, 64).unwrap(),
+        b"second",
+        "the replacement's content was never truncated"
+    );
 }
 
 /// Directory handles pin their enumeration generation: a listing

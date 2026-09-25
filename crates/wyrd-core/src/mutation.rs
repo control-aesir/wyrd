@@ -32,7 +32,7 @@
 //! This module depends only on `wyrd-format` and std: it is the
 //! `wyrd-core` mutation surface.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -46,6 +46,11 @@ use crate::wake::WakeSignal;
 /// (`EAGAIN` at the POSIX boundary); buffered state is memory, so the
 /// bound keeps it bounded.
 pub const MAX_PENDING_MUTATIONS: usize = 4096;
+
+/// Most distinct parent paths whose session-local create tokens are retained.
+/// Once full, new parent observations fail closed until an invalidation
+/// removes entries.
+pub const DEFAULT_MAX_PARENT_TOKENS: usize = 4096;
 
 /// The base identity a writable handle opened against, and the identity
 /// the loop compares against the current head at commit. A commit is
@@ -88,6 +93,121 @@ impl FileIdentity {
     /// The ordered chunk ids.
     pub fn chunks(&self) -> &[ContentId] {
         &self.chunks
+    }
+}
+
+/// Opaque, session-local identity of a parent directory observed by a
+/// presentation caller.
+///
+/// A token remains stable while the directory's descendants and siblings
+/// change. The live loop rotates it when the directory itself is replaced or
+/// removed, or when the eligible head set changes. A queued create carrying
+/// an older token is rejected with [`MutationError::StaleParent`]. Tokens
+/// are meaningful only within their owning mutation queue and process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParentToken(u64);
+
+// Parent state is part of the mutation precondition, so poisoning fails
+// closed here instead of recovering a possibly inconsistent token table.
+#[derive(Debug, Default)]
+struct ParentState {
+    next: u64,
+    tokens: HashMap<String, ParentToken>,
+    blocked: HashSet<String>,
+    block_all: bool,
+}
+
+#[derive(Debug)]
+struct ParentRegistry {
+    state: Mutex<ParentState>,
+    limit: usize,
+}
+
+impl Default for ParentRegistry {
+    fn default() -> Self {
+        Self::with_limit(DEFAULT_MAX_PARENT_TOKENS)
+    }
+}
+
+fn is_blocked(blocked: &HashSet<String>, path: &str) -> bool {
+    if blocked.contains(path) {
+        return true;
+    }
+    let mut ancestor = path;
+    while let Some((parent, _)) = ancestor.rsplit_once('/') {
+        ancestor = parent;
+        if blocked.contains(ancestor) {
+            return true;
+        }
+    }
+    false
+}
+
+impl ParentRegistry {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(ParentState::default()),
+            limit,
+        }
+    }
+
+    pub fn capture(&self, path: &str) -> Option<ParentToken> {
+        let mut state = self.state.lock().ok()?;
+        if state.block_all || is_blocked(&state.blocked, path) {
+            return None;
+        }
+        if let Some(token) = state.tokens.get(path) {
+            return Some(*token);
+        }
+        if state.tokens.len() >= self.limit {
+            return None;
+        }
+        let next = state.next.checked_add(1)?;
+        let token = ParentToken(next);
+        state.next = next;
+        state.tokens.insert(path.to_string(), token);
+        Some(token)
+    }
+
+    pub fn validate(&self, path: &str, token: ParentToken) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .is_some_and(|state| !state.block_all && state.tokens.get(path) == Some(&token))
+    }
+
+    pub fn invalidate_subtree(&self, path: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if path.is_empty() {
+            state.tokens.clear();
+            state.blocked.clear();
+            state.block_all = true;
+            return;
+        }
+        let prefix = format!("{path}/");
+        state
+            .tokens
+            .retain(|candidate, _| candidate != path && !candidate.starts_with(&prefix));
+        state.blocked.insert(path.to_string());
+    }
+
+    pub fn invalidate_all(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.tokens.clear();
+        state.blocked.clear();
+        state.block_all = true;
+    }
+
+    pub fn publish(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.blocked.clear();
+        state.block_all = false;
     }
 }
 
@@ -156,6 +276,10 @@ pub enum MutationError {
     /// commit performs no merge and authors no snapshot. POSIX `EIO`.
     #[error("stale handle for {0:?}: the path changed since it opened")]
     Stale(String),
+    /// A queued create observed a parent directory incarnation that is no
+    /// longer current. POSIX `ESTALE`.
+    #[error("stale parent for {0:?}: the directory changed before create")]
+    StaleParent(String),
     /// The operation exceeds a representable or budgeted size. POSIX
     /// `EFBIG`.
     #[error("resulting size {0} exceeds the supported bound")]
@@ -228,8 +352,10 @@ pub enum MutationKind {
     /// format layer's strict-parents rule).
     Mkdir { path: String },
     /// Create an empty regular file as its own snapshot (the `create`
-    /// op's namespace half). `EEXIST` when the name is taken.
-    CreateFile { path: String },
+    /// op's namespace half). The parent token is the directory incarnation
+    /// observed by the presentation caller; it is checked again by the
+    /// live loop. `EEXIST` when the name is taken.
+    CreateFile { path: String, parent: ParentToken },
     /// Commit a writable handle's full logical image onto the current
     /// head, accepted only if the path still carries `base`. `executable`
     /// is the handle's buffered exec bit for the committed entry.
@@ -276,9 +402,11 @@ impl std::fmt::Debug for MutationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MutationKind::Mkdir { path } => f.debug_struct("Mkdir").field("path", path).finish(),
-            MutationKind::CreateFile { path } => {
-                f.debug_struct("CreateFile").field("path", path).finish()
-            }
+            MutationKind::CreateFile { path, parent } => f
+                .debug_struct("CreateFile")
+                .field("path", path)
+                .field("parent", parent)
+                .finish(),
             MutationKind::CommitFile {
                 path,
                 base,
@@ -459,6 +587,7 @@ pub struct MutationQueue {
     /// deadline. Empty until the composer attaches it; the queue works
     /// without one (the loop then falls back to its staleness bound).
     waker: Mutex<Option<Arc<WakeSignal>>>,
+    parents: Arc<ParentRegistry>,
 }
 
 impl Default for MutationQueue {
@@ -472,12 +601,19 @@ impl MutationQueue {
     /// Production passes its budget at composition; tests use small
     /// bounds to exercise saturation without thousands of threads.
     pub fn with_limit(limit: usize) -> Self {
+        Self::with_limits(limit, DEFAULT_MAX_PARENT_TOKENS)
+    }
+
+    /// Construct a queue with independent mutation-admission and
+    /// parent-token retention bounds.
+    pub fn with_limits(limit: usize, parent_token_limit: usize) -> Self {
         MutationQueue {
             state: Mutex::new(QueueState::default()),
             work: Condvar::new(),
             next_id: AtomicU64::new(0),
             limit,
             waker: Mutex::new(None),
+            parents: Arc::new(ParentRegistry::with_limit(parent_token_limit)),
         }
     }
 
@@ -490,6 +626,39 @@ impl MutationQueue {
             .waker
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(waker);
+    }
+
+    /// Capture the current parent-directory incarnation for a queued
+    /// mutation. The same path returns the same token until the live loop
+    /// invalidates that path or its ancestors.
+    pub fn capture_parent(&self, path: &str) -> Option<ParentToken> {
+        self.parents.capture(path)
+    }
+
+    /// Check a captured parent token immediately before a create is
+    /// authored. A false result is reported as `StaleParent`.
+    pub fn validate_parent(&self, path: &str, token: ParentToken) -> bool {
+        self.parents.validate(path, token)
+    }
+
+    /// Rotate tokens for a path and all of its descendants after a
+    /// successful namespace replacement. New captures remain blocked until
+    /// the corresponding projection is published.
+    pub fn invalidate_parent_subtree(&self, path: &str) {
+        self.parents.invalidate_subtree(path);
+    }
+
+    /// Rotate every token when the eligible head set changes outside the
+    /// local queue. This is a fail-closed boundary for history that carries
+    /// no path-incarnation metadata.
+    pub fn invalidate_parent_tokens(&self) {
+        self.parents.invalidate_all();
+    }
+
+    /// Open captures for the newly published projection after a blocked
+    /// invalidation has been reflected in the serving view.
+    pub fn publish_parent_tokens(&self) {
+        self.parents.publish();
     }
 
     /// Poke the attached pacing signal, if any. Lock state first is
@@ -920,6 +1089,70 @@ mod tests {
         batch
     }
 
+    #[test]
+    fn parent_tokens_survive_descendants_and_rotate_after_replacement() {
+        let queue = MutationQueue::default();
+        let parent = queue.capture_parent("parent").unwrap();
+        let child = queue.capture_parent("parent/child").unwrap();
+        let sibling = queue.capture_parent("sibling").unwrap();
+
+        assert_eq!(queue.capture_parent("parent"), Some(parent));
+        assert_eq!(queue.capture_parent("parent/child"), Some(child));
+        assert_eq!(queue.capture_parent("sibling"), Some(sibling));
+
+        queue.invalidate_parent_subtree("parent");
+        assert!(!queue.validate_parent("parent", parent));
+        assert!(!queue.validate_parent("parent/child", child));
+        assert!(queue.validate_parent("sibling", sibling));
+        assert_eq!(queue.capture_parent("parent"), None);
+
+        queue.publish_parent_tokens();
+        let replacement = queue.capture_parent("parent").unwrap();
+        assert_ne!(replacement, parent);
+        assert_eq!(queue.capture_parent("sibling"), Some(sibling));
+    }
+
+    #[test]
+    fn parent_tokens_block_all_until_a_new_projection_is_published() {
+        let queue = MutationQueue::default();
+        let root = queue.capture_parent("").unwrap();
+        let child = queue.capture_parent("child").unwrap();
+
+        queue.invalidate_parent_tokens();
+        assert!(!queue.validate_parent("", root));
+        assert!(!queue.validate_parent("child", child));
+        assert_eq!(queue.capture_parent("child"), None);
+
+        queue.publish_parent_tokens();
+        assert_ne!(queue.capture_parent(""), Some(root));
+        assert_ne!(queue.capture_parent("child"), Some(child));
+    }
+
+    #[test]
+    fn parent_tokens_fail_closed_at_the_configured_bound() {
+        let queue = MutationQueue::with_limits(1, 1);
+        let first = queue.capture_parent("first").unwrap();
+        assert_eq!(queue.capture_parent("first"), Some(first));
+        assert_eq!(queue.capture_parent("second"), None);
+
+        queue.invalidate_parent_subtree("first");
+        queue.publish_parent_tokens();
+        assert!(queue.capture_parent("second").is_some());
+    }
+
+    #[test]
+    fn parent_tokens_ignore_sibling_changes() {
+        let queue = MutationQueue::default();
+        let parent = queue.capture_parent("parent").unwrap();
+        let sibling = queue.capture_parent("sibling").unwrap();
+
+        queue.invalidate_parent_subtree("sibling");
+        assert!(queue.validate_parent("parent", parent));
+        assert!(!queue.validate_parent("sibling", sibling));
+        queue.publish_parent_tokens();
+        assert_eq!(queue.capture_parent("parent"), Some(parent));
+    }
+
     /// Diagnostic rendering never carries file content: every variant
     /// formats without its plaintext bytes while keeping paths and
     /// content lengths. The queued entry (the shape logs and panic
@@ -942,6 +1175,7 @@ mod tests {
             },
             MutationKind::CreateFile {
                 path: "/vault/docs".into(),
+                parent: ParentToken(1),
             },
             MutationKind::CommitFile {
                 path: "/vault/docs".into(),

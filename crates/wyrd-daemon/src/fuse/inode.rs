@@ -228,6 +228,16 @@ impl InodeTable {
         }
     }
 
+    pub(super) fn ino_for_path(&self, path: &str) -> Option<u64> {
+        self.by_path.get(path).copied()
+    }
+
+    pub(super) fn matches(&self, ino: u64, path: &str, kind: fuser::FileType) -> bool {
+        self.by_ino
+            .get(&ino)
+            .is_some_and(|entry| entry.path == path && entry.kind == kind)
+    }
+
     /// The ino for a freshly resolved path: reuse the mapping when it
     /// still names the same kind (refreshing its validated
     /// generation), otherwise retire the stale ino and mint a new one.

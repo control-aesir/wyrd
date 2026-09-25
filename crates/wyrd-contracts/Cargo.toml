@@ -23,6 +23,7 @@ zeroize = "1.9"
 iroh.workspace = true
 tokio.workspace = true
 toml.workspace = true
+libc.workspace = true
 
 [lints]
 workspace = true

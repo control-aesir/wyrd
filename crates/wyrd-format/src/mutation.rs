@@ -7,9 +7,9 @@
 //! up, inserts the rebuilt nodes into the store, and returns the new root
 //! `ContentId`. Nothing is mutated in place; the previous root keeps
 //! resolving to the previous bytes (objects are immutable and
-//! content-addressed). Intermediate directories are created on `put` (but
-//! never on `mkdir`/`rename`, which resolve the parent strictly), and
-//! empty directories are not pruned on `remove`.
+//! content-addressed). Intermediate directories are created on `put` but
+//! never on `put_strict`, `mkdir`, or `rename`, which resolve the parent
+//! strictly. Empty directories are not pruned on `remove`.
 
 use crate::identity::ContentId;
 use crate::store::ObjectStore;
@@ -75,7 +75,25 @@ where
 {
     let components = parse_path(path)?;
     let tree = load_tree(store, &root)?;
-    put_node(store, tree, &components, entry)
+    put_node(store, tree, &components, entry, true)
+}
+
+/// Insert or replace the entry at `path` without creating intermediate
+/// directories. Every parent component must already exist and be a
+/// directory; otherwise the operation returns `NotFound` or
+/// `NotADirectory`.
+pub fn put_strict<S: ObjectStore>(
+    store: &mut S,
+    root: ContentId,
+    path: &str,
+    entry: Entry,
+) -> Result<ContentId, MutationError<S::Error>>
+where
+    S::Error: std::fmt::Debug,
+{
+    let components = parse_path(path)?;
+    let tree = load_tree(store, &root)?;
+    put_node(store, tree, &components, entry, false)
 }
 
 /// Remove the entry at `path` and return the new root `ContentId`.
@@ -256,6 +274,7 @@ fn put_node<S: ObjectStore>(
     tree: Tree,
     rest: &[Component],
     entry: Entry,
+    create_intermediates: bool,
 ) -> Result<ContentId, MutationError<S::Error>>
 where
     S::Error: std::fmt::Debug,
@@ -277,9 +296,10 @@ where
                 EntryContent::Dir { subtree } => load_tree(store, subtree)?,
                 _ => return Err(MutationError::NotADirectory(head.as_str().to_string())),
             },
-            None => Tree::empty(),
+            None if create_intermediates => Tree::empty(),
+            None => return Err(MutationError::NotFound(head.as_str().to_string())),
         };
-        let new_subtree = put_node(store, child, tail, entry)?;
+        let new_subtree = put_node(store, child, tail, entry, create_intermediates)?;
         upsert(
             &mut entries,
             Entry {
@@ -645,6 +665,16 @@ mod tests {
         let a = put(&mut store, root, "a.txt", file("a.txt", b"same")).unwrap();
         let b = put(&mut store, root, "a.txt", file("a.txt", b"same")).unwrap();
         assert_eq!(a, b, "identical content yields the same root");
+    }
+
+    #[test]
+    fn put_strict_does_not_create_intermediate_directories() {
+        let mut store = MemoryObjectStore::default();
+        let root = empty_root(&mut store);
+        assert!(matches!(
+            put_strict(&mut store, root, "a/b", file("b", b"x")),
+            Err(MutationError::NotFound(path)) if path == "a"
+        ));
     }
 
     #[test]

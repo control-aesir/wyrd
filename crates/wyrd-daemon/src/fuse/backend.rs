@@ -116,6 +116,7 @@ pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
         // available in time: distinct from EIO so callers can tell
         // "retry may succeed" from "something is wrong".
         MutationError::TimedOut => fuser::Errno::ETIMEDOUT,
+        MutationError::StaleParent(_) => fuser::Errno::ESTALE,
         MutationError::Conflicted { .. }
         | MutationError::Stale(_)
         | MutationError::Lock
@@ -388,6 +389,16 @@ where
     #[cfg(test)]
     pub(crate) fn budget_state(&self) -> (usize, usize) {
         (self.budget.total(), self.budget.dirty_handles())
+    }
+
+    fn lookup_current(&self, path: &str) -> Result<(Node, u64), fuser::Errno> {
+        let projection = self.projection()?;
+        let generation = projection.generation();
+        let node = projection
+            .view()
+            .lookup(path)
+            .map_err(|error| errno_of(&error))?;
+        Ok((node, generation))
     }
 
     /// Resolve `path` against the current projection and
@@ -936,9 +947,32 @@ where
         if unsupported_open_flags(flags) {
             return Err(fuser::Errno::EOPNOTSUPP);
         }
-        let parent_path = self.inode_path(parent_ino)?;
-        let child_path = join(&parent_path, name);
         let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
+        let parent_path = self.inode_path(parent_ino)?;
+        // Admission must not intern or re-mint the path: a retired parent
+        // inode needs to remain observable as ESTALE instead of being
+        // silently rebound before the queue sees the request.
+        let (parent, parent_generation) = self.lookup_current(&parent_path)?;
+        let (parent_kind, _, _) = attr_of(&parent);
+        let parent_is_current = {
+            let inodes = self.inodes.read().map_err(|_| fuser::Errno::EIO)?;
+            inodes.ino_for_path(&parent_path) == Some(parent_ino)
+                && inodes.matches(parent_ino, &parent_path, parent_kind)
+        };
+        if !parent_is_current {
+            return Err(fuser::Errno::ESTALE);
+        }
+        self.validate_inode(parent_ino, &parent_path, &parent, parent_generation)?;
+        match parent {
+            Node::Dir { .. } => {}
+            Node::MergedDir { subtrees } if subtrees.is_empty() => {}
+            Node::MergedDir { .. } | Node::Conflict { .. } => return Err(fuser::Errno::EIO),
+            _ => return Err(fuser::Errno::ENOTDIR),
+        }
+        let parent = mutations
+            .capture_parent(&parent_path)
+            .ok_or(fuser::Errno::ESTALE)?;
+        let child_path = join(&parent_path, name);
         // Reserve the handle slot before the namespace mutation: a
         // saturated table fails here, before the create commits a
         // snapshot the caller will never open, and the promise holds
@@ -950,6 +984,7 @@ where
         let identity = match mutations
             .submit(MutationKind::CreateFile {
                 path: child_path.clone(),
+                parent,
             })
             .map_err(|error| {
                 log_refused(&error);

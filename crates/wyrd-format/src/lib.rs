@@ -35,7 +35,9 @@ pub use identity::{
 };
 pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_LEN, ENTRY_LEN};
 pub use membership::{Change, MembershipError, MembershipTransition};
-pub use mutation::{mkdir, put, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH};
+pub use mutation::{
+    mkdir, put, put_strict, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH,
+};
 pub use snapshot::{Snapshot, SnapshotError};
 pub use store::{
     FetchStatus, MemoryObjectStore, MemoryStoreError, ObjectStore, SharedStore, SharedStoreError,

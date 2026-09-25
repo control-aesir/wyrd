@@ -39,11 +39,12 @@
 //!   [`ViewError::Corrupt`] triggers scrub/repair before surfacing.
 //! - Symlink targets are untrusted member-authored bytes. The view
 //!   never follows a symlink (an intermediate symlink is
-//!   [`ViewError::NotADirectory`); only the kernel follows, via
+//!   [`ViewError::NotADirectory`]); only the kernel follows, via
 //!   `readlink` — so the backend serves a target only when
-//!   [`confine_symlink_target`] proves it cannot escape the mount:
-//!   absolute targets and `..` walks above the drive root fail closed.
-//!   There is no trusted-drive opt-out in v0.
+//!   [`confine_symlink_target`] resolves observed intermediate links and
+//!   proves the complete path cannot escape the mount. Absolute targets,
+//!   root escapes, conflicts, cycles, and unavailable intermediates fail
+//!   closed. There is no trusted-drive opt-out in v0.
 
 mod drive;
 mod grammar;

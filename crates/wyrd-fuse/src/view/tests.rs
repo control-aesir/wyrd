@@ -600,15 +600,14 @@ fn missing_and_invalid_paths() {
 
 #[test]
 fn symlink_confinement_rejects_absolute_and_escaping_targets() {
-    // Absolute targets resolve in the host namespace: always refused.
+    let view = view(small_drive());
     for target in ["/etc/passwd", "/", "/sub/file"] {
         assert_eq!(
-            confine_symlink_target("link", target),
+            confine_symlink_target(&view, "link", target),
             Err(ConfinementError::Absolute),
             "{target:?} must be refused"
         );
     }
-    // A `..` that pops above the drive root escapes, at any depth.
     for (link, target) in [
         ("link", "../target"),
         ("link", ".."),
@@ -617,7 +616,7 @@ fn symlink_confinement_rejects_absolute_and_escaping_targets() {
         ("a/b/link", "../../../evil"),
     ] {
         assert_eq!(
-            confine_symlink_target(link, target),
+            confine_symlink_target(&view, link, target),
             Err(ConfinementError::EscapesRoot),
             "{link:?} -> {target:?} must be refused"
         );
@@ -626,7 +625,7 @@ fn symlink_confinement_rejects_absolute_and_escaping_targets() {
 
 #[test]
 fn symlink_confinement_keeps_in_drive_targets() {
-    // The kernel resolves these inside the mount, so they serve verbatim.
+    let view = view(small_drive());
     for (link, target) in [
         ("link", "hello.txt"),
         ("link", "sub/file"),
@@ -635,18 +634,54 @@ fn symlink_confinement_keeps_in_drive_targets() {
         ("link", "a//b"),
         ("link", "sub/"),
         ("link", ""),
-        // `..` up to the root (but not above) stays inside.
         ("link", "sub/../file"),
         ("sub/link", "../sibling"),
         ("sub/link", "../sub2/file"),
         ("a/b/link", "../../x"),
     ] {
         assert_eq!(
-            confine_symlink_target(link, target),
+            confine_symlink_target(&view, link, target),
             Ok(()),
             "{link:?} -> {target:?} must be served"
         );
     }
+}
+
+#[test]
+fn symlink_confinement_resolves_nested_links_and_rejects_cycles() {
+    let mut store = MemoryObjectStore::default();
+    let leaf = tree_of(
+        &mut store,
+        vec![
+            Entry::symlink("s", "..").unwrap(),
+            Entry::symlink("safe", "s/file").unwrap(),
+        ],
+    );
+    let root = tree_of(&mut store, vec![Entry::dir("a", leaf).unwrap()]);
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(root)]),
+    );
+    assert_eq!(confine_symlink_target(&view, "a/safe", "s/file"), Ok(()));
+
+    let mut store = MemoryObjectStore::default();
+    let root = tree_of(
+        &mut store,
+        vec![
+            Entry::symlink("a", "b").unwrap(),
+            Entry::symlink("b", "a").unwrap(),
+        ],
+    );
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(root)]),
+    );
+    assert_eq!(
+        confine_symlink_target(&view, "a", "b"),
+        Err(ConfinementError::Unresolvable)
+    );
 }
 
 #[test]

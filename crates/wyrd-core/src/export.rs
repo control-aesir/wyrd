@@ -30,9 +30,10 @@
 //!
 //! Symlinks pass the same confinement policy as the mount
 //! ([`confine_symlink_target`](crate::view::confine_symlink_target)):
-//! absolute and root-escaping targets are refused, because the plain
-//! copy must stay self-contained. Multi-head conflicts materialize as
-//! `name@N` siblings, numbered in SnapshotId byte order exactly like
+//! absolute, root-escaping, and compositionally escaping targets are
+//! refused, because the plain copy must stay self-contained. Multi-head
+//! conflicts materialize as `name@N` siblings, numbered in SnapshotId byte
+//! order exactly like
 //! the version-selection grammar, so `doc@1` on disk is `doc@1` in
 //! the mount. Export never picks a winner silently; a stored name
 //! colliding with a versioned sibling fails closed as
@@ -80,7 +81,7 @@ pub enum ExportError {
     },
     #[error("export name collision at {0}: a stored name meets a versioned sibling")]
     NameCollision(PathBuf),
-    #[error("symlink at {path} escapes the drive and is refused: {source}")]
+    #[error("symlink at {path} cannot be proven confined and is refused: {source}")]
     Symlink {
         path: String,
         source: ConfinementError,
@@ -557,9 +558,8 @@ fn export_node<V: NamespaceView>(
         }
         Node::Symlink { target } => {
             // The plain copy must stay self-contained: the same
-            // targets the mount refuses (absolute, root-escaping)
-            // never land on disk either.
-            confine_symlink_target(vpath, target).map_err(|source| ExportError::Symlink {
+            // targets the mount refuses never land on disk either.
+            confine_symlink_target(view, vpath, target).map_err(|source| ExportError::Symlink {
                 path: vpath.to_owned(),
                 source,
             })?;
@@ -1421,6 +1421,35 @@ mod tests {
             FakeNode::Symlink("../../evil".to_owned()),
         )]);
         view.set_root(vec![("sub".to_owned(), esc)]);
+
+        let error = export_tree(&view, &dest.join("out")).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExportError::Symlink {
+                    source: ConfinementError::EscapesRoot,
+                    ..
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_no_staging(&dest.join("out"));
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn refuses_chained_symlink_escape() {
+        let mut view = FakeView::default();
+        let b = view.dir(vec![
+            ("s".to_owned(), FakeNode::Symlink("../..".to_owned())),
+            (
+                "link".to_owned(),
+                FakeNode::Symlink("s/../../outside".to_owned()),
+            ),
+        ]);
+        let a = view.dir(vec![("b".to_owned(), b)]);
+        view.set_root(vec![("a".to_owned(), a)]);
+        let dest = tmp();
 
         let error = export_tree(&view, &dest.join("out")).unwrap_err();
         assert!(

@@ -2312,7 +2312,7 @@ where
             // an escaping target must never reach it: fail closed with
             // EACCES (sandbox convention) rather than serving bytes the
             // kernel would resolve outside the mount.
-            match wyrd_fuse::confine_symlink_target(path, &target) {
+            match wyrd_fuse::confine_symlink_target(view, path, &target) {
                 Ok(()) => Ok(target),
                 Err(_) => Err(fuser::Errno::EACCES),
             }

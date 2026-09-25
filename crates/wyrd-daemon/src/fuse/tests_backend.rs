@@ -183,6 +183,29 @@ fn symlink_targets_are_confined_to_the_mount() {
 }
 
 #[test]
+fn chained_symlink_escape_is_refused() {
+    let mut store = MemoryObjectStore::default();
+    let leaf = Tree::from_entries(vec![
+        Entry::symlink("s", "../..").unwrap(),
+        Entry::symlink("link", "s/../../outside").unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let a = Tree::from_entries(vec![Entry::dir("b", leaf).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let root = Tree::from_entries(vec![Entry::dir("a", a).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+
+    assert_eq!(symlink_target(&view, "a/b/link"), Err(fuser::Errno::EACCES));
+}
+
+#[test]
 fn reads_serve_the_opened_version_across_head_advancement() {
     let (backend, next) = evolving_backend(b"first", b"second");
     let handle = backend.open_at("f.txt").unwrap();

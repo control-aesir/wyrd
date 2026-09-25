@@ -16,6 +16,7 @@
 //! the view consults for absent content. [`NamespaceView`] (below, next
 //! commit) is the read surface the node loop programs against.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use wyrd_format::{ContentId, FetchStatus, ObjectStore, Snapshot, StoreFailure};
@@ -286,39 +287,92 @@ pub enum ConfinementError {
     Absolute,
     #[error("symlink target escapes the drive root")]
     EscapesRoot,
+    #[error("symlink target cannot be proven confined")]
+    Unresolvable,
 }
+
+const MAX_SYMLINK_HOPS: usize = 40;
 
 /// Confine a symlink target to the drive namespace: the v0 policy for
 /// untrusted member-authored targets. `link_path` is the symlink's own
 /// drive path (`""`-joined components); `target` is the stored target
-/// bytes.
+/// bytes. The view is consulted for every resolved component so nested
+/// symlinks are followed before the root boundary is checked.
 ///
 /// Absolute targets are refused outright. Relative targets resolve
-/// lexically against the link's parent directory — `.` and empty
-/// segments are skipped, `..` pops — and a `..` that pops above the
-/// drive root is refused. Anything else passes unchanged: a confined
-/// backend resolves it inside the drive, so materializing it verbatim
-/// is safe.
+/// against the link's parent directory; `.` and empty segments are
+/// skipped, `..` pops, and a `..` that pops above the drive root is
+/// refused. A conflicting, cyclic, or unavailable intermediate node
+/// cannot be proven safe and is refused.
 ///
 /// There is no trusted-drive opt-out in v0: confinement is always on.
-pub fn confine_symlink_target(link_path: &str, target: &str) -> Result<(), ConfinementError> {
+pub fn confine_symlink_target<V: NamespaceView>(
+    view: &V,
+    link_path: &str,
+    target: &str,
+) -> Result<(), ConfinementError> {
     if target.starts_with('/') {
         return Err(ConfinementError::Absolute);
     }
-    // The parent directory's depth: every component but the link's own
-    // name. Callers pass drive paths the view itself resolved, so a
-    // defensive split suffices.
-    let mut depth = link_path
+
+    let mut resolved = link_path
         .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-        .saturating_sub(1);
-    for segment in target.split('/') {
-        match segment {
+        .filter(|component| !component.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    resolved.pop();
+    let mut pending = target
+        .split('/')
+        .map(str::to_owned)
+        .collect::<VecDeque<_>>();
+    let mut followed = HashSet::new();
+    let mut hops = 0;
+
+    resolve_symlink_components(view, &mut resolved, &mut pending, &mut followed, &mut hops)
+}
+
+fn resolve_symlink_components<V: NamespaceView>(
+    view: &V,
+    resolved: &mut Vec<String>,
+    pending: &mut VecDeque<String>,
+    followed: &mut HashSet<Vec<String>>,
+    hops: &mut usize,
+) -> Result<(), ConfinementError> {
+    while let Some(component) = pending.pop_front() {
+        match component.as_str() {
             "" | "." => {}
-            ".." => depth = depth.checked_sub(1).ok_or(ConfinementError::EscapesRoot)?,
-            _ => depth += 1,
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(ConfinementError::EscapesRoot);
+                }
+            }
+            _ => {
+                resolved.push(component);
+                match view.lookup(&resolved.join("/")) {
+                    Ok(Node::Symlink { target: next }) => {
+                        *hops += 1;
+                        let symlink_path = resolved.clone();
+                        if *hops > MAX_SYMLINK_HOPS || !followed.insert(symlink_path.clone()) {
+                            return Err(ConfinementError::Unresolvable);
+                        }
+                        resolved.pop();
+                        if next.starts_with('/') {
+                            return Err(ConfinementError::Absolute);
+                        }
+                        for next_component in next.split('/').rev() {
+                            pending.push_front(next_component.to_owned());
+                        }
+                        resolve_symlink_components(view, resolved, pending, followed, hops)?;
+                        followed.remove(&symlink_path);
+                    }
+                    Ok(Node::Conflict { .. }) => return Err(ConfinementError::Unresolvable),
+                    Ok(_) => {}
+                    Err(ViewError::NotFound | ViewError::NotADirectory | ViewError::NotAFile) => {}
+                    Err(_) => return Err(ConfinementError::Unresolvable),
+                }
+            }
         }
     }
+
     Ok(())
 }

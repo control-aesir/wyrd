@@ -689,7 +689,25 @@ where
         // coalesces onto an unadmitted fetch. The per-pass cap paces
         // a demand flood: leftover pending demand is not dropped, it
         // waits for the next pass.
+        //
+        // Retries of an already-`Cached` identity admit without a
+        // commit: one durable snapshot per pass filters them, so a
+        // retry storm costs a single replay instead of a rebuild plus
+        // an fsync per want. The engine's own commit-time guard stays
+        // the authority for direct `want()` callers; returning `Ok`
+        // here still marks the identity admitted, and the fetch plan
+        // picks it up from the durable `Cached` policy.
+        let admitted = if self.wants.peek_pending().is_empty() {
+            None
+        } else {
+            Some(self.engine.runtime_state()?)
+        };
         admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
+            if admitted.as_ref().map(|state| state.materialization(&want))
+                == Some(MaterializationState::Cached)
+            {
+                return Ok(());
+            }
             self.engine
                 .set_materialization(want, MaterializationState::Cached)
         })?;

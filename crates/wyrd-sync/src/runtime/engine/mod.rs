@@ -1201,11 +1201,26 @@ impl Engine {
     /// Set the residency policy for one content object, durably. The
     /// next [`Engine::execute_plan`] run fetches everything not
     /// `RemoteOnly` that is not yet local.
+    ///
+    /// Idempotent at commit time: when the durable state already
+    /// equals `state`, no fact is appended — a timed-out want whose
+    /// retry re-registers the same identity must not grow the
+    /// append-only log (or burn an fsync) per retry. A genuine
+    /// transition still commits exactly once.
     pub fn set_materialization(
         &mut self,
         content: ContentId,
         state: MaterializationState,
     ) -> Result<(), EngineError> {
+        if self
+            .store
+            .rebuild(self.device)?
+            .runtime
+            .materialization(&content)
+            == state
+        {
+            return Ok(());
+        }
         self.store
             .commit(&[Fact::Materialization(content, state)])?;
         Ok(())
@@ -1338,7 +1353,8 @@ impl Engine {
 
 // Engine behavior tests live beside the engine, one file per theme:
 // the shared two-device scenario harness plus convergence,
-// authoring, drain/resume, serving, lifecycle, and outbox delivery.
+// authoring, drain/resume, serving, lifecycle, materialization,
+// and outbox delivery.
 #[cfg(test)]
 mod tests_authoring;
 #[cfg(test)]
@@ -1351,5 +1367,7 @@ mod tests_drain;
 mod tests_harness;
 #[cfg(test)]
 mod tests_lifecycle;
+#[cfg(test)]
+mod tests_materialization;
 #[cfg(test)]
 mod tests_serving;

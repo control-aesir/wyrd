@@ -251,17 +251,34 @@ pub trait ServingBarrier: Send + Sync {
     /// `Err` when the mirror failed or is gone. Callers gate
     /// announcement discharge on `true`.
     fn flush(&self, budget: Duration) -> Result<bool, std::io::Error>;
+
+    /// Live mirror-queue depth, if the barrier fronts a queue that
+    /// reports one. Defaults to `None` (test doubles, mirror-less
+    /// compositions); the live pass logs whatever it gets whenever
+    /// discharge waits, so a mirror slower than authoring is visible
+    /// in the pass logs instead of only in the queue's own counters.
+    fn queue_stats(&self) -> Option<wyrd_sync::serving::MirrorStats> {
+        None
+    }
 }
 
 impl ServingBarrier for wyrd_sync::serving::ServingEndpoint {
     fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
         wyrd_sync::serving::ServingEndpoint::flush_bounded(self, budget)
     }
+
+    fn queue_stats(&self) -> Option<wyrd_sync::serving::MirrorStats> {
+        Some(wyrd_sync::serving::ServingEndpoint::stats(self))
+    }
 }
 
 impl ServingBarrier for wyrd_sync::serving::ServingHandle {
     fn flush(&self, budget: Duration) -> Result<bool, std::io::Error> {
         wyrd_sync::serving::ServingHandle::flush_bounded(self, budget)
+    }
+
+    fn queue_stats(&self) -> Option<wyrd_sync::serving::MirrorStats> {
+        Some(wyrd_sync::serving::ServingHandle::stats(self))
     }
 }
 
@@ -623,8 +640,13 @@ where
         match barrier.flush(budget) {
             Ok(true) => Ok(true),
             Ok(false) => {
+                // The queue stats travel with the not-ready report: a
+                // mirror slower than authoring shows up here as depth
+                // against the bounds plus the rejection count, in the
+                // pass logs the guest already collects.
                 tracing::debug!(
                     budget_ms = budget.as_millis(),
+                    queue = ?barrier.queue_stats(),
                     "announcement discharge waits for serving readiness"
                 );
                 Ok(false)
@@ -632,6 +654,7 @@ where
             Err(error) => {
                 tracing::debug!(
                     error = %error,
+                    queue = ?barrier.queue_stats(),
                     "announcement discharge waits for serving readiness"
                 );
                 Ok(false)

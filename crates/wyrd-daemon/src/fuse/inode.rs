@@ -97,11 +97,17 @@ pub(super) struct DirectoryState {
     pub(super) next_handle: u64,
 }
 
+#[derive(Clone)]
+pub(super) struct ReadHandle {
+    pub(super) capture: OpenFile,
+    pub(super) executable: bool,
+}
+
 /// Open file handles: the immutable read capture, or the buffered
 /// writable session. A read descriptor serves the object that was
 /// opened; a writable handle adds one mutable logical image on top.
 pub(super) enum Handle {
-    Read(OpenFile),
+    Read(ReadHandle),
     Write(Arc<Mutex<WriteHandle>>),
 }
 

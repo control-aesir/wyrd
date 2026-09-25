@@ -53,6 +53,88 @@ fn file_write_session_commits_and_reopens() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn getattr_uses_open_handles_after_unlink() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (created, ino, _) = backend.create_at(1, "removed.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(created, 0, b"hello").unwrap();
+    backend.commit_handle(created).unwrap();
+    backend.release_handle(created).unwrap();
+    backend.set_exec_at(ino, true).unwrap();
+    let reader = backend.open_at("removed.txt").unwrap();
+    let writer = backend.open_write("removed.txt", libc::O_RDWR).unwrap();
+
+    backend.unlink_at(1, "removed.txt").unwrap();
+    assert_eq!(backend.getattr_at(ino, None), Err(fuser::Errno::ENOENT));
+    for handle in [reader, writer] {
+        let attr = backend.getattr_at(ino, Some(handle)).unwrap();
+        assert_eq!(attr.ino.0, ino);
+        assert_eq!(attr.size, 5);
+        assert_eq!(attr.kind, fuser::FileType::RegularFile);
+        assert_eq!(attr.perm, 0o755);
+    }
+    backend.release_handle(reader).unwrap();
+    backend.release_handle(writer).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn getattr_uses_writable_handle_after_rename() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let (stop, loop_handle) = spawn_live_loop(live);
+
+    let (source_handle, source_ino, _) = backend.create_at(1, "source.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(source_handle, 0, b"source").unwrap();
+    backend.commit_handle(source_handle).unwrap();
+    backend.release_handle(source_handle).unwrap();
+    backend.set_exec_at(source_ino, true).unwrap();
+
+    let (destination_handle, _, _) = backend.create_at(1, "target.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(destination_handle, 0, b"destination")
+        .unwrap();
+    backend.commit_handle(destination_handle).unwrap();
+    backend.release_handle(destination_handle).unwrap();
+
+    let writer = backend.open_write("source.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(writer, 0, b"changed!").unwrap();
+    backend
+        .rename_at(1, "source.txt", 1, "target.txt", false)
+        .unwrap();
+    backend.set_size_at(source_ino, 4).unwrap();
+
+    let attr = backend.getattr_at(source_ino, Some(writer)).unwrap();
+    assert_eq!(attr.ino.0, source_ino);
+    assert_eq!(attr.size, 8);
+    assert_eq!(attr.kind, fuser::FileType::RegularFile);
+    assert_eq!(attr.perm, 0o755);
+    assert_eq!(backend.attr_at("target.txt").unwrap().size, 4);
+    backend.release_handle(writer).unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Crash boundary: buffered-but-uncommitted handle bytes are
 /// volatile. The handle is written and never committed, then the
 /// daemon is dropped without ceremony — reopening from custody must

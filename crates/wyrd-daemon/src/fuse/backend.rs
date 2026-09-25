@@ -10,7 +10,7 @@ use wyrd_fuse::{DriveView, Materialization, Node, OpenFile, ViewError};
 
 use super::inode::{
     statfs_capacity, DirectoryEntries, DirectoryState, Handle, InodeError, InodeTable, OpenDir,
-    OpenFiles, WriteHandle, MOUNT_TIME, TTL,
+    OpenFiles, ReadHandle, WriteHandle, MOUNT_TIME, TTL,
 };
 use wyrd_core::budgets::{ResourceBudgets, DEFAULT_MAX_OPEN_HANDLES};
 use wyrd_core::mutation::{
@@ -513,23 +513,28 @@ where
     /// blocks bounded (the same deadline for the whole chain), then
     /// retries. A deadline expiry is `EIO`, never a partial file.
     pub fn open_at(&self, path: &str) -> Result<FileHandle, fuser::Errno> {
-        let attempt = |this: &Self| {
-            Result::<_, (ViewError, fuser::Errno)>::Ok({
-                let projection = this.projection().map_err(|error| {
-                    (
-                        ViewError::Store(StoreFailure::Transient, "projection lock".into()),
-                        error,
-                    )
-                })?;
-                let view = projection.view();
-                let node = view
-                    .lookup(path)
-                    .map_err(|error| (error.clone(), errno_of(&error)))?;
-                view.open(&node)
-                    .map_err(|error| (error.clone(), errno_of(&error)))?
-            })
+        let attempt = |this: &Self| -> Result<(OpenFile, bool), (ViewError, fuser::Errno)> {
+            let projection = this.projection().map_err(|error| {
+                (
+                    ViewError::Store(StoreFailure::Transient, "projection lock".into()),
+                    error,
+                )
+            })?;
+            let view = projection.view();
+            let node = view
+                .lookup(path)
+                .map_err(|error| (error.clone(), errno_of(&error)))?;
+            let file = view
+                .open(&node)
+                .map_err(|error| (error.clone(), errno_of(&error)))?;
+            let executable = match &node {
+                Node::File { executable, .. } => *executable,
+                _ => false,
+            };
+            Ok((file, executable))
         };
-        let file = self.with_demand(|| attempt(self), |attempted| attempted.map_err(|e| e.1))?;
+        let (file, executable) =
+            self.with_demand(|| attempt(self), |attempted| attempted.map_err(|e| e.1))?;
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
@@ -540,7 +545,13 @@ where
         }
         let handle = files.next;
         files.next = handle.checked_add(1).ok_or(fuser::Errno::EOVERFLOW)?;
-        files.by_handle.insert(handle, Handle::Read(file));
+        files.by_handle.insert(
+            handle,
+            Handle::Read(ReadHandle {
+                capture: file,
+                executable,
+            }),
+        );
         Ok(FileHandle(handle))
     }
 
@@ -607,7 +618,7 @@ where
     fn handle_of(&self, fh: FileHandle) -> Result<Handle, fuser::Errno> {
         let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
         match files.by_handle.get(&fh.0) {
-            Some(Handle::Read(file)) => Ok(Handle::Read(file.clone())),
+            Some(Handle::Read(handle)) => Ok(Handle::Read(handle.clone())),
             Some(Handle::Write(handle)) => Ok(Handle::Write(Arc::clone(handle))),
             None => Err(fuser::Errno::EBADF),
         }
@@ -708,7 +719,7 @@ where
         size: u32,
     ) -> Result<Vec<u8>, fuser::Errno> {
         match self.handle_of(fh)? {
-            Handle::Read(file) => self.read_via_capture(&file, offset, size),
+            Handle::Read(handle) => self.read_via_capture(&handle.capture, offset, size),
             Handle::Write(handle) => {
                 let (image, capture, failed, append, base_size) = {
                     let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
@@ -1279,6 +1290,16 @@ where
 
     pub(super) fn attr(&self, ino: u64, node: &Node) -> fuser::FileAttr {
         let (kind, size, executable) = attr_of(node);
+        self.attr_parts(ino, kind, size, executable)
+    }
+
+    fn attr_parts(
+        &self,
+        ino: u64,
+        kind: fuser::FileType,
+        size: u64,
+        executable: bool,
+    ) -> fuser::FileAttr {
         fuser::FileAttr {
             ino: fuser::INodeNo(ino),
             size,
@@ -1304,6 +1325,36 @@ where
             rdev: 0,
             blksize: 4096,
             flags: 0,
+        }
+    }
+
+    fn attr_for_handle(&self, ino: u64, fh: FileHandle) -> Result<fuser::FileAttr, fuser::Errno> {
+        let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
+        match files.by_handle.get(&fh.0) {
+            Some(Handle::Read(handle)) => Ok(self.attr_parts(
+                ino,
+                fuser::FileType::RegularFile,
+                handle.capture.size(),
+                handle.executable,
+            )),
+            Some(Handle::Write(handle)) => {
+                let handle = Arc::clone(handle);
+                drop(files);
+                let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+                if write.failed {
+                    return Err(fuser::Errno::EIO);
+                }
+                let image_size = write.image.as_ref().map_or(0, |image| image.len() as u64);
+                let size = if write.append {
+                    write.base.size().saturating_add(image_size)
+                } else if write.image.is_some() {
+                    image_size
+                } else {
+                    write.base.size()
+                };
+                Ok(self.attr_parts(ino, fuser::FileType::RegularFile, size, write.executable))
+            }
+            None => Err(fuser::Errno::EBADF),
         }
     }
 
@@ -1637,6 +1688,29 @@ where
         Ok(self.attr(ino, &node))
     }
 
+    pub fn getattr_at(
+        &self,
+        ino: u64,
+        fh: Option<FileHandle>,
+    ) -> Result<fuser::FileAttr, fuser::Errno> {
+        if let Some(fh) = fh {
+            return self.attr_for_handle(ino, fh);
+        }
+        let path = self.inode_path(ino)?;
+        let projection = self.projection()?;
+        match projection.view().lookup(&path) {
+            Ok(node) => {
+                self.validate_inode(ino, &path, &node, projection.generation())?;
+                Ok(self.attr(ino, &node))
+            }
+            Err(ViewError::NotFound) => {
+                self.retire_inode(ino);
+                Err(fuser::Errno::ENOENT)
+            }
+            Err(error) => Err(errno_of(&error)),
+        }
+    }
+
     /// Toggle a writable handle's exec bit (buffered, committed with the
     /// next boundary like content). The handle must name `path`.
     fn set_exec_handle(
@@ -1796,40 +1870,13 @@ where
         &self,
         _req: &fuser::Request,
         ino: INodeNo,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
         let _log = RequestLog::new("getattr");
-        let path = match self.inode_path(ino.0) {
-            Ok(path) => path,
-            Err(error) => {
-                reply.error(_log.fail(error));
-                return;
-            }
-        };
-        let Ok(projection) = self.projection() else {
-            reply.error(_log.fail(fuser::Errno::EIO));
-            return;
-        };
-        match projection.view().lookup(&path) {
-            Ok(node) => {
-                if let Err(error) =
-                    self.validate_inode(ino.0, &path, &node, projection.generation())
-                {
-                    reply.error(_log.fail(error));
-                    return;
-                }
-                let attr = self.attr(ino.0, &node);
-                reply.attr(&TTL, &attr);
-            }
-            Err(ViewError::NotFound) => {
-                // The path is gone: retire the mapping so a later
-                // recreation mints a fresh ino instead of reattaching
-                // the retired one to new content.
-                self.retire_inode(ino.0);
-                reply.error(_log.fail(fuser::Errno::ENOENT));
-            }
-            Err(error) => reply.error(_log.fail(errno_of(&error))),
+        match self.getattr_at(ino.0, fh) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(error) => reply.error(_log.fail(error)),
         }
     }
 

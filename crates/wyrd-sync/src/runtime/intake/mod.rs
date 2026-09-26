@@ -395,6 +395,23 @@ fn message_action(
                     }
                     match engine.log.status(&announcement.membership) {
                         Some(TransitionStatus::Canonical) => {
+                            // Authorship role: readers hold epoch secrets and
+                            // materialize, but author nothing (epochs.md). A
+                            // reader-signed announcement is structurally valid
+                            // yet unauthorized at the bound transition — the
+                            // body classifier would reject it later, so admit
+                            // no announcement fact, queue no fetch, and keep
+                            // the verdict memory-only and bounded like other
+                            // poison. Strangers still commit for the body
+                            // phase to judge; only the known-voiceless role
+                            // suppresses here.
+                            if engine
+                                .log
+                                .readers_of(&announcement.membership)
+                                .is_some_and(|readers| readers.contains(&announcement.author))
+                            {
+                                return Ok(Action::Suppress);
+                            }
                             // The compatibility gate: an announcement becomes a
                             // durable fact only when it is compatible with the
                             // announcement already known for the snapshot — the

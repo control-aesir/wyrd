@@ -4,11 +4,11 @@ use super::*;
 use wyrd_format::Change;
 use zeroize::Zeroizing;
 
-use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
+use crate::membership::test_util::{admit_reader, drive as member_drive, key, sign, Builder};
 use crate::membership::ForceUnclassifiedGuard;
 use crate::runtime::test_util::{
-    announcement_for, control_key, deliver, drain, fixture, owner, queue, transition_message,
-    MemoryMailbox,
+    announcement_for, announcement_msg, control_key, deliver, drain, fixture, identity_secret,
+    owner, queue, transition_message, MemoryMailbox,
 };
 #[test]
 fn announcement_defers_until_membership_lands() {
@@ -323,4 +323,89 @@ fn announcement_bound_to_invalid_transition_suppresses() {
     assert_eq!(report.deferred, 0);
     let facts = fixture.engine.store.load().expect("loads");
     assert!(facts.announcements.is_empty());
+}
+
+/// Readers are voiceless: a reader-signed announcement suppresses
+/// memory-only with no announcement fact, no fetchable announcement,
+/// and no durable message record, while a member-signed announcement
+/// for the same transition still commits.
+#[test]
+fn reader_authored_announcement_suppresses_without_fact_or_record() {
+    let mut fixture = fixture();
+    let (mut builder, genesis) = Builder::genesis(10);
+    let (reader_sk, reader_id) = key(21);
+    let admission = builder.child(vec![admit_reader(reader_id)]);
+    let admission_id = admission.transition_id();
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+    let seen_after_transitions = fixture.engine.store.load().expect("loads").seen.len();
+
+    // Reader-signed: structurally valid, epoch-matched, canonical —
+    // only the role gate fires.
+    let reader_snapshot = wyrd_format::SnapshotId::from_bytes([0x31; 32]);
+    let reader_bound = announcement_msg(
+        &identity_secret(&reader_sk),
+        reader_snapshot,
+        admission.epoch,
+        admission_id,
+    );
+    let mail = vec![deliver(&fixture, admission.epoch, &reader_bound)];
+    queue(&mut fixture, mail.clone());
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "suppression acks without a fact");
+    assert_eq!(fixture.engine.pending_count(), 0, "nothing parks for retry");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert!(
+        facts.announcements.is_empty(),
+        "no announcement fact for reader authorship"
+    );
+    assert_eq!(
+        facts.seen.len(),
+        seen_after_transitions,
+        "no durable message record for the suppressed announcement"
+    );
+    assert!(
+        fixture
+            .engine
+            .store
+            .rebuild(fixture.recipient)
+            .expect("rebuilds")
+            .runtime
+            .announcement(&reader_snapshot)
+            .is_none(),
+        "nothing fetchable follows a suppressed announcement"
+    );
+    // Bounded poison: redelivery short-circuits as a duplicate.
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).duplicates, 1);
+
+    // Member-signed: the same transition still commits.
+    let member_snapshot = wyrd_format::SnapshotId::from_bytes([0x32; 32]);
+    let member_bound = announcement_msg(
+        &identity_secret(&builder.sk),
+        member_snapshot,
+        admission.epoch,
+        admission_id,
+    );
+    let mail = vec![deliver(&fixture, admission.epoch, &member_bound)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1);
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.announcements.len(), 1, "member authorship commits");
+    assert!(
+        fixture
+            .engine
+            .store
+            .rebuild(fixture.recipient)
+            .expect("rebuilds")
+            .runtime
+            .announcement(&member_snapshot)
+            .is_some(),
+        "member announcement is fetchable"
+    );
 }

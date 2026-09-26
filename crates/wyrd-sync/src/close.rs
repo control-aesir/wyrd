@@ -1,24 +1,23 @@
-//! Shared teardown primitive: bound an iroh endpoint's graceful close
-//! by a deadline. The close drains in-flight transfers, and a stalled
-//! peer must turn into a reported `TimedOut` instead of an unbounded
-//! wait. One home for both transport shutdowns (bulk source, serving
-//! endpoint) so the bound cannot drift between them.
+//! Shared teardown primitive: bound a graceful transport stop by a
+//! deadline. A stalled peer must turn into a reported `TimedOut`
+//! instead of an unbounded wait. One home for both transport
+//! shutdowns (bulk source, serving endpoint) so the bound cannot
+//! drift between them.
 
-/// Bound `close` by `deadline`: a close that has not resolved in time
-/// reports [`std::io::ErrorKind::TimedOut`]. Factored out so the bound
-/// itself is unit-pinned (with a never-ready close) rather than
-/// trusted by inspection at each call site.
-pub(crate) async fn close_with_deadline(
-    close: impl std::future::Future<Output = ()>,
+/// Bound `stop` by `deadline`, reporting `message` on timeout.
+/// Factored out so the bound itself is unit-pinned (with a
+/// never-ready future) rather than trusted by inspection at each
+/// call site. Generic over the stop's output so multi-stage stops
+/// (router shutdown plus endpoint close) share the same bound as a
+/// bare close.
+pub(crate) async fn with_deadline<T>(
+    stop: impl std::future::Future<Output = T>,
     deadline: std::time::Duration,
-) -> std::io::Result<()> {
-    tokio::time::timeout(deadline, close).await.map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "endpoint close timed out with transfers in flight",
-        )
-    })?;
-    Ok(())
+    message: &str,
+) -> std::io::Result<T> {
+    tokio::time::timeout(deadline, stop)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, message.to_string()))
 }
 
 #[cfg(test)]
@@ -31,22 +30,24 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        // A close that never resolves trips the deadline instead of
-        // waiting forever: this pins the bound itself, not iroh's
-        // close behavior (which stays covered by the idle test in
-        // `bulk.rs` and the Lima suite).
-        let stalled = runtime.block_on(close_with_deadline(
+        // A stop that never resolves trips the deadline instead of
+        // waiting forever: this pins the bound itself, not any one
+        // transport's close behavior (those stay covered by the
+        // entry-point tests and the Lima suite).
+        let stalled = runtime.block_on(with_deadline(
             std::future::pending::<()>(),
             std::time::Duration::from_millis(10),
+            "stalled",
         ));
         assert!(
             matches!(stalled, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
-            "a stalled close must report TimedOut"
+            "a stalled stop must report TimedOut"
         );
-        let clean = runtime.block_on(close_with_deadline(
+        let clean = runtime.block_on(with_deadline(
             async {},
             std::time::Duration::from_secs(10),
+            "stalled",
         ));
-        assert!(clean.is_ok(), "a ready close reports clean");
+        assert!(clean.is_ok(), "a ready stop reports clean");
     }
 }

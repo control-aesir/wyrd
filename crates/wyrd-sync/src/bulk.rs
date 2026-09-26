@@ -315,12 +315,15 @@ impl IrohBulkSource {
     /// Close the owned endpoint, waiting at most `deadline` for
     /// in-flight transfers to finish: teardown joins must stay bounded
     /// even when a peer stalls mid-transfer. A timeout abandons the
-    /// graceful close and reports it — the caller still drops the
-    /// source, so no transfer outlives the shutdown either way.
+    /// graceful close and reports it — the endpoint is then aborted
+    /// (iroh logs it), so the peer sees a hard connection failure
+    /// rather than a clean close. The caller still drops the source,
+    /// so no transfer outlives the shutdown either way.
     pub fn shutdown(&self, deadline: std::time::Duration) -> std::io::Result<()> {
-        self.runtime.block_on(super::close::close_with_deadline(
+        self.runtime.block_on(super::close::with_deadline(
             self.endpoint.close(),
             deadline,
+            "endpoint close timed out with transfers in flight",
         ))
     }
 

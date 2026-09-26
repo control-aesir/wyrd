@@ -835,39 +835,43 @@ impl ServingEndpoint {
     /// endpoint close internally, so bounding only the trailing close
     /// would leave the wait unbounded behind a stage that pre-closes.
     /// A timeout abandons the graceful stop and reports it — the
-    /// sender drop and runtime join below still run, so no worker
-    /// outlives the shutdown either way.
+    /// endpoint is then aborted (iroh logs it), so peers see a hard
+    /// connection failure rather than a clean close. The sender drop
+    /// and runtime join below still run, so no worker outlives the
+    /// shutdown either way.
     ///
-    /// Every stage is captured, not returned early: the sender drop and
-    /// the runtime join below must run regardless, or a panicked handler
-    /// task reintroduces exactly the lingering threads this shutdown
-    /// exists to join. The first error is still reported.
+    /// Every stage is captured, not returned early: the endpoint close
+    /// runs even when the router shutdown reports an error, and the
+    /// sender drop and runtime join run regardless, or a panicked
+    /// handler task reintroduces exactly the lingering threads this
+    /// shutdown exists to join. The first error is still reported.
     pub fn shutdown(self, deadline: std::time::Duration) -> std::io::Result<()> {
         let mirror_result = self
             .mirror
             .lock()
             .map(|mut slot| *slot = None)
             .map_err(|_| std::io::Error::other("vault mirror lock poisoned"));
-        let transport_result = self.runtime.block_on(async {
-            tokio::time::timeout(deadline, async {
-                self.router
-                    .shutdown()
-                    .await
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                // Usually a no-op: the router shutdown above already
-                // closed the endpoint gracefully. Kept so the close
-                // never depends on router internals.
-                self.endpoint.close().await;
-                Ok::<(), std::io::Error>(())
-            })
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "serving transport stop timed out",
-                )
-            })?
-        });
+        let transport_result = self
+            .runtime
+            .block_on(super::close::with_deadline(
+                async {
+                    let router_result = self
+                        .router
+                        .shutdown()
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()));
+                    // Unconditional: a router failure (panicked accept
+                    // task) must not skip the graceful close. Usually
+                    // a no-op, since a clean router shutdown already
+                    // closed the endpoint — kept so the close never
+                    // depends on router internals.
+                    self.endpoint.close().await;
+                    router_result
+                },
+                deadline,
+                "serving transport stop timed out",
+            ))
+            .and_then(|inner| inner);
         drop(self.sender);
         self.runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
         mirror_result.and(transport_result)

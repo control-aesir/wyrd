@@ -57,6 +57,10 @@ pub(crate) fn announce(
         .log
         .members_of(&body.membership)
         .ok_or(EngineError::NoCanonicalMembership)?;
+    let readers = rebuilt
+        .log
+        .readers_of(&body.membership)
+        .ok_or(EngineError::NoCanonicalMembership)?;
 
     // Top up the author-time obligation for pre-outbox snapshots
     // (authored before the outbox existed, so no queue facts). The
@@ -64,15 +68,16 @@ pub(crate) fn announce(
     // snapshots this always matches what authoring queued — the branch
     // exists for legacy stores, not for recipient-set growth.
     // Already-covered pairs are skipped, so a re-announce commits
-    // nothing new here.
+    // nothing new here. Recipients are members and readers alike, so
+    // admitted readers keep materializing past admission.
     let mut obligation = Vec::new();
-    for member in &members {
-        if *member != engine.device
+    for recipient in members.iter().chain(readers.iter()) {
+        if *recipient != engine.device
             && !rebuilt
                 .runtime
-                .announcement_covered(body.snapshot_id(), *member)
+                .announcement_covered(body.snapshot_id(), *recipient)
         {
-            obligation.push(Fact::AnnouncementQueued(body.snapshot_id(), *member));
+            obligation.push(Fact::AnnouncementQueued(body.snapshot_id(), *recipient));
         }
     }
 

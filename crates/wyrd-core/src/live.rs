@@ -469,10 +469,11 @@ enum ApplyEntry {
 /// never in the variant a waiter matches on.
 fn authoring_error(error: EngineError) -> MutationError {
     match error {
-        // Not currently raised by `author_snapshot` (its only
-        // producers are the fetch planner): kept so a future
-        // classified store failure can never regress to opaque
-        // `Engine` unnoticed.
+        // Not currently raised by `author_snapshot` (its
+        // producers are the fetch planner and the closure gate in
+        // `partition_heads`; none of them is `author_snapshot`):
+        // kept so a future classified store failure can never
+        // regress to opaque `Engine` unnoticed.
         EngineError::Store(failure) => MutationError::Store(failure),
         EngineError::Ingest(IngestError::TooLarge { bytes, .. }) => {
             // `usize` is never wider than `u64` on a supported
@@ -2482,8 +2483,8 @@ mod prereq_tests {
     /// vault or durable write that hits a full disk — quota included
     /// — is `ENOSPC`, a denied one is `EACCES`, and anything else
     /// stays opaque `Engine`. Mirror backpressure is `EIO` too, by
-    /// decision: an `EAGAIN` would replay the whole mutation and
-    /// double-apply non-idempotent ops.
+    /// decision: the sealed bytes are already vault-durable, so a
+    /// replay would import a second copy for no new state.
     #[test]
     fn authoring_io_failures_classify_by_os_errno() {
         use wyrd_format::BaoRoot;
@@ -2622,6 +2623,8 @@ mod prereq_tests {
     /// An unwritable vault fails the commit with denied, through the
     /// real authoring path: the mutation applies, the snapshot seals,
     /// and the vault import refusal carries `EACCES` to the waiter.
+    /// Under a DAC override (root) the refusal cannot occur and the
+    /// test asserts nothing — the skip notice goes to stderr.
     #[cfg(unix)]
     #[test]
     fn unwritable_vault_dir_fails_the_commit_with_denied() {
@@ -2648,6 +2651,8 @@ mod prereq_tests {
     /// An unwritable durable store fails the commit with denied,
     /// through the real authoring path: the vault import succeeds
     /// and the durable-commit refusal carries `EACCES` to the waiter.
+    /// Under a DAC override (root) the refusal cannot occur and the
+    /// test asserts nothing — the skip notice goes to stderr.
     #[cfg(unix)]
     #[test]
     fn unwritable_durable_dir_fails_the_commit_with_denied() {

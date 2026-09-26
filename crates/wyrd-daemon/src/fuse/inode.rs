@@ -225,12 +225,19 @@ pub(super) struct OpenFiles {
 impl OpenFiles {
     /// Retained open-capture bytes across all open handles: each read
     /// capture plus each writable capture-plus-base pair. Computed on
-    /// demand under the table lock, so replaces (commit re-pins,
-    /// concurrent-path repins) and releases can never drift it — the
-    /// sum always reflects the handles actually retained. Locking
-    /// follows the `clean_handles_on` order (table, then handle), and
-    /// a poisoned handle mutex fails closed (`None` refuses the open
-    /// as `EIO`).
+    /// demand under the table lock, so releases can never drift it —
+    /// the handle leaves the table under the same lock first. Re-pins
+    /// (commit re-pins, concurrent-path repins) replace a handle's
+    /// capture without re-checking, so the sum bounds admission, not
+    /// steady-state retention: a handle opened small may grow toward
+    /// the ingest chunk ceiling afterwards. The scan is O(open
+    /// handles) with one mutex acquisition per writable handle,
+    /// serialized behind any in-flight commit — microseconds at
+    /// interactive scale, and a cached counter would need maintenance
+    /// on every re-pin path. Locking follows the `clean_handles_on`
+    /// order (table, then handle), and a poisoned handle mutex fails
+    /// closed (`None` refuses the open as `EIO` — mount-wide until
+    /// that handle is released, not per-request).
     pub(super) fn captured_bytes(&self) -> Option<usize> {
         let mut total = 0usize;
         for handle in self.by_handle.values() {

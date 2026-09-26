@@ -1,4 +1,5 @@
 use super::backend::current_owner;
+use super::inode::{Handle, ReadHandle};
 use super::tests_harness::{
     backend, chunky_backend, evolving_backend, heads, snapshot_of, NoMaterialization,
 };
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wyrd_format::ObjectStore;
-use wyrd_fuse::{DriveView, Node};
+use wyrd_fuse::{DriveView, Node, OpenFile};
 
 use wyrd_core::mutation::{
     FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
@@ -782,7 +783,58 @@ fn single_open_capture_cannot_evade_the_byte_budget() {
         Err(fuser::Errno::ENOSPC),
         "a writable handle pins capture plus base: 16 KiB past an 8 KiB ceiling refuses"
     );
+    assert_eq!(
+        backend.files.lock().unwrap().reserved,
+        0,
+        "the refused write-open gave its promised slot back"
+    );
     assert!(backend.release_handle(reader).is_ok());
+    backend.destroy();
+}
+
+/// A refused `insert_reserved` returns its promise: the byte ceiling
+/// is checked after the promise is consumed, so the refusal restores
+/// it — a refused insert never strands a slot toward `EMFILE`.
+#[test]
+fn refused_insert_returns_its_promise() {
+    let mut backend = chunky_backend(256);
+    backend.max_open_handles = 4096;
+    // Room for nothing: any insert refuses on the byte ceiling.
+    backend.max_open_capture_bytes = 0;
+    backend.reserve_slot().unwrap();
+    let big = Handle::Read(ReadHandle {
+        ino: None,
+        capture: OpenFile::new(vec![ContentId::from_bytes([0xAB; 32]); 256], 256),
+        executable: false,
+    });
+    assert_eq!(
+        backend.insert_reserved(big),
+        Err(fuser::Errno::ENOSPC),
+        "an over-ceiling insert refuses"
+    );
+    {
+        let files = backend.files.lock().unwrap();
+        assert_eq!(files.reserved, 0, "the refused insert restored its promise");
+        assert!(
+            files.by_handle.is_empty(),
+            "the refused insert stored nothing"
+        );
+    }
+    // The slot is usable afterwards: the refusal stranded nothing.
+    backend.max_open_capture_bytes = 256 * 32;
+    backend.reserve_slot().unwrap();
+    let small = Handle::Read(ReadHandle {
+        ino: None,
+        capture: OpenFile::new(Vec::new(), 0),
+        executable: false,
+    });
+    let handle = backend.insert_reserved(small).unwrap();
+    assert_eq!(
+        backend.files.lock().unwrap().reserved,
+        0,
+        "a served insert consumes its promise exactly once"
+    );
+    assert!(backend.release_handle(handle).is_ok());
     backend.destroy();
 }
 

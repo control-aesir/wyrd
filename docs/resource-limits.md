@@ -37,7 +37,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Write buffers aggregate | `write_aggregate_bytes` (256 MiB) | reservation refused; `ENOSPC` |
 | Dirty (buffered) handles | `write_dirty_handles` (64) | new dirty handle refused; `ENOSPC` |
 | Open file handles (read + write) | `max_open_handles` (4096) | open refused; `EMFILE` |
-| Open-capture bytes aggregate (read chunk lists + writable capture-plus-base) | `max_open_capture_bytes` (256 MiB) | open refused; `ENOSPC` |
+| Open-capture bytes aggregate (read chunk lists + writable capture-plus-base) | `max_open_capture_bytes` (256 MiB) | open refused; `ENOSPC`. Checked at open; a handle's retention may grow toward the ingest chunk ceiling afterwards |
 | Mailbox relay wire message | 512 KiB normalized JSON (SDK) | SDK transport backstop before the parsed event reaches Wyrd |
 | Mailbox relay event | 256 KiB decoded event-payload estimate (const; content plus tag values, after SDK parsing) | rejected before NIP-59 unwrap; the relay retains it for redelivery |
 | Mailbox notification channel | 1024 events (const) | backpressure stalls the relay stream; the relay retains everything |
@@ -124,7 +124,10 @@ surfaces:
   (a rising count means the relay stream is chronically choked).
 - POSIX errnos at the mount (`ENOSPC`, `EACCES`, `EMFILE`,
   `EAGAIN`): the refusal itself is the signal, logged per request
-  by the backend's request probe.
+  by the backend's request probe. One exception is mount-wide, not
+  per-request: `EIO` at the open boundary can mean a poisoned
+  handle mutex, which fails every open until that handle is
+  released.
 - `LiveError::Engine(EngineError::Store(_))`: the pass-failure
   form of a fatal disk condition, in the store class with its tight
   backoff and cap, so it terminates the mount quickly rather than

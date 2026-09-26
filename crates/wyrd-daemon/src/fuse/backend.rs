@@ -652,11 +652,8 @@ where
     }
 
     /// Best-effort admission check before operations with side
-    /// effects (budget reservations): refuses `EMFILE` while the
-    /// table is at the cap, so a saturated table never triggers
-    /// pointless work downstream. This is advisory —
-    /// `insert_handle` re-enforces atomically at insert time, and
-    /// the release there unwinds the budget reservation, so a race
+    /// effects: refuses `EMFILE` while the table is at the cap, so a
+    /// saturated table never triggers pointless work downstream.
     /// Promise a handle slot to an in-progress create: the count
     /// holds room across the blocking mutation submit, which must
     /// not hold the table lock. A saturated table (open plus
@@ -687,33 +684,34 @@ where
         }
     }
 
-    /// Insert into a promised slot: consumes the reservation, so count
-    /// room is guaranteed by the [`reserve_slot`](Self::reserve_slot)
-    /// invariant (`len + reserved <= max` held at promise time, and
-    /// only this call shrinks `reserved` without growing `len`). The
-    /// aggregate byte ceiling is re-checked here — retained bytes are
-    /// not reserved up front, so a concurrent open may have spent
-    /// them — and refuses `ENOSPC` with the promise intact. With
+    /// Insert into a promised slot: consumes the reservation on
+    /// every return — success or refusal — so a refused insert can
+    /// never strand it. The aggregate byte ceiling is re-checked here
+    /// — retained bytes are not reserved up front, so a concurrent
+    /// open may have spent them — and refuses `ENOSPC` like any other
+    /// admission refusal. Consuming inside `insert_reserved` rather
+    /// than in the callers keeps the accounting in one place:
+    /// [`release_slot`](Self::release_slot) saturates, so a
+    /// caller-side release could silently steal another caller's
+    /// promise on a path that fails after the decrement. With
     /// no promise held the insert refuses instead of bypassing the
     /// cap: a missing reservation is a caller bug, and failing closed
     /// keeps it from becoming a silent over-admission. Lock poison
-    /// still fails `EIO`.
-    fn insert_reserved(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
+    /// still fails `EIO`. `pub(super)` for the accounting unit test;
+    /// production callers go through `open_write` and `create_at`.
+    pub(super) fn insert_reserved(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
         let Ok(mut files) = self.files.lock() else {
             return Err(fuser::Errno::EIO);
         };
         if files.reserved == 0 {
             return Err(fuser::Errno::EIO);
         }
-        // Byte ceiling before consuming the promise: a refusal leaves
-        // the reservation intact, so the caller's `release_slot`
-        // unwind returns it and a refused insert leaks nothing.
+        files.reserved -= 1;
         let newcomer = handle.retained_bytes().ok_or(fuser::Errno::EIO)?;
         let retained = files.captured_bytes().ok_or(fuser::Errno::EIO)?;
         if retained.saturating_add(newcomer) > self.max_open_capture_bytes {
             return Err(fuser::Errno::ENOSPC);
         }
-        files.reserved -= 1;
         let fh = Self::next_file_handle(&mut files)?;
         files.by_handle.insert(fh, handle);
         Ok(FileHandle(fh))
@@ -989,9 +987,9 @@ where
         // Reserve the handle slot before any blocking submit below:
         // a saturated table fails before any side effect, and the
         // promise holds room across the submits. Every path after
-        // this consumes the promise (`insert_reserved`) or returns
-        // it — except a failed `insert_reserved` itself, which keeps
-        // create_at's accounting (the promise is consumed there).
+        // this consumes the promise (`insert_reserved` consumes on
+        // every return, success or refusal) or returns it
+        // (`release_slot`).
         self.reserve_slot()?;
         let handle = match self.build_write_handle(path, flags, append, truncate, ino) {
             Ok(handle) => handle,
@@ -1205,9 +1203,10 @@ where
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
         };
-        // Nothing fallible follows: the inode and capture are pinned
-        // above, and `attr` is pure, so the consumed promise always
-        // becomes a served handle.
+        // The inode and capture are pinned above and `attr` is pure,
+        // but the insert itself can still refuse (`ENOSPC` past the
+        // capture ceiling): `insert_reserved` consumes the promise on
+        // every return, so a failed insert shrinks nothing.
         let fh = self.insert_reserved(Handle::Write(Arc::new(Mutex::new(handle))))?;
         let attr = self.attr(ino, &node);
         Ok((fh, ino, attr))

@@ -757,6 +757,21 @@ impl ServingEndpoint {
                 }
             }));
             Router::builder(endpoint.clone())
+                // No per-requester check here, by design (trust.md
+                // T17): the second argument is a telemetry sink, not
+                // an admission hook — the protocol has no
+                // per-requester admission point. The (address, hash)
+                // pairs that make a lookup possible travel inside
+                // sealed announcements to members and readers alone;
+                // admission is content verification on the fetch side.
+                // A root with no published route is absence at the
+                // fetch plane (the endpoint itself answers an unheld
+                // root with a protocol error, and answers no listing).
+                // The push half shares the exposure: any dialer can
+                // import blobs into the derived mirror — no vault
+                // forgery (the boot rebuild heals it), but unbounded
+                // growth. Tracked in
+                // nostr:nevent1qqs9tekfm9gxxfz33aqdjk5wcu3gz84z3z279qnc97qrd4t5kfh930spz9mhxue69uhkwunpwdczuap49eehgxaqg6h.
                 .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
                 .spawn()
         });
@@ -1103,17 +1118,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn serving_endpoint_serves_vault_roots_over_iroh() {
-        let dir = serve_dir();
-        let vault = Vault::open(&dir).unwrap();
-        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
-        let sealed = b"verified through the serving endpoint".to_vec();
-        let root = vault.import(&sealed).unwrap();
-        // The write-through is async; flush orders serving readiness
-        // against the announcement a peer would act on.
-        serving.flush().unwrap();
-
+    /// A hermetic loopback bulk client: its own current-thread
+    /// runtime plus a relay-disabled endpoint with address discovery
+    /// cleared — the client half every live-iroh test in this module
+    /// composes.
+    fn loopback_bulk_source() -> crate::bulk::IrohBulkSource {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1125,8 +1134,21 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let mut source =
-            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime))
+    }
+
+    #[test]
+    fn serving_endpoint_serves_vault_roots_over_iroh() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let sealed = b"verified through the serving endpoint".to_vec();
+        let root = vault.import(&sealed).unwrap();
+        // The write-through is async; flush orders serving readiness
+        // against the announcement a peer would act on.
+        serving.flush().unwrap();
+
+        let mut source = loopback_bulk_source();
         source.publish_transport(crate::bulk::IrohBlobRef {
             provider: serving.addr(),
             hash: *root.as_bytes(),
@@ -1135,12 +1157,82 @@ mod tests {
             source.fetch_transport(&root, usize::MAX).unwrap(),
             Some(sealed)
         );
-        // A root the vault never held is absence, not error.
+        // A root with no published route is absence at the fetch
+        // plane: the miss is in the client's address map, before any
+        // dial — not a verdict from the endpoint.
         assert_eq!(
             source
                 .fetch_transport(&BaoRoot::from_bytes([0x33; 32]), usize::MAX)
                 .unwrap(),
             None
+        );
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
+    #[test]
+    fn serving_endpoint_bounds_live_fetches_by_the_request_ceiling() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let sealed = vec![0xA5u8; 512];
+        let root = vault.import(&sealed).unwrap();
+        serving.flush().unwrap();
+
+        let mut source = loopback_bulk_source();
+        source.publish_transport(crate::bulk::IrohBlobRef {
+            provider: serving.addr(),
+            hash: *root.as_bytes(),
+        });
+        // The ceiling rides the live request: the verified size
+        // rejects an oversize blob before anything streams, so a
+        // small max classifies Oversize over real transport instead
+        // of pulling unbounded bytes.
+        assert_eq!(
+            source.fetch_transport(&root, 16),
+            Err(BulkError::Oversize {
+                bytes: 512,
+                max: 16
+            })
+        );
+        // ... while the same bytes verify under a fitting ceiling.
+        assert_eq!(source.fetch_transport(&root, 512).unwrap(), Some(sealed));
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
+    #[test]
+    fn serving_endpoint_bounds_live_manifest_fetches_by_the_request_ceiling() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let sealed = vec![0x5Bu8; 512];
+        let root = vault.import(&sealed).unwrap();
+        serving.flush().unwrap();
+
+        let mut source = loopback_bulk_source();
+        let snapshot = SnapshotId::from_bytes([0x11; 32]);
+        source.publish_root(
+            snapshot,
+            ContentId::from_bytes([0x22; 32]),
+            crate::bulk::IrohBlobRef {
+                provider: serving.addr(),
+                hash: *root.as_bytes(),
+            },
+        );
+        // The manifest path shares the transport ceiling: the
+        // verified size rejects before anything streams, so decode
+        // never sees the oversize bytes.
+        assert_eq!(
+            source.fetch_root_manifest(&snapshot, 16),
+            Err(BulkError::Oversize {
+                bytes: 512,
+                max: 16
+            })
         );
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
         serving
@@ -1161,19 +1253,7 @@ mod tests {
         // Reopen: the boot rebuild re-imports the vault's roots, so the
         // representation serves again under its transport root.
         let reopened = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let client = runtime.block_on(async {
-            Endpoint::builder(presets::N0DisableRelay)
-                .clear_address_lookup()
-                .bind()
-                .await
-                .unwrap()
-        });
-        let mut source =
-            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        let mut source = loopback_bulk_source();
         source.publish_transport(crate::bulk::IrohBlobRef {
             provider: reopened.addr(),
             hash: *root.as_bytes(),
@@ -1285,19 +1365,7 @@ mod tests {
     /// transport root over a real iroh client: `None` when the mirror
     /// does not serve it.
     fn fetch_from(serving: &ServingEndpoint, root: &BaoRoot) -> Option<Vec<u8>> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let client = runtime.block_on(async {
-            Endpoint::builder(presets::N0DisableRelay)
-                .clear_address_lookup()
-                .bind()
-                .await
-                .unwrap()
-        });
-        let mut source =
-            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        let mut source = loopback_bulk_source();
         source.publish_transport(crate::bulk::IrohBlobRef {
             provider: serving.addr(),
             hash: *root.as_bytes(),

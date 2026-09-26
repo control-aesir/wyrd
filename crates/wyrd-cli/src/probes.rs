@@ -160,10 +160,10 @@ pub(crate) fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(),
     }
 }
 
-/// Teardown outcomes in dominance order: the field order is the
-/// reporting policy (loop, then session, then bulk, then serving), so
-/// a mis-ordered propagation does not compile instead of silently
-/// changing which failure the exit status names.
+/// Teardown outcomes as named fields, so a call site cannot silently
+/// swap two stages the way positional arguments allow. The dominance
+/// policy itself is the `.and()` chain below, in field order: keep
+/// the chain and the declaration in the same order.
 pub(crate) struct TeardownStatus {
     pub loop_result: Result<(), CliError>,
     pub session_result: Result<(), CliError>,

@@ -213,29 +213,11 @@ impl std::fmt::Debug for IrohBulkSource {
         f.debug_struct("IrohBulkSource")
             .field("endpoint", &self.endpoint.id())
             .field("roots", &self.roots.len())
+            .field("snapshots", &self.snapshots.len())
             .field("sealed", &self.sealed.len())
             .field("transport", &self.transport.len())
             .finish()
     }
-}
-
-/// Bound an endpoint close by a deadline: the graceful close drains
-/// in-flight transfers, and a stalled peer must turn into a reported
-/// `TimedOut` instead of an unbounded wait. Factored out so the bound
-/// itself is unit-pinned (with a never-ready close) rather than
-/// trusted by inspection. Shared by the bulk source and the serving
-/// endpoint shutdowns.
-pub(crate) async fn close_with_deadline(
-    close: impl std::future::Future<Output = ()>,
-    deadline: std::time::Duration,
-) -> std::io::Result<()> {
-    tokio::time::timeout(deadline, close).await.map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "endpoint close timed out with transfers in flight",
-        )
-    })?;
-    Ok(())
 }
 
 impl IrohBulkSource {
@@ -336,8 +318,10 @@ impl IrohBulkSource {
     /// graceful close and reports it — the caller still drops the
     /// source, so no transfer outlives the shutdown either way.
     pub fn shutdown(&self, deadline: std::time::Duration) -> std::io::Result<()> {
-        self.runtime
-            .block_on(close_with_deadline(self.endpoint.close(), deadline))
+        self.runtime.block_on(super::close::close_with_deadline(
+            self.endpoint.close(),
+            deadline,
+        ))
     }
 
     /// Fetch a representation by trying each recorded provider in
@@ -913,33 +897,66 @@ mod tests {
         });
         let source = IrohBulkSource::with_runtime(endpoint, Arc::new(runtime));
         // No transfers in flight: the close lands inside the deadline
-        // and reports clean.
+        // and reports clean. (The timeout itself is pinned on the
+        // shared bound in `close.rs`.)
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
-    fn close_deadline_reports_a_stalled_close() {
+    fn live_close_trips_a_zero_deadline() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // A close that never resolves trips the deadline instead of
-        // waiting forever: this pins the bound itself, not iroh's
-        // close behavior (which stays covered by the idle test above
-        // and the Lima suite).
-        let stalled = runtime.block_on(close_with_deadline(
-            std::future::pending::<()>(),
-            std::time::Duration::from_millis(10),
-        ));
-        assert!(
-            matches!(stalled, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
-            "a stalled close must report TimedOut"
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(b"live connection").await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, Arc::clone(&runtime));
+        let storage = StorageId::from_bytes([0x77; 32]);
+        source.publish_sealed(
+            storage,
+            IrohBlobRef {
+                provider: direct_addr(&server),
+                hash: *hash.as_bytes(),
+            },
         );
-        let clean = runtime.block_on(close_with_deadline(
-            async {},
-            std::time::Duration::from_secs(10),
-        ));
-        assert!(clean.is_ok(), "a ready close reports clean");
+        // Establish the connection so the close has a live peer to
+        // drain: a graceful close over it cannot resolve
+        // synchronously, so a zero deadline must report TimedOut.
+        // An unbounded close would block here instead and fail.
+        assert_eq!(
+            source.fetch_sealed(&storage, usize::MAX).unwrap(),
+            Some(b"live connection".to_vec())
+        );
+        let timed_out = source.shutdown(std::time::Duration::ZERO);
+        assert!(
+            matches!(timed_out, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "a live close past its deadline must report TimedOut"
+        );
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
     }
 
     #[test]

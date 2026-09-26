@@ -2545,7 +2545,9 @@ where
         // concurrent lookup cannot race the drop. A live loop drains
         // these commits like any release-path write; a settled queue
         // refuses fast with `Shutdown` and the loss is logged per
-        // path — never silent, never a hung session thread.
+        // path. Each attempt resolves with the loop's next pass or
+        // fails fast once the queue is settled — never by waiting on
+        // a loop that will never drain again.
         // Composer precondition: destroy must not run against an
         // open-but-undrained queue; that blocks exactly like a
         // steady-state release behind a stalled loop.

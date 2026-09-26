@@ -16,6 +16,7 @@
 
 pub mod authorization;
 pub mod bulk;
+pub(crate) mod close;
 pub mod closure;
 pub mod control;
 pub mod durable;

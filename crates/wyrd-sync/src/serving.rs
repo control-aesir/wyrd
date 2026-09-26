@@ -830,9 +830,13 @@ impl ServingEndpoint {
     /// drain task ends when its last sender goes away, and holding one
     /// would stall the join for the full timeout on every call.
     ///
-    /// The endpoint close waits at most `deadline` for peer connections
-    /// to drain: like the bulk close, a stalled peer reports `TimedOut`
-    /// instead of hanging teardown.
+    /// The transport stop (router shutdown plus endpoint close) waits
+    /// at most `deadline`: the router's own shutdown awaits a graceful
+    /// endpoint close internally, so bounding only the trailing close
+    /// would leave the wait unbounded behind a stage that pre-closes.
+    /// A timeout abandons the graceful stop and reports it — the
+    /// sender drop and runtime join below still run, so no worker
+    /// outlives the shutdown either way.
     ///
     /// Every stage is captured, not returned early: the sender drop and
     /// the runtime join below must run regardless, or a panicked handler
@@ -844,17 +848,29 @@ impl ServingEndpoint {
             .lock()
             .map(|mut slot| *slot = None)
             .map_err(|_| std::io::Error::other("vault mirror lock poisoned"));
-        let router_result = self
-            .runtime
-            .block_on(async { self.router.shutdown().await })
-            .map_err(|error| std::io::Error::other(error.to_string()));
-        let close_result = self.runtime.block_on(super::bulk::close_with_deadline(
-            self.endpoint.close(),
-            deadline,
-        ));
+        let transport_result = self.runtime.block_on(async {
+            tokio::time::timeout(deadline, async {
+                self.router
+                    .shutdown()
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                // Usually a no-op: the router shutdown above already
+                // closed the endpoint gracefully. Kept so the close
+                // never depends on router internals.
+                self.endpoint.close().await;
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "serving transport stop timed out",
+                )
+            })?
+        });
         drop(self.sender);
         self.runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-        mirror_result.and(router_result).and(close_result)
+        mirror_result.and(transport_result)
     }
 }
 
@@ -1212,6 +1228,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A poisoned mirror slot is reported but does not short-circuit
+    /// the shutdown: the endpoint still closes, the sender still
+    /// drops, and the runtime still joins. Poisoned after open —
+    /// `open` itself attaches to the slot, so a pre-poisoned vault
+    /// never gets this far.
+    #[test]
+    fn poisoned_mirror_lock_reports_but_still_shuts_down() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let endpoint = serving.endpoint.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = serving.mirror.lock().unwrap();
+                    panic!("poison the serving mirror slot");
+                })
+                .join()
+                .expect_err("the poisoner must panic");
+        });
+        let failed = serving.shutdown(std::time::Duration::from_secs(10));
+        assert!(
+            matches!(failed, Err(error) if error.to_string().contains("mirror")),
+            "a poisoned mirror slot must fail the shutdown, not panic"
+        );
+        assert!(
+            endpoint.is_closed(),
+            "shutdown still closes the endpoint past a poisoned slot"
+        );
+    }
+
+    #[test]
+    fn live_serving_close_trips_a_zero_deadline() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        // The transport stop joins the router task, which can never
+        // resolve synchronously — a zero deadline must report
+        // TimedOut. An unbounded stop would block here instead and
+        // fail. No peer is needed: the router join pends even idle.
+        let timed_out = serving.shutdown(std::time::Duration::ZERO);
+        assert!(
+            matches!(timed_out, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "a serving stop past its deadline must report TimedOut"
+        );
     }
 
     /// Fetch a representation from a loopback serving endpoint by

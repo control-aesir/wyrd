@@ -422,9 +422,11 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 /// seconds, and mistaking a slow close for a wedged one turns clean
 /// shutdowns into mount failures. Still bounded, so a peer that
 /// never answers cannot hang teardown forever; a timeout still fails
-/// the mount. Sized for the e2e stop budgets (90s on the throttled
-/// big-vault step): the common slow close lands in seconds, the bound
-/// only fires on a genuine wedge — which fails the mount either way.
+/// the mount. This is a per-endpoint wedge bound, not a share of a
+/// total: back-to-back wedge timeouts can exceed the e2e stop budgets,
+/// but any timeout already fails the step — the 90s budget binds the
+/// clean-but-slow path, measured at 14s on the throttled big-vault
+/// step.
 const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the

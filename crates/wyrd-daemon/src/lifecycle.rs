@@ -21,8 +21,12 @@
 //! Teardown order after the loop returns is presentation first,
 //! transport second: unmount and reap the session thread (the
 //! backend's `destroy` commits dirty handles here), settle the queue,
-//! then stop the mailbox, the bulk source, and serving inside
-//! bounded deadlines, folding every outcome into the exit status.
+//! then stop the mailbox, the bulk source, and serving, folding every
+//! outcome into the exit status. Mailbox stop and both endpoint closes
+//! run under deadlines; the bulk drop between them releases an owned
+//! current-thread runtime whose task-drop does not wait, so it carries
+//! no deadline. The sequence itself is not unit-pinned — the composer
+//! is binary-only, so the Lima suite is the order evidence.
 //! The order matters because `destroy` can only preserve dirty
 //! handles while the queue is live — against a settled queue the
 //! commit refuses fast with `Shutdown` and the loss is logged per

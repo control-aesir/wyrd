@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn live_close_trips_a_zero_deadline() {
+    fn live_close_returns_past_a_zero_deadline() {
         use iroh::{endpoint::presets, protocol::Router, Endpoint};
         use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
@@ -943,18 +943,21 @@ mod tests {
                 hash: *hash.as_bytes(),
             },
         );
-        // Establish the connection so the close has a live peer to
-        // drain: a graceful close over it cannot resolve
-        // synchronously, so a zero deadline must report TimedOut.
-        // An unbounded close would block here instead and fail.
+        // Establish the connection so the close runs against a live
+        // peer. The shutdown must return past a zero deadline instead
+        // of blocking: which outcome it reports is host timing (a fast
+        // host resolves the graceful close on the first poll and
+        // `timeout` reports clean), so the TimedOut variant is pinned
+        // by the never-ready unit test in `close.rs`, not here.
         assert_eq!(
             source.fetch_sealed(&storage, usize::MAX).unwrap(),
             Some(b"live connection".to_vec())
         );
-        let timed_out = source.shutdown(std::time::Duration::ZERO);
+        let start = std::time::Instant::now();
+        let _ = source.shutdown(std::time::Duration::ZERO);
         assert!(
-            matches!(timed_out, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
-            "a live close past its deadline must report TimedOut"
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "a live close past its deadline must return instead of blocking"
         );
         runtime.block_on(async {
             router.shutdown().await.unwrap();

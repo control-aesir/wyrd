@@ -2542,21 +2542,22 @@ where
         // Unmount: commit dirty writable handles best-effort, then
         // drop the table so it never leaks across mounts. Removal
         // precedes each commit (as in `release_handle`) so a
-        // concurrent lookup cannot race the drop. A live loop drains
-        // these commits like any release-path write; a settled queue
+        // concurrent lookup cannot race the drop. The composer's order
+        // runs destroy against an open, drained queue — the loop has
+        // returned but its post-return drain executes these commits
+        // like any release-path write — so each attempt resolves with
+        // the drain's next sweep, never by waiting on a loop that will
+        // never drain again. A queue already closed (admission shut
+        // after the session join, or the loop-thread panic recovery)
         // refuses fast with `Shutdown` and the loss is logged per
-        // path. Each attempt resolves with the loop's next pass or
-        // fails fast once the queue is settled — never by waiting on
-        // a loop that will never drain again. Attempts run serially
-        // and each is bounded by the loop's mutation-wait budget
-        // (30s), so a stalled-but-live loop can hold the session
-        // join for minutes; the composer's orderings never reach
-        // that state (signal paths settle first, session death keeps
-        // the loop draining), and the precondition below keeps it
-        // that way.
-        // Composer precondition: destroy must not run against an
-        // open-but-undrained queue; that blocks exactly like a
-        // steady-state release behind a stalled loop.
+        // path. Attempts run serially and each is bounded by the
+        // mutation-wait budget (30s): a commit that would hold for
+        // content fails closed in the drain instead of parking, so a
+        // stalled drain cannot hold the session join past one budget
+        // per handle, and the composer's close bounds even that.
+        // Composer precondition: destroy must run after the loop's
+        // return and before the admission close; the session join
+        // between them is what guarantees both.
         let removed: Vec<(u64, Handle)> = match self.files.lock() {
             Ok(mut files) => files.by_handle.drain().collect(),
             Err(error) => {

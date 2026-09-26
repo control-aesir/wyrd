@@ -1,4 +1,6 @@
-use super::tests_harness::{live_backend, scratch_drive, NoopMailbox, SettlementFailingMailbox};
+use super::tests_harness::{
+    live_backend, scratch_drive, NoopMailbox, PanicMailbox, SettlementFailingMailbox,
+};
 use super::*;
 
 use std::sync::{
@@ -18,12 +20,13 @@ use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 use wyrd_sync::transport::mailbox::Mailbox;
 
-use crate::lifecycle::{Supervisor, WakeSignal};
+use crate::lifecycle::{LoopError, LoopReturn, Supervisor, WakeSignal};
 
-/// The composer role's node half: a live node over the drive's file
+/// The composer role's view half: a live node over the drive's file
 /// store, so preservation assertions can reopen the drive from
 /// custody after teardown.
-type TeardownNode = LiveNode<DriveView<FsObjectStore, RuntimeMaterialization>>;
+type TeardownView = DriveView<FsObjectStore, RuntimeMaterialization>;
+type TeardownNode = LiveNode<TeardownView>;
 
 /// A process-latch stand-in: the composer trips one process-global
 /// flag; tests leak one per test so parallel tests never observe
@@ -46,42 +49,35 @@ fn await_outstanding(queue: &Arc<wyrd_core::mutation::MutationQueue>, count: usi
     }
 }
 
-/// Mirror the composer's loop thread: run the loop until `latch`
-/// trips (or the mailbox fails terminally), report the return on the
-/// trigger, then drain admitted mutations until the composer closes
-/// admission. Hands the loop outcome back with the node, so the test
-/// keeps ownership of both for the transport-free teardown.
+/// Mirror the composer's loop thread exactly — by calling the same
+/// supervision entry point `main.rs` uses, not a re-implementation:
+/// run the loop until the latch trips (or the mailbox fails
+/// terminally), report the return on the trigger, then drain admitted
+/// mutations until the composer closes admission. Returns the
+/// supervision's join handle so the test owns the ordered teardown.
 fn spawn_teardown_loop<M: Mailbox + Send + 'static>(
     live: TeardownNode,
     mailbox: M,
-    tripped: &'static AtomicBool,
     supervisor: Supervisor,
     trigger: std::sync::mpsc::Sender<()>,
-) -> std::thread::JoinHandle<(Result<LiveSummary, LiveError>, TeardownNode)> {
-    std::thread::spawn(move || {
-        let mut live = live;
-        let mut mailbox = mailbox;
-        let result = live.run_loop(
-            &mut mailbox,
-            None::<&mut MemoryBulkSource>,
-            tripped,
-            &LiveConfig {
-                interval: Duration::from_millis(10),
-                error_base_delay: Duration::from_millis(1),
-                error_max_delay: Duration::from_millis(5),
-                max_consecutive_errors: 2,
-                budgets: ResourceBudgets::default(),
-                max_mutation_wait: Duration::from_secs(30),
-                serving_flush_budget: Duration::from_secs(5),
-                fetch_pass_budget: Duration::from_secs(10),
-            },
-            &mut |_, _| {},
-        );
-        supervisor.note_loop_returned();
-        let _ = trigger.send(());
-        live.drain_until_closed();
-        (result, live)
-    })
+) -> std::thread::JoinHandle<LoopReturn<TeardownView, M, MemoryBulkSource>> {
+    supervisor.spawn_loop(
+        live,
+        mailbox,
+        None::<MemoryBulkSource>,
+        LiveConfig {
+            interval: Duration::from_millis(10),
+            error_base_delay: Duration::from_millis(1),
+            error_max_delay: Duration::from_millis(5),
+            max_consecutive_errors: 2,
+            budgets: ResourceBudgets::default(),
+            max_mutation_wait: Duration::from_secs(30),
+            serving_flush_budget: Duration::from_secs(5),
+            fetch_pass_budget: Duration::from_secs(10),
+        },
+        trigger,
+        |_, _| {},
+    )
 }
 
 /// Reopen the drive from custody and read one file's bytes: the
@@ -122,7 +118,7 @@ fn signal_path_shutdown_preserves_dirty_handle() {
     let tripped = latch();
     let supervisor = Supervisor::new(Arc::clone(&queue), tripped, Arc::new(WakeSignal::default()));
     let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
-    let drive = spawn_teardown_loop(live, NoopMailbox, tripped, supervisor.clone(), trigger_tx);
+    let drive = spawn_teardown_loop(live, NoopMailbox, supervisor.clone(), trigger_tx);
 
     // An unflushed write: created and buffered, never flushed or
     // released — exactly what a signal finds mid-session.
@@ -134,7 +130,7 @@ fn signal_path_shutdown_preserves_dirty_handle() {
     // SIGINT: trip the latch, wait for the loop's return, then run
     // the composer's teardown — unmount (no kernel here), join the
     // session (destroy commits against the open queue), close
-    // admission, join the loop, settle.
+    // admission, join the loop.
     tripped.store(true, Ordering::Relaxed);
     trigger_rx
         .recv_timeout(Duration::from_secs(10))
@@ -146,9 +142,9 @@ fn signal_path_shutdown_preserves_dirty_handle() {
         .join()
         .expect("destroy completes instead of hanging the join");
     supervisor.close_admission();
-    let (result, live) = drive.join().expect("the loop thread joins");
-    result.expect("loop stops cleanly");
-    supervisor.settle();
+    let returned = drive.join().expect("the loop thread joins");
+    returned.result.expect("loop stops cleanly");
+    let live = returned.live;
 
     drop(live);
     drop(queue);
@@ -180,7 +176,6 @@ fn terminal_loop_error_preserves_dirty_handle() {
     let drive = spawn_teardown_loop(
         live,
         SettlementFailingMailbox,
-        tripped,
         supervisor.clone(),
         trigger_tx,
     );
@@ -199,9 +194,9 @@ fn terminal_loop_error_preserves_dirty_handle() {
         .join()
         .expect("destroy completes instead of hanging the join");
     supervisor.close_admission();
-    let (result, live) = drive.join().expect("the loop thread joins");
-    assert!(result.is_err(), "the mailbox cap aborts the loop");
-    supervisor.settle();
+    let returned = drive.join().expect("the loop thread joins");
+    assert!(returned.result.is_err(), "the mailbox cap aborts the loop");
+    let live = returned.live;
 
     drop(live);
     drop(queue);
@@ -226,7 +221,7 @@ fn teardown_preserves_every_dirty_handle_and_drops_clean() {
     let tripped = latch();
     let supervisor = Supervisor::new(Arc::clone(&queue), tripped, Arc::new(WakeSignal::default()));
     let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
-    let drive = spawn_teardown_loop(live, NoopMailbox, tripped, supervisor.clone(), trigger_tx);
+    let drive = spawn_teardown_loop(live, NoopMailbox, supervisor.clone(), trigger_tx);
 
     let (first, _, _) = backend
         .create_at(1, "a.txt", libc::O_RDWR)
@@ -251,15 +246,65 @@ fn teardown_preserves_every_dirty_handle_and_drops_clean() {
         .join()
         .expect("destroy completes instead of hanging the join");
     supervisor.close_admission();
-    let (result, live) = drive.join().expect("the loop thread joins");
-    result.expect("loop stops cleanly");
-    supervisor.settle();
+    let returned = drive.join().expect("the loop thread joins");
+    returned.result.expect("loop stops cleanly");
+    let live = returned.live;
 
     drop(live);
     drop(queue);
     drop(supervisor);
     assert_eq!(reopen_and_read(&dir, &identity, "a.txt"), b"alpha");
     assert_eq!(reopen_and_read(&dir, &identity, "b.txt"), b"beta");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A loop-thread panic still tears down boundedly: the supervision
+/// catches it, closes admission so destroy's submit resolves with
+/// `Shutdown` instead of hanging the session join, hands every
+/// handle back, and reports the panic — the composer still runs
+/// transport teardown. The dirty bytes are lost (the engine state is
+/// suspect, so preservation is off the table); the reopened drive
+/// serves the pre-panic content.
+#[test]
+fn loop_thread_panic_tears_down_bounded() {
+    let (engine, dir, identity) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+    // Author before the loop panics: a panicking loop never applies,
+    // so the file must exist up front.
+    daemon.put_file("dirty.txt", b"old bytes").unwrap();
+    let (live, mut backend) = live_backend(daemon);
+    let queue = Arc::clone(live.mutations());
+    let tripped = latch();
+    let supervisor = Supervisor::new(Arc::clone(&queue), tripped, Arc::new(WakeSignal::default()));
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
+    let drive = spawn_teardown_loop(live, PanicMailbox, supervisor.clone(), trigger_tx);
+
+    // Dirty handle against the pre-existing file; the loop panics on
+    // its first intake instead of returning.
+    let fh = backend.open_write("dirty.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"panic bytes").unwrap();
+    trigger_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the panic recovery reports");
+    let session = std::thread::spawn(move || {
+        backend.destroy();
+    });
+    session
+        .join()
+        .expect("destroy resolves instead of hanging the join");
+    supervisor.close_admission();
+    let returned = drive.join().expect("the supervision joins");
+    assert!(
+        matches!(returned.result, Err(LoopError::Panicked)),
+        "the panic is reported, not propagated"
+    );
+    let live = returned.live;
+
+    drop(live);
+    drop(queue);
+    drop(supervisor);
+    assert_eq!(reopen_and_read(&dir, &identity, "dirty.txt"), b"old bytes");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -305,7 +350,6 @@ fn submissions_racing_admission_close_resolve_bounded() {
         });
         supervisor.close_admission();
     });
-    supervisor.settle();
 
     let outcomes = outcomes.lock().unwrap();
     assert_eq!(outcomes.len(), 8, "every racer resolved");

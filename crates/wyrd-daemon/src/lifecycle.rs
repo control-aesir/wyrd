@@ -27,16 +27,15 @@
 //! open queue the drain executes concurrently), close admission
 //! ([`Supervisor::close_admission`]) — the session join is the
 //! submission boundary, so after it no FUSE-driven submission can
-//! race the drain's end — reap the loop thread, settle stragglers,
-//! then stop the mailbox, the bulk source, and serving, folding every
-//! outcome into the exit status. Mailbox stop and both endpoint closes
-//! run under deadlines; the bulk drop between them releases an owned
+//! race the drain's end — reap the loop thread, then stop the
+//! mailbox, the bulk source, and serving, folding every outcome into
+//! the exit status. Mailbox stop and both endpoint closes run under deadlines; the bulk drop between them releases an owned
 //! current-thread runtime whose task-drop does not wait, so it carries
 //! no deadline. The composer order itself is not unit-pinned — the
 //! composer is binary-only, so the Lima suite is the order evidence —
 //! but the queue half of the contract is: the teardown-sequence tests
-//! pin that post-return submissions execute and settle only after the
-//! joins.
+//! pin that post-return submissions execute and admission closes only
+//! after the joins.
 //! The order matters because `destroy` can only preserve dirty
 //! handles while the queue is live and drained — against a settled
 //! queue the commit refuses fast with `Shutdown` and the loss is
@@ -46,14 +45,44 @@
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
+use wyrd_core::live::{LiveConfig, LiveError, LiveNode, LiveSummary};
 use wyrd_core::mutation::MutationQueue;
+use wyrd_core::view::{NamespaceView, RuntimeMaterialization};
+use wyrd_format::ObjectStore;
+use wyrd_sync::runtime::RoutePublishing;
+use wyrd_sync::transport::mailbox::Mailbox;
 
 // Pacing primitives live in wyrd-core (runtime sync, not process
 // policy); re-exported here until the Phase 3 shim removal.
 pub use wyrd_core::wake::{Wake, WakeSignal};
 
+/// How the supervised loop thread ended, with everything it
+/// borrowed: the composer keeps its transport handles on every path,
+/// including the panic recovery.
+pub struct LoopReturn<V: NamespaceView, M, B> {
+    /// The run outcome, or the panic the supervision caught.
+    pub result: Result<LiveSummary, LoopError>,
+    /// The node, handed back for post-teardown assertions and drop.
+    pub live: LiveNode<V>,
+    /// The mailbox, handed back for bounded task shutdown.
+    pub mailbox: M,
+    /// The bulk source, handed back for bounded endpoint close.
+    pub bulk: Option<B>,
+}
+
+/// The loop thread failed without returning: the loop itself
+/// reported, or the thread panicked mid-loop-or-drain and the
+/// supervision recovered the handles.
+#[derive(Debug)]
+pub enum LoopError {
+    /// The loop aborted with the class error.
+    Live(LiveError),
+    /// The thread panicked; admission already closed on the spot.
+    Panicked,
+}
+
 /// The lifecycle supervisor: shared stop flag plus the mutation queue
-/// to settle on loop exit. Cheaply cloneable across the session and
+/// to close on teardown. Cheaply cloneable across the session and
 /// loop threads; both notification methods are idempotent.
 #[derive(Debug, Clone)]
 pub struct Supervisor {
@@ -100,24 +129,98 @@ impl Supervisor {
     /// submit anymore, so close admission and complete every
     /// still-queued request with `Shutdown`. In the ordinary sequence
     /// the drain already executed everything queued, making this the
-    /// idempotent stray mop-up; calling it before the session join
-    /// strands destroy's submits and must never happen (see the
-    /// module contract).
+    /// idempotent mop-up for close-racers; calling it before the
+    /// session join strands destroy's submits and must never happen
+    /// (see the module contract). Taken-but-unfinished requests are
+    /// the batch guard's duty, never this call's.
     pub fn close_admission(&self) {
         self.queue.shutdown();
         self.waker.wake();
     }
 
-    /// The loop thread is joined: complete every still-queued request
-    /// with `Shutdown`. The drain executed everything queued before
-    /// the close, so this only ever sees submissions that raced the
-    /// close itself — the idempotent mop-up that guarantees no
-    /// admitted caller waits forever. Same plain shutdown the old
-    /// loop-exit path ran; kept as the supervisor's so the composer
-    /// never touches queue internals directly.
-    pub fn settle(&self) {
-        self.queue.shutdown();
-        self.waker.wake();
+    /// Spawn the supervised loop thread: run the loop until `stop`
+    /// trips (or a class cap aborts it), report the return on
+    /// `trigger`, then drain admitted mutations until the composer
+    /// closes admission. The composer keeps the join handle and runs
+    /// the ordered teardown — unmount, session join, close, loop
+    /// join — while the drain executes destroy's commits
+    /// concurrently.
+    ///
+    /// A panic mid-loop-or-drain is caught, never propagated: the
+    /// return reports [`LoopError::Panicked`] with every borrowed
+    /// handle recovered, admission closes on the spot so blocked
+    /// teardown submitters resolve with `Shutdown` instead of hanging
+    /// the session join, and the composer still runs transport
+    /// teardown. Preservation is off the table on that path (the
+    /// engine state is suspect); bounded lossy shutdown is the honest
+    /// outcome.
+    pub fn spawn_loop<V, M, B>(
+        &self,
+        live: LiveNode<V>,
+        mailbox: M,
+        bulk: Option<B>,
+        config: LiveConfig,
+        trigger: std::sync::mpsc::Sender<()>,
+        observe: impl FnMut(&LiveError, u32) + Send + 'static,
+    ) -> std::thread::JoinHandle<LoopReturn<V, M, B>>
+    where
+        V: NamespaceView<Materialization = RuntimeMaterialization> + Send + Sync + 'static,
+        V::Store: ObjectStore + Send + Sync + 'static,
+        <V::Store as ObjectStore>::Error: std::fmt::Debug,
+        M: Mailbox + Send + 'static,
+        B: RoutePublishing + Send + 'static,
+    {
+        let supervisor = self.clone();
+        std::thread::spawn(move || {
+            let mut live = live;
+            let mut mailbox = mailbox;
+            let mut bulk = bulk;
+            let mut observe = observe;
+            // Everything the loop borrows is thread-local, so the
+            // whole body stays inside the catch: a panic anywhere in
+            // it still returns the handles.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = live.run_loop(
+                    &mut mailbox,
+                    bulk.as_mut(),
+                    supervisor.stop,
+                    &config,
+                    &mut observe,
+                );
+                // Report before draining: the composer closes admission
+                // after its session join, and the drain below waits for
+                // exactly that close — sending first is what keeps the
+                // two from waiting on each other.
+                supervisor.note_loop_returned();
+                let _ = trigger.send(());
+                live.drain_until_closed();
+                result
+            }));
+            match ran {
+                Ok(result) => LoopReturn {
+                    result: result.map_err(LoopError::Live),
+                    live,
+                    mailbox,
+                    bulk,
+                },
+                Err(_) => {
+                    // The return never reported (the panic skipped it):
+                    // wake the composer — both calls are idempotent —
+                    // then close admission on the spot so blocked
+                    // teardown submitters resolve instead of hanging
+                    // the session join.
+                    supervisor.note_loop_returned();
+                    let _ = trigger.send(());
+                    supervisor.close_admission();
+                    LoopReturn {
+                        result: Err(LoopError::Panicked),
+                        live,
+                        mailbox,
+                        bulk,
+                    }
+                }
+            }
+        })
     }
 }
 

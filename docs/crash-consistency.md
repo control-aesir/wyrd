@@ -228,8 +228,7 @@ shutdown path: the loop returns without settling, the session joins
 first (destroy submits while the post-return drain executes
 concurrently), admission closes only after the join — the session
 join is the submission boundary, so no destroy-time submission can
-race the drain's end — and the supervisor settles stragglers after
-the loop join. The commit still refuses fast with `Shutdown` (and the
+race the drain's end. The commit still refuses fast with `Shutdown` (and the
 loss is logged per path) only for submissions that race the admission
 close itself; unmount stays a safety net, not a durability boundary.
 Pinned by

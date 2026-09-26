@@ -736,14 +736,12 @@ fn mount(
         }
     };
     let mut mailbox = returned.mailbox;
-    let Some(bulk) = returned.bulk else {
-        // Unreachable: the composer passes `Some`, and the thread
-        // hands it back untouched on every path.
-        tracing::error!(stage = "bulk", "loop thread lost the bulk source");
-        return Err(CliError::Bulk(std::io::Error::other(
-            "loop thread lost the bulk source",
-        )));
-    };
+    // Unreachable by construction: the composer passes `Some`, and
+    // the thread hands it back untouched on every path (including the
+    // panic recovery). Expect, so a future refactor that breaks the
+    // pairing fails loudly here instead of skipping transport
+    // teardown.
+    let bulk = returned.bulk.expect("loop thread returns the bulk source");
     // Dropped at scope end, after transport teardown — the same
     // effective lifetime the node always had.
     let _live = returned.live;

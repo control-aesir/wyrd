@@ -452,7 +452,11 @@ commit that fails its own evaluation (stale handle, conflict, store
 failure) is still lost and logged per path, and a crash loses
 everything unflushed; flush or fsync remains the reportable
 persistence point. But a clean SIGINT/SIGTERM with a healthy drive
-now preserves unflushed writes instead of dropping them.
+now preserves unflushed writes instead of dropping them. On a real
+mount the kernel releases every open file before destroy runs, so
+`release_handle` is the path that normally preserves signal-time
+writes; `destroy` is the net for handles whose release-time commit
+failed.
 
 `O_SYNC`/`O_DSYNC` deliberately sacrifice write coalescing: because the
 unit of commit is the snapshot, each successful `write` on such a handle

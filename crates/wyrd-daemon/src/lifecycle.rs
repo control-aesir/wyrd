@@ -29,7 +29,8 @@
 //! submission boundary, so after it no FUSE-driven submission can
 //! race the drain's end — reap the loop thread, then stop the
 //! mailbox, the bulk source, and serving, folding every outcome into
-//! the exit status. Mailbox stop and both endpoint closes run under deadlines; the bulk drop between them releases an owned
+//! the exit status. Mailbox stop and both endpoint closes run under
+//! deadlines; the bulk drop between them releases an owned
 //! current-thread runtime whose task-drop does not wait, so it carries
 //! no deadline. The composer order itself is not unit-pinned — the
 //! composer is binary-only, so the Lima suite is the order evidence —
@@ -41,7 +42,10 @@
 //! queue the commit refuses fast with `Shutdown` and the loss is
 //! logged per path. Composer precondition: never close admission
 //! before the session join returns; that strands destroy's submits
-//! exactly like the old settle-on-loop-exit did.
+//! exactly like the old settle-on-loop-exit did. The loop-thread
+//! panic recovery is the deliberate exception: with the loop dead,
+//! destroy's submits could never execute, so closing there trades
+//! the hang for bounded `Shutdown` losses.
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 

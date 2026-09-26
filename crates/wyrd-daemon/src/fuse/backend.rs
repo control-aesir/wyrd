@@ -1437,7 +1437,16 @@ where
             files.by_handle.remove(&fh.0)
         };
         if let Some(Handle::Write(handle)) = removed {
-            let _ = self.commit_write_handle(&handle);
+            // Best-effort means the error is not observable — but it
+            // is still a loss, so it is logged with the path like
+            // every other commit failure on this surface.
+            if let Err(error) = self.commit_write_handle(&handle) {
+                let path = handle
+                    .lock()
+                    .map(|write| write.path.clone())
+                    .unwrap_or_else(|_| "<locked>".to_string());
+                tracing::error!(stage = "session", %path, ?error, "release dropped a dirty handle's buffered writes");
+            }
         }
         Ok(())
     }

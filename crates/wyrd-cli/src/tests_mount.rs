@@ -307,12 +307,24 @@ fn live_mount_serves_read_write_until_shutdown() {
     assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello write");
 }
 
-/// A dirty handle survives signal-driven shutdown end to end: write
-/// through the mountpoint without flush or close, keep the descriptor
-/// open across the shutdown trip, rejoin, and prove the reopened
-/// drive serves the bytes. Ignored by default like the live mount
-/// above — same runner contract:
-/// `cargo nextest run -p wyrd-cli --bin wyrd --run-ignored all`.
+/// A dirty handle open at signal time survives shutdown end to
+/// end: write through the mountpoint without flush or close, trip
+/// shutdown, then close — the release commits against the still-open
+/// queue mid-teardown — rejoin, and prove the reopened drive serves
+/// the bytes.
+///
+/// This exercises the kernel-reachable preservation path
+/// deliberately: the kernel releases every open file before destroy
+/// runs, so `release_handle` (not `destroy`) is what preserves
+/// signal-time writes on a real mount; destroy's commit is pinned at
+/// daemon level instead. The close must precede the composer's
+/// unmount — the mount unmounts once, and an unmount against the
+/// still-open descriptor fails busy — so the trip-then-close order
+/// is load-bearing, not incidental.
+///
+/// Ignored by default like the live mount above — same runner
+/// contract: `cargo nextest run -p wyrd-cli --bin wyrd --run-ignored
+/// all`.
 #[test]
 #[ignore = "needs kernel FUSE and local networking"]
 fn live_mount_preserves_dirty_handle_across_shutdown() {
@@ -363,10 +375,10 @@ fn live_mount_preserves_dirty_handle_across_shutdown() {
         panic!("the mount did not serve in time");
     }
     // The unflushed write: buffered behind an open descriptor, never
-    // flushed or closed. The binding must stay alive across the
-    // shutdown below — dropping it would close (and commit) the
-    // handle before the signal arrives, testing release instead of
-    // destroy.
+    // flushed. The binding must stay alive until after the shutdown
+    // trip — dropping it earlier would close (and commit) the handle
+    // before the signal arrives, testing steady-state release
+    // instead of teardown.
     let dirty = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -374,8 +386,13 @@ fn live_mount_preserves_dirty_handle_across_shutdown() {
         .open(temp.0.join("mnt").join("dirty.txt"))
         .unwrap();
     (&dirty).write_all(b"unflushed through the mount").unwrap();
-    mount.shutdown_and_join("with a dirty handle open");
+    // Trip first, close second: the release races the loop's return
+    // and commits mid-teardown. Closing before the trip would commit
+    // on a live loop; closing after the rejoin starts would wedge the
+    // unmount busy.
+    SHUTDOWN.store(true, Ordering::Relaxed);
     drop(dirty);
+    mount.shutdown_and_join("with a dirty handle at signal time");
     assert!(
         fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
         "a clean unmount releases the mountpoint"

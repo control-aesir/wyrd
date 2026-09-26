@@ -1882,7 +1882,11 @@ where
                         // until the prerequisite deadline (30 s default)
                         // per handle. Fail closed instead — the per-path
                         // loss log reports it, and finishing the batch
-                        // releases the registered want.
+                        // releases the registered want. Continuing past
+                        // it is order-safe: the failed entry completes
+                        // terminally before any later entry applies, so
+                        // no later commit builds on state the failed
+                        // entry never produced.
                         batch.record(index, Err(MutationError::Engine));
                     }
                 }

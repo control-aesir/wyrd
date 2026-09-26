@@ -308,6 +308,52 @@ fn loop_thread_panic_tears_down_bounded() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A release after the loop's return commits the dirty handle: on
+/// a real mount the kernel releases every open file before destroy
+/// runs, so this — not destroy — is the kernel-reachable
+/// preservation path, and the queue contract it relies on is
+/// identical. Fails against the old order (the submit refuses with
+/// `Shutdown`, surfacing as `EIO`); passes now with the commit.
+#[test]
+fn release_after_loop_return_commits_dirty_handle() {
+    let (engine, dir, identity) = scratch_drive();
+    let daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
+    let (live, backend) = live_backend(daemon);
+    let queue = Arc::clone(live.mutations());
+    let tripped = latch();
+    let supervisor = Supervisor::new(Arc::clone(&queue), tripped, Arc::new(WakeSignal::default()));
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
+    let drive = spawn_teardown_loop(live, NoopMailbox, supervisor.clone(), trigger_tx);
+
+    let (fh, _, _) = backend
+        .create_at(1, "released.txt", libc::O_RDWR)
+        .expect("create commits");
+    backend.write_handle(fh, 0, b"released bytes").unwrap();
+
+    tripped.store(true, Ordering::Relaxed);
+    trigger_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the loop reports its return");
+    // Release-shaped, not destroy-shaped: one handle's commit after
+    // the return, against the open queue the drain serves.
+    backend.release_handle(fh).expect("release commits");
+    supervisor.close_admission();
+    let returned = drive.join().expect("the loop thread joins");
+    returned.result.expect("loop stops cleanly");
+    let live = returned.live;
+
+    drop(live);
+    drop(backend);
+    drop(queue);
+    drop(supervisor);
+    assert_eq!(
+        reopen_and_read(&dir, &identity, "released.txt"),
+        b"released bytes"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Submissions racing the admission close resolve boundedly: each
 /// one either executed before the close or refused by it — never
 /// stranded, never hung. The exact mix is scheduling, so the test

@@ -306,3 +306,110 @@ fn removed_reader_gets_no_new_epoch_material() {
         "no new tip queued for the removed reader"
     );
 }
+
+#[test]
+fn reader_receives_ongoing_snapshot_announcements() {
+    let (_dir, mut engine, invitation, reader, reader_encryption, reader_id) =
+        admit_reader_fixture("reader-ongoing");
+    let (_join_dir, mut joined) = join_reader(
+        "reader-ongoing-join",
+        &mut engine,
+        &invitation,
+        reader,
+        reader_encryption,
+        reader_id,
+    );
+
+    // A member-authored snapshot after admission: the obligation must
+    // name the reader, or it stays stale past admission catch-up.
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects.insert(ObjectKind::Chunk, b"ongoing").unwrap();
+    let tree = Tree::from_entries(vec![Entry::file("on.txt", 7, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let authorized = engine.author_snapshot(&objects, tree).unwrap();
+    let snapshot_id = authorized.snapshot().snapshot_id();
+    assert!(
+        engine
+            .pending_announcements()
+            .unwrap()
+            .contains(&(snapshot_id, reader_id)),
+        "ongoing authoring queues the announcement for the reader"
+    );
+
+    let mut relay = MemoryRelay::default();
+    let sent = {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: engine.device(),
+        };
+        engine
+            .announce_snapshot(&authorized, &mut sender, None)
+            .unwrap()
+    };
+    assert_eq!(sent, 1, "the lone reader is the only recipient");
+    // The top-up commits nothing new for an already-covered reader:
+    // exactly one queue fact names the pair, never a duplicate.
+    assert_eq!(
+        engine
+            .store
+            .load()
+            .expect("loads")
+            .announcement_queued
+            .iter()
+            .filter(|pair| **pair == (snapshot_id, reader_id))
+            .count(),
+        1,
+        "no duplicate queue fact for the covered reader"
+    );
+    let report = {
+        let mut receiver = MemoryMailbox {
+            relay: &mut relay,
+            owner: reader_id,
+        };
+        joined.drain(&mut receiver).unwrap()
+    };
+    assert!(report.accepted >= 1, "the announcement lands");
+    assert!(
+        joined
+            .store
+            .rebuild(reader_id)
+            .unwrap()
+            .runtime
+            .announcement(&snapshot_id)
+            .is_some(),
+        "reader records the ongoing announcement"
+    );
+
+    // The reader materializes the new head over the author's vault —
+    // convergence without authorship.
+    let mut serving =
+        crate::serving::VaultSource::from_state(&engine.runtime_state().unwrap(), engine.vault())
+            .unwrap();
+    let mut peer_objects = MemoryObjectStore::default();
+    joined
+        .execute_plan(&mut serving, &mut peer_objects)
+        .unwrap();
+    assert!(
+        joined
+            .live_heads()
+            .unwrap()
+            .iter()
+            .any(|head| head.snapshot().snapshot_id() == snapshot_id),
+        "reader materializes the new head"
+    );
+
+    // Voiceless still: the converged reader authors nothing.
+    let read_chunk = peer_objects.insert(ObjectKind::Chunk, b"rogue").unwrap();
+    let read_tree = Tree::from_entries(vec![
+        Entry::file("rogue.txt", 5, false, vec![read_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut peer_objects)
+    .unwrap();
+    assert!(matches!(
+        joined.author_snapshot(&peer_objects, read_tree),
+        Err(EngineError::ReaderCannotAuthor)
+    ));
+}

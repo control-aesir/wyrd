@@ -7,11 +7,12 @@ use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::Mailbox;
 
-/// Announce an authored snapshot to every other member over the control
-/// plane, returning the number of envelopes sent this call (the author
-/// is skipped: it already holds the body). The epoch must be one this
-/// engine holds a control key for, and the snapshot's root manifest must
-/// be recorded — the announcement carries the transport identities the
+/// Announce an authored snapshot to every other admitted device of the
+/// snapshot's bound transition — members and readers alike — over the
+/// control plane, returning the number of envelopes sent this call (the
+/// author is skipped: it already holds the body). The epoch must be one
+/// this engine holds a control key for, and the snapshot's root manifest
+/// must be recorded — the announcement carries the transport identities the
 /// peers will fetch by (object-model.md decision 26): the body's Bao
 /// root, the root manifest's ContentId, and the transport root of the
 /// author's own sealed representation. The author signs the payload
@@ -57,6 +58,10 @@ pub(crate) fn announce(
         .log
         .members_of(&body.membership)
         .ok_or(EngineError::NoCanonicalMembership)?;
+    let readers = rebuilt
+        .log
+        .readers_of(&body.membership)
+        .ok_or(EngineError::NoCanonicalMembership)?;
 
     // Top up the author-time obligation for pre-outbox snapshots
     // (authored before the outbox existed, so no queue facts). The
@@ -64,15 +69,16 @@ pub(crate) fn announce(
     // snapshots this always matches what authoring queued — the branch
     // exists for legacy stores, not for recipient-set growth.
     // Already-covered pairs are skipped, so a re-announce commits
-    // nothing new here.
+    // nothing new here. Recipients are members and readers alike, so
+    // admitted readers keep materializing past admission.
     let mut obligation = Vec::new();
-    for member in &members {
-        if *member != engine.device
+    for recipient in members.iter().chain(readers.iter()) {
+        if *recipient != engine.device
             && !rebuilt
                 .runtime
-                .announcement_covered(body.snapshot_id(), *member)
+                .announcement_covered(body.snapshot_id(), *recipient)
         {
-            obligation.push(Fact::AnnouncementQueued(body.snapshot_id(), *member));
+            obligation.push(Fact::AnnouncementQueued(body.snapshot_id(), *recipient));
         }
     }
 

@@ -150,15 +150,16 @@ where
         .log
         .members_of(&known.transition_id)
         .ok_or(EngineError::NoCanonicalMembership)?;
+    let readers = rebuilt
+        .log
+        .readers_of(&known.transition_id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
     if !members.contains(&engine.device) {
         // Readers are known to the log but voiceless: the refusal is
         // explicit so a misconfigured reader fails loudly instead of
-        // authoring snapshots every peer drops.
-        if rebuilt
-            .log
-            .readers_of(&known.transition_id)
-            .is_some_and(|readers| readers.contains(&engine.device))
-        {
+        // authoring snapshots every peer drops. One role predicate for
+        // the function: the recipient chain below reads the same set.
+        if readers.contains(&engine.device) {
             return Err(EngineError::ReaderCannotAuthor);
         }
         return Err(EngineError::NotAMember);
@@ -243,11 +244,13 @@ where
     // The announcement obligation, atomically with the body: a crash
     // between commit and the first send still leaves a discoverable
     // outbox entry, so restart resumes without re-authoring. One entry
-    // per other member; a lone member announces to nobody.
+    // per other admitted device — members and readers alike, so admitted
+    // readers keep materializing past admission; a lone participant
+    // announces to nobody.
     let snapshot_id = authorized.snapshot().snapshot_id();
-    for member in &members {
-        if *member != engine.device {
-            facts.push(Fact::AnnouncementQueued(snapshot_id, *member));
+    for recipient in members.iter().chain(readers.iter()) {
+        if *recipient != engine.device {
+            facts.push(Fact::AnnouncementQueued(snapshot_id, *recipient));
         }
     }
     engine.commit_facts(&facts)?;

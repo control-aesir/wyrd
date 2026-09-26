@@ -4,7 +4,9 @@ use super::*;
 use wyrd_format::Change;
 use zeroize::Zeroizing;
 
-use crate::membership::test_util::{admit_reader, drive as member_drive, key, sign, Builder};
+use crate::membership::test_util::{
+    admit, admit_reader, drive as member_drive, key, sign, Builder,
+};
 use crate::membership::ForceUnclassifiedGuard;
 use crate::runtime::test_util::{
     announcement_for, announcement_msg, announcement_msg_routed, control_key, deliver, drain,
@@ -337,12 +339,17 @@ fn reader_authored_announcement_suppresses_without_fact_or_record() {
     let (reader_sk, reader_id) = key(21);
     let admission = builder.child(vec![admit_reader(reader_id)]);
     let admission_id = admission.transition_id();
+    // A second member admitted one epoch later: a stranger at the
+    // admission transition, a member of the drive.
+    let (later_sk, later_id) = key(22);
+    let later_admission = builder.child(vec![admit(later_id)]);
     let mail = vec![
         deliver(&fixture, 1, &transition_message(&genesis)),
         deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 1, &transition_message(&later_admission)),
     ];
     queue(&mut fixture, mail);
-    assert_eq!(drain(&mut fixture).accepted, 2);
+    assert_eq!(drain(&mut fixture).accepted, 3);
     let seen_after_transitions = fixture.engine.store.load().expect("loads").seen.len();
 
     // Reader-signed: structurally valid, epoch-matched, canonical —
@@ -411,8 +418,9 @@ fn reader_authored_announcement_suppresses_without_fact_or_record() {
     );
 
     // A reader-authored announcement for the already-recorded snapshot
-    // stays out: a route-only difference is not a route update when the
-    // author disagrees, so no second fact ever commits.
+    // stays out through the role gate above (it returns before the
+    // compatibility check), so the verdict is stable no matter which
+    // gate fires first.
     let reader_reroute = announcement_msg_routed(
         &identity_secret(&reader_sk),
         member_snapshot,
@@ -432,5 +440,30 @@ fn reader_authored_announcement_suppresses_without_fact_or_record() {
         facts.announcements.len(),
         1,
         "no second fact for the reader reroute"
+    );
+
+    // A route-only difference from a differing author reaches the
+    // compatibility gate (the role gate passes a non-reader) and is
+    // classified a fork, not a route update — author agreement is what
+    // makes a route update — so still no second fact.
+    let member_reroute = announcement_msg_routed(
+        &identity_secret(&later_sk),
+        member_snapshot,
+        admission.epoch,
+        admission_id,
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+        Some(vec![0xAu8]),
+    );
+    let mail = vec![deliver(&fixture, admission.epoch, &member_reroute)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "fork suppression acks without a fact");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(
+        facts.announcements.len(),
+        1,
+        "no second fact for the differing-author reroute"
     );
 }

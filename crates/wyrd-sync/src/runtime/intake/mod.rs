@@ -404,7 +404,11 @@ fn message_action(
                             // the verdict memory-only and bounded like other
                             // poison. Strangers still commit for the body
                             // phase to judge; only the known-voiceless role
-                            // suppresses here.
+                            // suppresses here. The missing-state miss falls
+                            // through deliberately: inside the Canonical arm
+                            // the derived state exists by construction, and
+                            // `authoritative` clones the same state this
+                            // read clones — no fail-open is reachable.
                             if engine
                                 .log
                                 .readers_of(&announcement.membership)

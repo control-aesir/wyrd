@@ -1846,12 +1846,15 @@ where
     ///
     /// The drain applies only (no intake, fetch, or publication):
     /// teardown submissions carry their content, and teardown must
-    /// not depend on transport liveness. A sweep that records nothing
-    /// terminally (every entry held for content no drain can fetch)
-    /// waits for work-or-close instead of spinning; those entries
-    /// resolve in the supervisor's settle. Once admission closes, one
-    /// final sweep executes the last pre-close admissions, then the
-    /// remainder belongs to the settle.
+    /// not depend on transport liveness. Drain commits are therefore
+    /// device-local durable, not served — no publication runs, so
+    /// success means the bytes serve on the next mount, and the
+    /// `submit` contract carries exactly that exception. A sweep entry
+    /// that would hold for content fails closed instead of deferring — no pass
+    /// runs after the return, so the content could never arrive and
+    /// retrying would stall shutdown to the prerequisite deadline.
+    /// Once admission closes, one final sweep executes the last
+    /// pre-close admissions, then the drain returns.
     pub fn drain_until_closed(&mut self) {
         loop {
             let closed = self.mutations.is_closed();
@@ -1869,39 +1872,35 @@ where
                     .wait_until_work_or_closed(Duration::from_millis(250));
                 continue;
             }
-            let mut recorded = false;
             for index in 0..batch.len() {
                 match self.apply_entry(&mut batch, index) {
-                    ApplyEntry::Recorded => recorded = true,
-                    ApplyEntry::Deferred(base) => {
-                        // Total order: everything behind the held
-                        // entry goes back untouched; the next sweep
-                        // retries it.
-                        batch.defer_and_release_rest(index, base);
-                        break;
+                    ApplyEntry::Recorded => {}
+                    ApplyEntry::Deferred(_) => {
+                        // Teardown cannot fetch: no pass runs after the
+                        // return, so content that is not local now will
+                        // never arrive and retrying would park the sweep
+                        // until the prerequisite deadline (30 s default)
+                        // per handle. Fail closed instead — the per-path
+                        // loss log reports it, and finishing the batch
+                        // releases the registered want.
+                        batch.record(index, Err(MutationError::Engine));
                     }
                 }
             }
             batch.finish();
             if closed {
-                // The last pre-close admissions are executed; held
-                // leftovers resolve in the supervisor's settle.
+                // The last pre-close admissions are executed; leftovers
+                // were failed closed above, so nothing is left held.
                 return;
-            }
-            if !recorded {
-                // Nothing resolved terminally — every entry waits on
-                // content only a sync pass could fetch. Wait for
-                // work-or-close instead of retrying a sweep that
-                // cannot progress.
-                self.mutations
-                    .wait_until_work_or_closed(Duration::from_millis(250));
             }
         }
     }
 
     /// The mutation channel the backend submits through: the supervisor
     /// half of the lifecycle contract (session end trips the stop flag
-    /// the loop polls; loop end completes the queue this returns).
+    /// the loop polls; the loop's return leaves the queue open for the
+    /// post-return drain, and only the supervisor closes it after the
+    /// teardown joins).
     pub fn mutations(&self) -> &Arc<MutationQueue> {
         &self.mutations
     }

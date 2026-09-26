@@ -696,10 +696,14 @@ impl MutationQueue {
     /// Submit one operation and block until it commits or fails. At
     /// admission the request is durably unordered but total-ordered; the
     /// caller returns only after the executing pass completes it, so a
-    /// success means the state is served. Saturation (`EAGAIN`) is the
-    /// only failure that means the request never executed — and a closed
-    /// queue (loop stopped) fails fast with `Shutdown` without enqueueing,
-    /// so no admitted caller can outlive the loop that would drain it.
+    /// sync-pass success means the state is served. Teardown-drain
+    /// commits are the exception: the drain finishes immediately
+    /// without publishing, so their success means device-local durable
+    /// (served on the next mount's first pass), never less.
+    /// Saturation (`EAGAIN`) is the only failure that means the
+    /// request never executed — and a closed queue (teardown past the
+    /// admission close) fails fast with `Shutdown` without enqueueing,
+    /// so no admitted caller can outlive the teardown that owns it.
     pub fn submit(&self, kind: MutationKind) -> Result<MutationOutcome, MutationError> {
         let id = MutationId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let reply = Arc::new(Reply::default());

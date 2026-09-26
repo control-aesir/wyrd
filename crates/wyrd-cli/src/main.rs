@@ -414,6 +414,17 @@ pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// that never clears.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long teardown waits for the bulk endpoint's graceful close:
+/// much longer than the task-cancel bound above, because the close
+/// drains in-flight transfers over the same degraded links the drive
+/// syncs over — a throttled loopback legitimately needs tens of
+/// seconds, and mistaking a slow close for a wedged one turns clean
+/// shutdowns into mount failures. Still bounded, so a peer that
+/// never answers cannot hang teardown forever; a timeout still fails
+/// the mount. Sized with the serving shutdown cap (10s) to fit the
+/// e2e stop budgets (90s on the throttled big-vault step).
+const BULK_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
 /// platform cannot install the handler, termination falls back to the
 /// default disposition (same as dying in `fuser::mount` today).
@@ -677,7 +688,9 @@ fn mount(
     // drop, and a shutdown could wait on a relay outage that never
     // clears.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
-    let bulk_status = bulk.shutdown(SHUTDOWN_DEADLINE).map_err(CliError::Mount);
+    let bulk_status = bulk
+        .shutdown(BULK_SHUTDOWN_DEADLINE)
+        .map_err(CliError::Mount);
     if let Err(error) = &bulk_status {
         tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
     }

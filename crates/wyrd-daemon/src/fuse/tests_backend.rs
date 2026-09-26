@@ -792,11 +792,13 @@ fn single_open_capture_cannot_evade_the_byte_budget() {
     backend.destroy();
 }
 
-/// A refused `insert_reserved` returns its promise: the byte ceiling
-/// is checked after the promise is consumed, so the refusal restores
-/// it — a refused insert never strands a slot toward `EMFILE`.
+/// A refused `insert_reserved` consumes its promise: the byte ceiling
+/// is checked after the promise is consumed, so a refusal leaves the
+/// table with neither a handle nor a promise. Consume (not restore)
+/// is the shipped semantics: restoring would hand the promise back to
+/// a caller with no release path, reintroducing the leak.
 #[test]
-fn refused_insert_returns_its_promise() {
+fn refused_insert_consumes_its_promise() {
     let mut backend = chunky_backend(256);
     backend.max_open_handles = 4096;
     // Room for nothing: any insert refuses on the byte ceiling.
@@ -814,7 +816,7 @@ fn refused_insert_returns_its_promise() {
     );
     {
         let files = backend.files.lock().unwrap();
-        assert_eq!(files.reserved, 0, "the refused insert restored its promise");
+        assert_eq!(files.reserved, 0, "the refused insert consumed its promise");
         assert!(
             files.by_handle.is_empty(),
             "the refused insert stored nothing"

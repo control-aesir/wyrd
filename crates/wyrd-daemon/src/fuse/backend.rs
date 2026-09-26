@@ -651,9 +651,6 @@ where
         Ok(FileHandle(handle))
     }
 
-    /// Best-effort admission check before operations with side
-    /// effects: refuses `EMFILE` while the table is at the cap, so a
-    /// saturated table never triggers pointless work downstream.
     /// Promise a handle slot to an in-progress create: the count
     /// holds room across the blocking mutation submit, which must
     /// not hold the table lock. A saturated table (open plus

@@ -52,7 +52,8 @@ pub const DEFAULT_MAX_OPEN_HANDLES: usize = 4096;
 /// chunk lists plus writable capture-plus-base pairs). Refusals are
 /// `ENOSPC`, like every other byte budget: the exhausted resource is
 /// memory, not descriptor slots. Sized so every one of the 4096
-/// handle slots may pin a 64 KiB chunk list — far above plausible
+/// handle slots may pin a 64 KiB chunk list — two, for a writable
+/// handle, which pins capture plus base — far above plausible
 /// interactive use — while a pathological many-handle × many-chunk
 /// combination fails closed instead of retaining gigabytes: one
 /// maxed-out file (65,536 identities, 2 MiB per capture) still opens,

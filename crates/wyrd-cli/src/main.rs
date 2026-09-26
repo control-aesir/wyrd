@@ -633,23 +633,13 @@ fn mount(
             );
         },
     );
-    // The loop returned cleanly or terminally: settle the mutation
-    // queue (run_loop already drained on exit; this is the idempotent
-    // supervisor half) before tearing down serving and the bulk source.
-    supervisor.note_loop_ended();
-    // Cancel the mailbox tasks within a bounded deadline: the drainer
-    // and supervisor stop, and the runtime aborts whatever has not
-    // yielded by then. Without this the tasks would run until runtime
-    // drop, and a shutdown could wait on a relay outage that never
-    // clears.
-    mailbox.shutdown(SHUTDOWN_DEADLINE);
-    bulk.shutdown();
-    let _ = serving.shutdown();
-
-    // Clean shutdown either way: unmount first so the kernel releases
-    // the mountpoint, then reap the session thread, then report the
-    // combined outcome — a dead serving thread fails the mount even
-    // when the loop stopped cleanly.
+    // Presentation down first: unmount so the kernel releases the
+    // mountpoint, then reap the session thread (`destroy` commits
+    // dirty handles here) before cutting transport. A dead loop must
+    // not keep serving reads while its shutdown drains, and the
+    // session teardown lands at the earliest point the queue state
+    // allows — every later step runs against a closed queue and can
+    // only report loss, never prevent it.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
         tracing::warn!(stage = "session", error = %error, "unmount failed");
@@ -665,14 +655,42 @@ fn mount(
                     tracing::debug!(stage = "session", error = %error, "session thread joined with error");
                 }
             }
-            result
+            result.map_err(CliError::Mount)
         }
         Err(_) => {
             tracing::error!(stage = "session", "FUSE session thread panicked");
-            Err(std::io::Error::other("FUSE session thread panicked"))
+            Err(CliError::Mount(std::io::Error::other(
+                "FUSE session thread panicked",
+            )))
         }
     };
-    combine_status(result, session_result)
+    // The loop returned cleanly or terminally: settle the mutation
+    // queue (run_loop already settled it on exit; this is the
+    // idempotent supervisor half) before tearing down the bulk source
+    // and serving. Every teardown outcome is collected, not short-
+    // circuited: a failed bulk close must not skip the serving
+    // shutdown, and the combined status reports the first failure.
+    supervisor.note_loop_ended();
+    // Cancel the mailbox tasks within a bounded deadline: the drainer
+    // and supervisor stop, and the runtime aborts whatever has not
+    // yielded by then. Without this the tasks would run until runtime
+    // drop, and a shutdown could wait on a relay outage that never
+    // clears.
+    mailbox.shutdown(SHUTDOWN_DEADLINE);
+    let bulk_status = bulk.shutdown(SHUTDOWN_DEADLINE).map_err(CliError::Mount);
+    if let Err(error) = &bulk_status {
+        tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
+    }
+    let serving_status = serving.shutdown().map_err(CliError::Mount);
+    if let Err(error) = &serving_status {
+        tracing::warn!(stage = "serving", error = %error, "serving shutdown failed");
+    }
+    combine_status(
+        result.map_err(CliError::Live).map(|_| ()),
+        session_result,
+        bulk_status,
+        serving_status,
+    )
 }
 
 /// Export the drive's namespace to a plain tree. The open path

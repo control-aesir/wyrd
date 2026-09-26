@@ -1114,7 +1114,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
         serving.shutdown().unwrap();
     }
 
@@ -1152,7 +1152,7 @@ mod tests {
             source.fetch_transport(&root, usize::MAX).unwrap(),
             Some(sealed)
         );
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
         reopened.shutdown().unwrap();
     }
 
@@ -1220,7 +1220,7 @@ mod tests {
             hash: *root.as_bytes(),
         });
         let fetched = source.fetch_transport(root, usize::MAX).ok().flatten();
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
         fetched
     }
 

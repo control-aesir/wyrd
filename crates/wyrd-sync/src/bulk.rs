@@ -312,9 +312,23 @@ impl IrohBulkSource {
         self.sealed.get(storage).map(Vec::as_slice)
     }
 
-    /// Close the owned endpoint after all in-flight transfers have finished.
-    pub fn shutdown(&self) {
-        self.runtime.block_on(self.endpoint.close());
+    /// Close the owned endpoint, waiting at most `deadline` for
+    /// in-flight transfers to finish: teardown joins must stay bounded
+    /// even when a peer stalls mid-transfer. A timeout abandons the
+    /// graceful close and reports it — the source is still dropped by
+    /// the caller, so no transfer outlives the shutdown either way.
+    pub fn shutdown(&self, deadline: std::time::Duration) -> std::io::Result<()> {
+        self.runtime.block_on(async {
+            tokio::time::timeout(deadline, self.endpoint.close())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "bulk endpoint close timed out with transfers in flight",
+                    )
+                })?;
+            Ok(())
+        })
     }
 
     /// Fetch a representation by trying each recorded provider in
@@ -870,7 +884,30 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn idle_endpoint_close_is_bounded_and_clean() {
+        use iroh::{endpoint::presets, Endpoint};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let source = IrohBulkSource::with_runtime(endpoint, Arc::new(runtime));
+        // No transfers in flight: the close lands inside the deadline
+        // and reports clean. (A stalled peer would trip the timeout
+        // instead — that path is timing, not logic, so it stays
+        // unpinned.)
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1008,7 +1045,7 @@ mod tests {
             router_a.shutdown().await.unwrap();
             server_a.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1107,7 +1144,7 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1167,7 +1204,7 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1230,7 +1267,7 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     fn direct_addr(endpoint: &iroh::Endpoint) -> EndpointAddr {

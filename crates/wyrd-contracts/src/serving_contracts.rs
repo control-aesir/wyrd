@@ -90,7 +90,7 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
             "every sealed object landed over live transport"
         );
     }
-    bulk.shutdown();
+    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
     restarted.shutdown().unwrap();
     loaded.rig.teardown();
     let _ = std::fs::remove_dir_all(&serve_dir);

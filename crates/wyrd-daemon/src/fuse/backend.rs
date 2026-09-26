@@ -2539,9 +2539,38 @@ where
     }
 
     fn destroy(&mut self) {
-        // Unmount: the handle table must not leak across mounts.
-        if let Ok(mut files) = self.files.lock() {
-            files.by_handle.clear();
+        // Unmount: commit dirty writable handles best-effort, then
+        // drop the table so it never leaks across mounts. Removal
+        // precedes each commit (as in `release_handle`) so a
+        // concurrent lookup cannot race the drop. A live loop drains
+        // these commits like any release-path write; a settled queue
+        // refuses fast with `Shutdown` and the loss is logged per
+        // path — never silent, never a hung session thread.
+        // Composer precondition: destroy must not run against an
+        // open-but-undrained queue; that blocks exactly like a
+        // steady-state release behind a stalled loop.
+        let removed: Vec<(u64, Handle)> = match self.files.lock() {
+            Ok(mut files) => files.by_handle.drain().collect(),
+            Err(error) => {
+                tracing::error!(stage = "session", error = %error, "destroy found a poisoned handle table; dirty writes are lost");
+                return;
+            }
+        };
+        for (id, handle) in removed {
+            if let Handle::Write(handle) = handle {
+                let path = handle
+                    .lock()
+                    .map(|write| write.path.clone())
+                    .unwrap_or_else(|_| format!("<fh {id}>"));
+                match self.commit_write_handle(&handle) {
+                    Ok(()) => {
+                        tracing::info!(stage = "session", %path, "destroy committed a dirty handle")
+                    }
+                    Err(error) => {
+                        tracing::error!(stage = "session", %path, ?error, "destroy dropped a dirty handle's buffered writes")
+                    }
+                }
+            }
         }
     }
 }

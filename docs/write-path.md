@@ -586,7 +586,10 @@ Buffered state is memory, so these are daemon-write budgets; overflow
 fails closed rather than allocating without limit. Total open handles
 are additionally capped (`max_open_handles`, default 4096,
 `EMFILE` past it) — read captures pin their open-time version, so
-the table is memory too.
+the table is memory too — and retained capture bytes have their own
+ceiling (`max_open_capture_bytes`, default 256 MiB, `ENOSPC` past
+it, checked at open): a writable handle pins its capture plus its
+commit base.
 
 These budgets are local; they are independent of the **protocol
 ingest limits** (`Limits::V0`), which still bound every committed object.

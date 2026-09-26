@@ -5,13 +5,14 @@
 //! admission, mutation queue, write buffers, engine intake); this
 //! struct gathers the node-side ones into one place with the legacy
 //! constants as defaults, so embedders tune numbers without touching
-//! code and tests pin the defaults to the historical behavior. Two
-//! exceptions are new, not legacy: `max_admit_per_pass` (admission was
-//! previously uncapped per pass), `max_open_handles` (the table was
-//! previously bounded only by the kernel descriptor limit), and
-//! `max_parent_tokens` (the create-parent registry was new in the
-//! parent-race fix) — all are intentional new bounds, sized generously
-//! (see each default). The `wyrd` binary itself takes no tuning flags
+//! code and tests pin the defaults to the historical behavior. The
+//! intentional new bounds, not legacy, are `max_admit_per_pass`
+//! (admission was previously uncapped per pass), `max_open_handles`
+//! (the table was previously bounded only by the kernel descriptor
+//! limit), `max_open_capture_bytes` (the count cap could not bound
+//! retained chunk-list bytes), and `max_parent_tokens` (the
+//! create-parent registry was new in the parent-race fix) — all sized
+//! generously (see each default). The `wyrd` binary itself takes no tuning flags
 //! today and runs defaults; these are library-level settings until a
 //! configuration surface lands. The sync-engine bounds
 //! (`MAX_PENDING_MESSAGES`, fetch backoff) stay constants: they are
@@ -43,8 +44,21 @@ pub const DEFAULT_MAX_ADMIT_PER_PASS: usize = 1024;
 /// images). Refusals are `EMFILE`: the table is per-process, like the
 /// descriptor table the errno names. Sized with the registry family
 /// (4096): far above plausible interactive use, tight enough to bound
-/// pinned-capture memory.
+/// handle count — but not retained bytes, which have their own
+/// ceiling below.
 pub const DEFAULT_MAX_OPEN_HANDLES: usize = 4096;
+
+/// Most retained open-capture bytes across all open handles (read
+/// chunk lists plus writable capture-plus-base pairs). Refusals are
+/// `ENOSPC`, like every other byte budget: the exhausted resource is
+/// memory, not descriptor slots. Sized so every one of the 4096
+/// handle slots may pin a 64 KiB chunk list — two, for a writable
+/// handle, which pins capture plus base — far above plausible
+/// interactive use — while a pathological many-handle × many-chunk
+/// combination fails closed instead of retaining gigabytes: one
+/// maxed-out file (65,536 identities, 2 MiB per capture) still opens,
+/// the 129th concurrent one does not.
+pub const DEFAULT_MAX_OPEN_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The node-side resource bounds, threaded from the live config into
 /// the loop, the registries, and the backend at composition time.
@@ -75,6 +89,9 @@ pub struct ResourceBudgets {
     pub write_dirty_handles: usize,
     /// Most open file handles at once (`EMFILE` past it).
     pub max_open_handles: usize,
+    /// Most retained open-capture bytes across all open handles
+    /// (`ENOSPC` past it).
+    pub max_open_capture_bytes: usize,
 }
 
 impl Default for ResourceBudgets {
@@ -88,6 +105,7 @@ impl Default for ResourceBudgets {
             write_aggregate_bytes: MAX_BUFFERED_BYTES,
             write_dirty_handles: MAX_DIRTY_HANDLES,
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
+            max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
         }
     }
 }

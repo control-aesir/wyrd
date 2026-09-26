@@ -174,6 +174,14 @@ impl OpenFile {
         &self.chunks
     }
 
+    /// Retained chunk-list bytes: what this capture pins in memory
+    /// while the handle is open. The open-handle byte budget accounts
+    /// this per handle — a handle is never cheap merely because its
+    /// data is not materialized yet.
+    pub fn capture_bytes(&self) -> usize {
+        self.chunks.len() * std::mem::size_of::<ContentId>()
+    }
+
     /// The declared size reads verify against.
     pub fn size(&self) -> u64 {
         self.size

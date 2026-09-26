@@ -1,5 +1,8 @@
 use super::backend::current_owner;
-use super::tests_harness::{backend, evolving_backend, heads, snapshot_of, NoMaterialization};
+use super::inode::{Handle, ReadHandle};
+use super::tests_harness::{
+    backend, chunky_backend, evolving_backend, heads, snapshot_of, NoMaterialization,
+};
 use super::*;
 
 use fuser::{FileHandle, INodeNo};
@@ -7,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wyrd_format::ObjectStore;
-use wyrd_fuse::{DriveView, Node};
+use wyrd_fuse::{DriveView, Node, OpenFile};
 
 use wyrd_core::mutation::{
     FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
@@ -722,6 +725,118 @@ fn failed_truncated_open_releases_its_budget_reservation() {
     );
     assert_eq!(backend.budget.total(), 0, "no leaked aggregate bytes");
     assert!(backend.release_handle(reader).is_ok());
+    backend.destroy();
+}
+
+/// Past the aggregate open-capture byte ceiling, opens refuse
+/// `ENOSPC` while the handle-count cap sits untouched: the count cap
+/// alone cannot bound retained chunk-list bytes. Open handles keep
+/// serving and a release drains byte room for the next open.
+#[test]
+fn open_captures_refuse_enospc_past_the_byte_ceiling() {
+    // 256 identities × 32 bytes = 8 KiB retained per read capture.
+    let mut backend = chunky_backend(256);
+    backend.max_open_handles = 4096;
+    backend.max_open_capture_bytes = 3 * 256 * 32;
+    let first = backend.open_at("big.bin").unwrap();
+    let second = backend.open_at("big.bin").unwrap();
+    let third = backend.open_at("big.bin").unwrap();
+    assert_eq!(
+        backend.open_at("big.bin"),
+        Err(fuser::Errno::ENOSPC),
+        "a fourth 8 KiB capture past the 24 KiB ceiling refuses"
+    );
+    assert!(
+        backend.read_handle(first, 0, 4).is_ok(),
+        "open handles serve on"
+    );
+    assert!(backend.release_handle(first).is_ok());
+    assert!(
+        backend.open_at("big.bin").is_ok(),
+        "releasing drains byte room for the next open"
+    );
+    for handle in [second, third] {
+        assert!(backend.release_handle(handle).is_ok());
+    }
+    backend.destroy();
+}
+
+/// A single handle cannot evade the capture budget: a budget below
+/// one read capture refuses the very first open, and a budget between
+/// one and two captures admits the read handle but refuses the
+/// writable one (capture plus commit base).
+#[test]
+fn single_open_capture_cannot_evade_the_byte_budget() {
+    let mut backend = chunky_backend(256);
+    backend.max_open_handles = 4096;
+    backend.max_open_capture_bytes = 256 * 32 - 1;
+    assert_eq!(
+        backend.open_at("big.bin"),
+        Err(fuser::Errno::ENOSPC),
+        "one 8 KiB capture past a sub-capture ceiling refuses"
+    );
+    backend.max_open_capture_bytes = 256 * 32;
+    let reader = backend.open_at("big.bin").unwrap();
+    backend.mutations = Some(Arc::new(MutationQueue::default()));
+    assert_eq!(
+        backend.open_write("big.bin", libc::O_RDWR),
+        Err(fuser::Errno::ENOSPC),
+        "a writable handle pins capture plus base: 16 KiB past an 8 KiB ceiling refuses"
+    );
+    assert_eq!(
+        backend.files.lock().unwrap().reserved,
+        0,
+        "the refused write-open gave its promised slot back"
+    );
+    assert!(backend.release_handle(reader).is_ok());
+    backend.destroy();
+}
+
+/// A refused `insert_reserved` consumes its promise: the byte ceiling
+/// is checked after the promise is consumed, so a refusal leaves the
+/// table with neither a handle nor a promise. Consume (not restore)
+/// is the shipped semantics: restoring would hand the promise back to
+/// a caller with no release path, reintroducing the leak.
+#[test]
+fn refused_insert_consumes_its_promise() {
+    let mut backend = chunky_backend(256);
+    backend.max_open_handles = 4096;
+    // Room for nothing: any insert refuses on the byte ceiling.
+    backend.max_open_capture_bytes = 0;
+    backend.reserve_slot().unwrap();
+    let big = Handle::Read(ReadHandle {
+        ino: None,
+        capture: OpenFile::new(vec![ContentId::from_bytes([0xAB; 32]); 256], 256),
+        executable: false,
+    });
+    assert_eq!(
+        backend.insert_reserved(big),
+        Err(fuser::Errno::ENOSPC),
+        "an over-ceiling insert refuses"
+    );
+    {
+        let files = backend.files.lock().unwrap();
+        assert_eq!(files.reserved, 0, "the refused insert consumed its promise");
+        assert!(
+            files.by_handle.is_empty(),
+            "the refused insert stored nothing"
+        );
+    }
+    // The slot is usable afterwards: the refusal stranded nothing.
+    backend.max_open_capture_bytes = 256 * 32;
+    backend.reserve_slot().unwrap();
+    let small = Handle::Read(ReadHandle {
+        ino: None,
+        capture: OpenFile::new(Vec::new(), 0),
+        executable: false,
+    });
+    let handle = backend.insert_reserved(small).unwrap();
+    assert_eq!(
+        backend.files.lock().unwrap().reserved,
+        0,
+        "a served insert consumes its promise exactly once"
+    );
+    assert!(backend.release_handle(handle).is_ok());
     backend.destroy();
 }
 

@@ -150,6 +150,25 @@ pub(super) enum Handle {
     Write(Arc<Mutex<WriteHandle>>),
 }
 
+impl Handle {
+    /// Retained capture bytes: the read chunk list, or the writable
+    /// capture-plus-base pair. `None` when a held handle mutex is
+    /// poisoned — callers fail the admission closed.
+    pub(super) fn retained_bytes(&self) -> Option<usize> {
+        match self {
+            Handle::Read(read) => Some(read.capture.capture_bytes()),
+            Handle::Write(write) => {
+                let held = write.lock().ok()?;
+                Some(
+                    held.capture
+                        .capture_bytes()
+                        .saturating_add(held.base.capture_bytes()),
+                )
+            }
+        }
+    }
+}
+
 /// One writable open: the path, the identity it opened against, and the
 /// dense logical image its writes build.
 ///
@@ -201,6 +220,31 @@ pub(super) struct OpenFiles {
     pub(super) by_handle: HashMap<u64, Handle>,
     pub(super) next: u64,
     pub(super) reserved: usize,
+}
+
+impl OpenFiles {
+    /// Retained open-capture bytes across all open handles: each read
+    /// capture plus each writable capture-plus-base pair. Computed on
+    /// demand under the table lock, so releases can never drift it —
+    /// the handle leaves the table under the same lock first. Re-pins
+    /// (commit re-pins, concurrent-path repins) replace a handle's
+    /// capture without re-checking, so the sum bounds admission, not
+    /// steady-state retention: a handle opened small may grow toward
+    /// the ingest chunk ceiling afterwards. The scan is O(open
+    /// handles) with one mutex acquisition per writable handle,
+    /// serialized behind any in-flight commit — microseconds at
+    /// interactive scale, and a cached counter would need maintenance
+    /// on every re-pin path. Locking follows the `clean_handles_on`
+    /// order (table, then handle), and a poisoned handle mutex fails
+    /// closed (`None` refuses the open as `EIO` — mount-wide until
+    /// that handle is released, not per-request).
+    pub(super) fn captured_bytes(&self) -> Option<usize> {
+        let mut total = 0usize;
+        for handle in self.by_handle.values() {
+            total = total.saturating_add(handle.retained_bytes()?);
+        }
+        Some(total)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

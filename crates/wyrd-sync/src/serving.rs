@@ -757,6 +757,19 @@ impl ServingEndpoint {
                 }
             }));
             Router::builder(endpoint.clone())
+                // No per-requester check here, by design (trust.md
+                // T17): the blobs protocol answers exact
+                // transport-root lookups only, and the (address, hash)
+                // pairs that make a lookup possible travel inside
+                // sealed announcements to members and readers alone.
+                // Authorization is membership via announcement
+                // confidentiality; admission is content verification
+                // on the fetch side (the transfer proves the
+                // advertised root). The availability consequence is
+                // accepted: a member who can name a StorageId can
+                // fetch its ciphertext from any serving member.
+                // Unknown roots are absence, never an error and never
+                // a listing.
                 .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
                 .spawn()
         });
@@ -1142,6 +1155,51 @@ mod tests {
                 .unwrap(),
             None
         );
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
+    #[test]
+    fn serving_endpoint_bounds_live_fetches_by_the_request_ceiling() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let sealed = vec![0xA5u8; 512];
+        let root = vault.import(&sealed).unwrap();
+        serving.flush().unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut source =
+            crate::bulk::IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+        source.publish_transport(crate::bulk::IrohBlobRef {
+            provider: serving.addr(),
+            hash: *root.as_bytes(),
+        });
+        // The ceiling rides the live request: the verified size
+        // rejects an oversize blob before anything streams, so a
+        // small max classifies Oversize over real transport instead
+        // of pulling unbounded bytes.
+        assert_eq!(
+            source.fetch_transport(&root, 16),
+            Err(BulkError::Oversize {
+                bytes: 512,
+                max: 16
+            })
+        );
+        // ... while the same bytes verify under a fitting ceiling.
+        assert_eq!(source.fetch_transport(&root, 512).unwrap(), Some(sealed));
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
         serving
             .shutdown(std::time::Duration::from_secs(10))

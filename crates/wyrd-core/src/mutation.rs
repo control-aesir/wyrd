@@ -1146,6 +1146,27 @@ mod tests {
         }
     }
 
+    /// A classified store fault survives the format boundary: a full
+    /// disk reported by the store reads as `Store(StorageFull)`
+    /// (`ENOSPC` at the mount), never opaque `Engine`. Root-proof:
+    /// no filesystem state, just the classification the real
+    /// disk-backed stores report through the same arm.
+    #[test]
+    fn format_store_full_reports_no_space() {
+        use wyrd_format::StoreError;
+        #[derive(Debug)]
+        struct Full;
+        impl StoreError for Full {
+            fn failure(&self) -> StoreFailure {
+                StoreFailure::StorageFull
+            }
+        }
+        assert_eq!(
+            MutationError::from_format(wyrd_format::MutationError::Store(Full)),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
+    }
+
     /// Block until a request is queued, then take it as a batch. The
     /// guard completes on drop, so tests must finish it explicitly.
     fn take_batch_blocking(queue: &MutationQueue) -> MutationBatch<'_> {

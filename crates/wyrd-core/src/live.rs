@@ -460,7 +460,8 @@ enum ApplyEntry {
 /// Classify an authoring failure for the mutation channel. Resource
 /// conditions keep their POSIX meaning — a classified store failure
 /// passes through, a vault or durable I/O failure reads its OS
-/// errno, and a protocol ingest rejection names its ceiling — while
+/// errno through the shared store rule, and a protocol ingest
+/// rejection reports its observed size (or count and ceiling) — while
 /// validation, durability, and internal failures stay opaque
 /// `Engine` (EIO at the boundary). The channel never interpolates
 /// the engine error: foreign debug text (paths, key-adjacent
@@ -468,21 +469,37 @@ enum ApplyEntry {
 /// never in the variant a waiter matches on.
 fn authoring_error(error: EngineError) -> MutationError {
     match error {
+        // Not currently raised by `author_snapshot` (its only
+        // producers are the fetch planner): kept so a future
+        // classified store failure can never regress to opaque
+        // `Engine` unnoticed.
         EngineError::Store(failure) => MutationError::Store(failure),
         EngineError::Ingest(IngestError::TooLarge { bytes, .. }) => {
+            // `usize` is never wider than `u64` on a supported
+            // target; the fallback saturates rather than panics, so
+            // a lying platform still reports a ceiling, never a
+            // panic on the failure path.
             MutationError::TooLarge(u64::try_from(bytes).unwrap_or(u64::MAX))
         }
         EngineError::Ingest(IngestError::TooMany { count, max, .. }) => {
             MutationError::TooMany { count, max }
         }
+        // One classification rule for every disk-backed store
+        // (`StoreFailure::of_io`): the vault and the durable commit
+        // can never disagree with the object store on what "full"
+        // is — quota included. Unclassified I/O stays opaque
+        // `Engine`, and the foreign error stays in the trace.
         EngineError::Vault(VaultError::Io(error))
-        | EngineError::Durable(DurableError::Io(error)) => match error.kind() {
-            std::io::ErrorKind::StorageFull => MutationError::Store(StoreFailure::StorageFull),
-            std::io::ErrorKind::PermissionDenied => {
-                MutationError::Store(StoreFailure::PermissionDenied)
-            }
-            _ => MutationError::Engine,
+        | EngineError::Durable(DurableError::Io(error)) => match StoreFailure::of_io(&error) {
+            StoreFailure::Transient => MutationError::Engine,
+            failure => MutationError::Store(failure),
         },
+        // Bounded mirror backpressure, not a broken device — but
+        // still `EIO`, deliberately: an `EAGAIN` would replay the
+        // whole mutation at the syscall layer, which double-applies
+        // non-idempotent ops (append). Fail closed and let the
+        // caller decide; the serving drain retries the import.
+        EngineError::Vault(VaultError::MirrorFull { .. }) => MutationError::Engine,
         // A store read the loop cannot classify: the foreign debug
         // text stays in the trace, and the channel carries the
         // transient store failure (EIO), never the string.
@@ -2458,11 +2475,15 @@ mod prereq_tests {
         );
     }
 
-    /// Authoring I/O failures classify by OS errno: a vault or
-    /// durable write that hits a full disk is `ENOSPC`, a denied one
-    /// is `EACCES`, and anything else stays opaque `Engine`.
+    /// Authoring I/O failures classify by the shared store rule: a
+    /// vault or durable write that hits a full disk — quota included
+    /// — is `ENOSPC`, a denied one is `EACCES`, and anything else
+    /// stays opaque `Engine`. Mirror backpressure is `EIO` too, by
+    /// decision: an `EAGAIN` would replay the whole mutation and
+    /// double-apply non-idempotent ops.
     #[test]
     fn authoring_io_failures_classify_by_os_errno() {
+        use wyrd_format::BaoRoot;
         use wyrd_sync::durable::DurableError;
         use wyrd_sync::serving::VaultError;
         fn io(kind: std::io::ErrorKind) -> std::io::Error {
@@ -2477,6 +2498,14 @@ mod prereq_tests {
         assert_eq!(
             authoring_error(EngineError::Vault(VaultError::Io(io(
                 std::io::ErrorKind::StorageFull
+            )))),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
+        // Quota exhaustion is full, not opaque: the shared store
+        // rule says so, and the vault must agree with it.
+        assert_eq!(
+            authoring_error(EngineError::Vault(VaultError::Io(io(
+                std::io::ErrorKind::QuotaExceeded
             )))),
             MutationError::Store(StoreFailure::StorageFull)
         );
@@ -2496,6 +2525,16 @@ mod prereq_tests {
             authoring_error(EngineError::Durable(DurableError::Io(io(
                 std::io::ErrorKind::BrokenPipe
             )))),
+            MutationError::Engine
+        );
+        assert_eq!(
+            authoring_error(EngineError::Vault(VaultError::MirrorFull {
+                root: BaoRoot::from_bytes([0x11; 32]),
+                queued_items: 64,
+                queued_bytes: 64 << 20,
+                max_bytes: 64 << 20,
+                rejected: 1,
+            })),
             MutationError::Engine
         );
     }
@@ -2540,25 +2579,51 @@ mod prereq_tests {
         }
     }
 
+    /// A directory held read-only for a fault-injection test, with
+    /// its permissions restored on drop: a failed assert must never
+    /// leave a `0555` directory behind in the system temp dir.
+    #[cfg(unix)]
+    struct ReadOnlyDir<'a> {
+        path: &'a std::path::Path,
+    }
+
+    #[cfg(unix)]
+    impl<'a> ReadOnlyDir<'a> {
+        /// Lock `path` read-only. Returns `None` when the refusal
+        /// cannot occur — root bypasses permissions, so writability
+        /// is probed after the chmod and the test skips instead of
+        /// asserting nothing.
+        fn lock(path: &'a std::path::Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let probe = path.join(".writetest");
+            if std::fs::File::create(&probe).is_ok() {
+                std::fs::remove_file(&probe).unwrap();
+                return None;
+            }
+            Some(Self { path })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDir<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     /// An unwritable vault fails the commit with denied, through the
     /// real authoring path: the mutation applies, the snapshot seals,
     /// and the vault import refusal carries `EACCES` to the waiter.
     #[cfg(unix)]
     #[test]
     fn unwritable_vault_dir_fails_the_commit_with_denied() {
-        use std::os::unix::fs::PermissionsExt;
         let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("vault-perm");
         let vault = dir.join("vault");
-        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Root bypasses permissions, so probe writability now that
-        // the vault is supposed to be read-only and skip when the
-        // refusal cannot occur.
-        let probe = vault.join(".writetest");
-        if std::fs::File::create(&probe).is_ok() {
-            std::fs::remove_file(&probe).unwrap();
-            std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(guard) = ReadOnlyDir::lock(&vault) else {
             return;
-        }
+        };
         let mut node = live_over_fake(engine, store, &[head]);
         let error = node
             .apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
@@ -2569,7 +2634,7 @@ mod prereq_tests {
             "a vault import refusal is EACCES, not EIO: {error:?}"
         );
         drop(node);
-        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(guard);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2579,18 +2644,11 @@ mod prereq_tests {
     #[cfg(unix)]
     #[test]
     fn unwritable_durable_dir_fails_the_commit_with_denied() {
-        use std::os::unix::fs::PermissionsExt;
         let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("durable-perm");
         let commits = dir.join("commits");
-        std::fs::set_permissions(&commits, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Root bypasses permissions: probe, and skip when the
-        // refusal cannot occur.
-        let probe = commits.join(".writetest");
-        if std::fs::File::create(&probe).is_ok() {
-            std::fs::remove_file(&probe).unwrap();
-            std::fs::set_permissions(&commits, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(guard) = ReadOnlyDir::lock(&commits) else {
             return;
-        }
+        };
         let mut node = live_over_fake(engine, store, &[head]);
         let error = node
             .apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
@@ -2601,7 +2659,7 @@ mod prereq_tests {
             "a durable-commit refusal is EACCES, not EIO: {error:?}"
         );
         drop(node);
-        std::fs::set_permissions(&commits, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(guard);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

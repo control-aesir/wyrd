@@ -349,6 +349,20 @@ fn reader_receives_ongoing_snapshot_announcements() {
             .unwrap()
     };
     assert_eq!(sent, 1, "the lone reader is the only recipient");
+    // The top-up commits nothing new for an already-covered reader:
+    // exactly one queue fact names the pair, never a duplicate.
+    assert_eq!(
+        engine
+            .store
+            .load()
+            .expect("loads")
+            .announcement_queued
+            .iter()
+            .filter(|pair| **pair == (snapshot_id, reader_id))
+            .count(),
+        1,
+        "no duplicate queue fact for the covered reader"
+    );
     let report = {
         let mut receiver = MemoryMailbox {
             relay: &mut relay,
@@ -370,10 +384,9 @@ fn reader_receives_ongoing_snapshot_announcements() {
 
     // The reader materializes the new head over the author's vault —
     // convergence without authorship.
-    let serving =
+    let mut serving =
         crate::serving::VaultSource::from_state(&engine.runtime_state().unwrap(), engine.vault())
             .unwrap();
-    let mut serving = serving;
     let mut peer_objects = MemoryObjectStore::default();
     joined
         .execute_plan(&mut serving, &mut peer_objects)

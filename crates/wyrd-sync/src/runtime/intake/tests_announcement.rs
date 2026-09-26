@@ -7,9 +7,10 @@ use zeroize::Zeroizing;
 use crate::membership::test_util::{admit_reader, drive as member_drive, key, sign, Builder};
 use crate::membership::ForceUnclassifiedGuard;
 use crate::runtime::test_util::{
-    announcement_for, announcement_msg, control_key, deliver, drain, fixture, identity_secret,
-    owner, queue, transition_message, MemoryMailbox,
+    announcement_for, announcement_msg, announcement_msg_routed, control_key, deliver, drain,
+    fixture, identity_secret, owner, queue, transition_message, MemoryMailbox,
 };
+use wyrd_format::{BaoRoot, ContentId};
 #[test]
 fn announcement_defers_until_membership_lands() {
     let mut fixture = fixture();
@@ -407,5 +408,29 @@ fn reader_authored_announcement_suppresses_without_fact_or_record() {
             .announcement(&member_snapshot)
             .is_some(),
         "member announcement is fetchable"
+    );
+
+    // A reader-authored announcement for the already-recorded snapshot
+    // stays out: a route-only difference is not a route update when the
+    // author disagrees, so no second fact ever commits.
+    let reader_reroute = announcement_msg_routed(
+        &identity_secret(&reader_sk),
+        member_snapshot,
+        admission.epoch,
+        admission_id,
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+        Some(vec![0x9u8]),
+    );
+    let mail = vec![deliver(&fixture, admission.epoch, &reader_reroute)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "suppression acks without a fact");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(
+        facts.announcements.len(),
+        1,
+        "no second fact for the reader reroute"
     );
 }

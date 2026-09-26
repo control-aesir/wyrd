@@ -64,7 +64,10 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   Freshness is operational, not validity: newer announcements do not
   cryptographically invalidate older ones — announcement history is
   append-only, and address selection/fallback is an operational layer
-  decision.
+  decision. Ongoing announcements go to every other admitted device —
+  members and readers alike — of the snapshot's bound transition, so
+  admitted readers keep converging past admission; reader-authored
+  announcements are rejected at intake, since readers author nothing.
 - **Encrypted manifests** (hierarchical, per-subtree — see
   `object-model.md`): trees plus the content→storage mapping for every
   object the snapshot references, sealed to the drive. Drive members

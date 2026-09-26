@@ -7,9 +7,10 @@ use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::Mailbox;
 
-/// Announce an authored snapshot to every other member over the control
-/// plane, returning the number of envelopes sent this call (the author
-/// is skipped: it already holds the body). The epoch must be one this
+/// Announce an authored snapshot to every other admitted device — members
+/// and readers alike — over the control plane, returning the number of
+/// envelopes sent this call (the author is skipped: it already holds
+/// the body). The epoch must be one this
 /// engine holds a control key for, and the snapshot's root manifest must
 /// be recorded — the announcement carries the transport identities the
 /// peers will fetch by (object-model.md decision 26): the body's Bao

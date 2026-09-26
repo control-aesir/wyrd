@@ -157,12 +157,9 @@ where
     if !members.contains(&engine.device) {
         // Readers are known to the log but voiceless: the refusal is
         // explicit so a misconfigured reader fails loudly instead of
-        // authoring snapshots every peer drops.
-        if rebuilt
-            .log
-            .readers_of(&known.transition_id)
-            .is_some_and(|readers| readers.contains(&engine.device))
-        {
+        // authoring snapshots every peer drops. One role predicate for
+        // the function: the recipient chain below reads the same set.
+        if readers.contains(&engine.device) {
             return Err(EngineError::ReaderCannotAuthor);
         }
         return Err(EngineError::NotAMember);

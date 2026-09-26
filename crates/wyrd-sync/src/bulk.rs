@@ -213,11 +213,29 @@ impl std::fmt::Debug for IrohBulkSource {
         f.debug_struct("IrohBulkSource")
             .field("endpoint", &self.endpoint.id())
             .field("roots", &self.roots.len())
-            .field("snapshots", &self.snapshots.len())
             .field("sealed", &self.sealed.len())
             .field("transport", &self.transport.len())
             .finish()
     }
+}
+
+/// Bound an endpoint close by a deadline: the graceful close drains
+/// in-flight transfers, and a stalled peer must turn into a reported
+/// `TimedOut` instead of an unbounded wait. Factored out so the bound
+/// itself is unit-pinned (with a never-ready close) rather than
+/// trusted by inspection. Shared by the bulk source and the serving
+/// endpoint shutdowns.
+pub(crate) async fn close_with_deadline(
+    close: impl std::future::Future<Output = ()>,
+    deadline: std::time::Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(deadline, close).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "endpoint close timed out with transfers in flight",
+        )
+    })?;
+    Ok(())
 }
 
 impl IrohBulkSource {
@@ -315,20 +333,11 @@ impl IrohBulkSource {
     /// Close the owned endpoint, waiting at most `deadline` for
     /// in-flight transfers to finish: teardown joins must stay bounded
     /// even when a peer stalls mid-transfer. A timeout abandons the
-    /// graceful close and reports it — the source is still dropped by
-    /// the caller, so no transfer outlives the shutdown either way.
+    /// graceful close and reports it — the caller still drops the
+    /// source, so no transfer outlives the shutdown either way.
     pub fn shutdown(&self, deadline: std::time::Duration) -> std::io::Result<()> {
-        self.runtime.block_on(async {
-            tokio::time::timeout(deadline, self.endpoint.close())
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "bulk endpoint close timed out with transfers in flight",
-                    )
-                })?;
-            Ok(())
-        })
+        self.runtime
+            .block_on(close_with_deadline(self.endpoint.close(), deadline))
     }
 
     /// Fetch a representation by trying each recorded provider in
@@ -904,10 +913,33 @@ mod tests {
         });
         let source = IrohBulkSource::with_runtime(endpoint, Arc::new(runtime));
         // No transfers in flight: the close lands inside the deadline
-        // and reports clean. (A stalled peer would trip the timeout
-        // instead — that path is timing, not logic, so it stays
-        // unpinned.)
+        // and reports clean.
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn close_deadline_reports_a_stalled_close() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A close that never resolves trips the deadline instead of
+        // waiting forever: this pins the bound itself, not iroh's
+        // close behavior (which stays covered by the idle test above
+        // and the Lima suite).
+        let stalled = runtime.block_on(close_with_deadline(
+            std::future::pending::<()>(),
+            std::time::Duration::from_millis(10),
+        ));
+        assert!(
+            matches!(stalled, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "a stalled close must report TimedOut"
+        );
+        let clean = runtime.block_on(close_with_deadline(
+            async {},
+            std::time::Duration::from_secs(10),
+        ));
+        assert!(clean.is_ok(), "a ready close reports clean");
     }
 
     #[test]

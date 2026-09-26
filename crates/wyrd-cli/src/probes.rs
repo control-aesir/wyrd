@@ -160,20 +160,27 @@ pub(crate) fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(),
     }
 }
 
+/// Teardown outcomes in dominance order: the field order is the
+/// reporting policy (loop, then session, then bulk, then serving), so
+/// a mis-ordered propagation does not compile instead of silently
+/// changing which failure the exit status names.
+pub(crate) struct TeardownStatus {
+    pub loop_result: Result<(), CliError>,
+    pub session_result: Result<(), CliError>,
+    pub bulk_result: Result<(), CliError>,
+    pub serving_result: Result<(), CliError>,
+}
+
 /// Fold the loop, session, bulk, and serving outcomes into the
 /// process exit status. Teardown never short-circuits — every stage
 /// runs, and the first failure wins: a loop failure dominates (it
 /// names the operational cause), then a dead session, then the
 /// transport shutdowns. Success requires a clean stop, a cleanly
 /// reaped server, and clean transport shutdowns alike.
-pub(crate) fn combine_status(
-    loop_result: Result<(), CliError>,
-    session_result: Result<(), CliError>,
-    bulk_result: Result<(), CliError>,
-    serving_result: Result<(), CliError>,
-) -> Result<(), CliError> {
-    loop_result
-        .and(session_result)
-        .and(bulk_result)
-        .and(serving_result)
+pub(crate) fn combine_status(status: TeardownStatus) -> Result<(), CliError> {
+    status
+        .loop_result
+        .and(status.session_result)
+        .and(status.bulk_result)
+        .and(status.serving_result)
 }

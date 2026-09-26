@@ -65,7 +65,9 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
     // The serving daemon restarts: a fresh endpoint, the same vault.
     // The reannouncement changes only `node_addr`, so intake
     // classifies it as a route update and the recorded route rotates.
-    serving.shutdown().unwrap();
+    serving
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
     let restarted = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
     loaded.publish_body_and_announcement(Some(restarted.node_addr_bytes()));
     // The engine is already consumed for fetching; the route update
@@ -91,7 +93,9 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
         );
     }
     bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
-    restarted.shutdown().unwrap();
+    restarted
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
     loaded.rig.teardown();
     let _ = std::fs::remove_dir_all(&serve_dir);
 }

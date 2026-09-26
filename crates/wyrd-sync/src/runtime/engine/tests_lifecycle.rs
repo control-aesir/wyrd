@@ -337,5 +337,7 @@ fn routes_publish_from_announcements_and_fetch_over_live_iroh() {
         Some(plaintext.as_slice())
     );
     bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
-    serving.shutdown().unwrap();
+    serving
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
 }

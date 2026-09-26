@@ -10,6 +10,7 @@ use crate::logging::init_mount_diagnostics;
 use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
+use crate::probes::TeardownStatus;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
@@ -414,16 +415,17 @@ pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// that never clears.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long teardown waits for the bulk endpoint's graceful close:
-/// much longer than the task-cancel bound above, because the close
-/// drains in-flight transfers over the same degraded links the drive
-/// syncs over — a throttled loopback legitimately needs tens of
+/// How long teardown waits for each transport endpoint's graceful
+/// close: much longer than the task-cancel bound above, because the
+/// close drains in-flight transfers over the same degraded links the
+/// drive syncs over — a throttled loopback legitimately needs tens of
 /// seconds, and mistaking a slow close for a wedged one turns clean
 /// shutdowns into mount failures. Still bounded, so a peer that
 /// never answers cannot hang teardown forever; a timeout still fails
-/// the mount. Sized with the serving shutdown cap (10s) to fit the
-/// e2e stop budgets (90s on the throttled big-vault step).
-const BULK_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
+/// the mount. Sized for the e2e stop budgets (90s on the throttled
+/// big-vault step): the common slow close lands in seconds, the bound
+/// only fires on a genuine wedge — which fails the mount either way.
+const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
 /// platform cannot install the handler, termination falls back to the
@@ -689,21 +691,27 @@ fn mount(
     // clears.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
     let bulk_status = bulk
-        .shutdown(BULK_SHUTDOWN_DEADLINE)
-        .map_err(CliError::Mount);
+        .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
+        .map_err(CliError::Bulk);
     if let Err(error) = &bulk_status {
         tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
     }
-    let serving_status = serving.shutdown().map_err(CliError::Mount);
+    // Release the bulk endpoint (and its runtime) before stopping
+    // serving: a timed-out close must not linger with live peer
+    // connections while the rest of teardown runs.
+    drop(bulk);
+    let serving_status = serving
+        .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
+        .map_err(CliError::Serving);
     if let Err(error) = &serving_status {
         tracing::warn!(stage = "serving", error = %error, "serving shutdown failed");
     }
-    combine_status(
-        result.map_err(CliError::Live).map(|_| ()),
+    combine_status(TeardownStatus {
+        loop_result: result.map_err(CliError::Live).map(|_| ()),
         session_result,
-        bulk_status,
-        serving_status,
-    )
+        bulk_result: bulk_status,
+        serving_result: serving_status,
+    })
 }
 
 /// Export the drive's namespace to a plain tree. The open path

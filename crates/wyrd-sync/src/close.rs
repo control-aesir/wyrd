@@ -20,9 +20,28 @@ pub(crate) async fn with_deadline<T>(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, message.to_string()))
 }
 
+/// Run a transport stop as router shutdown followed by an
+/// unconditional endpoint close: a router failure (panicked accept
+/// task) must not skip the graceful close. Factored out so the
+/// unconditionality is unit-pinned rather than trusted by
+/// inspection — the trigger is unconstructible from outside iroh,
+/// but the fold is not.
+pub(crate) async fn stop_with_close(
+    router: impl std::future::Future<Output = std::io::Result<()>>,
+    close: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
+    let router_result = router.await;
+    close.await;
+    router_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     #[test]
     fn close_deadline_reports_a_stalled_close() {
@@ -49,5 +68,29 @@ mod tests {
             "stalled",
         ));
         assert!(clean.is_ok(), "a ready stop reports clean");
+    }
+
+    #[test]
+    fn failed_router_still_runs_the_close() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed);
+        let out = runtime.block_on(stop_with_close(
+            async { Err(std::io::Error::other("router down")) },
+            async {
+                flag.store(true, Ordering::Relaxed);
+            },
+        ));
+        assert!(
+            closed.load(Ordering::Relaxed),
+            "the close runs even when the router failed"
+        );
+        assert!(
+            matches!(out, Err(error) if error.to_string().contains("router down")),
+            "the router error is still reported"
+        );
     }
 }

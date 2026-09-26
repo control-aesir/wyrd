@@ -2547,7 +2547,13 @@ where
         // refuses fast with `Shutdown` and the loss is logged per
         // path. Each attempt resolves with the loop's next pass or
         // fails fast once the queue is settled — never by waiting on
-        // a loop that will never drain again.
+        // a loop that will never drain again. Attempts run serially
+        // and each is bounded by the loop's mutation-wait budget
+        // (30s), so a stalled-but-live loop can hold the session
+        // join for minutes; the composer's orderings never reach
+        // that state (signal paths settle first, session death keeps
+        // the loop draining), and the precondition below keeps it
+        // that way.
         // Composer precondition: destroy must not run against an
         // open-but-undrained queue; that blocks exactly like a
         // steady-state release behind a stalled loop.
@@ -2560,16 +2566,24 @@ where
         };
         for (id, handle) in removed {
             if let Handle::Write(handle) = handle {
-                let path = handle
-                    .lock()
-                    .map(|write| write.path.clone())
-                    .unwrap_or_else(|_| format!("<fh {id}>"));
-                match self.commit_write_handle(&handle) {
-                    Ok(()) => {
-                        tracing::info!(stage = "session", %path, "destroy committed a dirty handle")
-                    }
-                    Err(error) => {
-                        tracing::error!(stage = "session", %path, ?error, "destroy dropped a dirty handle's buffered writes")
+                let (path, dirty, failed) = match handle.lock() {
+                    Ok(write) => (write.path.clone(), write.dirty, write.failed),
+                    Err(_) => (format!("<fh {id}>"), true, false),
+                };
+                if failed {
+                    // An earlier commit already discarded this image;
+                    // nothing left to preserve, only to report.
+                    tracing::warn!(stage = "session", %path, "destroy dropped a previously failed handle's buffered writes");
+                } else if !dirty {
+                    tracing::debug!(stage = "session", %path, "destroy dropped a clean handle");
+                } else {
+                    match self.commit_write_handle(&handle) {
+                        Ok(()) => {
+                            tracing::info!(stage = "session", %path, "destroy committed a dirty handle")
+                        }
+                        Err(error) => {
+                            tracing::error!(stage = "session", %path, ?error, "destroy dropped a dirty handle's buffered writes")
+                        }
                     }
                 }
             }

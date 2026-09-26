@@ -854,20 +854,20 @@ impl ServingEndpoint {
         let transport_result = self
             .runtime
             .block_on(super::close::with_deadline(
-                async {
-                    let router_result = self
-                        .router
-                        .shutdown()
-                        .await
-                        .map_err(|error| std::io::Error::other(error.to_string()));
+                super::close::stop_with_close(
+                    async {
+                        self.router
+                            .shutdown()
+                            .await
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    },
                     // Unconditional: a router failure (panicked accept
                     // task) must not skip the graceful close. Usually
                     // a no-op, since a clean router shutdown already
                     // closed the endpoint — kept so the close never
                     // depends on router internals.
-                    self.endpoint.close().await;
-                    router_result
-                },
+                    self.endpoint.close(),
+                ),
                 deadline,
                 "serving transport stop timed out",
             ))

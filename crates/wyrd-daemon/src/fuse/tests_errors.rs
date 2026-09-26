@@ -98,6 +98,16 @@ fn mutation_errors_map_to_posix_errors() {
         mutation_errno(&MutationError::Store(StoreFailure::PermissionDenied)),
         fuser::Errno::EACCES
     );
+    // An authoring refusal past a protocol ingest ceiling is EFBIG,
+    // whether the ceiling bound bytes or structure.
+    assert_eq!(
+        mutation_errno(&MutationError::TooLarge(70_000_000)),
+        fuser::Errno::EFBIG
+    );
+    assert_eq!(
+        mutation_errno(&MutationError::TooMany { count: 3, max: 2 }),
+        fuser::Errno::EFBIG
+    );
 }
 
 /// The request probe records the reply errno inline and passes it

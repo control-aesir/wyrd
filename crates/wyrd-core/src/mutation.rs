@@ -292,6 +292,13 @@ pub enum MutationError {
     /// `EFBIG`.
     #[error("resulting size {0} exceeds the supported bound")]
     TooLarge(u64),
+    /// The operation exceeds a protocol structural ceiling (tree,
+    /// manifest, or membership counts). POSIX `EFBIG`, like the byte
+    /// ceiling: a count, not a size, so it names both instead of
+    /// overloading [`MutationError::TooLarge`]. Integers only — no
+    /// foreign error text crosses the channel.
+    #[error("count {count} exceeds the limit of {max}")]
+    TooMany { count: usize, max: usize },
     /// Object-store or tree access failed. A classified resource
     /// condition keeps its errno (`ENOSPC` for a full disk, `EACCES`
     /// for an unwritable store); everything else is POSIX `EIO`.

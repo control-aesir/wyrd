@@ -767,11 +767,14 @@ impl ServingEndpoint {
                 // A root with no published route is absence at the
                 // fetch plane (the endpoint itself answers an unheld
                 // root with a protocol error, and answers no listing).
-                // The push half shares the exposure: any dialer can
-                // import blobs into the derived mirror — no vault
-                // forgery (the boot rebuild heals it), but unbounded
-                // growth. Tracked in
-                // nostr:nevent1qqs9tekfm9gxxfz33aqdjk5wcu3gz84z3z279qnc97qrd4t5kfh930spz9mhxue69uhkwunpwdczuap49eehgxaqg6h.
+                // The push half is closed, not exposed: the blobs
+                // protocol disables `Push` by default (upstream
+                // `EventMask::DEFAULT`), so a push attempt is refused
+                // with a permission error before a payload byte is
+                // read — no vault forgery and no mirror growth.
+                // `serving_mount_refuses_push_and_leaves_the_mirror_unchanged`
+                // pins that posture against future mask or dependency
+                // changes.
                 .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
                 .spawn()
         });
@@ -1238,6 +1241,102 @@ mod tests {
         serving
             .shutdown(std::time::Duration::from_secs(10))
             .unwrap();
+    }
+
+    /// A push attempt against the serving mount lands nothing: the
+    /// blobs protocol disables `Push` by default (upstream
+    /// `EventMask::DEFAULT`), so the mount refuses before reading
+    /// payload bytes and the mirror is unchanged. This pins that
+    /// posture against future mask or dependency changes — the fetch
+    /// plane and the reopened store must both show absence.
+    #[test]
+    fn serving_mount_refuses_push_and_leaves_the_mirror_unchanged() {
+        use iroh_blobs::protocol::{ChunkRangesSeq, PushRequest};
+        use iroh_blobs::store::mem::MemStore;
+
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The shutdown nests runtimes: `ServingEndpoint` blocks on
+        // its own runtime internally, so it runs in sync context
+        // between two sequential `block_on`s, never inside one.
+        let pushed_hash = runtime.block_on(async {
+            let attacker = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let staged = MemStore::new();
+            // 64 bytes: a multiple of 32, so both ends parse it as a
+            // hash sequence under `root()` ranges (a plain blob push
+            // dies client-side on the sequence check, and a non-blob
+            // payload dies server-side on it — either way the test
+            // would measure request well-formedness, not the mount).
+            let tag = staged.add_slice([0xABu8; 64]).await.unwrap();
+            let conn = attacker
+                .connect(serving.addr(), iroh_blobs::ALPN)
+                .await
+                .unwrap();
+            // `root()` is the single-blob push form. The outcome
+            // itself is ignored: push is fire-and-forget (the client
+            // never reads a server response), so landing is observed
+            // through the mirror, not the push future.
+            let _ = staged
+                .remote()
+                .execute_push(conn, PushRequest::new(tag.hash, ChunkRangesSeq::root()))
+                .complete()
+                .await;
+            // Linger on an *async* sleep so this current-thread
+            // runtime keeps pumping QUIC while it waits — a blocking
+            // sleep would park the only driver thread and the server
+            // would never see the push.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            attacker.close().await;
+            tag.hash
+        });
+        // Poll the fetch plane while the endpoint is live: a landed
+        // push becomes servable within milliseconds, so a bounded poll
+        // that still sees nothing proves the mirror never took it.
+        let mut source = loopback_bulk_source();
+        source.publish_transport(crate::bulk::IrohBlobRef {
+            provider: serving.addr(),
+            hash: *pushed_hash.as_bytes(),
+        });
+        let mut landed = None;
+        for _ in 0..40 {
+            landed = source
+                .fetch_transport(&BaoRoot::from_bytes(*pushed_hash.as_bytes()), usize::MAX)
+                .ok()
+                .flatten();
+            if landed.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        assert!(
+            landed.is_none(),
+            "a push into the serving mirror must not land"
+        );
+        // The mirror check reopens the store, which blocks while the
+        // endpoint is live — so the shutdown comes first. The endpoint
+        // is gone here; what the reopen sees is exactly what the push
+        // left behind.
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
+        runtime.block_on(async {
+            let mirror = FsStore::load(&dir.join(SERVE_DIR)).await.unwrap();
+            assert!(
+                mirror.blobs().get_bytes(pushed_hash).await.is_err(),
+                "a refused push must leave the mirror unchanged"
+            );
+        });
     }
 
     #[test]

@@ -169,6 +169,32 @@ impl Mailbox for SendFailingMailbox {
     }
 }
 
+/// A mailbox whose receive panics: the loop-thread panic path. Only
+/// `recv` panics — intake is where the loop first touches the
+/// mailbox — so the panic lands inside the supervised body.
+pub(super) struct PanicMailbox;
+
+impl Mailbox for PanicMailbox {
+    fn send(
+        &mut self,
+        _envelope: MailboxEnvelope,
+    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
+        panic!("teardown test panic");
+    }
+
+    fn settle(
+        &mut self,
+        _id: DeliveryId,
+        _disposition: Disposition,
+    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+        Ok(())
+    }
+}
+
 /// A mailbox whose settlement always fails: every pass offers the
 /// same envelope and every settle aborts the drain, so the loop's
 /// error cap trips instead of the loop idling forever.

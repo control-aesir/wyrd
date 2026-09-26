@@ -20,4 +20,4 @@ pub use core::{
     FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, NodeError,
     ResourceBudgets, RuntimeMaterialization, SyncReport, WyrdNode,
 };
-pub use lifecycle::{Supervisor, Wake, WakeSignal};
+pub use lifecycle::{LoopError, LoopReturn, Supervisor, Wake, WakeSignal};

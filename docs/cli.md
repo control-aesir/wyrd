@@ -29,9 +29,15 @@ drive.
 ### `mount` — serve a live read-write projection
 
 Serves the drive's live projection at `<mountpoint>` via FUSE until
-SIGINT/SIGTERM, which tears down presentation first (unmount, join
-the session) and then transport (mailbox, bulk source, serving) under
-bounded deadlines. Writes through the mount commit as snapshots; the
+SIGINT/SIGTERM, which tears down in order: unmount and session join
+first (`destroy` commits still-dirty handles against the still-open
+mutation queue), then admission close and the loop join, then
+transport (mailbox, bulk source, serving) under bounded deadlines.
+A process holding a file open on the mount delays the session join
+until it closes — unmount refuses a busy mount — so SIGINT waits
+for the last descriptor; the stop budgets bind the unmount itself,
+not a wedged holder.
+Writes through the mount commit as snapshots; the
 serving endpoint and bulk source stay up for the life of the mount so
 peers can fetch what this drive holds.
 

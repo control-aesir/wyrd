@@ -17,7 +17,7 @@ use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::LiveMailbox;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
-use wyrd_daemon::{FailureClass, LiveConfig, LiveError, Supervisor, WyrdNode};
+use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LoopError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
 use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
 use wyrd_sync::control::SealedBootstrap;
@@ -515,7 +515,7 @@ fn mount(
     let serving = daemon
         .open_serving(&drive_dir, false)
         .map_err(CliError::Serving)?;
-    let mut bulk = bind_bulk_source()?;
+    let bulk = bind_bulk_source()?;
     tracing::info!(stage = "bulk", "bulk source bound");
     let serving_id = hex::encode(serving.addr().id.as_bytes());
     eprintln!("serving over iroh: {serving_id}");
@@ -561,7 +561,7 @@ fn mount(
     let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
         .map_err(|_| CliError::IdentityFormat)?;
     let seen_path = drive_dir.join("mailbox.seen");
-    let mut mailbox = LiveMailbox::connect(
+    let mailbox = LiveMailbox::connect(
         nostr::key::Keys::new(nostr_secret.clone()),
         nostr_secret,
         relays.clone(),
@@ -599,17 +599,24 @@ fn mount(
     let mut unmounter = session.unmount_callable();
     // One lifecycle supervisor owns the stop flag, the mutation queue,
     // and the loop's pacing signal: session end trips shutdown below,
-    // loop end settles the queue after run_loop returns. Either
-    // direction alone strands somebody — a dead session with a syncing
-    // loop, or a dead loop with blocked submitters — so both are wired.
-    // The signal is created and attached by `into_live`; sharing it
-    // here means a trip also pokes the loop out of its idle wait.
+    // loop return trips it on the loop thread. Either direction alone
+    // strands somebody — a dead session with a syncing loop, or a dead
+    // loop with blocked submitters — so both are wired. The signal is
+    // created and attached by `into_live`; sharing it here means a
+    // trip also pokes the loop out of its idle wait.
     let supervisor = Supervisor::new(
         Arc::clone(live.mutations()),
         &SHUTDOWN,
         Arc::clone(live.waker()),
     );
     let session_supervisor = supervisor.clone();
+    // Exit triggers: the session thread reports its exit and the loop
+    // thread reports its return; the composer tears down on the first
+    // of those or a shutdown trip. A dedicated channel (not the
+    // loop's pacing signal) carries the triggers, so steady-state
+    // pokes are never stolen from the loop's wait.
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
+    let session_trigger = trigger_tx.clone();
     // The session loop owns the backend: log its exit immediately on
     // the thread, then trip shutdown so the live loop exits promptly
     // instead of syncing and serving behind a dead presentation
@@ -624,14 +631,26 @@ fn mount(
             }
         }
         session_supervisor.note_session_ended();
+        // The composer may already be tearing down (loop-first exit):
+        // the trigger is advisory, the join below is authoritative.
+        let _ = session_trigger.send(());
         outcome
     });
-    let result = live.run_loop(
-        &mut mailbox,
-        Some(&mut bulk),
-        &SHUTDOWN,
-        &config,
-        &mut |error, consecutive| {
+    // The live loop runs supervised on its own thread so the
+    // composer can unmount and reap the session while the queue is
+    // still open: destroy's dirty-handle commits submit against a
+    // live queue, and the post-return drain executes them
+    // concurrently. The supervisor owns the thread body (run, report,
+    // drain, panic-recover); the composer keeps the join handle and
+    // everything it comes back with.
+    let loop_trigger = trigger_tx;
+    let drive = supervisor.spawn_loop(
+        live,
+        mailbox,
+        Some(bulk),
+        config,
+        loop_trigger,
+        move |error: &LiveError, consecutive: u32| {
             // `consecutive` counts failures of this error's class, not
             // of every class combined: each class backs off and trips
             // its cap independently.
@@ -648,16 +667,42 @@ fn mount(
             );
         },
     );
+    // Teardown trigger: the first session exit, loop return, or
+    // shutdown trip starts the ordered teardown below. The wait polls
+    // the process latch in slices because a signal-handler trip cannot
+    // notify the channel — the same slow-path guarantee as the loop's
+    // own stop polling, and fast enough for a path that already
+    // budgets seconds for transport closes.
+    loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            tracing::info!(stage = "teardown", "shutdown latch tripped");
+            break;
+        }
+        match trigger_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => {
+                tracing::info!(stage = "teardown", "teardown trigger received");
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::info!(stage = "teardown", "trigger senders gone");
+                break;
+            }
+        }
+    }
     // Presentation down first: unmount so the kernel releases the
     // mountpoint, then reap the session thread (`destroy` commits
-    // dirty handles here) before cutting transport. A dead loop must
-    // not keep serving reads while its shutdown drains, and the
-    // session teardown lands at the earliest point the queue state
-    // allows — every later step runs against a closed queue and can
-    // only report loss, never prevent it.
+    // dirty handles here, against the still-open queue the loop
+    // thread's drain executes concurrently) before cutting transport.
+    // A dead loop must not keep serving reads while its shutdown
+    // drains, and the session teardown lands at the earliest point
+    // the queue state allows — destroy can only preserve handles
+    // while the queue is live and drained.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
         tracing::warn!(stage = "session", error = %error, "unmount failed");
+    } else {
+        tracing::info!(stage = "session", "unmounted");
     }
     // The exit itself is already logged on the session thread above;
     // the join outcome is shutdown sequencing (debug), except a panic,
@@ -679,24 +724,68 @@ fn mount(
             )))
         }
     };
-    // The loop returned cleanly or terminally: settle the mutation
-    // queue (run_loop already settled it on exit; this is the
-    // idempotent supervisor half) before tearing down the bulk source
-    // and serving. Every teardown outcome is collected, not short-
-    // circuited: a failed bulk close must not skip the serving
-    // shutdown, and the combined status reports the first failure.
-    supervisor.note_loop_ended();
+    // The session is joined: destroy ran, so no teardown action can
+    // submit anymore — close admission before reaping the loop, whose
+    // drain exits on the close after one final sweep. Closing before
+    // the join would strand destroy's submits; closing after the loop
+    // join would leave the drain parked. Every teardown outcome is
+    // collected, not short-circuited: a failed loop, bulk, or serving
+    // close must not skip the remaining shutdowns, and the combined
+    // status reports the first failure.
+    supervisor.close_admission();
+    tracing::info!(stage = "teardown", "admission closed");
+    let returned = match drive.join() {
+        Ok(returned) => returned,
+        Err(_) => {
+            // The supervision catches loop/drain panics itself, so a
+            // join failure means the supervision died — fail loudly.
+            tracing::error!(stage = "sync", "supervised loop thread failed");
+            return Err(CliError::Mount(std::io::Error::other(
+                "supervised loop thread failed",
+            )));
+        }
+    };
+    let mut mailbox = returned.mailbox;
+    // Unreachable by construction: the composer passes `Some`, and
+    // the thread hands it back untouched on every path (including the
+    // panic recovery). Expect, so a future refactor that breaks the
+    // pairing fails loudly here instead of skipping transport
+    // teardown.
+    let bulk = returned.bulk.expect("loop thread returns the bulk source");
+    // Dropped at scope end, after transport teardown — the same
+    // effective lifetime the node always had.
+    let _live = returned.live;
+    tracing::info!(stage = "teardown", "loop thread joined");
+    let loop_result = match returned.result {
+        Ok(summary) => Ok(summary),
+        Err(LoopError::Live(error)) => Err(CliError::Live(error)),
+        Err(LoopError::Panicked) => {
+            // The panic recovery already closed admission, so destroy
+            // resolved; the recovered handles shut down below like
+            // every other outcome.
+            tracing::error!(
+                stage = "sync",
+                "live loop thread panicked; teardown continued with bounded loss"
+            );
+            Err(CliError::Mount(std::io::Error::other(
+                "live loop thread panicked",
+            )))
+        }
+    };
     // Cancel the mailbox tasks within a bounded deadline: the drainer
     // and supervisor stop, and the runtime aborts whatever has not
     // yielded by then. Without this the tasks would run until runtime
     // drop, and a shutdown could wait on a relay outage that never
     // clears.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
+    tracing::info!(stage = "teardown", "mailbox stopped");
     let bulk_status = bulk
         .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
         .map_err(CliError::Bulk);
     if let Err(error) = &bulk_status {
         tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
+    } else {
+        tracing::info!(stage = "teardown", "bulk source stopped");
     }
     // Release the bulk endpoint (and its runtime) before stopping
     // serving: a timed-out close must not linger with live peer
@@ -707,9 +796,11 @@ fn mount(
         .map_err(CliError::Serving);
     if let Err(error) = &serving_status {
         tracing::warn!(stage = "serving", error = %error, "serving shutdown failed");
+    } else {
+        tracing::info!(stage = "teardown", "serving stopped");
     }
     combine_status(TeardownStatus {
-        loop_result: result.map_err(CliError::Live).map(|_| ()),
+        loop_result: loop_result.map(|_| ()),
         session_result,
         bulk_result: bulk_status,
         serving_result: serving_status,

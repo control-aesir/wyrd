@@ -26,7 +26,9 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
-use crate::mutation::{FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue};
+use crate::mutation::{
+    FileIdentity, MutationBatch, MutationError, MutationKind, MutationOutcome, MutationQueue,
+};
 use crate::projection::{Projection, SharedProjection};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
@@ -441,6 +443,18 @@ where
     Ok((publishable, pending))
 }
 
+/// How one queued entry resolved in an apply sweep: recorded
+/// entries let the sweep continue, while a held entry owns the
+/// queue front — the sweep must end and release everything behind
+/// it untouched, never executing past the defer.
+///
+/// Module-private: an apply-sweep detail both the sync pass and the
+/// teardown drain share, not a public contract.
+enum ApplyEntry {
+    Recorded,
+    Deferred(SnapshotId),
+}
+
 impl<V> LiveNode<V>
 where
     V: NamespaceView<Materialization = RuntimeMaterialization>,
@@ -716,6 +730,70 @@ where
         report
     }
 
+    /// Evaluate one queued entry against the engine and record its
+    /// outcome, registering fetch demand for content the authoring
+    /// needs. Shared by the sync pass and the teardown drain so both
+    /// apply identical semantics; the caller owns the batch lifecycle
+    /// (the sync pass finishes only after publication, the drain
+    /// finishes immediately).
+    fn apply_entry(&mut self, batch: &mut MutationBatch<'_>, index: usize) -> ApplyEntry {
+        // Prerequisite deadline: wall-clock from admission (the
+        // caller has been blocked since), checked every pass and
+        // on the first evaluation too — a request whose budget
+        // ran out while the loop was fetching fails terminal
+        // `TimedOut` without starting a wait. The submitter hears
+        // it and nothing applies later.
+        let since = batch.wait_since(index);
+        if since.elapsed() >= self.max_mutation_wait {
+            tracing::debug!(
+                waited_ms = since.elapsed().as_millis(),
+                "mutation prerequisite wait expired"
+            );
+            batch.record(index, Err(MutationError::TimedOut));
+            return ApplyEntry::Recorded;
+        }
+        let pinned = batch.pinned(index);
+        let kind = batch.request(index).kind().clone();
+        match self.apply_mutation(&kind, pinned) {
+            Err(MutationError::NeedContent { chunk, base }) => {
+                let Some(base) = base else {
+                    // No pinnable head (headless or conflicted
+                    // evaluation): fail closed, never defer what
+                    // cannot pin.
+                    batch.record(index, Err(MutationError::Engine));
+                    return ApplyEntry::Recorded;
+                };
+                // One waiter per chunk: retries name new chunks as
+                // the walk advances, but re-registering a held
+                // chunk would accumulate counts against one
+                // release.
+                if !batch.wanted(index).contains(&chunk) {
+                    match self.wants.register(chunk) {
+                        Ok(()) => batch.note_want(index, chunk),
+                        Err(error) => {
+                            tracing::debug!(
+                                error = ?error,
+                                "mutation demand refused"
+                            );
+                            batch.record(index, Err(MutationError::Engine));
+                            return ApplyEntry::Recorded;
+                        }
+                    }
+                }
+                tracing::debug!(
+                    chunk = ?chunk,
+                    base = ?base,
+                    "mutation deferred for authoring content"
+                );
+                ApplyEntry::Deferred(base)
+            }
+            other => {
+                batch.record(index, other);
+                ApplyEntry::Recorded
+            }
+        }
+    }
+
     /// One pass body: intake, fetch, conditional republication, then
     /// outbound publish. Republication clears the dirty backlog; every
     /// failure path leaves it set (via the [`LiveNode::sync_once`]
@@ -817,62 +895,13 @@ where
         let mutations = Arc::clone(&self.mutations);
         let mut batch = mutations.take_batch().with_wants(Arc::clone(&self.wants));
         for index in 0..batch.len() {
-            // Prerequisite deadline: wall-clock from admission (the
-            // caller has been blocked since), checked every pass and
-            // on the first evaluation too — a request whose budget
-            // ran out while the loop was fetching fails terminal
-            // `TimedOut` without starting a wait. The submitter hears
-            // it and nothing applies later.
-            let since = batch.wait_since(index);
-            if since.elapsed() >= self.max_mutation_wait {
-                tracing::debug!(
-                    waited_ms = since.elapsed().as_millis(),
-                    "mutation prerequisite wait expired"
-                );
-                batch.record(index, Err(MutationError::TimedOut));
-                continue;
-            }
-            let pinned = batch.pinned(index);
-            let kind = batch.request(index).kind().clone();
-            match self.apply_mutation(&kind, pinned) {
-                Err(MutationError::NeedContent { chunk, base }) => {
-                    let Some(base) = base else {
-                        // No pinnable head (headless or conflicted
-                        // evaluation): fail closed, never defer what
-                        // cannot pin.
-                        batch.record(index, Err(MutationError::Engine));
-                        continue;
-                    };
-                    // One waiter per chunk: retries name new chunks as
-                    // the walk advances, but re-registering a held
-                    // chunk would accumulate counts against one
-                    // release.
-                    if !batch.wanted(index).contains(&chunk) {
-                        match self.wants.register(chunk) {
-                            Ok(()) => batch.note_want(index, chunk),
-                            Err(error) => {
-                                tracing::debug!(
-                                    error = ?error,
-                                    "mutation demand refused"
-                                );
-                                batch.record(index, Err(MutationError::Engine));
-                                continue;
-                            }
-                        }
-                    }
-                    tracing::debug!(
-                        chunk = ?chunk,
-                        base = ?base,
-                        "mutation deferred for authoring content"
-                    );
-                    // Total order: the held entry owns the front of
-                    // the queue, so everything after it in this batch
-                    // goes back untouched — never executed past the
-                    // defer. The pass then ends.
-                    batch.defer_and_release_rest(index, base);
-                    break;
-                }
-                other => batch.record(index, other),
+            // Total order: a held entry owns the front of the queue,
+            // so everything after it in this batch goes back
+            // untouched — never executed past the defer. The pass
+            // then ends.
+            if let ApplyEntry::Deferred(base) = self.apply_entry(&mut batch, index) {
+                batch.defer_and_release_rest(index, base);
+                break;
             }
         }
         // Fast retry: a held mutation's prerequisites may have landed
@@ -1726,14 +1755,16 @@ where
     /// data, so `Relaxed` ordering is the honest level and must stay
     /// that way.
     ///
-    /// No admitted mutation submitter outlives the loop: every return
-    /// path completes still-queued requests with
-    /// [`MutationError::Shutdown`](crate::mutation::MutationError::Shutdown)
-    /// and closes admission first, so a terminal error or a stop with
-    /// in-flight demand resolves blocked callers instead of stranding
-    /// them — and no later submission can queue behind the dead loop.
-    /// Taken-but-unfinished requests are already covered by the batch
-    /// guard's drop.
+    /// Returning never settles the mutation queue: both the clean
+    /// stop and the terminal error leave admission open, so teardown
+    /// submissions made after the return (unmount-time dirty-handle
+    /// commits) are admitted, not refused. The loop thread executes
+    /// them in [`LiveNode::drain_until_closed`], and only the
+    /// supervisor — after the presentation and loop joins — closes
+    /// admission and settles stragglers with
+    /// [`MutationError::Shutdown`](crate::mutation::MutationError::Shutdown).
+    /// No admitted submitter is stranded at any point: the queue stays
+    /// open and drained until the supervisor owns it.
     ///
     /// Backlog behavior under sustained traffic: each pass drains what
     /// the mailbox currently holds, so a flood costs latency (intake
@@ -1777,12 +1808,13 @@ where
                     summary.errors_retried += 1;
                     observe(&error, consecutive[index]);
                     if consecutive[index] > class.max_consecutive(config) {
-                        // Terminal: no further pass will drain, so complete
-                        // still-queued submitters now — returning first
-                        // would strand every admitted caller forever.
-                        // Held entries release their fetch wants through
-                        // the same finish path as every terminal outcome.
-                        self.mutations.shutdown_with(Some(Arc::clone(&self.wants)));
+                        // Terminal: no further sync pass will run, so
+                        // return the error — without settling the queue.
+                        // The loop thread drains admitted mutations
+                        // after the return (see `drain_until_closed`),
+                        // and the supervisor settles only after the
+                        // teardown joins: a terminal error ends sync,
+                        // it never strands or mass-fails submitters.
                         return Err(error);
                     }
                     // The backoff sleeps on the pacing signal, so a stop
@@ -1797,15 +1829,82 @@ where
                 }
             }
         }
-        // Stopped with demand possibly in flight: same guarantee as the
-        // terminal path — resolve, never strand.
-        self.mutations.shutdown_with(Some(Arc::clone(&self.wants)));
+        // Stopped with demand possibly in flight: return without
+        // settling — the queue stays open for teardown submissions
+        // (unmount-time commits land here), which the post-return
+        // drain executes. Settlement is the supervisor's, after the
+        // teardown joins.
         Ok(summary)
+    }
+
+    /// Execute admitted mutations until the supervisor closes
+    /// admission: the loop thread's post-[`LiveNode::run_loop`] phase.
+    /// Every return path of `run_loop` (clean stop or terminal error)
+    /// leads here, so teardown submissions — unmount-time
+    /// dirty-handle commits above all — execute with full apply
+    /// semantics instead of failing against a settled queue.
+    ///
+    /// The drain applies only (no intake, fetch, or publication):
+    /// teardown submissions carry their content, and teardown must
+    /// not depend on transport liveness. Drain commits are therefore
+    /// device-local durable, not served — no publication runs, so
+    /// success means the bytes serve on the next mount, and the
+    /// `submit` contract carries exactly that exception. A sweep entry
+    /// that would hold for content fails closed instead of deferring — no pass
+    /// runs after the return, so the content could never arrive and
+    /// retrying would stall shutdown to the prerequisite deadline.
+    /// Once admission closes, one final sweep executes the last
+    /// pre-close admissions, then the drain returns.
+    pub fn drain_until_closed(&mut self) {
+        loop {
+            let closed = self.mutations.is_closed();
+            // Clone the queue handle so the batch borrow does not pin
+            // `self` while mutations apply (the engine borrow is
+            // mutable).
+            let mutations = Arc::clone(&self.mutations);
+            let mut batch = mutations.take_batch().with_wants(Arc::clone(&self.wants));
+            if batch.is_empty() {
+                batch.finish();
+                if closed {
+                    return;
+                }
+                self.mutations
+                    .wait_until_work_or_closed(Duration::from_millis(250));
+                continue;
+            }
+            for index in 0..batch.len() {
+                match self.apply_entry(&mut batch, index) {
+                    ApplyEntry::Recorded => {}
+                    ApplyEntry::Deferred(_) => {
+                        // Teardown cannot fetch: no pass runs after the
+                        // return, so content that is not local now will
+                        // never arrive and retrying would park the sweep
+                        // until the prerequisite deadline (30 s default)
+                        // per handle. Fail closed instead — the per-path
+                        // loss log reports it, and finishing the batch
+                        // releases the registered want. Continuing past
+                        // it is order-safe: the failed entry completes
+                        // terminally before any later entry applies, so
+                        // no later commit builds on state the failed
+                        // entry never produced.
+                        batch.record(index, Err(MutationError::Engine));
+                    }
+                }
+            }
+            batch.finish();
+            if closed {
+                // The last pre-close admissions are executed; leftovers
+                // were failed closed above, so nothing is left held.
+                return;
+            }
+        }
     }
 
     /// The mutation channel the backend submits through: the supervisor
     /// half of the lifecycle contract (session end trips the stop flag
-    /// the loop polls; loop end completes the queue this returns).
+    /// the loop polls; the loop's return leaves the queue open for the
+    /// post-return drain, and only the supervisor closes it after the
+    /// teardown joins).
     pub fn mutations(&self) -> &Arc<MutationQueue> {
         &self.mutations
     }

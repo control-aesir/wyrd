@@ -307,6 +307,109 @@ fn live_mount_serves_read_write_until_shutdown() {
     assert_eq!(daemon.view().read(&file, 0, 11).unwrap(), b"hello write");
 }
 
+/// A dirty handle open at signal time survives shutdown end to
+/// end: write through the mountpoint without flush or close, trip
+/// shutdown, then close — the release commits against the still-open
+/// queue mid-teardown — rejoin, and prove the reopened drive serves
+/// the bytes.
+///
+/// This exercises the kernel-reachable preservation path
+/// deliberately: the kernel releases every open file before destroy
+/// runs, so `release_handle` (not `destroy`) is what preserves
+/// signal-time writes on a real mount; destroy's commit is pinned at
+/// daemon level instead. The close must precede the composer's
+/// unmount — the mount unmounts once, and an unmount against the
+/// still-open descriptor fails busy — so the trip-then-close order
+/// is load-bearing, not incidental.
+///
+/// Ignored by default like the live mount above — same runner
+/// contract: `cargo nextest run -p wyrd-cli --bin wyrd --run-ignored
+/// all`.
+#[test]
+#[ignore = "needs kernel FUSE and local networking"]
+fn live_mount_preserves_dirty_handle_across_shutdown() {
+    use std::io::Write as _;
+
+    // The shutdown latch is process-global: start unset so a
+    // previous run in this process cannot cut this mount short.
+    SHUTDOWN.store(false, Ordering::Relaxed);
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    command(vec![
+        "init".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap();
+
+    let identity = read_identity(&identity_file).unwrap();
+    let engine = Engine::open_keystore(drive.clone(), "test-pass", identity.clone()).unwrap();
+    let store = FsObjectStore::open(drive.clone()).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    daemon.put_file("hello.txt", b"hello mount").unwrap();
+    drop(daemon);
+
+    let mountpoint = temp.0.join("mnt");
+    fs::create_dir_all(&mountpoint).unwrap();
+    let drive_path = drive.clone();
+    let mut mount = MountGuard {
+        server: Some(std::thread::spawn(move || {
+            mount(drive, mountpoint, Vec::new(), false, "test-pass", identity)
+        })),
+    };
+    let target = temp.0.join("mnt").join("hello.txt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !target.is_file() && std::time::Instant::now() <= deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !target.is_file() {
+        mount.shutdown_and_join("during startup");
+        panic!("the mount did not serve in time");
+    }
+    // The unflushed write: buffered behind an open descriptor, never
+    // flushed. The binding must stay alive until after the shutdown
+    // trip — dropping it earlier would close (and commit) the handle
+    // before the signal arrives, testing steady-state release
+    // instead of teardown.
+    let dirty = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(temp.0.join("mnt").join("dirty.txt"))
+        .unwrap();
+    (&dirty).write_all(b"unflushed through the mount").unwrap();
+    // Trip first, close second: the release races the loop's return
+    // and commits mid-teardown. Closing before the trip would commit
+    // on a live loop; closing after the rejoin starts would wedge the
+    // unmount busy.
+    SHUTDOWN.store(true, Ordering::Relaxed);
+    drop(dirty);
+    mount.shutdown_and_join("with a dirty handle at signal time");
+    assert!(
+        fs::read_dir(temp.0.join("mnt")).unwrap().next().is_none(),
+        "a clean unmount releases the mountpoint"
+    );
+    let identity = read_identity(&identity_file).unwrap();
+    let engine = Engine::open_keystore(drive_path.clone(), "test-pass", identity).unwrap();
+    let store = FsObjectStore::open(drive_path).unwrap();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let node = daemon.view().lookup("dirty.txt").unwrap();
+    let file = daemon.view().open(&node).unwrap();
+    assert_eq!(
+        daemon.view().read(&file, 0, 25).unwrap(),
+        b"unflushed through the mount"
+    );
+}
 /// Owns a spawned mount thread: signals shutdown and rejoins on
 /// every exit path, so a failed assertion cannot orphan the
 /// mount. Rejoins are bounded: a wedged FUSE thread fails the

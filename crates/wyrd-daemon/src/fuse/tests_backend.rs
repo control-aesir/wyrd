@@ -809,10 +809,10 @@ fn destroy_commits_dirty_write_handles_while_queue_live() {
     );
 }
 
-/// Destroy after the queue settled (the loop is gone) fails the
-/// commit fast instead of blocking forever, and still drops the
-/// table: the loss is reported through the commit's error log, never
-/// a hung join or a leaked mount.
+/// Destroy after admission closed (the teardown is past the session
+/// join) fails the commit fast instead of blocking forever, and
+/// still drops the table: the loss is reported through the commit's
+/// error log, never a hung join or a leaked mount.
 #[test]
 fn destroy_after_queue_shutdown_clears_without_hanging() {
     let (mut backend, _) = evolving_backend(b"first", b"second");

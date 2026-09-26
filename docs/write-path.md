@@ -443,12 +443,20 @@ it plainly.
 
 Unmount adds one best-effort safety net, not a durability boundary:
 `destroy` attempts to commit every still-dirty handle before dropping
-the table. The commit needs a live loop behind the mutation queue, so
-it lands when the session dies first and refuses fast (with a per-path
-loss log) once the loop has exited and settled the queue — which is
-the state every signal-driven shutdown reaches. Unflushed writes open
-at SIGINT/SIGTERM are therefore not preserved; flush or fsync before
-signalling if the bytes matter.
+the table. The commit needs the mutation queue open and drained, so
+teardown keeps it that way on every path: the loop returns without
+settling, the session joins first (destroy submits while the loop's
+post-return drain executes), and admission closes only after the join
+— see the lifecycle contract in `wyrd-daemon/src/lifecycle.rs`. A
+commit that fails its own evaluation (stale handle, conflict, store
+failure) is still lost and logged per path, and a crash loses
+everything unflushed; flush or fsync remains the reportable
+persistence point. But a clean SIGINT/SIGTERM with a healthy drive
+now preserves unflushed writes instead of dropping them. On a real
+mount the kernel releases every open file before destroy runs, so
+`release_handle` is the path that normally preserves signal-time
+writes; `destroy` is the net for handles whose release-time commit
+failed.
 
 `O_SYNC`/`O_DSYNC` deliberately sacrifice write coalescing: because the
 unit of commit is the snapshot, each successful `write` on such a handle

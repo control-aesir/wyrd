@@ -223,10 +223,28 @@ duplication. Pinned by `torn_plan_commit_is_ignored_on_reopen`,
 Unmount commits still-dirty handles best-effort before dropping the
 handle table, and stops the mailbox, bulk source, and serving endpoint
 under bounded deadlines with every outcome folded into the exit
-status. The commit executes only while the mutation queue is live
-(session death); once the loop has exited and settled the queue, the
-commit refuses fast and the loss is logged per path — unmount is not
-a durability boundary for unflushed writes. Pinned by
+status. The commit executes against the still-open queue on every
+shutdown path: the loop returns without settling, the session joins
+first (destroy submits while the post-return drain executes
+concurrently), admission closes only after the join — the session
+join is the submission boundary, so no destroy-time submission can
+race the drain's end. The commit still refuses fast with `Shutdown` (and the
+loss is logged per path) only for submissions that race the admission
+close itself; unmount stays a safety net, not a durability boundary.
+Pinned by
+`signal_path_shutdown_preserves_dirty_handle`,
+`terminal_loop_error_preserves_dirty_handle`,
+`teardown_preserves_every_dirty_handle_and_drops_clean`,
+`release_after_loop_return_commits_dirty_handle`,
+`loop_thread_panic_tears_down_bounded`,
+`submissions_racing_admission_close_resolve_bounded`
+(`wyrd-daemon/src/core/tests_teardown.rs`),
+`loop_return_keeps_queue_open_for_teardown_submits`,
+`terminal_loop_error_completes_blocked_submitters`,
+`clean_stop_completes_blocked_submitters`
+(`wyrd-daemon/src/core/tests_run_loop.rs`),
+`loop_return_trips_shutdown_without_settling`
+(`wyrd-daemon/src/lifecycle.rs`),
 `destroy_commits_dirty_write_handles_while_queue_live`,
 `destroy_after_queue_shutdown_clears_without_hanging`
 (`wyrd-daemon/src/fuse/tests_backend.rs`),

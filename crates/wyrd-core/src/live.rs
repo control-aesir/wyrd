@@ -495,10 +495,13 @@ fn authoring_error(error: EngineError) -> MutationError {
             failure => MutationError::Store(failure),
         },
         // Bounded mirror backpressure, not a broken device — but
-        // still `EIO`, deliberately: an `EAGAIN` would replay the
-        // whole mutation at the syscall layer, which double-applies
-        // non-idempotent ops (append). Fail closed and let the
-        // caller decide; the serving drain retries the import.
+        // still `EIO`, deliberately: the sealed representation is
+        // already durable in the vault, so a caller-level replay
+        // re-seals under a fresh nonce and imports a second copy of
+        // the same content, leaking vault bytes for no new state.
+        // Fail closed per the commit-failure row
+        // (`docs/write-path.md`); the serving drain retries the
+        // import.
         EngineError::Vault(VaultError::MirrorFull { .. }) => MutationError::Engine,
         // A store read the loop cannot classify: the foreign debug
         // text stays in the trace, and the channel carries the
@@ -2592,13 +2595,16 @@ mod prereq_tests {
         /// Lock `path` read-only. Returns `None` when the refusal
         /// cannot occur — root bypasses permissions, so writability
         /// is probed after the chmod and the test skips instead of
-        /// asserting nothing.
+        /// asserting nothing. Permissions are restored before the
+        /// `None`, so the skip path leaks nothing either.
         fn lock(path: &'a std::path::Path) -> Option<Self> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
             let probe = path.join(".writetest");
             if std::fs::File::create(&probe).is_ok() {
                 std::fs::remove_file(&probe).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                eprintln!("skipping: running with DAC override, chmod refusal unavailable");
                 return None;
             }
             Some(Self { path })
@@ -2622,6 +2628,7 @@ mod prereq_tests {
         let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("vault-perm");
         let vault = dir.join("vault");
         let Some(guard) = ReadOnlyDir::lock(&vault) else {
+            std::fs::remove_dir_all(dir).unwrap();
             return;
         };
         let mut node = live_over_fake(engine, store, &[head]);
@@ -2647,6 +2654,7 @@ mod prereq_tests {
         let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("durable-perm");
         let commits = dir.join("commits");
         let Some(guard) = ReadOnlyDir::lock(&commits) else {
+            std::fs::remove_dir_all(dir).unwrap();
             return;
         };
         let mut node = live_over_fake(engine, store, &[head]);

@@ -758,6 +758,40 @@ impl MutationQueue {
         }
     }
 
+    /// Whether admission is closed: after this returns true no new
+    /// submission can be admitted, and the teardown drain (not the
+    /// loop) owns every still-queued request. Teardown reads this to
+    /// stop draining; it never implies the queued work is done.
+    pub fn is_closed(&self) -> bool {
+        self.lock_state().closed
+    }
+
+    /// Wait until work is queued or admission closes (or the timeout
+    /// elapses): the teardown drain's idle path. Returns whether
+    /// admission is closed — a false return with an empty queue only
+    /// means the timeout elapsed, so the caller re-checks. Closures
+    /// and submissions both wake the waiter promptly.
+    pub fn wait_until_work_or_closed(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock_state();
+        loop {
+            if state.closed {
+                return true;
+            }
+            if !state.pending.is_empty() || !state.deferred.is_empty() {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = match self.work.wait_timeout(state, deadline - now) {
+                Ok((guard, _)) => guard,
+                Err(poison) => poison.into_inner().0,
+            };
+        }
+    }
+
     /// Close admission and complete every still-queued request with
     /// [`MutationError::Shutdown`]: the loop will never drain again, so
     /// admitted-but-incomplete callers must hear it now rather than block
@@ -789,6 +823,11 @@ impl MutationQueue {
             batch.record(index, Err(MutationError::Shutdown));
         }
         batch.finish();
+        // A drain parked in `wait_until_work_or_closed` must observe
+        // the closure even if no submission ever arrives: the poke
+        // re-checks the world. (`submit` already notifies per
+        // admission; this covers the close side.)
+        self.work.notify_all();
         // A loop parked in its idle wait must observe the closure even
         // if the stop flag trip races it: the poke re-checks the world.
         self.poke_waker();

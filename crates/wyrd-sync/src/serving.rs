@@ -830,23 +830,51 @@ impl ServingEndpoint {
     /// drain task ends when its last sender goes away, and holding one
     /// would stall the join for the full timeout on every call.
     ///
-    /// A failing router shutdown is captured, not returned early: the
-    /// sender drop and the runtime join below must run regardless, or a
-    /// panicked handler task reintroduces exactly the lingering threads
-    /// this shutdown exists to join. The first error is still reported.
-    pub fn shutdown(self) -> std::io::Result<()> {
-        *self
+    /// The transport stop (router shutdown plus endpoint close) waits
+    /// at most `deadline`: the router's own shutdown awaits a graceful
+    /// endpoint close internally, so bounding only the trailing close
+    /// would leave the wait unbounded behind a stage that pre-closes.
+    /// A timeout abandons the graceful stop and reports it — the
+    /// endpoint is then aborted (iroh logs it), so peers see a hard
+    /// connection failure rather than a clean close. The sender drop
+    /// and runtime join below still run, so no worker outlives the
+    /// shutdown either way.
+    ///
+    /// Every stage is captured, not returned early: the endpoint close
+    /// runs even when the router shutdown reports an error, and the
+    /// sender drop and runtime join run regardless, or a panicked
+    /// handler task reintroduces exactly the lingering threads this
+    /// shutdown exists to join. The first error is still reported.
+    pub fn shutdown(self, deadline: std::time::Duration) -> std::io::Result<()> {
+        let mirror_result = self
             .mirror
             .lock()
-            .map_err(|_| std::io::Error::other("vault mirror lock poisoned"))? = None;
-        let router_result = self
+            .map(|mut slot| *slot = None)
+            .map_err(|_| std::io::Error::other("vault mirror lock poisoned"));
+        let transport_result = self
             .runtime
-            .block_on(async { self.router.shutdown().await });
-        self.runtime.block_on(self.endpoint.close());
+            .block_on(super::close::with_deadline(
+                super::close::stop_with_close(
+                    async {
+                        self.router
+                            .shutdown()
+                            .await
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    },
+                    // Unconditional: a router failure (panicked accept
+                    // task) must not skip the graceful close. Usually
+                    // a no-op, since a clean router shutdown already
+                    // closed the endpoint — kept so the close never
+                    // depends on router internals.
+                    self.endpoint.close(),
+                ),
+                deadline,
+                "serving transport stop timed out",
+            ))
+            .and_then(|inner| inner);
         drop(self.sender);
         self.runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-        router_result.map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(())
+        mirror_result.and(transport_result)
     }
 }
 
@@ -1114,8 +1142,10 @@ mod tests {
                 .unwrap(),
             None
         );
-        source.shutdown();
-        serving.shutdown().unwrap();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
     }
 
     #[test]
@@ -1126,7 +1156,7 @@ mod tests {
         let root = vault.import(&sealed).unwrap();
         let first = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
         first.flush().unwrap();
-        first.shutdown().unwrap();
+        first.shutdown(std::time::Duration::from_secs(10)).unwrap();
 
         // Reopen: the boot rebuild re-imports the vault's roots, so the
         // representation serves again under its transport root.
@@ -1152,8 +1182,10 @@ mod tests {
             source.fetch_transport(&root, usize::MAX).unwrap(),
             Some(sealed)
         );
-        source.shutdown();
-        reopened.shutdown().unwrap();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        reopened
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
     }
 
     #[test]
@@ -1163,7 +1195,9 @@ mod tests {
         let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
         let decoded = crate::transport::decode_node_addr(&serving.node_addr_bytes()).unwrap();
         assert_eq!(decoded.id, serving.addr().id);
-        serving.shutdown().unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
     }
 
     /// Shutdown runs the full cleanup sequence instead of returning
@@ -1181,7 +1215,9 @@ mod tests {
         let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
         let endpoint = serving.endpoint.clone();
         assert!(!endpoint.is_closed(), "a live endpoint reads open");
-        serving.shutdown().unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
         assert!(endpoint.is_closed(), "shutdown closes the endpoint");
         assert!(
             vault.mirror_slot().lock().expect("mirror lock").is_none(),
@@ -1196,6 +1232,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A poisoned mirror slot is reported but does not short-circuit
+    /// the shutdown: the endpoint still closes, the sender still
+    /// drops, and the runtime still joins. Poisoned after open —
+    /// `open` itself attaches to the slot, so a pre-poisoned vault
+    /// never gets this far.
+    #[test]
+    fn poisoned_mirror_lock_reports_but_still_shuts_down() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        let endpoint = serving.endpoint.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = serving.mirror.lock().unwrap();
+                    panic!("poison the serving mirror slot");
+                })
+                .join()
+                .expect_err("the poisoner must panic");
+        });
+        let failed = serving.shutdown(std::time::Duration::from_secs(10));
+        assert!(
+            matches!(failed, Err(error) if error.to_string().contains("mirror")),
+            "a poisoned mirror slot must fail the shutdown, not panic"
+        );
+        assert!(
+            endpoint.is_closed(),
+            "shutdown still closes the endpoint past a poisoned slot"
+        );
+    }
+
+    #[test]
+    fn live_serving_close_trips_a_zero_deadline() {
+        let dir = serve_dir();
+        let vault = Vault::open(&dir).unwrap();
+        let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
+        // The transport stop joins the router task, which can never
+        // resolve synchronously — a zero deadline must report
+        // TimedOut. An unbounded stop would block here instead and
+        // fail. No peer is needed: the router join pends even idle.
+        let timed_out = serving.shutdown(std::time::Duration::ZERO);
+        assert!(
+            matches!(timed_out, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "a serving stop past its deadline must report TimedOut"
+        );
     }
 
     /// Fetch a representation from a loopback serving endpoint by
@@ -1220,7 +1303,7 @@ mod tests {
             hash: *root.as_bytes(),
         });
         let fetched = source.fetch_transport(root, usize::MAX).ok().flatten();
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
         fetched
     }
 
@@ -1740,7 +1823,9 @@ mod tests {
         assert_eq!(vault.import(&sealed).unwrap(), root);
         serving.flush().unwrap();
         assert_eq!(fetch_from(&serving, &root), Some(sealed));
-        serving.shutdown().unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
     }
 
     #[test]
@@ -1770,7 +1855,9 @@ mod tests {
         assert_eq!(vault.import(&sealed).unwrap(), root);
         serving.flush().unwrap();
         assert_eq!(fetch_from(&serving, &root), Some(sealed));
-        serving.shutdown().unwrap();
+        serving
+            .shutdown(std::time::Duration::from_secs(10))
+            .unwrap();
     }
 
     /// Directory-sync calls seen by the restart-recovery test.

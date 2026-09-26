@@ -29,10 +29,11 @@ drive.
 ### `mount` — serve a live read-write projection
 
 Serves the drive's live projection at `<mountpoint>` via FUSE until
-SIGINT/SIGTERM, which shuts down cleanly (flush, unmount, exit).
-Writes through the mount commit as snapshots; the serving endpoint
-and bulk source stay up for the life of the mount so peers can fetch
-what this drive holds.
+SIGINT/SIGTERM, which tears down presentation first (unmount, join
+the session) and then transport (mailbox, bulk source, serving) under
+bounded deadlines. Writes through the mount commit as snapshots; the
+serving endpoint and bulk source stay up for the life of the mount so
+peers can fetch what this drive holds.
 
 - `--relay <url>` (repeatable): control-plane relays. With none
   given, control-plane intake stays idle and the drive is local-only —
@@ -206,4 +207,7 @@ Both are read and hardened by wyrd code, never by clap:
 - `--help` and `--version` print and exit successfully.
 - Exit `0` on success; exit `2` on any failure, with the reason on
   stderr (`error: ...`). Usage errors (bad flags, missing options)
-  are failures too, not help text.
+  are failures too, not help text. A transport teardown failure also
+  fails the mount: a bulk close that times out exits as a bulk error,
+  a serving shutdown failure as a serving error — after the
+  mountpoint is already unmounted.

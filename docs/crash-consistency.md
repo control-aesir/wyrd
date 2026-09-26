@@ -217,3 +217,24 @@ duplication. Pinned by `torn_plan_commit_is_ignored_on_reopen`,
 `plan_fetches_bodies_and_live_heads_survive_a_restart`
 (`plan/tests_execution.rs`), and the convergence restart suite
 (`engine/tests_convergence.rs`).
+
+## Unmount teardown
+
+Unmount commits still-dirty handles best-effort before dropping the
+handle table, and stops the mailbox, bulk source, and serving endpoint
+under bounded deadlines with every outcome folded into the exit
+status. The commit executes only while the mutation queue is live
+(session death); once the loop has exited and settled the queue, the
+commit refuses fast and the loss is logged per path — unmount is not
+a durability boundary for unflushed writes. Pinned by
+`destroy_commits_dirty_write_handles_while_queue_live`,
+`destroy_after_queue_shutdown_clears_without_hanging`
+(`wyrd-daemon/src/fuse/tests_backend.rs`),
+`close_deadline_reports_a_stalled_close`
+(`wyrd-sync/src/close.rs`),
+`live_close_trips_a_zero_deadline` (`wyrd-sync/src/bulk.rs`),
+`live_serving_close_trips_a_zero_deadline` and
+`poisoned_mirror_lock_reports_but_still_shuts_down`
+(`wyrd-sync/src/serving.rs`), and
+`combine_status_reports_transport_shutdown_failures`
+(`wyrd-cli/src/tests_cli.rs`).

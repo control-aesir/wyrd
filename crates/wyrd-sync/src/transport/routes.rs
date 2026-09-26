@@ -185,6 +185,6 @@ mod tests {
                 "each storage id addresses its own representation's bytes"
             );
         }
-        bulk.shutdown();
+        bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 }

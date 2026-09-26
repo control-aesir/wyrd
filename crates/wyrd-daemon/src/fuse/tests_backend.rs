@@ -6,7 +6,8 @@ use super::tests_harness::{
 use super::*;
 
 use fuser::{FileHandle, INodeNo};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wyrd_format::ObjectStore;
@@ -726,6 +727,113 @@ fn failed_truncated_open_releases_its_budget_reservation() {
     assert_eq!(backend.budget.total(), 0, "no leaked aggregate bytes");
     assert!(backend.release_handle(reader).is_ok());
     backend.destroy();
+}
+
+/// A drainer thread standing in for the live loop: it completes every
+/// taken batch with a canned commit identity and records the submitted
+/// kinds, so destroy-time commits resolve exactly like release-path
+/// commits behind a live loop. Without it a submit would block
+/// forever (see the O_TRUNC test above).
+fn spawn_drainer(
+    queue: &Arc<MutationQueue>,
+    seen: &Arc<Mutex<Vec<MutationKind>>>,
+    done: &Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let queue = Arc::clone(queue);
+    let seen = Arc::clone(seen);
+    let done = Arc::clone(done);
+    std::thread::spawn(move || loop {
+        let mut batch = queue.take_batch();
+        let empty = batch.is_empty();
+        for index in 0..batch.len() {
+            seen.lock()
+                .unwrap()
+                .push(batch.request(index).kind().clone());
+            batch.record(
+                index,
+                Ok(MutationOutcome::Committed(FileIdentity::new(
+                    5,
+                    false,
+                    Vec::new(),
+                ))),
+            );
+        }
+        batch.finish();
+        if empty && done.load(Ordering::Relaxed) {
+            break;
+        }
+        if empty {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    })
+}
+
+/// Destroy commits dirty writable handles instead of dropping them:
+/// files still open at unmount keep their buffered writes while the
+/// mutation queue is live. The table is cleared either way, so the
+/// mount never leaks handles across mounts.
+#[test]
+fn destroy_commits_dirty_write_handles_while_queue_live() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"dirty").unwrap();
+    assert_eq!(
+        backend.budget.dirty_handles(),
+        1,
+        "the unwritten handle is dirty before destroy"
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    backend.destroy();
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits after destroy");
+    match &seen.lock().unwrap()[..] {
+        [MutationKind::CommitFile { path, .. }] => assert_eq!(
+            path, "f.txt",
+            "destroy submits the dirty handle's image, not a synthetic op"
+        ),
+        other => panic!("destroy must commit exactly the dirty handle, saw {other:?}"),
+    }
+    assert_eq!(
+        backend.budget.dirty_handles(),
+        0,
+        "a committed handle releases its dirty mark"
+    );
+    assert_eq!(
+        backend.budget.total(),
+        0,
+        "a committed handle releases its buffered bytes"
+    );
+}
+
+/// Destroy after the queue settled (the loop is gone) fails the
+/// commit fast instead of blocking forever, and still drops the
+/// table: the loss is reported through the commit's error log, never
+/// a hung join or a leaked mount.
+#[test]
+fn destroy_after_queue_shutdown_clears_without_hanging() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"dirty").unwrap();
+    queue.shutdown();
+    // No drainer: the loop will never drain again. Destroy must
+    // refuse fast (Shutdown) rather than strand the session thread.
+    backend.destroy();
+    assert_eq!(
+        backend.budget.dirty_handles(),
+        0,
+        "a refused commit still releases its dirty mark"
+    );
+    assert_eq!(
+        backend.budget.total(),
+        0,
+        "a refused commit still releases its buffered bytes"
+    );
 }
 
 /// Past the aggregate open-capture byte ceiling, opens refuse

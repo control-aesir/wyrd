@@ -312,9 +312,19 @@ impl IrohBulkSource {
         self.sealed.get(storage).map(Vec::as_slice)
     }
 
-    /// Close the owned endpoint after all in-flight transfers have finished.
-    pub fn shutdown(&self) {
-        self.runtime.block_on(self.endpoint.close());
+    /// Close the owned endpoint, waiting at most `deadline` for
+    /// in-flight transfers to finish: teardown joins must stay bounded
+    /// even when a peer stalls mid-transfer. A timeout abandons the
+    /// graceful close and reports it — the endpoint is then aborted
+    /// (iroh logs it), so the peer sees a hard connection failure
+    /// rather than a clean close. The caller still drops the source,
+    /// so no transfer outlives the shutdown either way.
+    pub fn shutdown(&self, deadline: std::time::Duration) -> std::io::Result<()> {
+        self.runtime.block_on(super::close::with_deadline(
+            self.endpoint.close(),
+            deadline,
+            "endpoint close timed out with transfers in flight",
+        ))
     }
 
     /// Fetch a representation by trying each recorded provider in
@@ -870,7 +880,86 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn idle_endpoint_close_is_bounded_and_clean() {
+        use iroh::{endpoint::presets, Endpoint};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let source = IrohBulkSource::with_runtime(endpoint, Arc::new(runtime));
+        // No transfers in flight: the close lands inside the deadline
+        // and reports clean. (The timeout itself is pinned on the
+        // shared bound in `close.rs`.)
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn live_close_trips_a_zero_deadline() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(b"live connection").await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, Arc::clone(&runtime));
+        let storage = StorageId::from_bytes([0x77; 32]);
+        source.publish_sealed(
+            storage,
+            IrohBlobRef {
+                provider: direct_addr(&server),
+                hash: *hash.as_bytes(),
+            },
+        );
+        // Establish the connection so the close has a live peer to
+        // drain: a graceful close over it cannot resolve
+        // synchronously, so a zero deadline must report TimedOut.
+        // An unbounded close would block here instead and fail.
+        assert_eq!(
+            source.fetch_sealed(&storage, usize::MAX).unwrap(),
+            Some(b"live connection".to_vec())
+        );
+        let timed_out = source.shutdown(std::time::Duration::ZERO);
+        assert!(
+            matches!(timed_out, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "a live close past its deadline must report TimedOut"
+        );
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
     }
 
     #[test]
@@ -1008,7 +1097,7 @@ mod tests {
             router_a.shutdown().await.unwrap();
             server_a.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1107,7 +1196,7 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1167,7 +1256,7 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -1230,7 +1319,7 @@ mod tests {
             router.shutdown().await.unwrap();
             server.close().await;
         });
-        source.shutdown();
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
     fn direct_addr(endpoint: &iroh::Endpoint) -> EndpointAddr {

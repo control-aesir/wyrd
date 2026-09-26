@@ -10,6 +10,7 @@ use crate::logging::init_mount_diagnostics;
 use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
+use crate::probes::TeardownStatus;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
@@ -414,6 +415,20 @@ pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// that never clears.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long teardown waits for each transport endpoint's graceful
+/// close: much longer than the task-cancel bound above, because the
+/// close drains in-flight transfers over the same degraded links the
+/// drive syncs over — a throttled loopback legitimately needs tens of
+/// seconds, and mistaking a slow close for a wedged one turns clean
+/// shutdowns into mount failures. Still bounded, so a peer that
+/// never answers cannot hang teardown forever; a timeout still fails
+/// the mount. This is a per-endpoint wedge bound, not a share of a
+/// total: back-to-back wedge timeouts can exceed the e2e stop budgets,
+/// but any timeout already fails the step — the 90s budget binds the
+/// clean-but-slow path, measured at 14s on the throttled big-vault
+/// step.
+const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
 /// platform cannot install the handler, termination falls back to the
 /// default disposition (same as dying in `fuser::mount` today).
@@ -633,23 +648,13 @@ fn mount(
             );
         },
     );
-    // The loop returned cleanly or terminally: settle the mutation
-    // queue (run_loop already drained on exit; this is the idempotent
-    // supervisor half) before tearing down serving and the bulk source.
-    supervisor.note_loop_ended();
-    // Cancel the mailbox tasks within a bounded deadline: the drainer
-    // and supervisor stop, and the runtime aborts whatever has not
-    // yielded by then. Without this the tasks would run until runtime
-    // drop, and a shutdown could wait on a relay outage that never
-    // clears.
-    mailbox.shutdown(SHUTDOWN_DEADLINE);
-    bulk.shutdown();
-    let _ = serving.shutdown();
-
-    // Clean shutdown either way: unmount first so the kernel releases
-    // the mountpoint, then reap the session thread, then report the
-    // combined outcome — a dead serving thread fails the mount even
-    // when the loop stopped cleanly.
+    // Presentation down first: unmount so the kernel releases the
+    // mountpoint, then reap the session thread (`destroy` commits
+    // dirty handles here) before cutting transport. A dead loop must
+    // not keep serving reads while its shutdown drains, and the
+    // session teardown lands at the earliest point the queue state
+    // allows — every later step runs against a closed queue and can
+    // only report loss, never prevent it.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
         tracing::warn!(stage = "session", error = %error, "unmount failed");
@@ -665,14 +670,50 @@ fn mount(
                     tracing::debug!(stage = "session", error = %error, "session thread joined with error");
                 }
             }
-            result
+            result.map_err(CliError::Mount)
         }
         Err(_) => {
             tracing::error!(stage = "session", "FUSE session thread panicked");
-            Err(std::io::Error::other("FUSE session thread panicked"))
+            Err(CliError::Mount(std::io::Error::other(
+                "FUSE session thread panicked",
+            )))
         }
     };
-    combine_status(result, session_result)
+    // The loop returned cleanly or terminally: settle the mutation
+    // queue (run_loop already settled it on exit; this is the
+    // idempotent supervisor half) before tearing down the bulk source
+    // and serving. Every teardown outcome is collected, not short-
+    // circuited: a failed bulk close must not skip the serving
+    // shutdown, and the combined status reports the first failure.
+    supervisor.note_loop_ended();
+    // Cancel the mailbox tasks within a bounded deadline: the drainer
+    // and supervisor stop, and the runtime aborts whatever has not
+    // yielded by then. Without this the tasks would run until runtime
+    // drop, and a shutdown could wait on a relay outage that never
+    // clears.
+    mailbox.shutdown(SHUTDOWN_DEADLINE);
+    let bulk_status = bulk
+        .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
+        .map_err(CliError::Bulk);
+    if let Err(error) = &bulk_status {
+        tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
+    }
+    // Release the bulk endpoint (and its runtime) before stopping
+    // serving: a timed-out close must not linger with live peer
+    // connections while the rest of teardown runs.
+    drop(bulk);
+    let serving_status = serving
+        .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
+        .map_err(CliError::Serving);
+    if let Err(error) = &serving_status {
+        tracing::warn!(stage = "serving", error = %error, "serving shutdown failed");
+    }
+    combine_status(TeardownStatus {
+        loop_result: result.map_err(CliError::Live).map(|_| ()),
+        session_result,
+        bulk_result: bulk_status,
+        serving_result: serving_status,
+    })
 }
 
 /// Export the drive's namespace to a plain tree. The open path

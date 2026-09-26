@@ -13,12 +13,26 @@
 //!   [`MutationError::Shutdown`](wyrd_core::mutation::MutationError::Shutdown),
 //!   so no admitted caller waits forever.
 //!
-//! The loop itself drains on exit too
+//! The loop itself settles the queue on exit too
 //! ([`LiveNode::run_loop`](wyrd_core::live::LiveNode::run_loop)), so the
-//! supervisor's drain is an idempotent no-op in the ordinary case —
+//! supervisor's settle is an idempotent no-op in the ordinary case —
 //! belt and braces for composers that drive the queue past the loop.
-//! Join sequencing (unmount, reap the session thread) stays with the
-//! composer: it is FUSE-specific, while this supervisor is not.
+//!
+//! Teardown order after the loop returns is presentation first,
+//! transport second: unmount and reap the session thread (the
+//! backend's `destroy` commits dirty handles here), settle the queue,
+//! then stop the mailbox, the bulk source, and serving, folding every
+//! outcome into the exit status. Mailbox stop and both endpoint closes
+//! run under deadlines; the bulk drop between them releases an owned
+//! current-thread runtime whose task-drop does not wait, so it carries
+//! no deadline. The sequence itself is not unit-pinned — the composer
+//! is binary-only, so the Lima suite is the order evidence.
+//! The order matters because `destroy` can only preserve dirty
+//! handles while the queue is live — against a settled queue the
+//! commit refuses fast with `Shutdown` and the loss is logged per
+//! path. Composer precondition: never destroy the presentation
+//! surface against an open-but-undrained queue; that blocks exactly
+//! like a steady-state release behind a stalled loop.
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 

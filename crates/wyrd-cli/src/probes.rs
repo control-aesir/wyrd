@@ -2,8 +2,6 @@ use crate::CliError;
 #[cfg(any(test, target_os = "macos"))]
 use std::path::{Path, PathBuf};
 
-use wyrd_daemon::{LiveError, LiveSummary};
-
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_preflight(mountpoint: &Path) -> Result<(), CliError> {
     if let Err(reason) = check_mountpoint(mountpoint) {
@@ -162,17 +160,27 @@ pub(crate) fn check_macfuse_runtime(bundle: &Path, dev_dir: &Path) -> Result<(),
     }
 }
 
-/// Fold the loop and session outcomes into the process exit status: a
-/// loop failure dominates (it names the operational cause), but a
-/// session failure alone still fails the mount — success requires a
-/// clean stop AND a cleanly reaped server.
-pub(crate) fn combine_status(
-    loop_result: Result<LiveSummary, LiveError>,
-    session_result: Result<(), std::io::Error>,
-) -> Result<(), CliError> {
-    match (loop_result, session_result) {
-        (Ok(_), Ok(())) => Ok(()),
-        (Err(error), _) => Err(CliError::Live(error)),
-        (Ok(_), Err(error)) => Err(CliError::Mount(error)),
-    }
+/// Teardown outcomes as named fields, so a call site cannot silently
+/// swap two stages the way positional arguments allow. The dominance
+/// policy itself is the `.and()` chain below, in field order: keep
+/// the chain and the declaration in the same order.
+pub(crate) struct TeardownStatus {
+    pub loop_result: Result<(), CliError>,
+    pub session_result: Result<(), CliError>,
+    pub bulk_result: Result<(), CliError>,
+    pub serving_result: Result<(), CliError>,
+}
+
+/// Fold the loop, session, bulk, and serving outcomes into the
+/// process exit status. Teardown never short-circuits — every stage
+/// runs, and the first failure wins: a loop failure dominates (it
+/// names the operational cause), then a dead session, then the
+/// transport shutdowns. Success requires a clean stop, a cleanly
+/// reaped server, and clean transport shutdowns alike.
+pub(crate) fn combine_status(status: TeardownStatus) -> Result<(), CliError> {
+    status
+        .loop_result
+        .and(status.session_result)
+        .and(status.bulk_result)
+        .and(status.serving_result)
 }

@@ -1,6 +1,6 @@
 use super::tests_harness::{write_secret, TempDir};
 use super::*;
-use wyrd_daemon::LiveSummary;
+use wyrd_daemon::LiveError;
 #[test]
 fn init_command_creates_a_reopenable_drive() {
     let temp = TempDir::new();
@@ -92,35 +92,93 @@ fn relay_flag_is_rejected_for_init() {
 
 #[test]
 fn combine_status_fails_dead_sessions() {
-    let clean = LiveSummary {
-        passes: 1,
-        errors_retried: 0,
+    let clean = || TeardownStatus {
+        loop_result: Ok(()),
+        session_result: Ok(()),
+        bulk_result: Ok(()),
+        serving_result: Ok(()),
     };
     assert!(
-        combine_status(Ok(clean), Ok(())).is_ok(),
-        "clean stop and clean server exit zero"
+        combine_status(clean()).is_ok(),
+        "clean stop, clean server, and clean shutdowns exit zero"
     );
-    let clean = LiveSummary {
-        passes: 1,
-        errors_retried: 0,
-    };
     assert!(
         matches!(
-            combine_status(Ok(clean), Err(std::io::Error::other("dead"))),
+            combine_status(TeardownStatus {
+                session_result: Err(CliError::Mount(std::io::Error::other("dead"))),
+                ..clean()
+            }),
             Err(CliError::Mount(_))
         ),
         "a dead serving thread fails the mount"
     );
     assert!(
         matches!(
-            combine_status(Err(LiveError::Lock), Ok(())),
+            combine_status(TeardownStatus {
+                loop_result: Err(CliError::Live(LiveError::Lock)),
+                ..clean()
+            }),
             Err(CliError::Live(_))
         ),
         "a loop failure dominates"
     );
     assert!(
-        combine_status(Err(LiveError::Lock), Err(std::io::Error::other("dead"))).is_err(),
-        "both failing still fails"
+        combine_status(TeardownStatus {
+            loop_result: Err(CliError::Live(LiveError::Lock)),
+            session_result: Err(CliError::Mount(std::io::Error::other("dead"))),
+            bulk_result: Err(CliError::Bulk(std::io::Error::other("bulk"))),
+            serving_result: Err(CliError::Serving(std::io::Error::other("serving"))),
+        })
+        .is_err(),
+        "everything failing still fails"
+    );
+}
+
+/// Transport shutdown failures fail the mount instead of vanishing:
+/// a bulk close that timed out and a serving shutdown that errored
+/// are both operational causes the exit status must name, under
+/// their own variants.
+#[test]
+fn combine_status_reports_transport_shutdown_failures() {
+    let clean = || TeardownStatus {
+        loop_result: Ok(()),
+        session_result: Ok(()),
+        bulk_result: Ok(()),
+        serving_result: Ok(()),
+    };
+    assert!(
+        matches!(
+            combine_status(TeardownStatus {
+                bulk_result: Err(CliError::Bulk(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "bulk endpoint close timed out"
+                ))),
+                ..clean()
+            }),
+            Err(CliError::Bulk(_))
+        ),
+        "a timed-out bulk close fails the mount as a bulk error"
+    );
+    assert!(
+        matches!(
+            combine_status(TeardownStatus {
+                serving_result: Err(CliError::Serving(std::io::Error::other("serving down"))),
+                ..clean()
+            }),
+            Err(CliError::Serving(_))
+        ),
+        "a serving shutdown error fails the mount as a serving error"
+    );
+    assert!(
+        matches!(
+            combine_status(TeardownStatus {
+                loop_result: Err(CliError::Live(LiveError::Lock)),
+                serving_result: Err(CliError::Serving(std::io::Error::other("serving down"))),
+                ..clean()
+            }),
+            Err(CliError::Live(_))
+        ),
+        "the loop failure still dominates a serving failure"
     );
 }
 

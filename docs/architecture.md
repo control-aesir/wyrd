@@ -199,7 +199,10 @@ facts and live heads into the serving view without remounting, then
 publishes undischarged announcement, transition, and capability
 obligations from the durable outbox (mailbox failures stall delivery,
 never the pass), and
-shuts down cleanly on SIGINT/SIGTERM. `open`/`read` on non-local
+tears down presentation before transport on SIGINT/SIGTERM: unmount
+and session join first, then the mailbox, bulk source, and serving
+endpoint under bounded deadlines, with every outcome folded into the
+exit status. `open`/`read` on non-local
 content registers a want and blocks bounded (`docs/fetch-on-open.md`);
 the loop runs with a real iroh bulk source and publishes recorded routes
 each pass, and the mount opens the drive's serving endpoint, so a peer

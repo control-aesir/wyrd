@@ -1,5 +1,7 @@
 use super::backend::current_owner;
-use super::tests_harness::{backend, evolving_backend, heads, snapshot_of, NoMaterialization};
+use super::tests_harness::{
+    backend, chunky_backend, evolving_backend, heads, snapshot_of, NoMaterialization,
+};
 use super::*;
 
 use fuser::{FileHandle, INodeNo};
@@ -721,6 +723,65 @@ fn failed_truncated_open_releases_its_budget_reservation() {
         "no leaked dirty-handle mark"
     );
     assert_eq!(backend.budget.total(), 0, "no leaked aggregate bytes");
+    assert!(backend.release_handle(reader).is_ok());
+    backend.destroy();
+}
+
+/// Past the aggregate open-capture byte ceiling, opens refuse
+/// `ENOSPC` while the handle-count cap sits untouched: the count cap
+/// alone cannot bound retained chunk-list bytes. Open handles keep
+/// serving and a release drains byte room for the next open.
+#[test]
+fn open_captures_refuse_enospc_past_the_byte_ceiling() {
+    // 256 identities × 32 bytes = 8 KiB retained per read capture.
+    let mut backend = chunky_backend(256);
+    backend.max_open_handles = 4096;
+    backend.max_open_capture_bytes = 3 * 256 * 32;
+    let first = backend.open_at("big.bin").unwrap();
+    let second = backend.open_at("big.bin").unwrap();
+    let third = backend.open_at("big.bin").unwrap();
+    assert_eq!(
+        backend.open_at("big.bin"),
+        Err(fuser::Errno::ENOSPC),
+        "a fourth 8 KiB capture past the 24 KiB ceiling refuses"
+    );
+    assert!(
+        backend.read_handle(first, 0, 4).is_ok(),
+        "open handles serve on"
+    );
+    assert!(backend.release_handle(first).is_ok());
+    assert!(
+        backend.open_at("big.bin").is_ok(),
+        "releasing drains byte room for the next open"
+    );
+    for handle in [second, third] {
+        assert!(backend.release_handle(handle).is_ok());
+    }
+    backend.destroy();
+}
+
+/// A single handle cannot evade the capture budget: a budget below
+/// one read capture refuses the very first open, and a budget between
+/// one and two captures admits the read handle but refuses the
+/// writable one (capture plus commit base).
+#[test]
+fn single_open_capture_cannot_evade_the_byte_budget() {
+    let mut backend = chunky_backend(256);
+    backend.max_open_handles = 4096;
+    backend.max_open_capture_bytes = 256 * 32 - 1;
+    assert_eq!(
+        backend.open_at("big.bin"),
+        Err(fuser::Errno::ENOSPC),
+        "one 8 KiB capture past a sub-capture ceiling refuses"
+    );
+    backend.max_open_capture_bytes = 256 * 32;
+    let reader = backend.open_at("big.bin").unwrap();
+    backend.mutations = Some(Arc::new(MutationQueue::default()));
+    assert_eq!(
+        backend.open_write("big.bin", libc::O_RDWR),
+        Err(fuser::Errno::ENOSPC),
+        "a writable handle pins capture plus base: 16 KiB past an 8 KiB ceiling refuses"
+    );
     assert!(backend.release_handle(reader).is_ok());
     backend.destroy();
 }

@@ -102,3 +102,32 @@ pub(super) fn evolving_backend(
     ));
     (backend, next)
 }
+
+/// A one-file drive whose `big.bin` holds `chunks` distinct chunk
+/// identities: the open-capture budget tests pin aggregate retained
+/// bytes, so the file must carry a knob for capture size. Each
+/// identity is 32 bytes; one open read capture retains
+/// `chunks * 32` bytes, a writable handle twice that (capture plus
+/// commit base).
+pub(super) fn chunky_backend(chunks: usize) -> FuseBackend<MemoryObjectStore, NoMaterialization> {
+    let mut store = MemoryObjectStore::default();
+    let mut ids = Vec::with_capacity(chunks);
+    for index in 0..chunks {
+        ids.push(
+            store
+                .insert(ObjectKind::Chunk, &(index as u64).to_le_bytes())
+                .unwrap(),
+        );
+    }
+    let root = Tree::from_entries(vec![
+        Entry::file("big.bin", ids.len() as u64, false, ids).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    FuseBackend::new(DriveView::new(
+        store,
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    ))
+}

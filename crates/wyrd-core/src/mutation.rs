@@ -94,6 +94,14 @@ impl FileIdentity {
     pub fn chunks(&self) -> &[ContentId] {
         &self.chunks
     }
+
+    /// Retained chunk-list bytes: what this identity pins in memory
+    /// while a writable handle holds it as its commit base. Counted
+    /// alongside the handle's read capture by the open-handle byte
+    /// budget.
+    pub fn capture_bytes(&self) -> usize {
+        self.chunks.len() * std::mem::size_of::<ContentId>()
+    }
 }
 
 /// Opaque, session-local identity of a parent directory observed by a

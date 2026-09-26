@@ -235,6 +235,8 @@ Pinned by
 `signal_path_shutdown_preserves_dirty_handle`,
 `terminal_loop_error_preserves_dirty_handle`,
 `teardown_preserves_every_dirty_handle_and_drops_clean`,
+`release_after_loop_return_commits_dirty_handle`,
+`loop_thread_panic_tears_down_bounded`,
 `submissions_racing_admission_close_resolve_bounded`
 (`wyrd-daemon/src/core/tests_teardown.rs`),
 `loop_return_keeps_queue_open_for_teardown_submits`,

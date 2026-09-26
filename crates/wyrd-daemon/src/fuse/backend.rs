@@ -1439,13 +1439,23 @@ where
         if let Some(Handle::Write(handle)) = removed {
             // Best-effort means the error is not observable — but it
             // is still a loss, so it is logged with the path like
-            // every other commit failure on this surface.
+            // destroy's, split the same way: a handle already marked
+            // failed by an earlier commit only needs the warn, while
+            // a refused commit is the error. The pathless debug log
+            // inside the commit stays — it serves the flush/fsync
+            // paths that share the commit, where the errno itself is
+            // the report.
+            let previously_failed = handle.lock().map(|write| write.failed).unwrap_or(false);
             if let Err(error) = self.commit_write_handle(&handle) {
                 let path = handle
                     .lock()
                     .map(|write| write.path.clone())
                     .unwrap_or_else(|_| "<locked>".to_string());
-                tracing::error!(stage = "session", %path, ?error, "release dropped a dirty handle's buffered writes");
+                if previously_failed {
+                    tracing::warn!(stage = "session", %path, "release dropped a previously failed handle's buffered writes");
+                } else {
+                    tracing::error!(stage = "session", %path, ?error, "release dropped a dirty handle's buffered writes");
+                }
             }
         }
         Ok(())

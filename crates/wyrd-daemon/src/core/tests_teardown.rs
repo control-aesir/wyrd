@@ -287,12 +287,23 @@ fn loop_thread_panic_tears_down_bounded() {
     trigger_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("the panic recovery reports");
+    // Bounded teardown: the session join must resolve in seconds. A
+    // regression to blocking would hang here past the suite timeout;
+    // the elapsed bound turns that hang into a failure with a wide
+    // margin (normal path: well under a second; old stall: 30 s per
+    // handle).
+    let started = std::time::Instant::now();
     let session = std::thread::spawn(move || {
         backend.destroy();
     });
     session
         .join()
         .expect("destroy resolves instead of hanging the join");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "teardown must stay bounded, took {:?}",
+        started.elapsed()
+    );
     supervisor.close_admission();
     let returned = drive.join().expect("the supervision joins");
     assert!(
@@ -312,8 +323,15 @@ fn loop_thread_panic_tears_down_bounded() {
 /// a real mount the kernel releases every open file before destroy
 /// runs, so this — not destroy — is the kernel-reachable
 /// preservation path, and the queue contract it relies on is
-/// identical. Fails against the old order (the submit refuses with
-/// `Shutdown`, surfacing as `EIO`); passes now with the commit.
+/// identical.
+///
+/// Reporting note: `release_handle` returns `Ok` whenever the table
+/// drop succeeds — the commit outcome is unreportable by contract
+/// (a `release` errno is not observable to the application), so no
+/// assertion here can observe the commit itself. The load-bearing
+/// assertion is the reopen below: against the old order the commit
+/// refuses with `Shutdown` inside `commit_locked` and the reopened
+/// drive serves the stale bytes.
 #[test]
 fn release_after_loop_return_commits_dirty_handle() {
     let (engine, dir, identity) = scratch_drive();
@@ -336,8 +354,10 @@ fn release_after_loop_return_commits_dirty_handle() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the loop reports its return");
     // Release-shaped, not destroy-shaped: one handle's commit after
-    // the return, against the open queue the drain serves.
-    backend.release_handle(fh).expect("release commits");
+    // the return, against the open queue the drain serves. The return
+    // value cannot carry the commit outcome (see the doc above); the
+    // reopen below is the assertion.
+    let _ = backend.release_handle(fh);
     supervisor.close_admission();
     let returned = drive.join().expect("the loop thread joins");
     returned.result.expect("loop stops cleanly");

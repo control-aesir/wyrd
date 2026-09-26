@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use wyrd_core::mutation::{MutationError, MutationKind};
+use wyrd_core::mutation::{MutationKind, MutationOutcome};
 
 use super::tests_harness::{scratch_drive, NoopMailbox, SettlementFailingMailbox};
 
@@ -174,6 +174,59 @@ fn failure_classes_classify_and_cap_independently() {
     assert_eq!(FailureClass::Engine.max_consecutive(&configured), 7);
 }
 
+/// Signal-path ordering pin: once the loop has returned, teardown
+/// submissions must still be admitted — the queue may only die when
+/// the supervisor settles it after the teardown joins, never as a
+/// side effect of the loop's return. (Fails while the loop settles
+/// on exit: the submit refuses fast with Shutdown and never lands
+/// in pending.)
+#[test]
+fn loop_return_keeps_queue_open_for_teardown_submits() {
+    let (engine, dir, _) = scratch_drive();
+    let daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (mut live, parts) = daemon
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    drop(parts);
+    let queue = Arc::clone(live.mutations());
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let looped = scope.spawn(|| {
+            let mut mailbox = NoopMailbox;
+            live.run_loop(
+                &mut mailbox,
+                None::<&mut MemoryBulkSource>,
+                &stop,
+                &LiveConfig {
+                    interval: Duration::from_millis(10),
+                    ..LiveConfig::default()
+                },
+                &mut |_, _| {},
+            )
+        });
+        // Trip stop and reap the loop: every teardown submission
+        // below races nothing — the loop is gone.
+        stop.store(true, Ordering::Relaxed);
+        looped.join().unwrap().expect("loop stops cleanly");
+        // A teardown submission after the loop's return: admitted
+        // (pending) under the new contract, refused with Shutdown
+        // while the loop settles on exit. The submitter stays
+        // blocked until the test's drain releases it, so shut the
+        // queue down at the end to rejoin the scope cleanly.
+        scope.spawn(|| {
+            let _ = queue.submit(MutationKind::Mkdir {
+                path: "docs".to_string(),
+            });
+        });
+        await_pending(&queue);
+        queue.shutdown();
+    });
+
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Block until a mutation submission lands in pending (or fail on
 /// timeout): faster and less flaky than a fixed sleep, and it fails
 /// the test instead of hanging the suite.
@@ -188,11 +241,12 @@ fn await_pending(queue: &std::sync::Arc<wyrd_core::mutation::MutationQueue>) {
     }
 }
 
-/// A blocked mutation submitter is completed when the loop aborts:
-/// terminal error must not strand admitted callers. The submit lands
-/// in pending (drain fails first, so it is never taken); the loop
-/// trips the cap within milliseconds; the waiter must resolve
-/// instead of blocking forever.
+/// A blocked mutation submitter is executed when the loop aborts:
+/// terminal error ends sync, but the queue stays open — the
+/// post-return drain applies the admitted mutation instead of
+/// mass-failing it with Shutdown. The submit lands in pending (drain
+/// fails first, so it is never taken); the loop trips the cap within
+/// milliseconds; the drain resolves the waiter with the commit.
 #[test]
 fn terminal_loop_error_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
@@ -234,17 +288,26 @@ fn terminal_loop_error_completes_blocked_submitters() {
         &mut |_, _| {},
     );
     assert!(result.is_err(), "the cap aborts the loop");
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Err(MutationError::Shutdown)) => {}
-        other => panic!("blocked submitter must resolve with Shutdown, got {other:?}"),
-    }
+    // The abort settles nothing: the drain executes the admitted
+    // submit, and the close ends the drain.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            live.drain_until_closed();
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(MutationOutcome::Done)) => {}
+            other => panic!("blocked submitter must resolve with the commit, got {other:?}"),
+        }
+        queue.shutdown();
+    });
 
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A clean stop with an in-flight submitter completes it too: loop
-/// exit for any reason leaves no admitted-but-incomplete request.
+/// A clean stop with an in-flight submitter executes it too: loop
+/// exit for any reason leaves admission open, and the post-return
+/// drain applies what the passes never took.
 #[test]
 fn clean_stop_completes_blocked_submitters() {
     let (engine, dir, _) = scratch_drive();
@@ -265,7 +328,8 @@ fn clean_stop_completes_blocked_submitters() {
             let _ = tx.send(result);
         });
         // Wait until the submission lands in pending, then stop: the
-        // loop exits Ok, and the waiter must still resolve.
+        // loop exits Ok with the queue still open, and the drain
+        // executes the waiter.
         await_pending(&queue);
         stop.store(true, Ordering::Relaxed);
         let mut mailbox = NoopMailbox;
@@ -280,11 +344,15 @@ fn clean_stop_completes_blocked_submitters() {
             &mut |_, _| {},
         )
         .expect("loop stops cleanly");
+        scope.spawn(|| {
+            live.drain_until_closed();
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(MutationOutcome::Done)) => {}
+            other => panic!("blocked submitter must resolve with the commit, got {other:?}"),
+        }
+        queue.shutdown();
     });
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Err(MutationError::Shutdown)) => {}
-        other => panic!("blocked submitter must resolve with Shutdown, got {other:?}"),
-    }
 
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();

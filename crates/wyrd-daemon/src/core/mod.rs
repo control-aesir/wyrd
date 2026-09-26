@@ -21,6 +21,8 @@ mod tests_publish;
 mod tests_run_loop;
 #[cfg(test)]
 mod tests_sync;
+#[cfg(test)]
+mod tests_teardown;
 
 pub use wyrd_core::budgets::ResourceBudgets;
 pub use wyrd_core::live::{

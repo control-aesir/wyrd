@@ -599,17 +599,24 @@ fn mount(
     let mut unmounter = session.unmount_callable();
     // One lifecycle supervisor owns the stop flag, the mutation queue,
     // and the loop's pacing signal: session end trips shutdown below,
-    // loop end settles the queue after run_loop returns. Either
-    // direction alone strands somebody — a dead session with a syncing
-    // loop, or a dead loop with blocked submitters — so both are wired.
-    // The signal is created and attached by `into_live`; sharing it
-    // here means a trip also pokes the loop out of its idle wait.
+    // loop return trips it on the loop thread. Either direction alone
+    // strands somebody — a dead session with a syncing loop, or a dead
+    // loop with blocked submitters — so both are wired. The signal is
+    // created and attached by `into_live`; sharing it here means a
+    // trip also pokes the loop out of its idle wait.
     let supervisor = Supervisor::new(
         Arc::clone(live.mutations()),
         &SHUTDOWN,
         Arc::clone(live.waker()),
     );
     let session_supervisor = supervisor.clone();
+    // Exit triggers: the session thread reports its exit and the loop
+    // thread reports its return; the composer tears down on the first
+    // of those or a shutdown trip. A dedicated channel (not the
+    // loop's pacing signal) carries the triggers, so steady-state
+    // pokes are never stolen from the loop's wait.
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
+    let session_trigger = trigger_tx.clone();
     // The session loop owns the backend: log its exit immediately on
     // the thread, then trip shutdown so the live loop exits promptly
     // instead of syncing and serving behind a dead presentation
@@ -624,37 +631,75 @@ fn mount(
             }
         }
         session_supervisor.note_session_ended();
+        // The composer may already be tearing down (loop-first exit):
+        // the trigger is advisory, the join below is authoritative.
+        let _ = session_trigger.send(());
         outcome
     });
-    let result = live.run_loop(
-        &mut mailbox,
-        Some(&mut bulk),
-        &SHUTDOWN,
-        &config,
-        &mut |error, consecutive| {
-            // `consecutive` counts failures of this error's class, not
-            // of every class combined: each class backs off and trips
-            // its cap independently.
-            let class = FailureClass::from(error);
-            eprintln!(
-                "live sync pass failed ({class:?} class, {consecutive} consecutive): {error}"
-            );
-            tracing::warn!(
-                stage = "sync",
-                class = ?class,
-                consecutive,
-                error = %error,
-                "live sync pass failed"
-            );
-        },
-    );
+    // The live loop runs on its own thread so the composer can unmount
+    // and reap the session while the queue is still open: destroy's
+    // dirty-handle commits submit against a live queue, and the
+    // post-return drain below executes them concurrently. The thread
+    // hands back the loop outcome with everything it borrowed, so
+    // transport teardown below keeps its handles.
+    let loop_trigger = trigger_tx;
+    let loop_supervisor = supervisor.clone();
+    let drive = std::thread::spawn(move || {
+        let result = live.run_loop(
+            &mut mailbox,
+            Some(&mut bulk),
+            &SHUTDOWN,
+            &config,
+            &mut |error, consecutive| {
+                // `consecutive` counts failures of this error's class, not
+                // of every class combined: each class backs off and trips
+                // its cap independently.
+                let class = FailureClass::from(error);
+                eprintln!(
+                    "live sync pass failed ({class:?} class, {consecutive} consecutive): {error}"
+                );
+                tracing::warn!(
+                    stage = "sync",
+                    class = ?class,
+                    consecutive,
+                    error = %error,
+                    "live sync pass failed"
+                );
+            },
+        );
+        // Trip shutdown so a loop-first return (terminal error with a
+        // live session) still wakes the composer — and settle nothing:
+        // the drain below owns admitted mutations until the composer
+        // closes admission after the session join.
+        loop_supervisor.note_loop_returned();
+        let _ = loop_trigger.send(());
+        live.drain_until_closed();
+        (result, live, mailbox, bulk)
+    });
+    // Teardown trigger: the first session exit, loop return, or
+    // shutdown trip starts the ordered teardown below. The wait polls
+    // the process latch in slices because a signal-handler trip cannot
+    // notify the channel — the same slow-path guarantee as the loop's
+    // own stop polling, and fast enough for a path that already
+    // budgets seconds for transport closes.
+    loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            break;
+        }
+        match trigger_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
     // Presentation down first: unmount so the kernel releases the
     // mountpoint, then reap the session thread (`destroy` commits
-    // dirty handles here) before cutting transport. A dead loop must
-    // not keep serving reads while its shutdown drains, and the
-    // session teardown lands at the earliest point the queue state
-    // allows — every later step runs against a closed queue and can
-    // only report loss, never prevent it.
+    // dirty handles here, against the still-open queue the loop
+    // thread's drain executes concurrently) before cutting transport.
+    // A dead loop must not keep serving reads while its shutdown
+    // drains, and the session teardown lands at the earliest point
+    // the queue state allows — destroy can only preserve handles
+    // while the queue is live and drained.
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
         tracing::warn!(stage = "session", error = %error, "unmount failed");
@@ -679,13 +724,28 @@ fn mount(
             )))
         }
     };
-    // The loop returned cleanly or terminally: settle the mutation
-    // queue (run_loop already settled it on exit; this is the
-    // idempotent supervisor half) before tearing down the bulk source
-    // and serving. Every teardown outcome is collected, not short-
-    // circuited: a failed bulk close must not skip the serving
-    // shutdown, and the combined status reports the first failure.
-    supervisor.note_loop_ended();
+    // The session is joined: destroy ran, so no teardown action can
+    // submit anymore — close admission before reaping the loop, whose
+    // drain exits on the close after one final sweep. Closing before
+    // the join would strand destroy's submits; closing after the loop
+    // join would leave the drain parked. Every teardown outcome is
+    // collected, not short-circuited: a failed bulk close must not
+    // skip the serving shutdown, and the combined status reports the
+    // first failure.
+    supervisor.close_admission();
+    let (result, _live, mut mailbox, bulk) = match drive.join() {
+        Ok(returned) => returned,
+        Err(_) => {
+            tracing::error!(stage = "sync", "live loop thread panicked");
+            return Err(CliError::Mount(std::io::Error::other(
+                "live loop thread panicked",
+            )));
+        }
+    };
+    // Straggler settle: the drain executed everything queued before
+    // the close, so this is the idempotent mop-up for submissions
+    // that raced the close itself.
+    supervisor.settle();
     // Cancel the mailbox tasks within a bounded deadline: the drainer
     // and supervisor stop, and the runtime aborts whatever has not
     // yielded by then. Without this the tasks would run until runtime

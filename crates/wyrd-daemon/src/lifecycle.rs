@@ -1,38 +1,48 @@
 //! Unified shutdown sequencing for the mounted daemon: one owner for
 //! the stop flag the live loop polls and the mutation queue whose
-//! blocked submitters must never outlive the loop.
+//! blocked submitters must never outlive the teardown.
 //!
-//! Termination propagates both ways through two calls the composer
-//! (`main.rs`) wires at the thread boundaries:
+//! The lifecycle invariant: once shutdown begins, no component
+//! declares the mutation queue dead until every teardown action
+//! capable of submitting a mutation has finished. In practice the
+//! queue stays open and drained from the first stop trip until the
+//! composer has joined the presentation session — the only teardown
+//! submitter — and closes admission itself.
+//!
+//! Termination propagates through calls the composer (`main.rs`)
+//! wires at the thread boundaries:
 //!
 //! - the presentation session ends (any outcome) → [`Supervisor::note_session_ended`]
 //!   trips the stop flag, so the live loop exits promptly instead of
 //!   syncing and serving behind a dead surface;
-//! - the live loop returns (any outcome) → [`Supervisor::note_loop_ended`]
-//!   trips the stop flag and completes every still-queued mutation with
-//!   [`MutationError::Shutdown`](wyrd_core::mutation::MutationError::Shutdown),
-//!   so no admitted caller waits forever.
+//! - the live loop returns (any outcome) → [`Supervisor::note_loop_returned`]
+//!   trips the stop flag so the composer wakes and tears down. The
+//!   return settles nothing: the loop thread keeps executing admitted
+//!   mutations ([`LiveNode::drain_until_closed`](wyrd_core::live::LiveNode::drain_until_closed))
+//!   until the composer closes admission.
 //!
-//! The loop itself settles the queue on exit too
-//! ([`LiveNode::run_loop`](wyrd_core::live::LiveNode::run_loop)), so the
-//! supervisor's settle is an idempotent no-op in the ordinary case —
-//! belt and braces for composers that drive the queue past the loop.
-//!
-//! Teardown order after the loop returns is presentation first,
-//! transport second: unmount and reap the session thread (the
-//! backend's `destroy` commits dirty handles here), settle the queue,
+//! Teardown order on the composer thread is session first, loop
+//! second, transport last: unmount and reap the session thread (the
+//! backend's `destroy` commits dirty handles here, against the still-
+//! open queue the drain executes concurrently), close admission
+//! ([`Supervisor::close_admission`]) — the session join is the
+//! submission boundary, so after it no FUSE-driven submission can
+//! race the drain's end — reap the loop thread, settle stragglers,
 //! then stop the mailbox, the bulk source, and serving, folding every
 //! outcome into the exit status. Mailbox stop and both endpoint closes
 //! run under deadlines; the bulk drop between them releases an owned
 //! current-thread runtime whose task-drop does not wait, so it carries
-//! no deadline. The sequence itself is not unit-pinned — the composer
-//! is binary-only, so the Lima suite is the order evidence.
+//! no deadline. The composer order itself is not unit-pinned — the
+//! composer is binary-only, so the Lima suite is the order evidence —
+//! but the queue half of the contract is: the teardown-sequence tests
+//! pin that post-return submissions execute and settle only after the
+//! joins.
 //! The order matters because `destroy` can only preserve dirty
-//! handles while the queue is live — against a settled queue the
-//! commit refuses fast with `Shutdown` and the loss is logged per
-//! path. Composer precondition: never destroy the presentation
-//! surface against an open-but-undrained queue; that blocks exactly
-//! like a steady-state release behind a stalled loop.
+//! handles while the queue is live and drained — against a settled
+//! queue the commit refuses fast with `Shutdown` and the loss is
+//! logged per path. Composer precondition: never close admission
+//! before the session join returns; that strands destroy's submits
+//! exactly like the old settle-on-loop-exit did.
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
@@ -75,13 +85,37 @@ impl Supervisor {
         self.waker.wake();
     }
 
-    /// The live loop returned, cleanly or not: trip shutdown, close
-    /// admission, and settle the mutation queue so every
-    /// admitted-but-incomplete caller resolves with `Shutdown` instead
-    /// of blocking forever — and no later submission can queue behind
-    /// the dead loop.
-    pub fn note_loop_ended(&self) {
+    /// The live loop returned, cleanly or not: trip shutdown so the
+    /// composer wakes and tears down — and settle nothing. The queue
+    /// stays open for teardown submissions (unmount-time commits),
+    /// which the loop thread's post-return drain executes; admission
+    /// closes only in [`Supervisor::close_admission`], after the
+    /// session join that bounds every teardown submitter.
+    pub fn note_loop_returned(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.waker.wake();
+    }
+
+    /// The presentation session is joined: no teardown action can
+    /// submit anymore, so close admission and complete every
+    /// still-queued request with `Shutdown`. In the ordinary sequence
+    /// the drain already executed everything queued, making this the
+    /// idempotent stray mop-up; calling it before the session join
+    /// strands destroy's submits and must never happen (see the
+    /// module contract).
+    pub fn close_admission(&self) {
+        self.queue.shutdown();
+        self.waker.wake();
+    }
+
+    /// The loop thread is joined: complete every still-queued request
+    /// with `Shutdown`. The drain executed everything queued before
+    /// the close, so this only ever sees submissions that raced the
+    /// close itself — the idempotent mop-up that guarantees no
+    /// admitted caller waits forever. Same plain shutdown the old
+    /// loop-exit path ran; kept as the supervisor's so the composer
+    /// never touches queue internals directly.
+    pub fn settle(&self) {
         self.queue.shutdown();
         self.waker.wake();
     }
@@ -152,16 +186,31 @@ mod tests {
     }
 
     #[test]
-    fn loop_end_completes_pending_and_trips_shutdown() {
+    fn loop_return_trips_shutdown_without_settling() {
         let (supervisor, queue, flag) = supervisor();
         let rx = submit_blocking(Arc::clone(&queue));
-        supervisor.note_loop_ended();
+        supervisor.note_loop_returned();
         assert!(flag.load(Ordering::Relaxed));
+        // The return settles nothing: the submitter is still admitted
+        // (pending), left for the post-return drain to execute.
+        assert_eq!(queue.outstanding(), 1);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the submitter must stay blocked until the drain or the close"
+        );
+        // Idempotent: repeated returns change nothing either.
+        supervisor.note_loop_returned();
+        assert_eq!(queue.outstanding(), 1);
+        // Admission closes only after the session join: strays left
+        // for the close resolve with Shutdown instead of blocking
+        // forever.
+        supervisor.close_admission();
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Err(MutationError::Shutdown)) => {}
-            other => panic!("blocked submitter must resolve with Shutdown, got {other:?}"),
+            other => panic!("leftover submitter must resolve with Shutdown, got {other:?}"),
         }
-        // Idempotent: a second end finds nothing pending and changes nothing.
-        supervisor.note_loop_ended();
+        // Idempotent: a second close finds nothing pending and changes
+        // nothing.
+        supervisor.close_admission();
     }
 }

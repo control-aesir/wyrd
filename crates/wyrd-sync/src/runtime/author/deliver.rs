@@ -900,6 +900,7 @@ mod tests {
             "the pending obligation converges once the session agrees with itself"
         );
     }
+
     /// A corrupt session response is static breakage: it fails
     /// loudly. Driven through the committing wrapper (not the bare
     /// bytes fn) so "nothing committed" can actually fail.
@@ -1040,11 +1041,15 @@ mod tests {
     }
 
     /// An unreachable signer leaves the stale fact untouched for the
-    /// next pass: no replacement, no commit.
+    /// next pass: the staged `0x01` seal stays the obligation, no
+    /// replacement, no further commit.
     #[test]
     fn supersede_arm_unreachable_leaves_the_stale_fact() {
         let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
         let stale = stale_rotation_bytes(owner);
+        engine
+            .commit_facts(&[Fact::CapabilitySealed(1, owner, stale.clone())])
+            .expect("stage the stale fact");
         let before = engine.store.current();
         let replaced = supersede_stale_rotation(
             &mut engine,
@@ -1061,6 +1066,16 @@ mod tests {
             engine.store.current(),
             before,
             "the skipped supersede commits nothing"
+        );
+        let loaded = engine.store.load().unwrap();
+        assert_eq!(
+            loaded.capability_sealed,
+            vec![(1, owner, stale)],
+            "the staged stale fact is untouched"
+        );
+        assert!(
+            loaded.capability_sealed_replaced.is_empty(),
+            "no replacement fact claims the obligation"
         );
     }
 }

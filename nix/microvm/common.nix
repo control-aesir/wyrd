@@ -23,6 +23,11 @@
     # always eth0, so the suite throttles and addresses one name.
     boot.kernelParams = [ "net.ifnames=0" ];
 
+    # The test bridge is isolated (no uplink, host-only): filtering
+    # there buys nothing and breaks the relay port plus dynamic iroh
+    # UDP between peers. The VM boundary is the isolation.
+    networking.firewall.trustedInterfaces = [ "eth0" ];
+
     # The spike proved /dev/fuse is rw under the default microvm
     # kernel; no extra kernel modules needed. The suite fails loudly
     # at first mount if that ever regresses.

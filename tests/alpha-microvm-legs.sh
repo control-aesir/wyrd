@@ -199,6 +199,13 @@ leg_fetch_owner() {
 # and unobservable e2e — the member deletes stale-1.txt precisely
 # because the export fails closed on remote-only content, so the
 # export can never show that identity's absence.
+# The recovery probe below is order-dependent, not a regression pin
+# for decision 8 (fair share): candidate order is hash order, so a
+# run where the live provider sorts first would pass without the
+# fix. Read it as an end-to-end recovery smoke; the deterministic
+# pin lives in-crate at
+# runtime::plan::tests_execution::sliced_run_attempts_live_candidates_behind_a_dead_one,
+# which builds the dead-first order explicitly.
 leg_fetch_member() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane member leg"

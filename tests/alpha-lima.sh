@@ -531,7 +531,12 @@ main() {
   if [[ -f "$E2E_ROOT/relay.pid" ]]; then
     kill -KILL "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
   fi
-  rm -rf "$E2E_ROOT"
+  # Contents-only: the top dir may live on a share whose parent is
+  # not writable (microVM virtiofs; Lima's /tmp parent allows the
+  # removal). Empty the dir, keep the dir — identical fresh slate.
+  shopt -s nullglob dotglob
+  rm -rf "${E2E_ROOT:?}/"*
+  shopt -u nullglob dotglob
   mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
   local only="${E2E_ONLY_STEP:-}"
   # Comma list (`--step 1,4,6`): steps build on each other, so the run

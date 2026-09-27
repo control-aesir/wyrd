@@ -99,7 +99,12 @@ pub struct ResourceBudgets {
     /// (`ENOSPC` past it).
     pub max_open_capture_bytes: usize,
     /// Ceiling on the bytes this device retains in its object store
-    /// (`ENOSPC` at the commit that would cross it). `None` — the
+    /// (`ENOSPC` once already over, at the mounted commit boundary).
+    /// This is not a ceiling on the device: fetched bytes, the vault,
+    /// and the fact log all raise the count with no refusal, and a
+    /// commit starting under the ceiling is admitted and overshoots.
+    /// `storage-growth.md` states each of those; this is the field-doc
+    /// summary. `None` — the
     /// default — is unlimited, so unconfigured deployments behave
     /// exactly as before and the count costs only a relaxed atomic
     /// load per commit.

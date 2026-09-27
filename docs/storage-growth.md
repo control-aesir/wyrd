@@ -277,8 +277,11 @@ one is a place where the number understates what the device holds.
 **Only the local write path refuses.** The check sits in the mounted
 commit boundary. The sync pass writes fetched objects into the same store
 with no quota in scope, the vault retains ciphertext per representation,
-and the loop commits facts every pass. All three raise the count; none
-of them is ever refused. So the device's retained bytes are *not* bounded
+and the fact log grows per commit, per accepted intake message, and per
+delivery. All three raise the count; none of them is ever refused. (The
+fact log is not unbounded by a pass — materialization commits are
+idempotent, as "Already bounded" records — it simply is not metered
+here.) So the device's retained bytes are *not* bounded
 by the configured number, and the number can be crossed by paths that
 have no ceiling at all.
 
@@ -296,9 +299,12 @@ can pull.
 **The overshoot is one whole commit.** The check compares bytes already
 retained, so a commit that starts one byte under the quota is admitted
 and can take the total to `quota + N` for whatever that commit retains. On
-the author path `N` is bounded by the write buffer, 64 MiB
-(`MAX_WRITE_BUFFER_BYTES`); on the fetch path nothing bounds it. No commit
-is ever refused *for crossing* the ceiling — only once it is already over.
+the author path `N` is the handle's buffered image plus the tree nodes
+rebuilt on the changed path: 64 MiB of write buffer
+(`MAX_WRITE_BUFFER_BYTES`) plus namespace-sized nodes, which are the
+separate step-1 row in the fixed-cost table above and do not scale with
+the write. On the fetch path nothing bounds `N` at all. No commit is ever
+refused *for crossing* the ceiling — only once it is already over.
 
 **And it is one-way.** Nothing lowers the count: no GC, no eviction, and
 bytes charged by a fetch or by a commit that failed after its inserts stay
@@ -341,10 +347,12 @@ disk, where a zero-byte write still succeeds.
      retained, so the effective ceiling is the quota plus whatever the
      next admitted commit retains. A stricter reading would reserve the
      in-flight delta up front.
-   - **A startup cross-check.** `MemoryObjectStore::retained_bytes` is
-     the composition root's cross-check and nothing calls it yet, so a
-     quota set below current retention is discovered as a stream of
-     `ENOSPC` at the first write rather than as a startup diagnosis.
+   - **A startup cross-check.** `FsObjectStore::retained_bytes` is the
+     composition root's cross-check — a mounted store is an
+     `FsObjectStore`, so that is the one that matters — and nothing
+     calls it yet, so a quota set below current retention is discovered
+     as a stream of `ENOSPC` at the first write rather than as a startup
+     diagnosis.
    - **Granularity.** The bound is per device. Per drive would bound the
      *author* across its devices; per member-set would bound a group.
      The device scope is the conservative choice and is the only one

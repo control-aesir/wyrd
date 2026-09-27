@@ -1199,8 +1199,10 @@ where
     /// So the comparison is `>=` against bytes already retained, and it
     /// runs before the match: there is no arm-specific cost to
     /// estimate, and no path that reaches a first write without passing
-    /// here. The effective ceiling is therefore the quota plus at most
-    /// the one commit already in flight when the quota was crossed.
+    /// here. A commit starting *under* the ceiling is admitted, so the
+    /// effective ceiling is the quota plus whatever the next admitted
+    /// commit retains — one commit's worth, not zero, and nothing on the
+    /// fetch path to bound it.
     fn enforce_retained_quota(&self) -> Result<(), MutationError> {
         let (Some(limit), Some(retained)) =
             (self.budgets.retained_bytes_quota, &self.retained_bytes)

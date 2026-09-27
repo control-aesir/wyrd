@@ -156,12 +156,39 @@ impl FsObjectStore {
         Ok(store)
     }
 
-    /// Bytes of published objects on disk, by the same walk `open` uses
-    /// to clear temp debris. This is the composition root's cross-check:
-    /// comparing it against a configured quota at startup turns "every
-    /// write is `ENOSPC`" into a diagnosis at boot.
+    /// Bytes of published objects on disk, counted without touching
+    /// anything. This is the composition root's cross-check: comparing it
+    /// against a configured quota at startup turns "every write is
+    /// `ENOSPC`" into a diagnosis at boot.
+    ///
+    /// Read-only on purpose, and deliberately a separate walk from
+    /// [`Self::sweep_and_total`]. Merging them would make this query
+    /// delete `.tmp` debris, which no reader of a byte count expects and
+    /// which would contradict the store's stated rule that only `open`
+    /// removes temps. It is not on any current path, so the second walk
+    /// at open is the only cost, and `open` still pays for exactly one.
     pub fn retained_bytes(&self) -> Result<u64, FsStoreError> {
-        self.sweep_and_total()
+        let mut total = 0u64;
+        let mut stack = vec![self.objects_dir()];
+        while let Some(current) = stack.pop() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(FsStoreError::io(error)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(FsStoreError::io)?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_none_or(|ext| ext != "tmp") {
+                    // Temps are excluded: one is by definition not yet
+                    // retained content, and this walk removes nothing.
+                    total += entry.metadata().map_err(FsStoreError::io)?.len();
+                }
+            }
+        }
+        Ok(total)
     }
 
     fn objects_dir(&self) -> PathBuf {
@@ -184,12 +211,12 @@ impl FsObjectStore {
             .find(|(_, path)| path.is_file())
     }
 
-    /// One walk over the store that both removes `.tmp` debris and
-    /// totals the published objects, returning the retained byte count.
-    /// These were two traversals; the walk already visits every entry
-    /// and already knows which ones are temps, so a counted store on a
-    /// drive holding millions of objects should not pay for the tree
-    /// twice at open.
+    /// The `open`-time walk: removes every `.tmp` file and returns the
+    /// published byte total in one traversal. These were two walks; this
+    /// one already visits every entry and already knows which are temps,
+    /// so a counted store on a drive holding millions of objects pays for
+    /// the tree once rather than twice. The only caller that removes
+    /// anything — see [`Self::retained_bytes`] for the read-only count.
     ///
     /// Temps are excluded from the total: one is by definition not yet
     /// retained content, and this walk is about to delete them.
@@ -300,6 +327,14 @@ impl ObjectStore for FsObjectStore {
             // Only a real publication retains bytes. A rewrite of a
             // present-but-unverifiable object is charged, which is
             // correct: it lands the same bytes under the same name.
+            //
+            // One case over-charges, knowingly: if a concurrent writer
+            // won the rename, `atomic_write` reports success without
+            // this call having published, and the bytes are charged
+            // twice for one object. That needs two store clones or two
+            // processes on one directory, which the module header
+            // already scopes as trusted-directory territory, and the
+            // error is a ceiling reached early rather than one passed.
             if let Some(retained) = &self.retained {
                 retained.add(data.len() as u64);
             }

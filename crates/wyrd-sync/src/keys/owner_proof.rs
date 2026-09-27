@@ -217,10 +217,11 @@ mod tests {
     /// `0xA0`, recipient `0xB1`, transition `0xC2`, epoch 3, secrets
     /// `0xAA` and `0xBB`. Distinct one-byte patterns, so a field swap
     /// or truncation changes the bytes rather than colliding.
+    ///
     /// The fixture identity scalar, named so tests that need the
     /// bare curve key (signer sessions take `SecretKey`, not the
-    /// wrapper) share one source instead of round-tripping through
-    /// the wrapper's crate-private bytes.
+    /// wrapper) share one source. The identity wrapper itself has no
+    /// byte accessor — only `DeviceEncryptionSecret` does.
     const FIXTURE_SCALAR: [u8; 32] = [0x11; 32];
 
     fn fixture() -> (

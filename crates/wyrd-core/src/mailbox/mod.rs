@@ -80,7 +80,7 @@
 //! |---|---|---|---|
 //! | `identity: DeviceIdentitySecret` | CLI composer | mount duration | `Zeroizing`-backed, sync-audited; parsed once per mailbox/engine open |
 //! | engine identity clone | `Engine` | engine duration | snapshot authoring signs with the device key; the engine cannot borrow the CLI's copy |
-//! | bare `SecretKey` × 2 | `connect` arguments | the `connect` call only | transient parse results moved into the two `Keys` below; live across construction, not after |
+//! | bare `SecretKey` × 1 | `connect` argument | the `connect` call only | cloned out of the signer `Keys` scalar, moved into `open_keys` below; live across construction, not after |
 //! | signer `Keys` | `LiveMailbox.signer` | mailbox duration | outbound seals sign through the generic `S` boundary; a remote signer would hold no local secret (future: NIP-46 is not wired, see below) |
 //! | `open_keys: Keys` | `LiveMailbox` | mailbox duration | inbound `from_gift_wrap` needs the identity key, which the generic signer cannot lend |
 //!

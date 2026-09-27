@@ -13,14 +13,16 @@
 //!
 //! Residency policy: the engine owns both secrets for the process
 //! lifetime, and intake/inbox paths borrow them per call — no second
-//! owned copy. The one deliberate clone is the authoring pass's local
-//! signer session (`engine.identity_secret.clone()` once per pass: the
-//! obligation loop holds `&mut Engine` while minting through the
-//! session, so it cannot borrow). Every copy scrubs on drop via
-//! [`ZeroizeOnDrop`], including the pass-local session. Derived
-//! `Clone` stays for exactly these two owners (engine lifetime +
-//! pass-local session); nothing else may retain the bytes, and raw
-//! export below is crate-private so no downstream layer can either.
+//! owned copy inside the crate. Clones exist for exactly two further
+//! owners: the authoring pass's local signer session (cloned once per
+//! pass — the obligation loop holds `&mut Engine` while minting
+//! through the session, so it cannot borrow) and the composer's own
+//! wrapper, which outlives the engine move and is inventoried under
+//! "Signer secret boundary" in `wyrd-core`'s mailbox docs. Every copy
+//! scrubs on drop via [`ZeroizeOnDrop`], including the pass-local
+//! session. Derived `Clone` stays for these owners; nothing else may
+//! retain the bytes, and raw export is crate-private (encryption
+//! only, for the keystore wraps) so no downstream layer can either.
 
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use zeroize::ZeroizeOnDrop;
@@ -102,14 +104,12 @@ impl DeviceIdentitySecret {
     /// Mint the local Nostr signer keys for the mailbox endpoint: the
     /// typed exit for the identity scalar. The CLI and the mailbox
     /// tests build their `Keys` through here instead of parsing raw
-    /// bytes — the one transient parse lives inside the wrapper, and
-    /// no caller retains the scalar. Inventoried under "Signer secret
-    /// boundary" in `wyrd-core`'s mailbox docs.
+    /// bytes — the parse is the single validated one in
+    /// [`Self::secret_key`], and no caller ever sees bytes. The
+    /// returned `Keys` is itself a holder and is inventoried under
+    /// "Signer secret boundary" in `wyrd-core`'s mailbox docs.
     pub fn signer_keys(&self) -> nostr::key::Keys {
-        nostr::key::Keys::new(
-            nostr::key::SecretKey::from_slice(&self.0)
-                .expect("scalar validity established by from_bytes"),
-        )
+        nostr::key::Keys::new(self.secret_key().into())
     }
 }
 

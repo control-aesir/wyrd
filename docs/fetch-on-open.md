@@ -200,14 +200,16 @@ Decided properties:
 8. **Every eligible provider is attempted each pass.** A
    representation may name several providers (a dead route beside a
    live one after a serving restart). Under a pass budget each
-   remaining candidate gets a fair share of the time left, so a
+   remaining candidate gets a fair share of the time left, floored so
+   an early slow-but-live candidate gets a usable attempt, so a
    slow-first provider cannot spend the whole slice on its dial and
    starve the rest: the pass attempts every candidate. Two bounds
    apply: a cooled representation is not attempted at all, so a
    re-announced route is fetched once its cooldown lapses, not
    necessarily in the pass that learns it; and a share that expires
-   strikes like any transport failure, so a slow-but-live candidate
-   can cool under a tight budget (no floor yet).
+   is budget evidence, never provider evidence — the attempt reports
+   a deadline the plan neither counts nor strikes, so a slow-but-live
+   candidate never cools under a tight budget.
 
 ## What open() materializes vs what read() demands
 
@@ -304,8 +306,8 @@ Test matrix (each locks a decided invariant):
   budget far shorter than a dead dial, the run still attempts the
   live route and fulfills → a re-announced route recovers without a
   restart once its cooldown lapses, and a dead candidate never
-  starves the rest (a slow-but-live candidate gets a smaller share
-  and can strike on expiry — no floor yet).
+  starves the rest (an early slow-but-live candidate gets a floored
+  share, and a share that expires reports an unstriking deadline).
 - **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
   complete (and a terminal failure wakes all three with failure).
 - **Timeout then completion**: want times out → `EIO` → materialization

@@ -640,6 +640,132 @@ fn transport_failures_enter_cooldown_like_invalid_data() {
     assert_eq!(report.transport_errors, 1, "retried after the cooldown");
 }
 
+/// A peer whose object routes run out of pass budget (every sealed
+/// and transport fetch slices) while manifests and bodies still flow:
+/// the model of a pass too tight for the content provider, rather
+/// than a provider that went away.
+struct SlicedObjectRoutes {
+    inner: MemoryBulkSource,
+    sliced_storage: BTreeSet<StorageId>,
+    sliced_roots: BTreeSet<BaoRoot>,
+}
+
+impl AttemptBudget for SlicedObjectRoutes {}
+
+impl BulkSource for SlicedObjectRoutes {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.sliced_storage.contains(storage) {
+            return Err(BulkError::Deadline);
+        }
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.sliced_roots.contains(root) {
+            return Err(BulkError::Deadline);
+        }
+        self.inner.fetch_transport(root, max)
+    }
+}
+
+/// A sliced attempt is budget evidence, never representation evidence:
+/// the item stays pending without counting and without striking, so
+/// healing the route fulfills immediately — no cooldown is ever
+/// entered, unlike the transport-failure twin of this test above.
+#[test]
+fn deadline_slices_never_strike() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"sliced budget",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    // The content object's routes slice while manifests, trees, and
+    // bodies keep flowing: the model of a pass too tight for the
+    // provider rather than a provider that went away.
+    let sliced = |peer: &MemoryBulkSource| SlicedObjectRoutes {
+        inner: peer.clone(),
+        sliced_storage: BTreeSet::from([published.object_storage]),
+        sliced_roots: BTreeSet::from([published.object_transport]),
+    };
+
+    // More runs than would cool a striking fault, and every run must
+    // show the same shape: attempted (the item stays pending), but
+    // neither counted as a transport error nor struck into cooldown.
+    // The first call converges manifests (two passes, two slices); the
+    // rest slice once per run.
+    for _ in 0..u64::from(FETCH_MAX_STRIKES) + FETCH_COOLDOWN_PASSES + 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.transport_errors, 0, "slices are not counted");
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Healing the route fulfills on the very next run: had any slice
+    // struck, the representation would be cooling and this run would
+    // report unfulfilled instead of objects.
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "healed route fulfills with no cooldown");
+}
+
 #[test]
 fn fulfillment_clears_fetch_strikes() {
     let mut fixture = fixture();

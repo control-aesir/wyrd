@@ -236,3 +236,94 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
     loaded.rig.teardown();
     let _ = std::fs::remove_dir_all(&serve_dir);
 }
+
+/// Item-1 probe, deadline half: the same dead route as the restart
+/// test above, but every attempt runs under a 3 s pass slice — far
+/// shorter than a dead loopback dial. A sliced timeout is budget
+/// evidence, never provider evidence, so the dead phase must report
+/// no transport errors and strike nothing: after more runs than would
+/// cool a striking fault, the restart must fulfill on the very first
+/// run, not after a cooldown. (Each representation still has exactly
+/// one provider here; the multi-candidate walk itself is pinned
+/// in-crate by the budgeted walk test over real iroh in
+/// `wyrd-sync/src/bulk.rs`, where candidate lists can be built
+/// dead-first by hand — route publication replaces, never prepends,
+/// so engine state cannot order a dead provider first.)
+///
+/// No slow gate needed: the slice caps every dead attempt at ~3 s, so
+/// the dead phase costs seconds, not dial timeouts.
+#[test]
+fn sliced_dead_provider_recovers_without_cooldown() {
+    let mut loaded = Loaded::new("sliced-dead.txt", b"sliced dead contract");
+    let serve_dir = scratch_dir("serving-sliced-dead");
+    let vault = Vault::open(&serve_dir).unwrap();
+    vault.import(&loaded.snapshot.encode()).unwrap();
+    vault.import(&loaded.content.root.sealed.clone()).unwrap();
+    for (_, sealed) in &loaded.content.objects {
+        vault.import(sealed).unwrap();
+    }
+    let serving = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    serving.flush().unwrap();
+    loaded.publish_body_and_announcement(Some(serving.node_addr_bytes()));
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+
+    let mut engine = loaded.rig.take_engine();
+    let mut bulk = loopback_bulk_source();
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+    let mut objects = loaded.objects.clone();
+    // Converge everything structural while serving is up; objects
+    // stay unwanted, so only body and manifests land.
+    let first = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+    assert_eq!(first.snapshot_bodies, 1);
+    assert_eq!(first.manifests, 1);
+    // The recorded manifests add their entry routes: republish so the
+    // objects are addressable before serving dies.
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+
+    // Serving dies with the objects still unfetched. Every attempt now
+    // runs under a 3 s slice against a dial that would stall for 30:
+    // each must expire as an uncounted, unstriking deadline.
+    serving
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.want_all(&mut engine);
+    for _ in 0..8 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let report = engine
+            .execute_plan_sliced(&mut bulk, &mut objects, Some(deadline))
+            .unwrap();
+        assert_eq!(report.objects, 0, "nothing fulfills over the dead route");
+        assert_eq!(
+            report.transport_errors, 0,
+            "slices are budget evidence, not transport errors"
+        );
+        assert_eq!(report.unfulfilled, 2, "both objects stay pending");
+    }
+
+    // Serving restarts on a fresh endpoint; the reannouncement's route
+    // update rotates the recorded route. The very first unbounded run
+    // must fulfill both objects: had any slice struck, the
+    // representations would be cooling and this run would report
+    // unfulfilled instead.
+    let restarted = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    loaded.publish_body_and_announcement(Some(restarted.node_addr_bytes()));
+    let report = engine.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(report.accepted, 1, "the route update reannouncement");
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+    let report = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+    assert_eq!(
+        report.objects, 2,
+        "healed route fulfills with no cooldown after sliced runs"
+    );
+    assert_eq!(report.unfulfilled, 0);
+    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    restarted
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.rig.teardown();
+    let _ = std::fs::remove_dir_all(&serve_dir);
+}

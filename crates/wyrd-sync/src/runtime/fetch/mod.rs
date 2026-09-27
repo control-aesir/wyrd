@@ -31,6 +31,13 @@ pub(super) enum FetchOutcome<T> {
     UnavailableKey,
     /// Bulk transport failure.
     Transport,
+    /// The attempt ran out of its pass-budget slice before completing:
+    /// budget evidence, never provider evidence. The plan neither
+    /// strikes nor counts it — the pass-level unfulfilled total already
+    /// carries the budget signal, as with unstarted work past a spent
+    /// deadline. Falls back everywhere transport failures fall back;
+    /// only the terminal verdict differs.
+    Deadline,
     /// Verified bytes the local store refused.
     Local,
     /// The local disk cannot take more bytes (full) or this process
@@ -110,12 +117,12 @@ pub(super) fn root(
             content_id: announcement.root_manifest,
             sealed: bytes,
         }),
-        // Absence and a dead transport route both fall back to the eager
-        // exchange — which serves under the SAME author-signed identity:
+        // Absence, a dead transport route, and a sliced transport
+        // attempt all fall back to the eager exchange — which serves under the SAME author-signed identity:
         // the announced `root_manifest` is the only acceptable open-record
         // expectation, so a source cannot swap the logical identity
         // through the legacy route. Oversize is representation-terminal.
-        Ok(None) | Err(BulkError::Transport(_)) => {
+        Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline) => {
             match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
                 Ok(Some(served)) if served.content_id == announcement.root_manifest => Some(served),
                 // A well-sealed manifest for this snapshot under a
@@ -124,6 +131,7 @@ pub(super) fn root(
                 Ok(Some(_)) => return FetchOutcome::Invalid,
                 Ok(None) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+                Err(BulkError::Deadline) => return FetchOutcome::Deadline,
                 Err(_) => return FetchOutcome::Transport,
             }
         }
@@ -162,9 +170,10 @@ pub(super) fn snapshot_body(
         Some(announcement) => {
             match bulk.fetch_transport(&announcement.body_root, Limits::V0.max_object_bytes) {
                 Ok(Some(bytes)) => Some(bytes),
-                // Absence and a dead transport route both fall back to the
-                // snapshot address; oversize is representation-terminal.
-                Ok(None) | Err(BulkError::Transport(_)) => None,
+                // Absence, a dead transport route, and a sliced attempt
+                // all fall back to the snapshot address; oversize is
+                // representation-terminal.
+                Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
             }
         }
@@ -175,6 +184,7 @@ pub(super) fn snapshot_body(
         None => match bulk.fetch_snapshot(snapshot, Limits::V0.max_object_bytes) {
             Ok(served) => served,
             Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+            Err(BulkError::Deadline) => return FetchOutcome::Deadline,
             Err(_) => return FetchOutcome::Transport,
         },
     };
@@ -224,8 +234,10 @@ pub(super) fn child(
         Ok(Some(sealed)) => Some(sealed),
         Ok(None) => return FetchOutcome::Missing,
         // Oversize representations are invalid remote data, not
-        // transport trouble: the boundary classified them already.
+        // transport trouble: the boundary classified them already. A
+        // sliced attempt is budget trouble, not transport trouble.
         Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
+        Err(BulkError::Deadline) => return FetchOutcome::Deadline,
         Err(_) => return FetchOutcome::Transport,
     };
     let Some(sealed) = sealed else {
@@ -270,7 +282,7 @@ fn fetch_representation(
 ) -> Result<Option<Vec<u8>>, BulkError> {
     match bulk.fetch_transport(transport, Limits::V0.max_object_bytes) {
         Ok(Some(bytes)) => Ok(Some(bytes)),
-        Ok(None) | Err(BulkError::Transport(_)) => {
+        Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline) => {
             bulk.fetch_sealed(storage, Limits::V0.max_object_bytes)
         }
         Err(oversize @ BulkError::Oversize { .. }) => Err(oversize),
@@ -305,8 +317,10 @@ fn open_record(
 /// aggregate (most actionable) verdict for reporting, the storage ids
 /// whose bytes arrived and failed validation (the only ones that earn
 /// backoff strikes), and the representation that served valid bytes (the
-/// only one whose backoff state clears). Absent, key-less, transport-
-/// failed, and locally-refused representations never strike.
+/// only one whose backoff state clears). Absent, key-less,
+/// deadline-sliced, and locally-refused representations never strike;
+/// transport-failed ones back off like invalid data (see the plan's
+/// strike pass below).
 pub(super) struct ObjectAttempt {
     pub aggregate: FetchOutcome<()>,
     pub invalid: Vec<StorageId>,
@@ -322,7 +336,8 @@ pub(super) struct ObjectAttempt {
 /// corrupt or unavailable representation never blocks a healthy one.
 /// When every candidate fails, the most actionable failure wins:
 /// transport outranks local, local outranks invalid, invalid outranks a
-/// missing key, and a missing key outranks plain absence.
+/// missing key, a missing key outranks plain absence, and a sliced
+/// attempt outranks nothing — it is the absence of an attempt.
 pub(super) fn object(
     drive: &DriveId,
     bulk: &mut impl BulkSource,
@@ -365,6 +380,12 @@ pub(super) fn object(
             Err(BulkError::Oversize { .. }) => {
                 aggregate = worse(aggregate, FetchOutcome::Invalid);
                 invalid.push(candidate.storage_id);
+                continue;
+            }
+            // A sliced attempt is budget evidence, never representation
+            // evidence: it ranks into the aggregate but never strikes.
+            Err(BulkError::Deadline) => {
+                aggregate = worse(aggregate, FetchOutcome::Deadline);
                 continue;
             }
             Err(_) => {
@@ -437,19 +458,22 @@ pub(super) fn object(
 }
 
 /// The more actionable of two fetch failures, by the documented
-/// store-fatal > transport > local > invalid > missing-key > absence
-/// order. A fatal store condition outranks everything: it aborts the
-/// pass, so it must survive aggregation even beside a transport error.
+/// store-fatal > transport > local > invalid > missing-key > absence >
+/// deadline order. A fatal store condition outranks everything: it aborts the
+/// pass, so it must survive aggregation even beside a transport error. A
+/// deadline ranks weakest: it is the absence of an attempt, so any
+/// completed observation — even plain absence — outranks it.
 fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> {
     fn rank(outcome: &FetchOutcome<()>) -> u8 {
         match outcome {
+            FetchOutcome::Deadline => 0,
+            FetchOutcome::Missing => 1,
+            FetchOutcome::UnavailableKey => 2,
+            FetchOutcome::Invalid => 3,
+            FetchOutcome::Local => 4,
+            FetchOutcome::Transport => 5,
+            FetchOutcome::Store(_) => 6,
             FetchOutcome::Fulfilled(()) => 255,
-            FetchOutcome::Missing => 0,
-            FetchOutcome::UnavailableKey => 1,
-            FetchOutcome::Invalid => 2,
-            FetchOutcome::Local => 3,
-            FetchOutcome::Transport => 4,
-            FetchOutcome::Store(_) => 5,
         }
     }
     if rank(&second) > rank(&first) {
@@ -479,6 +503,7 @@ impl<T> FetchOutcome<T> {
             FetchOutcome::Missing
             | FetchOutcome::UnavailableKey
             | FetchOutcome::Transport
+            | FetchOutcome::Deadline
             | FetchOutcome::Store(_) => FetchStatus::Unavailable,
             FetchOutcome::Invalid | FetchOutcome::Local => FetchStatus::Corrupt,
         }

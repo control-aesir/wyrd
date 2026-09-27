@@ -1397,10 +1397,11 @@ mod tests {
         // authorization context and doc updates.
         //
         // Scope note: epoch 1 is the pre-existing exception. The
-        // owner open reinstalls the genesis secret from the keystore
-        // custody record through install_self_capability before this
-        // test snapshots anything; the sidecar restore itself covers
-        // epochs 2+ only.
+        // keystore custody record carries its own epoch-1 escrow, so
+        // an owner open whose keyring lacks the genesis secret
+        // reinstalls it through install_self_capability (idempotent:
+        // present material wins, no rewrite); the sidecar restore
+        // itself covers epochs 2+ only.
         let dir = TestDir::new("escrow-restore-control-keys-only");
         let owner = DeviceIdentitySecret::generate().unwrap();
         let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
@@ -1422,7 +1423,6 @@ mod tests {
             .expect("rotation installs its control key");
         drop(engine);
         let mut engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
-        let current_before = engine.store.current();
         let facts_before = engine.store.load().unwrap();
         let keyring_before =
             crate::durable::build_keyring(&engine.drive, &facts_before, engine.device).unwrap();
@@ -1443,13 +1443,12 @@ mod tests {
             "root custody alone restores epoch 3"
         );
         assert_eq!(
-            engine.store.current(),
-            current_before,
+            engine.store.load().unwrap(),
+            facts_before,
             "escrow restore commits nothing durable"
         );
-        let facts_after = engine.store.load().unwrap();
         let keyring_after =
-            crate::durable::build_keyring(&engine.drive, &facts_after, engine.device).unwrap();
+            crate::durable::build_keyring(&engine.drive, &facts_before, engine.device).unwrap();
         assert_eq!(
             keyring_before, keyring_after,
             "escrow restore installs no keyring secrets"

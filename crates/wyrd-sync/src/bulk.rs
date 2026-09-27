@@ -379,7 +379,10 @@ impl IrohBulkSource {
     /// absence and transport failure fall through to the next; oversize
     /// is terminal because every provider serves the same immutable
     /// bytes. With none serving, the last transport error returns (or
-    /// absence when there were no candidates).
+    /// absence when there were no candidates). Test-only: production
+    /// goes through [`IrohBulkSource::fetch_candidates`], which
+    /// fair-shares the pass budget across the same loop.
+    #[cfg(test)]
     fn fetch_candidates_with<F>(
         candidates: &[IrohBlobRef],
         max: usize,

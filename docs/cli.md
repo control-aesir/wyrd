@@ -207,7 +207,8 @@ Both are read and hardened by wyrd code, never by clap:
 - `mount` initializes structured diagnostics first: events to stderr
   plus `drive_dir/mount.log`, truncated per mount (one mount, one
   log — no rotation code). Init, export, member, and device log nothing to disk.
-- `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`)
+- `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
+  and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.
   `E2E_RUST_LOG=wyrd_core=debug ./lima/run-alpha.sh --keep --step 6`.
 - `--help` and `--version` print and exit successfully.

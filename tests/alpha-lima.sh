@@ -3,202 +3,18 @@
 # (via lima/run-alpha.sh); every assertion here is the suite. Steps mirror
 # the Lima issue's scope 1-6; each step function locks its invariants.
 #
-# Layout (all guest-local disk, never the 9p share — FUSE mountpoints and
-# drive dirs over 9p are unsupported):
-#   $E2E_ROOT/drives/<name>   drive directories under test
-#   $E2E_ROOT/creds/<name>    identity/passphrase files (0600)
-#   $E2E_ROOT/mnt/<name>      FUSE mountpoints
-#   $E2E_ROOT/logs/           per-step stderr captures, copied to the host
-#                             share on exit (trap) for collection.
+# Shared helpers live in tests/alpha-common.sh (also sourced by the
+# microVM suite); this file holds the Lima steps and main.
 set -euo pipefail
 
-# shellcheck source=/dev/null
-source /tmp/lima/e2e-env.sh
-
-E2E_ROOT="/tmp/wyrd-e2e"
-DRIVES="$E2E_ROOT/drives"
-CREDS="$E2E_ROOT/creds"
-MNTS="$E2E_ROOT/mnt"
-LOGDIR="$E2E_ROOT/logs"
+# Lima specifics: logs are collected back to the host share on exit,
+# and the checkout rides the 9p share.
 HOST_LOGS="/tmp/lima/logs/$(date +%Y%m%d-%H%M%S)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/alpha-common.sh"
 
-collect_logs() {
-  mkdir -p "$HOST_LOGS"
-  cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null || true
-  echo "logs collected under $HOST_LOGS (host: /tmp/lima/logs/)"
-}
-
-# A failed step must never strand a mount: unmount everything and kill
-# leftover mount processes, so the next run starts clean. The unmount is
-# attempted unconditionally — gating on `mountpoint -q` or `-e` can skip a
-# live mount whose FUSE fs misbehaves under stat.
-cleanup_mounts() {
-  local m pidf
-  for m in "$MNTS"/*; do
-    [[ -e "$m" || -L "$m" ]] || continue
-    fusermount3 -uz "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
-  done
-  for pidf in "$E2E_ROOT"/mount-*.pid; do
-    [[ -f "$pidf" ]] || continue
-    kill -KILL "$(cat "$pidf")" 2>/dev/null || true
-  done
-  # Reap anything we killed so no zombies linger.
-  wait 2>/dev/null || true
-  # A just-killed mount can need a beat before the kernel releases it.
-  sleep 1
-  for m in "$MNTS"/*; do
-    [[ -e "$m" || -L "$m" ]] || continue
-    fusermount3 -uz "$m" 2>/dev/null || true
-  done
-}
-trap 'cleanup_mounts; collect_logs' EXIT
-
-PASS_COUNT=0
-step()  { echo "=== step $1: $2 ==="; }
-pass()  { PASS_COUNT=$((PASS_COUNT + 1)); echo "  PASS: $1"; }
-die()   { echo "  FAIL: $1" >&2; exit 1; }
-
-wyrd() { "$WYRD_BIN" "$@"; }
-
-# with_creds <cred-dir> <subcommand> <args...>: credential flags precede
-# positionals on every subcommand (`wyrd <sub> --identity-file ... <dirs>`).
-with_creds() {
-  local c="$1" sub="$2"; shift 2
-  "$WYRD_BIN" "$sub" --identity-file "$c/identity" --passphrase-file "$c/passphrase" "$@"
-}
-
-# expect_exit <code> <log-name> <cmd...>: run, capture stderr to the log,
-# assert the exit code. stdout passes through for command substitution.
-expect_exit() {
-  local want="$1" name="$2"; shift 2
-  local err="$LOGDIR/$name.stderr"
-  local out
-  set +e
-  out="$("$@" 2>"$err")"
-  local got=$?
-  set -e
-  [[ $got -eq "$want" ]] || die "$name: exit $got, want $want (stderr: $(cat "$err"))"
-  printf '%s' "$out"
-}
-
-# expect_fail2 <log-name> <cmd...>: exit 2 with `error: ...` on stderr.
-# A usage error is a bug in the suite, not a closed failure: reject it so a
-# misspelled invocation can never pass as a negative case.
-expect_fail2() {
-  local name="$1"; shift
-  expect_exit 2 "$name" "$@" >/dev/null
-  grep -qE "Usage:|unexpected argument" "$LOGDIR/$name.stderr" \
-    && die "$name: usage error, not a closed failure"
-  head -c 7 "$LOGDIR/$name.stderr" | grep -q "^error: " \
-    || die "$name: stderr does not start with 'error: '"
-  pass "$name fails closed (exit 2, error: ...)"
-}
-
-# expect_usage2 <log-name> <cmd...>: exit 2 with a usage error
-# (the complement of expect_fail2: here a bad invocation IS the case).
-expect_usage2() {
-  local name="$1"; shift
-  expect_exit 2 "$name" "$@" >/dev/null
-  grep -qE "Usage:|unexpected argument" "$LOGDIR/$name.stderr" \
-    || die "$name: expected a usage error"
-  pass "$name refused as a usage error (exit 2)"
-}
-
-# Credential factories. Secrets stay in files plus shell vars for the
-# leak check; they never reach logs (asserted per step).
-gen_identity() { # <out>: 32 random bytes as 64 hex chars, mode 600
-  python3 -c 'import secrets; print(secrets.token_hex(32))' > "$1"
-  chmod 600 "$1"
-}
-gen_passphrase() { # <out>: random passphrase with trailing newline, 600
-  python3 -c 'import secrets; print("e2e-" + secrets.token_hex(16))' > "$1"
-  chmod 600 "$1"
-}
-
-# check_no_leaks <log-file> <secret...>: fail if any secret bytes appear.
-check_no_leaks() {
-  local log="$1"; shift
-  local s
-  for s in "$@"; do
-    grep -qF "$s" "$log" && die "secret leaked into $log"
-  done
-  pass "no secrets in $(basename "$log")"
-}
-
-# --- mount helpers -------------------------------------------------------
-# Mounts run as background jobs in this shell so `wait` reports their real
-# exit status. Readiness is polled via mountpoint(1), not via listing: an
-# unmounted empty dir lists fine too.
-poll_until() { # <seconds> <cmd...>
-  local n="$1"; shift
-  local i
-  for ((i = 0; i < n * 5; i++)); do
-    "$@" >/dev/null 2>&1 && return 0
-    sleep 0.2
-  done
-  return 1
-}
-
-start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
-  local name="$1" c="$2" d="$3" m="$4"; shift 4
-  mkdir -p "$m"
-  # Debug passthrough for stuck-peer forensics (E2E_RUST_LOG=wyrd_core=debug):
-  # empty means the binary's default info level, never an empty filter.
-  # Scoped to the mount process only: offline assertions require stderr
-  # to start with `error: `, so the restored shell must not leak it.
-  local old_rust_log="${RUST_LOG-__unset}"
-  [[ -n "${E2E_RUST_LOG:-}" ]] && export RUST_LOG="$E2E_RUST_LOG"
-  with_creds "$c" mount "$d" "$m" "$@" \
-    >"$LOGDIR/mount-$name.out" 2>"$LOGDIR/mount-$name.err" &
-  echo $! > "$E2E_ROOT/mount-$name.pid"
-  if [[ "$old_rust_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_rust_log"; fi
-  poll_until 20 mountpoint -q "$m" \
-    || die "$name: mountpoint never came up (see mount-$name.err)"
-  pass "$name: mountpoint up"
-}
-
-stop_mount() { # <name> <signal> [budget-s = 15]: signal, wait for exit,
-  # assert exit 0 + unmounted. The budget is a bound, not a target: a
-  # mount holding a large vault persists its serving store on the way
-  # out, so step 6's post-bulk stop gets a larger one.
-  local name="$1" sig="$2" budget="${3:-15}"
-  local pid started elapsed
-  started=$(date +%s)
-  pid="$(cat "$E2E_ROOT/mount-$name.pid")"
-  kill "-$sig" "$pid"
-  local i status="timeout"
-  for ((i = 0; i < budget * 5; i++)); do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      set +e; wait "$pid"; status=$?; set -e
-      break
-    fi
-    sleep 0.2
-  done
-  elapsed=$(( $(date +%s) - started ))
-  [[ "$status" == "0" ]] || die "$name: shutdown exit $status on $sig after ${elapsed}s, want clean 0"
-  mountpoint -q "$MNTS/$name" && die "$name: still mounted after $sig"
-  pass "$name: clean shutdown on $sig (exit 0, unmounted, ${elapsed}s)"
-}
-
-# stop_relay: TERM, poll briefly, then KILL — never a bare `wait` on a
-# process that may ignore or delay SIGTERM. An unbounded wait here is
-# how a failed check once hung the whole run: the guest shell sat in
-# do_wait on nostr-rs-relay for 44 minutes, and the EXIT trap could not
-# run because it came after the wait.
-stop_relay() {
-  local pid i
-  [[ -f "$E2E_ROOT/relay.pid" ]] || { pkill -x nostr-rs-relay 2>/dev/null || true; return 0; }
-  pid="$(cat "$E2E_ROOT/relay.pid")"
-  kill -TERM "$pid" 2>/dev/null || true
-  for ((i = 0; i < 25; i++)); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.2
-  done
-  kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-}
-
-# --- step 2: local-only mount --------------------------------------------
+# --- step 1: init lifecycle --------------------------------------------
 step1_init() {
   step 1 "init lifecycle"
   local d="$DRIVES/owner" c="$CREDS/owner"
@@ -316,7 +132,7 @@ step3_matrix() {
 
   start_mount matrix "$c" "$d" "$MNTS/matrix"
   set +e
-  python3 /mnt/wyrd/tests/alpha-lima-matrix.py "$MNTS/matrix" >"$LOGDIR/matrix.out" 2>&1
+  python3 "$SCRIPT_DIR/alpha-lima-matrix.py" "$MNTS/matrix" >"$LOGDIR/matrix.out" 2>&1
   local status=$?
   set -e
   cat "$LOGDIR/matrix.out"
@@ -497,11 +313,6 @@ step5_export() {
     check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")"
   done
 }
-# converged <file> <want>: file exists with exactly the wanted content.
-converged() {
-  [[ -f "$1" ]] && [[ "$(cat "$1")" == "$2" ]]
-}
-
 # --- step 6: live relay convergence -------------------------------------
 # Two mounts, one relay, both directions: the owner's writes appear on
 # the member's mount and back. This is the publish path's e2e proof —
@@ -510,7 +321,7 @@ step6_relay() {
   step 6 "live relay convergence"
   local od="$DRIVES/owner" oc="$CREDS/owner"
   local ndr="$DRIVES/newcomer" nc="$CREDS/newcomer"
-  local relay="ws://127.0.0.1:$RELAY_PORT"
+  local relay="ws://${RELAY_HOST}:$RELAY_PORT"
 
   command -v nostr-rs-relay >/dev/null \
     || die "nostr-rs-relay missing in the guest (provision.sh installs it)"
@@ -520,10 +331,14 @@ step6_relay() {
   # default (the CLI's own lines are plain stderr, unaffected).
   export E2E_RUST_LOG="${E2E_RUST_LOG:-wyrd_core=debug}"
 
-  # The suite owns the port: a previous --keep run may have stranded a
-  # relay, and two relays cannot share the port. Exact-name match only.
-  pkill -x nostr-rs-relay 2>/dev/null || true
-  sleep 1
+  # The suite owns the port when it manages the relay (Lima): a
+  # previous --keep run may have stranded a relay, and two relays
+  # cannot share the port. With RELAY_MANAGED=0 (microVM) the relay
+  # is an external service and is left alone. Exact-name match only.
+  if [[ "$RELAY_MANAGED" == 1 ]]; then
+    pkill -x nostr-rs-relay 2>/dev/null || true
+    sleep 1
+  fi
 
   cat > "$E2E_ROOT/relay.toml" <<EOF
 [info]
@@ -532,7 +347,7 @@ name = "wyrd-e2e"
 description = "Lima e2e relay; guest-local, one run."
 
 [network]
-address = "127.0.0.1"
+address = "$RELAY_BIND"
 port = $RELAY_PORT
 EOF
   mkdir -p "$E2E_ROOT/relay-db"
@@ -541,10 +356,11 @@ EOF
   # a mid-step restart (the conflict fixture) reuses the same config
   # and database under a suffixed log.
   start_relay() {
+    [[ "$RELAY_MANAGED" == 1 ]] || return 0
     nostr-rs-relay -c "$E2E_ROOT/relay.toml" -d "$E2E_ROOT/relay-db" \
       >"$LOGDIR/relay${1:-}.out" 2>"$LOGDIR/relay${1:-}.err" &
     echo $! > "$E2E_ROOT/relay.pid"
-    poll_until 20 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RELAY_PORT" \
+    poll_until 20 bash -c "exec 3<>/dev/tcp/$RELAY_HOST/$RELAY_PORT" \
       || die "relay never listened on $RELAY_PORT (see relay${1:-}.err)"
   }
 
@@ -714,7 +530,12 @@ main() {
   if [[ -f "$E2E_ROOT/relay.pid" ]]; then
     kill -KILL "$(cat "$E2E_ROOT/relay.pid")" 2>/dev/null || true
   fi
-  rm -rf "$E2E_ROOT"
+  # Contents-only: the top dir may live on a share whose parent is
+  # not writable (microVM virtiofs; Lima's /tmp parent allows the
+  # removal). Empty the dir, keep the dir — identical fresh slate.
+  shopt -s nullglob dotglob
+  rm -rf "${E2E_ROOT:?}/"*
+  shopt -u nullglob dotglob
   mkdir -p "$DRIVES" "$CREDS" "$MNTS" "$LOGDIR"
   local only="${E2E_ONLY_STEP:-}"
   # Comma list (`--step 1,4,6`): steps build on each other, so the run

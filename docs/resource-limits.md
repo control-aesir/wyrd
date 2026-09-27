@@ -6,10 +6,12 @@ protocol ingest ceilings (`Limits::V0`, bounding every committed
 object) are not in scope here — they bound committed data, while this
 doc bounds the live process holding and moving it.
 
-Those bounds are per operation. One resource escapes all of them — how
-much is *retained* over time, which no live bound can cap under an
-append-only store. That bound, its adversary, and what is enforceable
-before GC are in `storage-growth.md`.
+Those bounds are per operation. One resource escapes all of them in a
+way that amplifies — how much is *retained* over time, which no live
+bound can cap under an append-only store. That bound, its adversary,
+and what is enforceable before GC are in `storage-growth.md`. (The
+append-only membership log is a second thing no live bound caps; it is
+owner-gated and grows per transition, not an amplification path.)
 
 All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-core/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the

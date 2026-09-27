@@ -341,7 +341,10 @@ A commit proceeds in this order, and the order is the contract:
    is synced level by level, so a first-write hierarchy is durable too.
    The **announcement obligation is recorded durably here**, atomically
    with the snapshot (see below), so a crash after commit still knows the
-   snapshot must be announced.
+   snapshot must be announced. The obligation *fact* is appended earlier,
+   inside step 2's single fact-commit with the body and manifest facts;
+   step 3 is where those facts, and the objects they reference, become
+   durable together.
 4. **Publication.** Heads and materialization are swapped into the shared
    view under one short write lock. The view sees the old head until this
    step.
@@ -375,8 +378,11 @@ network propagation.
 
 ### Announcement obligation durability
 
-The obligation to announce a locally authored snapshot is **created at
-step 3, atomically with the commit**, not at step 6. Step 6 only
+The obligation to announce a locally authored snapshot is **committed at
+step 2, atomically with the snapshot, and durable at step 3** — not
+created at step 6. Its fact is appended in the same single fact-commit
+as the snapshot body and the manifest facts, so there is no window in
+which a snapshot exists without its obligation. Step 6 only
 *discharges* it. Therefore outbox-enqueue failure cannot lose an
 announcement: if step 3 committed, the obligation is durable, and a
 restart reconciles un-discharged obligations back through the outbox

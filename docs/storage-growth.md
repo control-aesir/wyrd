@@ -37,8 +37,14 @@ seat: a replica that authors nothing still retains what it is sent.
 > retained bytes <= (snapshots retained) x (per-snapshot fixed
 > overhead + content-proportional bytes)
 >
-> where snapshots retained = locally authored + materialized from
-> peers
+> where snapshots retained = locally authored + accepted from peers
+
+*Accepted*, not *materialized*, and the distinction is load-bearing:
+materialization is content residency (`RemoteOnly | Cached | Pinned`),
+so a device that accepts announcements and lets their structural
+closures land but never wants a byte of file content still pays the
+full structural cost — and counting only materialized snapshots would
+score that device at zero.
 
 On the author's own device the term is set by its own commit rate. On a
 replica it is set by **its peers'** commit rate, which is the whole
@@ -122,7 +128,12 @@ by POSIX boundaries on the authoring device:
   `write` is its own durable snapshot. This is the amplification peak,
   and it is opt-in per handle by the application.
 - Each namespace operation (`create`, `unlink`, `mkdir`, `rmdir`,
-  `rename`, `truncate`, `set-exec`) is one snapshot.
+  `rename`, path-addressed `truncate`, `set-exec`) submits a mutation
+  and commits one snapshot each.
+- A **handle** `truncate` does not: it arrives as `setattr` on an open
+  file, resizes the buffered image, and marks the handle dirty, so it
+  joins that handle's next boundary commit. `write` + `ftruncate` on one
+  handle is therefore one snapshot, not two.
 
 So the rate is chosen by the member, at their own throughput, and is not
 throttled by any protocol timer. On a replica the corresponding rate is
@@ -155,7 +166,7 @@ unbounded in count.
 | Party | Bears | Bounded today |
 |---|---|---|
 | Author | local disk, and its own fsync and announcement cost | yes, per operation |
-| Serving member / peer | the whole structural closure per accepted announcement — snapshot body, root and child manifests, tree nodes — whether or not a want asked for it; **chunk** objects only when a want pulls them, under the fetch ceilings | no — the structural closure is not gated at all |
+| Serving member / peer | the whole structural closure per accepted announcement — snapshot body, root and child manifests, tree nodes — whether or not a want asked for it; **chunk** objects only when a want pulls them | no — paced per pass under the admission and ingest ceilings, but unbounded in retention |
 | Vault | retained ciphertext per representation, and the count of them | no |
 
 The asymmetry is the finding, and the eager structural pull sharpens it.
@@ -221,10 +232,9 @@ those objects are unreclaimable.
 
 The boundary to check against is therefore the single fact-commit that
 ends authoring, where the snapshot-body, manifest, and
-`AnnouncementQueued` facts are written together — not a step label.
-`write-path.md` numbers that authoring as step 2 and the durability
-boundary as step 3, while describing the obligation as created at step 3;
-naming the call is what keeps the constraint checkable against the code.
+`AnnouncementQueued` facts are written together — not the durability
+boundary. Refusing before that one call strands nothing; refusing after
+it strands the obligation for a snapshot that does not exist.
 
 A quota would bound the author's own device and convert a silent
 unbounded growth into an explicit, documented, POSIX-legitimate refusal.
@@ -258,4 +268,6 @@ Tracked by the two follow-ups raised with this document:
 `protocol(storage): decide whether peers and vaults get a retention
 refusal right` (open question 1) and `feat(storage): per-device
 retained-bytes quota at the commit durability boundary` (open question
-2).
+2). The quota issue's title predates the refusal point being settled
+above and names the durability boundary; the title is not the decision —
+read that issue together with this section before implementing it.

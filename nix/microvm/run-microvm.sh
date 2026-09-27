@@ -179,8 +179,12 @@ for role in peer-o peer-n relay; do
   # the readiness check below while no daemon listens, and qemu
   # then dies with "Connection refused".
   rm -f "$vmdir"/*.sock
+  # 9>&-: the lock fd must not leak into daemons. Kept daemons
+  # outlive the runner, and an inherited lock fd would hold the
+  # flock forever: no second run could ever start, and --teardown
+  # could never acquire the lock it needs to kill them.
   ( cd "$vmdir" \
-    && ./runner/bin/virtiofsd-run > virtiofsd.log 2>&1 & )
+    && ./runner/bin/virtiofsd-run > virtiofsd.log 2>&1 & ) 9>&-
   # Wait for the socket to LISTEN, not merely exist: the file can
   # appear before virtiofsd accepts, and qemu fails fast on refused.
   for i in $(seq 1 30); do
@@ -188,7 +192,7 @@ for role in peer-o peer-n relay; do
     [[ "$i" == 30 ]] && { tail -n 5 "$vmdir/virtiofsd.log"; die "$role: virtiofsd never listened"; }
     sleep 1
   done
-  ( cd "$vmdir" && ./runner/bin/microvm-run > qemu.log 2>&1 & )
+  ( cd "$vmdir" && ./runner/bin/microvm-run > qemu.log 2>&1 & ) 9>&-
   echo "    $role up (tap $tap)"
 done
 

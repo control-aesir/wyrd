@@ -158,6 +158,10 @@ leg_fetch_owner() {
   poll_until 120 bash -c "! test -e '$MNTS/xowner-f2/stale-1.txt'" \
     || die "owner never converged the member's offline delete"
   pass "owner converges the delete before finishing"
+  # Convergence ack: the member must not shut down until its
+  # announcements have arrived here — a fast member would otherwise
+  # outrun its own outbox drain and this leg could never converge.
+  touch "$E2E_ROOT/owner-converged-done"
   poll_until 600 test -f "$E2E_ROOT/member-recovered-done" \
     || die "member never recovered the stale identity"
   stop_mount xowner-f2 INT
@@ -310,6 +314,11 @@ leg_fetch_member() {
   [[ "$attempt" -lt 10 ]] \
     || die "stale identity never recovered without remount after $attempt bounded opens"
   pass "failed fetch recovers after re-announcement without remount"
+  # Stay up until the owner confirms convergence: shutting down
+  # here would outrun the outbox drain and strand the scratch and
+  # delete announcements this leg's owner polls wait for.
+  poll_until 600 test -f "$E2E_ROOT/owner-converged-done" \
+    || die "owner never converged the scratch and delete"
   touch "$E2E_ROOT/member-recovered-done"
   stop_mount xmember-f TERM
   # Dedupe proof over the step-8 restart's redelivery, read after the

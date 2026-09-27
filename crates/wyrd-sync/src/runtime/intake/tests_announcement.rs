@@ -468,3 +468,58 @@ fn reader_authored_announcement_suppresses_without_fact_or_record() {
         "no second fact for the differing-author reroute"
     );
 }
+
+/// A redelivered announcement (identical bytes) is a duplicate that
+/// commits nothing further and disturbs no fetch state: announcement
+/// dedupe stays a processing guard, never a fetch outcome, so the
+/// redelivery re-queues no work and the plan is byte-identical
+/// before and after.
+#[test]
+fn redelivered_announcement_commits_nothing_and_disturbs_no_fetch() {
+    let mut fixture = fixture();
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = builder.child(vec![Change::Rotate]);
+    let admission_id = admission.transition_id();
+    let snapshot = wyrd_format::SnapshotId::from_bytes([0x41; 32]);
+    let bound = announcement_msg(
+        &identity_secret(&builder.sk),
+        snapshot,
+        admission.epoch,
+        admission_id,
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 2);
+    let envelope = deliver(&fixture, admission.epoch, &bound);
+    queue(&mut fixture, vec![envelope.clone()]);
+    assert_eq!(drain(&mut fixture).accepted, 1, "the announcement commits");
+    let planned_before = fixture
+        .engine
+        .runtime_state()
+        .expect("state reads")
+        .reconcile();
+    // Identical bytes redelivered: duplicate, no new facts, and the
+    // plan is unchanged — no fetch work re-queues.
+    queue(&mut fixture, vec![envelope]);
+    let report = drain(&mut fixture);
+    assert_eq!(report.duplicates, 1, "redelivery short-circuits");
+    assert_eq!(report.accepted, 0, "nothing commits twice");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(
+        facts.announcements.len(),
+        1,
+        "exactly one announcement fact"
+    );
+    let planned_after = fixture
+        .engine
+        .runtime_state()
+        .expect("state reads")
+        .reconcile();
+    assert_eq!(
+        planned_before, planned_after,
+        "redelivery disturbs no fetch state"
+    );
+}

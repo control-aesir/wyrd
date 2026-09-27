@@ -334,12 +334,44 @@ impl IrohBulkSource {
     /// representation, not of the route. With no provider serving it,
     /// the last transport error is returned (or absence when there were
     /// no candidates).
+    ///
+    /// Under a pass budget each remaining candidate gets a fair share
+    /// of the time left, recomputed as time burns: without it a
+    /// dead-first provider spends the whole remaining slice on its
+    /// dial and the live candidates behind it are never attempted —
+    /// every pass repeats the same burned dial and the item never
+    /// recovers. Unbudgeted runs keep the full timeouts per candidate.
     fn fetch_candidates(
-        &self,
+        &mut self,
         candidates: &[IrohBlobRef],
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        Self::fetch_candidates_with(candidates, max, |blob, max| self.fetch(blob, max))
+        let budget = self.attempt_deadline;
+        let mut last_error = None;
+        let total = candidates.len();
+        for (index, blob) in candidates.iter().enumerate() {
+            if let Some(deadline) = budget {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                self.attempt_deadline =
+                    Some(std::time::Instant::now() + remaining / (total - index) as u32);
+            }
+            match self.fetch(blob, max) {
+                Ok(bytes) => {
+                    self.attempt_deadline = budget;
+                    return Ok(Some(bytes));
+                }
+                Err(oversize @ BulkError::Oversize { .. }) => {
+                    self.attempt_deadline = budget;
+                    return Err(oversize);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        self.attempt_deadline = budget;
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     /// The provider-fallthrough loop, extracted so tests can drive it
@@ -510,10 +542,14 @@ impl BulkSource for IrohBulkSource {
         storage: &StorageId,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(candidates) = self.sealed.get(storage) else {
+        // Cloned: the candidate walk below re-arms the per-attempt
+        // budget through `&mut self`, which the map borrow would not
+        // survive. Candidate lists are short (providers per address),
+        // so the copy is cheaper than restructuring the maps.
+        let Some(candidates) = self.sealed.get(storage).cloned() else {
             return Ok(None);
         };
-        self.fetch_candidates(candidates, max)
+        self.fetch_candidates(&candidates, max)
     }
 
     fn fetch_transport(
@@ -521,10 +557,10 @@ impl BulkSource for IrohBulkSource {
         root: &BaoRoot,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(candidates) = self.transport.get(root) else {
+        let Some(candidates) = self.transport.get(root).cloned() else {
             return Ok(None);
         };
-        self.fetch_candidates(candidates, max)
+        self.fetch_candidates(&candidates, max)
     }
 }
 

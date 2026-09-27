@@ -120,6 +120,18 @@ leg_fetch_owner() {
   poll_until 180 test -f "$E2E_ROOT/member-fetch-done" \
     || die "member never finished the bounded-EIO probes"
   pass "owner stayed down while the member probed the dead route"
+  # Recovery setup: remount on a fresh endpoint (new iroh identity
+  # over the same drive) and write a new file. The new announcement
+  # carries the new route; the member must recover the stale identity
+  # over it without remounting.
+  start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
+  echo "owner-back" > "$MNTS/xowner-f2/owner-back-1.txt"
+  touch "$E2E_ROOT/owner-back"
+  poll_until 600 test -f "$E2E_ROOT/member-recovered-done" \
+    || die "member never recovered the stale identity"
+  stop_mount xowner-f2 INT
+  check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  touch "$E2E_ROOT/owner-stopped-2"
 }
 
 # leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
@@ -134,10 +146,7 @@ leg_fetch_owner() {
 # over the step-8 restart's redelivery, then delete the remote-only
 # file so the offline export phase stays meaningful.
 # Two matrix items are deliberately NOT e2e-legged here:
-# failure-then-reannounce recovery without remount (filed as
-# nostr:nevent1qqsp9u0jt79kepcrmx8zxcmzzxce0cf3c8fvzs32k7uqjgeajlzzscqpz9mhxue69uhkwunpwdczuap49eehg5s3hry
-# after four proving runs showed the mount never recovers that
-# identity), and timeout-then-completion (the waiter leaves with
+# timeout-then-completion (the waiter leaves with
 # EIO while the fetch continues (unit-pinned by
 # late_completion_caches_for_the_next_waiter in
 # crates/wyrd-core/src/want.rs, no e2e leg).
@@ -190,7 +199,36 @@ leg_fetch_member() {
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
   touch "$E2E_ROOT/member-fetch-done"
-  # Remove the remote-only file while the route is still dead:
+  # Recovery without remount: the owner is back on a fresh endpoint
+  # with a new route (see owner leg), and this mount never went
+  # down. The stale identity failed terminally against the dead
+  # route; the re-announcement must produce a new fetch attempt and
+  # the open must eventually succeed. Each attempt is a fresh
+  # bounded open (30s): the loop below is the retry, while the
+  # fetch continues across attempts. Ten attempts bound the worst
+  # case near eleven minutes; the live route should land it in the
+  # first few.
+  poll_until 120 test -f "$E2E_ROOT/owner-back" \
+    || die "owner never came back for the recovery probe"
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'owner-back-1.txt'" \
+    || die "member never listed the post-restart write"
+  pass "member converges on the post-restart head over the new route"
+  local attempt=0
+  while (( attempt < 10 )); do
+    if timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >"$E2E_ROOT/stale-recovered.got" 2>/dev/null \
+      && [[ "$(cat "$E2E_ROOT/stale-recovered.got")" == "stale-bytes" ]]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  [[ "$attempt" -lt 10 ]] \
+    || die "stale identity never recovered without remount after $attempt bounded opens"
+  pass "failed fetch recovers after re-announcement without remount"
+  touch "$E2E_ROOT/member-recovered-done"
+  poll_until 120 test -f "$E2E_ROOT/owner-stopped-2" \
+    || die "owner never stopped again for the offline delete"
+  # Remove the remote-only file while the route is dead again:
   # authorship is local-first, so the delete must work offline, and
   # the offline export phase fails closed on remote-only content.
   timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \

@@ -10,17 +10,22 @@ use wyrd_format::{
     SharedStore, Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
-use crate::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
+use crate::bulk::{
+    AttemptBudget, BulkError, BulkSource, IrohBlobRef, IrohBulkSource, MemoryBulkSource,
+    SealedManifest,
+};
 use crate::durable::CrashStage;
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
     admit_engine, announcement_msg, announcement_msg_with, body_root, deliver, drain, fixture,
     identity_secret, intake_body, intake_published, intake_snapshot, publish_into, queue, reopen,
-    AnnouncedRoots,
+    AnnouncedRoots, TestDir,
 };
 use crate::runtime::MaterializationState;
-use crate::seal::{entry_for, seal_manifest, SEAL_VERSION};
+use crate::seal::{blob_root, entry_for, seal_manifest, SEAL_VERSION};
+use crate::serving::{ServingEndpoint, Vault};
+use crate::transport::decode_node_addr;
 
 /// A store that refuses the local-write path: any import the
 /// engine performs must go through `insert_verified`, or the test
@@ -1080,4 +1085,140 @@ fn a_stalled_provider_cannot_outlast_the_runs_deadline() {
         "the unbounded run attempts all items"
     );
     assert_eq!(report.unfulfilled, 3);
+}
+
+/// A dead-first candidate must not starve the live ones behind it:
+/// the wedged-fetch shape under a sliced run. One chunk, two
+/// providers for its sealed route — the dead route published first,
+/// the live route second — under a pass budget far shorter than a
+/// dead dial. The run must still attempt the live route and fulfill
+/// the chunk instead of burning the whole budget on the dead dial
+/// and deferring the live candidate forever.
+#[test]
+fn sliced_run_attempts_live_candidates_behind_a_dead_one() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut inner = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    // One chunk under one root: hand-sealed so the test holds the
+    // sealed bytes for the serving vault below.
+    let drive = member_drive();
+    let plaintext = b"fair share probe";
+    let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+    let object_key = epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+    let sealed_object =
+        crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+    let entry = entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, plaintext).unwrap();
+    let storage = sealed_object.storage_id();
+    let snapshot = body.snapshot_id();
+    let manifest = Manifest::new(snapshot, vec![entry], Vec::new()).unwrap();
+    let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+    let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+    inner.publish_root(
+        snapshot,
+        SealedManifest {
+            content_id: id,
+            sealed: sealed.encode(),
+        },
+    );
+    intake_published(
+        &mut fixture,
+        &mut inner,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: id,
+            transport: crate::seal::transport_root(&sealed),
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    // Converge the structural plane over memory bulk while the chunk
+    // stays unwanted: body and manifests land, the chunk stays
+    // pending for the sliced run below.
+    let seeded = fixture
+        .engine
+        .execute_plan(&mut inner, &mut objects)
+        .unwrap();
+    assert_eq!(seeded.manifests, 1, "the root is recorded");
+    assert_eq!(seeded.unfulfilled, 0, "nothing wanted yet");
+    fixture
+        .engine
+        .set_materialization(content, MaterializationState::Pinned)
+        .unwrap();
+    // Live serving over loopback holds the chunk's sealed bytes; a
+    // second endpoint is shut down to model the dead route (dialing
+    // it stalls past any pass budget instead of refusing fast).
+    let live_dir = TestDir::new("fairshare-live");
+    let live_vault = Vault::open(&live_dir.path).unwrap();
+    live_vault.import(&sealed_object.encode()).unwrap();
+    let live_serving = ServingEndpoint::open_loopback(&live_vault, &live_dir.path).unwrap();
+    live_serving.flush().unwrap();
+    let live = decode_node_addr(&live_serving.node_addr_bytes()).unwrap();
+    let dead_dir = TestDir::new("fairshare-dead");
+    let dead_vault = Vault::open(&dead_dir.path).unwrap();
+    let dead_serving = ServingEndpoint::open_loopback(&dead_vault, &dead_dir.path).unwrap();
+    let dead = decode_node_addr(&dead_serving.node_addr_bytes()).unwrap();
+    dead_serving.shutdown(Duration::from_secs(10)).unwrap();
+    // The client: relay-disabled, no discovery — the hermetic shape
+    // the serving contracts use. The chunk's sealed route names the
+    // dead provider first, the live provider second.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = runtime.block_on(async {
+        iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap()
+    });
+    let mut bulk = IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
+    let hash = *blob_root(&sealed_object.encode()).as_bytes();
+    bulk.publish_sealed(
+        storage,
+        IrohBlobRef {
+            provider: dead,
+            hash,
+        },
+    );
+    bulk.publish_sealed(
+        storage,
+        IrohBlobRef {
+            provider: live,
+            hash,
+        },
+    );
+    // An 8s budget against a dead dial that stalls past it: the dead
+    // candidate must not consume the whole slice. The live route is
+    // attempted within the same pass and fulfills the chunk.
+    let started = Instant::now();
+    let report = fixture
+        .engine
+        .execute_plan_sliced(
+            &mut bulk,
+            &mut objects,
+            Some(Instant::now() + Duration::from_secs(8)),
+        )
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        report.objects, 1,
+        "the live candidate is attempted in-budget"
+    );
+    assert_eq!(
+        objects.get(&content).unwrap().as_deref(),
+        Some(plaintext.as_slice())
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the sliced run stayed bounded: {elapsed:?}"
+    );
+    bulk.shutdown(Duration::from_secs(10)).unwrap();
+    live_serving.shutdown(Duration::from_secs(10)).unwrap();
 }

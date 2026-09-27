@@ -969,3 +969,112 @@ fn invalid_roots_back_off() {
         .unwrap();
     assert_eq!(report.invalid, 1, "retried after the cooldown");
 }
+
+/// Item-1 probe for the wedged-fetch shape: an object's routes die
+/// (transport failures strike it into cooldown), the snapshot is then
+/// re-announced (fresh seal, so a fresh message id over the identical
+/// immutable core), and the bytes become servable again. Recovery must
+/// follow with no restart: the re-announcement leaves the pending
+/// fetch intact, attempts resume once the cooldown lapses, and the
+/// fetch fulfills over the healed routes.
+#[test]
+fn failed_fetch_recovers_after_reannouncement_without_restart() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"reannounce probe",
+    );
+    let body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    // The provider goes away: object routes fail in transport while
+    // manifests and bodies still flow.
+    let mut dead = DeadObjectRoutes {
+        inner: bulk.clone(),
+        dead_storage: BTreeSet::from([published.object_storage]),
+        dead_roots: BTreeSet::from([published.object_transport]),
+    };
+    // Fail until the representation cools: attempts first, then
+    // silence with the item still pending.
+    let mut saw_attempts = false;
+    let mut cooled = false;
+    for _ in 0..32 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut dead, &mut objects)
+            .unwrap();
+        assert_eq!(report.objects, 0, "nothing fulfills over dead routes");
+        if report.transport_errors > 0 {
+            saw_attempts = true;
+        }
+        if saw_attempts && report.transport_errors == 0 && report.unfulfilled == 1 {
+            cooled = true;
+            break;
+        }
+    }
+    assert!(saw_attempts, "dead routes were attempted");
+    assert!(cooled, "transport failures cooled the representation");
+    // The re-announcement: identical immutable core under a fresh
+    // seal (fresh message id, as a remounting owner produces). Intake
+    // accepts it without disturbing the pending fetch — the duplicate
+    // announcement fact is a no-op at record time.
+    let reannounce = announcement_msg_with(
+        &identity_secret(&builder.sk),
+        body.snapshot_id(),
+        admission.epoch,
+        admission.transition_id(),
+        body_root(&body),
+        published.root_manifest,
+        published.root_transport,
+    );
+    let envelope = deliver(&fixture, admission.epoch, &reannounce);
+    queue(&mut fixture, vec![envelope]);
+    assert_eq!(
+        drain(&mut fixture).accepted,
+        1,
+        "the re-announcement lands without fork or poison"
+    );
+    // The provider returns: the same bytes servable again. Attempts
+    // resume past the cooldown and the fetch fulfills — no restart.
+    let mut landed = false;
+    for _ in 0..(FETCH_COOLDOWN_PASSES + 2) {
+        let report = fixture
+            .engine
+            .execute_plan(&mut bulk, &mut objects)
+            .unwrap();
+        if report.objects == 1 {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed, "re-announced fetch recovers without restart");
+    assert_eq!(
+        objects.get(&published.content).unwrap().as_deref(),
+        Some(b"reannounce probe".as_slice())
+    );
+}

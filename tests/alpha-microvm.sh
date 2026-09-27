@@ -14,7 +14,8 @@
 #      rendezvous on the shared state root)
 #   4. serving-restart legs (fresh endpoint, route update, no repair)
 #   5. fetch-plane legs (blocking cold open, bounded EIO on dead
-#      routes, dedupe log with no double-append)
+#      routes, recovery without remount after the owner returns on a
+#      fresh endpoint, dedupe log with no double-append)
 #   6. offline reopen of both drives on the host
 #
 # Out of scope, tracked as follow-up: relay-partition conflict legs
@@ -143,7 +144,8 @@ wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
 echo "=== microvm 9: fetch plane ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
   "$RUN/owner-stopped" "$RUN/member-fetch-done" "$RUN/cold-2.got" \
-  "$RUN/stale-1.err" "$RUN/never-announced.err"
+  "$RUN/stale-1.err" "$RUN/never-announced.err" "$RUN/owner-back" \
+  "$RUN/member-recovered-done" "$RUN/owner-stopped-2" "$RUN/stale-recovered.got"
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-member $GMD $GMC $RELAY_URL" \
   >"$RUN/logs/leg-fetch-member.out" 2>&1 &
 LEG_N=$!
@@ -152,7 +154,7 @@ on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-owne
 LEG_O=$!
 wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
 wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
-pass "blocking open, bounded EIO, and dedupe hold across hosts"
+pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
 
 # --- phase 6: offline reopen --------------------------------------------
 # Depends on phase 5's remote-only delete (fetch-member removes

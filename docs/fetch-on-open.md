@@ -193,6 +193,14 @@ Decided properties:
    the truth; the daemon merges them at publish and the view exposes
    the result. FUSE never mutates materialization state, so
    "FUSE says Fetching while engine says Cached" cannot arise.
+8. **Every eligible provider is attempted each pass.** A
+   representation may name several providers (a dead route beside a
+   live one after a serving restart). Under a pass budget each
+   remaining candidate gets a fair share of the time left, so a
+   slow-first provider cannot spend the whole slice on its dial and
+   starve the rest: the pass attempts every candidate, and a
+   re-announced route is fetched in the pass that learns it, not
+   after the dead route stops being slow.
 
 ## What open() materializes vs what read() demands
 
@@ -284,6 +292,11 @@ Test matrix (each locks a decided invariant):
 - **Stale address**: announcement names a dead node_addr → fetch
   fails → no invalid object committed → the announcement and its
   content identity remain valid.
+- **Dead route beside a live one**: the same representation names a
+  dead provider first and the live provider second → under a pass
+  budget far shorter than a dead dial, the run still attempts the
+  live route and fulfills → a re-announced route recovers without a
+  restart, and a slow candidate never starves the rest.
 - **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
   complete (and a terminal failure wakes all three with failure).
 - **Timeout then completion**: want times out → `EIO` → materialization

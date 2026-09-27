@@ -235,10 +235,13 @@ Rules:
    crash between them leaves a missing sidecar, never an orphan); vault
    replication of records rides later transport work. Reopening from
    keystore restores every escrowed epoch's control key from root
-   custody alone, so control-plane operation converges — but it does
-   **not** restore historical encrypted content: without
-   membership/capability state there is no authorized v0 path to
-   install raw epoch secrets into a fresh keyring. Full-history
+   custody alone, so control-plane operation converges — but for the
+   sidecar epochs (2+) it does **not** restore historical encrypted
+   content: without membership/capability state there is no
+   authorized v0 path to install raw epoch secrets into a fresh
+   keyring. Epoch 1 is the exception: the keystore custody record
+   carries its own escrow, so the owner open reinstalls the genesis
+   secret into the keyring through the self-capability path. Full-history
    recovery, installing every unwrapped secret into a rebuilt keyring,
    belongs to the post-v0 guardian recovery design: guardians
    reconstructing the root establish the authorized recovery context

@@ -1388,15 +1388,20 @@ mod tests {
     }
 
     #[test]
-    fn root_alone_recovery_converges_control_without_historical_secrets() {
-        // The narrowed T13 contract, both halves: sidecars plus root
-        // alone restore the control plane (epoch control keys) but
-        // install no epoch secrets — without capability state there
-        // is no authorized v0 path to historical content. Models
-        // capability-state loss by rebuilding the keyring from the
-        // durable facts with every capability stripped, then runs
-        // the same restore the owner open performs.
-        let dir = TestDir::new("root-alone-no-historical-secrets");
+    fn escrow_restore_is_control_keys_only() {
+        // T13 scope pin: the sidecar restore refills vacant epoch
+        // control keys and does nothing else — it commits no durable
+        // facts, so no keyring the facts authorize can change under
+        // it. If a future guardian path installs unwrapped secrets
+        // durably, this test fails until that path carries its own
+        // authorization context and doc updates.
+        //
+        // Scope note: epoch 1 is the pre-existing exception. The
+        // owner open reinstalls the genesis secret from the keystore
+        // custody record through install_self_capability before this
+        // test snapshots anything; the sidecar restore itself covers
+        // epochs 2+ only.
+        let dir = TestDir::new("escrow-restore-control-keys-only");
         let owner = DeviceIdentitySecret::generate().unwrap();
         let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
         let newcomer = DeviceIdentitySecret::generate().unwrap();
@@ -1404,29 +1409,50 @@ mod tests {
         engine
             .admit_device(newcomer.device_id(), newcomer_encryption.encryption_key())
             .unwrap();
+        let epoch2_key = engine
+            .epoch_keys
+            .get(&2)
+            .cloned()
+            .expect("authoring installs the fresh control key");
         engine.rotate_epoch().unwrap();
+        let epoch3_key = engine
+            .epoch_keys
+            .get(&3)
+            .cloned()
+            .expect("rotation installs its control key");
         drop(engine);
         let mut engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
-        // Capability state lost: the rebuilt keyring is vacant for
-        // every epoch the capabilities carried — not just the later
-        // ones, the epoch-1 self capability too.
-        let mut facts = engine.store.load().unwrap();
-        facts.capabilities.clear();
-        let keyring = crate::durable::build_keyring(&engine.drive, &facts, engine.device).unwrap();
-        assert!(
-            keyring.secret(1).is_none()
-                && keyring.secret(2).is_none()
-                && keyring.secret(3).is_none(),
-            "no capability state means no historical secrets"
-        );
-        // ... but root custody alone still converges the control
-        // keys for the escrowed epochs.
+        let current_before = engine.store.current();
+        let facts_before = engine.store.load().unwrap();
+        let keyring_before =
+            crate::durable::build_keyring(&engine.drive, &facts_before, engine.device).unwrap();
+        // Vacate the later control keys, exactly like the sibling
+        // restore test; the restore must refill them with the exact
+        // keys, and change nothing else.
         engine.epoch_keys.remove(&2);
         engine.epoch_keys.remove(&3);
         restore_escrowed_epochs(&mut engine).unwrap();
-        assert!(
-            engine.epoch_keys.contains_key(&2) && engine.epoch_keys.contains_key(&3),
-            "control-plane convergence needs no capability state"
+        assert_eq!(
+            engine.epoch_keys.get(&2),
+            Some(&epoch2_key),
+            "root custody alone restores epoch 2"
+        );
+        assert_eq!(
+            engine.epoch_keys.get(&3),
+            Some(&epoch3_key),
+            "root custody alone restores epoch 3"
+        );
+        assert_eq!(
+            engine.store.current(),
+            current_before,
+            "escrow restore commits nothing durable"
+        );
+        let facts_after = engine.store.load().unwrap();
+        let keyring_after =
+            crate::durable::build_keyring(&engine.drive, &facts_after, engine.device).unwrap();
+        assert_eq!(
+            keyring_before, keyring_after,
+            "escrow restore installs no keyring secrets"
         );
     }
 

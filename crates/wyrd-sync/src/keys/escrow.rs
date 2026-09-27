@@ -7,7 +7,9 @@
 //! escrow key as a per-epoch record: the sidecars preserve every secret
 //! for the post-v0 guardian recovery, which installs the unwrapped
 //! secrets into a rebuilt keyring. v0 restore derives control keys only
-//! and does not restore historical encrypted content. This is escrow,
+//! and does not restore historical encrypted content for the sidecar
+//! epochs (2+); epoch 1 keeps its keystore-custody install path, which
+//! predates the sidecars. This is escrow,
 //! not derivation: no root→epoch KDF exists anywhere (T4 stands);
 //! without the sealed records the root yields nothing.
 //!

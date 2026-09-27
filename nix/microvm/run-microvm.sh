@@ -90,6 +90,10 @@ kill_stale_daemons
 echo "==> state dir $STATE_DIR"
 mkdir -p "$RUN" "$RUN/logs" "$WORK"
 [[ "$FRESH" == 1 ]] && rm -rf "$RUN" && mkdir -p "$RUN" "$RUN/logs"
+# The share is root-owned from the host; guest e2e (uid 1000, the
+# only normal user — numeric, no host user needed) must own the run
+# state or every drive/cred/mount mkdir fails. sshkey stays root.
+chown -R 1000:1000 "$RUN"
 
 echo "==> building wyrd + VM runners"
 WYRD_OUT="$(nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths 2>/dev/null | tail -n 1)"

@@ -144,8 +144,8 @@ wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
 echo "=== microvm 9: fetch plane ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
   "$RUN/owner-stopped" "$RUN/member-fetch-done" "$RUN/cold-2.got" \
-  "$RUN/stale-1.err" "$RUN/never-announced.err" "$RUN/owner-back" \
-  "$RUN/member-recovered-done" "$RUN/owner-stopped-2" "$RUN/stale-recovered.got"
+  "$RUN/stale-1.err" "$RUN/stale-2.err" "$RUN/never-announced.err" \
+  "$RUN/owner-back" "$RUN/member-recovered-done" "$RUN/stale-2-recovered.got"
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-member $GMD $GMC $RELAY_URL" \
   >"$RUN/logs/leg-fetch-member.out" 2>&1 &
 LEG_N=$!

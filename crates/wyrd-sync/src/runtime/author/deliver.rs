@@ -369,26 +369,27 @@ fn deliver_capabilities(
                 let obligation = format!("capability epoch {epoch} for {recipient}");
                 match verify_reused_rotation(
                     engine,
-                    bytes,
+                    &bytes,
                     &obligation,
                     epoch,
                     recipient,
                     &transition_id,
                 )? {
-                    Reused::Use(bytes) => bytes,
+                    Reused::Use => bytes,
                     // Stale registration: the recipient holds a new
-                    // secret the old bytes can never open under — mint
-                    // fresh instead of erroring, since healing beats
-                    // loudness here.
+                    // secret the old bytes can never open under. The
+                    // seal is structurally valid, so what retires it
+                    // is the new registration — named exactly by the
+                    // durable successor, like every other supersession.
                     Reused::Mint => {
-                        let Some(bytes) = mint_fresh_rotation(
+                        let Some(bytes) = supersede_stale_rotation(
                             engine,
                             &signer,
                             &rebuilt.keyring,
-                            &mut sealed_overlay,
                             epoch,
                             recipient,
                             &transition_id,
+                            &bytes,
                         )?
                         else {
                             continue;
@@ -400,13 +401,14 @@ fn deliver_capabilities(
             // A pre-framing epoch-sealed fact, or a rotation sealed
             // under a superseded version: its bytes can never open for
             // the current reader (no proof blob, or keys the recipient
-            // may never hold), so it never sends — mint fresh under the
-            // current framing, which always opens. The stale fact lingers
-            // durably and harmlessly; the new seal takes the overlay.
-            // This is the announced re-mint recovery for the `0x01 ->
-            // 0x02` bump, and it is what keeps an upgrade from stranding
-            // a pending obligation. Bytes decoding as neither framing
-            // still fail closed: genuinely undecodable outbox bytes never
+            // may never hold), so it never sends — supersede it durably
+            // under the current framing, which always opens. The stale
+            // fact lingers durably and harmlessly; the replacement is
+            // the obligation from the commit on. This is the announced
+            // re-mint recovery for the `0x01 -> 0x02` bump, and it is
+            // what keeps an upgrade from stranding a pending
+            // obligation. Bytes decoding as neither framing still fail
+            // closed: genuinely undecodable outbox bytes never
             // silently heal.
             Some(bytes) if is_superseded_rotation(&bytes) => {
                 let Some(replacement) = supersede_stale_rotation(
@@ -430,14 +432,20 @@ fn deliver_capabilities(
                         "{obligation}: sealed bytes do not decode"
                     )));
                 }
-                let Some(bytes) = mint_fresh_rotation(
+                // A pre-framing epoch-sealed capability fact: the
+                // envelope is valid but the framing predates rotation
+                // delivery, so the bytes can never become a sendable
+                // obligation. Supersede, exactly like a stale
+                // registration — the invariant is what matters, not
+                // the fact's origin.
+                let Some(bytes) = supersede_stale_rotation(
                     engine,
                     &signer,
                     &rebuilt.keyring,
-                    &mut sealed_overlay,
                     epoch,
                     recipient,
                     &transition_id,
+                    &bytes,
                 )?
                 else {
                     continue;
@@ -477,12 +485,12 @@ fn deliver_capabilities(
     Ok(sent)
 }
 
-/// What reused rotation bytes offer: resend them verbatim, or mint
-/// fresh when they went stale.
+/// What reused rotation bytes offer: resend them verbatim, or retire
+/// them for a durable successor when they went stale.
 enum Reused {
     /// The bytes still name the obligation: resend them verbatim.
-    Use(Vec<u8>),
-    /// The bytes went stale (or predate the framing): mint fresh.
+    Use,
+    /// The registration moved on: supersede durably.
     Mint,
 }
 
@@ -491,17 +499,18 @@ enum Reused {
 /// recipient, and the recipient's current registration. Anything
 /// undecodable or misaddressed fails closed (a fact-key/bytes mismatch
 /// would discharge one obligation while delivering another); a stale
-/// registration mints fresh instead, since the recipient holds a new
-/// secret the old bytes can never open under.
+/// registration supersedes durably instead, since the recipient holds
+/// a new secret the old bytes can never open under. Borrows the bytes:
+/// the stale arm needs them back to name the fact it retires.
 fn verify_reused_rotation(
     engine: &Engine,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     obligation: &str,
     epoch: u64,
     recipient: DeviceId,
     transition_id: &TransitionId,
 ) -> Result<Reused, EngineError> {
-    let sealed = SealedRotation::decode(&bytes).map_err(|_| {
+    let sealed = SealedRotation::decode(bytes).map_err(|_| {
         EngineError::SealedOutboxMismatch(format!("{obligation}: sealed bytes do not decode"))
     })?;
     if sealed.version != ROTATION_VERSION
@@ -518,7 +527,7 @@ fn verify_reused_rotation(
         .state_of(transition_id)
         .and_then(|state| state.encryption_key_of(&recipient).copied());
     if current.is_some_and(|key| key == sealed.encryption_key) {
-        Ok(Reused::Use(bytes))
+        Ok(Reused::Use)
     } else {
         Ok(Reused::Mint)
     }

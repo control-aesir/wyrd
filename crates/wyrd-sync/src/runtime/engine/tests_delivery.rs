@@ -990,7 +990,7 @@ fn stale_obligation_without_secrets_stays_pending() {
 }
 
 /// Every commit-protocol boundary around the replacement commit, driven
-/// to power loss and reloaded.
+/// to power loss and reloaded, for one planted stale shape.
 ///
 /// The replacement is the one place a delivery pass makes a durable
 /// change *before* touching the mailbox, so it is the one place a crash
@@ -1001,8 +1001,19 @@ fn stale_obligation_without_secrets_stays_pending() {
 /// outcome (a half-written replacement, or a second replacement beside
 /// the first) would let the outage path grow the store again, which is
 /// the defect the fact exists to prevent.
-#[test]
-fn replacement_commit_is_atomic_at_every_crash_stage() {
+///
+/// One matrix per stale shape: the commit under test is the same fact,
+/// but the trigger bytes — and therefore the classifier arm that
+/// reaches it — differ per path, and the matrix is what proves each
+/// arm lands on the same durable successor.
+fn replacement_crash_matrix(
+    plant: fn(
+        &mut crate::runtime::test_util::Fixture,
+        &MembershipTransition,
+        wyrd_format::DeviceId,
+        &wyrd_format::TransitionId,
+    ) -> Vec<u8>,
+) {
     use crate::durable::CrashStage;
 
     let mut saw_previous = 0;
@@ -1025,7 +1036,7 @@ fn replacement_commit_is_atomic_at_every_crash_stage() {
         } = world;
         let member = recipient.device;
         let admit_id = admit.transition_id();
-        let stale = plant_stale_obligation(&mut fx, &admit, member, &admit_id);
+        let stale = plant(&mut fx, &admit, member, &admit_id);
 
         // The replacement commit is this pass's first durable write.
         fx.engine.crash_after(stage);
@@ -1099,5 +1110,615 @@ fn replacement_commit_is_atomic_at_every_crash_stage() {
     assert!(
         saw_previous > 0 && saw_committed > 0,
         "the matrix must cover both the previous and the committed state, saw {saw_previous}/{saw_committed}"
+    );
+}
+
+/// The superseded-`0x01` trigger: the replacement commit is atomic at
+/// every crash stage.
+#[test]
+fn replacement_commit_is_atomic_at_every_crash_stage() {
+    replacement_crash_matrix(plant_stale_obligation);
+}
+
+/// The stale-registration trigger: the same commit, the same atomicity.
+#[test]
+fn stale_registration_replacement_commit_is_atomic_at_every_crash_stage() {
+    replacement_crash_matrix(plant_stale_registration_obligation);
+}
+
+/// The pre-framing epoch-sealed trigger: the same commit, the same
+/// atomicity.
+#[test]
+fn preframing_replacement_commit_is_atomic_at_every_crash_stage() {
+    replacement_crash_matrix(plant_preframing_obligation);
+}
+
+/// Plant one pending obligation sealed under the pre-framing
+/// epoch-sealed envelope: a genuine epoch-2 capability payload for the
+/// obligation's recipient. The envelope is valid, but the framing
+/// predates rotation delivery — no proof blob, and keys the recipient
+/// may never hold — so the send path can never use it. Returns the
+/// stale bytes.
+fn plant_preframing_obligation(
+    fx: &mut crate::runtime::test_util::Fixture,
+    admit: &MembershipTransition,
+    member: wyrd_format::DeviceId,
+    admit_id: &wyrd_format::TransitionId,
+) -> Vec<u8> {
+    use crate::durable::AuthorizedCapability;
+    use crate::keys::capability::Capability;
+
+    let state = fx.engine.log.state_of(admit_id).expect("admit is valid");
+    // Populate the keyring the way intake does: an authorized
+    // capability for this device over epochs 1..=2, as a durable fact.
+    let held = vec![secret(0xAA), secret(0xBB)];
+    let cap = Capability::mint(member_drive(), fx.recipient, &state, admit, held.clone())
+        .expect("owner is a member");
+    let authorized = AuthorizedCapability::authorize(cap, member_drive(), &fx.engine.log, admit_id)
+        .expect("capability is authorized");
+    fx.engine
+        .commit_facts(&[Fact::Capability(authorized)])
+        .unwrap();
+
+    let wrap = Capability::mint(member_drive(), member, &state, admit, held)
+        .expect("recipient is a member")
+        .wrap()
+        .expect("wraps")
+        .as_bytes()
+        .to_vec();
+    let stale = seal(
+        &control_key(2),
+        &member_drive(),
+        2,
+        &Message::Capability(crate::control::CapabilityPayload {
+            device: member,
+            epoch: 2,
+            wrapped: wrap,
+        }),
+    )
+    .expect("seals")
+    .encode();
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilityQueued(2, member),
+            Fact::CapabilitySealed(2, member, stale.clone()),
+        ])
+        .unwrap();
+    stale
+}
+
+/// A stale-registration obligation whose sender lacks mint authority
+/// is left alone: no replacement, no transmission marker, and the
+/// obligation still pending for an authorized signer. The Mint arm
+/// routes through the same supersede path as the version-stale arm, so
+/// the gate holds identically — this pins the arm, not just the shared
+/// function beneath it.
+#[test]
+fn non_owner_stale_registration_commits_no_replacement() {
+    use crate::control::seal_rotation;
+    use crate::keys::capability::Capability;
+    use crate::keys::owner_proof::OwnerProof;
+
+    let mut fx = fixture();
+    let engine_device = fx.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admit = admit_engine(&mut builder, engine_device);
+    let admit_id = admit.transition_id();
+    let mail = vec![
+        deliver(&fx, 1, &transition_message(&genesis)),
+        deliver(&fx, 1, &transition_message(&admit)),
+    ];
+    queue(&mut fx, mail);
+    assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
+    // The engine is a member of this world but not one of its owners.
+    let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
+    assert!(
+        !state.owners.contains(&engine_device),
+        "the engine holds no mint authority here"
+    );
+
+    // Give it the keyring anyway: authority, not knowledge, is what must
+    // stop the mint.
+    let held = vec![secret(0xAA), secret(0xBB)];
+    let cap = Capability::mint(member_drive(), engine_device, &state, &admit, held.clone())
+        .expect("engine is a member");
+    let authorized = crate::durable::AuthorizedCapability::authorize(
+        cap,
+        member_drive(),
+        &fx.engine.log,
+        &admit_id,
+    )
+    .expect("capability is authorized");
+    fx.engine
+        .commit_facts(&[Fact::Capability(authorized)])
+        .unwrap();
+    assert!(
+        fx.engine
+            .store
+            .rebuild(engine_device)
+            .unwrap()
+            .keyring
+            .secret(2)
+            .is_some(),
+        "the keyring is populated; only authority is missing"
+    );
+
+    // A stale-registration obligation to the engine's own device: a
+    // current-framing seal to a key that is not the registered one, so
+    // no version gap can be mistaken for the authority refusal.
+    let foreign_sk = DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("stale seal scalar");
+    let foreign_key = encryption_key(&foreign_sk);
+    assert_ne!(
+        state.encryption_key_of(&engine_device),
+        Some(&foreign_key),
+        "the planted key must not be the registered one"
+    );
+    let proof = OwnerProof::sign(
+        &fx.engine.identity_secret,
+        &member_drive(),
+        &engine_device,
+        &admit_id,
+        2,
+        &held,
+    )
+    .expect("local signer authorizes the owner-proof domain")
+    .encode();
+    let wrap = Capability::mint(member_drive(), engine_device, &state, &admit, held)
+        .expect("engine is a member")
+        .wrap()
+        .expect("wraps")
+        .as_bytes()
+        .to_vec();
+    let stale = seal_rotation(
+        &member_drive(),
+        engine_device,
+        &foreign_key,
+        2,
+        &admit.canonical_bytes(),
+        &wrap,
+        &proof,
+    )
+    .expect("seals")
+    .encode();
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilityQueued(2, engine_device),
+            Fact::CapabilitySealed(2, engine_device, stale.clone()),
+        ])
+        .unwrap();
+
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: engine_device,
+    };
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "an unauthorized sender sends nothing"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_sealed_replaced.is_empty(),
+        "no replacement is committed without mint authority"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "nothing is marked transmitted"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_capabilities(),
+        vec![(2, engine_device)],
+        "the obligation stays pending for an authorized signer"
+    );
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, engine_device),
+        Some(stale.as_slice()),
+        "the stale fact is left exactly as it was"
+    );
+}
+
+/// A pending obligation sealed under the pre-framing epoch-sealed
+/// envelope, where the sender holds both the epoch secrets and mint
+/// authority: the replacement is committed durably, a restart
+/// mid-outage resends *those* bytes, and the recipient actually
+/// installs the result. Same outage shape as the rotation-stale cases
+/// — a pass-local overlay would die with the process and re-mint
+/// different bytes every pass — now for the oldest framing.
+#[test]
+fn preframing_obligation_recovers_byte_identically_across_restart() {
+    use crate::control::SealedRotation;
+
+    let world = owner_engine_with_recipient();
+    let OwnerWorld {
+        owner: mut fx,
+        mut recipient,
+        genesis,
+        admit,
+    } = world;
+    let member = recipient.device;
+    let admit_id = admit.transition_id();
+    let stale = plant_preframing_obligation(&mut fx, &admit, member, &admit_id);
+
+    // Pass one: the re-mint commits the replacement, the send fails.
+    let mut failing = FailSend;
+    let err = fx.engine.deliver_pending(&mut failing).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Mailbox(_)),
+        "transport failure surfaces, does not poison: {err:?}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.capability_sealed_replaced.len(),
+        1,
+        "the supersession is committed exactly once"
+    );
+    let (_, _, supersedes, replacement) = loaded.capability_sealed_replaced[0].clone();
+    assert_eq!(
+        supersedes,
+        crate::durable::SealedCapabilityFactId::of(2, &member, &stale),
+        "the replacement names the stale fact it retires"
+    );
+    assert_eq!(
+        replacement.first(),
+        Some(&ROTATION_VERSION),
+        "the replacement carries current framing"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "a failed send discharges nothing"
+    );
+
+    // Restart with the obligation still pending and the replacement on
+    // file — the outage the recovery exists for.
+    let (engine_sk, engine_device) = identity(0x02);
+    fx.engine.release_store_lock();
+    fx.engine = Engine::open(
+        fx.dir.path.clone(),
+        member_drive(),
+        engine_device,
+        "test-pass",
+        engine_sk,
+        DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, member),
+        Some(replacement.as_slice()),
+        "the replacement is the obligation after replay"
+    );
+
+    // Pass two: the same bytes send, and the stale fact is not
+    // re-minted into a third set of bytes.
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: fx.recipient,
+    };
+    assert_eq!(fx.engine.deliver_pending(&mut mailbox).unwrap(), 1);
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.capability_sealed_replaced.len(),
+        1,
+        "recovery appends nothing further"
+    );
+    assert_eq!(
+        loaded.capability_delivered,
+        vec![(2, member)],
+        "the obligation discharges"
+    );
+    // Pass three: a discharged outbox stays quiet rather than
+    // re-minting or re-sending.
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "a discharged outbox stays quiet"
+    );
+
+    let mut receiver = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: member,
+    };
+    let delivery = receiver
+        .recv()
+        .unwrap()
+        .expect("the sent envelope is retained");
+    let inner = open_from_sender(&recipient.identity_sk, member, delivery.envelope()).unwrap();
+    assert_eq!(
+        SealedRotation::decode(&inner)
+            .expect("rotation framed")
+            .encode(),
+        replacement,
+        "the retry is byte-identical to the committed replacement"
+    );
+    assert!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .pending_capabilities()
+            .is_empty(),
+        "nothing is left pending"
+    );
+
+    // The replacement is a real capability, not just a durable fact:
+    // recipient intake installs it under the owner's proof. The
+    // recipient needs the world first — a rotation names a transition
+    // its log has never seen.
+    let to_member = |message: &crate::control::Message| {
+        let sealed = crate::control::seal(&control_key(1), &member_drive(), 1, message)
+            .expect("seals")
+            .encode();
+        seal_for_recipient(&fx.sender_sk, member, &sealed).expect("mails")
+    };
+    for envelope in [
+        to_member(&transition_message(&genesis)),
+        to_member(&transition_message(&admit)),
+    ] {
+        fx.relay.push(envelope);
+    }
+    // The world has to land first: the delivery is already in the
+    // relay, ahead of these two, and a rotation naming a transition the
+    // recipient has never seen defers for redelivery rather than
+    // installing.
+    let world = drain_side(&mut fx.relay, &mut recipient);
+    assert_eq!(world.accepted, 2, "the world transitions ingest");
+    let report = drain_side(&mut fx.relay, &mut recipient);
+    assert_eq!(report.accepted, 1, "the replacement ingests");
+    assert_eq!(report.skipped, 0, "nothing is suppressed");
+    assert_eq!(report.deferred, 0, "nothing is deferred");
+
+    let rebuilt = recipient
+        .engine
+        .store
+        .rebuild(member)
+        .expect("recipient rebuilds");
+    assert!(
+        rebuilt.keyring.secret(2).is_some(),
+        "the owner proof carried mint authority the recipient accepts"
+    );
+}
+
+/// Plant one pending obligation sealed to a superseded *registration*:
+/// a genuine owner-signed `0x02` rotation whose encryption key is not
+/// the recipient's registered one. There is no in-protocol rekey, so
+/// this is the end state of a Remove + re-Admit under a new key that
+/// the sender sealed before observing: the framing is current, and
+/// only the key mismatch marks it stale — exactly what
+/// `verify_reused_rotation` keys on. Returns the stale bytes.
+fn plant_stale_registration_obligation(
+    fx: &mut crate::runtime::test_util::Fixture,
+    admit: &MembershipTransition,
+    member: wyrd_format::DeviceId,
+    admit_id: &wyrd_format::TransitionId,
+) -> Vec<u8> {
+    use crate::control::seal_rotation;
+    use crate::durable::AuthorizedCapability;
+    use crate::keys::capability::Capability;
+    use crate::keys::owner_proof::OwnerProof;
+
+    let state = fx.engine.log.state_of(admit_id).expect("admit is valid");
+    // Populate the keyring the way intake does: an authorized
+    // capability for this device over epochs 1..=2, as a durable fact.
+    let held = vec![secret(0xAA), secret(0xBB)];
+    let cap = Capability::mint(member_drive(), fx.recipient, &state, admit, held.clone())
+        .expect("owner is a member");
+    let authorized = AuthorizedCapability::authorize(cap, member_drive(), &fx.engine.log, admit_id)
+        .expect("capability is authorized");
+    fx.engine
+        .commit_facts(&[Fact::Capability(authorized)])
+        .unwrap();
+
+    // Sealed to a key nobody registered: structurally a rotation for
+    // this obligation, so only the registration mismatch marks it
+    // stale.
+    let foreign_sk = DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("stale seal scalar");
+    let foreign_key = encryption_key(&foreign_sk);
+    assert_ne!(
+        state.encryption_key_of(&member),
+        Some(&foreign_key),
+        "the planted key must not be the registered one"
+    );
+    let proof = OwnerProof::sign(
+        &fx.engine.identity_secret,
+        &member_drive(),
+        &member,
+        admit_id,
+        2,
+        &held,
+    )
+    .expect("local signer authorizes the owner-proof domain")
+    .encode();
+    let wrap = Capability::mint(member_drive(), member, &state, admit, held)
+        .expect("recipient is a member")
+        .wrap()
+        .expect("wraps")
+        .as_bytes()
+        .to_vec();
+    let stale = seal_rotation(
+        &member_drive(),
+        member,
+        &foreign_key,
+        2,
+        &admit.canonical_bytes(),
+        &wrap,
+        &proof,
+    )
+    .expect("seals")
+    .encode();
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilityQueued(2, member),
+            Fact::CapabilitySealed(2, member, stale.clone()),
+        ])
+        .unwrap();
+    stale
+}
+
+/// A pending obligation sealed to a superseded registration, where the
+/// sender holds both the epoch secrets and mint authority: the
+/// replacement is committed durably, a restart mid-outage resends
+/// *those* bytes, and the recipient actually installs the result.
+///
+/// The reload is the load-bearing step, for the same reason as the
+/// `0x01` case: a pass-local overlay dies with the process, so the
+/// reopened engine would re-mint the stale obligation into *different*
+/// bytes — appending one fsynced, then-ignored record per pass for the
+/// whole outage.
+#[test]
+fn stale_registration_obligation_recovers_byte_identically_across_restart() {
+    use crate::control::SealedRotation;
+
+    let world = owner_engine_with_recipient();
+    let OwnerWorld {
+        owner: mut fx,
+        mut recipient,
+        genesis,
+        admit,
+    } = world;
+    let member = recipient.device;
+    let admit_id = admit.transition_id();
+    let stale = plant_stale_registration_obligation(&mut fx, &admit, member, &admit_id);
+
+    // Pass one: the re-mint commits the replacement, the send fails.
+    let mut failing = FailSend;
+    let err = fx.engine.deliver_pending(&mut failing).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Mailbox(_)),
+        "transport failure surfaces, does not poison: {err:?}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.capability_sealed_replaced.len(),
+        1,
+        "the supersession is committed exactly once"
+    );
+    let (_, _, supersedes, replacement) = loaded.capability_sealed_replaced[0].clone();
+    assert_eq!(
+        supersedes,
+        crate::durable::SealedCapabilityFactId::of(2, &member, &stale),
+        "the replacement names the stale fact it retires"
+    );
+    assert_eq!(
+        replacement.first(),
+        Some(&ROTATION_VERSION),
+        "the replacement carries current framing"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "a failed send discharges nothing"
+    );
+
+    // Restart with the obligation still pending and the replacement on
+    // file — the outage the recovery exists for.
+    let (engine_sk, engine_device) = identity(0x02);
+    fx.engine.release_store_lock();
+    fx.engine = Engine::open(
+        fx.dir.path.clone(),
+        member_drive(),
+        engine_device,
+        "test-pass",
+        engine_sk,
+        DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, member),
+        Some(replacement.as_slice()),
+        "the replacement is the obligation after replay"
+    );
+
+    // Pass two: the same bytes send, and the stale fact is not
+    // re-minted into a third set of bytes.
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: fx.recipient,
+    };
+    assert_eq!(fx.engine.deliver_pending(&mut mailbox).unwrap(), 1);
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.capability_sealed_replaced.len(),
+        1,
+        "recovery appends nothing further"
+    );
+    assert_eq!(
+        loaded.capability_delivered,
+        vec![(2, member)],
+        "the obligation discharges"
+    );
+    // Pass three: a discharged outbox stays quiet rather than
+    // re-minting or re-sending.
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "a discharged outbox stays quiet"
+    );
+
+    let mut receiver = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: member,
+    };
+    let delivery = receiver
+        .recv()
+        .unwrap()
+        .expect("the sent envelope is retained");
+    let inner = open_from_sender(&recipient.identity_sk, member, delivery.envelope()).unwrap();
+    assert_eq!(
+        SealedRotation::decode(&inner)
+            .expect("rotation framed")
+            .encode(),
+        replacement,
+        "the retry is byte-identical to the committed replacement"
+    );
+    assert!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .pending_capabilities()
+            .is_empty(),
+        "nothing is left pending"
+    );
+
+    // The replacement is a real capability, not just a durable fact:
+    // recipient intake installs it under the owner's proof. The
+    // recipient needs the world first — a rotation names a transition
+    // its log has never seen.
+    let to_member = |message: &crate::control::Message| {
+        let sealed = crate::control::seal(&control_key(1), &member_drive(), 1, message)
+            .expect("seals")
+            .encode();
+        seal_for_recipient(&fx.sender_sk, member, &sealed).expect("mails")
+    };
+    for envelope in [
+        to_member(&transition_message(&genesis)),
+        to_member(&transition_message(&admit)),
+    ] {
+        fx.relay.push(envelope);
+    }
+    // The world has to land first: the delivery is already in the
+    // relay, ahead of these two, and a rotation naming a transition the
+    // recipient has never seen defers for redelivery rather than
+    // installing.
+    let world = drain_side(&mut fx.relay, &mut recipient);
+    assert_eq!(world.accepted, 2, "the world transitions ingest");
+    let report = drain_side(&mut fx.relay, &mut recipient);
+    assert_eq!(report.accepted, 1, "the replacement ingests");
+    assert_eq!(report.skipped, 0, "nothing is suppressed");
+    assert_eq!(report.deferred, 0, "nothing is deferred");
+
+    let rebuilt = recipient
+        .engine
+        .store
+        .rebuild(member)
+        .expect("recipient rebuilds");
+    assert!(
+        rebuilt.keyring.secret(2).is_some(),
+        "the owner proof carried mint authority the recipient accepts"
     );
 }

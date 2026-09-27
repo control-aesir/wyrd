@@ -71,8 +71,8 @@ kill_stale_daemons() {
 }
 
 teardown() {
-  kill_stale_daemons
   if [[ "$KEEP" == 0 ]]; then
+    kill_stale_daemons
     for t in tap-o tap-n tap-r; do ip link del "$t" 2>/dev/null || true; done
     ip link del "$BRIDGE" 2>/dev/null || true
   else

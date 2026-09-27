@@ -123,6 +123,7 @@ recording a transmission the recipient would suppress. Pinned by
 `preframing_obligation_recovers_byte_identically_across_restart`,
 `non_owner_stale_obligation_commits_no_replacement`,
 `non_owner_stale_registration_commits_no_replacement`,
+`non_owner_preframing_commits_no_replacement`,
 `stale_obligation_without_secrets_stays_pending`,
 `stale_registration_without_secrets_stays_pending`,
 `preframing_without_secrets_stays_pending`,

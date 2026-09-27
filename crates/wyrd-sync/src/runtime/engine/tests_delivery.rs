@@ -768,133 +768,16 @@ fn stale_capability_obligation_recovers_byte_identically_across_restart() {
     );
 }
 
-/// A stale obligation whose sender lacks mint authority is left alone:
-/// no replacement, no transmission marker, and the obligation still
-/// pending for an authorized signer. Recipient intake suppresses such a
-/// proof (epochs.md rule 3), so committing one would durably record an
-/// obligation as discharged that no recipient ever honours.
+/// A superseded-version obligation whose sender lacks mint authority
+/// is left alone: no replacement, no transmission marker, and the
+/// obligation still pending for an authorized signer. Recipient intake
+/// suppresses such a proof (epochs.md rule 3), so committing one would
+/// durably record an obligation as discharged that no recipient ever
+/// honours. Checked through the shared driver, like the other two
+/// shapes.
 #[test]
 fn non_owner_stale_obligation_commits_no_replacement() {
-    use crate::control::seal_rotation;
-    use crate::keys::capability::Capability;
-    use crate::keys::owner_proof::OwnerProof;
-
-    let mut fx = fixture();
-    let engine_device = fx.recipient;
-    let (mut builder, genesis) = Builder::genesis(10);
-    let admit = admit_engine(&mut builder, engine_device);
-    let admit_id = admit.transition_id();
-    let mail = vec![
-        deliver(&fx, 1, &transition_message(&genesis)),
-        deliver(&fx, 1, &transition_message(&admit)),
-    ];
-    queue(&mut fx, mail);
-    assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
-    // The engine is a member of this world but not one of its owners.
-    let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
-    assert!(
-        !state.owners.contains(&engine_device),
-        "the engine holds no mint authority here"
-    );
-
-    // Give it the keyring anyway: authority, not knowledge, is what must
-    // stop the mint.
-    let held = vec![secret(0xAA), secret(0xBB)];
-    let cap = Capability::mint(member_drive(), engine_device, &state, &admit, held.clone())
-        .expect("engine is a member");
-    let authorized = crate::durable::AuthorizedCapability::authorize(
-        cap,
-        member_drive(),
-        &fx.engine.log,
-        &admit_id,
-    )
-    .expect("capability is authorized");
-    fx.engine
-        .commit_facts(&[Fact::Capability(authorized)])
-        .unwrap();
-    assert!(
-        fx.engine
-            .store
-            .rebuild(engine_device)
-            .unwrap()
-            .keyring
-            .secret(2)
-            .is_some(),
-        "the keyring is populated; only authority is missing"
-    );
-
-    // A stale obligation to the engine's own device, so no registration
-    // or keyring gap can be mistaken for the authority refusal.
-    let registration = state
-        .encryption_key_of(&engine_device)
-        .copied()
-        .expect("the engine has a registered key");
-    let proof = OwnerProof::sign(
-        &fx.engine.identity_secret,
-        &member_drive(),
-        &engine_device,
-        &admit_id,
-        2,
-        &held,
-    )
-    .expect("local signer authorizes the owner-proof domain")
-    .encode();
-    let wrap = Capability::mint(member_drive(), engine_device, &state, &admit, held)
-        .expect("engine is a member")
-        .wrap()
-        .expect("wraps")
-        .as_bytes()
-        .to_vec();
-    let mut stale = seal_rotation(
-        &member_drive(),
-        engine_device,
-        &registration,
-        2,
-        &admit.canonical_bytes(),
-        &wrap,
-        &proof,
-    )
-    .expect("seals")
-    .encode();
-    stale[0] = ROTATION_VERSION_SUPERSEDED;
-    fx.engine
-        .commit_facts(&[
-            Fact::CapabilityQueued(2, engine_device),
-            Fact::CapabilitySealed(2, engine_device, stale.clone()),
-        ])
-        .unwrap();
-
-    let mut mailbox = MemoryMailbox {
-        relay: &mut fx.relay,
-        owner: engine_device,
-    };
-    assert_eq!(
-        fx.engine.deliver_pending(&mut mailbox).unwrap(),
-        0,
-        "an unauthorized sender sends nothing"
-    );
-    let loaded = fx.engine.store.load().unwrap();
-    assert!(
-        loaded.capability_sealed_replaced.is_empty(),
-        "no replacement is committed without mint authority"
-    );
-    assert!(
-        loaded.capability_delivered.is_empty(),
-        "nothing is marked transmitted"
-    );
-    assert_eq!(
-        fx.engine.runtime_state().unwrap().pending_capabilities(),
-        vec![(2, engine_device)],
-        "the obligation stays pending for an authorized signer"
-    );
-    assert_eq!(
-        fx.engine
-            .runtime_state()
-            .unwrap()
-            .capability_sealed_bytes(2, engine_device),
-        Some(stale.as_slice()),
-        "the stale fact is left exactly as it was"
-    );
+    non_owner_leaves_stale_fact(plant_stale_obligation);
 }
 
 /// A stale `0x01` obligation the sender can satisfy neither way: it
@@ -1288,13 +1171,14 @@ fn replacement_crash_matrix(
         // apart from its replacement, while a `0x02`-framed stale fact
         // is not — so the split is stated as previous-vs-changed, not
         // as a version disjunct: anything that is not the planted
-        // bytes is a complete current-framing replacement.
+        // bytes must decode as a complete current-framing rotation.
         if after == stale {
             saw_previous += 1;
         } else {
+            let replacement = crate::control::SealedRotation::decode(&after)
+                .expect("a changed obligation decodes as a rotation");
             assert_eq!(
-                after.first(),
-                Some(&ROTATION_VERSION),
+                replacement.version, ROTATION_VERSION,
                 "{stage:?}: a changed obligation is a complete current-framing replacement"
             );
             saw_committed += 1;
@@ -1404,136 +1288,13 @@ fn plant_preframing_obligation(
 }
 
 /// A stale-registration obligation whose sender lacks mint authority
-/// is left alone: no replacement, no transmission marker, and the
-/// obligation still pending for an authorized signer. The Supersede
-/// arm routes through the same supersede path as the version-stale
-/// arm, so the gate holds identically — this pins the arm, not just
-/// the shared function beneath it.
+/// is left alone: the same four outcomes through the shared driver.
+/// The plant seals to a key that is not the registered one, so no
+/// version gap can be mistaken for the authority refusal — this pins
+/// the classifier arm, not just the shared function beneath it.
 #[test]
 fn non_owner_stale_registration_commits_no_replacement() {
-    use crate::control::seal_rotation;
-    use crate::keys::capability::Capability;
-    use crate::keys::owner_proof::OwnerProof;
-
-    let mut fx = fixture();
-    let engine_device = fx.recipient;
-    let (mut builder, genesis) = Builder::genesis(10);
-    let admit = admit_engine(&mut builder, engine_device);
-    let admit_id = admit.transition_id();
-    let mail = vec![
-        deliver(&fx, 1, &transition_message(&genesis)),
-        deliver(&fx, 1, &transition_message(&admit)),
-    ];
-    queue(&mut fx, mail);
-    assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
-    // The engine is a member of this world but not one of its owners.
-    let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
-    assert!(
-        !state.owners.contains(&engine_device),
-        "the engine holds no mint authority here"
-    );
-
-    // Give it the keyring anyway: authority, not knowledge, is what must
-    // stop the mint.
-    let held = vec![secret(0xAA), secret(0xBB)];
-    let cap = Capability::mint(member_drive(), engine_device, &state, &admit, held.clone())
-        .expect("engine is a member");
-    let authorized = crate::durable::AuthorizedCapability::authorize(
-        cap,
-        member_drive(),
-        &fx.engine.log,
-        &admit_id,
-    )
-    .expect("capability is authorized");
-    fx.engine
-        .commit_facts(&[Fact::Capability(authorized)])
-        .unwrap();
-    assert!(
-        fx.engine
-            .store
-            .rebuild(engine_device)
-            .unwrap()
-            .keyring
-            .secret(2)
-            .is_some(),
-        "the keyring is populated; only authority is missing"
-    );
-
-    // A stale-registration obligation to the engine's own device: a
-    // current-framing seal to a key that is not the registered one, so
-    // no version gap can be mistaken for the authority refusal.
-    let foreign_sk = DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("stale seal scalar");
-    let foreign_key = encryption_key(&foreign_sk);
-    assert_ne!(
-        state.encryption_key_of(&engine_device),
-        Some(&foreign_key),
-        "the planted key must not be the registered one"
-    );
-    let proof = OwnerProof::sign(
-        &fx.engine.identity_secret,
-        &member_drive(),
-        &engine_device,
-        &admit_id,
-        2,
-        &held,
-    )
-    .expect("local signer authorizes the owner-proof domain")
-    .encode();
-    let wrap = Capability::mint(member_drive(), engine_device, &state, &admit, held)
-        .expect("engine is a member")
-        .wrap()
-        .expect("wraps")
-        .as_bytes()
-        .to_vec();
-    let stale = seal_rotation(
-        &member_drive(),
-        engine_device,
-        &foreign_key,
-        2,
-        &admit.canonical_bytes(),
-        &wrap,
-        &proof,
-    )
-    .expect("seals")
-    .encode();
-    fx.engine
-        .commit_facts(&[
-            Fact::CapabilityQueued(2, engine_device),
-            Fact::CapabilitySealed(2, engine_device, stale.clone()),
-        ])
-        .unwrap();
-
-    let mut mailbox = MemoryMailbox {
-        relay: &mut fx.relay,
-        owner: engine_device,
-    };
-    assert_eq!(
-        fx.engine.deliver_pending(&mut mailbox).unwrap(),
-        0,
-        "an unauthorized sender sends nothing"
-    );
-    let loaded = fx.engine.store.load().unwrap();
-    assert!(
-        loaded.capability_sealed_replaced.is_empty(),
-        "no replacement is committed without mint authority"
-    );
-    assert!(
-        loaded.capability_delivered.is_empty(),
-        "nothing is marked transmitted"
-    );
-    assert_eq!(
-        fx.engine.runtime_state().unwrap().pending_capabilities(),
-        vec![(2, engine_device)],
-        "the obligation stays pending for an authorized signer"
-    );
-    assert_eq!(
-        fx.engine
-            .runtime_state()
-            .unwrap()
-            .capability_sealed_bytes(2, engine_device),
-        Some(stale.as_slice()),
-        "the stale fact is left exactly as it was"
-    );
+    non_owner_leaves_stale_fact(plant_stale_registration_obligation);
 }
 
 /// A world where the engine is a member but holds no mint authority:

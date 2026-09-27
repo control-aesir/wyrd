@@ -6,6 +6,11 @@ protocol ingest ceilings (`Limits::V0`, bounding every committed
 object) are not in scope here — they bound committed data, while this
 doc bounds the live process holding and moving it.
 
+Those bounds are per operation. Exactly one resource escapes all of
+them — how much is *retained* over time, which no live bound can cap
+under an append-only store. That bound, its adversary, and what is
+enforceable before GC are in [Cumulative storage growth](#cumulative-storage-growth).
+
 All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-core/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the
 backend at composition time. Defaults are the historical hardcoded
@@ -68,7 +73,7 @@ the one unbounded walk. Per-stage worst case for one hostile message:
 | Capability | one ECDH+AEAD unwrap of envelope-bounded bytes, then one memoized authorize | `WrappedCapability::unwrap` before `AuthorizedCapability::authorize`; unknown transitions defer into the 1024-bound pending shed, terminal history suppresses |
 | Rotation delivery | device check + transition decode + limits + epoch agreement before the unwrap | structural gates precede `WrappedCapability::unwrap`; the transition↔capability binding check stays after it (the binding lives inside the wrap) |
 | Manifest / object fan-out | none on intake, by construction | intake commits only transition / announcement / capability / control-message facts and never opens manifests, trees, or chunks; expansion is pull-based post-intake under the fetch byte ceiling and manifest count gates |
-| Commit rate | no time-based cap | structural: invalid commits 0 facts, replay commits 0 facts, over-limit deferrals shed with the relay retaining. Insider commit-rate bounding is the separate fact-log spam issue, not this table |
+| Commit rate | no time-based cap | structural: invalid commits 0 facts, replay commits 0 facts, over-limit deferrals shed with the relay retaining. Insider commit-rate bounding is the separate fact-log spam issue, not this table. The *writer's* own commit rate is POSIX-boundary driven and is treated as a retention question in [Cumulative storage growth](#cumulative-storage-growth) |
 
 ## Bytes in flight
 
@@ -82,6 +87,179 @@ is therefore the byte bound's coarse handle:
 
 There is no independent byte knob: the ingest ceiling already caps
 the per-object term, and capping admissions caps the sum.
+
+## Cumulative storage growth
+
+Every bound above is a *live-process* bound: it caps one operation, one
+pass, or one set of open handles, and each is released when the
+operation ends. None of them caps **retention**. The store is
+append-only with no GC in v0 (`AGENTS.md` hard rule; see also
+`crash-consistency.md`, unreferenced objects are never reclaimed), so
+committed bytes are never reclaimed: a bound that refuses the
+thousandth concurrent write is irrelevant to a member who commits
+serially forever. This section states the retention bound
+separately, because it is the one resource none of the bounds above
+can touch, and because a later GC design needs a defined adversary
+rather than an open assumption. (The append-only membership log is
+unbounded in depth for a related reason — by design, no depth cap —
+but it is owner-gated and grows per membership transition, not per
+authored byte, so it is not an amplification path.)
+
+### The bound, stated
+
+> retained bytes <= (snapshots committed) x (per-snapshot fixed
+> overhead + content-proportional bytes)
+
+The **fixed** term is the architectural problem. It does not shrink
+with change size, it is not reduced by content-addressed chunking or
+copy-on-write trees, and it dominates for small writes. Optimizing
+the per-commit cost (`seal_tree`, chunking) cannot bound it; only
+reducing the *number* of commits can, which is the mutation-unit
+question in `write-path.md`, not a micro-optimization.
+
+### Per-snapshot fixed overhead
+
+One commit pays each of these regardless of how many bytes changed
+(`write-path.md` commit steps 1-6):
+
+| Fixed cost | Where | Notes |
+|---|---|---|
+| Signed snapshot body | step 2 | author identity key, bound to DriveId and authorizing transition |
+| Vault import | step 2 | temp + fsync + rename + directory fsync |
+| Fact-log append + `CURRENT` rewrite | step 3 | append-only and crash-safe; one commit per snapshot |
+| Durability fsyncs | step 3 | object store, vault, fact log, and every directory created on the way, made durable **together** |
+| Announcement obligation recorded, then discharged | steps 3, 6 | durable outbox, per-recipient delivered markers, byte-identical sealed retries per route |
+| Serving mirror write-through + flush barrier | step 5 | bounded per-pass (64 items / 64 MiB), but paid per commit |
+| Projection generation bump + head swap | step 4 | one short write lock |
+
+The fsync count is the term that actually costs wall-clock: step 3
+makes several stores durable *together*, and a first-write hierarchy
+syncs its directories level by level.
+
+### Content-proportional bytes
+
+Small because a mutation materializes only what it touches: a commit
+rebuilds the affected tree nodes and the file's chunk list, and reuses
+unchanged nodes, chunk objects, and recorded representations
+(including manifest mappings, where the epoch rules allow). A one-byte
+edit to a large file does not copy the file.
+
+Each *object* is separately capped by `Limits::V0`
+(`wyrd-sync/src/ingest.rs`): 64 MiB per object pre-decode, 256 KiB
+chunk payloads (plus the 6-byte envelope header), 65,536 chunks per
+file, 1M tree entries, 580K manifest entries, 1M manifest children.
+These are per-object ceilings, so they bound the content term of any
+single snapshot and nothing about how many snapshots exist.
+
+### What drives the snapshot count
+
+There is no autosave timer. `debounce` appears nowhere in the tree,
+and none is specified. Snapshots are created by POSIX boundaries on
+the author's own device:
+
+- `write` only buffers; a snapshot is created by `flush`, `fsync`, or
+  `release` on a dirty handle. A committing boundary on a **clean**
+  handle performs no snapshot, so idle flushes are free.
+- `O_SYNC` / `O_DSYNC` deliberately forfeit coalescing: each
+  successful `write` is its own durable snapshot. This is the
+  amplification peak, and it is opt-in per handle by the application.
+- Each namespace operation (`create`, `unlink`, `mkdir`, `rmdir`,
+  `rename`, `truncate`, `set-exec`) is one snapshot.
+
+So the rate is chosen by the member, at their own throughput, and is
+not throttled by any protocol timer.
+
+The cheapest attack is therefore not `write 1 byte, commit, repeat`
+— it is **pure namespace churn**, `unlink` + `create` on one path, in
+a loop. That is two snapshots and two full fixed overheads per
+iteration while writing **zero content bytes**, so the content term
+drops out of the bound entirely and only the fixed term remains,
+multiplied without limit.
+
+### Already bounded (writer-side amplification, verified closed)
+
+Both writer-side paths previously named in the storage-bound
+discussion are closed in current `master`, and are recorded here so
+they are not re-opened as findings:
+
+| Path | Bound |
+|---|---|
+| Repeated failed wants appending unchanged `Fact::Materialization` | Closed. `Engine::set_materialization` / `set_materialization_from` compare durable state first and append nothing when it already equals the target, so a retried want costs no fact and no fsync. Pinned by `repeat_materialization_admission_commits_nothing` (a ten-deep retry storm commits nothing; a genuine transition commits exactly once) |
+| Unbounded serving-mirror import queue | Closed. `MAX_MIRROR_QUEUE_ITEMS` (64) and `MAX_MIRROR_QUEUE_BYTES` (64 MiB); a full queue returns `VaultError::MirrorFull` and keeps the vault file durable. Pinned by the `serving.rs` mirror-depth and capacity assertions |
+
+The remaining growth is the commit path itself, which is bounded per
+commit and unbounded in count.
+
+### Who bears the cost
+
+| Party | Bears | Bounded today |
+|---|---|---|
+| Author | local disk, and its own fsync and announcement cost | yes, per operation |
+| Serving member / peer | retained history for every snapshot it materializes, whether or not it wanted the content | no |
+| Vault | retained ciphertext per representation, and the count of them | no |
+
+The asymmetry is the finding. Authorization in v0 is membership, and
+membership carries **no retention obligation and no refusal right**:
+`trust.md` records that object admission is content verification with
+no per-object ACLs, and availability is explicitly called out as "not
+a confidentiality break" — but nothing lets a peer or vault decline to
+retain what an authorized member authored. One member can force
+unbounded growth on every other member and on every vault, at a cost
+to the attacker that is one signing key and a tight loop. Adding a
+peer refusal right would change the authorization contract, so it is
+recorded as an open question below rather than decided here.
+
+### Pre-GC bounds: what could be enforced
+
+**Nothing in this subsection is implemented.** It records which
+bounds survive the durability contract, so the GC design starts from
+a screened list rather than re-testing rejected options. Everything
+else in this document describes current behavior.
+
+Enforcement must not contradict the durability contract. Two of the
+obvious candidates fail that test:
+
+- **Snapshot rate limiting is not available pre-GC.** `flush` and
+  `fsync` are semantically equivalent and the commit boundary *is*
+  the durability boundary (`write-path.md`); a rate limit would have
+  to either delay or fail a call that POSIX says is already durable,
+  and `O_SYNC` promises one durable snapshot per write. Delaying a
+  reported-durable commit is a correctness regression, not a bound.
+- **History-depth policy cannot be enforced without GC**, because
+  there is nothing to prune when the policy is exceeded; it can only
+  be observed and reported.
+
+One candidate survives, and it is the only pre-GC bound that reuses
+an existing error path unchanged:
+
+| Bound | Enforcement | Why it is safe |
+|---|---|---|
+| Per-device retained-bytes quota (proposed) | Refuse the commit at the durability boundary as `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see Disk classification). A quota is a smaller disk, not a weaker promise |
+
+A quota would bound the author's own device and convert a silent
+unbounded growth into an explicit, documented, POSIX-legitimate
+refusal. It would not bound the author. Nothing in v0 can bound the
+author, because a member's commits are valid work and GC is the only
+mechanism that can make old bytes stop existing.
+
+### Open questions
+
+1. **Do serving members and vaults get a retention refusal right?**
+   This is the only pre-GC bound that limits the *author*, and it is
+   a `trust.md` authorization change, not a resource-limit change:
+   membership currently implies unbounded retention. Options are a
+   per-drive byte ceiling with `ENOSPC` at the serving boundary, an
+   eviction-under-pressure rule (which trades against the recovery
+   property that motivates the append-only store), or accepting
+   unbounded peer growth until GC. Not decided here.
+2. **Quota granularity**: per device, per drive, or per member-set,
+   and whether a quota interacts with the announcement obligation (a
+   quota-refused commit must not leave a durable obligation behind —
+   the obligation is created at step 3, atomically with the commit, so
+   the refusal has to happen at or before that boundary).
+
+Tracked as `harden(storage): define authorized-writer storage
+amplification bound`.
 
 ## Disk classification
 

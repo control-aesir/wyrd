@@ -204,3 +204,62 @@ impl Loaded {
         self.rig.drain()
     }
 }
+
+/// The fixture's own signatures verify through wyrd-sync's real
+/// public verification paths: membership classification derives a
+/// state only for signature-valid transitions, and durable
+/// authorization gatekeeps snapshot bodies. A drift in the pinned
+/// snapshot challenge context fails here, locally, instead of as a
+/// generic rejection in whichever contract runs first. It lives in
+/// this module (not `signing`) because it needs a plaintext tree
+/// beside the signatures — and that placement keeps the dependency
+/// direction one-way: `sealed` uses `signing`, never the reverse.
+#[test]
+fn fixture_signatures_verify_through_the_public_path() {
+    use super::signing::{device, drive, signed_snapshot, signed_transition};
+    use wyrd_format::membership::Admission;
+    use wyrd_format::Change;
+    use wyrd_sync::membership::MembershipLog;
+
+    let owner = device(0x10);
+    let recipient = device(0x20);
+    let genesis = signed_transition(
+        1,
+        None,
+        vec![],
+        vec![
+            Change::Admit(Admission {
+                device: owner.id,
+                encryption_key: owner.encryption_key,
+            }),
+            Change::SetOwners(vec![owner.id]),
+        ],
+        &[owner.id],
+        &[owner.id],
+        &owner,
+    );
+    let genesis_id = genesis.transition_id();
+    let admit = signed_transition(
+        2,
+        Some(genesis_id),
+        vec![],
+        vec![Change::Admit(Admission {
+            device: recipient.id,
+            encryption_key: recipient.encryption_key,
+        })],
+        &[owner.id, recipient.id],
+        &[owner.id],
+        &owner,
+    );
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis);
+    log.observe(admit.clone());
+    assert!(
+        log.state_of(&admit.transition_id()).is_some(),
+        "membership fixture signatures must classify"
+    );
+    let tree = plain_files(&[("probe.txt", b"signature probe")]).tree_id;
+    let snapshot = signed_snapshot(Vec::new(), tree, &owner, admit.transition_id(), 2, 1_000);
+    wyrd_sync::durable::AuthorizedSnapshot::authorize(snapshot, &drive())
+        .expect("snapshot fixture signature must authorize durably");
+}

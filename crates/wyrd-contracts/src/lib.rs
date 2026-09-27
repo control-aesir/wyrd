@@ -105,9 +105,10 @@
 //!     enumerates the new generation, and release drops the handle
 //!     (daemon FUSE backend).
 //! 40. `disappeared_then_recreated_paths_serve_the_new_bytes` — a
-//!     vanished path fails closed and retires its identity by path;
-//!     the recreation resolves fresh, never stale (daemon FUSE
-//!     backend).
+//!     vanished path fails closed and the recreation serves its own
+//!     bytes: path resolution and capture freshness, not the inode
+//!     table (the retire-by-path path needs a cross-crate ino seam
+//!     that does not exist yet).
 //! 41. `redelivered_announcement_after_restart_stays_a_duplicate` —
 //!     identical-bytes redelivery across an engine restart commits
 //!     nothing: dedupe is durable, and the one head stands.

@@ -7,8 +7,10 @@
 use std::path::PathBuf;
 
 use wyrd_format::membership::{Admission, Change};
-use wyrd_format::{DeviceId, MembershipTransition, SnapshotId, TransitionId};
-use wyrd_sync::control::{CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload};
+use wyrd_format::{BaoRoot, ContentId, DeviceId, MembershipTransition, SnapshotId, TransitionId};
+use wyrd_sync::control::{
+    sign_announcement, CapabilityPayload, Message, SnapshotAnnouncement, TransitionPayload,
+};
 use wyrd_sync::keys::capability::Capability;
 use wyrd_sync::keys::{DeviceIdentitySecret, EpochSecret};
 use wyrd_sync::membership::MembershipLog;
@@ -18,8 +20,6 @@ use zeroize::Zeroizing;
 
 use super::relay::{sealed_envelope, Relay};
 use super::signing::{device, drive, signed_transition, Device};
-use wyrd_format::{BaoRoot, ContentId};
-use wyrd_sync::control::sign_announcement;
 
 pub(crate) fn scratch_dir(label: &str) -> PathBuf {
     // Process-unique sequence: two threads can read the same clock tick,

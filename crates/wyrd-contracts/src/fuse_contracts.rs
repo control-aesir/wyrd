@@ -1,11 +1,15 @@
 //! The fuse-facing contracts: structural merge at changed
-//! descendants, and snapshot-stable descriptors.
+//! descendants, snapshot-stable descriptors, and the open/read/head
+//! lifecycle under concurrency and head advancement.
 
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_format::{Entry, MemoryObjectStore, ObjectStore, TransitionId, Tree};
+use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, TransitionId, Tree};
 use wyrd_fuse::{DriveView, Kind, Node, ViewError};
 
-use crate::support::{fixture_heads, mount_heads, signed_head, Loaded, RemoteOnlyMaterialization};
+use crate::support::{
+    device, drive, fixture_heads, mount_heads, signed_head, signed_snapshot, Loaded,
+    RemoteOnlyMaterialization,
+};
 
 /// A changed descendant never manufactures a directory path
 /// conflict: heads that both resolve `d` to a directory merge it
@@ -209,10 +213,12 @@ fn forged_snapshots_are_rejected_before_fuse_head_installation() {
 /// Concurrent opens, reads, and head publications never deadlock and
 /// never tear: every read returns one complete published version.
 /// Readers resolve against whichever generation is current per open
-/// while the publisher swaps generations underneath; the lock order
-/// (projection before handle tables, never the reverse) holds under
-/// contention, and captures are immutable once taken, so a read is
-/// always whole-version or nothing.
+/// while the publisher swaps generations underneath, and captures
+/// are immutable once taken, so a read is always whole-version or
+/// nothing. Completion of every reader under contention is asserted;
+/// the lock discipline that makes it so (projection before handle
+/// tables, never the reverse) is structural — this test would stay
+/// green under an inversion, so it pins the outcome, not the order.
 #[test]
 fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -222,24 +228,26 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     const READERS: usize = 4;
     const READS_PER_THREAD: usize = 20;
     const PUBLICATIONS: usize = 12;
+    /// A deadlock fails here after a minute, it never hangs the
+    /// suite: the daemon's own concurrency tests bound themselves
+    /// the same way.
+    const HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
     let mut store = MemoryObjectStore::default();
-    let author = crate::support::device(0x0A);
+    let author = device(0x0A);
     let membership = TransitionId::from_bytes([0x71; 32]);
     let mut bodies = Vec::new();
     let mut heads = Vec::new();
     for index in 0..VERSIONS {
         let body = vec![b'0' + index as u8; 16];
-        let chunk = store.insert(wyrd_format::ObjectKind::Chunk, &body).unwrap();
+        let chunk = store.insert(ObjectKind::Chunk, &body).unwrap();
         let tree = Tree::from_entries(vec![Entry::file("v.txt", 16, false, vec![chunk]).unwrap()])
             .unwrap()
             .insert_into(&mut store)
             .unwrap();
-        let snapshot =
-            crate::support::signed_snapshot(Vec::new(), tree, &author, membership, 1, index as u64);
+        let snapshot = signed_snapshot(Vec::new(), tree, &author, membership, 1, index as u64);
         let authorized =
-            wyrd_sync::durable::AuthorizedSnapshot::authorize(snapshot, &crate::support::drive())
-                .unwrap();
+            wyrd_sync::durable::AuthorizedSnapshot::authorize(snapshot, &drive()).unwrap();
         bodies.push(body);
         heads.push(authorized);
     }
@@ -250,41 +258,60 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
         mount_heads(vec![heads.next().unwrap()]),
     )));
     let published: Vec<_> = heads.collect();
+    // The bodies in publication order, parallel to `published`: the
+    // initial head serves `bodies[0]`, so the rotating set starts at
+    // `bodies[1]`.
+    let published_bodies: Vec<_> = bodies[1..].to_vec();
     let bodies = Arc::new(bodies);
     let completed = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(std::sync::Barrier::new(READERS + 1));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
 
-    std::thread::scope(|scope| {
-        for _ in 0..READERS {
-            let backend = Arc::clone(&backend);
-            let bodies = Arc::clone(&bodies);
-            let completed = Arc::clone(&completed);
-            scope.spawn(move || {
-                for _ in 0..READS_PER_THREAD {
-                    let handle = backend.open_at("v.txt").unwrap();
-                    let bytes = backend.read_handle(handle, 0, 64).unwrap();
-                    assert!(
-                        bodies.contains(&bytes),
-                        "a concurrent read is always one whole published version"
-                    );
-                    backend.release_handle(handle).unwrap();
-                    completed.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-        }
-        // Publish the remaining versions round-robin while the
-        // readers run: every publication swaps the served generation
-        // under live opens.
-        let rotating = published.len();
-        for index in 0..PUBLICATIONS {
-            backend
-                .publish_without_revision(DriveView::shared(
-                    backend.store_handle().unwrap(),
-                    RemoteOnlyMaterialization,
-                    mount_heads(vec![published[index % rotating].clone()]),
-                ))
-                .unwrap();
-        }
-    });
+    // Readers run on spawned threads (not a scope) so a deadlock
+    // fails at the bounded join below instead of hanging the suite:
+    // every handle shared here is `'static` through its `Arc`.
+    for _ in 0..READERS {
+        let backend = Arc::clone(&backend);
+        let bodies = Arc::clone(&bodies);
+        let completed = Arc::clone(&completed);
+        let start = Arc::clone(&start);
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            for _ in 0..READS_PER_THREAD {
+                let handle = backend.open_at("v.txt").unwrap();
+                let bytes = backend.read_handle(handle, 0, 64).unwrap();
+                assert!(
+                    bodies.contains(&bytes),
+                    "a concurrent read is always one whole published version"
+                );
+                backend.release_handle(handle).unwrap();
+                completed.fetch_add(1, Ordering::Relaxed);
+            }
+            done_tx.send(()).unwrap();
+        });
+    }
+    // Publish the remaining versions round-robin from the common
+    // start: every publication swaps the served generation under
+    // live opens. The barrier aligns the start; the 80-read vs
+    // 12-publish volume makes the overlap real, and the assertions
+    // below are exact either way.
+    start.wait();
+    let rotating = published.len();
+    for index in 0..PUBLICATIONS {
+        backend
+            .publish_without_revision(DriveView::shared(
+                backend.store_handle().unwrap(),
+                RemoteOnlyMaterialization,
+                mount_heads(vec![published[index % rotating].clone()]),
+            ))
+            .unwrap();
+    }
+    for _ in 0..READERS {
+        done_rx.recv_timeout(HANG_BOUND).expect(
+            "every reader finished within the hang bound: a deadlock fails here, not in a hang",
+        );
+    }
 
     assert_eq!(
         completed.load(Ordering::Relaxed),
@@ -296,13 +323,27 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
         PUBLICATIONS as u64,
         "every publication landed while reads were in flight"
     );
+
+    // The observation half: a fresh open after the last publication
+    // resolves the last published version, so readers were never
+    // pinned to the initial head.
+    let expected = published_bodies[(PUBLICATIONS - 1) % rotating].clone();
+    let handle = backend.open_at("v.txt").unwrap();
+    assert_eq!(
+        backend.read_handle(handle, 0, 64).unwrap(),
+        expected,
+        "a fresh open sees the last published version"
+    );
+    backend.release_handle(handle).unwrap();
 }
 
 /// An open directory pins its enumeration generation: publishing new
-/// heads does not rewrite a held listing, a fresh open sees the new
-/// generation, and releasing drops the handle. The listing a
-/// readdir serves is the one opendir enumerated, so a head advance
-/// can neither inject entries into a held handle nor strand it.
+/// heads advances the served generation but a held handle still
+/// reports the generation it enumerated at, a fresh open sees the
+/// new one, and releasing drops the handle. What the test observes
+/// is the generation stamp, not the pinned entries themselves —
+/// entry contents stay pinned by the daemon's in-crate
+/// directory-consistency tests.
 #[test]
 fn open_directories_pin_their_enumeration_generation() {
     let mut store = MemoryObjectStore::default();
@@ -371,9 +412,13 @@ fn open_directories_pin_their_enumeration_generation() {
 }
 
 /// A path that disappears and later reappears serves the new bytes:
-/// the vanished generation fails closed with ENOENT (retiring the
-/// stale identity by path), and the recreation resolves fresh rather
-/// than resurrecting the retired mapping.
+/// the vanished generation fails closed with ENOENT, and the
+/// recreation resolves fresh rather than serving the old capture.
+/// Stated plainly: this pins path resolution and capture freshness,
+/// not the inode table — `open_at` carries no ino, so the
+/// retire-by-path path inside `resolve_inode` is not exercised here
+/// (it is pinned in-crate); the inode-cache half of the lifecycle
+/// stays open until a cross-crate ino seam exists.
 #[test]
 fn disappeared_then_recreated_paths_serve_the_new_bytes() {
     let mut store = MemoryObjectStore::default();

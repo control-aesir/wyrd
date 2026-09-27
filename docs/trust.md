@@ -404,25 +404,32 @@ secret_digest            = BLAKE3-derive-key("wyrd epoch secret vector v1", CANO
 preimage                 = "wyrd owner proof v1" ‖ drive (32) ‖ recipient (32)
                            ‖ transition (32) ‖ epoch u64 LE (8) ‖ secret_digest (32)
 challenge                = BLAKE3-derive-key("wyrd owner proof v1", preimage)
-signature                = BIP-340(challenge), deterministic nonce
+signature                = BIP-340(challenge): deterministic under the local
+                           session; a remote session follows BIP-340, and the
+                           protocol requires only that the 64 bytes verify
 proof encoding           = signer DeviceId (32) ‖ signature (64)
 ```
 
 The preimage is 155 bytes, fixed: every field is fixed-width, so no
 concatenation is ambiguous. The secret-vector context is distinct
 from the proof context on purpose — a digest can never be replayed
-as a preimage or vice versa. The signature is always produced through a signer session
-scoped to the `OwnerProofV1` domain (`0x02` in the closed NIP-46
-signing-domain enum, continuing the Wyrd-private `0x00`/`0x01`
-allocation; standard NIP-46 defines method names, never signing
-domains, so there is no upstream value to reuse): a session that
-does not authorize the owner-proof domain refuses rather than
-minting under a confused authority. It exists because the two
+as a preimage or vice versa. The proof exists because the two
 authorities are distinct: the mailbox seal authenticates the
 *sender* (delivery authority, held
 by any member of the authorizing state), while the proof authenticates
 the *origin* of the secret material (mint authority, held only by an
-owner of the pre-state). Intake verifies the proof against the
+owner of the pre-state). The signature is produced through a signer
+session scoped to the `OwnerProofV1` domain (`0x02` in the closed
+NIP-46 signing-domain enum, continuing the Wyrd-private `0x00`/`0x01`
+allocation; standard NIP-46 defines method names, never signing
+domains, so there is no upstream value to reuse). Domain refusal is
+remote-session behavior: a session that does not authorize the
+owner-proof domain refuses rather than minting under a confused
+authority, and the mint verifies the returned signature against the
+session's reported key before accepting it. The local session — the
+only one shipped — holds the key itself and is unscoped by design,
+so today the domain names the operation without constraining it.
+Intake verifies the proof against the
 unwrapped secrets and requires its signer to be an owner of the
 transition's predecessor, so member delivery stays legal while member
 minting does not. A sender checks that same authority before it mints,
@@ -766,9 +773,10 @@ Wyrd daemon ── "sign_message(domain, drive, digest)" ──▶ scoped signer
 ```
 
 `sign_message` takes an operation domain (closed enum, per-domain
-authorization at the signer), the drive, and one 32-byte digest (the
-pinned Wyrd message digest for a snapshot or membership transition,
-above), and returns the BIP-340 signature. Scoping rules: the Wyrd signer session exposes
+authorization at the signer), the drive, and one 32-byte digest: the
+pinned Wyrd message digest for a snapshot, a membership transition
+(above), or an owner-proof challenge (rotation delivery, above). It
+returns the BIP-340 signature. Scoping rules: the Wyrd signer session exposes
 `get_public_key` and `sign_message` only. No `nip44_decrypt`, no
 `sign_event`, no arbitrary-event signing unless a concrete feature
 demands it — **default-deny**. This is especially desirable when the

@@ -11,6 +11,7 @@ use crate::keys::capability::{Capability, DriveKeyring};
 use crate::keys::owner_proof::OwnerProof;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::{seal_for_recipient, Mailbox};
+use crate::transport::signer::{SignerError, SignerSession};
 use zeroize::Zeroizing;
 
 /// Send every undischarged transition- and capability-delivery
@@ -333,6 +334,11 @@ fn deliver_capabilities(
     }
     let mut sealed_overlay: BTreeMap<(u64, DeviceId), Vec<u8>> = BTreeMap::new();
     let mut sent = 0usize;
+    // The mint session, cloned once per pass: the local identity signs
+    // for itself (a remote session would plug in here when NIP-46 mode
+    // lands). Cloned rather than borrowed so the obligation loop can
+    // keep its `&mut Engine` while minting through the session.
+    let signer = engine.identity_secret.clone();
     for (epoch, recipient) in pending {
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
@@ -372,6 +378,7 @@ fn deliver_capabilities(
                     Reused::Mint => {
                         let Some(bytes) = mint_fresh_rotation(
                             engine,
+                            &signer,
                             &rebuilt.keyring,
                             &mut sealed_overlay,
                             epoch,
@@ -412,6 +419,7 @@ fn deliver_capabilities(
                     crate::durable::SealedCapabilityFactId::of(epoch, &recipient, &bytes);
                 let Some(replacement) = mint_fresh_rotation_bytes(
                     engine,
+                    &signer,
                     &rebuilt.keyring,
                     epoch,
                     recipient,
@@ -437,6 +445,7 @@ fn deliver_capabilities(
                 }
                 let Some(bytes) = mint_fresh_rotation(
                     engine,
+                    &signer,
                     &rebuilt.keyring,
                     &mut sealed_overlay,
                     epoch,
@@ -451,6 +460,7 @@ fn deliver_capabilities(
             None => {
                 let Some(bytes) = mint_fresh_rotation(
                     engine,
+                    &signer,
                     &rebuilt.keyring,
                     &mut sealed_overlay,
                     epoch,
@@ -536,13 +546,15 @@ fn verify_reused_rotation(
 /// retry.
 fn mint_fresh_rotation(
     engine: &mut Engine,
+    session: &dyn SignerSession,
     keyring: &DriveKeyring,
     sealed_overlay: &mut BTreeMap<(u64, DeviceId), Vec<u8>>,
     epoch: u64,
     recipient: DeviceId,
     transition_id: &TransitionId,
 ) -> Result<Option<Vec<u8>>, EngineError> {
-    let Some(bytes) = mint_fresh_rotation_bytes(engine, keyring, epoch, recipient, transition_id)?
+    let Some(bytes) =
+        mint_fresh_rotation_bytes(engine, session, keyring, epoch, recipient, transition_id)?
     else {
         return Ok(None);
     };
@@ -556,6 +568,7 @@ fn mint_fresh_rotation(
 /// durable obligation (a replacement fact) or a first seal.
 fn mint_fresh_rotation_bytes(
     engine: &mut Engine,
+    session: &dyn SignerSession,
     keyring: &DriveKeyring,
     epoch: u64,
     recipient: DeviceId,
@@ -599,17 +612,26 @@ fn mint_fresh_rotation_bytes(
     // Mint authority, distinct from delivery authority: the owner signs
     // a commitment to this exact vector, so any member may later relay
     // the sealed bytes while only an owner can have originated them.
-    // The signature goes through the local signer session under the
-    // owner-proof domain: a narrower remote session would refuse here
-    // rather than mint under a confused authority.
-    let proof = OwnerProof::sign(
-        &engine.identity_secret,
+    // Raise vs count, stated (error-conventions.md): a session that is
+    // momentarily unreachable leaves the obligation pending for the
+    // next pass, exactly like a missing secret or registration — retry
+    // may heal it. A domain refusal or an identity mismatch is a
+    // misconfiguration retry will not heal, so it fails loudly rather
+    // than stalling the outbox silently.
+    let proof = match OwnerProof::sign(
+        session,
         &engine.drive,
         &recipient,
         &transition.transition_id(),
         epoch,
         &secrets,
-    )?;
+    ) {
+        Ok(proof) => proof,
+        Err(SignerError::Unreachable) => return Ok(None),
+        Err(e @ (SignerError::Refused | SignerError::IdentityMismatch)) => {
+            return Err(e.into());
+        }
+    };
     let sealed = seal_rotation(
         &engine.drive,
         recipient,
@@ -645,4 +667,133 @@ fn mint_wrap(
 ) -> Option<Vec<u8>> {
     let cap = Capability::mint(drive, recipient, state, transition, secrets).ok()?;
     Some(cap.wrap().ok()?.as_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests_harness::owner_engine;
+    use super::*;
+    use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
+    use crate::keys::EpochSecret;
+    use crate::membership::test_util::{drive as member_drive, key};
+    use crate::transport::signer::fake::FakeSignerSession;
+    use secp256k1::SecretKey;
+
+    /// A session with no path to a signature, standing in for a
+    /// dropped remote signer.
+    struct UnreachableSession;
+
+    impl SignerSession for UnreachableSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Err(SignerError::Unreachable)
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            Err(SignerError::Unreachable)
+        }
+    }
+
+    /// Owner engine, recipient, keyring, and transition id wired for a
+    /// mint: the owner mints its epoch-1 vector to itself. The
+    /// directory rides along so the caller keeps the store alive.
+    fn mint_setup() -> (
+        crate::runtime::test_util::TestDir,
+        Engine,
+        DriveKeyring,
+        DeviceId,
+        wyrd_format::TransitionId,
+    ) {
+        let (dir, engine, genesis_id) = owner_engine("signer-session-mint");
+        let owner = key(10).1;
+        let state = engine.log.state_of(&genesis_id).expect("genesis has state");
+        let registered = state
+            .encryption_key_of(&owner)
+            .copied()
+            .expect("owner key registered");
+        let cap = Capability::new(
+            member_drive(),
+            owner,
+            registered,
+            genesis_id,
+            1,
+            vec![EpochSecret::from_bytes([0x07; 32])],
+        )
+        .expect("mintable");
+        let mut keyring = DriveKeyring::new(member_drive(), owner);
+        keyring.install(&cap, &engine.log).expect("installs");
+        (dir, engine, keyring, owner, genesis_id)
+    }
+
+    /// A domain refusal is a misconfiguration retry will not heal: it
+    /// fails loudly, before anything is sealed or committed.
+    #[test]
+    fn refusing_session_fails_loud_with_nothing_committed() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let refusing =
+            FakeSignerSession::new(&SecretKey::from_slice(&[0x99; 32]).expect("scalar"), &[]);
+        let before = engine.store.current();
+        let err =
+            mint_fresh_rotation_bytes(&mut engine, &refusing, &keyring, 1, owner, &genesis_id)
+                .expect_err("a refused domain must not mint");
+        assert!(
+            matches!(err, EngineError::Signer(SignerError::Refused)),
+            "unexpected: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("owner-proof signer session failed"),
+            "the message stays true for every signer failure: {err}"
+        );
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed mint commits nothing"
+        );
+        assert!(
+            engine.store.load().unwrap().capability_sealed.is_empty(),
+            "no sealed fact claims the obligation"
+        );
+    }
+
+    /// An unreachable signer is transient: the obligation stays
+    /// pending — queued, unsealed, undelivered — for the next pass,
+    /// exactly like a missing secret or registration.
+    #[test]
+    fn unreachable_session_leaves_the_obligation_pending() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        engine
+            .commit_facts(&[Fact::CapabilityQueued(1, owner)])
+            .expect("queue the obligation");
+        let before = engine.store.current();
+        let mut overlay = BTreeMap::new();
+        let minted = mint_fresh_rotation(
+            &mut engine,
+            &UnreachableSession,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect("unreachable is pending, not an error");
+        assert!(minted.is_none(), "nothing to send this pass");
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the skipped mint commits nothing"
+        );
+        let loaded = engine.store.load().unwrap();
+        assert_eq!(
+            loaded.capability_queued,
+            vec![(1, owner)],
+            "the obligation stays queued"
+        );
+        assert!(
+            loaded.capability_sealed.is_empty() && loaded.capability_delivered.is_empty(),
+            "unsealed and undelivered"
+        );
+    }
 }

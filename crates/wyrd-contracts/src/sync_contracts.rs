@@ -2417,7 +2417,7 @@ fn owner_proof_encoding_is_pinned_end_to_end() {
         .expect("local signer answers for itself");
     assert_eq!(
         proof.signature,
-        unhex64(
+        unhex::<64>(
             "fe49621a77b2d214c4e45db0df225ce7290ae756bcfeec22bab2f301c48c0e5a\
              7f597642f817c4f1ef2a07c02ada032202224823560756bc44a390fc2ed72d9b"
         ),
@@ -2428,11 +2428,11 @@ fn owner_proof_encoding_is_pinned_end_to_end() {
         .expect("known-answer vector verifies");
 }
 
-/// The negative half of the pin: one changed bit anywhere in the
-/// committed material — a flipped secret byte, a different epoch,
-/// drive, or recipient — fails verification.
+/// The negative half of the pin: changed material anywhere in the
+/// commitment — a flipped secret bit, a different epoch, drive, or
+/// recipient — fails verification.
 #[test]
-fn owner_proof_single_bit_change_never_verifies() {
+fn owner_proof_tampered_material_never_verifies() {
     use wyrd_sync::keys::owner_proof::OwnerProof;
     let owner = DeviceIdentitySecret::from_bytes([0x11; 32]).expect("fixture scalar");
     let drive = wyrd_format::DriveId::from_bytes([0xA0; 32]);
@@ -2498,7 +2498,7 @@ fn supersession_identity_is_pinned_end_to_end() {
     );
     assert_eq!(
         id.as_bytes(),
-        &unhex32("e6c02934bb4b07e3be55365776e6837b293ee386fe74ab77709c70e1e0b9fe7e"),
+        &unhex::<32>("e6c02934bb4b07e3be55365776e6837b293ee386fe74ab77709c70e1e0b9fe7e"),
         "the supersession context and field layout reproduce the known answer"
     );
     assert_ne!(
@@ -2512,15 +2512,7 @@ fn supersession_identity_is_pinned_end_to_end() {
     );
 }
 
-fn unhex32(hex: &str) -> [u8; 32] {
-    unhex_n(hex)
-}
-
-fn unhex64(hex: &str) -> [u8; 64] {
-    unhex_n(hex)
-}
-
-fn unhex_n<const N: usize>(hex: &str) -> [u8; N] {
+fn unhex<const N: usize>(hex: &str) -> [u8; N] {
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))

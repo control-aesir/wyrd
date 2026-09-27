@@ -67,8 +67,8 @@ alongside the message. The table proves the rule row by row.
   and substituted-transition suppression (`tests_rotation.rs`), plus
   member-minted and non-owner-signed refusal, handover authorization,
   and the inverse incoming-owner refusal. The proof encoding itself
-  (domain strings, preimage layout, deterministic signature, known
-  answer, single-bit-change refusal) and its `OwnerProofV1` session
+  (domain strings, preimage layout, known-answer signature,
+  tampered-material refusal) and its `OwnerProofV1` session
   domain are pinned by `keys/owner_proof.rs` tests and the
   `owner_proof_*` contracts in `wyrd-contracts`; the supersession
   identity and the `0x16` record layout by the durable pins and

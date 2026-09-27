@@ -20,6 +20,8 @@ pub enum SignerError {
     Refused,
     #[error("signer session is unreachable")]
     Unreachable,
+    #[error("signer session returned a signature that does not verify under its reported key")]
+    IdentityMismatch,
 }
 
 /// A scoped Wyrd signer session: `get_public_key` and `sign_message`

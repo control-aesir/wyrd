@@ -196,7 +196,7 @@ pub enum EngineError {
     AnnouncementUnavailable(SnapshotId),
     #[error("observed transition {0:?} has no classification")]
     TransitionUnclassified(TransitionId),
-    #[error("signer session refused the owner proof: {0}")]
+    #[error("owner-proof signer session failed: {0}")]
     Signer(#[from] crate::transport::signer::SignerError),
 }
 

@@ -1021,6 +1021,17 @@ mod tests {
         assert!(decode_record(&drive, &key, tag, &bytes).is_some());
         // The replacement fact carries the same correlation gate as a
         // first seal, so a round-trip needs a real sealed payload.
+        let replacement = crate::control::seal_rotation(
+            &drive,
+            recipient,
+            &wyrd_format::DeviceEncryptionKey::from_bytes([0x7C; 32]),
+            2,
+            &[0xAA; 64],
+            &[0xCC; 64],
+            &[],
+        )
+        .expect("seals")
+        .encode();
         let (tag, bytes) = encode_fact(
             &key,
             &drive,
@@ -1028,22 +1039,30 @@ mod tests {
                 epoch: 2,
                 recipient,
                 supersedes: SealedCapabilityFactId::from_bytes([0xAB; 32]),
-                replacement: crate::control::seal_rotation(
-                    &drive,
-                    recipient,
-                    &wyrd_format::DeviceEncryptionKey::from_bytes([0x7C; 32]),
-                    2,
-                    &[0xAA; 64],
-                    &[0xCC; 64],
-                    &[],
-                )
-                .expect("seals")
-                .encode(),
+                replacement: replacement.clone(),
             },
         )
         .unwrap();
         assert_eq!(tag, TAG_CAPABILITY_SEALED_REPLACED);
         assert!(decode_record(&drive, &key, tag, &bytes).is_some());
+        // And the read direction recovers each field: the layout pin
+        // covers encode and decode both, not the round-trip alone.
+        match decode_record(&drive, &key, tag, &bytes) {
+            Some(DecodedFact::CapabilitySealedReplaced(epoch, to, id, payload)) => {
+                assert_eq!(epoch, 2, "epoch is the leading u64 LE");
+                assert_eq!(to, recipient, "recipient is the next 32 bytes");
+                assert_eq!(
+                    id,
+                    SealedCapabilityFactId::from_bytes([0xAB; 32]),
+                    "supersedes is the next 32 bytes"
+                );
+                assert_eq!(
+                    payload, replacement,
+                    "the remainder is the replacement bytes"
+                );
+            }
+            other => panic!("expected the replacement fact, got {other:?}"),
+        }
 
         // Decode is the exact inverse of encode: every correlation
         // encode enforces, decode enforces too. A record that could

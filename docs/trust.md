@@ -436,10 +436,15 @@ that same authority before it mints, not only the recipient: a
 sender without it leaves the obligation pending for an authorized
 signer, rather than committing a transmission no recipient would
 ever install. Version `0x01` (no proof) is superseded: a durable
-outbox fact sealed under it is re-minted rather than sent, and
-the re-mint commits a `CapabilitySealedReplaced` naming the fact it
-retires, so the superseded record is durably replaced rather than
-merely ignored. The AEAD key derives under
+outbox fact sealed under it is superseded rather than sent, and
+the supersession commits a `CapabilitySealedReplaced` naming the
+fact it retires, so the superseded record is durably replaced
+rather than merely ignored. The same record retires the other two
+stale shapes — a current-framing seal to a superseded registration,
+and a pre-framing epoch-sealed capability fact — through the same
+authority gate and the same owner-proof construction, so what a
+sender durably records for any of them is one replacement naming
+the exact fact it retires. The AEAD key derives under
 `"wyrd rotation delivery key v1"` — a context distinct from the
 capability-wrap and bootstrap contexts, so one shared secret never
 yields two framings' keys. Message ids derive

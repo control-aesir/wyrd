@@ -637,6 +637,26 @@ fn stale_capability_obligation_recovers_byte_identically_across_restart() {
         "a failed send discharges nothing"
     );
 
+    // Still in-process, still failing: the replacement is already the
+    // obligation, so the second pass reuses it instead of superseding
+    // again — the per-pass append the invariant forbids would show up
+    // here, before any restart.
+    let err = fx.engine.deliver_pending(&mut failing).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Mailbox(_)),
+        "transport failure surfaces, does not poison: {err:?}"
+    );
+    assert_eq!(
+        fx.engine
+            .store
+            .load()
+            .unwrap()
+            .capability_sealed_replaced
+            .len(),
+        1,
+        "the second failing pass appends no further replacement"
+    );
+
     // Restart with the obligation still pending and the replacement on
     // file — the outage the recovery exists for.
     let (engine_sk, engine_device) = identity(0x02);
@@ -949,6 +969,178 @@ fn stale_obligation_without_secrets_stays_pending() {
     .expect("seals")
     .encode();
     stale[0] = ROTATION_VERSION_SUPERSEDED;
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilityQueued(2, engine_device),
+            Fact::CapabilitySealed(2, engine_device, stale.clone()),
+        ])
+        .unwrap();
+
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: engine_device,
+    };
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "an unsatisfiable obligation skips, and the pass still succeeds"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_sealed_replaced.is_empty(),
+        "no replacement without the epoch secrets"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "nothing is marked transmitted"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_capabilities(),
+        vec![(2, engine_device)],
+        "the obligation stays pending"
+    );
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, engine_device),
+        Some(stale.as_slice()),
+        "the stale fact is left exactly as it was"
+    );
+}
+
+/// A member world with an empty keyring: the engine holds no epoch
+/// secrets, so no mint can complete on any arm. Returns the fixture,
+/// the admission transition, and its id.
+fn member_world_without_secrets() -> (
+    crate::runtime::test_util::Fixture,
+    MembershipTransition,
+    wyrd_format::TransitionId,
+) {
+    let mut fx = fixture();
+    let engine_device = fx.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admit = admit_engine(&mut builder, engine_device);
+    let admit_id = admit.transition_id();
+    let mail = vec![
+        deliver(&fx, 1, &transition_message(&genesis)),
+        deliver(&fx, 1, &transition_message(&admit)),
+    ];
+    queue(&mut fx, mail);
+    assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
+    assert!(
+        fx.engine
+            .store
+            .rebuild(engine_device)
+            .unwrap()
+            .keyring
+            .secret(2)
+            .is_none(),
+        "the keyring is genuinely empty"
+    );
+    (fx, admit, admit_id)
+}
+
+/// A stale-registration obligation the sender cannot mint for: no
+/// epoch secrets, so the supersede arm reaches the shared mint, finds
+/// nothing to seal with, and leaves the stale fact untouched for the
+/// next pass. The arm-level counterpart to
+/// `stale_obligation_without_secrets_stays_pending` (`0x01` shape)
+/// and `non_owner_stale_registration_commits_no_replacement`
+/// (authority on this same arm).
+#[test]
+fn stale_registration_without_secrets_stays_pending() {
+    use crate::control::seal_rotation;
+
+    let (mut fx, admit, _) = member_world_without_secrets();
+    let engine_device = fx.recipient;
+    // The classifier keys on the header alone, so the blobs are
+    // placeholders — the mint fails before any of them is read.
+    let foreign_sk = DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("stale seal scalar");
+    let stale = seal_rotation(
+        &member_drive(),
+        engine_device,
+        &encryption_key(&foreign_sk),
+        2,
+        &admit.canonical_bytes(),
+        &[0xCC; 64],
+        &[],
+    )
+    .expect("seals")
+    .encode();
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilityQueued(2, engine_device),
+            Fact::CapabilitySealed(2, engine_device, stale.clone()),
+        ])
+        .unwrap();
+
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: engine_device,
+    };
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "an unsatisfiable obligation skips, and the pass still succeeds"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_sealed_replaced.is_empty(),
+        "no replacement without the epoch secrets"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "nothing is marked transmitted"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_capabilities(),
+        vec![(2, engine_device)],
+        "the obligation stays pending"
+    );
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, engine_device),
+        Some(stale.as_slice()),
+        "the stale fact is left exactly as it was"
+    );
+}
+
+/// A pre-framing epoch-sealed obligation the sender cannot mint for:
+/// same unsatisfiable shape as above, through the envelope arm. The
+/// envelope is a genuine epoch-2 capability payload, so the only gap
+/// is the missing secret.
+#[test]
+fn preframing_without_secrets_stays_pending() {
+    let (mut fx, admit, admit_id) = member_world_without_secrets();
+    let engine_device = fx.recipient;
+    let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
+    let wrap = crate::keys::capability::Capability::mint(
+        member_drive(),
+        engine_device,
+        &state,
+        &admit,
+        vec![secret(0xAA), secret(0xBB)],
+    )
+    .expect("engine is a member")
+    .wrap()
+    .expect("wraps")
+    .as_bytes()
+    .to_vec();
+    let stale = seal(
+        &control_key(2),
+        &member_drive(),
+        2,
+        &Message::Capability(crate::control::CapabilityPayload {
+            device: engine_device,
+            epoch: 2,
+            wrapped: wrap,
+        }),
+    )
+    .expect("seals")
+    .encode();
     fx.engine
         .commit_facts(&[
             Fact::CapabilityQueued(2, engine_device),
@@ -1371,6 +1563,26 @@ fn preframing_obligation_recovers_byte_identically_across_restart() {
         "a failed send discharges nothing"
     );
 
+    // Still in-process, still failing: the replacement is already the
+    // obligation, so the second pass reuses it instead of superseding
+    // again — the per-pass append the invariant forbids would show up
+    // here, before any restart.
+    let err = fx.engine.deliver_pending(&mut failing).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Mailbox(_)),
+        "transport failure surfaces, does not poison: {err:?}"
+    );
+    assert_eq!(
+        fx.engine
+            .store
+            .load()
+            .unwrap()
+            .capability_sealed_replaced
+            .len(),
+        1,
+        "the second failing pass appends no further replacement"
+    );
+
     // Restart with the obligation still pending and the replacement on
     // file — the outage the recovery exists for.
     let (engine_sk, engine_device) = identity(0x02);
@@ -1610,6 +1822,26 @@ fn stale_registration_obligation_recovers_byte_identically_across_restart() {
     assert!(
         loaded.capability_delivered.is_empty(),
         "a failed send discharges nothing"
+    );
+
+    // Still in-process, still failing: the replacement is already the
+    // obligation, so the second pass reuses it instead of superseding
+    // again — the per-pass append the invariant forbids would show up
+    // here, before any restart.
+    let err = fx.engine.deliver_pending(&mut failing).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Mailbox(_)),
+        "transport failure surfaces, does not poison: {err:?}"
+    );
+    assert_eq!(
+        fx.engine
+            .store
+            .load()
+            .unwrap()
+            .capability_sealed_replaced
+            .len(),
+        1,
+        "the second failing pass appends no further replacement"
     );
 
     // Restart with the obligation still pending and the replacement on

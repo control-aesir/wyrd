@@ -120,12 +120,16 @@ leg_fetch_owner() {
   poll_until 180 test -f "$E2E_ROOT/member-fetch-done" \
     || die "member never finished the bounded-EIO probes"
   pass "owner stayed down while the member probed the dead route"
-  # Route back: remount (endpoint 2) so the member's failed open can
-  # complete — the timeout-cancelled wait, not the fetch. The member
-  # proves it with a single cat below; stale-1.txt must be readable
-  # before the offline export phase, which fails closed on
-  # remote-only content by design.
+  # Route back: remount (endpoint 2) and write again. The write is
+  # load-bearing, not incidental: like the step-8 restart leg, the
+  # member recovers on the re-announcement the new write triggers.
+  # A remount with no new writes sends nothing the member can use
+  # (tracked as a product question), so the leg does what production
+  # does — announce via a write — and proves the cancelled wait
+  # completes on it. stale-1.txt must be readable before the offline
+  # export phase, which fails closed on remote-only content.
   start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
+  echo "owner-back" > "$MNTS/xowner-f2/owner-back-1.txt"
   touch "$E2E_ROOT/owner-back"
   poll_until 400 test -f "$E2E_ROOT/member-stale-done" \
     || die "member never fetched stale-1.txt after the route returned"
@@ -186,14 +190,19 @@ leg_fetch_member() {
   touch "$E2E_ROOT/member-fetch-done"
   # Route returned: the earlier EIO cancelled the wait, not the
   # fetch — single opens below must complete once the bytes are
-  # servable. Retried single opens, not a convergence poll: each
-  # attempt is one blocking open (the hardcoded 30s open timeout
-  # bounds it), and the attempt budget absorbs remount +
-  # re-announce latency. The elapsed time is reported either way:
-  # ~30s per failed attempt means the open timed out waiting, ~0s
-  # would mean a cached terminal failure with no retry.
+  # servable. The fresh listing first: owner-back-1.txt arrives on
+  # the re-announcement, which is also what refreshes the dead
+  # route, so attempts only start once a live route exists. Retried
+  # single opens, not a convergence poll: each attempt is one
+  # blocking open (the hardcoded 30s open timeout bounds it), and
+  # the attempt budget absorbs re-announce latency. The elapsed
+  # time is reported either way: ~30s per failed attempt means the
+  # open timed out waiting, ~0s would mean a cached terminal
+  # failure with no retry.
   poll_until 180 test -f "$E2E_ROOT/owner-back" \
     || die "owner never remounted after the dead-route probes"
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'owner-back-1.txt'" \
+    || die "member never listed the re-announcement marker"
   local attempt ok=0 started elapsed
   started=$(date +%s)
   for attempt in 1 2 3 4; do

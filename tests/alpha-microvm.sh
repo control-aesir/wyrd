@@ -44,7 +44,7 @@ on_n() { $SSH "$PEER_N" "$@"; }
 
 # --- phase 1: shared core on peer-o ------------------------------------
 echo "=== microvm 1-5: shared core on peer-o ==="
-on_o "E2E_ONLY_STEP=1,2,3,4,5 bash $GUEST_TESTS/alpha-lima.sh" \
+on_o "E2E_ENV_FILE=$GUEST_ENV E2E_ONLY_STEP=1,2,3,4,5 bash $GUEST_TESTS/alpha-lima.sh" \
   || die "shared core steps 1-5 failed on peer-o"
 pass "shared core steps 1-5 green on peer-o"
 

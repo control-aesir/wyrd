@@ -1442,13 +1442,13 @@ mod tests {
             Some(&epoch3_key),
             "root custody alone restores epoch 3"
         );
+        let facts_after = engine.store.load().unwrap();
         assert_eq!(
-            engine.store.load().unwrap(),
-            facts_before,
+            facts_after, facts_before,
             "escrow restore commits nothing durable"
         );
         let keyring_after =
-            crate::durable::build_keyring(&engine.drive, &facts_before, engine.device).unwrap();
+            crate::durable::build_keyring(&engine.drive, &facts_after, engine.device).unwrap();
         assert_eq!(
             keyring_before, keyring_after,
             "escrow restore installs no keyring secrets"

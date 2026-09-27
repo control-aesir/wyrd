@@ -126,15 +126,18 @@
 //!   (public owner tag), channels, and health — no secret; the signer
 //!   serves the send path behind its `Arc` and is never cloned into a
 //!   spawned task.
-//! - Conversions, `LiveMailbox`/CLI signer path: the only
-//!   secret-to-bytes conversions here are the two transient
-//!   `from_slice` parses above; no `to_secret_*`/`as_secret_bytes`
-//!   call exists, and the CLI parses identity through `Zeroizing`
-//!   buffers. The sync control-seal path converts separately
-//!   (`nostr_secret` in `wyrd-sync`'s transport mailbox, used by seal
-//!   and open): its transient is dropped at return and its failures
-//!   map to the constant `InvalidKey`/`Crypto` variants, but it is
-//!   outside this section's pins.
+//! - Conversions, `LiveMailbox`/CLI signer path: no secret-to-bytes
+//!   conversion happens here or in the CLI — the CLI mints its typed
+//!   `Keys` through `DeviceIdentitySecret::signer_keys`, whose one
+//!   transient `from_slice` parse lives inside `wyrd-sync`'s wrapper
+//!   (raw bytes never cross the crate boundary); no
+//!   `to_secret_*`/`as_secret_bytes` call exists, and the CLI parses
+//!   identity through `Zeroizing` buffers. The sync control-seal path
+//!   converts separately (`nostr_secret` in `wyrd-sync`'s transport
+//!   mailbox, used by seal and open): its transient is dropped at
+//!   return and its failures map to the constant
+//!   `InvalidKey`/`Crypto` variants, but it is outside this
+//!   section's pins.
 //!
 //! Accepted residual: upstream `Drop` performs best-effort
 //! `non_secure_erase` on the secret scalar and the keypair (nostr

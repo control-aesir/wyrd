@@ -4,7 +4,6 @@ use super::tests_harness::{
 };
 use super::*;
 use nostr::event::FinalizeEvent;
-use nostr::key::SecretKey;
 use wyrd_format::{
     BaoRoot, ContentId, DeviceId, DriveId, Entry, MemoryObjectStore, ObjectKind, ObjectStore,
     SnapshotId, TransitionId, Tree,
@@ -21,7 +20,7 @@ use std::time::{Duration, Instant};
 use super::mini_relay::MiniRelay;
 
 fn keys_for(identity: &DeviceIdentitySecret) -> Keys {
-    Keys::new(SecretKey::from_slice(identity.as_bytes()).unwrap())
+    identity.signer_keys()
 }
 
 fn maximum_node_addr(drive: &DriveId, epoch: u64) -> Vec<u8> {
@@ -391,14 +390,15 @@ fn maximum_valid_control_message_is_acked_by_live_engine() {
 
     let mut owner_mailbox = LiveMailbox::connect(
         owner_keys.clone(),
-        SecretKey::from_slice(owner_identity.as_bytes()).unwrap(),
+        owner_keys.secret_key().clone(),
         vec![url.clone()],
         temp_path("max-control-owner-seen"),
     )
     .unwrap();
+    let recipient_open = recipient_keys.secret_key().clone();
     let mut recipient_mailbox = LiveMailbox::connect(
         recipient_keys,
-        SecretKey::from_slice(recipient_identity.as_bytes()).unwrap(),
+        recipient_open,
         vec![url],
         temp_path("max-control-recipient-seen"),
     )

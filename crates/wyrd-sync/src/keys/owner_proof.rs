@@ -217,6 +217,12 @@ mod tests {
     /// `0xA0`, recipient `0xB1`, transition `0xC2`, epoch 3, secrets
     /// `0xAA` and `0xBB`. Distinct one-byte patterns, so a field swap
     /// or truncation changes the bytes rather than colliding.
+    /// The fixture identity scalar, named so tests that need the
+    /// bare curve key (signer sessions take `SecretKey`, not the
+    /// wrapper) share one source instead of round-tripping through
+    /// the wrapper's crate-private bytes.
+    const FIXTURE_SCALAR: [u8; 32] = [0x11; 32];
+
     fn fixture() -> (
         DeviceIdentitySecret,
         DriveId,
@@ -225,7 +231,7 @@ mod tests {
         Vec<EpochSecret>,
     ) {
         (
-            DeviceIdentitySecret::from_bytes([0x11; 32]).expect("fixture scalar"),
+            DeviceIdentitySecret::from_bytes(FIXTURE_SCALAR).expect("fixture scalar"),
             DriveId::from_bytes([0xA0; 32]),
             DeviceId::from_bytes([0xB1; 32]),
             TransitionId::from_bytes([0xC2; 32]),
@@ -256,9 +262,9 @@ mod tests {
     /// refuses, even holding the right key.
     #[test]
     fn sign_requires_the_owner_proof_domain() {
-        let (owner, drive, recipient, transition, secrets) = fixture();
+        let (_owner, drive, recipient, transition, secrets) = fixture();
         let narrow = FakeSignerSession::new(
-            &SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
+            &SecretKey::from_slice(&FIXTURE_SCALAR).expect("fixture scalar"),
             &[SignDomain::SnapshotV1],
         );
         assert_eq!(
@@ -266,7 +272,7 @@ mod tests {
             Err(SignerError::Refused)
         );
         let scoped = FakeSignerSession::new(
-            &SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
+            &SecretKey::from_slice(&FIXTURE_SCALAR).expect("fixture scalar"),
             &[SignDomain::OwnerProofV1],
         );
         OwnerProof::sign(&scoped, &drive, &recipient, &transition, 3, &secrets)
@@ -278,10 +284,10 @@ mod tests {
     /// any caller can commit the bytes as a discharged obligation.
     #[test]
     fn sign_refuses_a_signature_that_mismatches_the_reported_key() {
-        let (owner, drive, recipient, transition, secrets) = fixture();
+        let (_owner, drive, recipient, transition, secrets) = fixture();
         // A real key, just not the one that signed: the report
         // parses, and the verification against it fails.
-        let sign_key = SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar");
+        let sign_key = SecretKey::from_slice(&FIXTURE_SCALAR).expect("fixture scalar");
         let mismatched = MismatchedSession::new(sign_key, unrelated_identity());
         assert_eq!(
             OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),

@@ -27,7 +27,6 @@
 set -euo pipefail
 
 need() { command -v "$1" >/dev/null || { echo "error: missing host tool: $1" >&2; exit 2; }; }
-for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill; do need "$t"; done
 
 STATE_DIR="/var/lib/wyrd-microvm/state"
 FRESH=0
@@ -46,6 +45,16 @@ done
 [[ "$EUID" == 0 ]] || { echo "error: run as root (taps, bridge, virtiofsd need it)" >&2; exit 2; }
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
 cd "$ROOT"
+
+# Tools per mode, checked after flag parsing so --teardown only
+# demands what it uses. Flag combos with --teardown fail loudly
+# instead of silently ignoring the rest.
+if [[ "$TEARDOWN" == 1 ]]; then
+  [[ "$FRESH" == 0 && "$KEEP" == 0 ]] || { echo "error: --teardown takes no other flags" >&2; exit 2; }
+  for t in pgrep ps kill pkill ip flock; do need "$t"; done
+else
+  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill; do need "$t"; done
+fi
 
 # One run at a time per host, not per state dir: taps, the bridge,
 # and SOCK_PAT are all host-global, so two runs under different
@@ -88,6 +97,14 @@ kill_stale_daemons() {
   sleep 2
   pkill -f "$SOCK_PAT" 2>/dev/null || true
   sleep 1
+  # Escalate: a surviving daemon (wedged qemu, respawning
+  # supervisor) must not be reported as removed below.
+  pids="$(pgrep -f "$SOCK_PAT" || true)"
+  [[ -z "$pids" ]] || pkill -KILL -f "$SOCK_PAT" 2>/dev/null || true
+  sleep 1
+  pids="$(pgrep -f "$SOCK_PAT" || true)"
+  [[ -z "$pids" ]] || { echo "  FAIL: stale daemons survive SIGKILL: $pids" >&2; return 1; }
+  return 0
 }
 
 teardown() {
@@ -101,16 +118,15 @@ teardown() {
 }
 trap teardown EXIT
 
-# Standalone teardown for kept runs: daemons, taps, bridge, then
-# out (--keep is meaningless here and ignored). The EXIT trap
-# re-runs the same kills idempotently afterwards.
+# Standalone teardown for kept runs: reuse teardown() with keeping
+# disabled, so the success line below only prints when the kills
+# and link deletions actually succeeded (kill_stale_daemons fails
+# loudly on survivors under set -e).
 # Never inline SOCK_PAT into `bash -c '...'`: pkill matches our own
 # argv and kills this shell. The variable form is safe.
 if [[ "$TEARDOWN" == 1 ]]; then
   echo "==> tearing down kept run"
-  kill_stale_daemons
-  for t in tap-o tap-n tap-r; do ip link del "$t" 2>/dev/null || true; done
-  ip link del "$BRIDGE" 2>/dev/null || true
+  KEEP=0; teardown
   echo "torn down: daemons, taps, and $BRIDGE removed ($STATE_DIR retained)"
   exit 0
 fi

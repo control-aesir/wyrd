@@ -27,9 +27,6 @@ set -euo pipefail
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
 RUN="$STATE_DIR/run"
 SSH_KEY="$STATE_DIR/sshkey"
-# The runner normally creates this, but the orchestrator must not
-# assume it: direct invocations would fail on the first redirect.
-mkdir -p "$RUN/logs"
 WYRD_BIN="${WYRD_BIN:?runner sets WYRD_BIN from the host build}"
 RELAY_URL="${RELAY_URL:-ws://10.0.7.10:18761}"
 PEER_O="${PEER_O:-e2e@10.0.7.11}"
@@ -63,6 +60,10 @@ pass "shared core steps 1-5 green on peer-o"
 
 # --- phase 2: second member natively on peer-n --------------------------
 echo "=== microvm 6: member-n invite/join split ==="
+# Created here, not at the top: phase 1's guest pre-clean empties
+# the shared state root, so anything made earlier would be wiped
+# before the first redirect that needs it.
+mkdir -p "$RUN/logs"
 MC="$RUN/creds/member-n"
 MD="$RUN/drives/member-n"
 GMC="$GUEST_RUN/creds/member-n"
@@ -158,9 +159,14 @@ as_guest "$WYRD_BIN" export \
 pass "flush-committed state survives restart on both drives"
 
 # Host-side leak check over the logs the host produced (guest logs
-# are checked in-guest by each leg). All four credential secrets,
-# matching the Lima step's coverage.
-for f in "$RUN"/logs/pairing-n.stderr "$RUN"/logs/invite-n.stderr "$RUN"/logs/join-n.stderr; do
+# are checked in-guest by each leg). All four credential secrets
+# over every host-written log, matching the Lima step's coverage:
+# the merged stdout outputs can carry credential-adjacent lines
+# just as easily as the stderrs.
+for f in "$RUN"/logs/pairing-n.stderr "$RUN"/logs/invite-n.stderr "$RUN"/logs/join-n.stderr \
+         "$RUN"/logs/export-o.out "$RUN"/logs/export-m.out \
+         "$RUN"/logs/reopen-n.out "$RUN"/logs/reopen-o.out; do
+  [[ -f "$f" ]] || continue
   for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")" \
            "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
     grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"

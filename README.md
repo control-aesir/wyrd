@@ -168,6 +168,7 @@ restart, and shutdown legs across real guest boundaries:
 ```bash
 sudo ./nix/microvm/run-microvm.sh --fresh   # full run on the KVM host
 sudo ./nix/microvm/run-microvm.sh --keep     # leave VMs up for debugging
+sudo ./nix/microvm/run-microvm.sh --teardown # stop a kept run (daemons, taps, bridge)
 ```
 
 Linux with `/dev/kvm` is required (no nested KVM under macOS

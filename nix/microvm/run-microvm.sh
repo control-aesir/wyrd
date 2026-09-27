@@ -106,15 +106,20 @@ for role in peer-o peer-n relay; do
   vmdir="$WORK/vm-$role"
   mkdir -p "$vmdir"
   ln -sfn "$WORK/runner-$role" "$vmdir/runner"
+  # Stale sockets from a kept run must go: a leftover .sock passes
+  # the readiness check below while no daemon listens, and qemu
+  # then dies with "Connection refused".
+  rm -f "$vmdir"/*.sock
   ( cd "$vmdir" \
     && ./runner/bin/virtiofsd-run > virtiofsd.log 2>&1 &
     echo $! >> "$WORK/daemon.pids" )
+  # Wait for the socket to LISTEN, not merely exist: the file can
+  # appear before virtiofsd accepts, and qemu fails fast on refused.
   for i in $(seq 1 30); do
-    compgen -G "$vmdir/*.sock" > /dev/null && break
+    ss -xl 2>/dev/null | grep -q "wyrd-$role-virtiofs-wyrd-state.sock" && break
+    [[ "$i" == 30 ]] && { tail -n 5 "$vmdir/virtiofsd.log"; die "$role: virtiofsd never listened"; }
     sleep 1
   done
-  compgen -G "$vmdir/*.sock" > /dev/null \
-    || { tail -n 5 "$vmdir/virtiofsd.log"; die "$role: virtiofsd socket never appeared"; }
   ( cd "$vmdir" && ./runner/bin/microvm-run > qemu.log 2>&1 &
     echo $! >> "$WORK/daemon.pids" )
   echo "    $role up (tap $tap)"

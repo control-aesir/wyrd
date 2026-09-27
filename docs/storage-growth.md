@@ -78,7 +78,7 @@ every announcement it accepts (see "Who bears the cost").
 | Sealed root and child manifests, imported | authoring | author | author **and replica** — every held manifest's children are planned, not just a want's |
 | Fact-log append + `CURRENT` rewrite | durability | both | both |
 | Durability fsyncs | durability | both | both |
-| Announcement obligation recorded, then discharged | durability / announcement | author | author only — both halves are driven from the author's own durable outbox, and the per-recipient factor (delivered markers, byte-identical sealed retries per route) is likewise author-side, so this term scales with recipient count and is not a per-commit constant |
+| Announcement obligation recorded, then discharged | authoring / announcement | author | author only — both halves are driven from the author's own durable outbox, and the per-recipient factor (delivered markers, byte-identical sealed retries per route) is likewise author-side, so this term scales with recipient count and is not a per-commit constant |
 | Serving mirror write-through + flush barrier | serving | both | both |
 | Projection generation bump + head swap | publication | both | both |
 
@@ -132,14 +132,18 @@ by POSIX boundaries on the authoring device:
   `write` is its own durable snapshot. This is the amplification peak,
   and it is opt-in per handle by the application.
 - Each namespace operation addressed by **path** (`create`, `unlink`,
-  `mkdir`, `rmdir`, `rename`, `chmod`, `truncate`, `setattr`) submits a
-  mutation and commits one snapshot per *effective* operation — a
-  truncate to the current size, or a chmod to the mode already recorded,
-  submits nothing.
-- The **handle**-addressed forms (`ftruncate`, `fchmod`) do not: they
-  arrive as `setattr` on an open file, resize or re-flag the buffered
-  image, mark the handle dirty, and commit only under `O_SYNC`. So
-  `write` + `ftruncate` on one handle is one snapshot, not two.
+  `mkdir`, `rmdir`, `rename`, `chmod`, `truncate`) submits a mutation
+  and commits one snapshot per *effective* operation — a truncate to
+  the current size, or a chmod to the mode already recorded, submits
+  nothing.
+- The same operations addressed through a **file handle** (`ftruncate`,
+  `fchmod`) are not always immediate: on a writable, non-append handle
+  they arrive as the same `setattr` carrying a `FileHandle`, resize or
+  re-flag the buffered image, mark the handle dirty, and commit only
+  under `O_SYNC`, so `write` + `ftruncate` on one handle is one
+  snapshot, not two. On an **append** handle (`O_APPEND`, the default
+  for `>>`) and on a **read** handle, a mode or size change is
+  path-addressed and submits immediately instead.
 
 So the rate is chosen by the member, at their own throughput, and is not
 throttled by any protocol timer. On a replica the corresponding rate is
@@ -225,37 +229,31 @@ existing error path unchanged:
 
 | Bound | Enforcement | Why it is safe |
 |---|---|---|
-| Per-device retained-bytes quota (proposed) | Refuse the commit before the authoring step's first write to disk, reporting `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see `resource-limits.md`, Disk classification). A quota is a smaller disk, not a weaker promise |
+| Per-device retained-bytes quota (proposed) | Refuse the commit before its first write to disk, reporting `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see `resource-limits.md`, Disk classification). A quota is a smaller disk, not a weaker promise |
 
-The refusal point is load-bearing and easy to get wrong, in the one place
-where being off by a step is the failure mode being designed against. The
-objects and the sealed envelopes are each written with temp + fsync +
-rename + directory fsync *before* any commit decision exists, so a quota
-checked at the durability boundary refuses *after* spending the bytes it
-was trying to protect: the effective ceiling becomes quota + one commit,
-and every refused attempt permanently spends budget, because with no GC
-those objects are unreclaimable.
+The refusal point is load-bearing and easy to get wrong, in the one
+place where being off by a step is the failure mode being designed
+against. Two boundaries matter, and they answer different questions.
 
-Two boundaries, not one, and they answer different questions.
-
-**The byte ceiling** must be checked before the authoring step's first
-write to disk. The objects and the sealed envelopes are each written
-with temp + fsync + rename + directory fsync before any commit decision
-exists, so a check at the durability boundary refuses *after* spending
-the bytes it was trying to protect: the effective ceiling becomes quota
-+ one commit, and every refused attempt permanently spends budget,
-because with no GC those objects are unreclaimable. `author_snapshot`
-imports the sealed body, then each sealed manifest as it is built, and
-only then commits facts, so a check placed just before the fact-commit
-has already spent every byte of the commit it refuses.
+**The byte ceiling** must be checked before the commit's **first** write
+to disk — which is the object insert, not the seal. A mutation writes
+its chunks and rebuilt tree nodes into the object store and only then
+reaches authoring, in the same call, with no decision point in between.
+A check placed anywhere later has already spent the bytes it is trying
+to protect, and with no GC those objects are unreferenced and
+unreclaimable. The leak is not a constant, because the member chooses
+its size: `Limits::V0` admits a 64 MiB object and 65,536 chunks per
+file, so writing one large new file inserts every chunk and is then
+refused, on every attempt, at no cost in quota. A quota that allowed
+that would not be a ceiling.
 
 **The fact-commit** — the single call that ends authoring, writing the
-snapshot-body, manifest, and `AnnouncementQueued` facts together — is the
-*latest still-consistent* point, because a refusal after it strands a
-durable announcement obligation for a snapshot that does not exist.
-Refusing at the byte boundary leaves no facts and so strands nothing;
-refusing at the fact-commit boundary strands no facts either, but only
-because everything before it has already been spent.
+snapshot-body, manifest, and `AnnouncementQueued` facts together — is
+the *latest still-consistent* point, because a refusal after it strands
+a durable announcement obligation for a snapshot that does not exist.
+Refusing there strands no facts either, which is what makes it the
+latest consistent choice, but by then the commit's bytes are already
+spent, which is why it is not the byte ceiling's point.
 
 A quota would bound the author's own device and convert a silent
 unbounded growth into an explicit, documented, POSIX-legitimate refusal.
@@ -278,12 +276,13 @@ work and GC is the only mechanism that can make old bytes stop existing.
    or accepting unbounded peer growth until GC. Not decided here.
 2. **Quota granularity and check sequencing**: per device, per drive, or
    per member-set, and how the check interleaves with a commit already
-   in flight. The refusal point is settled above (before the authoring
-   step's first write to disk); what stays open is the accounting for a
-   commit that is already underway when the quota is crossed, and the
-   interaction with the announcement obligation, whose facts share that
-   final fact-commit — so a refusal must land before it and leave no
-   durable obligation behind.
+   in flight. The refusal point is settled above (before the commit's
+   first write to disk, with the fact-commit as the latest consistent
+   fallback); what stays open is the accounting for a commit that is
+   already underway when the quota is crossed, and the interaction with
+   the announcement obligation, whose facts share that final fact-commit
+   — so a refusal must land before it and leave no durable obligation
+   behind.
 
 Tracked by the two follow-ups raised with this document:
 `protocol(storage): decide whether peers and vaults get a retention

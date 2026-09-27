@@ -122,7 +122,7 @@ pub(super) fn root(
         // the announced `root_manifest` is the only acceptable open-record
         // expectation, so a source cannot swap the logical identity
         // through the legacy route. Oversize is representation-terminal.
-        Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline) => {
+        Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline { .. }) => {
             match bulk.fetch_root_manifest(snapshot, Limits::V0.max_object_bytes) {
                 Ok(Some(served)) if served.content_id == announcement.root_manifest => Some(served),
                 // A well-sealed manifest for this snapshot under a
@@ -131,7 +131,7 @@ pub(super) fn root(
                 Ok(Some(_)) => return FetchOutcome::Invalid,
                 Ok(None) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-                Err(BulkError::Deadline) => return FetchOutcome::Deadline,
+                Err(BulkError::Deadline { .. }) => return FetchOutcome::Deadline,
                 Err(_) => return FetchOutcome::Transport,
             }
         }
@@ -173,7 +173,7 @@ pub(super) fn snapshot_body(
                 // Absence, a dead transport route, and a sliced attempt
                 // all fall back to the snapshot address; oversize is
                 // representation-terminal.
-                Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline) => None,
+                Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline { .. }) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
             }
         }
@@ -184,7 +184,7 @@ pub(super) fn snapshot_body(
         None => match bulk.fetch_snapshot(snapshot, Limits::V0.max_object_bytes) {
             Ok(served) => served,
             Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-            Err(BulkError::Deadline) => return FetchOutcome::Deadline,
+            Err(BulkError::Deadline { .. }) => return FetchOutcome::Deadline,
             Err(_) => return FetchOutcome::Transport,
         },
     };
@@ -237,7 +237,7 @@ pub(super) fn child(
         // transport trouble: the boundary classified them already. A
         // sliced attempt is budget trouble, not transport trouble.
         Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-        Err(BulkError::Deadline) => return FetchOutcome::Deadline,
+        Err(BulkError::Deadline { .. }) => return FetchOutcome::Deadline,
         Err(_) => return FetchOutcome::Transport,
     };
     let Some(sealed) = sealed else {
@@ -273,8 +273,11 @@ pub(super) fn child(
 /// availability guarantee (`docs/fetch-on-open.md`). Oversize is
 /// representation-terminal: both routes carry the same bytes, so no
 /// route can succeed after it, and the classification propagates.
-/// Errors from the fallback propagate unchanged, so the boundary's
-/// classification stays authoritative.
+/// A fallback that granted no budget slice changes nothing: a
+/// zero-slice deadline means it never attempted, so the primary
+/// outcome stands instead of masking an observed fault (or absence)
+/// behind a budget event. Other fallback errors propagate unchanged,
+/// so the boundary's classification stays authoritative.
 fn fetch_representation(
     bulk: &mut impl BulkSource,
     transport: &BaoRoot,
@@ -282,10 +285,12 @@ fn fetch_representation(
 ) -> Result<Option<Vec<u8>>, BulkError> {
     match bulk.fetch_transport(transport, Limits::V0.max_object_bytes) {
         Ok(Some(bytes)) => Ok(Some(bytes)),
-        Ok(None) | Err(BulkError::Transport(_)) | Err(BulkError::Deadline) => {
-            bulk.fetch_sealed(storage, Limits::V0.max_object_bytes)
-        }
         Err(oversize @ BulkError::Oversize { .. }) => Err(oversize),
+        primary => match bulk.fetch_sealed(storage, Limits::V0.max_object_bytes) {
+            Ok(Some(bytes)) => Ok(Some(bytes)),
+            Err(BulkError::Deadline { slice }) if slice.is_zero() => primary,
+            fallback => fallback,
+        },
     }
 }
 
@@ -316,11 +321,12 @@ fn open_record(
 /// One object fetch's outcome with per-representation attribution: the
 /// aggregate (most actionable) verdict for reporting, the storage ids
 /// whose bytes arrived and failed validation (the only ones that earn
-/// backoff strikes), and the representation that served valid bytes (the
-/// only one whose backoff state clears). Absent, key-less,
-/// deadline-sliced, and locally-refused representations never strike;
-/// transport-failed ones back off like invalid data (see the plan's
-/// strike pass below).
+/// backoff strikes), the storage ids whose attempts ran out of budget
+/// (which earn burn-backoff instead, never strikes), and the
+/// representation that served valid bytes (the only one whose backoff
+/// state clears). Absent, key-less, and locally-refused
+/// representations are attributed nowhere: they are not evidence
+/// about the representation at all.
 pub(super) struct ObjectAttempt {
     pub aggregate: FetchOutcome<()>,
     pub invalid: Vec<StorageId>,
@@ -328,6 +334,10 @@ pub(super) struct ObjectAttempt {
     /// these off like invalid data so an unreachable route cannot
     /// starve the items behind it.
     pub transport_failed: Vec<StorageId>,
+    /// Candidates whose attempt ran out of its budget slice: the plan
+    /// counts these toward burn-backoff (a hanging route must still
+    /// stop being retried every pass) without striking them as faulty.
+    pub deadline_sliced: Vec<StorageId>,
     pub fulfilled: Option<StorageId>,
 }
 
@@ -335,9 +345,10 @@ pub(super) struct ObjectAttempt {
 /// A later candidate still fulfills after an earlier one fails, so one
 /// corrupt or unavailable representation never blocks a healthy one.
 /// When every candidate fails, the most actionable failure wins:
-/// transport outranks local, local outranks invalid, invalid outranks a
-/// missing key, a missing key outranks plain absence, and a sliced
-/// attempt outranks nothing — it is the absence of an attempt.
+/// transport outranks local, local outranks invalid, invalid outranks
+/// a missing key, a missing key outranks a sliced attempt, and a
+/// sliced attempt outranks plain absence — a peer never asked is
+/// budget pressure, not a negative answer.
 pub(super) fn object(
     drive: &DriveId,
     bulk: &mut impl BulkSource,
@@ -350,6 +361,7 @@ pub(super) fn object(
     let mut aggregate = FetchOutcome::Missing;
     let mut invalid = Vec::new();
     let mut transport_failed = Vec::new();
+    let mut deadline_sliced = Vec::new();
     for candidate in candidates {
         let Some(secret) = keyring.secret(candidate.encryption_epoch) else {
             aggregate = worse(aggregate, FetchOutcome::UnavailableKey);
@@ -383,9 +395,11 @@ pub(super) fn object(
                 continue;
             }
             // A sliced attempt is budget evidence, never representation
-            // evidence: it ranks into the aggregate but never strikes.
-            Err(BulkError::Deadline) => {
+            // evidence: it ranks into the aggregate and attributes
+            // burn-backoff, but never strikes.
+            Err(BulkError::Deadline { .. }) => {
                 aggregate = worse(aggregate, FetchOutcome::Deadline);
+                deadline_sliced.push(candidate.storage_id);
                 continue;
             }
             Err(_) => {
@@ -421,6 +435,7 @@ pub(super) fn object(
                     aggregate: FetchOutcome::Store(fatal),
                     invalid,
                     transport_failed,
+                    deadline_sliced,
                     fulfilled: None,
                 };
             }
@@ -433,6 +448,7 @@ pub(super) fn object(
                     aggregate: FetchOutcome::Fulfilled(()),
                     invalid,
                     transport_failed,
+                    deadline_sliced,
                     fulfilled: Some(candidate.storage_id),
                 };
             }
@@ -442,6 +458,7 @@ pub(super) fn object(
                         aggregate: FetchOutcome::Store(fatal),
                         invalid,
                         transport_failed,
+                        deadline_sliced,
                         fulfilled: None,
                     };
                 }
@@ -453,21 +470,24 @@ pub(super) fn object(
         aggregate,
         invalid,
         transport_failed,
+        deadline_sliced,
         fulfilled: None,
     }
 }
 
 /// The more actionable of two fetch failures, by the documented
-/// store-fatal > transport > local > invalid > missing-key > absence >
-/// deadline order. A fatal store condition outranks everything: it aborts the
-/// pass, so it must survive aggregation even beside a transport error. A
-/// deadline ranks weakest: it is the absence of an attempt, so any
-/// completed observation — even plain absence — outranks it.
+/// store-fatal > transport > local > invalid > missing-key >
+/// deadline > absence order. A fatal store condition outranks
+/// everything: it aborts the pass, so it must survive aggregation
+/// even beside a transport error. A deadline outranks plain absence:
+/// absence says no peer holds the bytes, but a sliced peer was never
+/// asked, so budget pressure is the more actionable verdict — while
+/// any completed fault observation still outranks it.
 fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> {
     fn rank(outcome: &FetchOutcome<()>) -> u8 {
         match outcome {
-            FetchOutcome::Deadline => 0,
-            FetchOutcome::Missing => 1,
+            FetchOutcome::Missing => 0,
+            FetchOutcome::Deadline => 1,
             FetchOutcome::UnavailableKey => 2,
             FetchOutcome::Invalid => 3,
             FetchOutcome::Local => 4,

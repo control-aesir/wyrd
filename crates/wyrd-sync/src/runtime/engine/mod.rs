@@ -268,6 +268,13 @@ pub struct ExecuteReport {
     /// a failing transport is worth distinguishing for operators:
     /// both retry later, only one needs investigating.
     pub transport_errors: usize,
+    /// Attempts that ran out of their pass-budget slice this run:
+    /// budget evidence, never provider evidence. Counted so a
+    /// budget-starved pass is visible in diagnostics (rather than a
+    /// silent pile of `unfulfilled`); never struck as faulty, but
+    /// repeated slices back the representation off on the separate
+    /// burn ledger.
+    pub deadlines: usize,
     /// Attempts finding peer absence: no bytes served, or no usable
     /// fetch candidate at all.
     pub missing: usize,
@@ -546,6 +553,18 @@ pub struct Engine {
     /// becomes eligible again. Transient: reset on restart, never durable.
     pub(super) fetch_run: u64,
     pub(super) fetch_strikes: BTreeMap<FetchKey, (u32, u64)>,
+    /// Budget-burn backoff, the fault-free twin of the strike ledger:
+    /// per-representation counts of runs whose attempt ran out of its
+    /// budget slice, with the run last burned. A representation that
+    /// repeatedly burns its slice backs off into the same cooldown —
+    /// without asserting fault, so a slow-but-live provider is never
+    /// branded corrupt for the pass being tight. Same duty cycle as
+    /// strikes (one burn per run, same threshold, same cooldown):
+    /// hanging routes stop being retried every pass forever, and a
+    /// starved victim gets its full-budget attempts back while the
+    /// culprit cools. Transient like the strikes; a fulfillment
+    /// clears both ledgers.
+    pub(super) fetch_budget_burns: BTreeMap<FetchKey, (u32, u64)>,
     pub(super) fetch_cool_until: BTreeMap<FetchKey, u64>,
     /// Test-only crash injection: the next durable commit stops after
     /// the named stage, simulating power loss (see
@@ -601,6 +620,7 @@ impl Engine {
             pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
+            fetch_budget_burns: BTreeMap::new(),
             fetch_cool_until: BTreeMap::new(),
             #[cfg(test)]
             crash_stage: None,
@@ -1287,6 +1307,10 @@ impl Engine {
     /// bulk transport error ........ unfulfilled plus transport_errors, retried
     ///                               next run; repeated failures back the
     ///                               representation off like invalid data
+    /// budget-sliced attempt ....... unfulfilled plus deadlines, retried next
+    ///                               run; never struck as faulty, but repeated
+    ///                               slices back the representation off on the
+    ///                               separate burn ledger
     /// epoch capability unheld ..... unfulfilled plus unavailable_keys, retried next run
     /// over fetch ceiling .......... unfulfilled plus invalid, never committed
     /// over ingest limits .......... unfulfilled plus invalid, never committed
@@ -1331,14 +1355,15 @@ impl Engine {
     /// Whether a representation is fetch-eligible this run: its cooldown
     /// (if any) has expired. Cooled representations are skipped, not
     /// attempted — the item stays pending and reports unfulfilled.
-    /// Expiry also clears the strike count: cooldown restarts striking
-    /// from zero rather than resuming a stale count.
+    /// Expiry also clears both backoff ledgers: cooldown restarts
+    /// striking and burning from zero rather than resuming stale counts.
     pub(super) fn fetch_eligible(&mut self, key: &FetchKey) -> bool {
         match self.fetch_cool_until.get(key) {
             None => true,
             Some(until) if self.fetch_run > *until => {
                 self.fetch_cool_until.remove(key);
                 self.fetch_strikes.remove(key);
+                self.fetch_budget_burns.remove(key);
                 true
             }
             Some(_) => false,
@@ -1385,10 +1410,34 @@ impl Engine {
         }
     }
 
-    /// Record a fulfilled fetch: strikes and cooldowns dissolve — the
-    /// representation served valid bytes.
+    /// Record a budget-sliced fetch attempt, on its own
+    /// one-burn-per-run ledger: a representation whose attempts keep
+    /// running out of budget backs off into cooldown without ever
+    /// being struck as faulty. Without it a hanging route is retried
+    /// every pass forever, burning its floored share each time and
+    /// starving the candidates and items behind it — the unstriking
+    /// deadline alone removes the only backoff hanging routes had.
+    /// Same threshold and cooldown as strikes, so the duty cycle
+    /// matches and a starved victim retries with full-budget attempts
+    /// while the culprit cools; a fulfillment clears both ledgers.
+    pub(super) fn note_fetch_deadline(&mut self, key: &FetchKey) {
+        let (burns, last_run) = self.fetch_budget_burns.entry(*key).or_insert((0, 0));
+        if *last_run == self.fetch_run {
+            return;
+        }
+        *last_run = self.fetch_run;
+        *burns = burns.saturating_add(1);
+        if *burns >= FETCH_MAX_STRIKES {
+            self.fetch_cool_until
+                .insert(*key, self.fetch_run + FETCH_COOLDOWN_PASSES);
+        }
+    }
+
+    /// Record a fulfilled fetch: strikes, burns, and cooldowns
+    /// dissolve — the representation served valid bytes.
     pub(super) fn note_fetch_fulfilled(&mut self, key: &FetchKey) {
         self.fetch_strikes.remove(key);
+        self.fetch_budget_burns.remove(key);
         self.fetch_cool_until.remove(key);
     }
 }

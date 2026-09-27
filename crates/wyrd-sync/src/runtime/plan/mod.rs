@@ -157,11 +157,13 @@ fn execute_inner(
                     engine.note_fetch_transport_failure(&body_key);
                 }
                 // A sliced attempt is budget evidence, never
-                // representation evidence: the item stays pending for
-                // the next run, but nothing strikes and nothing counts
-                // — the pass-level unfulfilled total already carries
-                // the budget signal.
-                FetchOutcome::Deadline => {}
+                // representation evidence: it counts toward
+                // burn-backoff but never strikes, and the item stays
+                // pending for the next run.
+                FetchOutcome::Deadline => {
+                    report.deadlines += 1;
+                    engine.note_fetch_deadline(&body_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
@@ -203,9 +205,13 @@ fn execute_inner(
                     report.transport_errors += 1;
                     engine.note_fetch_transport_failure(&root_key);
                 }
-                // Budget evidence, not representation evidence: no
-                // strike, no count; the item stays pending.
-                FetchOutcome::Deadline => {}
+                // Budget evidence, not representation evidence: counts
+                // toward burn-backoff, never strikes; the item stays
+                // pending.
+                FetchOutcome::Deadline => {
+                    report.deadlines += 1;
+                    engine.note_fetch_deadline(&root_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
@@ -247,9 +253,13 @@ fn execute_inner(
                     report.transport_errors += 1;
                     engine.note_fetch_transport_failure(&child_key);
                 }
-                // Budget evidence, not representation evidence: no
-                // strike, no count; the item stays pending.
-                FetchOutcome::Deadline => {}
+                // Budget evidence, not representation evidence: counts
+                // toward burn-backoff, never strikes; the item stays
+                // pending.
+                FetchOutcome::Deadline => {
+                    report.deadlines += 1;
+                    engine.note_fetch_deadline(&child_key);
+                }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
             }
@@ -287,14 +297,21 @@ fn execute_inner(
             // retrying every pass and starving the items behind it).
             // Sliced attempts never strike: the deadline belongs to the
             // waiter, and a sliced timeout carries no fault information
-            // about the provider. Absent, key-less, and locally-refused
-            // candidates never strike: they are not evidence against
-            // the representation.
+            // about the provider. They burn instead: repeated slices
+            // back the representation off exactly like strikes, on a
+            // separate ledger, so a hanging route stops being retried
+            // every pass without ever being branded faulty. Absent,
+            // key-less, and locally-refused candidates are attributed
+            // nowhere: they are not evidence against the
+            // representation.
             for storage in &attempt.invalid {
                 engine.note_fetch_invalid(&FetchKey::Storage(*storage));
             }
             for storage in &attempt.transport_failed {
                 engine.note_fetch_transport_failure(&FetchKey::Storage(*storage));
+            }
+            for storage in &attempt.deadline_sliced {
+                engine.note_fetch_deadline(&FetchKey::Storage(*storage));
             }
             match attempt.aggregate {
                 FetchOutcome::Fulfilled(()) => {
@@ -312,7 +329,9 @@ fn execute_inner(
                 FetchOutcome::Invalid => {
                     report.invalid += 1;
                 }
-                FetchOutcome::Deadline => {}
+                FetchOutcome::Deadline => {
+                    report.deadlines += 1;
+                }
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,

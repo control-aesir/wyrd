@@ -201,15 +201,21 @@ Decided properties:
    representation may name several providers (a dead route beside a
    live one after a serving restart). Under a pass budget each
    remaining candidate gets a fair share of the time left, floored so
-   an early slow-but-live candidate gets a usable attempt, so a
-   slow-first provider cannot spend the whole slice on its dial and
-   starve the rest: the pass attempts every candidate. Two bounds
+   an early slow-but-live candidate gets a usable attempt. No
+   candidate takes more than half of what's left, so a dead-first
+   provider cannot spend the whole slice — but tails shrink
+   geometrically, so with several hanging candidates ahead a late
+   live route can get an unusably small slice. Candidate lists are
+   short in practice (bounded by the distinct recorded providers for
+   one address), so the walk reaches the live route. Two bounds
    apply: a cooled representation is not attempted at all, so a
    re-announced route is fetched once its cooldown lapses, not
-   necessarily in the pass that learns it; and a share that expires
-   is budget evidence, never provider evidence — the attempt reports
-   a deadline the plan neither counts nor strikes, so a slow-but-live
-   candidate never cools under a tight budget.
+   necessarily in the pass that learns it; and only subdivided
+   attempts expire as deadlines — counted, never struck, but repeated
+   slices back the representation off on the separate burn ledger —
+   while a full-share attempt (the only or last candidate) expires as
+   a transport failure exactly as before, so a hanging route with no
+   one behind it still backs off.
 
 ## What open() materializes vs what read() demands
 
@@ -307,7 +313,9 @@ Test matrix (each locks a decided invariant):
   live route and fulfills → a re-announced route recovers without a
   restart once its cooldown lapses, and a dead candidate never
   starves the rest (an early slow-but-live candidate gets a floored
-  share, and a share that expires reports an unstriking deadline).
+  share; a subdivided share that expires reports a counted,
+  unstriking deadline with burn-backoff, while a full-share expiry
+  still strikes).
 - **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
   complete (and a terminal failure wakes all three with failure).
 - **Timeout then completion**: want times out → `EIO` → materialization

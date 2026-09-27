@@ -69,15 +69,21 @@ pub enum BulkError {
     Transport(String),
     /// The attempt ran out of its pass-budget slice before completing:
     /// evidence about the budget, never about the provider. The plan
-    /// does not strike on it (a sliced timeout carries no fault
-    /// information — with a bigger budget the attempt might have
-    /// succeeded), and it travels every fallback path transport
-    /// failures travel. Instant failures under a slice — refused
-    /// dials, protocol errors, oversize — stay [`BulkError::Transport`]:
-    /// those completed observations are fault information even when
-    /// the budget is tight.
-    #[error("bulk attempt ran out of its pass-budget slice")]
-    Deadline,
+    /// counts it but does not strike on it (a sliced timeout carries
+    /// no fault information — with a bigger share the attempt might
+    /// have succeeded). Only attempts the candidate walk subdivided
+    /// report it: a full-share attempt (the only or last candidate,
+    /// or any single-route fetch) reports [`BulkError::Transport`] on
+    /// expiry exactly as before, so a hanging route with no one
+    /// behind it still backs off. `slice` is the budget the attempt
+    /// was granted and expired — the diagnostic identity of a budget
+    /// event (zero when the walk stopped before granting any).
+    /// Instant failures under a slice — refused dials, protocol
+    /// errors, oversize — stay [`BulkError::Transport`]: those
+    /// completed observations are fault information even when the
+    /// budget is tight.
+    #[error("bulk attempt ran out of its {slice:?} pass-budget slice")]
+    Deadline { slice: std::time::Duration },
     #[error("sealed representation of {bytes} bytes exceeds the {max}-byte fetch ceiling")]
     Oversize { bytes: usize, max: usize },
 }
@@ -156,6 +162,12 @@ impl IrohBlobRef {
 
 /// Append a provider unless the exact ref is already held, preserving
 /// publication order and keeping periodic route passes idempotent.
+/// Order is publication order, and pairs persist within a pass:
+/// `publish_recorded_routes` (`transport/routes.rs`) clears between
+/// passes, so a dead-first list within one pass comes from that
+/// pass's recorded state — the walk tests below build theirs by hand
+/// for the same reason, and stay valid only while publication keeps
+/// this append-without-prepend shape.
 fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
     if !candidates.contains(&blob) {
         candidates.push(blob);
@@ -166,11 +178,22 @@ fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
 /// time left across the candidates still unattempted, floored so an
 /// early-listed slow-but-live provider gets a usable attempt instead
 /// of a guaranteed expiry. The floor never exceeds half the remaining
-/// budget (and never the dial bound): a dead provider burns at most
-/// half, so the walk still reaches every candidate — the dead-first
-/// wedge cannot return. The last candidate always gets everything
-/// left; a spent budget shares nothing (the caller stops the walk on
-/// a zero share rather than attempting).
+/// budget (and never the dial bound): no candidate takes more than
+/// half of what's left, so a dead-first provider cannot spend the
+/// whole slice. What it does not promise is a usable share for every
+/// candidate: tails shrink geometrically, so with several hanging
+/// candidates ahead a late live route can get an unusably small
+/// slice. Candidate lists are short in practice — bounded by the
+/// distinct recorded providers for one address — so the walk reaches
+/// the live route; a deep hanging tail would starve, and fixing that
+/// needs route ordering, which belongs to retry-policy work, not to
+/// this division. The floor draws from the shared phase budget: at
+/// N>=3 the first provider can take up to half the phase's remaining
+/// budget where the bare division gave it remaining/N, so intra-item
+/// fairness trades against inter-item fairness in the same change.
+/// The last candidate always gets everything left; a spent budget
+/// shares nothing (the caller stops the walk on a zero share rather
+/// than attempting).
 fn candidate_share(
     remaining: std::time::Duration,
     index: usize,
@@ -178,6 +201,42 @@ fn candidate_share(
 ) -> std::time::Duration {
     let fair = remaining / (total - index) as u32;
     fair.max(FETCH_DIAL_TIMEOUT.min(remaining / 2))
+}
+
+/// Whether the candidate walk subdivided this attempt below what an
+/// unshared attempt would have received. `Shared` attempts that
+/// expire report [`BulkError::Deadline`]: the walk took budget from
+/// them, so the expiry is budget evidence. `Full` attempts — the only
+/// or last candidate, or any single-route fetch outside a walk —
+/// report [`BulkError::Transport`] on expiry exactly as before: with
+/// no one behind them a hanging route must still back off.
+///
+/// The walk computes this with [`attempt_bound`] from the granted
+/// share and the live remaining, and sets it alongside the re-armed
+/// deadline as a pair — `fetch` cannot derive it, because the re-arm
+/// makes the remaining it re-reads approximately equal the share by
+/// construction. One helper, one call site per attempt, so the
+/// timeout that fires and the class it maps to agree structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptBound {
+    Full,
+    Shared,
+}
+
+/// Whether subdividing to `share` out of `remaining` shortens the
+/// attempt below its unshared bound (`remaining` clamped to the
+/// built-in blob timeout): a share roomier than the built-ins leaves
+/// a `Full` attempt whose expiry is fault evidence, not budget
+/// evidence. Pure so tests pin the boundary without a network.
+fn attempt_bound(
+    share: Option<std::time::Duration>,
+    remaining: std::time::Duration,
+) -> AttemptBound {
+    let unshared = remaining.min(FETCH_BLOB_TIMEOUT);
+    match share {
+        Some(share) if share.min(FETCH_BLOB_TIMEOUT) < unshared => AttemptBound::Shared,
+        _ => AttemptBound::Full,
+    }
 }
 
 /// Upper bound for one provider dial: iroh discovery can stall behind
@@ -197,22 +256,22 @@ const FETCH_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 
 /// Dial one provider with a deadline: the timeout above is the live
 /// value; the parameter exists so tests can prove boundedness fast
-/// against an unroutable provider. A dial cut short by its pass-budget
-/// slice reports [`BulkError::Deadline`] instead of transport failure:
-/// a timeout under an artificially shortened deadline carries no fault
+/// against an unroutable provider. A dial cut short by subdivision
+/// reports [`BulkError::Deadline`] instead of transport failure: a
+/// timeout under an artificially shortened deadline carries no fault
 /// information. Instant dial failures (refused, unreachable) stay
 /// transport errors — those completed even under the slice.
 async fn dial(
     endpoint: &Endpoint,
     provider: EndpointAddr,
     timeout: std::time::Duration,
-    sliced: bool,
+    bound: AttemptBound,
 ) -> Result<iroh::endpoint::Connection, BulkError> {
     tokio::time::timeout(timeout, endpoint.connect(provider, iroh_blobs::ALPN))
         .await
         .map_err(|_| {
-            if sliced {
-                BulkError::Deadline
+            if bound == AttemptBound::Shared {
+                BulkError::Deadline { slice: timeout }
             } else {
                 BulkError::Transport("provider dial timed out".to_string())
             }
@@ -249,6 +308,13 @@ pub struct IrohBulkSource {
     /// attempt. `None` runs under the built-in timeouts. Plan-run
     /// state, reset by the plan — never source configuration.
     attempt_deadline: Option<std::time::Instant>,
+    /// The candidate walk's bound for the in-flight attempt, set
+    /// alongside the re-armed [`IrohBulkSource::attempt_deadline`] and
+    /// read by `fetch` to classify a timeout as budget evidence
+    /// (`Shared`) or fault evidence (`Full`). `None` outside a walk:
+    /// single-route fetches are never subdivided. Plan-run state like
+    /// the deadline, restored on the same exits.
+    attempt_bound: Option<AttemptBound>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -277,6 +343,7 @@ impl IrohBulkSource {
             sealed: BTreeMap::new(),
             transport: BTreeMap::new(),
             attempt_deadline: None,
+            attempt_bound: None,
         }
     }
 
@@ -386,8 +453,11 @@ impl IrohBulkSource {
     /// dead-first provider spends the whole remaining slice on its
     /// dial and the live candidates behind it are never attempted —
     /// every pass repeats the same burned dial and the item never
-    /// recovers. A sliced attempt expires as a deadline the plan does
-    /// not strike. Unbudgeted runs keep the full timeouts per candidate.
+    /// recovers. An attempt the walk subdivided expires as a deadline
+    /// the plan counts but does not strike; a full-share attempt (the
+    /// only or last candidate) expires as a transport failure exactly
+    /// as before, so a hanging route with no one behind it still
+    /// backs off. Unbudgeted runs keep the full timeouts per candidate.
     fn fetch_candidates(
         &mut self,
         candidates: &[IrohBlobRef],
@@ -408,20 +478,24 @@ impl IrohBulkSource {
                     break;
                 }
                 self.attempt_deadline = Some(std::time::Instant::now() + share);
+                self.attempt_bound = Some(attempt_bound(Some(share), remaining));
             }
             match self.fetch(blob, max) {
                 Ok(bytes) => {
                     self.attempt_deadline = budget;
+                    self.attempt_bound = None;
                     return Ok(Some(bytes));
                 }
                 Err(oversize @ BulkError::Oversize { .. }) => {
                     self.attempt_deadline = budget;
+                    self.attempt_bound = None;
                     return Err(oversize);
                 }
                 Err(error) => last_error = Some(error),
             }
         }
         self.attempt_deadline = budget;
+        self.attempt_bound = None;
         match last_error {
             Some(error) => Err(error),
             // No candidates is genuine absence: nothing to ask. But
@@ -429,7 +503,9 @@ impl IrohBulkSource {
             // out before anything could be asked — a deadline, never a
             // fabricated absence claim about what the peers hold.
             None if total == 0 => Ok(None),
-            None => Err(BulkError::Deadline),
+            None => Err(BulkError::Deadline {
+                slice: std::time::Duration::ZERO,
+            }),
         }
     }
 
@@ -476,16 +552,19 @@ impl IrohBulkSource {
         let hash = blob.hash();
         // The plan may cap this attempt at the time remaining to its
         // deadline, re-read here so every attempt in the pass clamps
-        // to the live remaining. A sliced attempt that expires reports
-        // [`BulkError::Deadline`], which the plan does not strike: the
-        // deadline belongs to the waiter and a sliced timeout carries
-        // no fault information about the provider. Only timeouts map
-        // this way — an instant failure under a slice (refused dial,
-        // protocol error) completed its observation and stays a
-        // transport error. Unbudgeted runs use the built-in timeouts.
-        let sliced = self.attempt_deadline.is_some_and(|deadline| {
-            deadline.saturating_duration_since(std::time::Instant::now()) < FETCH_BLOB_TIMEOUT
-        });
+        // to the live remaining. How an expiry classifies comes from
+        // the walk's bound, set alongside the re-armed deadline: a
+        // subdivided (`Shared`) attempt that expires reports
+        // [`BulkError::Deadline`], which the plan counts but does not
+        // strike — the walk took budget from it, so the expiry is
+        // budget evidence. A full-share attempt (the only or last
+        // candidate, or any single-route fetch) reports a transport
+        // timeout exactly as before: with no one behind it a hanging
+        // route must still back off. Only timeouts map this way — an
+        // instant failure under a slice (refused dial, protocol error)
+        // completed its observation and stays a transport error.
+        // Unbudgeted runs use the built-in timeouts.
+        let bound = self.attempt_bound.unwrap_or(AttemptBound::Full);
         let blob_timeout = self
             .attempt_deadline
             .map(|deadline| {
@@ -501,7 +580,7 @@ impl IrohBulkSource {
             // streams cannot outlast a peer that never answers. Slow
             // passes still complete; the plan retries what they miss.
             tokio::time::timeout(blob_timeout, async move {
-                let connection = dial(&endpoint, provider, dial_timeout, sliced).await?;
+                let connection = dial(&endpoint, provider, dial_timeout, bound).await?;
                 let (size, _) = get_verified_size(&connection, &hash)
                     .await
                     .map_err(|error| BulkError::Transport(error.to_string()))?;
@@ -515,8 +594,10 @@ impl IrohBulkSource {
             })
             .await
             .map_err(|_| {
-                if sliced {
-                    BulkError::Deadline
+                if bound == AttemptBound::Shared {
+                    BulkError::Deadline {
+                        slice: blob_timeout,
+                    }
                 } else {
                     BulkError::Transport("blob fetch timed out".to_string())
                 }
@@ -580,6 +661,9 @@ where
 impl AttemptBudget for IrohBulkSource {
     fn set_attempt_deadline(&mut self, deadline: Option<std::time::Instant>) {
         self.attempt_deadline = deadline;
+        // The walk re-arms its bound per attempt; a fresh deadline
+        // from the plan carries none until the walk grants one.
+        self.attempt_bound = None;
     }
 }
 
@@ -1151,7 +1235,9 @@ mod tests {
         source.set_attempt_deadline(Some(std::time::Instant::now()));
         assert_eq!(
             source.fetch_sealed(&storage, usize::MAX),
-            Err(BulkError::Deadline)
+            Err(BulkError::Deadline {
+                slice: std::time::Duration::ZERO
+            })
         );
         source.set_attempt_deadline(None);
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
@@ -1183,9 +1269,14 @@ mod tests {
         let provider = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x77; 32]).public())
             .with_relay_url(relay);
         let start = Instant::now();
-        let result = runtime.block_on(dial(&client, provider, Duration::from_millis(500), true));
+        let result = runtime.block_on(dial(
+            &client,
+            provider,
+            Duration::from_millis(500),
+            AttemptBound::Shared,
+        ));
         assert!(
-            matches!(result, Err(BulkError::Deadline)),
+            matches!(result, Err(BulkError::Deadline { .. })),
             "sliced dial must report deadline, got {result:?}"
         );
         assert!(
@@ -1197,13 +1288,17 @@ mod tests {
     }
 
     #[test]
-    fn sliced_fetch_reports_deadline_not_transport() {
+    fn fetch_classifies_expiry_by_bound_not_budget() {
         use iroh::{endpoint::presets, Endpoint, RelayUrl};
 
-        // A live-silent relay under a 200 ms pass slice: nothing can
-        // complete against a peer that never speaks, so the outer
-        // attempt timeout must report Deadline — budget evidence the
-        // plan will not strike — rather than a transport failure.
+        // A live-silent relay under a 100 ms deadline, driven through
+        // `fetch` directly with a preset bound: the only reachable
+        // outcome is the timeout, so the bound alone decides its
+        // class. `Shared` (a subdivided walk attempt) expires as a
+        // deadline the plan will count but not strike; `Full` (the
+        // only or last candidate, or any single-route fetch) expires
+        // as a transport failure exactly as before, so a hanging
+        // route with no one behind it still backs off.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::mem::forget(listener);
@@ -1221,23 +1316,33 @@ mod tests {
         let runtime = Arc::new(runtime);
         let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
         let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
-        let storage = StorageId::from_bytes([0x9A; 32]);
-        source.publish_sealed(
-            storage,
-            IrohBlobRef {
-                provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x78; 32]).public())
-                    .with_relay_url(relay),
-                hash: [0xBC; 32],
-            },
+        let blob = IrohBlobRef {
+            provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x78; 32]).public())
+                .with_relay_url(relay),
+            hash: [0xBC; 32],
+        };
+        source.attempt_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+        source.attempt_bound = Some(AttemptBound::Shared);
+        assert!(
+            matches!(
+                source.fetch(&blob, usize::MAX),
+                Err(BulkError::Deadline { .. })
+            ),
+            "a subdivided expiry is budget evidence"
         );
-        source.set_attempt_deadline(Some(
-            std::time::Instant::now() + std::time::Duration::from_millis(200),
-        ));
-        assert_eq!(
-            source.fetch_sealed(&storage, usize::MAX),
-            Err(BulkError::Deadline)
+        source.attempt_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+        source.attempt_bound = Some(AttemptBound::Full);
+        assert!(
+            matches!(
+                source.fetch(&blob, usize::MAX),
+                Err(BulkError::Transport(_))
+            ),
+            "a full-share expiry is fault evidence"
         );
-        source.set_attempt_deadline(None);
+        source.attempt_deadline = None;
+        source.attempt_bound = None;
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
 
@@ -1306,6 +1411,113 @@ mod tests {
             server.close().await;
         });
         source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn budgeted_walk_reaches_live_behind_hanging_candidates() {
+        use iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
+        use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+        // Three hanging providers (live-silent relays: each consumes
+        // its whole share) in front of one live one, under a 10 s
+        // pass budget. The floored shares are 5 s, 2.5 s, 1.25 s, so
+        // the live route gets ~1.25 s — plenty for a loopback serve —
+        // and the walk fulfills instead of burning the budget on the
+        // first hang. On the pre-floor code the first hang spends the
+        // whole remaining slice and the live route is never attempted.
+        // This pins the realistic shape (short lists); a deep hanging
+        // tail still shrinks geometrically — see `candidate_share`.
+        let content = b"walk reaches live behind hangs";
+        let relays: Vec<RelayUrl> = (0..3)
+            .map(|_| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                std::mem::forget(listener);
+                format!("https://127.0.0.1:{port}").parse().unwrap()
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client, router, hash) = runtime.block_on(async {
+            let server = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
+            let router = Router::builder(server.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            let tag = store.add_slice(content).await.unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap();
+            (server, client, router, tag.hash)
+        });
+        let runtime = Arc::new(runtime);
+        let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+        let root = BaoRoot::from_bytes(*hash.as_bytes());
+        for (i, relay) in relays.into_iter().enumerate() {
+            source.publish_transport(IrohBlobRef {
+                provider: EndpointAddr::new(
+                    iroh::SecretKey::from_bytes(&[0xD0 + i as u8; 32]).public(),
+                )
+                .with_relay_url(relay),
+                hash: *hash.as_bytes(),
+            });
+        }
+        source.publish_transport(IrohBlobRef {
+            provider: direct_addr(&server),
+            hash: *hash.as_bytes(),
+        });
+        source.set_attempt_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        ));
+        assert_eq!(
+            source.fetch_transport(&root, usize::MAX).unwrap(),
+            Some(content.to_vec())
+        );
+        source.set_attempt_deadline(None);
+
+        runtime.block_on(async {
+            router.shutdown().await.unwrap();
+            server.close().await;
+        });
+        source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn attempt_bound_marks_only_subdivided_attempts_shared() {
+        use std::time::Duration;
+
+        // A subdivided share classifies as budget evidence on expiry.
+        assert_eq!(
+            attempt_bound(Some(Duration::from_secs(5)), Duration::from_secs(10)),
+            AttemptBound::Shared
+        );
+        // The only or last candidate gets everything left: its expiry
+        // is fault evidence, exactly as before.
+        assert_eq!(
+            attempt_bound(Some(Duration::from_secs(10)), Duration::from_secs(10)),
+            AttemptBound::Full
+        );
+        // A share roomier than the built-ins binds nothing: the
+        // built-in timeout fires first, so the expiry is fault
+        // evidence even inside a walk.
+        assert_eq!(
+            attempt_bound(Some(Duration::from_secs(150)), Duration::from_secs(300)),
+            AttemptBound::Full
+        );
+        // Outside a walk there is no share to subdivide.
+        assert_eq!(
+            attempt_bound(None, Duration::from_secs(10)),
+            AttemptBound::Full
+        );
     }
 
     #[test]
@@ -1473,7 +1685,12 @@ mod tests {
         let provider = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x77; 32]).public())
             .with_relay_url(relay);
         let start = Instant::now();
-        let result = runtime.block_on(dial(&client, provider, Duration::from_millis(500), false));
+        let result = runtime.block_on(dial(
+            &client,
+            provider,
+            Duration::from_millis(500),
+            AttemptBound::Full,
+        ));
         let elapsed = start.elapsed();
         assert!(
             matches!(result, Err(BulkError::Transport(ref message)) if message == "provider dial timed out"),

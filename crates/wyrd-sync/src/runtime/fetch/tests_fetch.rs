@@ -675,7 +675,11 @@ impl BulkSource for SlicedObjectRoutes {
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
         if self.sliced_storage.contains(storage) {
-            return Err(BulkError::Deadline);
+            return Err(BulkError::Deadline {
+                // Injected, not measured: the fixture models a sliced
+                // attempt without running a clock.
+                slice: std::time::Duration::ZERO,
+            });
         }
         self.inner.fetch_sealed(storage, max)
     }
@@ -686,18 +690,24 @@ impl BulkSource for SlicedObjectRoutes {
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
         if self.sliced_roots.contains(root) {
-            return Err(BulkError::Deadline);
+            return Err(BulkError::Deadline {
+                // Injected, not measured: the fixture models a sliced
+                // attempt without running a clock.
+                slice: std::time::Duration::ZERO,
+            });
         }
         self.inner.fetch_transport(root, max)
     }
 }
 
 /// A sliced attempt is budget evidence, never representation evidence:
-/// the item stays pending without counting and without striking, so
-/// healing the route fulfills immediately — no cooldown is ever
-/// entered, unlike the transport-failure twin of this test above.
+/// it counts toward burn-backoff but never strikes as faulty. The
+/// item stays pending, repeated slices back it off on the separate
+/// burn ledger (same duty cycle as strikes, so hanging routes stop
+/// being retried every pass), and healing the route fulfills — with
+/// the strike ledger provably untouched throughout.
 #[test]
-fn deadline_slices_never_strike() {
+fn deadline_slices_burn_backoff_without_striking() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let (mut builder, genesis) = Builder::genesis(10);
@@ -741,29 +751,129 @@ fn deadline_slices_never_strike() {
         sliced_roots: BTreeSet::from([published.object_transport]),
     };
 
-    // More runs than would cool a striking fault, and every run must
-    // show the same shape: attempted (the item stays pending), but
-    // neither counted as a transport error nor struck into cooldown.
-    // The first call converges manifests (two passes, two slices); the
-    // rest slice once per run.
-    for _ in 0..u64::from(FETCH_MAX_STRIKES) + FETCH_COOLDOWN_PASSES + 1 {
+    // The first call converges manifests (two passes, two slices);
+    // every later call slices once. Slices count as deadlines, never
+    // as transport errors or invalid data.
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 2, "sliced while converging");
+    assert_eq!(report.transport_errors, 0);
+    assert_eq!(report.invalid, 0);
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
         let report = fixture
             .engine
             .execute_plan(&mut sliced(&bulk), &mut objects)
             .unwrap();
-        assert_eq!(report.transport_errors, 0, "slices are not counted");
-        assert_eq!(report.invalid, 0);
-        assert_eq!(report.objects, 0);
+        assert_eq!(report.deadlines, 1, "sliced while burning");
+        assert_eq!(report.transport_errors, 0);
         assert_eq!(report.unfulfilled, 1, "the item stays pending");
     }
-    // Healing the route fulfills on the very next run: had any slice
-    // struck, the representation would be cooling and this run would
-    // report unfulfilled instead of objects.
+    // The burn threshold backs the representation off like a strike
+    // would — without striking: attempts stop, the item stays
+    // pending, and the fault ledger stays empty.
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 0, "burning off");
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    assert!(
+        fixture.engine.fetch_strikes.is_empty(),
+        "burns must never strike as faulty"
+    );
+    assert!(
+        !fixture.engine.fetch_budget_burns.is_empty(),
+        "slices must burn toward backoff"
+    );
+    // Past the cooldown the attempts resume, still slicing.
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 1, "retried after the burn cooldown");
+    // Healing the route fulfills on the very next run.
     let report = fixture
         .engine
         .execute_plan(&mut healthy.clone(), &mut objects)
         .unwrap();
-    assert_eq!(report.objects, 1, "healed route fulfills with no cooldown");
+    assert_eq!(report.objects, 1, "healed route fulfills after burns");
+}
+
+/// The other half of the classification rule: an instant transport
+/// failure under an armed budget is still fault evidence and still
+/// strikes. Same harness as the cooldown twin above, but every run
+/// executes under a generous slice — nothing actually expires, so a
+/// `Transport` here completed its observation and must back off
+/// exactly like the unbounded run.
+#[test]
+fn transport_faults_still_strike_under_budget() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"budgeted fault",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    let dead = |peer: &MemoryBulkSource| DeadObjectRoutes {
+        inner: peer.clone(),
+        dead_storage: BTreeSet::from([published.object_storage]),
+        dead_roots: BTreeSet::from([published.object_transport]),
+    };
+    let sliced_run = |engine: &mut crate::runtime::engine::Engine,
+                      bulk: &mut DeadObjectRoutes,
+                      objects: &mut MemoryObjectStore| {
+        engine.execute_plan_sliced(
+            bulk,
+            objects,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        )
+    };
+
+    // The first call converges manifests (two passes), so the object
+    // is attempted in both while striking once; every later call
+    // attempts once, striking once per run — budget armed throughout.
+    let report = sliced_run(&mut fixture.engine, &mut dead(&bulk), &mut objects).unwrap();
+    assert_eq!(report.transport_errors, 2, "attempted while striking");
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = sliced_run(&mut fixture.engine, &mut dead(&bulk), &mut objects).unwrap();
+        assert_eq!(report.transport_errors, 1, "attempted while striking");
+    }
+    // The strike threshold cools the representation even with the
+    // budget armed: faults back off, slices burn off, same duty
+    // cycle, separate ledgers.
+    let report = sliced_run(&mut fixture.engine, &mut dead(&bulk), &mut objects).unwrap();
+    assert_eq!(report.transport_errors, 0, "backing off");
+    assert_eq!(report.unfulfilled, 1, "the item stays pending");
 }
 
 #[test]

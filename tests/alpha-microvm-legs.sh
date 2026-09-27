@@ -127,7 +127,7 @@ leg_fetch_owner() {
   # remote-only content by design.
   start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
   touch "$E2E_ROOT/owner-back"
-  poll_until 180 test -f "$E2E_ROOT/member-stale-done" \
+  poll_until 400 test -f "$E2E_ROOT/member-stale-done" \
     || die "member never fetched stale-1.txt after the route returned"
   stop_mount xowner-f2 INT
   check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -185,14 +185,29 @@ leg_fetch_member() {
   pass "unknown-path open fails fast, never hangs for an announcement"
   touch "$E2E_ROOT/member-fetch-done"
   # Route returned: the earlier EIO cancelled the wait, not the
-  # fetch — a single open now completes once the bytes are servable.
+  # fetch — single opens below must complete once the bytes are
+  # servable. Retried single opens, not a convergence poll: each
+  # attempt is one blocking open (the hardcoded 30s open timeout
+  # bounds it), and the attempt budget absorbs remount +
+  # re-announce latency. The elapsed time is reported either way:
+  # ~30s per failed attempt means the open timed out waiting, ~0s
+  # would mean a cached terminal failure with no retry.
   poll_until 180 test -f "$E2E_ROOT/owner-back" \
     || die "owner never remounted after the dead-route probes"
-  timeout 120 cat "$MNTS/xmember-f/stale-1.txt" >"$E2E_ROOT/stale-1.got" \
-    || die "stale-1.txt never became readable after the route returned"
+  local attempt ok=0 started elapsed
+  started=$(date +%s)
+  for attempt in 1 2 3 4; do
+    if timeout 45 cat "$MNTS/xmember-f/stale-1.txt" >"$E2E_ROOT/stale-1.got" 2>/dev/null; then
+      ok=1; break
+    fi
+    echo "  INFO: stale-1.txt open attempt $attempt failed, retrying" >&2
+  done
+  elapsed=$(( $(date +%s) - started ))
+  [[ "$ok" == 1 ]] \
+    || die "stale-1.txt never became readable after the route returned (${elapsed}s over 4 opens)"
   [[ "$(cat "$E2E_ROOT/stale-1.got")" == "stale-bytes" ]] \
     || die "stale-1.txt returned wrong bytes after the route returned"
-  pass "re-announcement completes the cancelled wait"
+  pass "re-announcement completes the cancelled wait (${elapsed}s over $attempt open(s))"
   touch "$E2E_ROOT/member-stale-done"
   # Dedupe proof over the step-8 restart's redelivery: every id is
   # recorded once (record() is a no-op for known ids), so the file

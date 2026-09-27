@@ -44,7 +44,11 @@ materialization is content residency (`RemoteOnly | Cached | Pinned`),
 so a device that accepts announcements and lets their structural
 closures land but never wants a byte of file content still pays the
 full structural cost — and counting only materialized snapshots would
-score that device at zero.
+score that device at zero. The substitution is exact for the **fixed**
+term. For the content term on a replica it deliberately
+over-approximates, since chunks land only when a want pulls them; the
+inequality still holds and erring high is the safe direction for a
+ceiling.
 
 On the author's own device the term is set by its own commit rate. On a
 replica it is set by **its peers'** commit rate, which is the whole
@@ -127,13 +131,15 @@ by POSIX boundaries on the authoring device:
 - `O_SYNC` / `O_DSYNC` deliberately forfeit coalescing: each successful
   `write` is its own durable snapshot. This is the amplification peak,
   and it is opt-in per handle by the application.
-- Each namespace operation (`create`, `unlink`, `mkdir`, `rmdir`,
-  `rename`, path-addressed `truncate`, `set-exec`) submits a mutation
-  and commits one snapshot each.
-- A **handle** `truncate` does not: it arrives as `setattr` on an open
-  file, resizes the buffered image, and marks the handle dirty, so it
-  joins that handle's next boundary commit. `write` + `ftruncate` on one
-  handle is therefore one snapshot, not two.
+- Each namespace operation addressed by **path** (`create`, `unlink`,
+  `mkdir`, `rmdir`, `rename`, `chmod`, `truncate`, `setattr`) submits a
+  mutation and commits one snapshot per *effective* operation — a
+  truncate to the current size, or a chmod to the mode already recorded,
+  submits nothing.
+- The **handle**-addressed forms (`ftruncate`, `fchmod`) do not: they
+  arrive as `setattr` on an open file, resize or re-flag the buffered
+  image, mark the handle dirty, and commit only under `O_SYNC`. So
+  `write` + `ftruncate` on one handle is one snapshot, not two.
 
 So the rate is chosen by the member, at their own throughput, and is not
 throttled by any protocol timer. On a replica the corresponding rate is
@@ -166,7 +172,7 @@ unbounded in count.
 | Party | Bears | Bounded today |
 |---|---|---|
 | Author | local disk, and its own fsync and announcement cost | yes, per operation |
-| Serving member / peer | the whole structural closure per accepted announcement — snapshot body, root and child manifests, tree nodes — whether or not a want asked for it; **chunk** objects only when a want pulls them | no — paced per pass under the admission and ingest ceilings, but unbounded in retention |
+| Serving member / peer | the whole structural closure per accepted announcement — snapshot body, root and child manifests, tree nodes — whether or not a want asked for it; **chunk** objects only when a want pulls them | no — paced per pass by the fetch pass budget, per object by the ingest ceilings, but unbounded in retention |
 | Vault | retained ciphertext per representation, and the count of them | no |
 
 The asymmetry is the finding, and the eager structural pull sharpens it.
@@ -230,11 +236,26 @@ was trying to protect: the effective ceiling becomes quota + one commit,
 and every refused attempt permanently spends budget, because with no GC
 those objects are unreclaimable.
 
-The boundary to check against is therefore the single fact-commit that
-ends authoring, where the snapshot-body, manifest, and
-`AnnouncementQueued` facts are written together — not the durability
-boundary. Refusing before that one call strands nothing; refusing after
-it strands the obligation for a snapshot that does not exist.
+Two boundaries, not one, and they answer different questions.
+
+**The byte ceiling** must be checked before the authoring step's first
+write to disk. The objects and the sealed envelopes are each written
+with temp + fsync + rename + directory fsync before any commit decision
+exists, so a check at the durability boundary refuses *after* spending
+the bytes it was trying to protect: the effective ceiling becomes quota
++ one commit, and every refused attempt permanently spends budget,
+because with no GC those objects are unreclaimable. `author_snapshot`
+imports the sealed body, then each sealed manifest as it is built, and
+only then commits facts, so a check placed just before the fact-commit
+has already spent every byte of the commit it refuses.
+
+**The fact-commit** — the single call that ends authoring, writing the
+snapshot-body, manifest, and `AnnouncementQueued` facts together — is the
+*latest still-consistent* point, because a refusal after it strands a
+durable announcement obligation for a snapshot that does not exist.
+Refusing at the byte boundary leaves no facts and so strands nothing;
+refusing at the fact-commit boundary strands no facts either, but only
+because everything before it has already been spent.
 
 A quota would bound the author's own device and convert a silent
 unbounded growth into an explicit, documented, POSIX-legitimate refusal.

@@ -371,9 +371,12 @@ obligation discharged at 6.**
 > Later-stage failure never rolls back an earlier durable state.
 
 The state machine is monotonic: `prepared → durable → visible →
-servable → obligation recorded → discharged`. A failure at a later stage
-leaves the earlier states standing; nothing after step 3 undoes step 3.
-This is what forbids transactional coupling between the local commit and
+servable → discharged`. The announcement obligation is not a later
+state in that chain — its fact is committed at step 2 and durable at
+step 3 (see below), so it is *eligible* for discharge only once serving
+readiness passes at step 5. A failure at a later stage leaves the
+earlier states standing; nothing after step 3 undoes step 3. This is
+what forbids transactional coupling between the local commit and
 network propagation.
 
 ### Announcement obligation durability

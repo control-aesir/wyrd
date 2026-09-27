@@ -222,10 +222,10 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     const READS_PER_THREAD: usize = 20;
     const PUBLICATIONS: usize = 12;
     const RENDEZVOUS_CYCLES: usize = 4;
-    /// A deadlock fails here after a minute, it never hangs the
-    /// suite: the daemon's own concurrency tests bound themselves
-    /// the same way. The bound covers both directions — readers and
-    /// publisher join on the main thread.
+    // A deadlock fails here after a minute instead of hanging the
+    // suite. (The daemon's own concurrency tests bound admission
+    // with a spin deadline in-crate; this contract bounds the joins
+    // cross-crate, where spinning is not available.)
     const HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
     let mut store = MemoryObjectStore::default();
@@ -279,6 +279,10 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
         std::thread::spawn(move || {
             start.wait();
             for _ in 0..READS_PER_THREAD {
+                // No assertion here by design: a panic on a detached
+                // thread never fails this test — the outcome travels
+                // to the main thread as a Result, which asserts each
+                // one below with its own cause.
                 let outcome = (|| -> Result<Vec<u8>, fuser::Errno> {
                     let handle = backend.open_at("v.txt")?;
                     let bytes = backend.read_handle(handle, 0, 64)?;
@@ -350,9 +354,11 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
             // a sequencing failure.
             let handle = match rendezvous_backend.open_at("v.txt") {
                 Ok(handle) => handle,
+                // Only the open channel is fed: the main thread is
+                // blocked on `opened_rx` at this point, so this is
+                // where a refused open must fail.
                 Err(error) => {
                     opened_tx.send(Err(error)).unwrap();
-                    got_tx.send(Err(error)).unwrap();
                     continue;
                 }
             };
@@ -373,6 +379,10 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     let phase2_backend = Arc::clone(&backend);
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     let (pub2_tx, pub2_rx) = std::sync::mpsc::channel();
+    // Never joined: the main thread receives every result below, and
+    // the `go_tx` drop at function end terminates the worker, which
+    // is blocked on `go_rx` with nothing left to do. The contracts
+    // binary runs serially, so no cross-test overlap is possible.
     std::thread::spawn(move || {
         for head in go_rx {
             let outcome = (|| -> Result<(), fuser::Errno> {

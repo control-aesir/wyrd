@@ -19,13 +19,13 @@ use super::signing::{drive, signed_snapshot};
 
 /// The plaintext shape of a flat one-level drive, built in a scratch
 /// store: the root tree plus every chunk.
-pub(crate) struct PlainFiles {
-    pub(crate) tree_id: ContentId,
+struct PlainFiles {
+    tree_id: ContentId,
     tree_bytes: Vec<u8>,
     chunks: Vec<(ContentId, Vec<u8>)>,
 }
 
-pub(crate) fn plain_files(files: &[(&str, &[u8])]) -> PlainFiles {
+fn plain_files(files: &[(&str, &[u8])]) -> PlainFiles {
     let mut scratch = MemoryObjectStore::default();
     let mut tree_entries = Vec::new();
     let mut chunks = Vec::new();

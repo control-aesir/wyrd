@@ -158,14 +158,10 @@ as_guest "$WYRD_BIN" export \
   || die "member export lost the cross-host write"
 pass "flush-committed state survives restart on both drives"
 
-# Host-side leak check over the logs the host produced (guest logs
-# are checked in-guest by each leg). All four credential secrets
-# over every host-written log, matching the Lima step's coverage:
-# the merged stdout outputs can carry credential-adjacent lines
-# just as easily as the stderrs.
-for f in "$RUN"/logs/pairing-n.stderr "$RUN"/logs/invite-n.stderr "$RUN"/logs/join-n.stderr \
-         "$RUN"/logs/export-o.out "$RUN"/logs/export-m.out \
-         "$RUN"/logs/reopen-n.out "$RUN"/logs/reopen-o.out; do
+# Host-side leak check over every log the host wrote (guest logs
+# are checked in-guest by each leg). All four credential secrets,
+# matching the Lima step's coverage.
+for f in "$RUN"/logs/*; do
   [[ -f "$f" ]] || continue
   for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")" \
            "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do

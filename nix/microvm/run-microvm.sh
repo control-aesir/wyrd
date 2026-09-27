@@ -48,10 +48,13 @@ cd "$ROOT"
 
 # Tools per mode, checked after flag parsing so --teardown only
 # demands what it uses. Flag combos with --teardown fail loudly
-# instead of silently ignoring the rest.
+# instead of silently ignoring the rest; a non-default --state-dir
+# with --teardown is refused for the same reason (taps, bridge, and
+# daemon pattern are all host-global, so it would be ignored).
 if [[ "$TEARDOWN" == 1 ]]; then
   [[ "$FRESH" == 0 && "$KEEP" == 0 ]] || { echo "error: --teardown takes no other flags" >&2; exit 2; }
-  for t in pgrep ps kill pkill ip flock; do need "$t"; done
+  [[ "$STATE_DIR" == "/var/lib/wyrd-microvm/state" ]] || { echo "error: --teardown ignores --state-dir (host-global)" >&2; exit 2; }
+  for t in git pgrep ps kill pkill ip flock; do need "$t"; done
 else
   for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill; do need "$t"; done
 fi
@@ -127,6 +130,12 @@ trap teardown EXIT
 if [[ "$TEARDOWN" == 1 ]]; then
   echo "==> tearing down kept run"
   KEEP=0; teardown
+  # Verify, don't claim: a surviving guest with a deleted NIC is
+  # worse than a loud failure.
+  for t in tap-o tap-n tap-r; do
+    ip link show "$t" &>/dev/null && die "tap $t survives teardown"
+  done
+  ip link show "$BRIDGE" &>/dev/null && die "$BRIDGE survives teardown"
   echo "torn down: daemons, taps, and $BRIDGE removed ($STATE_DIR retained)"
   exit 0
 fi
@@ -243,7 +252,7 @@ timeout 3600 env \
   "RELAY_URL=ws://$NET.10:18761" \
   "PEER_O=e2e@$NET.11" \
   "PEER_N=e2e@$NET.12" \
-  bash "$ROOT/tests/alpha-microvm.sh"
+  bash "$ROOT/tests/alpha-microvm.sh" 9>&-
 STATUS=$?
 set -e
 [[ "$STATUS" == 0 ]] || die "microvm suite failed (exit $STATUS, logs under $RUN/logs)"

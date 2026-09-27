@@ -99,11 +99,96 @@ leg_restart_member() {
   check_no_leaks "$LOGDIR/mount-xmember-r.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# leg_fetch_owner <drive> <creds> <relay>: mount, wait until the
+# member's blocking open is already waiting (a write that lands
+# before the cat starts would pass vacuously), publish the cold
+# file, then the stale file the member lists before the route dies,
+# then stop: the stop IS the stale-route setup — no VM surgery,
+# just an unmounted owner.
+leg_fetch_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 9 "fetch-plane owner leg"
+  start_mount xowner-f "$c" "$d" "$MNTS/xowner-f" --relay "$relay"
+  poll_until 120 test -f "$E2E_ROOT/member-catting" \
+    || die "member never started its blocking open"
+  echo "cold-bytes" > "$MNTS/xowner-f/cold-2.txt"
+  poll_until 120 test -f "$E2E_ROOT/member-cold-done" \
+    || die "member never completed the blocking cold open"
+  pass "member's single open unblocked on the announcement"
+  echo "stale-bytes" > "$MNTS/xowner-f/stale-1.txt"
+  poll_until 120 test -f "$E2E_ROOT/member-listed-done" \
+    || die "member never listed the stale file"
+  stop_mount xowner-f INT
+  check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  touch "$E2E_ROOT/owner-stopped"
+  poll_until 180 test -f "$E2E_ROOT/member-fetch-done" \
+    || die "member never finished the bounded-EIO probes"
+  pass "owner stayed down while the member probed the dead route"
+}
+
+# leg_fetch_member <drive> <creds> <relay>: mount cold, prove open()
+# blocks until arrival with ONE cat (no retry loop), list the stale
+# file for its manifest only, then probe the dead route after the
+# owner stops: both probes must fail closed and bounded (EIO,
+# rc 1) — a hang would surface as the timeout's rc 124 instead.
+# Close with the dedupe proof: redelivery across the step-8
+# restart must never double-append to mailbox.seen.
+leg_fetch_member() {
+  local d="$1" c="$2" relay="$3"
+  step 9 "fetch-plane member leg"
+  start_mount xmember-f "$c" "$d" "$MNTS/xmember-f" --relay "$relay"
+  # The cat starts before the owner writes (it waits on
+  # member-catting below), so success proves the open blocked for
+  # arrival rather than finding ready bytes.
+  timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" &
+  local catpid=$!
+  touch "$E2E_ROOT/member-catting"
+  wait "$catpid" || die "blocking cold open failed (open did not wait for arrival)"
+  [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \
+    || die "cold open returned wrong bytes"
+  pass "single open blocks until the announced bytes arrive"
+  touch "$E2E_ROOT/member-cold-done"
+  # Manifest-only convergence: readdir pulls the manifest chain
+  # without opening contents, so the member holds the announcement
+  # for stale-1.txt while its chunks are still unfetched.
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'stale-1.txt'" \
+    || die "member never listed the stale file"
+  touch "$E2E_ROOT/member-listed-done"
+  poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
+    || die "owner never stopped for the dead-route probes"
+  # Dead route, held manifest: the bytes are announced but
+  # unfetchable. The open must fail closed and bounded.
+  local rc=0
+  timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >/dev/null 2>&1 || rc=$?
+  [[ "$rc" == 1 ]] || die "stale-manifest open returned rc $rc, want EIO (1)"
+  pass "announced-but-unfetchable open fails closed and bounded"
+  # Never announced at all: same bound, no route ever appears.
+  rc=0
+  timeout 60 cat "$MNTS/xmember-f/never-announced.txt" >/dev/null 2>&1 || rc=$?
+  [[ "$rc" == 1 ]] || die "unknown-path open returned rc $rc, want EIO (1)"
+  pass "unknown-path open fails closed and bounded"
+  touch "$E2E_ROOT/member-fetch-done"
+  # Dedupe proof over the step-8 restart's redelivery: every id is
+  # recorded once (record() is a no-op for known ids), so the file
+  # holds no duplicate line; the count backstops the durable bound
+  # (65,536 in prod — unit tests pin eviction at the 512 test bound).
+  [[ -f "$d/mailbox.seen" ]] || die "member mailbox.seen missing"
+  [[ -z "$(sort "$d/mailbox.seen" | uniq -d)" ]] \
+    || die "mailbox.seen holds duplicate ids: redelivery double-appended"
+  [[ "$(wc -l < "$d/mailbox.seen")" -le 65536 ]] \
+    || die "mailbox.seen breached the durable bound"
+  pass "redelivery never double-appends the dedupe log"
+  stop_mount xmember-f TERM
+  check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
 case "${1:-}" in
   converge-owner) leg_converge_owner "$2" "$3" "$4" ;;
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
   restarted-owner) leg_restarted_owner "$2" "$3" "$4" ;;
   restart-member) leg_restart_member "$2" "$3" "$4" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member <drive> <creds> <relay>" >&2; exit 2 ;;
+  fetch-owner) leg_fetch_owner "$2" "$3" "$4" ;;
+  fetch-member) leg_fetch_member "$2" "$3" "$4" ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member <drive> <creds> <relay>" >&2; exit 2 ;;
 esac
 echo "legs: $PASS_COUNT checks passed"

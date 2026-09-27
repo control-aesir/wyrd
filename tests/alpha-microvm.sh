@@ -13,15 +13,15 @@
 #   3. cross-host convergence legs in parallel (guest legs, done-file
 #      rendezvous on the shared state root)
 #   4. serving-restart legs (fresh endpoint, route update, no repair)
-#   5. offline reopen of both drives on the host
+#   5. fetch-plane legs (blocking cold open, bounded EIO on dead
+#      routes, dedupe log with no double-append)
+#   6. offline reopen of both drives on the host
 #
-# Out of scope for v1, tracked as follow-ups: relay-partition
-# conflict legs (concurrent commits, StaleHandle, ConflictedHeads,
-# name@N export), and the control-plane specifics plus fetch matrix
-# (NIP-44 interop, dedupe growth, coalescing, timeout semantics,
-# registry overflow, StorageId-only serve). The topology supports
-# them (relay is a VM service the host can stop); the assertions
-# need product behavior observed on odin first, not encoded blind.
+# Out of scope, tracked as follow-up: relay-partition conflict legs
+# (concurrent commits, StaleHandle, ConflictedHeads, name@N export).
+# The topology supports them (relay is a VM service the host can
+# stop); the assertions need product behavior observed on odin
+# first, not encoded blind.
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
@@ -130,7 +130,21 @@ wait "$LEG_N" || die "restart member leg failed (see logs/leg-restart-member.out
 wait "$LEG_O" || die "restarted owner leg failed (see logs/leg-restart-owner.out)"
 pass "route update rewires fetch across hosts"
 
-# --- phase 5: offline reopen --------------------------------------------
+# --- phase 5: fetch plane ---------------------------------------------
+echo "=== microvm 10: fetch plane ==="
+rm -f "$RUN/member-catting" "$RUN/member-cold-done" "$RUN/member-listed-done" \
+  "$RUN/owner-stopped" "$RUN/member-fetch-done" "$RUN/cold-2.got"
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-member $GMD $GMC $RELAY_URL" \
+  >"$RUN/logs/leg-fetch-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-owner $OD $OC $RELAY_URL" \
+  >"$RUN/logs/leg-fetch-owner.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
+wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
+pass "blocking open, bounded EIO, and dedupe hold across hosts"
+
+# --- phase 6: offline reopen --------------------------------------------
 echo "=== microvm 9: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"

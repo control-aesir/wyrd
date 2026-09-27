@@ -121,7 +121,11 @@ type.
 ## The WantRegistry: demand is state, the channel is just a wakeup
 
 The registry is the primary abstraction; a channel is merely the
-daemon-loop wakeup signal. The registry owns the semantic state:
+daemon-loop wakeup signal. The registry owns the semantic state,
+and the decided properties below cover the whole demand-to-fetch
+path including per-pass provider scheduling (property 8 lives in
+the bulk source, not the registry, but is decided here with the
+demand policy it serves):
 
 ```text
 WantRegistry
@@ -198,9 +202,12 @@ Decided properties:
    live one after a serving restart). Under a pass budget each
    remaining candidate gets a fair share of the time left, so a
    slow-first provider cannot spend the whole slice on its dial and
-   starve the rest: the pass attempts every candidate, and a
-   re-announced route is fetched in the pass that learns it, not
-   after the dead route stops being slow.
+   starve the rest: the pass attempts every candidate. Two bounds
+   apply: a cooled representation is not attempted at all, so a
+   re-announced route is fetched once its cooldown lapses, not
+   necessarily in the pass that learns it; and a share that expires
+   strikes like any transport failure, so a slow-but-live candidate
+   can cool under a tight budget (no floor yet).
 
 ## What open() materializes vs what read() demands
 
@@ -296,7 +303,9 @@ Test matrix (each locks a decided invariant):
   dead provider first and the live provider second → under a pass
   budget far shorter than a dead dial, the run still attempts the
   live route and fulfills → a re-announced route recovers without a
-  restart, and a slow candidate never starves the rest.
+  restart once its cooldown lapses, and a dead candidate never
+  starves the rest (a slow-but-live candidate gets a smaller share
+  and can strike on expiry — no floor yet).
 - **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
   complete (and a terminal failure wakes all three with failure).
 - **Timeout then completion**: want times out → `EIO` → materialization

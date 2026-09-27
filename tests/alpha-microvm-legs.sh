@@ -162,7 +162,10 @@ leg_fetch_owner() {
   # announcements have arrived here — a fast member would otherwise
   # outrun its own outbox drain and this leg could never converge.
   touch "$E2E_ROOT/owner-converged-done"
-  poll_until 600 test -f "$E2E_ROOT/member-recovered-done" \
+  # Ten attempts bound the member's worst case near eleven minutes
+  # (10 x (60s attempt + 5s sleep)), so this wait must clear it or
+  # the owner's diagnostic masks the member's own.
+  poll_until 700 test -f "$E2E_ROOT/member-recovered-done" \
     || die "member never recovered the stale identity"
   stop_mount xowner-f2 INT
   check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -288,13 +291,8 @@ leg_fetch_member() {
   # bounded open (30s): the loop below is the retry, while the
   # fetch continues across attempts. Ten attempts bound the worst
   # case near eleven minutes; the live route should land it in the
-  # first few. (The post-restart head itself converged before the
-  # scratch above; the polls below re-assert the end state.)
-  poll_until 120 test -f "$E2E_ROOT/owner-back" \
-    || die "owner never came back for the recovery probe"
-  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'owner-back-1.txt'" \
-    || die "member never listed the post-restart write"
-  pass "member converges on the post-restart head over the new route"
+  # first few. (The post-restart head converged before the scratch
+  # above, so no second converge is needed here.)
   # Localize the post-restart file too: phase 6 exports this drive
   # offline and fails closed on remote-only content, so the export
   # needs every head file local — and reads need chunks only, never

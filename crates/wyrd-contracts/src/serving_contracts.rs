@@ -126,6 +126,13 @@ fn loopback_bulk_source() -> IrohBulkSource {
 /// must land over the new route — with no restart and no strike
 /// reset on the fetching side.
 ///
+/// Note what this pins: strike/cooldown revival over a healed route
+/// (each representation has exactly one provider here — the restarted
+/// endpoint — so the multi-provider fair share is inert). The fair
+/// share itself is pinned in-crate by the sliced unit test in
+/// `runtime::plan::tests_execution`, which builds the dead-first
+/// order explicitly.
+///
 /// Slow-gated (nextest `slow` profile): dead loopback dials stall to
 /// the full dial timeout rather than refusing, so the failure phase
 /// alone costs minutes. The sliced unit test in

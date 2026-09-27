@@ -974,11 +974,16 @@ fn invalid_roots_back_off() {
 /// (transport failures strike it into cooldown), the snapshot is then
 /// re-announced (fresh seal, so a fresh message id over the identical
 /// immutable core), and the bytes become servable again. Recovery must
-/// follow with no restart: the re-announcement leaves the pending
-/// fetch intact, attempts resume once the cooldown lapses, and the
-/// fetch fulfills over the healed routes.
+/// follow with no restart: the re-announcement is accepted without
+/// disturbing the pending fetch, attempts resume once the cooldown
+/// lapses, and the fetch fulfills over the healed routes. Note what
+/// this does NOT pin: the re-announcement itself does not re-enable
+/// the attempt (intake never clears a cooldown) — delete the
+/// re-announcement and the test still passes. It pins cooldown
+/// revival plus harmless redelivery, not announcement-triggered
+/// retry.
 #[test]
-fn failed_fetch_recovers_after_reannouncement_without_restart() {
+fn cooled_fetch_recovers_after_cooldown_without_restart() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let (mut builder, genesis) = Builder::genesis(10);
@@ -1072,7 +1077,7 @@ fn failed_fetch_recovers_after_reannouncement_without_restart() {
             break;
         }
     }
-    assert!(landed, "re-announced fetch recovers without restart");
+    assert!(landed, "cooled fetch recovers without restart");
     assert_eq!(
         objects.get(&published.content).unwrap().as_deref(),
         Some(b"reannounce probe".as_slice())

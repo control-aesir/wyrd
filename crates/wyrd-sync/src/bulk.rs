@@ -80,7 +80,10 @@ pub enum BulkError {
 /// longer push a timeout decision past its wall-clock bound. The
 /// default is a no-op (attempts run under the source's own built-in
 /// timeouts); sources with real per-attempt deadlines override it.
-/// The knob is plan-run state: the plan sets it at entry and clears
+/// `IrohBulkSource` goes further and divides the remaining time
+/// across the candidates that are still unattempted, so each attempt
+/// re-arms to a *smaller* share, not the live remaining. The knob is
+/// plan-run state: the plan sets it at entry and clears
 /// it on the way out.
 pub trait AttemptBudget {
     fn set_attempt_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
@@ -418,9 +421,12 @@ impl IrohBulkSource {
         // The plan may cap this attempt at the time remaining to its
         // deadline, re-read here so every attempt in the pass clamps
         // to the live remaining: a sliced attempt reports a transport
-        // timeout (retried next pass), never a strike — the deadline
-        // belongs to the waiter, not the provider. Unbudgeted runs
-        // use the built-in timeouts.
+        // timeout (retried next pass) — and a transport timeout
+        // strikes like any other, so a share that expires against a
+        // slow-but-live provider cools it. The deadline belongs to
+        // the waiter, but the strike belongs to the provider:
+        // budget-caused and fault-caused timeouts are not yet
+        // distinguished. Unbudgeted runs use the built-in timeouts.
         let blob_timeout = self
             .attempt_deadline
             .map(|deadline| {

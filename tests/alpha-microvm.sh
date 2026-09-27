@@ -144,6 +144,7 @@ wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
 echo "=== microvm 9: fetch plane ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
   "$RUN/member-scratch-done" "$RUN/owner-stopped" "$RUN/member-fetch-done" \
+  "$RUN/member-probed-done" "$RUN/owner-converged-done" \
   "$RUN/cold-2.got" "$RUN/stale-1.err" "$RUN/stale-2.err" \
   "$RUN/never-announced.err" "$RUN/owner-back" \
   "$RUN/member-recovered-done" "$RUN/stale-2-recovered.got"
@@ -158,10 +159,11 @@ wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
 pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
 
 # --- phase 6: offline reopen --------------------------------------------
-# Depends on phase 5's remote-only delete (fetch-member removes
-# stale-1.txt with the route down): the export below fails closed
-# on remote-only content, so without that delete this phase dies
-# at the member export. Correct product behavior, coupled phases.
+# Depends on phase 5's delete (fetch-member removes stale-1.txt once
+# the scratch write has localized the trees it needs): the export
+# below fails closed on remote-only content, so without that delete
+# this phase dies at the member export. Correct product behavior,
+# coupled phases.
 echo "=== microvm 10: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"

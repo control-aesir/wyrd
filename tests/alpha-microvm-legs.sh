@@ -99,9 +99,7 @@ leg_restart_member() {
   check_no_leaks "$LOGDIR/mount-xmember-r.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
-# leg_fetch_owner <drive> <creds> <relay>: mount, wait until the
-# member's blocking open is already waiting (a write that lands
-# before the cat starts would pass vacuously), publish the cold
+# leg_fetch_owner <drive> <creds> <relay>: mount, publish the cold
 # file, then the stale file the member lists before the route dies,
 # then stop: the stop IS the stale-route setup — no VM surgery,
 # just an unmounted owner.
@@ -109,8 +107,6 @@ leg_fetch_owner() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane owner leg"
   start_mount xowner-f "$c" "$d" "$MNTS/xowner-f" --relay "$relay"
-  poll_until 120 test -f "$E2E_ROOT/member-catting" \
-    || die "member never started its blocking open"
   echo "cold-bytes" > "$MNTS/xowner-f/cold-2.txt"
   poll_until 120 test -f "$E2E_ROOT/member-cold-done" \
     || die "member never completed the blocking cold open"
@@ -126,24 +122,27 @@ leg_fetch_owner() {
   pass "owner stayed down while the member probed the dead route"
 }
 
-# leg_fetch_member <drive> <creds> <relay>: mount cold, prove open()
-# blocks until arrival with ONE cat (no retry loop), list the stale
-# file for its manifest only, then probe the dead route after the
-# owner stops: both probes must fail closed and bounded (EIO,
-# rc 1) — a hang would surface as the timeout's rc 124 instead.
-# Close with the dedupe proof: redelivery across the step-8
-# restart must never double-append to mailbox.seen.
+# leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
+# file's announcement via listing, then prove open() blocks for the
+# bytes with ONE cat (no retry loop). List the stale file for its
+# manifest only, then probe the dead route after the owner stops:
+# both probes must fail closed and bounded (rc 1, never the
+# timeout's rc 124), with the errno telling them apart — EIO for
+# announced-but-unfetchable, ENOENT for never-announced (open
+# blocks for content after announce, not for announcements
+# themselves). Close with the dedupe proof: redelivery across the
+# step-8 restart must never double-append to mailbox.seen.
 leg_fetch_member() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane member leg"
   start_mount xmember-f "$c" "$d" "$MNTS/xmember-f" --relay "$relay"
-  # The cat starts before the owner writes (it waits on
-  # member-catting below), so success proves the open blocked for
-  # arrival rather than finding ready bytes.
-  timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" &
-  local catpid=$!
-  touch "$E2E_ROOT/member-catting"
-  wait "$catpid" || die "blocking cold open failed (open did not wait for arrival)"
+  # Announcement first (listing shows the new head), bytes second
+  # (the single cat below): this split is what makes the cat a
+  # blocking-open proof rather than a find-ready-bytes no-op.
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'cold-2.txt'" \
+    || die "member never listed the cold file"
+  timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" \
+    || die "blocking cold open failed (open did not wait for the bytes)"
   [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \
     || die "cold open returned wrong bytes"
   pass "single open blocks until the announced bytes arrive"
@@ -159,14 +158,19 @@ leg_fetch_member() {
   # Dead route, held manifest: the bytes are announced but
   # unfetchable. The open must fail closed and bounded.
   local rc=0
-  timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >/dev/null 2>&1 || rc=$?
+  timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >/dev/null 2>"$E2E_ROOT/stale-1.err" || rc=$?
   [[ "$rc" == 1 ]] || die "stale-manifest open returned rc $rc, want EIO (1)"
+  grep -q "Input/output error" "$E2E_ROOT/stale-1.err" \
+    || die "stale-manifest open was not EIO: $(cat "$E2E_ROOT/stale-1.err")"
   pass "announced-but-unfetchable open fails closed and bounded"
-  # Never announced at all: same bound, no route ever appears.
+  # Never announced at all: resolve fails fast, no 30s wait for an
+  # announcement that may never come.
   rc=0
-  timeout 60 cat "$MNTS/xmember-f/never-announced.txt" >/dev/null 2>&1 || rc=$?
-  [[ "$rc" == 1 ]] || die "unknown-path open returned rc $rc, want EIO (1)"
-  pass "unknown-path open fails closed and bounded"
+  timeout 60 cat "$MNTS/xmember-f/never-announced.txt" >/dev/null 2>"$E2E_ROOT/never-announced.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "unknown-path open returned rc $rc, want ENOENT (1)"
+  grep -q "No such file or directory" "$E2E_ROOT/never-announced.err" \
+    || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
+  pass "unknown-path open fails fast, never hangs for an announcement"
   touch "$E2E_ROOT/member-fetch-done"
   # Dedupe proof over the step-8 restart's redelivery: every id is
   # recorded once (record() is a no-op for known ids), so the file

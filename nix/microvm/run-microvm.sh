@@ -97,7 +97,10 @@ echo "==> booting guests"
 for role in peer-o peer-n relay; do
   tap="${TAP_DEV[$role]}"
   ip link del "$tap" 2>/dev/null || true
-  ip tuntap add dev "$tap" mode tap
+  # multi_queue: the microvm runner attaches with queues=<vcpu>
+  # (multiqueue); a single-queue tap fails the attach with EINVAL
+  # ("could not configure /dev/net/tun") and the guest never boots.
+  ip tuntap add dev "$tap" mode tap multi_queue
   ip link set "$tap" up
   ip link set "$tap" master "$BRIDGE"
   vmdir="$WORK/vm-$role"

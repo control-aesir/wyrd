@@ -36,18 +36,47 @@ done
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
 cd "$ROOT"
 
+# Reap strangers first: kept runs, killed ssh sessions, and
+# supervisor restart loops all leave daemons holding our sockets.
+# Idempotent: a no-op when nothing is running.
+kill_stale_daemons
+
 BRIDGE="br-wyrd"
 NET="10.0.7"
 RUN="$STATE_DIR/run"
 WORK="$STATE_DIR/work"
 SSH_KEY="$STATE_DIR/sshkey"
-declare -a DAEMONS=()
 
 die() { echo "  FAIL: $1" >&2; exit 1; }
 
+# Unique string in every daemon cmdline we start (virtiofsd
+# --socket-path and qemu -chardev path). PID files cannot work:
+# $! is the spawner subshell (dead on arrival), and kept runs are
+# strangers to the next invocation. So both the startup pre-clean
+# and the EXIT trap kill by this pattern, which cannot match
+# anything but our own daemons.
+SOCK_PAT='wyrd-.*-virtiofs-wyrd-state\.sock'
+
+kill_stale_daemons() {
+  local pids pid ppid
+  pids="$(pgrep -f "$SOCK_PAT" || true)"
+  [[ -z "$pids" ]] && return 0
+  # Supervisors first (the parents): SIGTERM stops their children
+  # cleanly instead of orphaning them into a restart loop.
+  for pid in $pids; do
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null || true)"
+    ppid="$(echo "$ppid" | tr -d ' ')"
+    if [[ -n "$ppid" && "$ppid" != 1 && "$ppid" != "$$" ]]; then
+      kill "$ppid" 2>/dev/null || true
+    fi
+  done
+  sleep 2
+  pkill -f "$SOCK_PAT" 2>/dev/null || true
+  sleep 1
+}
+
 teardown() {
-  for pid in "${DAEMONS[@]}"; do kill "$pid" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+  kill_stale_daemons
   if [[ "$KEEP" == 0 ]]; then
     for t in tap-o tap-n tap-r; do ip link del "$t" 2>/dev/null || true; done
     ip link del "$BRIDGE" 2>/dev/null || true
@@ -93,7 +122,6 @@ cp "$SSH_KEY.pub" "$STATE_DIR/ssh_host_key.pub"
 } > "$STATE_DIR/e2e-env.sh"
 
 echo "==> booting guests"
-: > "$WORK/daemon.pids"
 for role in peer-o peer-n relay; do
   tap="${TAP_DEV[$role]}"
   ip link del "$tap" 2>/dev/null || true
@@ -111,8 +139,7 @@ for role in peer-o peer-n relay; do
   # then dies with "Connection refused".
   rm -f "$vmdir"/*.sock
   ( cd "$vmdir" \
-    && ./runner/bin/virtiofsd-run > virtiofsd.log 2>&1 &
-    echo $! >> "$WORK/daemon.pids" )
+    && ./runner/bin/virtiofsd-run > virtiofsd.log 2>&1 & )
   # Wait for the socket to LISTEN, not merely exist: the file can
   # appear before virtiofsd accepts, and qemu fails fast on refused.
   for i in $(seq 1 30); do
@@ -120,11 +147,9 @@ for role in peer-o peer-n relay; do
     [[ "$i" == 30 ]] && { tail -n 5 "$vmdir/virtiofsd.log"; die "$role: virtiofsd never listened"; }
     sleep 1
   done
-  ( cd "$vmdir" && ./runner/bin/microvm-run > qemu.log 2>&1 &
-    echo $! >> "$WORK/daemon.pids" )
+  ( cd "$vmdir" && ./runner/bin/microvm-run > qemu.log 2>&1 & )
   echo "    $role up (tap $tap)"
 done
-mapfile -t DAEMONS < "$WORK/daemon.pids"
 
 echo "==> waiting for ssh"
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"

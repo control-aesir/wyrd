@@ -622,12 +622,12 @@ fn mint_fresh_rotation_bytes(
     // under it — leaves the obligation pending for the next pass,
     // exactly like a missing secret or registration, with a debug
     // line so a never-converging stall stays greppable. A domain
-    // refusal or a malformed session response is static
-    // misconfiguration, so it fails loudly rather than stalling the
-    // outbox silently. Loudness aborts the whole pass, not just this
-    // obligation: the error propagates through `deliver_pending`,
-    // and the live loop counts it toward its consecutive-error
-    // budget.
+    // refusal, a malformed session response, or a session signing as
+    // another device is static misconfiguration, so it fails loudly
+    // rather than stalling the outbox silently. Loudness aborts the
+    // whole pass, not just this obligation: the error propagates
+    // through `deliver_pending`, and the live loop counts it toward
+    // its consecutive-error budget.
     let proof = match OwnerProof::sign(
         session,
         &engine.drive,
@@ -645,10 +645,31 @@ fn mint_fresh_rotation_bytes(
             tracing::debug!(epoch, recipient = ?recipient, error = ?e, "owner-proof mint skipped; obligation stays pending");
             return Ok(None);
         }
-        Err(e @ (SignerError::Refused | SignerError::MalformedResponse)) => {
+        Err(
+            e @ (SignerError::Refused
+            | SignerError::MalformedResponse
+            // Unreachable from `sign`, which never reports the engine
+            // join: listed so the terminal class stays exhaustive if
+            // a future session path does.
+            | SignerError::SessionIdentityMismatch { .. }),
+        ) => {
             return Err(e.into());
         }
     };
+    // The join the mint-authority gate assumes: the gate vetted
+    // `engine.device` as an owner, so the proof must name the same
+    // identity. A session consistently signing as another device —
+    // reachable, domain-authorized, but mapped to the wrong engine —
+    // would otherwise mint deliveries the recipient suppresses while
+    // the sender commits them as discharged. The engine's identity
+    // never changes under it, so this never heals: loud, with both
+    // identities in the error.
+    if proof.signer != engine.device {
+        return Err(EngineError::Signer(SignerError::SessionIdentityMismatch {
+            reported: proof.signer,
+            device: engine.device,
+        }));
+    }
     let sealed = seal_rotation(
         &engine.drive,
         recipient,
@@ -693,7 +714,7 @@ mod tests {
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, key};
     use crate::transport::signer::fake::{
-        unrelated_identity, FakeSignerSession, GarbageSession, MismatchedSession,
+        unrelated_identity, unrelated_secret, FakeSignerSession, GarbageSession, MismatchedSession,
         UnreachableSession,
     };
     use secp256k1::SecretKey;
@@ -811,7 +832,7 @@ mod tests {
         let before = engine.store.current();
         let rotated = MismatchedSession::new(
             SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
-            unrelated_identity().1,
+            unrelated_identity(),
         );
         let mut overlay = BTreeMap::new();
         let minted = mint_fresh_rotation(
@@ -866,6 +887,38 @@ mod tests {
         assert!(
             matches!(err, EngineError::Signer(SignerError::MalformedResponse)),
             "unexpected: {err:?}"
+        );
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed mint commits nothing"
+        );
+    }
+
+    /// A session consistently signing as another device: the gate
+    /// vetted the engine's identity, so a proof naming anyone else
+    /// is misconfiguration — loud, with both identities, before
+    /// anything is sealed or committed.
+    #[test]
+    fn foreign_session_fails_loud_with_nothing_committed() {
+        use crate::control::SignDomain;
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let (foreign_secret, foreign_id) = (unrelated_secret(), unrelated_identity());
+        assert_ne!(foreign_id, owner, "the session is not this device");
+        let foreign = FakeSignerSession::new(&foreign_secret, &[SignDomain::OwnerProofV1]);
+        let before = engine.store.current();
+        let err = mint_fresh_rotation_bytes(&mut engine, &foreign, &keyring, 1, owner, &genesis_id)
+            .expect_err("another device's session must not mint");
+        assert!(
+            matches!(
+                err,
+                EngineError::Signer(SignerError::SessionIdentityMismatch { .. })
+            ),
+            "unexpected: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains(&format!("{foreign_id}")),
+            "both identities travel in the error: {err}"
         );
         assert_eq!(
             engine.store.current(),

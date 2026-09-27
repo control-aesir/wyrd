@@ -209,7 +209,7 @@ mod tests {
     use super::*;
     use crate::keys::DeviceIdentitySecret;
     use crate::transport::signer::fake::{
-        unrelated_identity, FakeSignerSession, GarbageSession, MismatchedSession,
+        unrelated_identity, unrelated_secret, FakeSignerSession, GarbageSession, MismatchedSession,
     };
     use secp256k1::SecretKey;
 
@@ -280,8 +280,7 @@ mod tests {
         // A real key, just not the one that signed: the report
         // parses, and the verification against it fails.
         let sign_key = SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar");
-        let (_, reported) = unrelated_identity();
-        let mismatched = MismatchedSession::new(sign_key, reported);
+        let mismatched = MismatchedSession::new(sign_key, unrelated_identity());
         assert_eq!(
             OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),
             Err(SignerError::IdentityMismatch)
@@ -316,8 +315,8 @@ mod tests {
     #[test]
     fn sign_never_verifies_session_garbage() {
         let (_, drive, recipient, transition, secrets) = fixture();
-        let (sign_key, reported) = unrelated_identity();
-        let session = MismatchedSession::with_signature(sign_key, reported, [0xFF; 64]);
+        let session =
+            MismatchedSession::with_signature(unrelated_secret(), unrelated_identity(), [0xFF; 64]);
         assert_eq!(
             OwnerProof::sign(&session, &drive, &recipient, &transition, 3, &secrets),
             Err(SignerError::IdentityMismatch)

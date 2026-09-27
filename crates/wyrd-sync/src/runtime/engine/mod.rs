@@ -200,8 +200,10 @@ pub enum EngineError {
     /// count (error-conventions.md): transient failures
     /// (`Unreachable`, `IdentityMismatch`) never surface here — the
     /// mint site leaves the obligation pending instead. Only static
-    /// misconfiguration (`Refused`, `MalformedResponse`) raises, and
-    /// it aborts the whole delivery pass.
+    /// misconfiguration raises: `Refused`, `MalformedResponse`, and a
+    /// session signing as another device
+    /// (`SessionIdentityMismatch`) — and raising aborts the whole
+    /// delivery pass.
     #[error("owner-proof signer session failed: {0}")]
     Signer(#[from] crate::transport::signer::SignerError),
 }

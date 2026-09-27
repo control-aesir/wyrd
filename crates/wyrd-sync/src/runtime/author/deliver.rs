@@ -751,16 +751,27 @@ mod tests {
     }
 
     /// A domain refusal is a misconfiguration retry will not heal: it
-    /// fails loudly, before anything is sealed or committed.
+    /// fails loudly. Driven through the committing wrapper (not the
+    /// bare bytes fn) so "nothing committed" can actually fail: the
+    /// first seal commits inside `mint_fresh_rotation`, after the
+    /// proof.
     #[test]
     fn refusing_session_fails_loud_with_nothing_committed() {
         let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
         let refusing =
             FakeSignerSession::new(&SecretKey::from_slice(&[0x99; 32]).expect("scalar"), &[]);
         let before = engine.store.current();
-        let err =
-            mint_fresh_rotation_bytes(&mut engine, &refusing, &keyring, 1, owner, &genesis_id)
-                .expect_err("a refused domain must not mint");
+        let mut overlay = BTreeMap::new();
+        let err = mint_fresh_rotation(
+            &mut engine,
+            &refusing,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect_err("a refused domain must not mint");
         assert!(
             matches!(err, EngineError::Signer(SignerError::Refused)),
             "unexpected: {err:?}"
@@ -769,6 +780,7 @@ mod tests {
             format!("{err}").contains("owner-proof signer session failed"),
             "the message stays true for every signer failure: {err}"
         );
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,
@@ -868,17 +880,19 @@ mod tests {
             "the pending obligation converges once the session agrees with itself"
         );
     }
-
     /// A corrupt session response is static breakage: it fails
-    /// loudly, before anything is sealed or committed.
+    /// loudly. Driven through the committing wrapper (not the bare
+    /// bytes fn) so "nothing committed" can actually fail.
     #[test]
     fn corrupt_session_fails_loud_with_nothing_committed() {
         let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
         let before = engine.store.current();
-        let err = mint_fresh_rotation_bytes(
+        let mut overlay = BTreeMap::new();
+        let err = mint_fresh_rotation(
             &mut engine,
             &GarbageSession,
             &keyring,
+            &mut overlay,
             1,
             owner,
             &genesis_id,
@@ -888,6 +902,7 @@ mod tests {
             matches!(err, EngineError::Signer(SignerError::MalformedResponse)),
             "unexpected: {err:?}"
         );
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,
@@ -897,8 +912,9 @@ mod tests {
 
     /// A session consistently signing as another device: the gate
     /// vetted the engine's identity, so a proof naming anyone else
-    /// is misconfiguration — loud, with both identities, before
-    /// anything is sealed or committed.
+    /// is misconfiguration — loud, with both identities. Driven
+    /// through the committing wrapper so "nothing committed" can
+    /// actually fail.
     #[test]
     fn foreign_session_fails_loud_with_nothing_committed() {
         use crate::control::SignDomain;
@@ -907,8 +923,17 @@ mod tests {
         assert_ne!(foreign_id, owner, "the session is not this device");
         let foreign = FakeSignerSession::new(&foreign_secret, &[SignDomain::OwnerProofV1]);
         let before = engine.store.current();
-        let err = mint_fresh_rotation_bytes(&mut engine, &foreign, &keyring, 1, owner, &genesis_id)
-            .expect_err("another device's session must not mint");
+        let mut overlay = BTreeMap::new();
+        let err = mint_fresh_rotation(
+            &mut engine,
+            &foreign,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect_err("another device's session must not mint");
         assert!(
             matches!(
                 err,
@@ -916,10 +941,16 @@ mod tests {
             ),
             "unexpected: {err:?}"
         );
+        let rendered = format!("{err}");
         assert!(
-            format!("{err}").contains(&format!("{foreign_id}")),
-            "both identities travel in the error: {err}"
+            rendered.contains(&format!("{foreign_id}")),
+            "the reported identity travels in the error: {err}"
         );
+        assert!(
+            rendered.contains(&format!("{owner}")),
+            "the expected identity travels in the error: {err}"
+        );
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,

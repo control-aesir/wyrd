@@ -157,14 +157,14 @@ pub(crate) mod fake {
         }
     }
 
-    /// A valid identity unrelated to any fixture: the "someone else"
-    /// for mismatch tests, built once here instead of once per test
-    /// module.
+    /// The secret half of the unrelated identity below.
     pub(crate) fn unrelated_secret() -> secp256k1::SecretKey {
         secp256k1::SecretKey::from_slice(&[0x22; 32]).expect("unrelated scalar")
     }
 
-    /// The device id the unrelated identity names.
+    /// A valid identity unrelated to any fixture: the "someone else"
+    /// for mismatch tests, naming the device id the unrelated secret
+    /// signs for.
     pub(crate) fn unrelated_identity() -> DeviceId {
         let keypair = Keypair::from_secret_key(SECP256K1, &unrelated_secret());
         let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);

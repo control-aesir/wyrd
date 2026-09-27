@@ -492,4 +492,23 @@ mod tests {
             "no orphaned in-flight entry for a departed waiter"
         );
     }
+
+    /// A timed-out waiter writes no fetch state: after the deadline
+    /// the identity carries no waiter — waiter lifetime and fetch
+    /// outcome are distinct state. (No lingering demand and no
+    /// admission are pinned by the demand-cycle tests; what was
+    /// missing was the waiter count itself.) A later registration
+    /// starts a fresh demand instead of coalescing onto a ghost.
+    #[test]
+    fn timeout_leaves_no_fetch_state_behind() {
+        let registry = WantRegistry::default();
+        let error =
+            wait_for_materialization(&registry, content(5), Duration::from_millis(50), || false)
+                .unwrap_err();
+        assert_eq!(error, WantError::TimedOut);
+        assert_eq!(registry.waiter_count(&content(5)), 0, "no waiter lingers");
+        // A later demand registers fresh and admits normally.
+        registry.register(content(5)).unwrap();
+        assert_eq!(admit_all(&registry), vec![content(5)]);
+    }
 }

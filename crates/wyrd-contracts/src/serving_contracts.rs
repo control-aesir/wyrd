@@ -117,3 +117,122 @@ fn loopback_bulk_source() -> IrohBulkSource {
     });
     IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime))
 }
+
+/// Item-1 probe at the live-transport layer: the wedged-fetch shape
+/// with real iroh dials. Body and manifests converge while serving is
+/// up; serving then dies, object attempts fail in transport until the
+/// representations cool; serving restarts on a fresh endpoint, the
+/// same snapshot is re-announced as a route update, and the objects
+/// must land over the new route — with no restart and no strike
+/// reset on the fetching side.
+///
+/// Note what this pins: strike/cooldown revival over a healed route
+/// (each representation has exactly one provider here — the restarted
+/// endpoint — so the multi-provider fair share is inert). The fair
+/// share itself is pinned in-crate by the sliced unit test in
+/// `runtime::plan::tests_execution`, which builds the dead-first
+/// order explicitly.
+///
+/// Slow-gated (nextest `slow` profile): dead loopback dials stall to
+/// the full dial timeout rather than refusing, so the failure phase
+/// alone costs minutes. The sliced unit test in
+/// `runtime::plan::tests_execution` covers the same shape in seconds;
+/// this one proves it over real transport.
+#[test]
+fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
+    let mut loaded = Loaded::new("restart-failures.txt", b"restart failures contract");
+    let serve_dir = scratch_dir("serving-restart-failures");
+    let vault = Vault::open(&serve_dir).unwrap();
+    vault.import(&loaded.snapshot.encode()).unwrap();
+    vault.import(&loaded.content.root.sealed.clone()).unwrap();
+    for (_, sealed) in &loaded.content.objects {
+        vault.import(sealed).unwrap();
+    }
+    let serving = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    serving.flush().unwrap();
+    loaded.publish_body_and_announcement(Some(serving.node_addr_bytes()));
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+
+    let mut engine = loaded.rig.take_engine();
+    let mut bulk = loopback_bulk_source();
+    let routes = bulk
+        .publish_routes(&engine.runtime_state().unwrap())
+        .unwrap()
+        .published;
+    assert_eq!(routes, 4, "the announcement publishes its four routes");
+    let mut objects = loaded.objects.clone();
+    // Round one: converge everything structural while serving is up.
+    // Objects stay unwanted, so only body and manifests land.
+    let first = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+    assert_eq!(first.snapshot_bodies, 1);
+    assert_eq!(first.manifests, 1);
+    assert_eq!(first.objects, 0);
+    // The recorded manifests add their entry routes: republish so the
+    // objects are addressable before serving dies (otherwise the dead
+    // phase reports absence, which never strikes, instead of transport
+    // failure).
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+
+    // Serving dies with the objects still unfetched. Object attempts
+    // now fail in transport until the strike threshold cools them;
+    // the cooldown is the state the restart must revive past.
+    serving
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.want_all(&mut engine);
+    let mut saw_transport_errors = false;
+    let mut cooled = false;
+    for _ in 0..8 {
+        let report = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+        assert_eq!(report.objects, 0, "nothing fulfills over the dead route");
+        if report.transport_errors > 0 {
+            saw_transport_errors = true;
+        } else if saw_transport_errors && report.unfulfilled == 2 {
+            cooled = true;
+            break;
+        }
+    }
+    assert!(
+        saw_transport_errors,
+        "dead-route attempts were made before the restart"
+    );
+    assert!(
+        cooled,
+        "the dead representations cooled: no attempts, still pending"
+    );
+
+    // Serving restarts on a fresh endpoint with the same vault; the
+    // reannouncement changes only `node_addr`, so intake classifies
+    // it as a route update and the recorded route rotates.
+    let restarted = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    loaded.publish_body_and_announcement(Some(restarted.node_addr_bytes()));
+    let report = engine.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(report.accepted, 1, "the route update reannouncement");
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+    // Past the cooldown the attempts resume, this time over the live
+    // route: both objects land with no fetching-side restart.
+    let mut landed = false;
+    for _ in 0..10 {
+        let report = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+        if report.objects == 2 {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed, "the objects land over the new route");
+    for id in &loaded.content.content_ids {
+        assert!(
+            objects.get(id).unwrap().is_some(),
+            "every sealed object landed over live transport"
+        );
+    }
+    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    restarted
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.rig.teardown();
+    let _ = std::fs::remove_dir_all(&serve_dir);
+}

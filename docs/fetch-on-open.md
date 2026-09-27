@@ -121,7 +121,11 @@ type.
 ## The WantRegistry: demand is state, the channel is just a wakeup
 
 The registry is the primary abstraction; a channel is merely the
-daemon-loop wakeup signal. The registry owns the semantic state:
+daemon-loop wakeup signal. The registry owns the semantic state,
+and the decided properties below cover the whole demand-to-fetch
+path including per-pass provider scheduling (property 8 lives in
+the bulk source, not the registry, but is decided here with the
+demand policy it serves):
 
 ```text
 WantRegistry
@@ -193,6 +197,17 @@ Decided properties:
    the truth; the daemon merges them at publish and the view exposes
    the result. FUSE never mutates materialization state, so
    "FUSE says Fetching while engine says Cached" cannot arise.
+8. **Every eligible provider is attempted each pass.** A
+   representation may name several providers (a dead route beside a
+   live one after a serving restart). Under a pass budget each
+   remaining candidate gets a fair share of the time left, so a
+   slow-first provider cannot spend the whole slice on its dial and
+   starve the rest: the pass attempts every candidate. Two bounds
+   apply: a cooled representation is not attempted at all, so a
+   re-announced route is fetched once its cooldown lapses, not
+   necessarily in the pass that learns it; and a share that expires
+   strikes like any transport failure, so a slow-but-live candidate
+   can cool under a tight budget (no floor yet).
 
 ## What open() materializes vs what read() demands
 
@@ -284,6 +299,13 @@ Test matrix (each locks a decided invariant):
 - **Stale address**: announcement names a dead node_addr → fetch
   fails → no invalid object committed → the announcement and its
   content identity remain valid.
+- **Dead route beside a live one**: the same representation names a
+  dead provider first and the live provider second → under a pass
+  budget far shorter than a dead dial, the run still attempts the
+  live route and fulfills → a re-announced route recovers without a
+  restart once its cooldown lapses, and a dead candidate never
+  starves the rest (a slow-but-live candidate gets a smaller share
+  and can strike on expiry — no floor yet).
 - **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
   complete (and a terminal failure wakes all three with failure).
 - **Timeout then completion**: want times out → `EIO` → materialization

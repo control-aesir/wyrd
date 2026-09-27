@@ -100,9 +100,15 @@ leg_restart_member() {
 }
 
 # leg_fetch_owner <drive> <creds> <relay>: mount, publish the cold
-# file, then the stale file the member lists before the route dies,
-# then stop: the stop IS the stale-route setup — no VM surgery,
-# just an unmounted owner.
+# file, then the two stale files the member lists before the route
+# dies, then stop: the stop IS the stale-route setup — no VM
+# surgery, just an unmounted owner. After the member's dead-route
+# probes, remount on a fresh endpoint and write a new file first:
+# the new announcement carries the new route (which the member's
+# later tree fetch needs) and the head advances singly — the member
+# converges it before authoring scratch, so no fork. The member
+# must recover the second stale identity over the new route
+# without remounting.
 leg_fetch_owner() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane owner leg"
@@ -112,32 +118,82 @@ leg_fetch_owner() {
     || die "member never completed the blocking cold open"
   pass "member's single open unblocked on the announcement"
   echo "stale-bytes" > "$MNTS/xowner-f/stale-1.txt"
+  echo "stale-2-bytes" > "$MNTS/xowner-f/stale-2.txt"
   poll_until 120 test -f "$E2E_ROOT/member-listed-done" \
-    || die "member never listed the stale file"
+    || die "member never listed the stale files"
+  # Stop before the member probes: the EIO probes below require the
+  # route down — a live route would serve fetch-on-open and read rc
+  # 0 instead of failing closed. The scratch write that localizes
+  # trees for the later delete runs against the fresh endpoint
+  # instead; same drive, same lineage, so nothing forks.
   stop_mount xowner-f INT
   check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   touch "$E2E_ROOT/owner-stopped"
-  poll_until 180 test -f "$E2E_ROOT/member-fetch-done" \
-    || die "member never finished the bounded-EIO probes"
+  poll_until 240 test -f "$E2E_ROOT/member-probed-done" \
+    || die "member never finished the dead-route probes"
   pass "owner stayed down while the member probed the dead route"
+  # Recovery setup: remount on a fresh endpoint (new iroh identity
+  # over the same drive) and write a new file BEFORE the member
+  # authors anything: the member converges this head first, so the
+  # scratch and the delete extend the post-restart lineage instead
+  # of forking it (the suite has no conflict legs). The new
+  # announcement also carries the fresh route the member needs for
+  # serving. File presence in the member's own view is the
+  # self-synchronizing signal — no sleeps. Reading the scratch file
+  # later also localizes its bytes: phase 6 exports this drive
+  # offline and fails closed on remote-only content.
+  start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
+  echo "owner-back" > "$MNTS/xowner-f2/owner-back-1.txt"
+  touch "$E2E_ROOT/owner-back"
+  # The member created its scratch file and deleted stale-1 on the
+  # post-restart head; converge both before finishing, so the suite
+  # never leaves a forked head behind.
+  poll_until 180 test -f "$E2E_ROOT/member-scratch-done" \
+    || die "member never created the scratch file"
+  poll_until 120 converged "$MNTS/xowner-f2/scratch-del.txt" "scratch" \
+    || die "owner never converged the scratch file's bytes"
+  pass "owner converges the member's scratch write with bytes"
+  poll_until 240 test -f "$E2E_ROOT/member-fetch-done" \
+    || die "member never finished the delete"
+  poll_until 120 bash -c "! test -e '$MNTS/xowner-f2/stale-1.txt'" \
+    || die "owner never converged the member's offline delete"
+  pass "owner converges the delete before finishing"
+  # Convergence ack: the member must not shut down until its
+  # announcements have arrived here — a fast member would otherwise
+  # outrun its own outbox drain and this leg could never converge.
+  touch "$E2E_ROOT/owner-converged-done"
+  # Ten attempts bound the member's worst case near eleven minutes
+  # (10 x (60s attempt + 5s sleep)), so this wait must clear it or
+  # the owner's diagnostic masks the member's own.
+  poll_until 700 test -f "$E2E_ROOT/member-recovered-done" \
+    || die "member never recovered the stale identity"
+  stop_mount xowner-f2 INT
+  check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
 # leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
 # file's announcement via listing, then prove open() blocks for the
-# bytes with ONE cat (no retry loop). List the stale file for its
-# manifest only, then probe the dead route after the owner stops:
-# the stale probe exercises read-side chunk demand (the manifest is
-# already local, so open succeeds and the bounded EIO comes from
+# bytes with ONE cat (no retry loop). List both stale files for
+# their manifests only, then probe the dead route right after the
+# owner stops — before authoring anything, so no local write can
+# fetch the probed identities first (fetch-on-open serves a live
+# route with rc 0, which is correct serving but the wrong probe).
+# The stale-1 probe exercises read-side chunk demand (the manifest
+# is already local, so open succeeds and the bounded EIO comes from
 # the read) with the errno to prove it; the never-announced path
 # fails fast with ENOENT — open blocks for content after announce,
-# not for announcements themselves. Close with the dedupe proof
-# over the step-8 restart's redelivery, then delete the remote-only
-# file so the offline export phase stays meaningful.
+# not for announcements themselves. The recovery identity fails
+# bounded here too, so its later success proves revival. Then the
+# owner returns on a fresh endpoint: converge its head (and route)
+# first, scratch-write to localize the trees the delete needs, and
+# delete stale-1 — all on the post-restart lineage, no fork. Close
+# with the dedupe proof over the step-8 restart's redelivery.
+# Wall-clock envelope (whole guest run shares one 1-hour budget):
+# probes ~130s worst case, owner convergence chain concurrent with
+# the member's recovery, recovery loop 650s worst case, ack waits
+# fail-fast (120s member-side). Typical green run: 4-6 minutes.
 # Two matrix items are deliberately NOT e2e-legged here:
-# failure-then-reannounce recovery without remount (filed as
-# nostr:nevent1qqsp9u0jt79kepcrmx8zxcmzzxce0cf3c8fvzs32k7uqjgeajlzzscqpz9mhxue69uhkwunpwdczuap49eehg5s3hry
-# after four proving runs showed the mount never recovers that
-# identity), and timeout-then-completion (the waiter leaves with
+# timeout-then-completion (the waiter leaves with
 # EIO while the fetch continues (unit-pinned by
 # late_completion_caches_for_the_next_waiter in
 # crates/wyrd-core/src/want.rs, no e2e leg).
@@ -147,6 +203,13 @@ leg_fetch_owner() {
 # and unobservable e2e — the member deletes stale-1.txt precisely
 # because the export fails closed on remote-only content, so the
 # export can never show that identity's absence.
+# The recovery probe below is order-dependent, not a regression pin
+# for decision 8 (fair share): candidate order is hash order, so a
+# run where the live provider sorts first would pass without the
+# fix. Read it as an end-to-end recovery smoke; the deterministic
+# pin lives in-crate at
+# runtime::plan::tests_execution::sliced_run_attempts_live_candidates_behind_a_dead_one,
+# which builds the dead-first order explicitly.
 leg_fetch_member() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane member leg"
@@ -163,15 +226,18 @@ leg_fetch_member() {
   pass "single open blocks until the announced bytes arrive"
   touch "$E2E_ROOT/member-cold-done"
   # Manifest-only convergence: readdir pulls the manifest chain
-  # without opening contents, so the member holds the announcement
-  # for stale-1.txt while its chunks are still unfetched.
+  # without opening contents, so the member holds the announcements
+  # for both stale files while their chunks are still unfetched.
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'stale-1.txt'" \
-    || die "member never listed the stale file"
+    || die "member never listed stale-1.txt"
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'stale-2.txt'" \
+    || die "member never listed stale-2.txt"
   touch "$E2E_ROOT/member-listed-done"
   poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
     || die "owner never stopped for the dead-route probes"
-  # Dead route, held manifest: the bytes are announced but
-  # unfetchable. The read must fail closed and bounded.
+  # Dead route, held manifest, nothing authored yet: the bytes are
+  # announced but unfetchable, and no local write has had a chance
+  # to demand them first. Each read must fail closed and bounded.
   local rc=0
   timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >/dev/null 2>"$E2E_ROOT/stale-1.err" || rc=$?
   [[ "$rc" == 1 ]] || die "stale-manifest read returned rc $rc, want EIO (1)"
@@ -189,13 +255,83 @@ leg_fetch_member() {
   grep -q "No such file or directory" "$E2E_ROOT/never-announced.err" \
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
-  touch "$E2E_ROOT/member-fetch-done"
-  # Remove the remote-only file while the route is still dead:
-  # authorship is local-first, so the delete must work offline, and
-  # the offline export phase fails closed on remote-only content.
+  # The recovery identity must FAIL first: bounded EIO against the
+  # dead route, so the later success proves revival rather than a
+  # first attempt that never saw trouble.
+  rc=0
+  timeout 60 cat "$MNTS/xmember-f/stale-2.txt" >/dev/null 2>"$E2E_ROOT/stale-2.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "stale-2 read returned rc $rc, want EIO (1)"
+  grep -q "Input/output error" "$E2E_ROOT/stale-2.err" \
+    || die "stale-2 read was not EIO: $(cat "$E2E_ROOT/stale-2.err")"
+  pass "second stale identity fails closed and bounded"
+  touch "$E2E_ROOT/member-probed-done"
+  # The owner is back on a fresh endpoint with a new route (see
+  # owner leg). Converge its head BEFORE authoring: the scratch and
+  # the delete below must extend the post-restart lineage, and the
+  # announcement carries the route the tree fetch needs.
+  poll_until 120 test -f "$E2E_ROOT/owner-back" \
+    || die "owner never came back after the dead-route probes"
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'owner-back-1.txt'" \
+    || die "member never listed the post-restart write"
+  pass "member converges on the post-restart head over the new route"
+  # Scratch write against the live route: creating a file forces
+  # the current head's tree object to materialize (reads never
+  # fetch tree objects, only manifests and chunks), and the delete
+  # below needs that tree local. Completion is the signal —
+  # success means the trees are local, so no timing guess.
+  echo "scratch" > "$MNTS/xmember-f/scratch-del.txt"
+  poll_until 120 converged "$MNTS/xmember-f/scratch-del.txt" "scratch" \
+    || die "scratch write never became readable"
+  pass "scratch write forces tree materialization over the live route"
+  touch "$E2E_ROOT/member-scratch-done"
+  # Delete of stale-1: the scratch write above authored a head
+  # whose tree object is local by construction, so this delete
+  # needs nothing from the network — same local-first authorship
+  # the green suite proved, now deterministic instead of
+  # timing-lucky. The owner converges it (see owner leg), so no
+  # head fork. stale-2 stays for the recovery probe below.
   timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \
-    || die "member cannot author while the route is down"
-  pass "member authors offline with the route down"
+    || die "member cannot author the delete"
+  pass "member authors the delete with trees local"
+  touch "$E2E_ROOT/member-fetch-done"
+  # Recovery without remount: the owner is back on a fresh endpoint
+  # with a new route (see owner leg), and this mount never went
+  # down. The stale-2 identity failed terminally against the dead
+  # route; the live route must produce a new fetch attempt and the
+  # open must eventually succeed. Each attempt is a fresh
+  # bounded open (30s): the loop below is the retry, while the
+  # fetch continues across attempts. Ten attempts bound the worst
+  # case near eleven minutes; the live route should land it in the
+  # first few. (The post-restart head converged before the scratch
+  # above, so no second converge is needed here.)
+  # Localize the post-restart file too: phase 6 exports this drive
+  # offline and fails closed on remote-only content, so the export
+  # needs every head file local — and reads need chunks only, never
+  # tree objects, so this stays a pure fetch-plane assertion.
+  poll_until 180 converged "$MNTS/xmember-f/owner-back-1.txt" "owner-back" \
+    || die "member never fetched the post-restart bytes"
+  pass "post-restart bytes land over the new route"
+  local attempt=0
+  while (( attempt < 10 )); do
+    if timeout 60 cat "$MNTS/xmember-f/stale-2.txt" >"$E2E_ROOT/stale-2-recovered.got" 2>/dev/null \
+      && [[ "$(cat "$E2E_ROOT/stale-2-recovered.got")" == "stale-2-bytes" ]]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  [[ "$attempt" -lt 10 ]] \
+    || die "stale identity never recovered without remount after $attempt bounded opens"
+  pass "failed fetch recovers after re-announcement without remount"
+  # Stay up until the owner confirms convergence: shutting down
+  # here would outrun the outbox drain and strand the scratch and
+  # delete announcements this leg's owner polls wait for. Short
+  # budget on purpose: in the normal case the owner acks while this
+  # mount is still recovering, so this only ever costs minutes when
+  # the owner is genuinely stuck.
+  poll_until 120 test -f "$E2E_ROOT/owner-converged-done" \
+    || die "owner never converged the scratch and delete"
+  touch "$E2E_ROOT/member-recovered-done"
   stop_mount xmember-f TERM
   # Dedupe proof over the step-8 restart's redelivery, read after the
   # mount is down so no concurrent append can slip mid-read. Two

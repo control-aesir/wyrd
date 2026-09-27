@@ -14,7 +14,8 @@
 #      rendezvous on the shared state root)
 #   4. serving-restart legs (fresh endpoint, route update, no repair)
 #   5. fetch-plane legs (blocking cold open, bounded EIO on dead
-#      routes, dedupe log with no double-append)
+#      routes, recovery without remount after the owner returns on a
+#      fresh endpoint, dedupe log with no double-append)
 #   6. offline reopen of both drives on the host
 #
 # Out of scope, tracked as follow-up: relay-partition conflict legs
@@ -142,8 +143,11 @@ wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
 # --- phase 5: fetch plane ---------------------------------------------
 echo "=== microvm 9: fetch plane ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
-  "$RUN/owner-stopped" "$RUN/member-fetch-done" "$RUN/cold-2.got" \
-  "$RUN/stale-1.err" "$RUN/never-announced.err"
+  "$RUN/member-scratch-done" "$RUN/owner-stopped" "$RUN/member-fetch-done" \
+  "$RUN/member-probed-done" "$RUN/owner-converged-done" \
+  "$RUN/cold-2.got" "$RUN/stale-1.err" "$RUN/stale-2.err" \
+  "$RUN/never-announced.err" "$RUN/owner-back" \
+  "$RUN/member-recovered-done" "$RUN/stale-2-recovered.got"
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-member $GMD $GMC $RELAY_URL" \
   >"$RUN/logs/leg-fetch-member.out" 2>&1 &
 LEG_N=$!
@@ -152,13 +156,14 @@ on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-owne
 LEG_O=$!
 wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
 wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
-pass "blocking open, bounded EIO, and dedupe hold across hosts"
+pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
 
 # --- phase 6: offline reopen --------------------------------------------
-# Depends on phase 5's remote-only delete (fetch-member removes
-# stale-1.txt with the route down): the export below fails closed
-# on remote-only content, so without that delete this phase dies
-# at the member export. Correct product behavior, coupled phases.
+# Depends on phase 5's delete (fetch-member removes stale-1.txt once
+# the scratch write has localized the trees it needs): the export
+# below fails closed on remote-only content, so without that delete
+# this phase dies at the member export. Correct product behavior,
+# coupled phases.
 echo "=== microvm 10: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"

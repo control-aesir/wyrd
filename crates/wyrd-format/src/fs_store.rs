@@ -144,38 +144,24 @@ impl FsObjectStore {
             retained,
         };
         fs::create_dir_all(store.objects_dir()).map_err(FsStoreError::io)?;
-        store.sweep_temps()?;
+        // One walk: clear temp debris and total published objects.
+        let seeded = store.sweep_and_total()?;
         if let Some(retained) = store.retained.clone() {
-            retained.add(store.retained_bytes()?);
+            // One accountant per store. The seed is additive, so two
+            // stores sharing one tally over one directory would count the
+            // same disk twice and halve the ceiling; attach a fresh
+            // `RetainedBytes` per store, or none at all.
+            retained.add(seeded);
         }
         Ok(store)
     }
 
-    /// Bytes of live objects on disk. Counts published objects only:
-    /// temp debris is swept at open, and a `.tmp` file is by definition
-    /// not retained content.
+    /// Bytes of published objects on disk, by the same walk `open` uses
+    /// to clear temp debris. This is the composition root's cross-check:
+    /// comparing it against a configured quota at startup turns "every
+    /// write is `ENOSPC`" into a diagnosis at boot.
     pub fn retained_bytes(&self) -> Result<u64, FsStoreError> {
-        let mut total = 0u64;
-        let mut stack = vec![self.objects_dir()];
-        while let Some(current) = stack.pop() {
-            let entries = match fs::read_dir(&current) {
-                Ok(entries) => entries,
-                // The objects root may not exist yet on a fresh drive;
-                // an absent directory is an empty store, not a failure.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(FsStoreError::io(error)),
-            };
-            for entry in entries {
-                let entry = entry.map_err(FsStoreError::io)?;
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_none_or(|ext| ext != "tmp") {
-                    total += entry.metadata().map_err(FsStoreError::io)?.len();
-                }
-            }
-        }
-        Ok(total)
+        self.sweep_and_total()
     }
 
     fn objects_dir(&self) -> PathBuf {
@@ -198,12 +184,26 @@ impl FsObjectStore {
             .find(|(_, path)| path.is_file())
     }
 
-    /// Remove every `.tmp` file under the store: debris from writers
-    /// that crashed between temp-write and rename.
-    fn sweep_temps(&self) -> Result<(), FsStoreError> {
+    /// One walk over the store that both removes `.tmp` debris and
+    /// totals the published objects, returning the retained byte count.
+    /// These were two traversals; the walk already visits every entry
+    /// and already knows which ones are temps, so a counted store on a
+    /// drive holding millions of objects should not pay for the tree
+    /// twice at open.
+    ///
+    /// Temps are excluded from the total: one is by definition not yet
+    /// retained content, and this walk is about to delete them.
+    fn sweep_and_total(&self) -> Result<u64, FsStoreError> {
+        let mut total = 0u64;
         let mut stack = vec![self.objects_dir()];
         while let Some(current) = stack.pop() {
-            let entries = fs::read_dir(&current).map_err(FsStoreError::io)?;
+            // The objects root may not exist yet on a fresh drive; an
+            // absent directory is an empty store, not a failure.
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(FsStoreError::io(error)),
+            };
             for entry in entries {
                 let entry = entry.map_err(FsStoreError::io)?;
                 let path = entry.path();
@@ -212,17 +212,19 @@ impl FsObjectStore {
                 } else if path.extension().is_some_and(|ext| ext == "tmp") {
                     // A concurrent writer may rename the temp into place
                     // between the listing and the removal: NotFound means
-                    // the file already reached its live name, which is the
-                    // outcome sweeping wants anyway.
+                    // the file already reached its live name, which is
+                    // the outcome sweeping wants anyway.
                     match fs::remove_file(&path) {
                         Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => return Err(FsStoreError::io(error)),
                     }
+                } else {
+                    total += entry.metadata().map_err(FsStoreError::io)?.len();
                 }
             }
         }
-        Ok(())
+        Ok(total)
     }
 
     /// Durably create one file: temp + `fsync` + rename + directory

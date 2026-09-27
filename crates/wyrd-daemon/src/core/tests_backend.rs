@@ -278,6 +278,73 @@ fn into_live_stores_the_composition_config_budgets() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The retention quota reaches the mount as `ENOSPC`, through the real
+/// composition — node, live parts, backend, loop — rather than as a
+/// unit-level error variant. The errno mapping itself is already pinned
+/// in `fuse::tests_errors`; what this adds is the wiring the issue asked
+/// for: a commit refused at the quota surfaces as a POSIX failure, and
+/// the refusal leaves no file behind, so the boundary reads "no space"
+/// and the namespace is unchanged rather than half-applied.
+#[test]
+fn a_quota_refused_commit_reaches_the_mount_as_enospc() {
+    // One ceiling, one accountant: the config and the store are built
+    // from the same `RetainedBytes` so the count the check reads is the
+    // count the store keeps.
+    let (engine, dir, _) = scratch_drive();
+    let (mut config, retained) = LiveConfig::with_retained_quota(0);
+    config.interval = Duration::from_millis(10);
+    config.max_mutation_wait = Duration::from_secs(30);
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default().with_retained(retained)).unwrap();
+    // The ceiling is already reached by this device's own content, so
+    // the refusal is genuinely exercised rather than an empty store.
+    daemon.put_file("live.txt", b"shared").unwrap();
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
+    let backend = FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let loop_config = config;
+    let loop_handle = std::thread::spawn(move || {
+        let mut live = live;
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &loop_config,
+            &mut |_, _| {},
+        )
+    });
+
+    let reader = backend.open_at("live.txt").expect("baseline serves");
+    assert_eq!(
+        backend.create_at(1, "denied.txt", libc::O_RDWR),
+        Err(fuser::Errno::ENOSPC),
+        "a quota-refused create reads as no space at the boundary"
+    );
+    assert!(backend.release_handle(reader).is_ok());
+    assert_eq!(
+        backend.open_at("denied.txt").unwrap_err(),
+        fuser::Errno::ENOENT,
+        "the refused commit left no file behind"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A create refused `EMFILE` creates nothing: the handle-cap
 /// pre-check runs before the create mutation is submitted, so a
 /// saturated table fails without a namespace side effect. (The

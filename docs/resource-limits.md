@@ -50,7 +50,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Mailbox notification channel | 1024 events (const) | backpressure stalls the relay stream; the relay retains everything |
 | Mailbox held handovers | 1024 unacked (const) | `recv` stops pulling; held mail rotates so the engine drains free |
 | Engine intake held messages | `MAX_PENDING_MESSAGES` 1024 (const) | over-limit deferrals shed without consuming; relay redelivers |
-| Retained object bytes per device | `retained_bytes_quota` (unset — unlimited) | commit refused before its first write; `ENOSPC` at `flush`/`fsync`. The one bound here that survives the append-only store, and the only one an operator must opt into: derivation, counting, and its two stated limits (object store only, not the vault) are in `storage-growth.md` |
+| Retained object bytes, at the mounted commit boundary | `retained_bytes_quota` (unset — unlimited) | commit refused before its first write; `ENOSPC` at `flush`/`fsync`. Enforced **only** on the local write path: fetched bytes, the vault, and the fact log all raise the count without a refusal, so the device's total is not bounded by this number, and a remote author can spend a peer's local-write headroom by authoring content. Opt-in by embedding and wiring an accountant, like every other budget here — the `wyrd` binary takes no flags for any of them. Derivation and the full set of limits are in `storage-growth.md` |
 
 The mailbox and engine-intake bounds stay constants: they are
 protocol-adjacent, already bounded and backpressure-tested, and not

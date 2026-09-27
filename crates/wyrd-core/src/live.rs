@@ -244,6 +244,31 @@ pub struct LiveConfig {
     pub retained_bytes: Option<Arc<RetainedBytes>>,
 }
 
+impl LiveConfig {
+    /// A config with a retention ceiling, and the accountant to hand to
+    /// the store that maintains it.
+    ///
+    /// The two halves must be the same `RetainedBytes`: the ceiling is a
+    /// comparison against a number the store keeps, so a config pointing
+    /// at a different tally reads as permanently zero (refuse
+    /// everything) or permanently growing (bound nothing) — the exact
+    /// failure the composition-time refusal exists to catch, one layer
+    /// too late to catch. Building both from one call makes that
+    /// mis-wiring unrepresentable rather than merely documented:
+    ///
+    /// ```ignore
+    /// let (config, retained) = LiveConfig::with_retained_quota(limit);
+    /// let store = FsObjectStore::open_with(dir, Some(Arc::clone(&retained)))?;
+    /// ```
+    pub fn with_retained_quota(limit: u64) -> (Self, Arc<RetainedBytes>) {
+        let retained = RetainedBytes::new();
+        let mut config = LiveConfig::default();
+        config.budgets.retained_bytes_quota = Some(limit);
+        config.retained_bytes = Some(Arc::clone(&retained));
+        (config, retained)
+    }
+}
+
 impl Default for LiveConfig {
     fn default() -> Self {
         LiveConfig {
@@ -2765,7 +2790,7 @@ mod prereq_tests {
     #[test]
     fn a_reached_retained_quota_refuses_the_commit_before_it_spends() {
         let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("retained-quota");
-        let retained = Arc::new(RetainedBytes::default());
+        let (config, retained) = LiveConfig::with_retained_quota(0);
         let store = store.with_retained(Arc::clone(&retained));
         // The scratch drive's own history is already counted, so the
         // zero ceiling is genuinely reached rather than trivially empty.
@@ -2774,9 +2799,6 @@ mod prereq_tests {
             seeded > 0,
             "attaching seeds from what the store already holds"
         );
-        let mut config = LiveConfig::default();
-        config.budgets.retained_bytes_quota = Some(0);
-        config.retained_bytes = Some(Arc::clone(&retained));
         let mut node = live_over_configured(engine, store, &[head], &config);
 
         let committed = node.engine.current();
@@ -2809,13 +2831,10 @@ mod prereq_tests {
     #[test]
     fn a_commit_under_the_quota_lands_and_counts_its_retained_bytes() {
         let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("retained-under");
-        let retained = Arc::new(RetainedBytes::default());
+        // Generous enough that the commit lands whatever it retains.
+        let (config, retained) = LiveConfig::with_retained_quota(u64::MAX);
         let store = store.with_retained(Arc::clone(&retained));
         let seeded = retained.get();
-        let mut config = LiveConfig::default();
-        // Generous enough that the commit lands whatever it retains.
-        config.budgets.retained_bytes_quota = Some(u64::MAX);
-        config.retained_bytes = Some(Arc::clone(&retained));
         let mut node = live_over_configured(engine, store, &[head], &config);
 
         let committed = node.engine.current();
@@ -2842,11 +2861,8 @@ mod prereq_tests {
     #[test]
     fn reinserting_held_content_is_not_charged_twice() {
         let (engine, dir, store, chunk, _root, head) = scratch_file_drive("retained-dedup");
-        let retained = Arc::new(RetainedBytes::default());
+        let (config, retained) = LiveConfig::with_retained_quota(u64::MAX);
         let store = store.with_retained(Arc::clone(&retained));
-        let mut config = LiveConfig::default();
-        config.budgets.retained_bytes_quota = Some(u64::MAX);
-        config.retained_bytes = Some(Arc::clone(&retained));
         let mut node = live_over_configured(engine, store, &[head], &config);
 
         let payload = b"the very same bytes";
@@ -2879,6 +2895,89 @@ mod prereq_tests {
             retained.get(),
             after_first,
             "re-presenting identical content retains no additional bytes"
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The ceiling is "quota, plus whatever the next admitted commit
+    /// retains" — not "quota, and refuse the commit that would cross
+    /// it". The check compares bytes already retained, so a commit
+    /// starting one byte under is admitted and overshoots. Pinning the
+    /// boundary is the only way a reader of the docs can tell which of
+    /// those two bounds the code implements.
+    #[test]
+    fn the_commit_that_crosses_the_ceiling_is_admitted_and_overshoots() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("retained-crossing");
+        let (mut config, retained) = LiveConfig::with_retained_quota(u64::MAX);
+        let store = store.with_retained(Arc::clone(&retained));
+        let seeded = retained.get();
+
+        // Sit exactly one byte under the seeded total, so the next
+        // commit is the one that crosses.
+        let limit = seeded + 1;
+        config.budgets.retained_bytes_quota = Some(limit);
+        let mut node = live_over_configured(engine, store, &[head], &config);
+
+        assert!(
+            seeded < limit,
+            "the ceiling starts above what is retained, or nothing is testable"
+        );
+        node.apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
+            .unwrap();
+        assert!(
+            retained.get() > limit,
+            "the crossing commit lands and overshoots: {} > {limit}",
+            retained.get()
+        );
+
+        // And the commit after that is refused, at the overshot total.
+        let error = node
+            .apply_mutation(&MutationKind::Mkdir { path: "h".into() }, None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Store(StoreFailure::StorageFull),
+            "once over, the next local write is refused"
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Bytes the device did not author still raise the count, and
+    /// nothing refuses them. This is the interference channel the
+    /// normative docs now name: a remote author's content can spend a
+    /// peer's local-write headroom, so the first `ENOSPC` a peer sees
+    /// may be caused by a member on another device. The test pins the
+    /// behavior that makes the documentation true.
+    #[test]
+    fn bytes_retained_without_a_local_commit_still_raise_the_count() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("retained-foreign");
+        let (mut config, retained) = LiveConfig::with_retained_quota(u64::MAX);
+        let mut store = store.with_retained(Arc::clone(&retained));
+        let authored = retained.get();
+
+        // Stand in for a fetch: content this device never authored,
+        // landing in the same object store with no quota in scope.
+        let foreign = b"fetched from a peer, never authored here";
+        store.insert(ObjectKind::Chunk, foreign).unwrap();
+        assert_eq!(
+            retained.get(),
+            authored + foreign.len() as u64,
+            "a fetch charges the same accountant the commit check reads"
+        );
+
+        // With the ceiling now below the total, the local write is
+        // refused even though this device authored none of the excess.
+        config.budgets.retained_bytes_quota = Some(authored + 1);
+        let mut node = live_over_configured(engine, store, &[head], &config);
+        let error = node
+            .apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Store(StoreFailure::StorageFull),
+            "a peer's content can exhaust a local author's headroom"
         );
         drop(node);
         std::fs::remove_dir_all(dir).unwrap();

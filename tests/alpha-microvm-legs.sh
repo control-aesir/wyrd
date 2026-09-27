@@ -118,6 +118,12 @@ leg_fetch_owner() {
   echo "stale-2-bytes" > "$MNTS/xowner-f/stale-2.txt"
   poll_until 120 test -f "$E2E_ROOT/member-listed-done" \
     || die "member never listed the stale files"
+  # The member creates a scratch file while this mount is still up
+  # (see member leg): creation forces the current head's tree object
+  # to materialize, which the later offline delete needs local. Do
+  # not stop before it completes.
+  poll_until 180 test -f "$E2E_ROOT/member-scratch-done" \
+    || die "member never created the scratch file"
   stop_mount xowner-f INT
   check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   touch "$E2E_ROOT/owner-stopped"
@@ -125,12 +131,18 @@ leg_fetch_owner() {
     || die "member never finished the dead-route probes"
   pass "owner stayed down while the member probed the dead route"
   # Recovery setup: remount on a fresh endpoint (new iroh identity
-  # over the same drive) and write a new file. The member deleted
-  # stale-1.txt while the route was down; this mount must converge
-  # that delete BEFORE writing, or the new write forks the head
-  # (the suite has no conflict legs). Absence of the file in this
+  # over the same drive) and write a new file. The member created a
+  # scratch file and deleted stale-1 while the route was down; this
+  # mount must converge both BEFORE writing, or the new write forks
+  # the head (the suite has no conflict legs). File presence in this
   # mount's own view is the self-synchronizing signal — no sleeps.
+  # Reading the scratch file also localizes its bytes: phase 6
+  # exports this drive offline and fails closed on remote-only
+  # content.
   start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
+  poll_until 120 converged "$MNTS/xowner-f2/scratch-del.txt" "scratch" \
+    || die "owner never converged the scratch file's bytes"
+  pass "owner converges the member's scratch write with bytes"
   poll_until 120 bash -c "! test -e '$MNTS/xowner-f2/stale-1.txt'" \
     || die "owner never converged the member's offline delete"
   pass "owner converges the offline delete before writing"
@@ -190,6 +202,17 @@ leg_fetch_member() {
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'stale-2.txt'" \
     || die "member never listed stale-2.txt"
   touch "$E2E_ROOT/member-listed-done"
+  # Scratch write while the owner is still up: creating a file
+  # forces the current head's tree object to materialize (reads
+  # never fetch tree objects, only manifests and chunks), and the
+  # offline delete below needs that tree local. Completion is the
+  # signal — success means the trees are local, so no timing guess.
+  # The owner waits for this before stopping (see owner leg).
+  echo "scratch" > "$MNTS/xmember-f/scratch-del.txt"
+  poll_until 120 converged "$MNTS/xmember-f/scratch-del.txt" "scratch" \
+    || die "scratch write never became readable"
+  pass "scratch write forces tree materialization while owner is up"
+  touch "$E2E_ROOT/member-scratch-done"
   poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
     || die "owner never stopped for the dead-route probes"
   # Dead route, held manifest: the bytes are announced but
@@ -211,11 +234,12 @@ leg_fetch_member() {
   grep -q "No such file or directory" "$E2E_ROOT/never-announced.err" \
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
-  # Offline delete of stale-1 under the pre-restart head: identical
-  # to the green suite's authorship proof (same head shape, same
-  # local trees), and the owner converges it before writing again
-  # (see owner leg), so no head fork. stale-2 stays for the recovery
-  # probe below.
+  # Offline delete of stale-1: the scratch write above authored a
+  # head whose tree object is local by construction, so this delete
+  # needs nothing from the network — same local-first authorship the
+  # green suite proved, now deterministic instead of timing-lucky.
+  # The owner converges it before writing again (see owner leg), so
+  # no head fork. stale-2 stays for the recovery probe below.
   timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \
     || die "member cannot author while the route is down"
   pass "member authors offline with the route down"

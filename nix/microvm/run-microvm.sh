@@ -6,11 +6,15 @@
 # a host bridge). One command end to end:
 #
 #   sudo ./nix/microvm/run-microvm.sh [--state-dir DIR] [--fresh] [--keep]
+#   sudo ./nix/microvm/run-microvm.sh --teardown
 #
 #   --state-dir DIR  host state root (default /var/lib/wyrd-microvm/state)
 #   --fresh          wipe $STATE_DIR/run before booting (default: keep,
 #                    so a failed run's drives survive for forensics)
 #   --keep           leave VMs and network up afterwards for debugging
+#   --teardown       stop a kept run (daemons, taps, bridge) and exit;
+#                    takes the run lock, so it refuses while a suite
+#                    is active. State dirs and logs are retained.
 #
 # Flow: build wyrd + three VM runners -> bridge/taps -> ephemeral ssh
 # key + e2e-env.sh into the state share -> boot virtiofsd+qemu per VM
@@ -23,16 +27,18 @@
 set -euo pipefail
 
 need() { command -v "$1" >/dev/null || { echo "error: missing host tool: $1" >&2; exit 2; }; }
-for t in nix ssh ssh-keygen ip ss timeout flock; do need "$t"; done
+for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill; do need "$t"; done
 
 STATE_DIR="/var/lib/wyrd-microvm/state"
 FRESH=0
 KEEP=0
+TEARDOWN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --fresh) FRESH=1; shift ;;
     --keep) KEEP=1; shift ;;
+    --teardown) TEARDOWN=1; shift ;;
     *) echo "error: unknown flag $1 (see header)" >&2; exit 2 ;;
   esac
 done
@@ -92,6 +98,20 @@ teardown() {
   fi
 }
 trap teardown EXIT
+
+# Standalone teardown for kept runs: daemons, taps, bridge, then
+# out (--keep is meaningless here and ignored). The EXIT trap
+# re-runs the same kills idempotently afterwards.
+# Never inline SOCK_PAT into `bash -c '...'`: pkill matches our own
+# argv and kills this shell. The variable form is safe.
+if [[ "$TEARDOWN" == 1 ]]; then
+  echo "==> tearing down kept run"
+  kill_stale_daemons
+  for t in tap-o tap-n tap-r; do ip link del "$t" 2>/dev/null || true; done
+  ip link del "$BRIDGE" 2>/dev/null || true
+  echo "torn down: daemons, taps, and $BRIDGE removed ($STATE_DIR retained)"
+  exit 0
+fi
 
 # Reap strangers first: kept runs, killed ssh sessions, and
 # supervisor restart loops all leave daemons holding our sockets.

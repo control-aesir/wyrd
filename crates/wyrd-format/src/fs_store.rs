@@ -144,21 +144,18 @@ impl FsObjectStore {
             retained,
         };
         fs::create_dir_all(store.objects_dir()).map_err(FsStoreError::io)?;
-        // The walk always clears debris. It only totals when an
+        // One traversal either way; the total is asked for only when an
         // accountant is attached, because `open()` is the shipped
-        // constructor and the total costs an extra stat per object on a
-        // store holding millions of them — a price only worth paying
-        // when something reads the number.
-        match store.retained.clone() {
-            Some(retained) => {
-                // One accountant per store. The seed is additive, so two
-                // stores sharing one tally over one directory would count
-                // the same disk twice and halve the ceiling; attach a
-                // fresh `RetainedBytes` per store, or none at all.
-                let seeded = store.sweep_and_total()?;
-                retained.add(seeded);
-            }
-            None => store.sweep_temps()?,
+        // constructor and nothing reads the number without one.
+        let mut seeded = 0u64;
+        let wanted = store.retained.is_some();
+        store.sweep(if wanted { Some(&mut seeded) } else { None })?;
+        if let Some(retained) = &store.retained {
+            // One accountant per store. The seed is additive, so two
+            // stores sharing one tally over one directory would count the
+            // same disk twice and halve the ceiling; attach a fresh
+            // `RetainedBytes` per store, or none at all.
+            retained.add(seeded);
         }
         Ok(store)
     }
@@ -169,11 +166,10 @@ impl FsObjectStore {
     /// `ENOSPC`" into a diagnosis at boot.
     ///
     /// Read-only on purpose, and deliberately a separate walk from
-    /// [`Self::sweep_and_total`]. Merging them would make this query
-    /// delete `.tmp` debris, which no reader of a byte count expects and
-    /// which would contradict the store's stated rule that only `open`
-    /// removes temps. It is not on any current path, so the second walk
-    /// at open is the only cost, and `open` still pays for exactly one.
+    /// [`Self::sweep`]. Merging them would make this query delete `.tmp`
+    /// debris, which no reader of a byte count expects and which would
+    /// contradict the store's stated rule that only `open` removes temps.
+    /// It is on no current path, and `open` still walks the tree once.
     pub fn retained_bytes(&self) -> Result<u64, FsStoreError> {
         let mut total = 0u64;
         let mut stack = vec![self.objects_dir()];
@@ -218,12 +214,27 @@ impl FsObjectStore {
             .find(|(_, path)| path.is_file())
     }
 
-    /// Remove every `.tmp` file under the store: debris from writers
-    /// that crashed between temp-write and rename. This is the shipped
-    /// path's walk — the same traversal `master` had, with no `stat` per
-    /// object, because nothing asks for a byte count when no accountant
-    /// is attached.
-    fn sweep_temps(&self) -> Result<(), FsStoreError> {
+    /// Walk the object tree, removing every `.tmp` file, and total the
+    /// published objects when `total` asks for it.
+    ///
+    /// One traversal, two jobs, and the total is opt-in: `metadata()` per
+    /// object is a real cost on a store holding millions of them, and the
+    /// shipped `open()` path has no accountant, so it pays only for the
+    /// debris sweep — the traversal master had. Only a store with a
+    /// `RetainedBytes` attached asks for the number.
+    ///
+    /// The two totals in this file (here and [`Self::retained_bytes`])
+    /// must agree, or the startup cross-check cannot diagnose anything.
+    /// They differ only in what they do with an entry: this one deletes
+    /// temps, that one leaves them. `is_dir` decides recursion in both,
+    /// so symlinks are treated identically.
+    ///
+    /// A `read_dir` that fails with `NotFound` is tolerated and skipped.
+    /// That is a behaviour change from master, which propagated the
+    /// error: a fanout directory removed by a concurrent process is
+    /// debris, not a failure, and a mount that disappeared under us is
+    /// not worth failing `open` over.
+    fn sweep(&self, mut total: Option<&mut u64>) -> Result<(), FsStoreError> {
         let mut stack = vec![self.objects_dir()];
         while let Some(current) = stack.pop() {
             let entries = match fs::read_dir(&current) {
@@ -237,62 +248,22 @@ impl FsObjectStore {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "tmp") {
-                    // A concurrent writer may rename the temp into place
-                    // between the listing and the removal: NotFound means
-                    // the file already reached its live name, which is
-                    // the outcome sweeping wants anyway.
+                    // Debris from a writer that crashed between temp-write
+                    // and rename. A concurrent writer may rename the temp
+                    // into place between the listing and the removal:
+                    // NotFound means the file already reached its live
+                    // name, which is the outcome sweeping wants anyway.
                     match fs::remove_file(&path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => return Err(FsStoreError::io(error)),
                     }
+                } else if let Some(total) = total.as_deref_mut() {
+                    *total += entry.metadata().map_err(FsStoreError::io)?.len();
                 }
             }
         }
         Ok(())
-    }
-
-    /// The `open`-time walk: removes every `.tmp` file and returns the
-    /// published byte total in one traversal. These were two walks; this
-    /// one already visits every entry and already knows which are temps,
-    /// so a counted store on a drive holding millions of objects pays for
-    /// the tree once rather than twice. The only caller that removes
-    /// anything — see [`Self::retained_bytes`] for the read-only count.
-    ///
-    /// Temps are excluded from the total: one is by definition not yet
-    /// retained content, and this walk is about to delete them.
-    fn sweep_and_total(&self) -> Result<u64, FsStoreError> {
-        let mut total = 0u64;
-        let mut stack = vec![self.objects_dir()];
-        while let Some(current) = stack.pop() {
-            // The objects root may not exist yet on a fresh drive; an
-            // absent directory is an empty store, not a failure.
-            let entries = match fs::read_dir(&current) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(FsStoreError::io(error)),
-            };
-            for entry in entries {
-                let entry = entry.map_err(FsStoreError::io)?;
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "tmp") {
-                    // A concurrent writer may rename the temp into place
-                    // between the listing and the removal: NotFound means
-                    // the file already reached its live name, which is
-                    // the outcome sweeping wants anyway.
-                    match fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(FsStoreError::io(error)),
-                    }
-                } else {
-                    total += entry.metadata().map_err(FsStoreError::io)?.len();
-                }
-            }
-        }
-        Ok(total)
     }
 
     /// Durably create one file: temp + `fsync` + rename + directory

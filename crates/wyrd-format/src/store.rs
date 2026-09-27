@@ -196,6 +196,14 @@ impl MemoryObjectStore {
     /// holds. Seeding here rather than leaving it to the caller is what
     /// keeps a reopened drive's count honest: a store that already holds
     /// a drive's history starts counted, not empty.
+    ///
+    /// One accountant per store, for the same reason the disk store
+    /// documents at its charge site: the seed is additive, so cloning an
+    /// accounted store and re-attaching the same tally — this type
+    /// derives `Clone` — charges the copy's whole contents a second time
+    /// and halves the ceiling. The disk store has the same hazard and
+    /// scopes it as trusted-directory territory; the note is here so the
+    /// asymmetry does not get copied into a production store.
     pub fn with_retained(mut self, retained: Arc<RetainedBytes>) -> Self {
         retained.add(self.retained_bytes());
         self.retained = Some(retained);

@@ -2780,6 +2780,57 @@ mod prereq_tests {
         .0
     }
 
+    /// At the ceiling, a mutation that would retain nothing is still
+    /// refused. The check runs before the mutation is inspected, so it
+    /// cannot know what the store would have kept — and that is the one
+    /// place this bound parts company with a real full disk, where a
+    /// zero-byte write still succeeds. The document says so; this makes
+    /// it executable rather than asserted, because the alternative is a
+    /// test that would have to be edited to contradict the prose.
+    #[test]
+    fn at_the_ceiling_a_content_identical_commit_is_still_refused() {
+        let (engine, dir, store, chunk, _root, head) = scratch_file_drive("retained-noop");
+        let (config, retained) = LiveConfig::with_retained_quota(0);
+        let store = store.with_retained(Arc::clone(&retained));
+        let seeded = retained.get();
+        let mut node = live_over_configured(engine, store, &[head], &config);
+
+        // The exact image the drive already holds, so every chunk of it
+        // is in the store and the commit would retain zero new bytes.
+        let held = node
+            .store
+            .read()
+            .unwrap()
+            .get(&chunk)
+            .unwrap()
+            .expect("the scratch drive holds this chunk");
+        let before = node.engine.current();
+        let error = node
+            .apply_mutation(
+                &MutationKind::CommitFile {
+                    path: "f".into(),
+                    base: FileIdentity::new(held.len() as u64, false, vec![chunk]),
+                    executable: false,
+                    content: held,
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Store(StoreFailure::StorageFull),
+            "a mutation retaining nothing is refused at the ceiling, unlike a full disk"
+        );
+        assert_eq!(
+            retained.get(),
+            seeded,
+            "and it retains nothing on the way to being refused"
+        );
+        assert_eq!(node.engine.current(), before, "and commits no snapshot");
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The retained-bytes quota refuses the commit at its first write.
     /// With the ceiling already reached, a mutation fails
     /// `StorageFull` — the classification that reaches the mount as

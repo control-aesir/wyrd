@@ -271,8 +271,10 @@ commits are valid work, and GC is the only mechanism that can make old
 bytes stop existing. That is open question 1, and it is a `trust.md`
 authorization change rather than a resource limit.
 
-The quota is narrower than "a ceiling on storage" in four ways, and each
-one is a place where the number understates what the device holds.
+The quota is narrower than "a ceiling on storage" in three ways, and each
+one is a place where the number understates what the device holds. The
+fourth thing below is not that: it is what running into the ceiling costs,
+which is a different question and the one an operator meets first.
 
 **Only the mounted write path refuses.** The check sits in the live
 node's commit boundary, ahead of every arm of `apply_mutation`. Four
@@ -292,7 +294,7 @@ way the device's retained bytes are *not* bounded by the configured
 number, and the number can be crossed by paths that
 have no ceiling at all.
 
-**Which makes it an interference channel.** Because those unrefused paths
+**And that makes it an interference channel.** Because those unrefused paths
 do charge the accountant, a remote author can spend a peer's headroom
 simply by authoring content — the peer accepts the closure, its count
 climbs past the quota, and the first refusal lands on the peer's own next

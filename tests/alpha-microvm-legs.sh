@@ -126,16 +126,21 @@ leg_fetch_owner() {
 # file's announcement via listing, then prove open() blocks for the
 # bytes with ONE cat (no retry loop). List the stale file for its
 # manifest only, then probe the dead route after the owner stops:
-# the stale probe must fail closed and bounded (EIO with the errno
-# to prove it), the never-announced path must fail fast (ENOENT —
-# open blocks for content after announce, not for announcements
-# themselves). Close with the dedupe proof over the step-8
-# restart's redelivery, then delete the remote-only file so the
-# offline export phase stays meaningful. Failure-then-reannounce
-# recovery without remount is deliberately NOT asserted here: four
-# proving runs showed the mount never recovers that identity (filed
-# as a product issue), and the design doc only promises
-# timeout-then-completion, not failure-then-retry.
+# the stale probe exercises read-side chunk demand (the manifest is
+# already local, so open succeeds and the bounded EIO comes from
+# the read) with the errno to prove it; the never-announced path
+# fails fast with ENOENT — open blocks for content after announce,
+# not for announcements themselves. Close with the dedupe proof
+# over the step-8 restart's redelivery, then delete the remote-only
+# file so the offline export phase stays meaningful.
+# Two matrix items are deliberately NOT e2e-legged here:
+# failure-then-reannounce recovery without remount (filed as
+# nostr:nevent1qqsp9u0jt79kepcrmx8zxcmzzxce0cf3c8fvzs32k7uqjgeajlzzscqpz9mhxue69uhkwunpwdczuap49eehg5s3hry
+# after four proving runs showed the mount never recovers that
+# identity), and timeout-then-completion (the waiter leaves with
+# EIO while the fetch continues — unit-pinned by
+# late_completion_caches_for_the_next_waiter in
+# crates/wyrd-core/src/want.rs, no e2e leg).
 leg_fetch_member() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane member leg"
@@ -160,13 +165,13 @@ leg_fetch_member() {
   poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
     || die "owner never stopped for the dead-route probes"
   # Dead route, held manifest: the bytes are announced but
-  # unfetchable. The open must fail closed and bounded.
+  # unfetchable. The read must fail closed and bounded.
   local rc=0
   timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >/dev/null 2>"$E2E_ROOT/stale-1.err" || rc=$?
-  [[ "$rc" == 1 ]] || die "stale-manifest open returned rc $rc, want EIO (1)"
+  [[ "$rc" == 1 ]] || die "stale-manifest read returned rc $rc, want EIO (1)"
   grep -q "Input/output error" "$E2E_ROOT/stale-1.err" \
-    || die "stale-manifest open was not EIO: $(cat "$E2E_ROOT/stale-1.err")"
-  pass "announced-but-unfetchable open fails closed and bounded"
+    || die "stale-manifest read was not EIO: $(cat "$E2E_ROOT/stale-1.err")"
+  pass "announced-but-unfetchable read fails closed and bounded"
   # Never announced at all: resolve fails fast, no 30s wait for an
   # announcement that may never come.
   rc=0
@@ -176,15 +181,16 @@ leg_fetch_member() {
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
   touch "$E2E_ROOT/member-fetch-done"
-  # Dedupe proof over the step-8 restart's redelivery: every id is
-  # recorded once (record() is a no-op for known ids), so the file
-  # holds no duplicate line; the count backstops the durable bound
-  # (65,536 in prod — unit tests pin eviction at the 512 test bound).
+  # Dedupe proof over the step-8 restart's redelivery: every
+  # retained id is recorded once (record() is a no-op for known
+  # ids), so while the run stays under the retention bound the file
+  # holds no duplicate line. Past the bound an evicted id may
+  # legitimately re-append after redelivery (seen_store.rs:21-25),
+  # so this is a below-the-bound invariant; the bound itself is
+  # pinned by unit tests at the 512 test bound.
   [[ -f "$d/mailbox.seen" ]] || die "member mailbox.seen missing"
   [[ -z "$(sort "$d/mailbox.seen" | uniq -d)" ]] \
     || die "mailbox.seen holds duplicate ids: redelivery double-appended"
-  [[ "$(wc -l < "$d/mailbox.seen")" -le 65536 ]] \
-    || die "mailbox.seen breached the durable bound"
   pass "redelivery never double-appends the dedupe log"
   # Remove the remote-only file while the route is still dead:
   # authorship is local-first, so the delete must work offline, and

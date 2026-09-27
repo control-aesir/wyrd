@@ -228,7 +228,10 @@ unbounded-open-latency avoidance. What is *not* traded away:
 The filesystem-visible contract stays one sentence: **"make this path
 readable within the deadline"** — never "fetch object X"; the
 materialization layer decides whether that means one object or twenty,
-and FUSE never knows.
+and FUSE never knows. Resolution against the projected namespace is
+not demand: a path no installed head contains is `ENOENT` immediately —
+open blocks for content *after* announce, never for announcements
+themselves.
 
 ## Locking discipline
 

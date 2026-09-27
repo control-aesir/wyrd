@@ -131,7 +131,7 @@ wait "$LEG_O" || die "restarted owner leg failed (see logs/leg-restart-owner.out
 pass "route update rewires fetch across hosts"
 
 # --- phase 5: fetch plane ---------------------------------------------
-echo "=== microvm 10: fetch plane ==="
+echo "=== microvm 9: fetch plane ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
   "$RUN/owner-stopped" "$RUN/member-fetch-done" "$RUN/cold-2.got" \
   "$RUN/stale-1.err" "$RUN/never-announced.err"
@@ -146,7 +146,11 @@ wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
 pass "blocking open, bounded EIO, and dedupe hold across hosts"
 
 # --- phase 6: offline reopen --------------------------------------------
-echo "=== microvm 9: offline reopen ==="
+# Depends on phase 5's remote-only delete (fetch-member removes
+# stale-1.txt with the route down): the export below fails closed
+# on remote-only content, so without that delete this phase dies
+# at the member export. Correct product behavior, coupled phases.
+echo "=== microvm 10: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"
 as_guest "$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
@@ -171,6 +175,10 @@ as_guest "$WYRD_BIN" export \
   || die "owner export lost the post-restart write"
 [[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-1" ]] \
   || die "member export lost the cross-host write"
+# The fetch phase pulled cold-2.txt over the network; the export
+# proves the verified remote object survives process death.
+[[ "$(cat "$RUN/export-member/cold-2.txt")" == "cold-bytes" ]] \
+  || die "member export lost the fetched cold-2.txt"
 pass "flush-committed state survives restart on both drives"
 
 # Host-side leak check over every log the host wrote (guest logs

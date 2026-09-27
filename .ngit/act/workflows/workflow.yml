@@ -11,6 +11,8 @@ on:
       - "rust-toolchain.toml"
       - "flake.nix"
       - "flake.lock"
+      - "nix/**"
+      - "tests/**"
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
       - ".ngit/scripts/build.sh"
@@ -24,6 +26,8 @@ on:
       - "rust-toolchain.toml"
       - "flake.nix"
       - "flake.lock"
+      - "nix/**"
+      - "tests/**"
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
       - ".ngit/scripts/build.sh"
@@ -239,7 +243,7 @@ jobs:
         continue-on-error: true
         uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'nix/**') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           token: unused
 

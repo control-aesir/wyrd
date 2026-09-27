@@ -8,9 +8,15 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Hardened e2e gate (issue: microvm.nix reproducible suite). Linux
+    # only: vfkit on macOS lacks the 9p shares and tap/bridge
+    # networking the topology needs, and Apple Silicon provides no
+    # nested KVM — the gate runs on a real Linux host (odin).
+    microvm.url = "github:microvm-nix/microvm.nix";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, crane, rust-overlay, ... }:
+  outputs = { self, nixpkgs, crane, rust-overlay, microvm, ... }:
     let
       # Product platforms. x86_64-darwin is deliberately absent even though
       # rust-toolchain.toml lists the target: no builder covers it, so it
@@ -123,9 +129,49 @@
       # The package build plus the release archive, per system.
       # `nix flake check` builds the current system's entries; CI covers
       # linux, the maintainer's machine darwin.
+      # On x86_64-linux the microVM runners join the gate: they prove
+      # the VM topology evaluates and builds (kernel, shares, tapes).
+      # Suite *execution* needs KVM and runs on the maintainer's Linux
+      # host via nix/microvm/run-microvm.sh, never in CI.
       checks = forAllSystems (system: {
         wyrd = self.packages.${system}.wyrd;
         wyrd-dist = self.packages.${system}.wyrd-dist;
+      } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        wyrd-microvm-peer-o =
+          self.nixosConfigurations.wyrd-peer-o.config.microvm.runner.qemu;
+        wyrd-microvm-peer-n =
+          self.nixosConfigurations.wyrd-peer-n.config.microvm.runner.qemu;
+        wyrd-microvm-relay =
+          self.nixosConfigurations.wyrd-relay.config.microvm.runner.qemu;
       });
+      # Hardened e2e topology: two peers plus a relay, each a microVM
+      # definition (see nix/microvm/). x86_64-linux only: KVM hosts
+      # are x86_64, and the guests carry the flake's wyrd package so
+      # the suite executes the same binary both sides.
+      nixosConfigurations =
+        let
+          microvmGuest = role:
+            nixpkgs.lib.nixosSystem {
+              system = "x86_64-linux";
+              modules = [
+                microvm.nixosModules.microvm
+                ./nix/microvm/common.nix
+                ./nix/microvm/${role}.nix
+                # The suite executes WYRD_BIN in-guest, and the host
+                # store is not visible there — so the guests carry the
+                # same package. Same content-addressed path both
+                # sides, no rewriting needed.
+                ({ ... }: {
+                  environment.systemPackages =
+                    [ self.packages.x86_64-linux.wyrd ];
+                })
+              ];
+            };
+        in
+        {
+          wyrd-peer-o = microvmGuest "peer-o";
+          wyrd-peer-n = microvmGuest "peer-n";
+          wyrd-relay = microvmGuest "relay";
+        };
     };
 }

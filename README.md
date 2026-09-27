@@ -160,6 +160,26 @@ closure):
 The guest script is `tests/alpha-lima.sh`; logs land in
 `/tmp/lima/logs/`.
 
+The hardened gate is the microVM suite: two peer VMs plus a relay VM
+on a Linux KVM host, running the same shared core (`tests/alpha-*.sh`
+via `tests/alpha-common.sh`) plus multi-host convergence, serving
+restart, and shutdown legs across real guest boundaries:
+
+```bash
+sudo ./nix/microvm/run-microvm.sh --fresh   # full run on the KVM host
+sudo ./nix/microvm/run-microvm.sh --keep     # leave VMs up for debugging
+sudo ./nix/microvm/run-microvm.sh --teardown # stop a kept run (daemons, taps, bridge)
+```
+
+Linux with `/dev/kvm` is required (no nested KVM under macOS
+virtualization, and vfkit lacks the tap/bridge networking the
+topology needs). The topology is declared in `nix/microvm/`
+(`flake.nix` `nixosConfigurations.wyrd-*`); `nix flake check` on
+x86_64-linux builds the three runners as the eval+build gate,
+while suite *execution* stays on the KVM host. Logs land under
+`/var/lib/wyrd-microvm/state/run/logs` (overridable with
+`--state-dir`).
+
 On macOS, the `wyrd-cli` and `wyrd-contracts` test binaries link the
 system FUSE library at load, and `wyrd mount` needs the kernel extension,
 so running them requires system macFUSE: `brew install --cask macfuse`,

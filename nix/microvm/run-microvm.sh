@@ -36,11 +36,6 @@ done
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
 cd "$ROOT"
 
-# Reap strangers first: kept runs, killed ssh sessions, and
-# supervisor restart loops all leave daemons holding our sockets.
-# Idempotent: a no-op when nothing is running.
-kill_stale_daemons
-
 BRIDGE="br-wyrd"
 NET="10.0.7"
 RUN="$STATE_DIR/run"
@@ -85,6 +80,12 @@ teardown() {
   fi
 }
 trap teardown EXIT
+
+# Reap strangers first: kept runs, killed ssh sessions, and
+# supervisor restart loops all leave daemons holding our sockets.
+# Idempotent: a no-op when nothing is running. Placed after the
+# definitions above; bash reads top-down.
+kill_stale_daemons
 
 echo "==> state dir $STATE_DIR"
 mkdir -p "$RUN" "$RUN/logs" "$WORK"

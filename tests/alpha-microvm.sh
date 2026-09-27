@@ -38,6 +38,13 @@ PASS=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 die() { echo "  FAIL: $1" >&2; exit 1; }
 
+# The orchestrator runs as root (taps, VMs), but share files belong
+# to uid 1000 (guest e2e, the only normal user) — and the credential
+# hardening refuses cross-uid opens both directions. So every host
+# wyrd invocation drops privilege to 1000 first. setpriv works with
+# numeric ids and needs no passwd entry, unlike su/runuser.
+as_guest() { setpriv --reuid 1000 --regid 1000 --clear-groups -- "$@"; }
+
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
 on_o() { $SSH "$PEER_O" "$@"; }
 on_n() { $SSH "$PEER_N" "$@"; }
@@ -56,9 +63,12 @@ GMC="$GUEST_RUN/creds/member-n"
 GMD="$GUEST_RUN/drives/member-n"
 mkdir -p "$MC" "$MD"
 # Credential bytes without python: od + tr are always present.
+# Created as root, then handed to uid 1000: the guest legs open
+# these, and cross-uid opens fail closed.
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$MC/identity"
 printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$MC/passphrase"
 chmod 600 "$MC/identity" "$MC/passphrase"
+chown -R 1000:1000 "$MC" "$MD"
 # Guests must carry the baked suite, the runner-written env, and a
 # working wyrd binary from the shared host store before anything else.
 on_n "test -f $GUEST_TESTS/alpha-common.sh && test -f $GUEST_ENV" \
@@ -68,19 +78,19 @@ on_n "source $GUEST_ENV; test -x \"\$WYRD_BIN\"" \
 on_o "source $GUEST_ENV; test -x \"\$WYRD_BIN\"" \
   || die "peer-o cannot execute WYRD_BIN from the shared store"
 pass "both peers carry the suite and execute the shared binary"
-"$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
+as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" pairing-request "$RUN/pairing-n.txt" >"$RUN/logs/pairing-n.out" 2>"$RUN/logs/pairing-n.stderr" \
   || die "member-n pairing-request failed"
 pass "member-n pairing stages on the host"
 DEV="$(grep '^device ' "$RUN/pairing-n.txt" | cut -d' ' -f2)"
 KEY="$(grep '^encryption-key ' "$RUN/pairing-n.txt" | cut -d' ' -f2)"
 [[ "${#DEV}" == 64 && "${#KEY}" == 64 ]] || die "member-n pairing material malformed"
-"$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
+as_guest "$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
   --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" \
   invite "$DEV" "$KEY" "$RUN/invitation-n" >"$RUN/logs/invite-n.out" 2>"$RUN/logs/invite-n.stderr" \
   || die "owner invite of member-n failed"
 pass "owner invites member-n"
-"$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
+as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" join "$RUN/invitation-n" >"$RUN/logs/join-n.out" 2>"$RUN/logs/join-n.stderr" \
   || die "member-n join failed"
 pass "member-n joins"
@@ -115,9 +125,9 @@ pass "route update rewires fetch across hosts"
 
 # --- phase 5: offline reopen --------------------------------------------
 echo "=== microvm 9: offline reopen ==="
-"$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
+as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"
-"$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
+as_guest "$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
   --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" id \
   >"$RUN/logs/reopen-o.out" 2>&1 || die "owner drive does not reopen"
 pass "both drives reopen offline after unmount"

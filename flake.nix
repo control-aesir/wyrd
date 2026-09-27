@@ -146,8 +146,8 @@
       });
       # Hardened e2e topology: two peers plus a relay, each a microVM
       # definition (see nix/microvm/). x86_64-linux only: KVM hosts
-      # are x86_64, and the runner pins the same system for the wyrd
-      # package the guests execute from the shared host store.
+      # are x86_64, and the guests carry the flake's wyrd package so
+      # the suite executes the same binary both sides.
       nixosConfigurations =
         let
           microvmGuest = role:
@@ -157,6 +157,14 @@
                 microvm.nixosModules.microvm
                 ./nix/microvm/common.nix
                 ./nix/microvm/${role}.nix
+                # The suite executes WYRD_BIN in-guest, and the host
+                # store is not visible there — so the guests carry the
+                # same package. Same content-addressed path both
+                # sides, no rewriting needed.
+                ({ ... }: {
+                  environment.systemPackages =
+                    [ self.packages.x86_64-linux.wyrd ];
+                })
               ];
             };
         in

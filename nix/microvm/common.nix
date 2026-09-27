@@ -1,9 +1,9 @@
 # nix/microvm/common.nix — shared base for every wyrd microVM guest.
 # Fully provisioned at build time: the bridge network has no uplink,
 # so guests cannot fetch anything after boot (no `nix profile add`
-# inside). The wyrd binary itself is NOT baked here — guests execute
-# it from the host nix store, which microvm.nix shares read-only.
-# The runner passes its store path via the state share's e2e-env.sh.
+# inside). The wyrd binary rides the closure too (see the inline
+# module in flake.nix): the host store is not visible in-guest, and
+# the same content-addressed path serves both sides.
 { config, pkgs, lib, ... }:
 {
   options.wyrd = {

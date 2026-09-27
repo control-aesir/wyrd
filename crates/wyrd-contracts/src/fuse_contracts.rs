@@ -258,13 +258,19 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     // initial head serves `bodies[0]`, so the rotating set starts at
     // `bodies[1]`.
     let published_bodies: Vec<_> = bodies[1..].to_vec();
-    let bodies = Arc::new(bodies);
     let rotating = published.len();
+    assert!(
+        rotating > 1,
+        "phase two needs at least two rotating versions: with one, pre- and post-publication coincide and the rendezvous passes vacuously"
+    );
 
     // Workers run on spawned threads (not a scope) so a deadlock
     // fails at a bounded join instead of hanging the suite: every
     // handle shared here is `'static` through its `Arc`.
     let start = Arc::new(std::sync::Barrier::new(READERS + 1));
+    // Results travel as `Result`: a worker-side harness failure
+    // (open/read/release refusing) must fail here with its own
+    // cause, never sixty seconds later mislabeled as a deadlock.
     let (read_tx, read_rx) = std::sync::mpsc::channel();
     for _ in 0..READERS {
         let backend = Arc::clone(&backend);
@@ -273,13 +279,13 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
         std::thread::spawn(move || {
             start.wait();
             for _ in 0..READS_PER_THREAD {
-                let handle = backend.open_at("v.txt").unwrap();
-                let bytes = backend.read_handle(handle, 0, 64).unwrap();
-                backend.release_handle(handle).unwrap();
-                // No assertion here by design: a panic on a detached
-                // thread never fails this test — the bytes travel to
-                // the main thread, which asserts each one below.
-                read_tx.send(bytes).unwrap();
+                let outcome = (|| -> Result<Vec<u8>, fuser::Errno> {
+                    let handle = backend.open_at("v.txt")?;
+                    let bytes = backend.read_handle(handle, 0, 64)?;
+                    backend.release_handle(handle)?;
+                    Ok(bytes)
+                })();
+                read_tx.send(outcome).unwrap();
             }
         });
     }
@@ -289,25 +295,27 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     let (published_tx, published_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         publish_start.wait();
-        for index in 0..PUBLICATIONS {
-            publish_backend
-                .publish_without_revision(DriveView::shared(
-                    publish_backend.store_handle().unwrap(),
+        let outcome = (|| -> Result<(), fuser::Errno> {
+            for index in 0..PUBLICATIONS {
+                publish_backend.publish_without_revision(DriveView::shared(
+                    publish_backend.store_handle()?,
                     RemoteOnlyMaterialization,
                     mount_heads(vec![publish_heads[index % rotating].clone()]),
-                ))
-                .unwrap();
-        }
-        published_tx.send(()).unwrap();
+                ))?;
+            }
+            Ok(())
+        })();
+        published_tx.send(outcome).unwrap();
     });
 
     // Phase one: every read is asserted whole-version here on the
     // main thread, so a tear fails at its own assertion with its own
     // message instead of surfacing sixty seconds later as a hang.
     for _ in 0..(READERS * READS_PER_THREAD) {
-        let bytes = read_rx.recv_timeout(HANG_BOUND).expect(
+        let outcome = read_rx.recv_timeout(HANG_BOUND).expect(
             "every read arrived within the hang bound: a deadlock fails here, not in a hang",
         );
+        let bytes = outcome.expect("a worker-side open/read/release refused: harness failure");
         assert!(
             bodies.contains(&bytes),
             "a concurrent read is always one whole published version"
@@ -315,11 +323,12 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     }
     published_rx
         .recv_timeout(HANG_BOUND)
-        .expect("every publication landed within the hang bound: a publisher deadlock fails here");
+        .expect("every publication landed within the hang bound: a publisher deadlock fails here")
+        .expect("a worker-side publish refused: harness failure");
     assert_eq!(
         backend.generation().unwrap(),
         PUBLICATIONS as u64,
-        "every publication landed while reads were in flight"
+        "every publication landed"
     );
 
     // Phase two: forced interleaving. Each cycle opens before the
@@ -334,12 +343,15 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     let rendezvous_backend = Arc::clone(&backend);
     std::thread::spawn(move || {
         for _ in 0..RENDEZVOUS_CYCLES {
-            let handle = rendezvous_backend.open_at("v.txt").unwrap();
-            opened_tx.send(handle).unwrap();
-            swapped_rx.recv().unwrap();
-            let bytes = rendezvous_backend.read_handle(handle, 0, 64).unwrap();
-            rendezvous_backend.release_handle(handle).unwrap();
-            got_tx.send(bytes).unwrap();
+            let opened = (|| -> Result<Vec<u8>, fuser::Errno> {
+                let handle = rendezvous_backend.open_at("v.txt")?;
+                opened_tx.send(handle).unwrap();
+                swapped_rx.recv().unwrap();
+                let bytes = rendezvous_backend.read_handle(handle, 0, 64)?;
+                rendezvous_backend.release_handle(handle)?;
+                Ok(bytes)
+            })();
+            got_tx.send(opened).unwrap();
         }
     });
     for cycle in 0..RENDEZVOUS_CYCLES {
@@ -358,10 +370,12 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
         swapped_tx.send(()).unwrap();
         let bytes = got_rx
             .recv_timeout(HANG_BOUND)
-            .expect("the read follows its publication");
+            .expect("the read follows its publication")
+            .expect("a rendezvous open/read/release refused: harness failure");
         assert_eq!(
             bytes, current,
-            "an open that predates a publication serves the pre-publication whole version"
+            "an open that predates a publication serves the pre-publication whole version \
+             while reads were in flight"
         );
         current = next;
     }

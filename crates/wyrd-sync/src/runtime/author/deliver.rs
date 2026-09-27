@@ -33,10 +33,13 @@ pub(crate) fn deliver_pending(
     // One validated delivery snapshot per pass: every read below comes
     // from this rebuild. Mid-pass commits only append Sealed,
     // SealedReplaced, and Delivered facts — never new Queued pairs — so
-    // the frozen pending lists stay exact, and an in-memory overlay
-    // absorbs newly sealed bytes. No re-read per pair: a newcomer
-    // catch-up or a large fan-out costs one log decode, not one per
-    // obligation.
+    // the frozen pending lists stay exact. The transition loop keeps a
+    // pass-local overlay absorbing newly sealed bytes (one envelope
+    // fans out over many recipients); the capability loop keeps none
+    // (pairs are unique per pass, and stale arms supersede durably —
+    // memory does not survive the outage the recovery exists for).
+    // No re-read per pair: a newcomer catch-up or a large fan-out
+    // costs one log decode, not one per obligation.
     let rebuilt = engine.store.rebuild(engine.device)?;
     let mut sent = 0usize;
     sent += deliver_transitions(engine, mailbox, &rebuilt)?;
@@ -337,7 +340,6 @@ fn deliver_capabilities(
         chain.insert(t.epoch, id);
         cursor = t.prev;
     }
-    let mut sealed_overlay: BTreeMap<(u64, DeviceId), Vec<u8>> = BTreeMap::new();
     let mut sent = 0usize;
     // The mint session, cloned once per pass: the local identity signs
     // for itself (a remote session would plug in here when NIP-46 mode
@@ -348,15 +350,16 @@ fn deliver_capabilities(
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
         };
-        let reused = sealed_overlay
-            .get(&(epoch, recipient))
-            .cloned()
-            .or_else(|| {
-                rebuilt
-                    .runtime
-                    .capability_sealed_bytes(epoch, recipient)
-                    .map(<[u8]>::to_vec)
-            });
+        // No pass-local overlay here, unlike transitions: pending pairs
+        // are unique per pass (a set, visited once), so a first seal
+        // can never be re-read in the same pass — the committed fact
+        // is the reuse source on the next one. A stale arm supersedes
+        // durably for the same reason: memory does not survive the
+        // outage the recovery exists for.
+        let reused = rebuilt
+            .runtime
+            .capability_sealed_bytes(epoch, recipient)
+            .map(<[u8]>::to_vec);
         let sealed_bytes = match reused {
             // Rotation reuse: the fact's key must still name what the
             // bytes carry (drive, epoch, recipient, current
@@ -369,26 +372,27 @@ fn deliver_capabilities(
                 let obligation = format!("capability epoch {epoch} for {recipient}");
                 match verify_reused_rotation(
                     engine,
-                    bytes,
+                    &bytes,
                     &obligation,
                     epoch,
                     recipient,
                     &transition_id,
                 )? {
-                    Reused::Use(bytes) => bytes,
+                    Reused::Use => bytes,
                     // Stale registration: the recipient holds a new
-                    // secret the old bytes can never open under — mint
-                    // fresh instead of erroring, since healing beats
-                    // loudness here.
-                    Reused::Mint => {
-                        let Some(bytes) = mint_fresh_rotation(
+                    // secret the old bytes can never open under. The
+                    // seal is structurally valid, so what retires it
+                    // is the new registration — named exactly by the
+                    // durable successor, like every other supersession.
+                    Reused::Supersede => {
+                        let Some(bytes) = supersede_stale_rotation(
                             engine,
                             &signer,
                             &rebuilt.keyring,
-                            &mut sealed_overlay,
                             epoch,
                             recipient,
                             &transition_id,
+                            &bytes,
                         )?
                         else {
                             continue;
@@ -397,17 +401,18 @@ fn deliver_capabilities(
                     }
                 }
             }
-            // A pre-framing epoch-sealed fact, or a rotation sealed
-            // under a superseded version: its bytes can never open for
+            // A stale fact under an older framing — a rotation sealed
+            // under a superseded version, or a pre-framing epoch-sealed
+            // capability — never sends: its bytes can never open for
             // the current reader (no proof blob, or keys the recipient
-            // may never hold), so it never sends — mint fresh under the
-            // current framing, which always opens. The stale fact lingers
-            // durably and harmlessly; the new seal takes the overlay.
-            // This is the announced re-mint recovery for the `0x01 ->
-            // 0x02` bump, and it is what keeps an upgrade from stranding
-            // a pending obligation. Bytes decoding as neither framing
-            // still fail closed: genuinely undecodable outbox bytes never
-            // silently heal.
+            // may never hold). Supersede it durably under the current
+            // framing, which always opens. The stale fact lingers
+            // durably and harmlessly; the replacement is the obligation
+            // from the commit on. This is the announced re-mint
+            // recovery for the `0x01 -> 0x02` bump, and it is what
+            // keeps an upgrade from stranding a pending obligation.
+            // Bytes decoding as neither framing still fail closed:
+            // genuinely undecodable outbox bytes never silently heal.
             Some(bytes) if is_superseded_rotation(&bytes) => {
                 let Some(replacement) = supersede_stale_rotation(
                     engine,
@@ -430,14 +435,17 @@ fn deliver_capabilities(
                         "{obligation}: sealed bytes do not decode"
                     )));
                 }
-                let Some(bytes) = mint_fresh_rotation(
+                // Same older-framing rule as above: the envelope is
+                // valid but predates rotation delivery, so supersede
+                // rather than send.
+                let Some(bytes) = supersede_stale_rotation(
                     engine,
                     &signer,
                     &rebuilt.keyring,
-                    &mut sealed_overlay,
                     epoch,
                     recipient,
                     &transition_id,
+                    &bytes,
                 )?
                 else {
                     continue;
@@ -449,7 +457,6 @@ fn deliver_capabilities(
                     engine,
                     &signer,
                     &rebuilt.keyring,
-                    &mut sealed_overlay,
                     epoch,
                     recipient,
                     &transition_id,
@@ -477,13 +484,13 @@ fn deliver_capabilities(
     Ok(sent)
 }
 
-/// What reused rotation bytes offer: resend them verbatim, or mint
-/// fresh when they went stale.
+/// What reused rotation bytes offer: resend them verbatim, or retire
+/// them for a durable successor when they went stale.
 enum Reused {
     /// The bytes still name the obligation: resend them verbatim.
-    Use(Vec<u8>),
-    /// The bytes went stale (or predate the framing): mint fresh.
-    Mint,
+    Use,
+    /// The registration moved on: supersede durably.
+    Supersede,
 }
 
 /// Verify reused rotation bytes against the obligation about to be
@@ -491,17 +498,18 @@ enum Reused {
 /// recipient, and the recipient's current registration. Anything
 /// undecodable or misaddressed fails closed (a fact-key/bytes mismatch
 /// would discharge one obligation while delivering another); a stale
-/// registration mints fresh instead, since the recipient holds a new
-/// secret the old bytes can never open under.
+/// registration supersedes durably instead, since the recipient holds
+/// a new secret the old bytes can never open under. Borrows the bytes:
+/// the stale arm needs them back to name the fact it retires.
 fn verify_reused_rotation(
     engine: &Engine,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     obligation: &str,
     epoch: u64,
     recipient: DeviceId,
     transition_id: &TransitionId,
 ) -> Result<Reused, EngineError> {
-    let sealed = SealedRotation::decode(&bytes).map_err(|_| {
+    let sealed = SealedRotation::decode(bytes).map_err(|_| {
         EngineError::SealedOutboxMismatch(format!("{obligation}: sealed bytes do not decode"))
     })?;
     if sealed.version != ROTATION_VERSION
@@ -518,9 +526,9 @@ fn verify_reused_rotation(
         .state_of(transition_id)
         .and_then(|state| state.encryption_key_of(&recipient).copied());
     if current.is_some_and(|key| key == sealed.encryption_key) {
-        Ok(Reused::Use(bytes))
+        Ok(Reused::Use)
     } else {
-        Ok(Reused::Mint)
+        Ok(Reused::Supersede)
     }
 }
 
@@ -535,7 +543,6 @@ fn mint_fresh_rotation(
     engine: &mut Engine,
     session: &dyn SignerSession,
     keyring: &DriveKeyring,
-    sealed_overlay: &mut BTreeMap<(u64, DeviceId), Vec<u8>>,
     epoch: u64,
     recipient: DeviceId,
     transition_id: &TransitionId,
@@ -546,7 +553,6 @@ fn mint_fresh_rotation(
         return Ok(None);
     };
     engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
-    sealed_overlay.insert((epoch, recipient), bytes.clone());
     Ok(Some(bytes))
 }
 
@@ -787,17 +793,8 @@ mod tests {
         let refusing =
             FakeSignerSession::new(&SecretKey::from_slice(&[0x99; 32]).expect("scalar"), &[]);
         let before = engine.store.current();
-        let mut overlay = BTreeMap::new();
-        let err = mint_fresh_rotation(
-            &mut engine,
-            &refusing,
-            &keyring,
-            &mut overlay,
-            1,
-            owner,
-            &genesis_id,
-        )
-        .expect_err("a refused domain must not mint");
+        let err = mint_fresh_rotation(&mut engine, &refusing, &keyring, 1, owner, &genesis_id)
+            .expect_err("a refused domain must not mint");
         assert!(
             matches!(err, EngineError::Signer(SignerError::Refused)),
             "unexpected: {err:?}"
@@ -806,7 +803,6 @@ mod tests {
             format!("{err}").contains("owner-proof signer session failed"),
             "the message stays true for every signer failure: {err}"
         );
-        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,
@@ -828,19 +824,16 @@ mod tests {
             .commit_facts(&[Fact::CapabilityQueued(1, owner)])
             .expect("queue the obligation");
         let before = engine.store.current();
-        let mut overlay = BTreeMap::new();
         let minted = mint_fresh_rotation(
             &mut engine,
             &UnreachableSession,
             &keyring,
-            &mut overlay,
             1,
             owner,
             &genesis_id,
         )
         .expect("unreachable is pending, not an error");
         assert!(minted.is_none(), "nothing to send this pass");
-        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,
@@ -872,19 +865,9 @@ mod tests {
             SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
             unrelated_identity(),
         );
-        let mut overlay = BTreeMap::new();
-        let minted = mint_fresh_rotation(
-            &mut engine,
-            &rotated,
-            &keyring,
-            &mut overlay,
-            1,
-            owner,
-            &genesis_id,
-        )
-        .expect("a rotated session is pending, not an error");
+        let minted = mint_fresh_rotation(&mut engine, &rotated, &keyring, 1, owner, &genesis_id)
+            .expect("a rotated session is pending, not an error");
         assert!(minted.is_none(), "nothing to send this pass");
-        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,
@@ -914,12 +897,10 @@ mod tests {
     fn corrupt_session_fails_loud_with_nothing_committed() {
         let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
         let before = engine.store.current();
-        let mut overlay = BTreeMap::new();
         let err = mint_fresh_rotation(
             &mut engine,
             &GarbageSession,
             &keyring,
-            &mut overlay,
             1,
             owner,
             &genesis_id,
@@ -929,7 +910,6 @@ mod tests {
             matches!(err, EngineError::Signer(SignerError::MalformedResponse)),
             "unexpected: {err:?}"
         );
-        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,
@@ -950,17 +930,8 @@ mod tests {
         assert_ne!(foreign_id, owner, "the session is not this device");
         let foreign = FakeSignerSession::new(&foreign_secret, &[SignDomain::OwnerProofV1]);
         let before = engine.store.current();
-        let mut overlay = BTreeMap::new();
-        let err = mint_fresh_rotation(
-            &mut engine,
-            &foreign,
-            &keyring,
-            &mut overlay,
-            1,
-            owner,
-            &genesis_id,
-        )
-        .expect_err("another device's session must not mint");
+        let err = mint_fresh_rotation(&mut engine, &foreign, &keyring, 1, owner, &genesis_id)
+            .expect_err("another device's session must not mint");
         assert!(
             matches!(
                 err,
@@ -977,7 +948,6 @@ mod tests {
             rendered.contains(&format!("{owner}")),
             "the expected identity travels in the error: {err}"
         );
-        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,

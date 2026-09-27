@@ -6,7 +6,7 @@
 //! but post-invitation epoch N+1 material must reach devices holding
 //! only epochs ≤ N — sealing it that way asks the device for the very
 //! key it is being given. Rotation delivery is therefore its own
-//! framing (envelope version `0x01`, distinct from the epoch-sealed
+//! framing (envelope version `0x02`, distinct from the epoch-sealed
 //! `0x00`), secured by the recipient's registered encryption key (ECDH
 //! with a fresh sender-ephemeral key, the capability-wrap construction
 //! under its own HKDF context) — never by an epoch key. After opening,

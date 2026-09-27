@@ -97,10 +97,14 @@ Releases are not required to write every format they read:
 
     Outbox retirement is a new record tag, not a version bump.
     `CapabilitySealedReplaced` (`0x16`) names the sealed fact it
-    supersedes and carries its replacement, so the `0x01 -> 0x02`
-    obligation stays recoverable instead of stuck: replay resolves
+    supersedes and carries its replacement, so a stale obligation
+    stays recoverable instead of stuck: replay resolves
     the chain to the newest bytes and leaves the superseded record
-    inert. An old node skips the unknown tag (invariant 10's
+    inert. Three triggers reach it — a superseded rotation version
+    (the `0x01 -> 0x02` case above), a current-framing seal to a
+    superseded registration, and a pre-framing epoch-sealed
+    capability fact — all through the same record and the same
+    supersession identity. An old node skips the unknown tag (invariant 10's
     exception), so a store written by a new node still opens there —
     it simply keeps treating the superseded bytes as the obligation.
     `0x16` was chosen after `0x13`, which is

@@ -11,7 +11,9 @@ use wyrd_format::{
     StoreFailure, Tree,
 };
 use wyrd_sync::closure::ClosureError;
-use wyrd_sync::durable::AuthorizedSnapshot;
+use wyrd_sync::durable::{AuthorizedSnapshot, DurableError};
+use wyrd_sync::ingest::IngestError;
+use wyrd_sync::serving::VaultError;
 use wyrd_sync::{
     runtime::{
         DrainReport, Engine, EngineError, ExecuteReport, MaterializationState, RoutePublishing,
@@ -453,6 +455,61 @@ where
 enum ApplyEntry {
     Recorded,
     Deferred(SnapshotId),
+}
+
+/// Classify an authoring failure for the mutation channel. Resource
+/// conditions keep their POSIX meaning — a classified store failure
+/// passes through, a vault or durable I/O failure reads its OS
+/// errno through the shared store rule, and a protocol ingest
+/// rejection reports its observed size (or count and ceiling) — while
+/// validation, durability, and internal failures stay opaque
+/// `Engine` (EIO at the boundary). The channel never interpolates
+/// the engine error: foreign debug text (paths, key-adjacent
+/// material) stays in the trace log the authoring caller emits,
+/// never in the variant a waiter matches on.
+fn authoring_error(error: EngineError) -> MutationError {
+    match error {
+        // Not currently raised by `author_snapshot` (its
+        // producers are the fetch planner and the closure gate in
+        // `partition_heads`; none of them is `author_snapshot`):
+        // kept so a future classified store failure can never
+        // regress to opaque `Engine` unnoticed.
+        EngineError::Store(failure) => MutationError::Store(failure),
+        EngineError::Ingest(IngestError::TooLarge { bytes, .. }) => {
+            // `usize` is never wider than `u64` on a supported
+            // target; the fallback saturates rather than panics, so
+            // a lying platform still reports a ceiling, never a
+            // panic on the failure path.
+            MutationError::TooLarge(u64::try_from(bytes).unwrap_or(u64::MAX))
+        }
+        EngineError::Ingest(IngestError::TooMany { count, max, .. }) => {
+            MutationError::TooMany { count, max }
+        }
+        // One classification rule for every disk-backed store
+        // (`StoreFailure::of_io`): the vault and the durable commit
+        // can never disagree with the object store on what "full"
+        // is — quota included. Unclassified I/O stays opaque
+        // `Engine`, and the foreign error stays in the trace.
+        EngineError::Vault(VaultError::Io(error))
+        | EngineError::Durable(DurableError::Io(error)) => match StoreFailure::of_io(&error) {
+            StoreFailure::Transient => MutationError::Engine,
+            failure => MutationError::Store(failure),
+        },
+        // Bounded mirror backpressure, not a broken device — but
+        // still `EIO`, deliberately: the sealed representation is
+        // already durable in the vault, so a caller-level replay
+        // re-seals under a fresh nonce and imports a second copy of
+        // the same content, leaking vault bytes for no new state.
+        // Fail closed per the commit-failure row
+        // (`docs/write-path.md`); the serving drain retries the
+        // import.
+        EngineError::Vault(VaultError::MirrorFull { .. }) => MutationError::Engine,
+        // A store read the loop cannot classify: the foreign debug
+        // text stays in the trace, and the channel carries the
+        // transient store failure (EIO), never the string.
+        EngineError::ObjectStore(_) => MutationError::Store(StoreFailure::Transient),
+        _ => MutationError::Engine,
+    }
 }
 
 impl<V> LiveNode<V>
@@ -1381,11 +1438,11 @@ where
     }
 
     /// Author one snapshot over a mutated root, tracing the engine
-    /// refusal: authoring collapses every failure to opaque `Engine`
-    /// at the boundary, and the variant tells a missing epoch key
-    /// from a failed closure self-check or a refused commit. A free
-    /// function (not a method) so callers holding the store guard can
-    /// still split-borrow the engine.
+    /// refusal: resource and ingest causes keep their POSIX meaning
+    /// through [`authoring_error`], and the trace tells a missing
+    /// epoch key from a failed closure self-check or a refused
+    /// commit. A free function (not a method) so callers holding the
+    /// store guard can still split-borrow the engine.
     fn author_traced<S>(
         engine: &mut Engine,
         store: &S,
@@ -1403,7 +1460,7 @@ where
                     chunk,
                     base: Self::pin_head(heads),
                 },
-                _ => MutationError::Engine,
+                error => authoring_error(error),
             }
         })
     }
@@ -2400,6 +2457,222 @@ mod prereq_tests {
             matches!(error, EngineError::Store(StoreFailure::StorageFull)),
             "the store class survives the closure boundary: {error:?}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Authoring over a classified store failure keeps the resource
+    /// errno: a full disk is `ENOSPC` and an unwritable store is
+    /// `EACCES` at the boundary, never opaque `Engine`.
+    #[test]
+    fn authoring_store_failure_keeps_its_resource_errno() {
+        assert_eq!(
+            authoring_error(EngineError::Store(StoreFailure::StorageFull)),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Store(StoreFailure::PermissionDenied)),
+            MutationError::Store(StoreFailure::PermissionDenied)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Store(StoreFailure::Transient)),
+            MutationError::Store(StoreFailure::Transient)
+        );
+    }
+
+    /// Authoring I/O failures classify by the shared store rule: a
+    /// vault or durable write that hits a full disk — quota included
+    /// — is `ENOSPC`, a denied one is `EACCES`, and anything else
+    /// stays opaque `Engine`. Mirror backpressure is `EIO` too, by
+    /// decision: the sealed bytes are already vault-durable, so a
+    /// replay would import a second copy for no new state.
+    #[test]
+    fn authoring_io_failures_classify_by_os_errno() {
+        use wyrd_format::BaoRoot;
+        use wyrd_sync::durable::DurableError;
+        use wyrd_sync::serving::VaultError;
+        fn io(kind: std::io::ErrorKind) -> std::io::Error {
+            std::io::Error::new(kind, "simulated authoring I/O failure")
+        }
+        assert_eq!(
+            authoring_error(EngineError::Durable(DurableError::Io(io(
+                std::io::ErrorKind::StorageFull
+            )))),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Vault(VaultError::Io(io(
+                std::io::ErrorKind::StorageFull
+            )))),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
+        // Quota exhaustion is full, not opaque: the shared store
+        // rule says so, and the vault must agree with it.
+        assert_eq!(
+            authoring_error(EngineError::Vault(VaultError::Io(io(
+                std::io::ErrorKind::QuotaExceeded
+            )))),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Durable(DurableError::Io(io(
+                std::io::ErrorKind::PermissionDenied
+            )))),
+            MutationError::Store(StoreFailure::PermissionDenied)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Vault(VaultError::Io(io(
+                std::io::ErrorKind::PermissionDenied
+            )))),
+            MutationError::Store(StoreFailure::PermissionDenied)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Durable(DurableError::Io(io(
+                std::io::ErrorKind::BrokenPipe
+            )))),
+            MutationError::Engine
+        );
+        assert_eq!(
+            authoring_error(EngineError::Vault(VaultError::MirrorFull {
+                root: BaoRoot::from_bytes([0x11; 32]),
+                queued_items: 64,
+                queued_bytes: 64 << 20,
+                max_bytes: 64 << 20,
+                rejected: 1,
+            })),
+            MutationError::Engine
+        );
+    }
+
+    /// Authoring against a protocol ingest ceiling is `EFBIG` at the
+    /// boundary: an oversized object and an over-count structure map
+    /// to their own size/count variants, never opaque `Engine`.
+    #[test]
+    fn authoring_ingest_rejection_reports_its_ceiling() {
+        use wyrd_sync::ingest::IngestError;
+        assert_eq!(
+            authoring_error(EngineError::Ingest(IngestError::TooLarge {
+                what: "tree",
+                bytes: 70_000_000,
+                max: 67_108_864,
+            })),
+            MutationError::TooLarge(70_000_000)
+        );
+        assert_eq!(
+            authoring_error(EngineError::Ingest(IngestError::TooMany {
+                what: "tree entries",
+                count: 3,
+                max: 2,
+            })),
+            MutationError::TooMany { count: 3, max: 2 }
+        );
+    }
+
+    /// Authoring validation failures stay opaque `Engine` (EIO): a
+    /// missing membership tip, an exhausted timestamp space, and a
+    /// damaged durable sequence are caller-indistinguishable at the
+    /// boundary, and the debug trace keeps the cause.
+    #[test]
+    fn authoring_validation_failure_stays_opaque() {
+        use wyrd_sync::durable::DurableError;
+        for error in [
+            EngineError::NoCanonicalMembership,
+            EngineError::TimestampExhausted,
+            EngineError::Durable(DurableError::SequenceExhausted),
+        ] {
+            assert_eq!(authoring_error(error), MutationError::Engine);
+        }
+    }
+
+    /// A directory held read-only for a fault-injection test, with
+    /// its permissions restored on drop: a failed assert must never
+    /// leave a `0555` directory behind in the system temp dir.
+    #[cfg(unix)]
+    struct ReadOnlyDir<'a> {
+        path: &'a std::path::Path,
+    }
+
+    #[cfg(unix)]
+    impl<'a> ReadOnlyDir<'a> {
+        /// Lock `path` read-only. Returns `None` when the refusal
+        /// cannot occur — root bypasses permissions, so writability
+        /// is probed after the chmod and the test skips instead of
+        /// asserting nothing. Permissions are restored before the
+        /// `None`, so the skip path leaks nothing either.
+        fn lock(path: &'a std::path::Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let probe = path.join(".writetest");
+            if std::fs::File::create(&probe).is_ok() {
+                std::fs::remove_file(&probe).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                eprintln!("skipping: running with DAC override, chmod refusal unavailable");
+                return None;
+            }
+            Some(Self { path })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDir<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// An unwritable vault fails the commit with denied, through the
+    /// real authoring path: the mutation applies, the snapshot seals,
+    /// and the vault import refusal carries `EACCES` to the waiter.
+    /// Under a DAC override (root) the refusal cannot occur and the
+    /// test asserts nothing — the skip notice goes to stderr.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_vault_dir_fails_the_commit_with_denied() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("vault-perm");
+        let vault = dir.join("vault");
+        let Some(guard) = ReadOnlyDir::lock(&vault) else {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        };
+        let mut node = live_over_fake(engine, store, &[head]);
+        let error = node
+            .apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Store(StoreFailure::PermissionDenied),
+            "a vault import refusal is EACCES, not EIO: {error:?}"
+        );
+        drop(node);
+        drop(guard);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An unwritable durable store fails the commit with denied,
+    /// through the real authoring path: the vault import succeeds
+    /// and the durable-commit refusal carries `EACCES` to the waiter.
+    /// Under a DAC override (root) the refusal cannot occur and the
+    /// test asserts nothing — the skip notice goes to stderr.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_durable_dir_fails_the_commit_with_denied() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("durable-perm");
+        let commits = dir.join("commits");
+        let Some(guard) = ReadOnlyDir::lock(&commits) else {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        };
+        let mut node = live_over_fake(engine, store, &[head]);
+        let error = node
+            .apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Store(StoreFailure::PermissionDenied),
+            "a durable-commit refusal is EACCES, not EIO: {error:?}"
+        );
+        drop(node);
+        drop(guard);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -119,7 +119,7 @@ pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
         MutationError::IsDirectory(_) => fuser::Errno::EISDIR,
         MutationError::AlreadyExists(_) => fuser::Errno::EEXIST,
         MutationError::DirectoryNotEmpty(_) => fuser::Errno::ENOTEMPTY,
-        MutationError::TooLarge(_) => fuser::Errno::EFBIG,
+        MutationError::TooLarge(_) | MutationError::TooMany { .. } => fuser::Errno::EFBIG,
         MutationError::Store(StoreFailure::StorageFull) => fuser::Errno::ENOSPC,
         MutationError::Store(StoreFailure::PermissionDenied) => fuser::Errno::EACCES,
         // A valid operation whose authoring prerequisite never became

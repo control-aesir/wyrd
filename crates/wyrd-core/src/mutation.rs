@@ -292,6 +292,13 @@ pub enum MutationError {
     /// `EFBIG`.
     #[error("resulting size {0} exceeds the supported bound")]
     TooLarge(u64),
+    /// The operation exceeds a protocol structural ceiling (tree,
+    /// manifest, or membership counts). POSIX `EFBIG`, like the byte
+    /// ceiling: a count, not a size, so it names both instead of
+    /// overloading [`MutationError::TooLarge`]. Integers only — no
+    /// foreign error text crosses the channel.
+    #[error("count {count} exceeds the limit of {max}")]
+    TooMany { count: usize, max: usize },
     /// Object-store or tree access failed. A classified resource
     /// condition keeps its errno (`ENOSPC` for a full disk, `EACCES`
     /// for an unwritable store); everything else is POSIX `EIO`.
@@ -1137,6 +1144,27 @@ mod tests {
         MutationKind::Mkdir {
             path: path.to_string(),
         }
+    }
+
+    /// A classified store fault survives the format boundary: a full
+    /// disk reported by the store reads as `Store(StorageFull)`
+    /// (`ENOSPC` at the mount), never opaque `Engine`. Root-proof:
+    /// no filesystem state, just the classification the real
+    /// disk-backed stores report through the same arm.
+    #[test]
+    fn format_store_full_reports_no_space() {
+        use wyrd_format::StoreError;
+        #[derive(Debug)]
+        struct Full;
+        impl StoreError for Full {
+            fn failure(&self) -> StoreFailure {
+                StoreFailure::StorageFull
+            }
+        }
+        assert_eq!(
+            MutationError::from_format(wyrd_format::MutationError::Store(Full)),
+            MutationError::Store(StoreFailure::StorageFull)
+        );
     }
 
     /// Block until a request is queued, then take it as a batch. The

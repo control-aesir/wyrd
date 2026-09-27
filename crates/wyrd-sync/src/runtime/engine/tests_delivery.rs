@@ -535,7 +535,7 @@ fn plant_stale_obligation(
     // capability for this device over epochs 1..=2, as a durable fact.
     let held = vec![secret(0xAA), secret(0xBB)];
     let cap = Capability::mint(member_drive(), fx.recipient, &state, admit, held.clone())
-        .expect("owner is a member");
+        .expect("the engine is a member");
     let authorized = AuthorizedCapability::authorize(cap, member_drive(), &fx.engine.log, admit_id)
         .expect("capability is authorized");
     fx.engine
@@ -1253,7 +1253,7 @@ fn plant_preframing_obligation(
     // capability for this device over epochs 1..=2, as a durable fact.
     let held = vec![secret(0xAA), secret(0xBB)];
     let cap = Capability::mint(member_drive(), fx.recipient, &state, admit, held.clone())
-        .expect("owner is a member");
+        .expect("the engine is a member");
     let authorized = AuthorizedCapability::authorize(cap, member_drive(), &fx.engine.log, admit_id)
         .expect("capability is authorized");
     fx.engine
@@ -1343,6 +1343,21 @@ fn non_owner_leaves_stale_fact(
 ) {
     let (mut fx, admit, admit_id, engine) = non_owner_world();
     let stale = plant(&mut fx, &admit, engine, &admit_id);
+    // The plants populate the keyring themselves: authority, not
+    // knowledge, is what must stop the mint below. Pin it here, once
+    // for all three shapes, or a plant change could silently move
+    // these checks behind a keyring gap while every assertion below
+    // still holds.
+    assert!(
+        fx.engine
+            .store
+            .rebuild(engine)
+            .unwrap()
+            .keyring
+            .secret(2)
+            .is_some(),
+        "the keyring is populated; only authority is missing"
+    );
     let mut mailbox = MemoryMailbox {
         relay: &mut fx.relay,
         owner: engine,
@@ -1590,7 +1605,7 @@ fn plant_stale_registration_obligation(
     // capability for this device over epochs 1..=2, as a durable fact.
     let held = vec![secret(0xAA), secret(0xBB)];
     let cap = Capability::mint(member_drive(), fx.recipient, &state, admit, held.clone())
-        .expect("owner is a member");
+        .expect("the engine is a member");
     let authorized = AuthorizedCapability::authorize(cap, member_drive(), &fx.engine.log, admit_id)
         .expect("capability is authorized");
     fx.engine

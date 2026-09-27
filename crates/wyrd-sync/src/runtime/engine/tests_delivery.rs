@@ -1009,18 +1009,31 @@ fn stale_obligation_without_secrets_stays_pending() {
     );
 }
 
-/// A member world with an empty keyring: the engine holds no epoch
-/// secrets, so no mint can complete on any arm. Returns the fixture,
-/// the admission transition, and its id.
+/// A member world with an empty keyring: genesis names the engine
+/// device as owner, so it holds mint authority for the epoch-2
+/// admission that follows — the authority gate passes and the missing
+/// secret becomes the binding constraint. Returns the fixture, the
+/// admission transition and its id, and the admitted member the
+/// obligations below are planted for.
 fn member_world_without_secrets() -> (
     crate::runtime::test_util::Fixture,
     MembershipTransition,
     wyrd_format::TransitionId,
+    wyrd_format::DeviceId,
 ) {
     let mut fx = fixture();
-    let engine_device = fx.recipient;
-    let (mut builder, genesis) = Builder::genesis(10);
-    let admit = admit_engine(&mut builder, engine_device);
+    let (mut builder, genesis) = Builder::genesis(0x02);
+    assert_eq!(
+        identity(0x02).1,
+        fx.recipient,
+        "the fixture is the owner engine"
+    );
+    let (_, member_device) = identity(0x03);
+    let member_encryption_sk = DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap();
+    let admit = builder.child(vec![Change::Admit(Admission {
+        device: member_device,
+        encryption_key: encryption_key(&member_encryption_sk),
+    })]);
     let admit_id = admit.transition_id();
     let mail = vec![
         deliver(&fx, 1, &transition_message(&genesis)),
@@ -1028,17 +1041,23 @@ fn member_world_without_secrets() -> (
     ];
     queue(&mut fx, mail);
     assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
+    // The tests below claim the *missing secret* is the binding
+    // constraint: pin the other half of that claim here, or a world
+    // change could silently move them back behind the authority gate
+    // while every assertion still holds.
     assert!(
         fx.engine
-            .store
-            .rebuild(engine_device)
-            .unwrap()
-            .keyring
-            .secret(2)
-            .is_none(),
-        "the keyring is genuinely empty"
+            .log
+            .owners_of(&genesis.transition_id())
+            .is_some_and(|owners| owners.contains(&fx.recipient)),
+        "the engine holds mint authority, so the gate passes"
     );
-    (fx, admit, admit_id)
+    let keyring = fx.engine.store.rebuild(fx.recipient).unwrap().keyring;
+    assert!(
+        keyring.secret(1).is_none() && keyring.secret(2).is_none(),
+        "the keyring holds no epoch secret at all"
+    );
+    (fx, admit, admit_id, member_device)
 }
 
 /// A stale-registration obligation the sender cannot mint for: no
@@ -1052,14 +1071,14 @@ fn member_world_without_secrets() -> (
 fn stale_registration_without_secrets_stays_pending() {
     use crate::control::seal_rotation;
 
-    let (mut fx, admit, _) = member_world_without_secrets();
+    let (mut fx, admit, _, member) = member_world_without_secrets();
     let engine_device = fx.recipient;
     // The classifier keys on the header alone, so the blobs are
     // placeholders — the mint fails before any of them is read.
     let foreign_sk = DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("stale seal scalar");
     let stale = seal_rotation(
         &member_drive(),
-        engine_device,
+        member,
         &encryption_key(&foreign_sk),
         2,
         &admit.canonical_bytes(),
@@ -1070,8 +1089,8 @@ fn stale_registration_without_secrets_stays_pending() {
     .encode();
     fx.engine
         .commit_facts(&[
-            Fact::CapabilityQueued(2, engine_device),
-            Fact::CapabilitySealed(2, engine_device, stale.clone()),
+            Fact::CapabilityQueued(2, member),
+            Fact::CapabilitySealed(2, member, stale.clone()),
         ])
         .unwrap();
 
@@ -1095,14 +1114,14 @@ fn stale_registration_without_secrets_stays_pending() {
     );
     assert_eq!(
         fx.engine.runtime_state().unwrap().pending_capabilities(),
-        vec![(2, engine_device)],
+        vec![(2, member)],
         "the obligation stays pending"
     );
     assert_eq!(
         fx.engine
             .runtime_state()
             .unwrap()
-            .capability_sealed_bytes(2, engine_device),
+            .capability_sealed_bytes(2, member),
         Some(stale.as_slice()),
         "the stale fact is left exactly as it was"
     );
@@ -1114,17 +1133,17 @@ fn stale_registration_without_secrets_stays_pending() {
 /// is the missing secret.
 #[test]
 fn preframing_without_secrets_stays_pending() {
-    let (mut fx, admit, admit_id) = member_world_without_secrets();
+    let (mut fx, admit, admit_id, member) = member_world_without_secrets();
     let engine_device = fx.recipient;
     let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
     let wrap = crate::keys::capability::Capability::mint(
         member_drive(),
-        engine_device,
+        member,
         &state,
         &admit,
         vec![secret(0xAA), secret(0xBB)],
     )
-    .expect("engine is a member")
+    .expect("member is a member")
     .wrap()
     .expect("wraps")
     .as_bytes()
@@ -1134,7 +1153,7 @@ fn preframing_without_secrets_stays_pending() {
         &member_drive(),
         2,
         &Message::Capability(crate::control::CapabilityPayload {
-            device: engine_device,
+            device: member,
             epoch: 2,
             wrapped: wrap,
         }),
@@ -1143,8 +1162,8 @@ fn preframing_without_secrets_stays_pending() {
     .encode();
     fx.engine
         .commit_facts(&[
-            Fact::CapabilityQueued(2, engine_device),
-            Fact::CapabilitySealed(2, engine_device, stale.clone()),
+            Fact::CapabilityQueued(2, member),
+            Fact::CapabilitySealed(2, member, stale.clone()),
         ])
         .unwrap();
 
@@ -1168,14 +1187,14 @@ fn preframing_without_secrets_stays_pending() {
     );
     assert_eq!(
         fx.engine.runtime_state().unwrap().pending_capabilities(),
-        vec![(2, engine_device)],
+        vec![(2, member)],
         "the obligation stays pending"
     );
     assert_eq!(
         fx.engine
             .runtime_state()
             .unwrap()
-            .capability_sealed_bytes(2, engine_device),
+            .capability_sealed_bytes(2, member),
         Some(stale.as_slice()),
         "the stale fact is left exactly as it was"
     );

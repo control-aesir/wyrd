@@ -33,8 +33,12 @@ pub(crate) fn deliver_pending(
     // One validated delivery snapshot per pass: every read below comes
     // from this rebuild. Mid-pass commits only append Sealed,
     // SealedReplaced, and Delivered facts — never new Queued pairs — so
-    // the frozen pending lists stay exact, and an in-memory overlay
-    // absorbs newly sealed bytes. No re-read per pair: a newcomer
+    // the frozen pending lists stay exact. The transition loop keeps a
+    // pass-local overlay absorbing newly sealed bytes (one envelope
+    // fans out over many recipients); the capability loop keeps none
+    // (pairs are unique per pass, and stale arms supersede durably —
+    // memory does not survive the outage the recovery exists for).
+    // No re-read per pair: a newcomer
     // catch-up or a large fan-out costs one log decode, not one per
     // obligation.
     let rebuilt = engine.store.rebuild(engine.device)?;

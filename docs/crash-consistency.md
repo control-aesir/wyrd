@@ -124,6 +124,8 @@ recording a transmission the recipient would suppress. Pinned by
 `non_owner_stale_obligation_commits_no_replacement`,
 `non_owner_stale_registration_commits_no_replacement`,
 `stale_obligation_without_secrets_stays_pending`,
+`stale_registration_without_secrets_stays_pending`,
+`preframing_without_secrets_stays_pending`,
 `replacement_commit_is_atomic_at_every_crash_stage`,
 `stale_registration_replacement_commit_is_atomic_at_every_crash_stage`,
 and `preframing_replacement_commit_is_atomic_at_every_crash_stage`

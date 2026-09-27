@@ -341,7 +341,10 @@ A commit proceeds in this order, and the order is the contract:
    is synced level by level, so a first-write hierarchy is durable too.
    The **announcement obligation is recorded durably here**, atomically
    with the snapshot (see below), so a crash after commit still knows the
-   snapshot must be announced.
+   snapshot must be announced. The obligation *fact* is appended earlier,
+   inside step 2's single fact-commit with the body and manifest facts;
+   step 3 is where those facts, and the objects they reference, become
+   durable together.
 4. **Publication.** Heads and materialization are swapped into the shared
    view under one short write lock. The view sees the old head until this
    step.
@@ -368,15 +371,21 @@ obligation discharged at 6.**
 > Later-stage failure never rolls back an earlier durable state.
 
 The state machine is monotonic: `prepared → durable → visible →
-servable → obligation recorded → discharged`. A failure at a later stage
-leaves the earlier states standing; nothing after step 3 undoes step 3.
-This is what forbids transactional coupling between the local commit and
+servable → discharged`. The announcement obligation is not a later
+state in that chain — its fact is committed at step 2 and durable at
+step 3 (see below), so it is *eligible* for discharge only once serving
+readiness passes at step 5. A failure at a later stage leaves the
+earlier states standing; nothing after step 3 undoes step 3. This is
+what forbids transactional coupling between the local commit and
 network propagation.
 
 ### Announcement obligation durability
 
-The obligation to announce a locally authored snapshot is **created at
-step 3, atomically with the commit**, not at step 6. Step 6 only
+The obligation to announce a locally authored snapshot is **committed at
+step 2, atomically with the snapshot, and durable at step 3** — not
+created at step 6. Its fact is appended in the same single fact-commit
+as the snapshot body and the manifest facts, so there is no window in
+which a snapshot exists without its obligation. Step 6 only
 *discharges* it. Therefore outbox-enqueue failure cannot lose an
 announcement: if step 3 committed, the obligation is durable, and a
 restart reconciles un-discharged obligations back through the outbox
@@ -476,7 +485,11 @@ Write-time and commit-time failures are distinct surfaces:
   store/authoring/durability failure; `EFBIG` when the resulting file or
   tree exceeds a protocol ingest ceiling; `ENOSPC` when a protocol object
   budget is exceeded. A `write` that succeeded never implies the later
-  commit will.
+  commit will. (A reserved per-device retained-bytes quota would report
+  `ENOSPC` here too, reusing this reporting path unchanged; it is not
+  implemented. The check itself would have to run before the commit's
+  first write to disk, not at the durability boundary, or a refused
+  commit spends the bytes it is protecting — see `storage-growth.md`.)
 
 ## Namespace operations
 

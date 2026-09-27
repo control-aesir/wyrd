@@ -6,6 +6,13 @@ protocol ingest ceilings (`Limits::V0`, bounding every committed
 object) are not in scope here — they bound committed data, while this
 doc bounds the live process holding and moving it.
 
+Those bounds are per operation. One resource escapes all of them in a
+way that amplifies — how much is *retained* over time, which no live
+bound can cap under an append-only store. That bound, its adversary,
+and what is enforceable before GC are in `storage-growth.md`. (The
+append-only membership log is a second thing no live bound caps; it is
+owner-gated and grows per transition, not an amplification path.)
+
 All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-core/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the
 backend at composition time. Defaults are the historical hardcoded
@@ -68,7 +75,7 @@ the one unbounded walk. Per-stage worst case for one hostile message:
 | Capability | one ECDH+AEAD unwrap of envelope-bounded bytes, then one memoized authorize | `WrappedCapability::unwrap` before `AuthorizedCapability::authorize`; unknown transitions defer into the 1024-bound pending shed, terminal history suppresses |
 | Rotation delivery | device check + transition decode + limits + epoch agreement before the unwrap | structural gates precede `WrappedCapability::unwrap`; the transition↔capability binding check stays after it (the binding lives inside the wrap) |
 | Manifest / object fan-out | none on intake, by construction | intake commits only transition / announcement / capability / control-message facts and never opens manifests, trees, or chunks; expansion is pull-based post-intake under the fetch byte ceiling and manifest count gates |
-| Commit rate | no time-based cap | structural: invalid commits 0 facts, replay commits 0 facts, over-limit deferrals shed with the relay retaining. Insider commit-rate bounding is the separate fact-log spam issue, not this table |
+| Commit rate | no time-based cap | structural: invalid commits 0 facts, replay commits 0 facts, over-limit deferrals shed with the relay retaining. Insider commit-rate bounding is the separate fact-log spam issue, not this table. The *writer's* own commit rate is POSIX-boundary driven and is treated as a retention question in `storage-growth.md` |
 
 ## Bytes in flight
 

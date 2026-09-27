@@ -43,6 +43,7 @@ die() { echo "  FAIL: $1" >&2; exit 1; }
 # hardening refuses cross-uid opens both directions. So every host
 # wyrd invocation drops privilege to 1000 first. setpriv works with
 # numeric ids and needs no passwd entry, unlike su/runuser.
+command -v setpriv >/dev/null || die "setpriv missing on the host (util-linux)"
 as_guest() { setpriv --reuid 1000 --regid 1000 --clear-groups -- "$@"; }
 
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
@@ -112,7 +113,7 @@ pass "owner and member converge across hosts"
 
 # --- phase 4: serving restart -------------------------------------------
 echo "=== microvm 8: serving restart ==="
-rm -f "$RUN/member-done"
+rm -f "$RUN/member-ready" "$RUN/member-done"
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh restart-member $GMD $GMC $RELAY_URL" \
   >"$RUN/logs/leg-restart-member.out" 2>&1 &
 LEG_N=$!
@@ -131,6 +132,25 @@ as_guest "$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
   --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" id \
   >"$RUN/logs/reopen-o.out" 2>&1 || die "owner drive does not reopen"
 pass "both drives reopen offline after unmount"
+# Durability is the point of the reopen, not the `id` call: export
+# both drives and assert the cross-host writes survived the restart.
+# (Cleared first: export refuses populated destinations, and a
+# non-fresh rerun would leave the previous run's trees behind.)
+rm -rf "$RUN/export-owner" "$RUN/export-member"
+as_guest "$WYRD_BIN" export \
+  --identity-file "$RUN/creds/owner/identity" \
+  --passphrase-file "$RUN/creds/owner/passphrase" \
+  "$RUN/drives/owner" "$RUN/export-owner" >"$RUN/logs/export-o.out" 2>&1 \
+  || die "owner drive does not export after reopen"
+as_guest "$WYRD_BIN" export \
+  --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
+  "$MD" "$RUN/export-member" >"$RUN/logs/export-m.out" 2>&1 \
+  || die "member drive does not export after reopen"
+[[ "$(cat "$RUN/export-owner/after-restart.txt")" == "after-restart" ]] \
+  || die "owner export lost the post-restart write"
+[[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-1" ]] \
+  || die "member export lost the cross-host write"
+pass "flush-committed state survives restart on both drives"
 
 # Host-side leak check over the logs the host produced (guest logs
 # are checked in-guest by each leg).

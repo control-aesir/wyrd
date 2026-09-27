@@ -313,7 +313,6 @@ step5_export() {
     check_no_leaks "$f" "$(cat "$oc/identity")" "$(cat "$oc/passphrase")"
   done
 }
-# converged <file> <want>: file exists with exactly the wanted content.
 # --- step 6: live relay convergence -------------------------------------
 # Two mounts, one relay, both directions: the owner's writes appear on
 # the member's mount and back. This is the publish path's e2e proof —

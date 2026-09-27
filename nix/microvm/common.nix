@@ -84,12 +84,12 @@
       wantedBy = [ "multi-user.target" ];
       script = ''
         for i in $(seq 1 150); do
-          [ -f /mnt/wyrd-state/ssh_host_key.pub ] && break
+          [ -f /mnt/wyrd-state/authorized_keys.pub ] && break
           sleep 0.2
         done
         mkdir -p /root/.ssh /home/e2e/.ssh
-        cp /mnt/wyrd-state/ssh_host_key.pub /root/.ssh/authorized_keys
-        cp /mnt/wyrd-state/ssh_host_key.pub /home/e2e/.ssh/authorized_keys
+        cp /mnt/wyrd-state/authorized_keys.pub /root/.ssh/authorized_keys
+        cp /mnt/wyrd-state/authorized_keys.pub /home/e2e/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys /home/e2e/.ssh/authorized_keys
         chown -R e2e:users /home/e2e/.ssh
       '';

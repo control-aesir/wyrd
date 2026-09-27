@@ -67,7 +67,11 @@ devenv shell                # enter the dev environment (rust, git-hooks)
 ## Running the Lima e2e suite
 
 `./lima/run-alpha.sh [--keep] [--step N[,N...]]` is long (minutes) and lives in a
-guest. Operate it, never babysit it blind:
+guest. Operate it, never babysit it blind. (The hardened gate is the
+microVM suite instead: `nix/microvm/run-microvm.sh --fresh [--keep]`
+on a Linux KVM host, same contract helpers, two peers plus a relay
+VM. Prefer it for topology, convergence, and restart evidence; use
+Lima for macOS dev iteration and as the refactor guard.)
 
 - **Never pipe it through `tail`.** A foreground pipe buffers everything, so
   a twenty-minute run looks like a hang. Run it detached with the output to a

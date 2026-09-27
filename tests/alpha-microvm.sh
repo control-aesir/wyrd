@@ -13,15 +13,18 @@
 #   3. cross-host convergence legs in parallel (guest legs, done-file
 #      rendezvous on the shared state root)
 #   4. serving-restart legs (fresh endpoint, route update, no repair)
-#   5. offline reopen of both drives on the host
+#   5. fetch-plane legs (blocking cold open, bounded EIO on dead
+#      routes, dedupe log with no double-append)
+#   6. offline reopen of both drives on the host
 #
-# Out of scope for v1, tracked as follow-ups: relay-partition
-# conflict legs (concurrent commits, StaleHandle, ConflictedHeads,
-# name@N export), and the control-plane specifics plus fetch matrix
-# (NIP-44 interop, dedupe growth, coalescing, timeout semantics,
-# registry overflow, StorageId-only serve). The topology supports
-# them (relay is a VM service the host can stop); the assertions
-# need product behavior observed on odin first, not encoded blind.
+# Out of scope, tracked as follow-up: relay-partition conflict legs
+# (concurrent commits, StaleHandle, ConflictedHeads, name@N export).
+# Still tracked on the control-plane issue (NIP-44 sealing interop
+# over the relay, mailbox.seen dedupe-log growth):
+# nostr:nevent1qqsw5yaj93c8556axtlamjcgh2y8lhelw49pv5cqcfsyhz4q24dm6cspz9mhxue69uhkwunpwdczuap49eehgyz9qww.
+# The topology supports them (relay is a VM service the host can
+# stop); the assertions need product behavior observed on odin
+# first, not encoded blind.
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
@@ -129,9 +132,34 @@ LEG_O=$!
 wait "$LEG_N" || die "restart member leg failed (see logs/leg-restart-member.out)"
 wait "$LEG_O" || die "restarted owner leg failed (see logs/leg-restart-owner.out)"
 pass "route update rewires fetch across hosts"
+# Snapshot the member's dedupe log size: phase 5 asserts it grew
+# across this restart (redelivery observed) and holds no duplicates.
+# Missing file means no acks yet — record 0 rather than dying here;
+# the leg fails on it if the log is still empty at the end.
+wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
+  || echo 0 > "$RUN/seen-after-restart"
 
-# --- phase 5: offline reopen --------------------------------------------
-echo "=== microvm 9: offline reopen ==="
+# --- phase 5: fetch plane ---------------------------------------------
+echo "=== microvm 9: fetch plane ==="
+rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
+  "$RUN/owner-stopped" "$RUN/member-fetch-done" "$RUN/cold-2.got" \
+  "$RUN/stale-1.err" "$RUN/never-announced.err"
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-member $GMD $GMC $RELAY_URL" \
+  >"$RUN/logs/leg-fetch-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh fetch-owner $OD $OC $RELAY_URL" \
+  >"$RUN/logs/leg-fetch-owner.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
+wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
+pass "blocking open, bounded EIO, and dedupe hold across hosts"
+
+# --- phase 6: offline reopen --------------------------------------------
+# Depends on phase 5's remote-only delete (fetch-member removes
+# stale-1.txt with the route down): the export below fails closed
+# on remote-only content, so without that delete this phase dies
+# at the member export. Correct product behavior, coupled phases.
+echo "=== microvm 10: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"
 as_guest "$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
@@ -156,6 +184,10 @@ as_guest "$WYRD_BIN" export \
   || die "owner export lost the post-restart write"
 [[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-1" ]] \
   || die "member export lost the cross-host write"
+# The fetch phase pulled cold-2.txt over the network; the export
+# proves the verified remote object survives process death.
+[[ "$(cat "$RUN/export-member/cold-2.txt")" == "cold-bytes" ]] \
+  || die "member export lost the fetched cold-2.txt"
 pass "flush-committed state survives restart on both drives"
 
 # Host-side leak check over every log the host wrote (guest logs

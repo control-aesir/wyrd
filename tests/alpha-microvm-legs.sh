@@ -99,11 +99,131 @@ leg_restart_member() {
   check_no_leaks "$LOGDIR/mount-xmember-r.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# leg_fetch_owner <drive> <creds> <relay>: mount, publish the cold
+# file, then the stale file the member lists before the route dies,
+# then stop: the stop IS the stale-route setup — no VM surgery,
+# just an unmounted owner.
+leg_fetch_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 9 "fetch-plane owner leg"
+  start_mount xowner-f "$c" "$d" "$MNTS/xowner-f" --relay "$relay"
+  echo "cold-bytes" > "$MNTS/xowner-f/cold-2.txt"
+  poll_until 120 test -f "$E2E_ROOT/member-cold-done" \
+    || die "member never completed the blocking cold open"
+  pass "member's single open unblocked on the announcement"
+  echo "stale-bytes" > "$MNTS/xowner-f/stale-1.txt"
+  poll_until 120 test -f "$E2E_ROOT/member-listed-done" \
+    || die "member never listed the stale file"
+  stop_mount xowner-f INT
+  check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  touch "$E2E_ROOT/owner-stopped"
+  poll_until 180 test -f "$E2E_ROOT/member-fetch-done" \
+    || die "member never finished the bounded-EIO probes"
+  pass "owner stayed down while the member probed the dead route"
+}
+
+# leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
+# file's announcement via listing, then prove open() blocks for the
+# bytes with ONE cat (no retry loop). List the stale file for its
+# manifest only, then probe the dead route after the owner stops:
+# the stale probe exercises read-side chunk demand (the manifest is
+# already local, so open succeeds and the bounded EIO comes from
+# the read) with the errno to prove it; the never-announced path
+# fails fast with ENOENT — open blocks for content after announce,
+# not for announcements themselves. Close with the dedupe proof
+# over the step-8 restart's redelivery, then delete the remote-only
+# file so the offline export phase stays meaningful.
+# Two matrix items are deliberately NOT e2e-legged here:
+# failure-then-reannounce recovery without remount (filed as
+# nostr:nevent1qqsp9u0jt79kepcrmx8zxcmzzxce0cf3c8fvzs32k7uqjgeajlzzscqpz9mhxue69uhkwunpwdczuap49eehg5s3hry
+# after four proving runs showed the mount never recovers that
+# identity), and timeout-then-completion (the waiter leaves with
+# EIO while the fetch continues (unit-pinned by
+# late_completion_caches_for_the_next_waiter in
+# crates/wyrd-core/src/want.rs, no e2e leg).
+# A third row is half-legged by construction: the stale probe pins
+# fail-closed EIO but not "no invalid object committed", which is
+# structurally guaranteed (verified ingest admits nothing invalid)
+# and unobservable e2e — the member deletes stale-1.txt precisely
+# because the export fails closed on remote-only content, so the
+# export can never show that identity's absence.
+leg_fetch_member() {
+  local d="$1" c="$2" relay="$3"
+  step 9 "fetch-plane member leg"
+  start_mount xmember-f "$c" "$d" "$MNTS/xmember-f" --relay "$relay"
+  # Announcement first (listing shows the new head), bytes second
+  # (the single cat below): this split is what makes the cat a
+  # blocking-open proof rather than a find-ready-bytes no-op.
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'cold-2.txt'" \
+    || die "member never listed the cold file"
+  timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" \
+    || die "blocking cold open failed (open did not wait for the bytes)"
+  [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \
+    || die "cold open returned wrong bytes"
+  pass "single open blocks until the announced bytes arrive"
+  touch "$E2E_ROOT/member-cold-done"
+  # Manifest-only convergence: readdir pulls the manifest chain
+  # without opening contents, so the member holds the announcement
+  # for stale-1.txt while its chunks are still unfetched.
+  poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'stale-1.txt'" \
+    || die "member never listed the stale file"
+  touch "$E2E_ROOT/member-listed-done"
+  poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
+    || die "owner never stopped for the dead-route probes"
+  # Dead route, held manifest: the bytes are announced but
+  # unfetchable. The read must fail closed and bounded.
+  local rc=0
+  timeout 60 cat "$MNTS/xmember-f/stale-1.txt" >/dev/null 2>"$E2E_ROOT/stale-1.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "stale-manifest read returned rc $rc, want EIO (1)"
+  grep -q "Input/output error" "$E2E_ROOT/stale-1.err" \
+    || die "stale-manifest read was not EIO: $(cat "$E2E_ROOT/stale-1.err")"
+  pass "announced-but-unfetchable read fails closed and bounded"
+  # Never announced at all: resolve fails fast, no 30s wait for an
+  # announcement that may never come. The 10s budget (well under the
+  # 30s open deadline) is what makes "immediately" real: a regression
+  # that blocked the full deadline before ENOENT would die here as
+  # rc 124 instead of passing as rc 1.
+  rc=0
+  timeout 10 cat "$MNTS/xmember-f/never-announced.txt" >/dev/null 2>"$E2E_ROOT/never-announced.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "unknown-path open returned rc $rc, want ENOENT (1)"
+  grep -q "No such file or directory" "$E2E_ROOT/never-announced.err" \
+    || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
+  pass "unknown-path open fails fast, never hangs for an announcement"
+  touch "$E2E_ROOT/member-fetch-done"
+  # Remove the remote-only file while the route is still dead:
+  # authorship is local-first, so the delete must work offline, and
+  # the offline export phase fails closed on remote-only content.
+  timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \
+    || die "member cannot author while the route is down"
+  pass "member authors offline with the route down"
+  stop_mount xmember-f TERM
+  # Dedupe proof over the step-8 restart's redelivery, read after the
+  # mount is down so no concurrent append can slip mid-read. Two
+  # preconditions make the check real: the log is non-empty (an
+  # empty log would pass trivially and means the member stopped
+  # acking), and it grew past the phase-4 snapshot (the restart
+  # redelivered, so "no duplicates" is observed, not vacuous).
+  # Past the retention bound an evicted id may legitimately
+  # re-append after redelivery (seen_store.rs:21-25), so the no-dup
+  # half is a below-the-bound invariant; the bound itself is pinned
+  # by unit tests at the 512 test bound.
+  [[ -s "$d/mailbox.seen" ]] || die "member mailbox.seen empty: member stopped acking"
+  [[ -f "$E2E_ROOT/seen-after-restart" ]] || die "phase-4 seen snapshot missing"
+  [[ "$(wc -l < "$d/mailbox.seen")" -gt "$(cat "$E2E_ROOT/seen-after-restart")" ]] \
+    || die "mailbox.seen did not grow across the restart: no redelivery observed"
+  [[ -z "$(sort "$d/mailbox.seen" | uniq -d)" ]] \
+    || die "mailbox.seen holds duplicate ids: redelivery double-appended"
+  pass "redelivery grows the dedupe log without double-appending"
+  check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
 case "${1:-}" in
   converge-owner) leg_converge_owner "$2" "$3" "$4" ;;
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
   restarted-owner) leg_restarted_owner "$2" "$3" "$4" ;;
   restart-member) leg_restart_member "$2" "$3" "$4" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member <drive> <creds> <relay>" >&2; exit 2 ;;
+  fetch-owner) leg_fetch_owner "$2" "$3" "$4" ;;
+  fetch-member) leg_fetch_member "$2" "$3" "$4" ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member <drive> <creds> <relay>" >&2; exit 2 ;;
 esac
 echo "legs: $PASS_COUNT checks passed"

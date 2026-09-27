@@ -11,10 +11,14 @@
 #   $E2E_ROOT/creds/<name>    identity/passphrase files (0600)
 #   $E2E_ROOT/mnt/<name>      FUSE mountpoints
 #   $E2E_ROOT/logs/           per-step stderr captures
+#   $PIDDIR/                  mount pid files (default $E2E_ROOT)
 #
 # Knobs (all optional, with Lima defaults):
 #   E2E_ENV_FILE   env file to source (default /tmp/lima/e2e-env.sh)
 #   E2E_ROOT       state root (default /tmp/wyrd-e2e)
+#   PIDDIR         mount pid files; microVM legs point this at a
+#                  per-guest directory so concurrent guests sharing
+#                  one E2E_ROOT can never SIGKILL each other's mounts
 #   CHECKOUT       repo checkout carrying tests/ (default /mnt/wyrd)
 #   RELAY_HOST     relay address peers dial (default 127.0.0.1)
 #   RELAY_BIND     address the managed relay binds (default 127.0.0.1)
@@ -28,6 +32,7 @@ set -euo pipefail
 source "${E2E_ENV_FILE:-/tmp/lima/e2e-env.sh}"
 
 E2E_ROOT="${E2E_ROOT:-/tmp/wyrd-e2e}"
+PIDDIR="${PIDDIR:-$E2E_ROOT}"
 DRIVES="$E2E_ROOT/drives"
 CREDS="$E2E_ROOT/creds"
 MNTS="$E2E_ROOT/mnt"
@@ -55,7 +60,7 @@ cleanup_mounts() {
     [[ -e "$m" || -L "$m" ]] || continue
     fusermount3 -uz "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
   done
-  for pidf in "$E2E_ROOT"/mount-*.pid; do
+  for pidf in "$PIDDIR"/mount-*.pid; do
     [[ -f "$pidf" ]] || continue
     kill -KILL "$(cat "$pidf")" 2>/dev/null || true
   done
@@ -167,7 +172,8 @@ start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
   [[ -n "${E2E_RUST_LOG:-}" ]] && export RUST_LOG="$E2E_RUST_LOG"
   with_creds "$c" mount "$d" "$m" "$@" \
     >"$LOGDIR/mount-$name.out" 2>"$LOGDIR/mount-$name.err" &
-  echo $! > "$E2E_ROOT/mount-$name.pid"
+  mkdir -p "$PIDDIR"
+  echo $! > "$PIDDIR/mount-$name.pid"
   if [[ "$old_rust_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_rust_log"; fi
   poll_until 20 mountpoint -q "$m" \
     || die "$name: mountpoint never came up (see mount-$name.err)"
@@ -181,7 +187,7 @@ stop_mount() { # <name> <signal> [budget-s = 15]: signal, wait for exit,
   local name="$1" sig="$2" budget="${3:-15}"
   local pid started elapsed
   started=$(date +%s)
-  pid="$(cat "$E2E_ROOT/mount-$name.pid")"
+  pid="$(cat "$PIDDIR/mount-$name.pid")"
   kill "-$sig" "$pid"
   local i status="timeout"
   for ((i = 0; i < budget * 5; i++)); do
@@ -214,6 +220,7 @@ stop_relay() {
   wait "$pid" 2>/dev/null || true
 }
 
+# converged <file> <want>: file exists with exactly the wanted content.
 converged() {
   [[ -f "$1" ]] && [[ "$(cat "$1")" == "$2" ]]
 }

@@ -637,12 +637,12 @@ fn mint_fresh_rotation_bytes(
         &secrets,
     ) {
         Ok(proof) => proof,
-        Err(SignerError::Unreachable | SignerError::IdentityMismatch) => {
+        Err(e @ (SignerError::Unreachable | SignerError::IdentityMismatch)) => {
             // A stall with no error is invisible unless it is logged:
-            // a permanently mis-wired session shows here as a pending
-            // obligation that never converges, greppable under the
-            // rotation debug the e2e step already enables.
-            tracing::debug!(epoch, recipient = ?recipient, "owner-proof signer unavailable; obligation stays pending");
+            // the variant names the diagnosis, so a permanently
+            // mis-wired session reads differently from a dropped one
+            // in the rotation debug the e2e step already enables.
+            tracing::debug!(epoch, recipient = ?recipient, error = ?e, "owner-proof mint skipped; obligation stays pending");
             return Ok(None);
         }
         Err(e @ (SignerError::Refused | SignerError::MalformedResponse)) => {
@@ -693,7 +693,7 @@ mod tests {
     use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, key};
-    use crate::transport::signer::fake::FakeSignerSession;
+    use crate::transport::signer::fake::{FakeSignerSession, GarbageSession, MismatchedSession};
     use secp256k1::SecretKey;
 
     /// A session with no path to a signature, standing in for a
@@ -710,51 +710,6 @@ mod tests {
             _request: SignMessageRequest,
         ) -> Result<SignMessageResponse, SignerError> {
             Err(SignerError::Unreachable)
-        }
-    }
-
-    /// A session that signs with one key and reports another,
-    /// standing in for a reconnected signer that rotated its key.
-    struct RotatedSession {
-        sign_key: SecretKey,
-        reported: DeviceId,
-    }
-
-    impl SignerSession for RotatedSession {
-        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
-            Ok(self.reported)
-        }
-
-        fn sign_message(
-            &self,
-            request: SignMessageRequest,
-        ) -> Result<SignMessageResponse, SignerError> {
-            use secp256k1::{Keypair, SECP256K1};
-            let keypair = Keypair::from_secret_key(SECP256K1, &self.sign_key);
-            Ok(SignMessageResponse {
-                signature: SECP256K1
-                    .sign_schnorr_no_aux_rand(&request.digest, &keypair)
-                    .to_byte_array(),
-            })
-        }
-    }
-
-    /// A session answering with bytes no key can be read from,
-    /// standing in for a corrupt signer response.
-    struct CorruptSession;
-
-    impl SignerSession for CorruptSession {
-        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
-            Ok(DeviceId::from_bytes([0xFF; 32]))
-        }
-
-        fn sign_message(
-            &self,
-            _request: SignMessageRequest,
-        ) -> Result<SignMessageResponse, SignerError> {
-            Ok(SignMessageResponse {
-                signature: [0xFF; 64],
-            })
         }
     }
 
@@ -878,10 +833,10 @@ mod tests {
             .commit_facts(&[Fact::CapabilityQueued(1, owner)])
             .expect("queue the obligation");
         let before = engine.store.current();
-        let rotated = RotatedSession {
-            sign_key: SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
-            reported: other_key_id(),
-        };
+        let rotated = MismatchedSession::new(
+            SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
+            other_key_id(),
+        );
         let mut overlay = BTreeMap::new();
         let minted = mint_fresh_rotation(
             &mut engine,
@@ -904,6 +859,16 @@ mod tests {
             vec![(1, owner)],
             "the obligation stays queued"
         );
+        // Next pass, reconciled: the local session reports the key it
+        // signs with, and the still-queued obligation mints.
+        let local = engine.identity_secret.clone();
+        let healed =
+            mint_fresh_rotation_bytes(&mut engine, &local, &keyring, 1, owner, &genesis_id)
+                .expect("reconciled session mints");
+        assert!(
+            healed.is_some(),
+            "the pending obligation converges once the session agrees with itself"
+        );
     }
 
     /// A corrupt session response is static breakage: it fails
@@ -914,7 +879,7 @@ mod tests {
         let before = engine.store.current();
         let err = mint_fresh_rotation_bytes(
             &mut engine,
-            &CorruptSession,
+            &GarbageSession,
             &keyring,
             1,
             owner,

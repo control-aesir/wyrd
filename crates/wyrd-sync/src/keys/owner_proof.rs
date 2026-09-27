@@ -208,7 +208,7 @@ impl OwnerProof {
 mod tests {
     use super::*;
     use crate::keys::DeviceIdentitySecret;
-    use crate::transport::signer::fake::FakeSignerSession;
+    use crate::transport::signer::fake::{FakeSignerSession, GarbageSession, MismatchedSession};
     use secp256k1::SecretKey;
 
     /// Fixed inputs for every vector below: owner scalar `0x11`, drive
@@ -269,32 +269,6 @@ mod tests {
             .expect("owner-proof domain is authorized");
     }
 
-    /// A session that signs with one key and reports another: the
-    /// signature is valid Schnorr, but not under the reported key.
-    struct MismatchedSession {
-        sign_key: SecretKey,
-        reported: DeviceId,
-    }
-
-    impl SignerSession for MismatchedSession {
-        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
-            Ok(self.reported)
-        }
-
-        fn sign_message(
-            &self,
-            request: SignMessageRequest,
-        ) -> Result<crate::control::nip46::SignMessageResponse, SignerError> {
-            use secp256k1::Keypair;
-            let keypair = Keypair::from_secret_key(SECP256K1, &self.sign_key);
-            Ok(crate::control::nip46::SignMessageResponse {
-                signature: SECP256K1
-                    .sign_schnorr_no_aux_rand(&request.digest, &keypair)
-                    .to_byte_array(),
-            })
-        }
-    }
-
     /// `sign` never accepts a proof its own signer field cannot
     /// verify: a mismatched session is refused at mint time, before
     /// any caller can commit the bytes as a discharged obligation.
@@ -308,33 +282,14 @@ mod tests {
             SECP256K1,
             &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
         );
-        let mismatched = MismatchedSession {
-            sign_key: SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
-            reported: DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize()),
-        };
+        let mismatched = MismatchedSession::new(
+            SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
+            DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize()),
+        );
         assert_eq!(
             OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),
             Err(SignerError::IdentityMismatch)
         );
-    }
-
-    /// A session answering with garbage: the 32-byte signer field is
-    /// not an x-only key, so there is nothing to verify against.
-    struct GarbageSession;
-
-    impl SignerSession for GarbageSession {
-        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
-            Ok(DeviceId::from_bytes([0xFF; 32]))
-        }
-
-        fn sign_message(
-            &self,
-            _request: SignMessageRequest,
-        ) -> Result<crate::control::nip46::SignMessageResponse, SignerError> {
-            Ok(crate::control::nip46::SignMessageResponse {
-                signature: [0xFF; 64],
-            })
-        }
     }
 
     /// An unparseable session response is a different failure with

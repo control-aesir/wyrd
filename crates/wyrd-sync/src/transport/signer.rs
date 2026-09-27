@@ -20,7 +20,10 @@ use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
 /// reconnects under a rotated key) — callers leave the work pending
 /// for the next pass on either. `Refused` is static configuration
 /// and `MalformedResponse` a broken session; neither converges by
-/// waiting, so callers fail loud on those.
+/// waiting, so callers fail loud on those. Classification rule for
+/// future session clients: a truncated or corrupt transport frame is
+/// `Unreachable`, never `MalformedResponse` — the loud arm's "static
+/// misconfiguration" claim holds only under that mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SignerError {
     #[error("signer session refused the request")]
@@ -87,6 +90,56 @@ pub(crate) mod fake {
                 .sign_schnorr_no_aux_rand(&request.digest, &self.keypair)
                 .to_byte_array();
             Ok(SignMessageResponse { signature })
+        }
+    }
+
+    /// A session that signs with one key and reports another: the
+    /// reconnected-signer double for rotation and mis-wiring tests.
+    pub(crate) struct MismatchedSession {
+        sign_key: secp256k1::SecretKey,
+        reported: DeviceId,
+    }
+
+    impl MismatchedSession {
+        pub(crate) fn new(sign_key: secp256k1::SecretKey, reported: DeviceId) -> Self {
+            MismatchedSession { sign_key, reported }
+        }
+    }
+
+    impl SignerSession for MismatchedSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(self.reported)
+        }
+
+        fn sign_message(
+            &self,
+            request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            let keypair = Keypair::from_secret_key(SECP256K1, &self.sign_key);
+            Ok(SignMessageResponse {
+                signature: SECP256K1
+                    .sign_schnorr_no_aux_rand(&request.digest, &keypair)
+                    .to_byte_array(),
+            })
+        }
+    }
+
+    /// A session answering with bytes no key can be read from: the
+    /// corrupt-response double.
+    pub(crate) struct GarbageSession;
+
+    impl SignerSession for GarbageSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(DeviceId::from_bytes([0xFF; 32]))
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            Ok(SignMessageResponse {
+                signature: [0xFF; 64],
+            })
         }
     }
 }

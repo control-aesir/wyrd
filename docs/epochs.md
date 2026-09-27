@@ -301,9 +301,8 @@ A **capability** delivered to a member of epoch N:
   transition ‖ epoch LE ‖ secret-vector digest; deterministic under
   the local session, verified-not-compared in general). The request
   always names the `OwnerProofV1` signer-session domain; enforcement
-  of the domain is remote-session behavior.
-  The secret bytes are never the signed message, only a
-  commitment to them. This keeps the protocol's two authorities
+  of the domain is remote-session behavior. The secret bytes are
+  never the signed message, only a commitment to them. This keeps the protocol's two authorities
   distinct, which is easy to conflate and was the exploit's root:
   **owner authorization authenticates the origin of the secret
   material; member authorization authenticates only its delivery.**

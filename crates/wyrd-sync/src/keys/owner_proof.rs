@@ -164,6 +164,9 @@ impl OwnerProof {
         let signer = session.get_public_key()?;
         let public = XOnlyPublicKey::from_slice(signer.as_bytes())
             .map_err(|_| SignerError::MalformedResponse)?;
+        // Defensive-only under secp256k1 0.30, which parses any 64
+        // bytes and range-checks at verification: kept so a future
+        // validating version fails closed here.
         let signature = Signature::from_slice(&response.signature)
             .map_err(|_| SignerError::MalformedResponse)?;
         SECP256K1
@@ -295,8 +298,6 @@ mod tests {
     /// `sign` never accepts a proof its own signer field cannot
     /// verify: a mismatched session is refused at mint time, before
     /// any caller can commit the bytes as a discharged obligation.
-    /// An unparseable session response is a different failure with
-    /// its own diagnosis.
     #[test]
     fn sign_refuses_a_signature_that_mismatches_the_reported_key() {
         use secp256k1::Keypair;
@@ -336,6 +337,8 @@ mod tests {
         }
     }
 
+    /// An unparseable session response is a different failure with
+    /// its own diagnosis.
     #[test]
     fn sign_refuses_an_unparseable_session_response() {
         let (_, drive, recipient, transition, secrets) = fixture();
@@ -349,6 +352,49 @@ mod tests {
                 &secrets
             ),
             Err(SignerError::MalformedResponse)
+        );
+    }
+
+    /// A session reporting a real key with garbage signature bytes.
+    /// secp256k1 0.30 parses any 64 bytes as a Schnorr signature
+    /// (range checks happen at verification), so garbage reaches
+    /// verification and fails there — it never verifies. If an
+    /// upgrade makes `from_slice` fallible, this test fails and the
+    /// `MalformedResponse` mapping above stops being defensive-only:
+    /// update both together.
+    struct GarbageSignatureSession {
+        reported: DeviceId,
+    }
+
+    impl SignerSession for GarbageSignatureSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(self.reported)
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<crate::control::nip46::SignMessageResponse, SignerError> {
+            Ok(crate::control::nip46::SignMessageResponse {
+                signature: [0xFF; 64],
+            })
+        }
+    }
+
+    #[test]
+    fn sign_never_verifies_session_garbage() {
+        use secp256k1::Keypair;
+        let (_, drive, recipient, transition, secrets) = fixture();
+        let other = Keypair::from_secret_key(
+            SECP256K1,
+            &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
+        );
+        let session = GarbageSignatureSession {
+            reported: DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize()),
+        };
+        assert_eq!(
+            OwnerProof::sign(&session, &drive, &recipient, &transition, 3, &secrets),
+            Err(SignerError::IdentityMismatch)
         );
     }
 

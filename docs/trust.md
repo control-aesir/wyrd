@@ -429,10 +429,9 @@ authority, and the mint verifies the returned signature against the
 session's reported key before accepting it. The local session — the
 only one shipped — holds the key itself and is unscoped by design,
 so today the domain names the operation without constraining it.
-Intake verifies the proof against the
-unwrapped secrets and requires its signer to be an owner of the
-transition's predecessor, so member delivery stays legal while member
-minting does not. A sender checks that same authority before it mints,
+Intake verifies the proof against the unwrapped secrets and requires
+its signer to be an owner of the transition's predecessor, so member
+delivery stays legal while member minting does not. A sender checks that same authority before it mints,
 not only the recipient: a sender without it leaves the obligation
 pending for an authorized signer, rather than committing a
 transmission no recipient would ever install. Version `0x01` (no

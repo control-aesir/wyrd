@@ -620,7 +620,8 @@ fn mint_fresh_rotation_bytes(
     // Raise vs count, stated (error-conventions.md): a session
     // that is momentarily unreachable — or one whose key rotated
     // under it — leaves the obligation pending for the next pass,
-    // exactly like a missing secret or registration. A domain
+    // exactly like a missing secret or registration, with a debug
+    // line so a never-converging stall stays greppable. A domain
     // refusal or a malformed session response is static
     // misconfiguration, so it fails loudly rather than stalling the
     // outbox silently. Loudness aborts the whole pass, not just this
@@ -636,7 +637,14 @@ fn mint_fresh_rotation_bytes(
         &secrets,
     ) {
         Ok(proof) => proof,
-        Err(SignerError::Unreachable | SignerError::IdentityMismatch) => return Ok(None),
+        Err(SignerError::Unreachable | SignerError::IdentityMismatch) => {
+            // A stall with no error is invisible unless it is logged:
+            // a permanently mis-wired session shows here as a pending
+            // obligation that never converges, greppable under the
+            // rotation debug the e2e step already enables.
+            tracing::debug!(epoch, recipient = ?recipient, "owner-proof signer unavailable; obligation stays pending");
+            return Ok(None);
+        }
         Err(e @ (SignerError::Refused | SignerError::MalformedResponse)) => {
             return Err(e.into());
         }
@@ -703,6 +711,60 @@ mod tests {
         ) -> Result<SignMessageResponse, SignerError> {
             Err(SignerError::Unreachable)
         }
+    }
+
+    /// A session that signs with one key and reports another,
+    /// standing in for a reconnected signer that rotated its key.
+    struct RotatedSession {
+        sign_key: SecretKey,
+        reported: DeviceId,
+    }
+
+    impl SignerSession for RotatedSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(self.reported)
+        }
+
+        fn sign_message(
+            &self,
+            request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            use secp256k1::{Keypair, SECP256K1};
+            let keypair = Keypair::from_secret_key(SECP256K1, &self.sign_key);
+            Ok(SignMessageResponse {
+                signature: SECP256K1
+                    .sign_schnorr_no_aux_rand(&request.digest, &keypair)
+                    .to_byte_array(),
+            })
+        }
+    }
+
+    /// A session answering with bytes no key can be read from,
+    /// standing in for a corrupt signer response.
+    struct CorruptSession;
+
+    impl SignerSession for CorruptSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(DeviceId::from_bytes([0xFF; 32]))
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            Ok(SignMessageResponse {
+                signature: [0xFF; 64],
+            })
+        }
+    }
+
+    fn other_key_id() -> DeviceId {
+        use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
+        let other = Keypair::from_secret_key(
+            SECP256K1,
+            &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
+        );
+        DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize())
     }
 
     /// Owner engine, recipient, keyring, and transition id wired for a
@@ -803,6 +865,70 @@ mod tests {
         assert!(
             loaded.capability_sealed.is_empty() && loaded.capability_delivered.is_empty(),
             "unsealed and undelivered"
+        );
+    }
+
+    /// A rotated session heals: the mismatch leaves the obligation
+    /// pending with nothing committed, and the next pass — with the
+    /// session reporting the key it signs with — mints.
+    #[test]
+    fn rotated_session_leaves_the_obligation_pending() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        engine
+            .commit_facts(&[Fact::CapabilityQueued(1, owner)])
+            .expect("queue the obligation");
+        let before = engine.store.current();
+        let rotated = RotatedSession {
+            sign_key: SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
+            reported: other_key_id(),
+        };
+        let mut overlay = BTreeMap::new();
+        let minted = mint_fresh_rotation(
+            &mut engine,
+            &rotated,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect("a rotated session is pending, not an error");
+        assert!(minted.is_none(), "nothing to send this pass");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the skipped mint commits nothing"
+        );
+        assert_eq!(
+            engine.store.load().unwrap().capability_queued,
+            vec![(1, owner)],
+            "the obligation stays queued"
+        );
+    }
+
+    /// A corrupt session response is static breakage: it fails
+    /// loudly, before anything is sealed or committed.
+    #[test]
+    fn corrupt_session_fails_loud_with_nothing_committed() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let before = engine.store.current();
+        let err = mint_fresh_rotation_bytes(
+            &mut engine,
+            &CorruptSession,
+            &keyring,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect_err("a corrupt response must not mint");
+        assert!(
+            matches!(err, EngineError::Signer(SignerError::MalformedResponse)),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed mint commits nothing"
         );
     }
 }

@@ -97,6 +97,20 @@
 //!     an owner-signed but invalid sibling is suppressed while the
 //!     genuine admission converges around it; the pusher is transport,
 //!     never authority.
+//! 38. `concurrent_opens_reads_and_publications_never_deadlock_or_tear` —
+//!     opens, reads, and head publications interleave across threads:
+//!     every read is one whole published version (daemon FUSE backend).
+//! 39. `open_directories_pin_their_enumeration_generation` — a held
+//!     directory listing predates later publications, a fresh open
+//!     enumerates the new generation, and release drops the handle
+//!     (daemon FUSE backend).
+//! 40. `disappeared_then_recreated_paths_serve_the_new_bytes` — a
+//!     vanished path fails closed and retires its identity by path;
+//!     the recreation resolves fresh, never stale (daemon FUSE
+//!     backend).
+//! 41. `redelivered_announcement_after_restart_stays_a_duplicate` —
+//!     identical-bytes redelivery across an engine restart commits
+//!     nothing: dedupe is durable, and the one head stands.
 //!
 //! The layering contracts (workspace extraction program):
 //!

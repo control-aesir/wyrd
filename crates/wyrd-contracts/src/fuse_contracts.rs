@@ -2,7 +2,7 @@
 //! descendants, and snapshot-stable descriptors.
 
 use wyrd_daemon::fuse::FuseBackend;
-use wyrd_format::{Entry, MemoryObjectStore, ObjectStore, Tree};
+use wyrd_format::{Entry, MemoryObjectStore, ObjectStore, TransitionId, Tree};
 use wyrd_fuse::{DriveView, Kind, Node, ViewError};
 
 use crate::support::{fixture_heads, mount_heads, signed_head, Loaded, RemoteOnlyMaterialization};
@@ -204,4 +204,247 @@ fn forged_snapshots_are_rejected_before_fuse_head_installation() {
         AuthorizedSnapshot::authorize(forged, &crate::support::drive()),
         Err(Rejection::BadSignature)
     );
+}
+
+/// Concurrent opens, reads, and head publications never deadlock and
+/// never tear: every read returns one complete published version.
+/// Readers resolve against whichever generation is current per open
+/// while the publisher swaps generations underneath; the lock order
+/// (projection before handle tables, never the reverse) holds under
+/// contention, and captures are immutable once taken, so a read is
+/// always whole-version or nothing.
+#[test]
+fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const VERSIONS: usize = 4;
+    const READERS: usize = 4;
+    const READS_PER_THREAD: usize = 20;
+    const PUBLICATIONS: usize = 12;
+
+    let mut store = MemoryObjectStore::default();
+    let author = crate::support::device(0x0A);
+    let membership = TransitionId::from_bytes([0x71; 32]);
+    let mut bodies = Vec::new();
+    let mut heads = Vec::new();
+    for index in 0..VERSIONS {
+        let body = vec![b'0' + index as u8; 16];
+        let chunk = store.insert(wyrd_format::ObjectKind::Chunk, &body).unwrap();
+        let tree = Tree::from_entries(vec![Entry::file("v.txt", 16, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let snapshot =
+            crate::support::signed_snapshot(Vec::new(), tree, &author, membership, 1, index as u64);
+        let authorized =
+            wyrd_sync::durable::AuthorizedSnapshot::authorize(snapshot, &crate::support::drive())
+                .unwrap();
+        bodies.push(body);
+        heads.push(authorized);
+    }
+    let mut heads = heads.into_iter();
+    let backend = Arc::new(FuseBackend::new(DriveView::new(
+        store,
+        RemoteOnlyMaterialization,
+        mount_heads(vec![heads.next().unwrap()]),
+    )));
+    let published: Vec<_> = heads.collect();
+    let bodies = Arc::new(bodies);
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|scope| {
+        for _ in 0..READERS {
+            let backend = Arc::clone(&backend);
+            let bodies = Arc::clone(&bodies);
+            let completed = Arc::clone(&completed);
+            scope.spawn(move || {
+                for _ in 0..READS_PER_THREAD {
+                    let handle = backend.open_at("v.txt").unwrap();
+                    let bytes = backend.read_handle(handle, 0, 64).unwrap();
+                    assert!(
+                        bodies.contains(&bytes),
+                        "a concurrent read is always one whole published version"
+                    );
+                    backend.release_handle(handle).unwrap();
+                    completed.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        // Publish the remaining versions round-robin while the
+        // readers run: every publication swaps the served generation
+        // under live opens.
+        let rotating = published.len();
+        for index in 0..PUBLICATIONS {
+            backend
+                .publish_without_revision(DriveView::shared(
+                    backend.store_handle().unwrap(),
+                    RemoteOnlyMaterialization,
+                    mount_heads(vec![published[index % rotating].clone()]),
+                ))
+                .unwrap();
+        }
+    });
+
+    assert_eq!(
+        completed.load(Ordering::Relaxed),
+        READERS * READS_PER_THREAD,
+        "every reader finished: no deadlock under contention"
+    );
+    assert_eq!(
+        backend.generation().unwrap(),
+        PUBLICATIONS as u64,
+        "every publication landed while reads were in flight"
+    );
+}
+
+/// An open directory pins its enumeration generation: publishing new
+/// heads does not rewrite a held listing, a fresh open sees the new
+/// generation, and releasing drops the handle. The listing a
+/// readdir serves is the one opendir enumerated, so a head advance
+/// can neither inject entries into a held handle nor strand it.
+#[test]
+fn open_directories_pin_their_enumeration_generation() {
+    let mut store = MemoryObjectStore::default();
+    let chunk = store
+        .insert(wyrd_format::ObjectKind::Chunk, b"one")
+        .unwrap();
+    let tree_one = Tree::from_entries(vec![Entry::file("one.txt", 3, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let backend = FuseBackend::new(DriveView::new(
+        store,
+        RemoteOnlyMaterialization,
+        fixture_heads(vec![signed_head(tree_one)]),
+    ));
+
+    // The root path always maps to ino 1: open its listing.
+    let dir = backend.open_dir(1, "").unwrap();
+    let generation = backend.dir_generation(dir).unwrap();
+
+    // A head advance adds a sibling: the held handle still reports
+    // its enumeration generation, not the new one.
+    let chunk_two = backend
+        .store_handle()
+        .unwrap()
+        .write()
+        .map(|mut store| {
+            store
+                .insert(wyrd_format::ObjectKind::Chunk, b"two")
+                .unwrap()
+        })
+        .unwrap();
+    let tree_two = Tree::from_entries(vec![
+        Entry::file("one.txt", 3, false, vec![chunk]).unwrap(),
+        Entry::file("two.txt", 3, false, vec![chunk_two]).unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut *backend.store_handle().unwrap().write().unwrap())
+    .unwrap();
+    backend
+        .publish_without_revision(DriveView::shared(
+            backend.store_handle().unwrap(),
+            RemoteOnlyMaterialization,
+            fixture_heads(vec![signed_head(tree_two)]),
+        ))
+        .unwrap();
+    assert_eq!(backend.generation().unwrap(), generation + 1);
+    assert_eq!(
+        backend.dir_generation(dir).unwrap(),
+        generation,
+        "the held listing predates the publication"
+    );
+
+    // A fresh open enumerates the new generation.
+    let fresh = backend.open_dir(1, "").unwrap();
+    assert_eq!(backend.dir_generation(fresh).unwrap(), generation + 1);
+
+    // Releasing drops the handle: it reports EBADF afterwards.
+    backend.release_dir(dir).unwrap();
+    assert_eq!(
+        backend.dir_generation(dir),
+        Err(fuser::Errno::EBADF),
+        "a released directory handle is gone"
+    );
+    backend.release_dir(fresh).unwrap();
+}
+
+/// A path that disappears and later reappears serves the new bytes:
+/// the vanished generation fails closed with ENOENT (retiring the
+/// stale identity by path), and the recreation resolves fresh rather
+/// than resurrecting the retired mapping.
+#[test]
+fn disappeared_then_recreated_paths_serve_the_new_bytes() {
+    let mut store = MemoryObjectStore::default();
+    let chunk_before = store
+        .insert(wyrd_format::ObjectKind::Chunk, b"before")
+        .unwrap();
+    let tree_before =
+        Tree::from_entries(vec![
+            Entry::file("gone.txt", 6, false, vec![chunk_before]).unwrap()
+        ])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let backend = FuseBackend::new(DriveView::new(
+        store,
+        RemoteOnlyMaterialization,
+        fixture_heads(vec![signed_head(tree_before)]),
+    ));
+
+    let handle = backend.open_at("gone.txt").unwrap();
+    assert_eq!(backend.read_handle(handle, 0, 64).unwrap(), b"before");
+    backend.release_handle(handle).unwrap();
+
+    // The path vanishes from the heads: resolution fails closed.
+    let tree_empty = Tree::from_entries(vec![])
+        .unwrap()
+        .insert_into(&mut *backend.store_handle().unwrap().write().unwrap())
+        .unwrap();
+    backend
+        .publish_without_revision(DriveView::shared(
+            backend.store_handle().unwrap(),
+            RemoteOnlyMaterialization,
+            fixture_heads(vec![signed_head(tree_empty)]),
+        ))
+        .unwrap();
+    assert_eq!(
+        backend.open_at("gone.txt"),
+        Err(fuser::Errno::ENOENT),
+        "the vanished path fails closed"
+    );
+
+    // The path returns with different bytes: the open serves the
+    // recreation, never the retired identity's capture.
+    let chunk_after = backend
+        .store_handle()
+        .unwrap()
+        .write()
+        .map(|mut store| {
+            store
+                .insert(wyrd_format::ObjectKind::Chunk, b"after!")
+                .unwrap()
+        })
+        .unwrap();
+    let tree_after = Tree::from_entries(vec![
+        Entry::file("gone.txt", 6, false, vec![chunk_after]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut *backend.store_handle().unwrap().write().unwrap())
+    .unwrap();
+    backend
+        .publish_without_revision(DriveView::shared(
+            backend.store_handle().unwrap(),
+            RemoteOnlyMaterialization,
+            fixture_heads(vec![signed_head(tree_after)]),
+        ))
+        .unwrap();
+    let handle = backend.open_at("gone.txt").unwrap();
+    assert_eq!(
+        backend.read_handle(handle, 0, 64).unwrap(),
+        b"after!",
+        "the recreated path serves its own bytes"
+    );
+    backend.release_handle(handle).unwrap();
 }

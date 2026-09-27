@@ -1591,7 +1591,9 @@ where
     /// Drop an open directory handle. Directory handles live in their
     /// own table (separate from file handles), so they release through
     /// this path, not [`release_handle`](Self::release_handle).
-    pub(crate) fn release_dir(&self, fh: u64) -> Result<(), fuser::Errno> {
+    /// Public alongside [`open_dir`](Self::open_dir): the contract
+    /// suite pins the open-handle lifecycle across head changes.
+    pub fn release_dir(&self, fh: u64) -> Result<(), fuser::Errno> {
         let mut directories = self.directories.write().map_err(|_| fuser::Errno::EIO)?;
         directories.entries.remove(&fh);
         Ok(())
@@ -1602,8 +1604,9 @@ where
     /// child (kind-aware, stamped with the enumeration generation),
     /// and pin the listing with its generation. The non-callback form
     /// of the kernel `opendir` op — the surface the
-    /// directory-consistency tests ride.
-    pub(crate) fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
+    /// directory-consistency tests ride, in-crate and across the
+    /// contract suite.
+    pub fn open_dir(&self, ino: u64, path: &str) -> Result<u64, fuser::Errno> {
         let Ok(projection) = self.projection() else {
             return Err(fuser::Errno::EIO);
         };

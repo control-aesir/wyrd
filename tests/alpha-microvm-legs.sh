@@ -173,15 +173,26 @@ leg_fetch_member() {
     || die "stale-manifest read was not EIO: $(cat "$E2E_ROOT/stale-1.err")"
   pass "announced-but-unfetchable read fails closed and bounded"
   # Never announced at all: resolve fails fast, no 30s wait for an
-  # announcement that may never come.
+  # announcement that may never come. The 10s budget (well under the
+  # 30s open deadline) is what makes "immediately" real: a regression
+  # that blocked the full deadline before ENOENT would die here as
+  # rc 124 instead of passing as rc 1.
   rc=0
-  timeout 60 cat "$MNTS/xmember-f/never-announced.txt" >/dev/null 2>"$E2E_ROOT/never-announced.err" || rc=$?
+  timeout 10 cat "$MNTS/xmember-f/never-announced.txt" >/dev/null 2>"$E2E_ROOT/never-announced.err" || rc=$?
   [[ "$rc" == 1 ]] || die "unknown-path open returned rc $rc, want ENOENT (1)"
   grep -q "No such file or directory" "$E2E_ROOT/never-announced.err" \
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
   touch "$E2E_ROOT/member-fetch-done"
-  # Dedupe proof over the step-8 restart's redelivery: every
+  # Remove the remote-only file while the route is still dead:
+  # authorship is local-first, so the delete must work offline, and
+  # the offline export phase fails closed on remote-only content.
+  timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \
+    || die "member cannot author while the route is down"
+  pass "member authors offline with the route down"
+  stop_mount xmember-f TERM
+  # Dedupe proof over the step-8 restart's redelivery, read after the
+  # mount is down so no concurrent append can slip mid-read: every
   # retained id is recorded once (record() is a no-op for known
   # ids), so while the run stays under the retention bound the file
   # holds no duplicate line. Past the bound an evicted id may
@@ -192,13 +203,6 @@ leg_fetch_member() {
   [[ -z "$(sort "$d/mailbox.seen" | uniq -d)" ]] \
     || die "mailbox.seen holds duplicate ids: redelivery double-appended"
   pass "redelivery never double-appends the dedupe log"
-  # Remove the remote-only file while the route is still dead:
-  # authorship is local-first, so the delete must work offline, and
-  # the offline export phase fails closed on remote-only content.
-  timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \
-    || die "member cannot author while the route is down"
-  pass "member authors offline with the route down"
-  stop_mount xmember-f TERM
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 

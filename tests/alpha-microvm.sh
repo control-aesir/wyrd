@@ -19,6 +19,9 @@
 #
 # Out of scope, tracked as follow-up: relay-partition conflict legs
 # (concurrent commits, StaleHandle, ConflictedHeads, name@N export).
+# Still tracked on the control-plane issue (NIP-44 sealing interop
+# over the relay, mailbox.seen dedupe-log growth):
+# nostr:nevent1qqsw5yaj93c8556axtlamjcgh2y8lhelw49pv5cqcfsyhz4q24dm6cspz9mhxue69uhkwunpwdczuap49eehgyz9qww.
 # The topology supports them (relay is a VM service the host can
 # stop); the assertions need product behavior observed on odin
 # first, not encoded blind.

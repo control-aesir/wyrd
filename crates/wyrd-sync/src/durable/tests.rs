@@ -26,6 +26,16 @@ use wyrd_format::{
 
 const PASSPHRASE: &str = "durable test passphrase";
 
+/// Decode pinned hex for the known-answer vectors below. Local to
+/// this test module: a shared home waits for a third in-crate user.
+fn unhex<const N: usize>(hex: &str) -> [u8; N] {
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .collect();
+    bytes.try_into().expect("pinned length")
+}
+
 /// An isolated store directory, removed on drop. Unique per test
 /// (process id plus counter) since tests run multithreaded.
 struct TestDir {
@@ -350,6 +360,80 @@ fn the_replacement_tag_is_a_clean_upgrade_boundary() {
         Some(replacement.as_slice()),
         "replay resolves the chain to the newest bytes"
     );
+}
+
+/// The supersession identity, pinned to a known answer:
+/// `BLAKE3-derive-key("wyrd capability supersede id v1",
+/// context ‖ epoch LE ‖ recipient ‖ sealed bytes)`. A context-string
+/// edit or a field reorder silently renames every supersession link,
+/// so the renaming breaks here instead.
+#[test]
+fn supersession_identity_matches_known_answer() {
+    let id = SealedCapabilityFactId::of(
+        2,
+        &DeviceId::from_bytes([0x04; 32]),
+        b"sealed-bytes-fixture",
+    );
+    assert_eq!(
+        id.as_bytes(),
+        &unhex::<32>("e6c02934bb4b07e3be55365776e6837b293ee386fe74ab77709c70e1e0b9fe7e")
+    );
+    // Any input bit changes the identity: a replacement names exactly
+    // one fact, and cannot be retargeted by mutating what it names.
+    assert_ne!(
+        SealedCapabilityFactId::of(
+            3,
+            &DeviceId::from_bytes([0x04; 32]),
+            b"sealed-bytes-fixture"
+        ),
+        id
+    );
+    assert_ne!(
+        SealedCapabilityFactId::of(
+            2,
+            &DeviceId::from_bytes([0x04; 32]),
+            b"sealed-bytes-fixturd"
+        ),
+        id
+    );
+}
+
+/// The `0x16` record layout, byte for byte: epoch u64 LE ‖ recipient
+/// (32) ‖ supersedes (32) ‖ replacement bytes. The tag and the field
+/// order are the upgrade boundary old readers skip over, so both are
+/// pinned here rather than left to the round-trip.
+#[test]
+fn replacement_record_layout_is_byte_exact() {
+    use crate::durable::codec::{encode_fact, TAG_CAPABILITY_SEALED_REPLACED};
+    let recipient = DeviceId::from_bytes([0x04; 32]);
+    let stale = sealed_rotation_bytes(&drive(), recipient, 2, 0x01);
+    let replacement = sealed_rotation_bytes(&drive(), recipient, 2, 0x02);
+    let supersedes = SealedCapabilityFactId::of(2, &recipient, &stale);
+    let (tag, bytes) = encode_fact(
+        &[0u8; 32],
+        &drive(),
+        &Fact::CapabilitySealedReplaced {
+            epoch: 2,
+            recipient,
+            supersedes,
+            replacement: replacement.clone(),
+        },
+    )
+    .expect("a correlated replacement encodes");
+    assert_eq!(
+        tag, TAG_CAPABILITY_SEALED_REPLACED,
+        "the record carries the replacement tag"
+    );
+    assert_eq!(
+        tag, 0x16,
+        "the tag is pinned: a different value is a different format"
+    );
+    let mut expected = Vec::with_capacity(72 + replacement.len());
+    expected.extend_from_slice(&2u64.to_le_bytes());
+    expected.extend_from_slice(recipient.as_bytes());
+    expected.extend_from_slice(supersedes.as_bytes());
+    expected.extend_from_slice(&replacement);
+    assert_eq!(bytes, expected);
 }
 
 /// Inside the committed prefix, corruption fails the load: a damaged

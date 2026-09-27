@@ -112,7 +112,12 @@ Releases are not required to write every format they read:
     `the_replacement_tag_is_a_clean_upgrade_boundary`: `0x16` sits
     outside the enumerated pre-replacement set, a commit carrying a
     real replacement loads rather than poisoning the file, and a
-    current reader resolves the chain to the replacement bytes.
+    current reader resolves the chain to the replacement bytes. The
+    field order and the supersession identity are pinned byte-exact
+    alongside it (`replacement_record_layout_is_byte_exact`,
+    `supersession_identity_matches_known_answer`); the owner-proof
+    construction the replacement supersedes toward is pinned the
+    same way (`owner_proof_*` in `wyrd-contracts`).
 
 ## What this forbids
 

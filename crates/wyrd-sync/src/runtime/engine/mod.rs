@@ -196,6 +196,16 @@ pub enum EngineError {
     AnnouncementUnavailable(SnapshotId),
     #[error("observed transition {0:?} has no classification")]
     TransitionUnclassified(TransitionId),
+    /// A signer session failed to mint an owner proof. Raise vs
+    /// count (error-conventions.md): transient failures
+    /// (`Unreachable`, `IdentityMismatch`) never surface here — the
+    /// mint site leaves the obligation pending instead. Only static
+    /// misconfiguration raises: `Refused`, `MalformedResponse`, and a
+    /// session signing as another device
+    /// (`SessionIdentityMismatch`) — and raising aborts the whole
+    /// delivery pass.
+    #[error("owner-proof signer session failed: {0}")]
+    Signer(#[from] crate::transport::signer::SignerError),
 }
 
 /// What one [`Engine::carry_pending`] drain did. Composition

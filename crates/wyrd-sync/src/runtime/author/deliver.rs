@@ -11,6 +11,7 @@ use crate::keys::capability::{Capability, DriveKeyring};
 use crate::keys::owner_proof::OwnerProof;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::{seal_for_recipient, Mailbox};
+use crate::transport::signer::{SignerError, SignerSession};
 use zeroize::Zeroizing;
 
 /// Send every undischarged transition- and capability-delivery
@@ -320,6 +321,11 @@ fn deliver_capabilities(
 ) -> Result<usize, EngineError> {
     let mut pending = rebuilt.runtime.pending_capabilities();
     pending.sort();
+    if pending.is_empty() {
+        // Nothing to mint: skip the chain walk and the session
+        // clone below, so an idle pass copies no key material.
+        return Ok(0);
+    }
     // The canonical chain's epoch-to-transition map, walked once:
     // capability wraps bind to the epoch's canonical transition.
     let mut chain: BTreeMap<u64, TransitionId> = BTreeMap::new();
@@ -333,6 +339,11 @@ fn deliver_capabilities(
     }
     let mut sealed_overlay: BTreeMap<(u64, DeviceId), Vec<u8>> = BTreeMap::new();
     let mut sent = 0usize;
+    // The mint session, cloned once per pass: the local identity signs
+    // for itself (a remote session would plug in here when NIP-46 mode
+    // lands). Cloned rather than borrowed so the obligation loop can
+    // keep its `&mut Engine` while minting through the session.
+    let signer = engine.identity_secret.clone();
     for (epoch, recipient) in pending {
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
@@ -372,6 +383,7 @@ fn deliver_capabilities(
                     Reused::Mint => {
                         let Some(bytes) = mint_fresh_rotation(
                             engine,
+                            &signer,
                             &rebuilt.keyring,
                             &mut sealed_overlay,
                             epoch,
@@ -397,35 +409,18 @@ fn deliver_capabilities(
             // still fail closed: genuinely undecodable outbox bytes never
             // silently heal.
             Some(bytes) if is_superseded_rotation(&bytes) => {
-                // Supersede durably, exactly once. First-seal-wins
-                // cannot express "these bytes are no longer the
-                // obligation", so the change is its own fact: a
-                // pass-local overlay would be discarded on restart,
-                // leaving the stale fact to be re-minted into *new*
-                // bytes every pass — one appended-and-fsynced,
-                // then-ignored record per obligation per pass during a
-                // relay outage, and retries that are no longer
-                // byte-identical. With the fact committed, replay makes
-                // the replacement the current obligation and every
-                // later pass reuses these exact bytes.
-                let supersedes =
-                    crate::durable::SealedCapabilityFactId::of(epoch, &recipient, &bytes);
-                let Some(replacement) = mint_fresh_rotation_bytes(
+                let Some(replacement) = supersede_stale_rotation(
                     engine,
+                    &signer,
                     &rebuilt.keyring,
                     epoch,
                     recipient,
                     &transition_id,
+                    &bytes,
                 )?
                 else {
                     continue;
                 };
-                engine.commit_facts(&[Fact::CapabilitySealedReplaced {
-                    epoch,
-                    recipient,
-                    supersedes,
-                    replacement: replacement.clone(),
-                }])?;
                 replacement
             }
             Some(bytes) => {
@@ -437,6 +432,7 @@ fn deliver_capabilities(
                 }
                 let Some(bytes) = mint_fresh_rotation(
                     engine,
+                    &signer,
                     &rebuilt.keyring,
                     &mut sealed_overlay,
                     epoch,
@@ -451,6 +447,7 @@ fn deliver_capabilities(
             None => {
                 let Some(bytes) = mint_fresh_rotation(
                     engine,
+                    &signer,
                     &rebuilt.keyring,
                     &mut sealed_overlay,
                     epoch,
@@ -536,13 +533,15 @@ fn verify_reused_rotation(
 /// retry.
 fn mint_fresh_rotation(
     engine: &mut Engine,
+    session: &dyn SignerSession,
     keyring: &DriveKeyring,
     sealed_overlay: &mut BTreeMap<(u64, DeviceId), Vec<u8>>,
     epoch: u64,
     recipient: DeviceId,
     transition_id: &TransitionId,
 ) -> Result<Option<Vec<u8>>, EngineError> {
-    let Some(bytes) = mint_fresh_rotation_bytes(engine, keyring, epoch, recipient, transition_id)?
+    let Some(bytes) =
+        mint_fresh_rotation_bytes(engine, session, keyring, epoch, recipient, transition_id)?
     else {
         return Ok(None);
     };
@@ -551,11 +550,50 @@ fn mint_fresh_rotation(
     Ok(Some(bytes))
 }
 
+/// Supersede a stale sealed fact durably, exactly once, and return
+/// the replacement bytes. First-seal-wins cannot express "these
+/// bytes are no longer the obligation", so the change is its own
+/// fact: a pass-local overlay would be discarded on restart, leaving
+/// the stale fact to be re-minted into *new* bytes every pass — one
+/// appended-and-fsynced, then-ignored record per obligation per pass
+/// during a relay outage, and retries that are no longer
+/// byte-identical. With the fact committed, replay makes the
+/// replacement the current obligation and every later pass reuses
+/// these exact bytes.
+///
+/// Returns `None` — obligation stays pending, stale fact untouched —
+/// when the mint cannot complete, so a later pass retries the same
+/// replacement rather than stacking failures.
+fn supersede_stale_rotation(
+    engine: &mut Engine,
+    session: &dyn SignerSession,
+    keyring: &DriveKeyring,
+    epoch: u64,
+    recipient: DeviceId,
+    transition_id: &TransitionId,
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let supersedes = crate::durable::SealedCapabilityFactId::of(epoch, &recipient, bytes);
+    let Some(replacement) =
+        mint_fresh_rotation_bytes(engine, session, keyring, epoch, recipient, transition_id)?
+    else {
+        return Ok(None);
+    };
+    engine.commit_facts(&[Fact::CapabilitySealedReplaced {
+        epoch,
+        recipient,
+        supersedes,
+        replacement: replacement.clone(),
+    }])?;
+    Ok(Some(replacement))
+}
+
 /// Mint current-framing rotation bytes for one obligation without
 /// committing anything: the caller decides whether this becomes the
 /// durable obligation (a replacement fact) or a first seal.
 fn mint_fresh_rotation_bytes(
     engine: &mut Engine,
+    session: &dyn SignerSession,
     keyring: &DriveKeyring,
     epoch: u64,
     recipient: DeviceId,
@@ -599,14 +637,65 @@ fn mint_fresh_rotation_bytes(
     // Mint authority, distinct from delivery authority: the owner signs
     // a commitment to this exact vector, so any member may later relay
     // the sealed bytes while only an owner can have originated them.
-    let proof = OwnerProof::sign(
-        &engine.identity_secret,
+    // Raise vs count, stated (error-conventions.md): a session
+    // that is momentarily unreachable — or one whose key rotated
+    // under it — leaves the obligation pending for the next pass,
+    // exactly like a missing secret or registration, with a debug
+    // line so a never-converging stall stays greppable. A domain
+    // refusal, a malformed session response, or a session signing as
+    // another device is static misconfiguration, so it fails loudly
+    // rather than stalling the outbox silently. Loudness aborts the
+    // whole pass, not just this obligation: the error propagates
+    // through `deliver_pending`, and the live loop counts it toward
+    // its consecutive-error budget.
+    let proof = match OwnerProof::sign(
+        session,
         &engine.drive,
         &recipient,
         &transition.transition_id(),
         epoch,
         &secrets,
-    );
+    ) {
+        Ok(proof) => proof,
+        Err(e @ (SignerError::Unreachable | SignerError::IdentityMismatch)) => {
+            // A stall with no error is invisible unless it is logged:
+            // the variant names the diagnosis, so a permanently
+            // mis-wired session reads differently from a dropped one.
+            // `debug!`, not the e2e rotation log: the e2e harnesses
+            // set no `wyrd_sync` scope (Lima defaults to
+            // `wyrd_core=debug`, microVM to the binary's `info`) —
+            // this line is for daemon logs with crate debug enabled
+            // (`--verbose`). Widening the Lima filter to carry it was
+            // considered and declined: harness config is out of scope
+            // for this change.
+            tracing::debug!(epoch, recipient = ?recipient, error = ?e, "owner-proof mint skipped; obligation stays pending");
+            return Ok(None);
+        }
+        Err(
+            e @ (SignerError::Refused
+            | SignerError::MalformedResponse
+            // Unreachable from `sign`, which never reports the engine
+            // join: listed so the terminal class stays exhaustive if
+            // a future session path does.
+            | SignerError::SessionIdentityMismatch { .. }),
+        ) => {
+            return Err(e.into());
+        }
+    };
+    // The join the mint-authority gate assumes: the gate vetted
+    // `engine.device` as an owner, so the proof must name the same
+    // identity. A session consistently signing as another device —
+    // reachable, domain-authorized, but mapped to the wrong engine —
+    // would otherwise mint deliveries the recipient suppresses while
+    // the sender commits them as discharged. The engine's identity
+    // never changes under it, so this never heals: loud, with both
+    // identities in the error.
+    if proof.signer != engine.device {
+        return Err(EngineError::Signer(SignerError::SessionIdentityMismatch {
+            reported: proof.signer,
+            device: engine.device,
+        }));
+    }
     let sealed = seal_rotation(
         &engine.drive,
         recipient,
@@ -642,4 +731,357 @@ fn mint_wrap(
 ) -> Option<Vec<u8>> {
     let cap = Capability::mint(drive, recipient, state, transition, secrets).ok()?;
     Some(cap.wrap().ok()?.as_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests_harness::owner_engine;
+    use super::*;
+    use crate::keys::EpochSecret;
+    use crate::membership::test_util::{drive as member_drive, key};
+    use crate::transport::signer::fake::{
+        unrelated_identity, unrelated_secret, FakeSignerSession, GarbageSession, MismatchedSession,
+        UnreachableSession,
+    };
+    use secp256k1::SecretKey;
+
+    /// Owner engine, recipient, keyring, and transition id wired for a
+    /// mint: the owner mints its epoch-1 vector to itself. The
+    /// directory rides along so the caller keeps the store alive.
+    fn mint_setup() -> (
+        crate::runtime::test_util::TestDir,
+        Engine,
+        DriveKeyring,
+        DeviceId,
+        wyrd_format::TransitionId,
+    ) {
+        let (dir, engine, genesis_id) = owner_engine("signer-session-mint");
+        let owner = key(10).1;
+        let state = engine.log.state_of(&genesis_id).expect("genesis has state");
+        let registered = state
+            .encryption_key_of(&owner)
+            .copied()
+            .expect("owner key registered");
+        let cap = Capability::new(
+            member_drive(),
+            owner,
+            registered,
+            genesis_id,
+            1,
+            vec![EpochSecret::from_bytes([0x07; 32])],
+        )
+        .expect("mintable");
+        let mut keyring = DriveKeyring::new(member_drive(), owner);
+        keyring.install(&cap, &engine.log).expect("installs");
+        (dir, engine, keyring, owner, genesis_id)
+    }
+
+    /// A domain refusal is a misconfiguration retry will not heal: it
+    /// fails loudly. Driven through the committing wrapper (not the
+    /// bare bytes fn) so "nothing committed" can actually fail: the
+    /// first seal commits inside `mint_fresh_rotation`, after the
+    /// proof.
+    #[test]
+    fn refusing_session_fails_loud_with_nothing_committed() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let refusing =
+            FakeSignerSession::new(&SecretKey::from_slice(&[0x99; 32]).expect("scalar"), &[]);
+        let before = engine.store.current();
+        let mut overlay = BTreeMap::new();
+        let err = mint_fresh_rotation(
+            &mut engine,
+            &refusing,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect_err("a refused domain must not mint");
+        assert!(
+            matches!(err, EngineError::Signer(SignerError::Refused)),
+            "unexpected: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("owner-proof signer session failed"),
+            "the message stays true for every signer failure: {err}"
+        );
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed mint commits nothing"
+        );
+        assert!(
+            engine.store.load().unwrap().capability_sealed.is_empty(),
+            "no sealed fact claims the obligation"
+        );
+    }
+
+    /// An unreachable signer is transient: the obligation stays
+    /// pending — queued, unsealed, undelivered — for the next pass,
+    /// exactly like a missing secret or registration.
+    #[test]
+    fn unreachable_session_leaves_the_obligation_pending() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        engine
+            .commit_facts(&[Fact::CapabilityQueued(1, owner)])
+            .expect("queue the obligation");
+        let before = engine.store.current();
+        let mut overlay = BTreeMap::new();
+        let minted = mint_fresh_rotation(
+            &mut engine,
+            &UnreachableSession,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect("unreachable is pending, not an error");
+        assert!(minted.is_none(), "nothing to send this pass");
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the skipped mint commits nothing"
+        );
+        let loaded = engine.store.load().unwrap();
+        assert_eq!(
+            loaded.capability_queued,
+            vec![(1, owner)],
+            "the obligation stays queued"
+        );
+        assert!(
+            loaded.capability_sealed.is_empty() && loaded.capability_delivered.is_empty(),
+            "unsealed and undelivered"
+        );
+    }
+
+    /// A rotated session heals: the mismatch leaves the obligation
+    /// pending with nothing committed, and the next pass — with the
+    /// session reporting the key it signs with — mints.
+    #[test]
+    fn rotated_session_leaves_the_obligation_pending() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        engine
+            .commit_facts(&[Fact::CapabilityQueued(1, owner)])
+            .expect("queue the obligation");
+        let before = engine.store.current();
+        let rotated = MismatchedSession::new(
+            SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
+            unrelated_identity(),
+        );
+        let mut overlay = BTreeMap::new();
+        let minted = mint_fresh_rotation(
+            &mut engine,
+            &rotated,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect("a rotated session is pending, not an error");
+        assert!(minted.is_none(), "nothing to send this pass");
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the skipped mint commits nothing"
+        );
+        assert_eq!(
+            engine.store.load().unwrap().capability_queued,
+            vec![(1, owner)],
+            "the obligation stays queued"
+        );
+        // Next pass, reconciled: the local session reports the key it
+        // signs with, and the still-queued obligation mints.
+        let local = engine.identity_secret.clone();
+        let healed =
+            mint_fresh_rotation_bytes(&mut engine, &local, &keyring, 1, owner, &genesis_id)
+                .expect("reconciled session mints");
+        assert!(
+            healed.is_some(),
+            "the pending obligation converges once the session agrees with itself"
+        );
+    }
+
+    /// A corrupt session response is static breakage: it fails
+    /// loudly. Driven through the committing wrapper (not the bare
+    /// bytes fn) so "nothing committed" can actually fail.
+    #[test]
+    fn corrupt_session_fails_loud_with_nothing_committed() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let before = engine.store.current();
+        let mut overlay = BTreeMap::new();
+        let err = mint_fresh_rotation(
+            &mut engine,
+            &GarbageSession,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect_err("a corrupt response must not mint");
+        assert!(
+            matches!(err, EngineError::Signer(SignerError::MalformedResponse)),
+            "unexpected: {err:?}"
+        );
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed mint commits nothing"
+        );
+    }
+
+    /// A session consistently signing as another device: the gate
+    /// vetted the engine's identity, so a proof naming anyone else
+    /// is misconfiguration — loud, with both identities. Driven
+    /// through the committing wrapper so "nothing committed" can
+    /// actually fail.
+    #[test]
+    fn foreign_session_fails_loud_with_nothing_committed() {
+        use crate::control::SignDomain;
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let (foreign_secret, foreign_id) = (unrelated_secret(), unrelated_identity());
+        assert_ne!(foreign_id, owner, "the session is not this device");
+        let foreign = FakeSignerSession::new(&foreign_secret, &[SignDomain::OwnerProofV1]);
+        let before = engine.store.current();
+        let mut overlay = BTreeMap::new();
+        let err = mint_fresh_rotation(
+            &mut engine,
+            &foreign,
+            &keyring,
+            &mut overlay,
+            1,
+            owner,
+            &genesis_id,
+        )
+        .expect_err("another device's session must not mint");
+        assert!(
+            matches!(
+                err,
+                EngineError::Signer(SignerError::SessionIdentityMismatch { .. })
+            ),
+            "unexpected: {err:?}"
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(&format!("{foreign_id}")),
+            "the reported identity travels in the error: {err}"
+        );
+        assert!(
+            rendered.contains(&format!("{owner}")),
+            "the expected identity travels in the error: {err}"
+        );
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed mint commits nothing"
+        );
+    }
+
+    /// A sealed rotation envelope at the superseded `0x01` framing:
+    /// structurally a rotation for this obligation, so only its
+    /// version marks it stale.
+    fn stale_rotation_bytes(owner: DeviceId) -> Vec<u8> {
+        use crate::control::rotation::ROTATION_VERSION_SUPERSEDED;
+        use crate::runtime::test_util::encryption_key;
+        let key =
+            crate::keys::DeviceEncryptionSecret::from_bytes([0xE0; 32]).expect("stale seal scalar");
+        let mut sealed = seal_rotation(
+            &member_drive(),
+            owner,
+            &encryption_key(&key),
+            1,
+            &[0xAA; 64],
+            &[0xCC; 64],
+            &[],
+        )
+        .expect("seals");
+        sealed.version = ROTATION_VERSION_SUPERSEDED;
+        sealed.encode()
+    }
+
+    /// The supersede arm fails the same way as the first-seal path:
+    /// a refused mint commits no replacement fact.
+    #[test]
+    fn supersede_arm_refusal_commits_nothing() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let stale = stale_rotation_bytes(owner);
+        let before = engine.store.current();
+        let refusing =
+            FakeSignerSession::new(&SecretKey::from_slice(&[0x99; 32]).expect("scalar"), &[]);
+        let err = supersede_stale_rotation(
+            &mut engine,
+            &refusing,
+            &keyring,
+            1,
+            owner,
+            &genesis_id,
+            &stale,
+        )
+        .expect_err("a refused supersede must not mint");
+        assert!(
+            matches!(err, EngineError::Signer(SignerError::Refused)),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed supersede commits nothing"
+        );
+        assert!(
+            engine
+                .store
+                .load()
+                .unwrap()
+                .capability_sealed_replaced
+                .is_empty(),
+            "no replacement fact claims the obligation"
+        );
+    }
+
+    /// An unreachable signer leaves the stale fact untouched for the
+    /// next pass: the staged `0x01` seal stays the obligation, no
+    /// replacement, no further commit.
+    #[test]
+    fn supersede_arm_unreachable_leaves_the_stale_fact() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let stale = stale_rotation_bytes(owner);
+        engine
+            .commit_facts(&[Fact::CapabilitySealed(1, owner, stale.clone())])
+            .expect("stage the stale fact");
+        let before = engine.store.current();
+        let replaced = supersede_stale_rotation(
+            &mut engine,
+            &UnreachableSession,
+            &keyring,
+            1,
+            owner,
+            &genesis_id,
+            &stale,
+        )
+        .expect("unreachable is pending, not an error");
+        assert!(replaced.is_none(), "nothing to replace with this pass");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the skipped supersede commits nothing"
+        );
+        let loaded = engine.store.load().unwrap();
+        assert_eq!(
+            loaded.capability_sealed,
+            vec![(1, owner, stale)],
+            "the staged stale fact is untouched"
+        );
+        assert!(
+            loaded.capability_sealed_replaced.is_empty(),
+            "no replacement fact claims the obligation"
+        );
+    }
 }

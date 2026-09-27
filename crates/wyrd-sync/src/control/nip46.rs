@@ -26,10 +26,16 @@ use super::ControlError;
 
 /// The operations a Wyrd signer session may be asked to sign. Closed:
 /// adding an operation is a contract change, not a string.
+///
+/// The domain byte is a Wyrd-private allocation, not a Nostr registry
+/// value: standard NIP-46 defines method names (`sign_event`, ...), never
+/// signing domains, so there is no upstream value to reuse for the owner
+/// proof — `0x02` continues the private sequence `0x00`/`0x01` above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignDomain {
     MembershipTransitionV1,
     SnapshotV1,
+    OwnerProofV1,
 }
 
 impl SignDomain {
@@ -38,6 +44,7 @@ impl SignDomain {
         match self {
             SignDomain::MembershipTransitionV1 => 0x00,
             SignDomain::SnapshotV1 => 0x01,
+            SignDomain::OwnerProofV1 => 0x02,
         }
     }
 
@@ -46,6 +53,7 @@ impl SignDomain {
         match byte {
             0x00 => Some(SignDomain::MembershipTransitionV1),
             0x01 => Some(SignDomain::SnapshotV1),
+            0x02 => Some(SignDomain::OwnerProofV1),
             _ => None,
         }
     }
@@ -132,8 +140,10 @@ mod tests {
     fn domains_are_closed_and_distinct() {
         assert_eq!(SignDomain::MembershipTransitionV1.byte(), 0x00);
         assert_eq!(SignDomain::SnapshotV1.byte(), 0x01);
+        assert_eq!(SignDomain::OwnerProofV1.byte(), 0x02);
         assert_eq!(SignDomain::from_byte(0x01), Some(SignDomain::SnapshotV1));
-        assert_eq!(SignDomain::from_byte(0x02), None);
+        assert_eq!(SignDomain::from_byte(0x02), Some(SignDomain::OwnerProofV1));
+        assert_eq!(SignDomain::from_byte(0x03), None);
     }
 
     #[test]

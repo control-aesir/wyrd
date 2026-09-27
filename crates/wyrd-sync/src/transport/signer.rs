@@ -14,12 +14,36 @@ use wyrd_format::DeviceId;
 
 use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
 
+/// What a signer session can report instead of a signature.
+/// Retryability, stated (error-conventions.md): `Unreachable` is
+/// transient, and `IdentityMismatch` is plausibly so (a session that
+/// reconnects under a rotated key) — callers leave the work pending
+/// for the next pass on either. `Refused`, `MalformedResponse`, and
+/// `SessionIdentityMismatch` are terminal: static configuration, a
+/// broken session, and a session mapped to the wrong device, none of
+/// which converges by waiting, so callers fail loud on those.
+/// Classification rule for future session clients: a truncated or
+/// corrupt transport frame is `Unreachable`, never `MalformedResponse`
+/// — the owner-proof mint's loud arm (`runtime/author/deliver.rs`)
+/// calls that "static misconfiguration", and the claim holds only
+/// under this mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SignerError {
     #[error("signer session refused the request")]
     Refused,
     #[error("signer session is unreachable")]
     Unreachable,
+    #[error("signer session returned a signature that does not verify under its reported key")]
+    IdentityMismatch,
+    #[error("signer session returned an unparseable key or signature")]
+    MalformedResponse,
+    #[error("signer session signs as {reported}, but this device is {device}")]
+    SessionIdentityMismatch {
+        /// The identity the session reported and proved.
+        reported: DeviceId,
+        /// The identity the caller expected it to sign for.
+        device: DeviceId,
+    },
 }
 
 /// A scoped Wyrd signer session: `get_public_key` and `sign_message`
@@ -76,6 +100,110 @@ pub(crate) mod fake {
                 .sign_schnorr_no_aux_rand(&request.digest, &self.keypair)
                 .to_byte_array();
             Ok(SignMessageResponse { signature })
+        }
+    }
+
+    /// A session that signs with one key and reports another: the
+    /// reconnected-signer double for rotation and mis-wiring tests.
+    /// `override_signature`, when set, is returned verbatim instead
+    /// of signing — the corrupt-signature double without a sixth
+    /// type.
+    pub(crate) struct MismatchedSession {
+        sign_key: secp256k1::SecretKey,
+        reported: DeviceId,
+        override_signature: Option<[u8; 64]>,
+    }
+
+    impl MismatchedSession {
+        pub(crate) fn new(sign_key: secp256k1::SecretKey, reported: DeviceId) -> Self {
+            MismatchedSession {
+                sign_key,
+                reported,
+                override_signature: None,
+            }
+        }
+
+        pub(crate) fn with_signature(
+            sign_key: secp256k1::SecretKey,
+            reported: DeviceId,
+            signature: [u8; 64],
+        ) -> Self {
+            MismatchedSession {
+                sign_key,
+                reported,
+                override_signature: Some(signature),
+            }
+        }
+    }
+
+    impl SignerSession for MismatchedSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(self.reported)
+        }
+
+        fn sign_message(
+            &self,
+            request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            if let Some(signature) = self.override_signature {
+                return Ok(SignMessageResponse { signature });
+            }
+            let keypair = Keypair::from_secret_key(SECP256K1, &self.sign_key);
+            Ok(SignMessageResponse {
+                signature: SECP256K1
+                    .sign_schnorr_no_aux_rand(&request.digest, &keypair)
+                    .to_byte_array(),
+            })
+        }
+    }
+
+    /// A fixed valid secret for tests that need a signing key
+    /// unrelated to any fixture.
+    pub(crate) fn unrelated_secret() -> secp256k1::SecretKey {
+        secp256k1::SecretKey::from_slice(&[0x22; 32]).expect("unrelated scalar")
+    }
+
+    /// The device id of the unrelated secret: a valid signer
+    /// unrelated to any fixture.
+    pub(crate) fn unrelated_identity() -> DeviceId {
+        let keypair = Keypair::from_secret_key(SECP256K1, &unrelated_secret());
+        let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
+        DeviceId::from_bytes(xonly.serialize())
+    }
+
+    /// A session with no path to a signature, standing in for a
+    /// dropped remote signer.
+    pub(crate) struct UnreachableSession;
+
+    impl SignerSession for UnreachableSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Err(SignerError::Unreachable)
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            Err(SignerError::Unreachable)
+        }
+    }
+
+    /// A session answering with bytes no key can be read from: the
+    /// corrupt-response double.
+    pub(crate) struct GarbageSession;
+
+    impl SignerSession for GarbageSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(DeviceId::from_bytes([0xFF; 32]))
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            Ok(SignMessageResponse {
+                signature: [0xFF; 64],
+            })
         }
     }
 }

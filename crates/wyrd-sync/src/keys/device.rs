@@ -17,6 +17,8 @@ use zeroize::ZeroizeOnDrop;
 use wyrd_format::{DeviceEncryptionKey, DeviceId};
 
 use super::CryptoError;
+use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
+use crate::transport::signer::{SignerError, SignerSession};
 
 /// The device's Nostr identity secret: signs transitions, opens
 /// NIP-44 envelopes addressed to the device. Never unwraps
@@ -90,6 +92,30 @@ impl DeviceIdentitySecret {
     pub fn device_id(&self) -> DeviceId {
         let keypair = Keypair::from_secret_key(SECP256K1, &self.secret_key());
         DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
+    }
+}
+
+/// The local endpoint of [`SignerSession`]: the device signing for
+/// itself. Domain scoping constrains *remote* sessions (a bunker or
+/// phone signer authorizes per domain because the requester does not
+/// hold the key); locally the key holder answers for its own identity
+/// across domains, with the transient-key discipline above.
+impl SignerSession for DeviceIdentitySecret {
+    fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+        Ok(self.device_id())
+    }
+
+    fn sign_message(
+        &self,
+        request: SignMessageRequest,
+    ) -> Result<SignMessageResponse, SignerError> {
+        // Transient keypair, same discipline as `device_id`: convert,
+        // call, drop.
+        let keypair = Keypair::from_secret_key(SECP256K1, &self.secret_key());
+        let signature = SECP256K1
+            .sign_schnorr_no_aux_rand(&request.digest, &keypair)
+            .to_byte_array();
+        Ok(SignMessageResponse { signature })
     }
 }
 

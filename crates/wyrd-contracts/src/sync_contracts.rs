@@ -2394,3 +2394,130 @@ fn recovery_resurrects_bytes_from_a_voided_branch_and_mounts() {
     drop(daemon);
     rig.teardown();
 }
+
+/// The owner-proof encoding, pinned through the public API: fixed
+/// inputs mint exactly the known-answer proof, and it verifies. A
+/// second implementation must reproduce these bytes to interop; a
+/// domain-string edit, field reorder, or endianness change here
+/// breaks this rather than passing review. (Unit pins for the
+/// digest, the preimage layout, and the session-domain refusal live
+/// in `wyrd-sync`; this is the cross-crate anchor.)
+#[test]
+fn owner_proof_encoding_is_pinned_end_to_end() {
+    use wyrd_sync::keys::owner_proof::OwnerProof;
+    let owner = DeviceIdentitySecret::from_bytes([0x11; 32]).expect("fixture scalar");
+    let drive = wyrd_format::DriveId::from_bytes([0xA0; 32]);
+    let recipient = wyrd_format::DeviceId::from_bytes([0xB1; 32]);
+    let transition = wyrd_format::TransitionId::from_bytes([0xC2; 32]);
+    let secrets = vec![
+        EpochSecret::from_bytes([0xAA; 32]),
+        EpochSecret::from_bytes([0xBB; 32]),
+    ];
+    let proof = OwnerProof::sign(&owner, &drive, &recipient, &transition, 3, &secrets)
+        .expect("local signer answers for itself");
+    assert_eq!(
+        proof.signature,
+        unhex::<64>(
+            "fe49621a77b2d214c4e45db0df225ce7290ae756bcfeec22bab2f301c48c0e5a\
+             7f597642f817c4f1ef2a07c02ada032202224823560756bc44a390fc2ed72d9b"
+        ),
+        "deterministic mint reproduces the known answer"
+    );
+    proof
+        .verify(&drive, &recipient, &transition, 3, &secrets)
+        .expect("known-answer vector verifies");
+}
+
+/// The negative half of the pin: changed material anywhere in the
+/// commitment — a flipped secret bit, a different epoch, drive, or
+/// recipient — fails verification.
+#[test]
+fn owner_proof_tampered_material_never_verifies() {
+    use wyrd_sync::keys::owner_proof::OwnerProof;
+    let owner = DeviceIdentitySecret::from_bytes([0x11; 32]).expect("fixture scalar");
+    let drive = wyrd_format::DriveId::from_bytes([0xA0; 32]);
+    let recipient = wyrd_format::DeviceId::from_bytes([0xB1; 32]);
+    let transition = wyrd_format::TransitionId::from_bytes([0xC2; 32]);
+    let secrets = vec![
+        EpochSecret::from_bytes([0xAA; 32]),
+        EpochSecret::from_bytes([0xBB; 32]),
+    ];
+    let proof = OwnerProof::sign(&owner, &drive, &recipient, &transition, 3, &secrets)
+        .expect("local signer answers for itself");
+    let mut tampered = secrets.clone();
+    tampered[1] = EpochSecret::from_bytes([0xBB ^ 0x01; 32]);
+    assert!(
+        proof
+            .verify(&drive, &recipient, &transition, 3, &tampered)
+            .is_err(),
+        "a flipped secret byte fails"
+    );
+    assert!(
+        proof
+            .verify(&drive, &recipient, &transition, 4, &secrets)
+            .is_err(),
+        "the same vector under another epoch fails"
+    );
+    assert!(
+        proof
+            .verify(
+                &wyrd_format::DriveId::from_bytes([0xA1; 32]),
+                &recipient,
+                &transition,
+                3,
+                &secrets
+            )
+            .is_err(),
+        "another drive fails"
+    );
+    assert!(
+        proof
+            .verify(
+                &drive,
+                &wyrd_format::DeviceId::from_bytes([0xB2; 32]),
+                &transition,
+                3,
+                &secrets
+            )
+            .is_err(),
+        "another recipient fails"
+    );
+}
+
+/// The supersession identity, pinned through the public API: the
+/// fixed inputs name exactly the known-answer fact, and any input
+/// change names a different one, so a replacement cannot be
+/// retargeted.
+#[test]
+fn supersession_identity_is_pinned_end_to_end() {
+    use wyrd_sync::durable::SealedCapabilityFactId;
+    let id = SealedCapabilityFactId::of(
+        2,
+        &wyrd_format::DeviceId::from_bytes([0x04; 32]),
+        b"sealed-bytes-fixture",
+    );
+    assert_eq!(
+        id.as_bytes(),
+        &unhex::<32>("e6c02934bb4b07e3be55365776e6837b293ee386fe74ab77709c70e1e0b9fe7e"),
+        "the supersession context and field layout reproduce the known answer"
+    );
+    assert_ne!(
+        SealedCapabilityFactId::of(
+            2,
+            &wyrd_format::DeviceId::from_bytes([0x05; 32]),
+            b"sealed-bytes-fixture"
+        ),
+        id,
+        "another recipient is another fact"
+    );
+}
+
+/// Local hex decode for pinned vectors; a shared home waits for a
+/// third in-crate user.
+fn unhex<const N: usize>(hex: &str) -> [u8; N] {
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .collect();
+    bytes.try_into().expect("pinned length")
+}

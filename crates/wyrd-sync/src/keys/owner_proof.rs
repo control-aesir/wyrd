@@ -27,7 +27,10 @@
 //! preimage                       = PROOF_DOMAIN ‖ drive ‖ recipient ‖ transition ‖
 //!                                  epoch_le ‖ secret_digest
 //! challenge                      = BLAKE3-derive-key(PROOF_CONTEXT, preimage)
-//! signature                      = BIP-340(challenge), deterministic nonce
+//! signature                      = BIP-340(challenge): deterministic under the
+//!                                  local session; a remote session follows
+//!                                  BIP-340, and the protocol requires only
+//!                                  that the 64 bytes verify
 //! ```
 //!
 //! `CANONICAL` is protocol material, pinned here rather than borrowed
@@ -36,12 +39,15 @@
 //! every field, so no concatenation is ambiguous.
 
 use secp256k1::schnorr::Signature;
-use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
+use secp256k1::XOnlyPublicKey;
+use secp256k1::SECP256K1;
 use wyrd_format::{DeviceId, DriveId, TransitionId};
 use zeroize::Zeroizing;
 
 use super::epoch::EpochSecret;
-use crate::keys::{CryptoError, DeviceIdentitySecret};
+use crate::control::nip46::{SignDomain, SignMessageRequest};
+use crate::keys::CryptoError;
+use crate::transport::signer::{SignerError, SignerSession};
 
 /// Domain context for the signed preimage (T12: every derived constant
 /// agrees byte-for-byte across implementations).
@@ -126,25 +132,50 @@ impl OwnerProof {
     }
 
     /// Sign the commitment to `secrets` for `recipient` under
-    /// `transition`, with the owner's identity key. Deterministic
-    /// BIP-340, matching every other signature in the system.
-    pub fn sign(
-        owner: &DeviceIdentitySecret,
+    /// `transition` through a signer session scoped to
+    /// [`SignDomain::OwnerProofV1`]. The domain is always named in
+    /// the request; enforcement is remote-session behavior — a
+    /// remote session that does not authorize the owner-proof domain
+    /// refuses, so a compromised client cannot talk a narrower signer
+    /// (a bunker scoped to snapshots, say) into minting authority.
+    /// The returned signature is verified against the session's
+    /// reported key before it is accepted, so a session that signs
+    /// with one key and reports another cannot launder an
+    /// unverifiable proof into the outbox. Deterministic BIP-340
+    /// under the local session, matching every other signature in
+    /// the system; a remote session follows BIP-340 and the protocol
+    /// requires only that the 64 bytes verify against the challenge.
+    pub fn sign<S: SignerSession + ?Sized>(
+        session: &S,
         drive: &DriveId,
         recipient: &DeviceId,
         transition: &TransitionId,
         epoch: u64,
         secrets: &[EpochSecret],
-    ) -> Self {
+    ) -> Result<Self, SignerError> {
         let digest = secret_vector_digest(secrets);
         let preimage = owner_proof_preimage(drive, recipient, transition, epoch, &digest);
         let challenge = blake3::derive_key(PROOF_CONTEXT, &preimage);
-        let keypair = Keypair::from_secret_key(SECP256K1, &owner.secret_key());
-        let signature = SECP256K1.sign_schnorr_no_aux_rand(&challenge, &keypair);
-        OwnerProof {
-            signer: owner.device_id(),
-            signature: signature.to_byte_array(),
-        }
+        let response = session.sign_message(SignMessageRequest {
+            domain: SignDomain::OwnerProofV1,
+            drive: *drive,
+            digest: challenge,
+        })?;
+        let signer = session.get_public_key()?;
+        let public = XOnlyPublicKey::from_slice(signer.as_bytes())
+            .map_err(|_| SignerError::MalformedResponse)?;
+        // Defensive-only under secp256k1 0.30, which parses any 64
+        // bytes and range-checks at verification: kept so a future
+        // validating version fails closed here.
+        let signature = Signature::from_slice(&response.signature)
+            .map_err(|_| SignerError::MalformedResponse)?;
+        SECP256K1
+            .verify_schnorr(&signature, &challenge, &public)
+            .map_err(|_| SignerError::IdentityMismatch)?;
+        Ok(OwnerProof {
+            signer,
+            signature: response.signature,
+        })
     }
 
     /// Verify the proof against the claimed signer and the material it
@@ -170,5 +201,205 @@ impl OwnerProof {
         SECP256K1
             .verify_schnorr(&signature, &challenge, &public)
             .map_err(|_| CryptoError::Malformed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::DeviceIdentitySecret;
+    use crate::transport::signer::fake::{
+        unrelated_identity, unrelated_secret, FakeSignerSession, GarbageSession, MismatchedSession,
+    };
+    use secp256k1::SecretKey;
+
+    /// Fixed inputs for every vector below: owner scalar `0x11`, drive
+    /// `0xA0`, recipient `0xB1`, transition `0xC2`, epoch 3, secrets
+    /// `0xAA` and `0xBB`. Distinct one-byte patterns, so a field swap
+    /// or truncation changes the bytes rather than colliding.
+    fn fixture() -> (
+        DeviceIdentitySecret,
+        DriveId,
+        DeviceId,
+        TransitionId,
+        Vec<EpochSecret>,
+    ) {
+        (
+            DeviceIdentitySecret::from_bytes([0x11; 32]).expect("fixture scalar"),
+            DriveId::from_bytes([0xA0; 32]),
+            DeviceId::from_bytes([0xB1; 32]),
+            TransitionId::from_bytes([0xC2; 32]),
+            vec![
+                EpochSecret::from_bytes([0xAA; 32]),
+                EpochSecret::from_bytes([0xBB; 32]),
+            ],
+        )
+    }
+
+    /// Local hex decode for pinned vectors; a shared home waits
+    /// for a third in-crate user.
+    fn unhex<const N: usize>(hex: &str) -> [u8; N] {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        bytes.try_into().expect("pinned length")
+    }
+
+    /// `BLAKE3-derive-key("wyrd epoch secret vector v1",
+    /// u32_le(2) ‖ 0xAA×32 ‖ 0xBB×32)` for the fixture vector.
+    const SECRET_DIGEST_HEX: &str =
+        "4495a31a805035ec58d02dfe9766eb4b5729a2ea6a9a87792a9840df0c4d5be1";
+
+    /// The signature is produced under the owner-proof session domain,
+    /// never an ad hoc context: a session scoped to any other domain
+    /// refuses, even holding the right key.
+    #[test]
+    fn sign_requires_the_owner_proof_domain() {
+        let (owner, drive, recipient, transition, secrets) = fixture();
+        let narrow = FakeSignerSession::new(
+            &SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
+            &[SignDomain::SnapshotV1],
+        );
+        assert_eq!(
+            OwnerProof::sign(&narrow, &drive, &recipient, &transition, 3, &secrets),
+            Err(SignerError::Refused)
+        );
+        let scoped = FakeSignerSession::new(
+            &SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
+            &[SignDomain::OwnerProofV1],
+        );
+        OwnerProof::sign(&scoped, &drive, &recipient, &transition, 3, &secrets)
+            .expect("owner-proof domain is authorized");
+    }
+
+    /// `sign` never accepts a proof its own signer field cannot
+    /// verify: a mismatched session is refused at mint time, before
+    /// any caller can commit the bytes as a discharged obligation.
+    #[test]
+    fn sign_refuses_a_signature_that_mismatches_the_reported_key() {
+        let (owner, drive, recipient, transition, secrets) = fixture();
+        // A real key, just not the one that signed: the report
+        // parses, and the verification against it fails.
+        let sign_key = SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar");
+        let mismatched = MismatchedSession::new(sign_key, unrelated_identity());
+        assert_eq!(
+            OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),
+            Err(SignerError::IdentityMismatch)
+        );
+    }
+
+    /// An unparseable session response is a different failure with
+    /// its own diagnosis.
+    #[test]
+    fn sign_refuses_an_unparseable_session_response() {
+        let (_, drive, recipient, transition, secrets) = fixture();
+        assert_eq!(
+            OwnerProof::sign(
+                &GarbageSession,
+                &drive,
+                &recipient,
+                &transition,
+                3,
+                &secrets
+            ),
+            Err(SignerError::MalformedResponse)
+        );
+    }
+
+    /// Garbage signature bytes against a real reported key.
+    /// secp256k1 0.30 parses any 64 bytes as a Schnorr signature
+    /// (range checks happen at verification), so garbage reaches
+    /// verification and fails there — it never verifies. If an
+    /// upgrade makes `from_slice` fallible, this test fails and the
+    /// `MalformedResponse` mapping in `sign` stops being
+    /// defensive-only: update both together.
+    #[test]
+    fn sign_never_verifies_session_garbage() {
+        let (_, drive, recipient, transition, secrets) = fixture();
+        let session =
+            MismatchedSession::with_signature(unrelated_secret(), unrelated_identity(), [0xFF; 64]);
+        assert_eq!(
+            OwnerProof::sign(&session, &drive, &recipient, &transition, 3, &secrets),
+            Err(SignerError::IdentityMismatch)
+        );
+    }
+
+    /// `BLAKE3-derive-key("wyrd epoch secret vector v1",
+    /// u32_le(2) ‖ 0xAA×32 ‖ 0xBB×32)`.
+    #[test]
+    fn secret_vector_digest_matches_known_answer() {
+        let (_, _, _, _, secrets) = fixture();
+        assert_eq!(secret_vector_digest(&secrets), unhex(SECRET_DIGEST_HEX));
+    }
+
+    /// The full preimage, byte for byte: domain string ‖ drive ‖
+    /// recipient ‖ transition ‖ epoch LE ‖ digest. A domain-string
+    /// edit, a field swap, or an endianness change breaks this rather
+    /// than passing review.
+    #[test]
+    fn preimage_layout_is_byte_exact() {
+        let (_, drive, recipient, transition, secrets) = fixture();
+        let digest = secret_vector_digest(&secrets);
+        let preimage = owner_proof_preimage(&drive, &recipient, &transition, 3, &digest);
+        assert_eq!(preimage.len(), 155);
+        // "wyrd owner proof v1" ‖ drive 0xA0×32 ‖ recipient 0xB1×32 ‖
+        // transition 0xC2×32 ‖ epoch 3 LE ‖ secret digest.
+        let mut expected = Vec::with_capacity(155);
+        expected.extend_from_slice(b"wyrd owner proof v1");
+        expected.extend_from_slice(&[0xA0; 32]);
+        expected.extend_from_slice(&[0xB1; 32]);
+        expected.extend_from_slice(&[0xC2; 32]);
+        expected.extend_from_slice(&3u64.to_le_bytes());
+        expected.extend_from_slice(&unhex::<32>(SECRET_DIGEST_HEX));
+        assert_eq!(&*preimage, &expected);
+    }
+
+    /// Deterministic BIP-340 over the challenge: the same inputs mint
+    /// the same proof, and the pinned proof verifies. A second
+    /// implementation must reproduce these bytes to interop.
+    #[test]
+    fn signature_matches_known_answer_and_verifies() {
+        let (owner, drive, recipient, transition, secrets) = fixture();
+        let proof = OwnerProof::sign(&owner, &drive, &recipient, &transition, 3, &secrets)
+            .expect("local signer answers for itself");
+        assert_eq!(
+            proof.signer.as_bytes(),
+            &unhex::<32>("4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa")
+        );
+        assert_eq!(
+            proof.signature,
+            unhex(
+                "fe49621a77b2d214c4e45db0df225ce7290ae756bcfeec22bab2f301c48c0e5a\
+                 7f597642f817c4f1ef2a07c02ada032202224823560756bc44a390fc2ed72d9b"
+            )
+        );
+        let round_tripped = OwnerProof::decode(&proof.encode()).expect("96-byte canonical form");
+        assert_eq!(round_tripped, proof);
+        proof
+            .verify(&drive, &recipient, &transition, 3, &secrets)
+            .expect("known-answer vector verifies");
+    }
+
+    /// Changed material anywhere in the commitment fails
+    /// verification: a flipped secret bit, or the same vector under a
+    /// different epoch.
+    #[test]
+    fn tampered_material_fails_verification() {
+        let (owner, drive, recipient, transition, secrets) = fixture();
+        let proof = OwnerProof::sign(&owner, &drive, &recipient, &transition, 3, &secrets)
+            .expect("local signer answers for itself");
+        let mut tampered = secrets.clone();
+        tampered[0] = EpochSecret::from_bytes({
+            let mut raw = [0xAA; 32];
+            raw[0] ^= 0x01;
+            raw
+        });
+        assert!(proof
+            .verify(&drive, &recipient, &transition, 3, &tampered)
+            .is_err());
+        assert!(proof
+            .verify(&drive, &recipient, &transition, 4, &secrets)
+            .is_err());
     }
 }

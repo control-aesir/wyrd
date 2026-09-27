@@ -26,6 +26,9 @@ use crate::keys::random_bytes;
 use crate::keys::DeviceIdentitySecret;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use std::collections::VecDeque;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MailboxError {
     #[error("NIP-44 seal/open failed")]
@@ -326,6 +329,83 @@ pub enum Disposition {
 }
 
 #[cfg(test)]
+struct Slot {
+    id: DeliveryId,
+    envelope: MailboxEnvelope,
+}
+
+/// The single shared in-memory relay/mailbox fake for `wyrd-sync`
+/// tests: every sent envelope lands in a shared queue; `recv` filters
+/// by the owning device. Handovers clone out of the slot, so the
+/// queue retains every envelope until `Ack`. No network, no async.
+/// One definition only — the runtime engine tests import this pair
+/// rather than carrying a twin, so the two cannot drift in
+/// settlement behavior.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemoryRelay {
+    queue: VecDeque<Slot>,
+    next_id: u64,
+}
+
+#[cfg(test)]
+impl MemoryRelay {
+    pub(crate) fn push(&mut self, envelope: MailboxEnvelope) {
+        let id = DeliveryId::new(self.next_id);
+        // Test-only counter: exhausting u64 is unreachable, but wrap
+        // would silently violate the uniqueness contract, so fail
+        // loudly instead of wrapping.
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("delivery id space exhausted");
+        self.queue.push_back(Slot { id, envelope });
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct MemoryMailbox<'a> {
+    pub(crate) relay: &'a mut MemoryRelay,
+    pub(crate) owner: DeviceId,
+}
+
+#[cfg(test)]
+impl Mailbox for MemoryMailbox<'_> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        self.relay.push(envelope);
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+        let found = self
+            .relay
+            .queue
+            .iter()
+            .find(|s| s.envelope.recipient == self.owner);
+        Ok(found.map(|slot| Delivery::new(slot.id, slot.envelope.clone())))
+    }
+
+    fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+        if let Some(pos) = self.relay.queue.iter().position(|s| s.id == id) {
+            match disposition {
+                Disposition::Ack => {
+                    self.relay.queue.remove(pos);
+                }
+                // Retry requeues at the back: the envelope is offered
+                // again on a later pass, never ahead of mail it has not
+                // blocked, and a pass still terminates on re-offer.
+                Disposition::Retry => {
+                    if let Some(slot) = self.relay.queue.remove(pos) {
+                        self.relay.queue.push_back(slot);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::bootstrap::{open_bootstrap, seal_bootstrap, SealedBootstrap};
@@ -333,78 +413,8 @@ mod tests {
     use crate::keys::DeviceEncryptionSecret;
     use crate::keys::EpochSecret;
     use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-    use std::collections::VecDeque;
     use wyrd_format::{BaoRoot, ContentId, DriveId, SnapshotId, TransitionId};
     use zeroize::Zeroizing;
-
-    /// An in-memory relay: every sent envelope lands in a shared queue;
-    /// `recv` filters by the owning device. Handovers clone out of the
-    /// slot, so the queue retains every envelope until `Ack`. No
-    /// network, no async.
-    struct Slot {
-        id: DeliveryId,
-        envelope: MailboxEnvelope,
-    }
-
-    #[derive(Default)]
-    struct MemoryRelay {
-        queue: VecDeque<Slot>,
-        next_id: u64,
-    }
-
-    impl MemoryRelay {
-        fn push(&mut self, envelope: MailboxEnvelope) {
-            let id = DeliveryId::new(self.next_id);
-            // Test-only counter: exhausting u64 is unreachable, but wrap
-            // would silently violate the uniqueness contract, so fail
-            // loudly instead of wrapping.
-            self.next_id = self
-                .next_id
-                .checked_add(1)
-                .expect("delivery id space exhausted");
-            self.queue.push_back(Slot { id, envelope });
-        }
-    }
-
-    struct MemoryMailbox<'a> {
-        relay: &'a mut MemoryRelay,
-        owner: DeviceId,
-    }
-
-    impl Mailbox for MemoryMailbox<'_> {
-        fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-            self.relay.push(envelope);
-            Ok(())
-        }
-
-        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
-            let found = self
-                .relay
-                .queue
-                .iter()
-                .find(|s| s.envelope.recipient == self.owner);
-            Ok(found.map(|slot| Delivery::new(slot.id, slot.envelope.clone())))
-        }
-
-        fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
-            if let Some(pos) = self.relay.queue.iter().position(|s| s.id == id) {
-                match disposition {
-                    Disposition::Ack => {
-                        self.relay.queue.remove(pos);
-                    }
-                    // Retry requeues at the back: the envelope is offered
-                    // again on a later pass, never ahead of mail it has
-                    // not blocked, and a pass still terminates on re-offer.
-                    Disposition::Retry => {
-                        if let Some(slot) = self.relay.queue.remove(pos) {
-                            self.relay.queue.push_back(slot);
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
 
     fn identity(pattern: u8) -> (DeviceIdentitySecret, DeviceId) {
         let sk = DeviceIdentitySecret::from_bytes([pattern; 32]).unwrap();
@@ -628,6 +638,35 @@ mod tests {
         assert_eq!(third.id(), first_id);
         // Acknowledging consumes: the relay holds nothing more.
         mailbox.settle(third.id(), Disposition::Ack).unwrap();
+        assert!(mailbox.recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn retry_requeues_at_the_back_behind_unblocked_mail() {
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let mut relay = MemoryRelay::default();
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"first").expect("seals"));
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"second").expect("seals"));
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: recipient,
+        };
+        // Retry moves the head to the back: the next offer is the
+        // mail it never blocked, not the retried envelope in place.
+        let first = mailbox.recv().unwrap().expect("first offered");
+        let first_id = first.id();
+        mailbox.settle(first_id, Disposition::Retry).unwrap();
+        let second = mailbox.recv().unwrap().expect("second offered next");
+        assert_ne!(second.id(), first_id);
+        // The retried envelope is still retained, under its own id,
+        // behind the mail it yielded to.
+        let second_id = second.id();
+        mailbox.settle(second_id, Disposition::Ack).unwrap();
+        let reoffered = mailbox.recv().unwrap().expect("retry re-offered last");
+        assert_eq!(reoffered.id(), first_id);
+        mailbox.settle(first_id, Disposition::Ack).unwrap();
         assert!(mailbox.recv().unwrap().is_none());
     }
 

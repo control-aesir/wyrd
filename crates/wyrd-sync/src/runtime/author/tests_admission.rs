@@ -12,10 +12,9 @@ use crate::keys::capability::WrappedCapability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
 use crate::runtime::test_util::{
-    control_key, encryption_key, identity, identity_secret, transition_message, MemoryMailbox,
-    MemoryRelay, TestDir,
+    control_key, encryption_key, identity, identity_secret, transition_message, TestDir,
 };
-use crate::transport::mailbox::seal_for_recipient;
+use crate::transport::mailbox::{seal_for_recipient, MemoryMailbox, MemoryRelay};
 
 #[test]
 fn epoch_increment_checked_at_boundary() {

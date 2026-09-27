@@ -11,7 +11,8 @@ use super::tests_harness::{device_of, owner_engine};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::test_util::key;
 use crate::runtime::engine::{Engine, EngineError};
-use crate::runtime::test_util::{encryption_key, MemoryMailbox, MemoryRelay, TestDir};
+use crate::runtime::test_util::{encryption_key, TestDir};
+use crate::transport::mailbox::{MemoryMailbox, MemoryRelay};
 
 use std::collections::BTreeSet;
 

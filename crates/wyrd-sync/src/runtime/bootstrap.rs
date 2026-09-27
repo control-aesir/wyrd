@@ -881,8 +881,8 @@ mod tests {
     use crate::control::bootstrap::seal_bootstrap;
     use crate::control::{seal, KeyRotation, Message};
     use crate::keys::capability::Capability;
-    use crate::runtime::test_util::{MemoryMailbox, MemoryRelay, TestDir};
-    use crate::transport::mailbox::seal_for_recipient;
+    use crate::runtime::test_util::TestDir;
+    use crate::transport::mailbox::{seal_for_recipient, MemoryMailbox, MemoryRelay};
     use wyrd_format::TransitionId;
 
     #[test]

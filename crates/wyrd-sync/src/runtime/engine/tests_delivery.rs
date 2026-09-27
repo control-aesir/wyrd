@@ -12,11 +12,11 @@ use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
     admit_engine, announcement_for, announcement_msg, control_key, deliver, drain, encryption_key,
-    fixture, identity, queue, transition_message, MemoryMailbox, TestDir,
+    fixture, identity, queue, transition_message, TestDir,
 };
 use crate::transport::mailbox::{
     open_from_sender, seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox,
-    MailboxEnvelope, MailboxError,
+    MailboxEnvelope, MailboxError, MemoryMailbox,
 };
 
 /// A planted stale obligation: given a fixture, an admission

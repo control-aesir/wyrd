@@ -5,7 +5,8 @@ use crate::seal::EncryptedObject;
 use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, Tree};
 
 use crate::membership::test_util::drive as member_drive;
-use crate::runtime::test_util::{MemoryMailbox, TestDir};
+use crate::runtime::test_util::TestDir;
+use crate::transport::mailbox::MemoryMailbox;
 
 #[test]
 fn a_peer_materializes_authored_content_from_the_vault_alone() {

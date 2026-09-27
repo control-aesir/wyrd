@@ -10,9 +10,9 @@ use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, Builder};
 use crate::runtime::engine::Engine;
 use crate::runtime::test_util::{
-    control_key, identity, identity_secret, transition_message, MemoryMailbox, MemoryRelay, TestDir,
+    control_key, identity, identity_secret, transition_message, TestDir,
 };
-use crate::transport::mailbox::seal_for_recipient;
+use crate::transport::mailbox::{seal_for_recipient, MemoryMailbox, MemoryRelay};
 
 use wyrd_format::TransitionId;
 use zeroize::Zeroizing;

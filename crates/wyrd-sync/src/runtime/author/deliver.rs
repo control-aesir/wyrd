@@ -409,36 +409,18 @@ fn deliver_capabilities(
             // still fail closed: genuinely undecodable outbox bytes never
             // silently heal.
             Some(bytes) if is_superseded_rotation(&bytes) => {
-                // Supersede durably, exactly once. First-seal-wins
-                // cannot express "these bytes are no longer the
-                // obligation", so the change is its own fact: a
-                // pass-local overlay would be discarded on restart,
-                // leaving the stale fact to be re-minted into *new*
-                // bytes every pass — one appended-and-fsynced,
-                // then-ignored record per obligation per pass during a
-                // relay outage, and retries that are no longer
-                // byte-identical. With the fact committed, replay makes
-                // the replacement the current obligation and every
-                // later pass reuses these exact bytes.
-                let supersedes =
-                    crate::durable::SealedCapabilityFactId::of(epoch, &recipient, &bytes);
-                let Some(replacement) = mint_fresh_rotation_bytes(
+                let Some(replacement) = supersede_stale_rotation(
                     engine,
                     &signer,
                     &rebuilt.keyring,
                     epoch,
                     recipient,
                     &transition_id,
+                    &bytes,
                 )?
                 else {
                     continue;
                 };
-                engine.commit_facts(&[Fact::CapabilitySealedReplaced {
-                    epoch,
-                    recipient,
-                    supersedes,
-                    replacement: replacement.clone(),
-                }])?;
                 replacement
             }
             Some(bytes) => {
@@ -566,6 +548,44 @@ fn mint_fresh_rotation(
     engine.commit_facts(&[Fact::CapabilitySealed(epoch, recipient, bytes.clone())])?;
     sealed_overlay.insert((epoch, recipient), bytes.clone());
     Ok(Some(bytes))
+}
+
+/// Supersede a stale sealed fact durably, exactly once, and return
+/// the replacement bytes. First-seal-wins cannot express "these
+/// bytes are no longer the obligation", so the change is its own
+/// fact: a pass-local overlay would be discarded on restart, leaving
+/// the stale fact to be re-minted into *new* bytes every pass — one
+/// appended-and-fsynced, then-ignored record per obligation per pass
+/// during a relay outage, and retries that are no longer
+/// byte-identical. With the fact committed, replay makes the
+/// replacement the current obligation and every later pass reuses
+/// these exact bytes.
+///
+/// Returns `None` — obligation stays pending, stale fact untouched —
+/// when the mint cannot complete, so a later pass retries the same
+/// replacement rather than stacking failures.
+fn supersede_stale_rotation(
+    engine: &mut Engine,
+    session: &dyn SignerSession,
+    keyring: &DriveKeyring,
+    epoch: u64,
+    recipient: DeviceId,
+    transition_id: &TransitionId,
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let supersedes = crate::durable::SealedCapabilityFactId::of(epoch, &recipient, bytes);
+    let Some(replacement) =
+        mint_fresh_rotation_bytes(engine, session, keyring, epoch, recipient, transition_id)?
+    else {
+        return Ok(None);
+    };
+    engine.commit_facts(&[Fact::CapabilitySealedReplaced {
+        epoch,
+        recipient,
+        supersedes,
+        replacement: replacement.clone(),
+    }])?;
+    Ok(Some(replacement))
 }
 
 /// Mint current-framing rotation bytes for one obligation without
@@ -955,6 +975,92 @@ mod tests {
             engine.store.current(),
             before,
             "the failed mint commits nothing"
+        );
+    }
+
+    /// A sealed rotation envelope at the superseded `0x01` framing:
+    /// structurally a rotation for this obligation, so only its
+    /// version marks it stale.
+    fn stale_rotation_bytes(owner: DeviceId) -> Vec<u8> {
+        use crate::control::rotation::ROTATION_VERSION_SUPERSEDED;
+        use crate::runtime::test_util::encryption_key;
+        let key =
+            crate::keys::DeviceEncryptionSecret::from_bytes([0xE0; 32]).expect("stale seal scalar");
+        let mut sealed = seal_rotation(
+            &member_drive(),
+            owner,
+            &encryption_key(&key),
+            1,
+            &[0xAA; 64],
+            &[0xCC; 64],
+            &[],
+        )
+        .expect("seals");
+        sealed.version = ROTATION_VERSION_SUPERSEDED;
+        sealed.encode()
+    }
+
+    /// The supersede arm fails the same way as the first-seal path:
+    /// a refused mint commits no replacement fact.
+    #[test]
+    fn supersede_arm_refusal_commits_nothing() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let stale = stale_rotation_bytes(owner);
+        let before = engine.store.current();
+        let refusing =
+            FakeSignerSession::new(&SecretKey::from_slice(&[0x99; 32]).expect("scalar"), &[]);
+        let err = supersede_stale_rotation(
+            &mut engine,
+            &refusing,
+            &keyring,
+            1,
+            owner,
+            &genesis_id,
+            &stale,
+        )
+        .expect_err("a refused supersede must not mint");
+        assert!(
+            matches!(err, EngineError::Signer(SignerError::Refused)),
+            "unexpected: {err:?}"
+        );
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the failed supersede commits nothing"
+        );
+        assert!(
+            engine
+                .store
+                .load()
+                .unwrap()
+                .capability_sealed_replaced
+                .is_empty(),
+            "no replacement fact claims the obligation"
+        );
+    }
+
+    /// An unreachable signer leaves the stale fact untouched for the
+    /// next pass: no replacement, no commit.
+    #[test]
+    fn supersede_arm_unreachable_leaves_the_stale_fact() {
+        let (_dir, mut engine, keyring, owner, genesis_id) = mint_setup();
+        let stale = stale_rotation_bytes(owner);
+        let before = engine.store.current();
+        let replaced = supersede_stale_rotation(
+            &mut engine,
+            &UnreachableSession,
+            &keyring,
+            1,
+            owner,
+            &genesis_id,
+            &stale,
+        )
+        .expect("unreachable is pending, not an error");
+        assert!(replaced.is_none(), "nothing to replace with this pass");
+        assert_eq!(
+            engine.store.current(),
+            before,
+            "the skipped supersede commits nothing"
         );
     }
 }

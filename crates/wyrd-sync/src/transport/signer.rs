@@ -157,15 +157,14 @@ pub(crate) mod fake {
         }
     }
 
-    /// The secret half of the mismatch pair: the key the someone-else
-    /// identity below signs for. Test modules that need a session
-    /// speaking for another device take both halves from here, so the
-    /// unrelated identity is built once.
+    /// A fixed valid secret for tests that need a signing key
+    /// unrelated to any fixture.
     pub(crate) fn unrelated_secret() -> secp256k1::SecretKey {
         secp256k1::SecretKey::from_slice(&[0x22; 32]).expect("unrelated scalar")
     }
 
-    /// The device id the unrelated secret signs for.
+    /// The device id of the unrelated secret: a valid signer
+    /// unrelated to any fixture.
     pub(crate) fn unrelated_identity() -> DeviceId {
         let keypair = Keypair::from_secret_key(SECP256K1, &unrelated_secret());
         let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);

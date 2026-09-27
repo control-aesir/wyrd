@@ -419,8 +419,7 @@ authorities are distinct: the mailbox seal authenticates the
 state), while the proof authenticates the *origin* of the secret
 material (mint authority, held only by an owner of the pre-state).
 The signature is produced through a signer session scoped to the
-session scoped to the `OwnerProofV1` domain (`0x02` in the closed
-NIP-46 signing-domain enum, continuing the Wyrd-private `0x00`/`0x01`
+`OwnerProofV1` domain (`0x02` in the closed NIP-46 signing-domain enum, continuing the Wyrd-private `0x00`/`0x01`
 allocation; standard NIP-46 defines method names, never signing
 domains, so there is no upstream value to reuse). Domain refusal is
 remote-session behavior: a session that does not authorize the
@@ -435,8 +434,8 @@ delivery stays legal while member minting does not. A sender checks
 that same authority before it mints, not only the recipient: a
 sender without it leaves the obligation pending for an authorized
 signer, rather than committing a transmission no recipient would
-ever install. Version `0x01` (no proof) is superseded: a durable outbox fact sealed under it is
-re-minted rather than sent, and the re-mint commits a
+ever install. Version `0x01` (no proof) is superseded: a durable
+outbox fact sealed under it is re-minted rather than sent, and the re-mint commits a
 `CapabilitySealedReplaced` naming the fact it retires, so the
 superseded record is durably replaced rather than merely ignored.
 The AEAD key derives under `"wyrd rotation delivery key v1"` — a

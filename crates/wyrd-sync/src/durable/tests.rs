@@ -26,6 +26,18 @@ use wyrd_format::{
 
 const PASSPHRASE: &str = "durable test passphrase";
 
+/// Decode pinned hex in tests: the known-answer vectors below read
+/// as hex literals, and neither this crate nor `wyrd-contracts`
+/// depends on `hex`, so test-only hex parsing stays a local helper
+/// rather than a new dev-dependency.
+fn unhex<const N: usize>(hex: &str) -> [u8; N] {
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .collect();
+    bytes.try_into().expect("pinned length")
+}
+
 /// An isolated store directory, removed on drop. Unique per test
 /// (process id plus counter) since tests run multithreaded.
 struct TestDir {
@@ -359,13 +371,6 @@ fn the_replacement_tag_is_a_clean_upgrade_boundary() {
 /// so the renaming breaks here instead.
 #[test]
 fn supersession_identity_matches_known_answer() {
-    fn unhex32(hex: &str) -> [u8; 32] {
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
-            .collect();
-        bytes.try_into().expect("32 bytes")
-    }
     let id = SealedCapabilityFactId::of(
         2,
         &DeviceId::from_bytes([0x04; 32]),
@@ -373,7 +378,7 @@ fn supersession_identity_matches_known_answer() {
     );
     assert_eq!(
         id.as_bytes(),
-        &unhex32("e6c02934bb4b07e3be55365776e6837b293ee386fe74ab77709c70e1e0b9fe7e")
+        &unhex::<32>("e6c02934bb4b07e3be55365776e6837b293ee386fe74ab77709c70e1e0b9fe7e")
     );
     // Any input bit changes the identity: a replacement names exactly
     // one fact, and cannot be retargeted by mutating what it names.

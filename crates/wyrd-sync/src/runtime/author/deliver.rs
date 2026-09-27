@@ -660,8 +660,11 @@ fn mint_fresh_rotation_bytes(
         Err(e @ (SignerError::Unreachable | SignerError::IdentityMismatch)) => {
             // A stall with no error is invisible unless it is logged:
             // the variant names the diagnosis, so a permanently
-            // mis-wired session reads differently from a dropped one
-            // in the rotation debug the e2e step already enables.
+            // mis-wired session reads differently from a dropped one.
+            // `debug!`, not the e2e rotation log: the e2e filter is
+            // `wyrd_core`-scoped and never carries `wyrd_sync`
+            // records — this line is for daemon logs with crate
+            // debug enabled (`--verbose`).
             tracing::debug!(epoch, recipient = ?recipient, error = ?e, "owner-proof mint skipped; obligation stays pending");
             return Ok(None);
         }

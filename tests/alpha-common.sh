@@ -200,6 +200,9 @@ stop_mount() { # <name> <signal> [budget-s = 15]: signal, wait for exit,
   elapsed=$(( $(date +%s) - started ))
   [[ "$status" == "0" ]] || die "$name: shutdown exit $status on $sig after ${elapsed}s, want clean 0"
   mountpoint -q "$MNTS/$name" && die "$name: still mounted after $sig"
+  # Remove the pid file on the clean path: a stale pid plus pid
+  # reuse lets a later cleanup_mounts SIGKILL an unrelated process.
+  rm -f "$PIDDIR/mount-$name.pid"
   pass "$name: clean shutdown on $sig (exit 0, unmounted, ${elapsed}s)"
 }
 

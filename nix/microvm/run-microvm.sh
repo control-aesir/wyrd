@@ -47,12 +47,14 @@ done
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
 cd "$ROOT"
 
-# One run at a time: a second invocation's startup pre-clean would
-# reap the first run's daemons (SOCK_PAT matches any wyrd microVM
-# on the host). Held for the whole script via fd 9.
-mkdir -p "$STATE_DIR"
-exec 9>"$STATE_DIR/lock"
-flock -n 9 || { echo "error: another run holds $STATE_DIR/lock" >&2; exit 2; }
+# One run at a time per host, not per state dir: taps, the bridge,
+# and SOCK_PAT are all host-global, so two runs under different
+# --state-dir would still reap each other's daemons and fight over
+# br-wyrd. The lock path is fixed for the same reason. Held for the
+# whole script via fd 9.
+mkdir -p /var/lib/wyrd-microvm
+exec 9>/var/lib/wyrd-microvm/lock
+flock -n 9 || { echo "error: another run holds /var/lib/wyrd-microvm/lock" >&2; exit 2; }
 
 BRIDGE="br-wyrd"
 NET="10.0.7"
@@ -128,13 +130,15 @@ mkdir -p "$RUN" "$RUN/logs" "$WORK"
 chown -R 1000:1000 "$RUN"
 
 echo "==> building wyrd + VM runners"
-WYRD_OUT="$(nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs 2>"$RUN/logs/nix-build-wyrd.log" | tail -n 1)"
+if ! WYRD_OUT="$(nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs 2>"$RUN/logs/nix-build-wyrd.log" | tail -n 1)"; then
+  die "host build failed (see run/logs/nix-build-wyrd.log)"
+fi
 WYRD_BIN="$WYRD_OUT/bin/wyrd"
 [[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see run/logs/nix-build-wyrd.log)"
 echo "    $WYRD_BIN"
 for role in peer-o peer-n relay; do
   nix build "$ROOT#nixosConfigurations.wyrd-$role.config.microvm.runner.qemu" \
-    --out-link "$WORK/runner-$role" --print-build-logs 2>&1 | tail -n 2
+    --out-link "$WORK/runner-$role" --print-build-logs 2>&1 | tee "$RUN/logs/nix-build-$role.log"
 done
 
 echo "==> network: $BRIDGE ${NET}.0/24"

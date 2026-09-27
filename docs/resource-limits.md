@@ -90,6 +90,13 @@ the per-object term, and capping admissions caps the sum.
 
 ## Cumulative storage growth
 
+> **Not a live bound.** Everything above this line in the document is
+> a bound the daemon enforces today. This section is analysis and
+> screening: it states the retention bound, the adversary, and which
+> bounds could be enforced before GC exists. The only rows here that
+> describe current behavior are the two in "Already bounded" — those
+> two are enforced. The per-device quota is a proposal, not code.
+
 Every bound above is a *live-process* bound: it caps one operation, one
 pass, or one set of open handles, and each is released when the
 operation ends. None of them caps **retention**. The store is
@@ -107,8 +114,20 @@ authored byte, so it is not an amplification path.)
 
 ### The bound, stated
 
-> retained bytes <= (snapshots committed) x (per-snapshot fixed
+The counting variable is **per retaining device**, not per authoring
+seat: a replica that authors nothing still retains what it is sent.
+
+> retained bytes <= (snapshots retained) x (per-snapshot fixed
 > overhead + content-proportional bytes)
+>
+> where snapshots retained = locally authored + materialized from
+> peers
+
+On the author's own device the term is set by its own commit rate. On a
+replica it is set by **its peers'** commit rate, which is the whole
+reason the author is not the only bearer. The fixed overhead is also
+per *recipient* for the announcement leg, so a member with N devices
+pays that term N times per snapshot.
 
 The **fixed** term is the architectural problem. It does not shrink
 with change size, it is not reduced by content-addressed chunking or
@@ -124,11 +143,12 @@ One commit pays each of these regardless of how many bytes changed
 
 | Fixed cost | Where | Notes |
 |---|---|---|
+| Rebuilt tree nodes for the mutation | step 1 | content-proportional in cardinality even when the file content is not: a namespace-only change still writes a fresh root node |
 | Signed snapshot body | step 2 | author identity key, bound to DriveId and authorizing transition |
-| Vault import | step 2 | temp + fsync + rename + directory fsync |
+| Vault import, including a freshly sealed root manifest | step 2 | temp + fsync + rename + directory fsync; `author_over` seals the hierarchy on every commit, so the root manifest is new bytes per commit even when nothing below it changed |
 | Fact-log append + `CURRENT` rewrite | step 3 | append-only and crash-safe; one commit per snapshot |
 | Durability fsyncs | step 3 | object store, vault, fact log, and every directory created on the way, made durable **together** |
-| Announcement obligation recorded, then discharged | steps 3, 6 | durable outbox, per-recipient delivered markers, byte-identical sealed retries per route |
+| Announcement obligation recorded, then discharged | steps 3, 6 | durable outbox, per-recipient delivered markers, byte-identical sealed retries per route — so this term scales with recipient count, it is not a per-commit constant |
 | Serving mirror write-through + flush barrier | step 5 | bounded per-pass (64 items / 64 MiB), but paid per commit |
 | Projection generation bump + head swap | step 4 | one short write lock |
 
@@ -153,9 +173,9 @@ single snapshot and nothing about how many snapshots exist.
 
 ### What drives the snapshot count
 
-There is no autosave timer. `debounce` appears nowhere in the tree,
-and none is specified. Snapshots are created by POSIX boundaries on
-the author's own device:
+No debounce or autosave timer exists in the code. Snapshots are
+created by POSIX boundaries on the device, which for a replica means
+its peers' commits, not its own syscalls:
 
 - `write` only buffers; a snapshot is created by `flush`, `fsync`, or
   `release` on a dirty handle. A committing boundary on a **clean**
@@ -171,21 +191,24 @@ not throttled by any protocol timer.
 
 The cheapest attack is therefore not `write 1 byte, commit, repeat`
 — it is **pure namespace churn**, `unlink` + `create` on one path, in
-a loop. That is two snapshots and two full fixed overheads per
-iteration while writing **zero content bytes**, so the content term
-drops out of the bound entirely and only the fixed term remains,
-multiplied without limit.
+a loop. That is two snapshots per iteration while writing **zero
+file-content bytes**, so the file-content term drops out. What does
+not drop out is the per-snapshot cost that is not file content: each
+iteration still writes a rebuilt root tree node and a freshly sealed
+root manifest, and still pays a signature, a fact-log commit, the
+durability fsyncs, and a full announcement set. The bound's remaining
+term is therefore the fixed term in full, multiplied without limit.
 
-### Already bounded (writer-side amplification, verified closed)
+### Already bounded (writer-side amplification)
 
-Both writer-side paths previously named in the storage-bound
-discussion are closed in current `master`, and are recorded here so
-they are not re-opened as findings:
+Both writer-side paths named in the storage-bound discussion are
+closed, and are recorded here so they are not re-opened as findings.
+These two rows describe enforced behavior, not screening:
 
 | Path | Bound |
 |---|---|
-| Repeated failed wants appending unchanged `Fact::Materialization` | Closed. `Engine::set_materialization` / `set_materialization_from` compare durable state first and append nothing when it already equals the target, so a retried want costs no fact and no fsync. Pinned by `repeat_materialization_admission_commits_nothing` (a ten-deep retry storm commits nothing; a genuine transition commits exactly once) |
-| Unbounded serving-mirror import queue | Closed. `MAX_MIRROR_QUEUE_ITEMS` (64) and `MAX_MIRROR_QUEUE_BYTES` (64 MiB); a full queue returns `VaultError::MirrorFull` and keeps the vault file durable. Pinned by the `serving.rs` mirror-depth and capacity assertions |
+| Repeated failed wants appending unchanged `Fact::Materialization` | Closed. `Engine::set_materialization` / `set_materialization_from` compare durable state first and append nothing when it already equals the target, so a retried want costs no fact and no fsync. Both append sites are guarded (`runtime/engine/mod.rs`), pinned by `repeat_materialization_admission_commits_nothing` — a ten-deep retry storm commits nothing, and a genuine transition commits exactly once |
+| Unbounded serving-mirror import queue | Closed. `MAX_MIRROR_QUEUE_ITEMS` (64) and `MAX_MIRROR_QUEUE_BYTES` (64 MiB) in `serving.rs`; a full queue returns `VaultError::MirrorFull` and keeps the vault file durable. Pinned by `a_full_mirror_queue_applies_backpressure_without_losing_the_vault` and `an_oversize_reservation_fails_before_queueing` |
 
 The remaining growth is the commit path itself, which is bounded per
 commit and unbounded in count.
@@ -195,29 +218,35 @@ commit and unbounded in count.
 | Party | Bears | Bounded today |
 |---|---|---|
 | Author | local disk, and its own fsync and announcement cost | yes, per operation |
-| Serving member / peer | retained history for every snapshot it materializes, whether or not it wanted the content | no |
+| Serving member / peer | the fact log and snapshot bodies for every snapshot it accepts, whether or not it wanted the content; manifests and chunks only when a want pulls them, under the fetch ceilings | partly — the fact-log and snapshot-body half is not gated at all |
 | Vault | retained ciphertext per representation, and the count of them | no |
 
-The asymmetry is the finding. Authorization in v0 is membership, and
-membership carries **no retention obligation and no refusal right**:
-`trust.md` records that object admission is content verification with
-no per-object ACLs, and availability is explicitly called out as "not
-a confidentiality break" — but nothing lets a peer or vault decline to
-retain what an authorized member authored. One member can force
-unbounded growth on every other member and on every vault, at a cost
-to the attacker that is one signing key and a tight loop. Adding a
-peer refusal right would change the authorization contract, so it is
-recorded as an open question below rather than decided here.
+The asymmetry is the finding, and it sits in that split. Intake
+commits only transition / announcement / capability / control-message
+facts and never opens manifests, trees, or chunks, so a peer retains
+the *history* of what a member did unconditionally, while the
+*content* is pull-based. Amplification therefore costs a peer
+something it did not ask for even when it never fetches a byte.
+
+Authorization in v0 is membership, and membership carries **no
+retention obligation and no refusal right**: `trust.md` records that
+object admission is content verification with no per-object ACLs, and
+availability is explicitly called out as "not a confidentiality
+break" — but nothing lets a peer or vault decline to retain what an
+authorized member authored. One member can force unbounded growth on
+every other member and on every vault, at a cost to the attacker that
+is one signing key and a tight loop. Adding a peer refusal right would
+change the authorization contract, so it is recorded as an open
+question below rather than decided here.
 
 ### Pre-GC bounds: what could be enforced
 
 **Nothing in this subsection is implemented.** It records which
 bounds survive the durability contract, so the GC design starts from
-a screened list rather than re-testing rejected options. Everything
-else in this document describes current behavior.
+a screened list rather than re-testing rejected options.
 
-Enforcement must not contradict the durability contract. Two of the
-obvious candidates fail that test:
+Enforcement must not contradict the durability contract. Three of the
+obvious candidates fail that test, and the fourth is deferred:
 
 - **Snapshot rate limiting is not available pre-GC.** `flush` and
   `fsync` are semantically equivalent and the commit boundary *is*
@@ -228,19 +257,34 @@ obvious candidates fail that test:
 - **History-depth policy cannot be enforced without GC**, because
   there is nothing to prune when the policy is exceeded; it can only
   be observed and reported.
+- **Vault pinning limits are not screened separately**, because any
+  form of them — a cap on what a vault will hold for one drive — *is*
+  the retention refusal right below, wearing a different name. It
+  inherits that decision rather than pre-empting it.
 
 One candidate survives, and it is the only pre-GC bound that reuses
 an existing error path unchanged:
 
 | Bound | Enforcement | Why it is safe |
 |---|---|---|
-| Per-device retained-bytes quota (proposed) | Refuse the commit at the durability boundary as `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see Disk classification). A quota is a smaller disk, not a weaker promise |
+| Per-device retained-bytes quota (proposed) | Refuse the commit before step 1's first durable write, as `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see Disk classification). A quota is a smaller disk, not a weaker promise |
+
+The refusal point is load-bearing and easy to get wrong. Steps 1-2
+already write durably (rebuilt objects into the store, sealed
+envelopes into the vault, each temp + fsync + rename + directory
+fsync), so a quota checked at step 3 would refuse *after* spending
+the bytes it was trying to protect: the effective ceiling becomes
+quota + one commit, and every refused attempt permanently spends
+budget, because with no GC those objects are unreclaimable. The check
+has to precede the first durable write of the commit, or account for
+the in-flight commit's bytes explicitly.
 
 A quota would bound the author's own device and convert a silent
 unbounded growth into an explicit, documented, POSIX-legitimate
-refusal. It would not bound the author. Nothing in v0 can bound the
-author, because a member's commits are valid work and GC is the only
-mechanism that can make old bytes stop existing.
+refusal. It would not bound the author **on other devices, nor in the
+vault**. Nothing in v0 can bound the author, because a member's
+commits are valid work and GC is the only mechanism that can make old
+bytes stop existing.
 
 ### Open questions
 
@@ -252,14 +296,22 @@ mechanism that can make old bytes stop existing.
    eviction-under-pressure rule (which trades against the recovery
    property that motivates the append-only store), or accepting
    unbounded peer growth until GC. Not decided here.
-2. **Quota granularity**: per device, per drive, or per member-set,
-   and whether a quota interacts with the announcement obligation (a
-   quota-refused commit must not leave a durable obligation behind —
-   the obligation is created at step 3, atomically with the commit, so
-   the refusal has to happen at or before that boundary).
+2. **Quota granularity and refusal point**: per device, per drive, or
+   per member-set, and how the check sequences against the commit's
+   durable writes. Two constraints are already known and both must
+   hold. The refusal must precede step 1's first durable write, or
+   account for the in-flight commit's bytes, or the ceiling degrades
+   to quota + one commit and each refusal permanently spends budget
+   (no GC reclaims it). And a quota-refused commit must not leave a
+   durable announcement obligation behind: the obligation is created
+   at step 3, atomically with the commit, so the refusal has to
+   happen at or before that boundary too.
 
-Tracked as `harden(storage): define authorized-writer storage
-amplification bound`.
+Tracked by the two follow-ups raised with this section:
+`protocol(storage): decide whether peers and vaults get a retention
+refusal right` (open question 1) and `feat(storage): per-device
+retained-bytes quota at the commit durability boundary` (open question
+2).
 
 ## Disk classification
 

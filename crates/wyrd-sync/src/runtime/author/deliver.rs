@@ -690,37 +690,13 @@ fn mint_wrap(
 mod tests {
     use super::super::tests_harness::owner_engine;
     use super::*;
-    use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
     use crate::keys::EpochSecret;
     use crate::membership::test_util::{drive as member_drive, key};
-    use crate::transport::signer::fake::{FakeSignerSession, GarbageSession, MismatchedSession};
+    use crate::transport::signer::fake::{
+        unrelated_identity, FakeSignerSession, GarbageSession, MismatchedSession,
+        UnreachableSession,
+    };
     use secp256k1::SecretKey;
-
-    /// A session with no path to a signature, standing in for a
-    /// dropped remote signer.
-    struct UnreachableSession;
-
-    impl SignerSession for UnreachableSession {
-        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
-            Err(SignerError::Unreachable)
-        }
-
-        fn sign_message(
-            &self,
-            _request: SignMessageRequest,
-        ) -> Result<SignMessageResponse, SignerError> {
-            Err(SignerError::Unreachable)
-        }
-    }
-
-    fn other_key_id() -> DeviceId {
-        use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
-        let other = Keypair::from_secret_key(
-            SECP256K1,
-            &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
-        );
-        DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize())
-    }
 
     /// Owner engine, recipient, keyring, and transition id wired for a
     /// mint: the owner mints its epoch-1 vector to itself. The
@@ -835,7 +811,7 @@ mod tests {
         let before = engine.store.current();
         let rotated = MismatchedSession::new(
             SecretKey::from_slice(&[0x11; 32]).expect("scalar"),
-            other_key_id(),
+            unrelated_identity().1,
         );
         let mut overlay = BTreeMap::new();
         let minted = mint_fresh_rotation(
@@ -849,6 +825,7 @@ mod tests {
         )
         .expect("a rotated session is pending, not an error");
         assert!(minted.is_none(), "nothing to send this pass");
+        assert!(overlay.is_empty(), "no overlay takes the obligation");
         assert_eq!(
             engine.store.current(),
             before,

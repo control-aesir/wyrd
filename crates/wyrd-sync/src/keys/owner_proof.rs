@@ -208,7 +208,9 @@ impl OwnerProof {
 mod tests {
     use super::*;
     use crate::keys::DeviceIdentitySecret;
-    use crate::transport::signer::fake::{FakeSignerSession, GarbageSession, MismatchedSession};
+    use crate::transport::signer::fake::{
+        unrelated_identity, FakeSignerSession, GarbageSession, MismatchedSession,
+    };
     use secp256k1::SecretKey;
 
     /// Fixed inputs for every vector below: owner scalar `0x11`, drive
@@ -274,18 +276,14 @@ mod tests {
     /// any caller can commit the bytes as a discharged obligation.
     #[test]
     fn sign_refuses_a_signature_that_mismatches_the_reported_key() {
-        use secp256k1::Keypair;
         let (owner, drive, recipient, transition, secrets) = fixture();
         // A real key, just not the one that signed: the report
         // parses, and the verification against it fails.
-        let other = Keypair::from_secret_key(
-            SECP256K1,
-            &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
-        );
-        let mismatched = MismatchedSession::new(
+        let (sign_key, reported) = (
             SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
-            DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize()),
+            unrelated_identity().1,
         );
+        let mismatched = MismatchedSession::new(sign_key, reported);
         assert_eq!(
             OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),
             Err(SignerError::IdentityMismatch)
@@ -310,43 +308,18 @@ mod tests {
         );
     }
 
-    /// A session reporting a real key with garbage signature bytes.
+    /// Garbage signature bytes against a real reported key.
     /// secp256k1 0.30 parses any 64 bytes as a Schnorr signature
     /// (range checks happen at verification), so garbage reaches
     /// verification and fails there — it never verifies. If an
     /// upgrade makes `from_slice` fallible, this test fails and the
-    /// `MalformedResponse` mapping above stops being defensive-only:
-    /// update both together.
-    struct GarbageSignatureSession {
-        reported: DeviceId,
-    }
-
-    impl SignerSession for GarbageSignatureSession {
-        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
-            Ok(self.reported)
-        }
-
-        fn sign_message(
-            &self,
-            _request: SignMessageRequest,
-        ) -> Result<crate::control::nip46::SignMessageResponse, SignerError> {
-            Ok(crate::control::nip46::SignMessageResponse {
-                signature: [0xFF; 64],
-            })
-        }
-    }
-
+    /// `MalformedResponse` mapping in `sign` stops being
+    /// defensive-only: update both together.
     #[test]
     fn sign_never_verifies_session_garbage() {
-        use secp256k1::Keypair;
         let (_, drive, recipient, transition, secrets) = fixture();
-        let other = Keypair::from_secret_key(
-            SECP256K1,
-            &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
-        );
-        let session = GarbageSignatureSession {
-            reported: DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize()),
-        };
+        let (sign_key, reported) = unrelated_identity();
+        let session = MismatchedSession::with_signature(sign_key, reported, [0xFF; 64]);
         assert_eq!(
             OwnerProof::sign(&session, &drive, &recipient, &transition, 3, &secrets),
             Err(SignerError::IdentityMismatch)

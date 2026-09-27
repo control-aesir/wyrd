@@ -95,14 +95,34 @@ pub(crate) mod fake {
 
     /// A session that signs with one key and reports another: the
     /// reconnected-signer double for rotation and mis-wiring tests.
+    /// `override_signature`, when set, is returned verbatim instead
+    /// of signing — the corrupt-signature double without a sixth
+    /// type.
     pub(crate) struct MismatchedSession {
         sign_key: secp256k1::SecretKey,
         reported: DeviceId,
+        override_signature: Option<[u8; 64]>,
     }
 
     impl MismatchedSession {
         pub(crate) fn new(sign_key: secp256k1::SecretKey, reported: DeviceId) -> Self {
-            MismatchedSession { sign_key, reported }
+            MismatchedSession {
+                sign_key,
+                reported,
+                override_signature: None,
+            }
+        }
+
+        pub(crate) fn with_signature(
+            sign_key: secp256k1::SecretKey,
+            reported: DeviceId,
+            signature: [u8; 64],
+        ) -> Self {
+            MismatchedSession {
+                sign_key,
+                reported,
+                override_signature: Some(signature),
+            }
         }
     }
 
@@ -115,12 +135,42 @@ pub(crate) mod fake {
             &self,
             request: SignMessageRequest,
         ) -> Result<SignMessageResponse, SignerError> {
+            if let Some(signature) = self.override_signature {
+                return Ok(SignMessageResponse { signature });
+            }
             let keypair = Keypair::from_secret_key(SECP256K1, &self.sign_key);
             Ok(SignMessageResponse {
                 signature: SECP256K1
                     .sign_schnorr_no_aux_rand(&request.digest, &keypair)
                     .to_byte_array(),
             })
+        }
+    }
+
+    /// A valid identity unrelated to any fixture: the "someone else"
+    /// for mismatch tests, built once here instead of once per test
+    /// module.
+    pub(crate) fn unrelated_identity() -> (secp256k1::SecretKey, DeviceId) {
+        let secret = secp256k1::SecretKey::from_slice(&[0x22; 32]).expect("unrelated scalar");
+        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
+        let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
+        (secret, DeviceId::from_bytes(xonly.serialize()))
+    }
+
+    /// A session with no path to a signature, standing in for a
+    /// dropped remote signer.
+    pub(crate) struct UnreachableSession;
+
+    impl SignerSession for UnreachableSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Err(SignerError::Unreachable)
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<SignMessageResponse, SignerError> {
+            Err(SignerError::Unreachable)
         }
     }
 

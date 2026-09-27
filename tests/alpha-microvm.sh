@@ -132,6 +132,12 @@ LEG_O=$!
 wait "$LEG_N" || die "restart member leg failed (see logs/leg-restart-member.out)"
 wait "$LEG_O" || die "restarted owner leg failed (see logs/leg-restart-owner.out)"
 pass "route update rewires fetch across hosts"
+# Snapshot the member's dedupe log size: phase 5 asserts it grew
+# across this restart (redelivery observed) and holds no duplicates.
+# Missing file means no acks yet — record 0 rather than dying here;
+# the leg fails on it if the log is still empty at the end.
+wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
+  || echo 0 > "$RUN/seen-after-restart"
 
 # --- phase 5: fetch plane ---------------------------------------------
 echo "=== microvm 9: fetch plane ==="

@@ -81,6 +81,25 @@ fn read_blocks_on_want_until_content_arrives() {
     );
 }
 
+/// Resolution is not demand: a path no installed head contains
+/// fails fast with ENOENT and registers no want — the open deadline
+/// is never consumed waiting for an announcement that may never
+/// come (normative in `docs/fetch-on-open.md`: resolution against
+/// the projected namespace is not demand).
+#[test]
+fn unknown_path_is_enoent_without_registering_a_want() {
+    let (backend, _store, registry, _chunk) = withheld_backend(Duration::from_secs(30));
+    assert_eq!(
+        backend.open_at("ghost.txt"),
+        Err(fuser::Errno::ENOENT),
+        "unannounced paths resolve fast, never block for arrival"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "resolution registered no demand"
+    );
+}
+
 /// The deadline is EIO, never a partial file, and the demand entry
 /// is retired on expiry: a want whose fetch was never admitted
 /// dies with the last waiter (the engine, once admitted, is not

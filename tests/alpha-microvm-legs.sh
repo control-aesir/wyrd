@@ -138,9 +138,15 @@ leg_fetch_owner() {
 # nostr:nevent1qqsp9u0jt79kepcrmx8zxcmzzxce0cf3c8fvzs32k7uqjgeajlzzscqpz9mhxue69uhkwunpwdczuap49eehg5s3hry
 # after four proving runs showed the mount never recovers that
 # identity), and timeout-then-completion (the waiter leaves with
-# EIO while the fetch continues — unit-pinned by
+# EIO while the fetch continues (unit-pinned by
 # late_completion_caches_for_the_next_waiter in
 # crates/wyrd-core/src/want.rs, no e2e leg).
+# A third row is half-legged by construction: the stale probe pins
+# fail-closed EIO but not "no invalid object committed", which is
+# structurally guaranteed (verified ingest admits nothing invalid)
+# and unobservable e2e — the member deletes stale-1.txt precisely
+# because the export fails closed on remote-only content, so the
+# export can never show that identity's absence.
 leg_fetch_member() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane member leg"
@@ -192,17 +198,22 @@ leg_fetch_member() {
   pass "member authors offline with the route down"
   stop_mount xmember-f TERM
   # Dedupe proof over the step-8 restart's redelivery, read after the
-  # mount is down so no concurrent append can slip mid-read: every
-  # retained id is recorded once (record() is a no-op for known
-  # ids), so while the run stays under the retention bound the file
-  # holds no duplicate line. Past the bound an evicted id may
-  # legitimately re-append after redelivery (seen_store.rs:21-25),
-  # so this is a below-the-bound invariant; the bound itself is
-  # pinned by unit tests at the 512 test bound.
-  [[ -f "$d/mailbox.seen" ]] || die "member mailbox.seen missing"
+  # mount is down so no concurrent append can slip mid-read. Two
+  # preconditions make the check real: the log is non-empty (an
+  # empty log would pass trivially and means the member stopped
+  # acking), and it grew past the phase-4 snapshot (the restart
+  # redelivered, so "no duplicates" is observed, not vacuous).
+  # Past the retention bound an evicted id may legitimately
+  # re-append after redelivery (seen_store.rs:21-25), so the no-dup
+  # half is a below-the-bound invariant; the bound itself is pinned
+  # by unit tests at the 512 test bound.
+  [[ -s "$d/mailbox.seen" ]] || die "member mailbox.seen empty: member stopped acking"
+  [[ -f "$E2E_ROOT/seen-after-restart" ]] || die "phase-4 seen snapshot missing"
+  [[ "$(wc -l < "$d/mailbox.seen")" -gt "$(cat "$E2E_ROOT/seen-after-restart")" ]] \
+    || die "mailbox.seen did not grow across the restart: no redelivery observed"
   [[ -z "$(sort "$d/mailbox.seen" | uniq -d)" ]] \
     || die "mailbox.seen holds duplicate ids: redelivery double-appended"
-  pass "redelivery never double-appends the dedupe log"
+  pass "redelivery grows the dedupe log without double-appending"
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 

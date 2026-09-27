@@ -120,6 +120,18 @@ leg_fetch_owner() {
   poll_until 180 test -f "$E2E_ROOT/member-fetch-done" \
     || die "member never finished the bounded-EIO probes"
   pass "owner stayed down while the member probed the dead route"
+  # Route back: remount (endpoint 2) so the member's failed open can
+  # complete — the timeout-cancelled wait, not the fetch. The member
+  # proves it with a single cat below; stale-1.txt must be readable
+  # before the offline export phase, which fails closed on
+  # remote-only content by design.
+  start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
+  touch "$E2E_ROOT/owner-back"
+  poll_until 180 test -f "$E2E_ROOT/member-stale-done" \
+    || die "member never fetched stale-1.txt after the route returned"
+  stop_mount xowner-f2 INT
+  check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  pass "re-announcement completes the cancelled wait"
 }
 
 # leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
@@ -172,6 +184,16 @@ leg_fetch_member() {
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
   touch "$E2E_ROOT/member-fetch-done"
+  # Route returned: the earlier EIO cancelled the wait, not the
+  # fetch — a single open now completes once the bytes are servable.
+  poll_until 180 test -f "$E2E_ROOT/owner-back" \
+    || die "owner never remounted after the dead-route probes"
+  timeout 120 cat "$MNTS/xmember-f/stale-1.txt" >"$E2E_ROOT/stale-1.got" \
+    || die "stale-1.txt never became readable after the route returned"
+  [[ "$(cat "$E2E_ROOT/stale-1.got")" == "stale-bytes" ]] \
+    || die "stale-1.txt returned wrong bytes after the route returned"
+  pass "re-announcement completes the cancelled wait"
+  touch "$E2E_ROOT/member-stale-done"
   # Dedupe proof over the step-8 restart's redelivery: every id is
   # recorded once (record() is a no-op for known ids), so the file
   # holds no duplicate line; the count backstops the durable bound

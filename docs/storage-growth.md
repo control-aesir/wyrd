@@ -76,7 +76,7 @@ every announcement it accepts (see "Who bears the cost").
 | Rebuilt tree nodes for the mutation | objects | author | author **and replica** — the plan treats tree nodes as structural: "the closure cannot be navigated or verified without them, so they are always wanted" |
 | Signed snapshot body | authoring | author | author **and replica** — the body is signed by the author and imported into the replica's own vault; a replica verifies the signature, it does not produce one |
 | Sealed root and child manifests, imported | authoring | author | author **and replica** — every held manifest's children are planned, not just a want's |
-| Fact-log append + `CURRENT` rewrite | durability | both | both |
+| Fact-log append + `CURRENT` rewrite | authoring / durability | both | both |
 | Durability fsyncs | durability | both | both |
 | Announcement obligation recorded, then discharged | authoring / announcement | author | author only — both halves are driven from the author's own durable outbox, and the per-recipient factor (delivered markers, byte-identical sealed retries per route) is likewise author-side, so this term scales with recipient count and is not a per-commit constant |
 | Serving mirror write-through + flush barrier | serving | both | both |
@@ -142,8 +142,11 @@ by POSIX boundaries on the authoring device:
   re-flag the buffered image, mark the handle dirty, and commit only
   under `O_SYNC`, so `write` + `ftruncate` on one handle is one
   snapshot, not two. On an **append** handle (`O_APPEND`, the default
-  for `>>`) and on a **read** handle, a mode or size change is
-  path-addressed and submits immediately instead.
+  for `>>`) and on a **read** handle a *mode* change is
+  path-addressed and submits immediately; a *size* change through
+  those handles is refused outright (`EOPNOTSUPP` on append, which has
+  no full image to truncate, and `EBADF` on read), so neither can be
+  used for handle-addressed churn.
 
 So the rate is chosen by the member, at their own throughput, and is not
 throttled by any protocol timer. On a replica the corresponding rate is
@@ -242,10 +245,14 @@ reaches authoring, in the same call, with no decision point in between.
 A check placed anywhere later has already spent the bytes it is trying
 to protect, and with no GC those objects are unreferenced and
 unreclaimable. The leak is not a constant, because the member chooses
-its size: `Limits::V0` admits a 64 MiB object and 65,536 chunks per
-file, so writing one large new file inserts every chunk and is then
-refused, on every attempt, at no cost in quota. A quota that allowed
-that would not be a ceiling.
+its size: one handle's buffered image is capped at 64 MiB
+(`MAX_WRITE_BUFFER_BYTES`), so a single commit inserts up to that much
+in chunks — at 16 KiB minimum chunk size, up to 4,096 chunks, and at
+the 256 KiB maximum chunk size only 256. (The 65,536-chunk
+`Limits::V0` ceiling is reachable on a *replica's* fetch path, which is
+the other bearer, not this one.) Writing one large new file inserts
+every chunk and is then refused, on every attempt, at no cost in quota.
+A quota that allowed that would not be a ceiling.
 
 **The fact-commit** — the single call that ends authoring, writing the
 snapshot-body, manifest, and `AnnouncementQueued` facts together — is

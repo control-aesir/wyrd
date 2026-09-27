@@ -132,7 +132,7 @@ step3_matrix() {
 
   start_mount matrix "$c" "$d" "$MNTS/matrix"
   set +e
-  python3 "$CHECKOUT/tests/alpha-lima-matrix.py" "$MNTS/matrix" >"$LOGDIR/matrix.out" 2>&1
+  python3 "$SCRIPT_DIR/alpha-lima-matrix.py" "$MNTS/matrix" >"$LOGDIR/matrix.out" 2>&1
   local status=$?
   set -e
   cat "$LOGDIR/matrix.out"

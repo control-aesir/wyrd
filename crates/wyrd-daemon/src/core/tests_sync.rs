@@ -6,6 +6,7 @@ use wyrd_format::{ContentId, FetchStatus};
 use wyrd_sync::transport::mailbox::Mailbox;
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use wyrd_core::want::WantRegistry;
 
@@ -20,6 +21,90 @@ use wyrd_format::{DeviceId, MemoryObjectStore};
 use wyrd_sync::bulk::MemoryBulkSource;
 
 use wyrd_sync::transport::mailbox::MailboxEnvelope;
+
+/// A quota refusal arrives at `fsync`, not at `write`, and the handle
+/// does not survive it. This is the shape the storage issue's
+/// verification names, and it is the consequential one: `write` returns
+/// success, the bytes sit in the handle's buffered image, and the
+/// refusal only appears when the commit is attempted — the "a `write`
+/// that succeeded never implies the later commit will" case. The image is
+/// taken before the submit, so a refusal discards it and poisons the fd.
+///
+/// That is deliberate: it is what a genuinely full disk does, which is
+/// the whole reason the quota reuses `StorageFull` and reads as a smaller
+/// disk rather than a weaker promise. Pinned here so the equivalence is
+/// a fact about this code and not an assumption in a document.
+#[test]
+fn a_quota_refused_fsync_reports_enospc_and_poisons_the_handle() {
+    let (engine, dir, _) = scratch_drive();
+    // One ceiling and one accountant, so the count the check reads is
+    // the count the store keeps.
+    let (config, retained) = LiveConfig::with_retained_quota(0);
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default().with_retained(retained)).unwrap();
+    // The baseline goes in through the node's own write API, which is
+    // not quota-checked (see the unrefused-writers note in
+    // `resource-limits.md`), and is what puts the drive over a zero
+    // ceiling so the refusal is genuinely reached.
+    daemon.put_file("base.txt", b"over the ceiling").unwrap();
+    // Composed inline rather than through `live_backend`, which builds
+    // from the default config and so cannot carry a quota.
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
+    let backend = crate::fuse::FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_stop = std::sync::Arc::clone(&stop);
+    let loop_config = wyrd_core::live::LiveConfig {
+        budgets: config.budgets,
+        interval: Duration::from_millis(10),
+        ..wyrd_core::live::LiveConfig::default()
+    };
+    let loop_handle = std::thread::spawn(move || {
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &loop_config,
+            &mut |_, _| {},
+        )
+    });
+
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    // The write succeeds: its bytes are buffered, not committed.
+    backend
+        .write_handle(handle, 0, b"x")
+        .expect("write only buffers");
+    assert_eq!(
+        backend.commit_handle(handle),
+        Err(fuser::Errno::ENOSPC),
+        "the refusal arrives at the commit boundary"
+    );
+    // The buffered image went with the attempt, so the handle is spent.
+    assert_eq!(
+        backend.write_handle(handle, 0, b"y"),
+        Err(fuser::Errno::EIO),
+        "a refused commit leaves the handle unusable, as a full disk does"
+    );
+    // And the namespace still serves the pre-refusal content: the
+    // refusal committed nothing, so there is nothing to serve from it.
+    let reader = backend
+        .open_at("base.txt")
+        .expect("pre-refusal content still serves");
+    assert!(backend.release_handle(reader).is_ok());
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    std::fs::remove_dir_all(dir).unwrap();
+}
 
 /// The dirty-handle budget bounds the mounted surface: the 65th
 /// dirty handle's write is `ENOSPC`, and releasing one frees a slot.

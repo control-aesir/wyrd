@@ -144,14 +144,21 @@ impl FsObjectStore {
             retained,
         };
         fs::create_dir_all(store.objects_dir()).map_err(FsStoreError::io)?;
-        // One walk: clear temp debris and total published objects.
-        let seeded = store.sweep_and_total()?;
-        if let Some(retained) = store.retained.clone() {
-            // One accountant per store. The seed is additive, so two
-            // stores sharing one tally over one directory would count the
-            // same disk twice and halve the ceiling; attach a fresh
-            // `RetainedBytes` per store, or none at all.
-            retained.add(seeded);
+        // The walk always clears debris. It only totals when an
+        // accountant is attached, because `open()` is the shipped
+        // constructor and the total costs an extra stat per object on a
+        // store holding millions of them — a price only worth paying
+        // when something reads the number.
+        match store.retained.clone() {
+            Some(retained) => {
+                // One accountant per store. The seed is additive, so two
+                // stores sharing one tally over one directory would count
+                // the same disk twice and halve the ceiling; attach a
+                // fresh `RetainedBytes` per store, or none at all.
+                let seeded = store.sweep_and_total()?;
+                retained.add(seeded);
+            }
+            None => store.sweep_temps()?,
         }
         Ok(store)
     }
@@ -209,6 +216,40 @@ impl FsObjectStore {
             .iter()
             .map(|kind| (*kind, self.path_for(*kind, id)))
             .find(|(_, path)| path.is_file())
+    }
+
+    /// Remove every `.tmp` file under the store: debris from writers
+    /// that crashed between temp-write and rename. This is the shipped
+    /// path's walk — the same traversal `master` had, with no `stat` per
+    /// object, because nothing asks for a byte count when no accountant
+    /// is attached.
+    fn sweep_temps(&self) -> Result<(), FsStoreError> {
+        let mut stack = vec![self.objects_dir()];
+        while let Some(current) = stack.pop() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(FsStoreError::io(error)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(FsStoreError::io)?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "tmp") {
+                    // A concurrent writer may rename the temp into place
+                    // between the listing and the removal: NotFound means
+                    // the file already reached its live name, which is
+                    // the outcome sweeping wants anyway.
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(FsStoreError::io(error)),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The `open`-time walk: removes every `.tmp` file and returns the

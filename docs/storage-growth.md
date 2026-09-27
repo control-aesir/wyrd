@@ -274,15 +274,22 @@ authorization change rather than a resource limit.
 The quota is narrower than "a ceiling on storage" in four ways, and each
 one is a place where the number understates what the device holds.
 
-**Only the local write path refuses.** The check sits in the mounted
-commit boundary. The sync pass writes fetched objects into the same store
-with no quota in scope, the vault retains ciphertext per representation,
-and the fact log grows per commit, per accepted intake message, and per
-delivery. All three raise the count; none of them is ever refused. (The
-fact log is not unbounded by a pass — materialization commits are
-idempotent, as "Already bounded" records — it simply is not metered
-here.) So the device's retained bytes are *not* bounded
-by the configured number, and the number can be crossed by paths that
+**Only the mounted write path refuses.** The check sits in the live
+node's commit boundary, ahead of every arm of `apply_mutation`. Four
+writers raise the count with nothing to refuse them: the sync pass
+fetching objects into the same store, the vault retaining ciphertext per
+representation, the fact log growing per commit / per accepted intake
+message / per delivery, and the node's own `put_file` and `remove`, which
+insert chunks and tree nodes and author a snapshot with no quota in scope.
+(The fact log is not unbounded by a pass — materialization commits are
+idempotent, as "Already bounded" records — it simply is not metered here.)
+
+That last one is the narrowest and the most likely to be assumed covered,
+because those methods sit on the same type that carries the accountant.
+But `into_live` consumes the node, so it is the pre-live and
+headless-embedder window rather than a hole in the mounted path. Either
+way the device's retained bytes are *not* bounded by the configured
+number, and the number can be crossed by paths that
 have no ceiling at all.
 
 **Which makes it an interference channel.** Because those unrefused paths
@@ -313,6 +320,18 @@ leaves the device permanently unable to take a local write, and raising
 the quota is the only remedy. At the ceiling every local mutation is
 refused, including ones that would retain nothing new — unlike a real full
 disk, where a zero-byte write still succeeds.
+
+**A refusal costs the open handle its buffer.** The commit takes the
+handle's buffered image before submitting, so an `ENOSPC` at `fsync`
+discards those uncommitted bytes and every later operation on that
+descriptor returns `EIO`. A program that writes and `close`s without an
+explicit sync gets no errno at all — `release` commits best-effort, logs,
+and returns success — so that path loses the write silently. This is
+master's policy for every commit failure and exactly what a genuinely
+full disk does, which is the sense in which a quota is a smaller disk and
+not a weaker promise. It is stated here because an operator deciding
+whether to set a ceiling should know that running into it costs open
+handles, not just the write in hand.
 
 ## Open questions
 

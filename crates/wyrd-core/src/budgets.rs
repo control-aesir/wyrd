@@ -101,8 +101,9 @@ pub struct ResourceBudgets {
     /// Ceiling on the bytes this device retains in its object store
     /// (`ENOSPC` once already over, at the mounted commit boundary).
     /// This is not a ceiling on the device: fetched bytes, the vault,
-    /// and the fact log all raise the count with no refusal, and a
-    /// commit starting under the ceiling is admitted and overshoots.
+    /// the fact log, and this crate's own pre-live `put_file`/`remove`
+    /// all raise the count with no refusal, and a commit starting under
+    /// the ceiling is admitted and overshoots.
     /// `storage-growth.md` states each of those; this is the field-doc
     /// summary. `None` — the
     /// default — is unlimited, so unconfigured deployments behave

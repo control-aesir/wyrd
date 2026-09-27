@@ -280,8 +280,15 @@ fn a_quota_refused_commit_commits_nothing_at_all() {
         let outcome = queue.submit(MutationKind::Mkdir {
             path: "denied".to_string(),
         });
-        // Let several passes run: a stranded obligation would be picked
-        // up and announced here, long after the refusal.
+        // Idle passes, so the final segment count is attributable to
+        // the refused commit: this shows fifty ordinary passes append
+        // nothing of their own. It is deliberately not the witness for
+        // the obligation — an obligation whose snapshot body was never
+        // committed would not be announced either, because
+        // `announce_pending` finds no body and `reannounce_one` commits
+        // nothing when no announcement matches. The count below is the
+        // witness, and it works because the obligation is written in the
+        // same fact-commit as the body.
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -327,7 +334,14 @@ fn committed_fact_segments(dir: &std::path::Path) -> usize {
     };
     entries
         .filter_map(Result::ok)
-        .filter(|e| e.path().is_file())
+        .filter(|entry| {
+            let path = entry.path();
+            // Skip temps: the durable store writes `commits/<name>.tmp`
+            // and renames it into place, so counting them would make this
+            // witness one in-flight commit away from a spurious failure.
+            // The same skip the read-only object-store walk uses.
+            path.is_file() && path.extension().is_none_or(|ext| ext != "tmp")
+        })
         .count()
 }
 

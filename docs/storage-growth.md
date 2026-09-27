@@ -333,9 +333,10 @@ disk, where a zero-byte write still succeeds.
    what a follow-up should settle:
    - **Counting the other two writers.** `RetainedBytes` covers the
      object store only. The sync vault retains ciphertext per
-     representation, and the fact log grows with every pass; both are
-     writers the tally never sees, so the reported total is lower than
-     the bytes this device actually holds.
+     representation, and the fact log grows per commit, per accepted
+     intake message, and per delivery; both are writers the tally never
+     sees, so the reported total is lower than the bytes this device
+     actually holds.
    - **Refusing the unrefused paths.** Fetched objects cross the quota
      with no ceiling in scope, which is what turns a local quota into the
      interference channel above. Whether a peer may decline to retain is

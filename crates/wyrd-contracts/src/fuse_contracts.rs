@@ -343,39 +343,72 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
     let rendezvous_backend = Arc::clone(&backend);
     std::thread::spawn(move || {
         for _ in 0..RENDEZVOUS_CYCLES {
-            let opened = (|| -> Result<Vec<u8>, fuser::Errno> {
-                let handle = rendezvous_backend.open_at("v.txt")?;
-                opened_tx.send(handle).unwrap();
-                swapped_rx.recv().unwrap();
+            // The open result travels on its own channel: a refused
+            // open must fail the main thread where it waits for the
+            // open — folding it into `got_tx` would strand the main
+            // thread on `opened_rx`, misreporting a refused open as
+            // a sequencing failure.
+            let handle = match rendezvous_backend.open_at("v.txt") {
+                Ok(handle) => handle,
+                Err(error) => {
+                    opened_tx.send(Err(error)).unwrap();
+                    got_tx.send(Err(error)).unwrap();
+                    continue;
+                }
+            };
+            opened_tx.send(Ok(handle)).unwrap();
+            swapped_rx.recv().unwrap();
+            let bytes = (|| -> Result<Vec<u8>, fuser::Errno> {
                 let bytes = rendezvous_backend.read_handle(handle, 0, 64)?;
                 rendezvous_backend.release_handle(handle)?;
                 Ok(bytes)
             })();
-            got_tx.send(opened).unwrap();
+            got_tx.send(bytes).unwrap();
+        }
+    });
+    // The phase-two publish runs on its own worker, bounded like
+    // every other join: the main thread must never publish unbounded
+    // while a handle is held across it, or a projection/files
+    // inversion would hang the suite instead of failing it.
+    let phase2_backend = Arc::clone(&backend);
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (pub2_tx, pub2_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for head in go_rx {
+            let outcome = (|| -> Result<(), fuser::Errno> {
+                phase2_backend.publish_without_revision(DriveView::shared(
+                    phase2_backend.store_handle()?,
+                    RemoteOnlyMaterialization,
+                    mount_heads(vec![head]),
+                ))?;
+                Ok(())
+            })();
+            pub2_tx.send(outcome).unwrap();
         }
     });
     for cycle in 0..RENDEZVOUS_CYCLES {
         opened_rx
             .recv_timeout(HANG_BOUND)
-            .expect("the open precedes its publication");
+            .expect("the open precedes its publication")
+            .expect("a rendezvous open refused: harness failure");
         let next = published_bodies[(PUBLICATIONS + cycle) % rotating].clone();
         let head = published[(PUBLICATIONS + cycle) % rotating].clone();
-        backend
-            .publish_without_revision(DriveView::shared(
-                backend.store_handle().unwrap(),
-                RemoteOnlyMaterialization,
-                mount_heads(vec![head]),
-            ))
-            .unwrap();
+        go_tx.send(head).unwrap();
+        pub2_rx
+            .recv_timeout(HANG_BOUND)
+            .expect(
+                "the phase-two publish finished within the bound: a publisher deadlock fails here",
+            )
+            .expect("a phase-two publish refused: harness failure");
         swapped_tx.send(()).unwrap();
         let bytes = got_rx
             .recv_timeout(HANG_BOUND)
             .expect("the read follows its publication")
-            .expect("a rendezvous open/read/release refused: harness failure");
+            .expect("a rendezvous read/release refused: harness failure");
         assert_eq!(
             bytes, current,
             "an open that predates a publication serves the pre-publication whole version \
-             while reads were in flight"
+             while an open handle was held"
         );
         current = next;
     }

@@ -90,12 +90,14 @@ the per-object term, and capping admissions caps the sum.
 
 ## Cumulative storage growth
 
-> **Not a live bound.** Everything above this line in the document is
-> a bound the daemon enforces today. This section is analysis and
-> screening: it states the retention bound, the adversary, and which
-> bounds could be enforced before GC exists. The only rows here that
-> describe current behavior are the two in "Already bounded" — those
-> two are enforced. The per-device quota is a proposal, not code.
+> **Not a live bound.** This section is analysis and screening: it
+> states the retention bound, the adversary, and which bounds could be
+> enforced before GC exists. Most of the document above is behavior the
+> daemon enforces today, though not all of it — the intake table also
+> records documented *absences*. Within this section, the
+> fixed-overhead table and the two "Already bounded" rows describe
+> enforced current behavior; everything else is analysis, screening, or
+> a proposal. The per-device quota is a proposal, not code.
 
 Every bound above is a *live-process* bound: it caps one operation, one
 pass, or one set of open handles, and each is released when the
@@ -138,19 +140,25 @@ question in `write-path.md`, not a micro-optimization.
 
 ### Per-snapshot fixed overhead
 
-One commit pays each of these regardless of how many bytes changed
-(`write-path.md` commit steps 1-6):
+This table is the **author's** fixed cost — the authoring seat pays all
+eight rows. A replica pays only the rows marked *both*: it does not
+author, so it never signs a snapshot, never rebuilds tree nodes for its
+own mutation, never imports a root manifest per commit, and never runs
+an announcement pass. A peer's fixed term is the fact-log append, its
+own durability fsyncs, the projection bump, and mirror write-through
+for content it actually pulls. A GC designer sizing a replica's disk
+should use the *both* subset, not this table.
 
-| Fixed cost | Where | Notes |
-|---|---|---|
-| Rebuilt tree nodes for the mutation | step 1 | content-proportional in cardinality even when the file content is not: a namespace-only change still writes a fresh root node |
-| Signed snapshot body | step 2 | author identity key, bound to DriveId and authorizing transition |
-| Vault import, including a freshly sealed root manifest | step 2 | temp + fsync + rename + directory fsync; `author_over` seals the hierarchy on every commit, so the root manifest is new bytes per commit even when nothing below it changed |
-| Fact-log append + `CURRENT` rewrite | step 3 | append-only and crash-safe; one commit per snapshot |
-| Durability fsyncs | step 3 | object store, vault, fact log, and every directory created on the way, made durable **together** |
-| Announcement obligation recorded, then discharged | steps 3, 6 | durable outbox, per-recipient delivered markers, byte-identical sealed retries per route — so this term scales with recipient count, it is not a per-commit constant |
-| Serving mirror write-through + flush barrier | step 5 | bounded per-pass (64 items / 64 MiB), but paid per commit |
-| Projection generation bump + head swap | step 4 | one short write lock |
+| Fixed cost | Where | Who pays | Notes |
+|---|---|---|---|
+| Rebuilt tree nodes for the mutation | step 1 | author | content-proportional in cardinality even when the file content is not: a namespace-only change still writes a fresh root node |
+| Signed snapshot body | step 2 | author | author identity key, bound to DriveId and authorizing transition; a peer verifies this signature at intake, it does not produce one |
+| Vault import, including a freshly sealed root manifest | step 2 | author | temp + fsync + rename + directory fsync. The re-seal is new bytes every commit because `seal` draws a fresh 24-byte random nonce, so each seal is a distinct envelope with a distinct transport root over the sealed bytes — and that root is the vault's address. The manifest's own `ContentId` is derived from plaintext and `import` is a no-op for a root already held, so content-addressing alone would dedupe an unchanged re-seal; the nonce is what defeats it |
+| Fact-log append + `CURRENT` rewrite | step 3 | both | append-only and crash-safe; one commit per snapshot |
+| Durability fsyncs | step 3 | both | object store, vault, fact log, and every directory created on the way, made durable **together** |
+| Announcement obligation recorded, then discharged | steps 3, 6 | author | durable outbox, per-recipient delivered markers, byte-identical sealed retries per route — so this term scales with recipient count, it is not a per-commit constant. Both halves are driven from the author's own outbox |
+| Serving mirror write-through + flush barrier | step 5 | both | bounded per-pass (64 items / 64 MiB), but paid per commit |
+| Projection generation bump + head swap | step 4 | both | one short write lock |
 
 The fsync count is the term that actually costs wall-clock: step 3
 makes several stores durable *together*, and a first-write hierarchy
@@ -296,16 +304,14 @@ bytes stop existing.
    eviction-under-pressure rule (which trades against the recovery
    property that motivates the append-only store), or accepting
    unbounded peer growth until GC. Not decided here.
-2. **Quota granularity and refusal point**: per device, per drive, or
-   per member-set, and how the check sequences against the commit's
-   durable writes. Two constraints are already known and both must
-   hold. The refusal must precede step 1's first durable write, or
-   account for the in-flight commit's bytes, or the ceiling degrades
-   to quota + one commit and each refusal permanently spends budget
-   (no GC reclaims it). And a quota-refused commit must not leave a
-   durable announcement obligation behind: the obligation is created
-   at step 3, atomically with the commit, so the refusal has to
-   happen at or before that boundary too.
+2. **Quota granularity and check sequencing**: per device, per drive,
+   or per member-set, and how the check interleaves with a commit
+   already in flight. The refusal point is settled above (before step
+   1's first durable write); what stays open is the accounting for a
+   commit that is already underway when the quota is crossed, and the
+   interaction with the announcement obligation, which is created at
+   step 3 atomically with the commit — so a refusal must land at or
+   before that boundary and leave no durable obligation behind.
 
 Tracked by the two follow-ups raised with this section:
 `protocol(storage): decide whether peers and vaults get a retention

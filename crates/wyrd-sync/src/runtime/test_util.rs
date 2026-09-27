@@ -1,8 +1,9 @@
-//! Test support for the runtime-engine tests: an in-memory relay and
-//! mailbox pair, isolated store directories, the single-engine
-//! [`fixture`], and the publisher-side helpers that seal snapshots and
-//! control messages into a bulk peer. Shared by the intake, plan,
-//! fetch, and scenario test modules.
+//! Test support for the runtime-engine tests: isolated store
+//! directories, the single-engine [`fixture`], and the
+//! publisher-side helpers that seal snapshots and control messages
+//! into a bulk peer. Shared by the intake, plan, fetch, and scenario
+//! test modules. The in-memory relay/mailbox fake lives in
+//! [`crate::transport::mailbox`] and is imported from there.
 //!
 //! The publisher side seals manifests and objects under keys derived
 //! from the epoch secrets the capability delivers; the engine side

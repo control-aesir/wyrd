@@ -26,6 +26,9 @@ use crate::keys::random_bytes;
 use crate::keys::DeviceIdentitySecret;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use std::collections::VecDeque;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MailboxError {
     #[error("NIP-44 seal/open failed")]
@@ -325,6 +328,12 @@ pub enum Disposition {
     Retry,
 }
 
+#[cfg(test)]
+struct Slot {
+    id: DeliveryId,
+    envelope: MailboxEnvelope,
+}
+
 /// The single shared in-memory relay/mailbox fake for `wyrd-sync`
 /// tests: every sent envelope lands in a shared queue; `recv` filters
 /// by the owning device. Handovers clone out of the slot, so the
@@ -333,15 +342,9 @@ pub enum Disposition {
 /// rather than carrying a twin, so the two cannot drift in
 /// settlement behavior.
 #[cfg(test)]
-struct Slot {
-    id: DeliveryId,
-    envelope: MailboxEnvelope,
-}
-
-#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryRelay {
-    queue: std::collections::VecDeque<Slot>,
+    queue: VecDeque<Slot>,
     next_id: u64,
 }
 
@@ -635,6 +638,35 @@ mod tests {
         assert_eq!(third.id(), first_id);
         // Acknowledging consumes: the relay holds nothing more.
         mailbox.settle(third.id(), Disposition::Ack).unwrap();
+        assert!(mailbox.recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn retry_requeues_at_the_back_behind_unblocked_mail() {
+        let (sender_sk, _sender) = identity(0x01);
+        let (_, recipient) = identity(0x02);
+        let mut relay = MemoryRelay::default();
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"first").expect("seals"));
+        relay.push(seal_for_recipient(&sender_sk, recipient, b"second").expect("seals"));
+
+        let mut mailbox = MemoryMailbox {
+            relay: &mut relay,
+            owner: recipient,
+        };
+        // Retry moves the head to the back: the next offer is the
+        // mail it never blocked, not the retried envelope in place.
+        let first = mailbox.recv().unwrap().expect("first offered");
+        let first_id = first.id();
+        mailbox.settle(first_id, Disposition::Retry).unwrap();
+        let second = mailbox.recv().unwrap().expect("second offered next");
+        assert_ne!(second.id(), first_id);
+        // The retried envelope is still retained, under its own id,
+        // behind the mail it yielded to.
+        let second_id = second.id();
+        mailbox.settle(second_id, Disposition::Ack).unwrap();
+        let reoffered = mailbox.recv().unwrap().expect("retry re-offered last");
+        assert_eq!(reoffered.id(), first_id);
+        mailbox.settle(first_id, Disposition::Ack).unwrap();
         assert!(mailbox.recv().unwrap().is_none());
     }
 

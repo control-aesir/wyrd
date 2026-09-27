@@ -19,6 +19,12 @@ One page. Read this, then the focused docs:
   operations, conflicted-drive policy
 - `error-conventions.md` — typed-error convention: thiserror enum per
   boundary, fail-closed classification, raise-vs-count rule
+- `resource-limits.md` — **normative** live-operation bounds: the
+  `ResourceBudgets` table, intake computational budgets, bytes in flight,
+  disk classification, pressure signals
+- `storage-growth.md` — retention under the append-only, no-GC store:
+  the per-device amplification bound, its adversary, and which bounds
+  are enforceable before GC (analysis, not an enforced bound)
 - `cli.md` — `wyrd` command reference: subcommands, credential files,
   diagnostics, exit codes
 - `upgrade-contract.md` — **normative** upgrade and migration contract:

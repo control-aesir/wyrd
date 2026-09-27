@@ -479,9 +479,8 @@ Write-time and commit-time failures are distinct surfaces:
   commit will. (A reserved per-device retained-bytes quota would report
   `ENOSPC` here too, reusing this reporting path unchanged; it is not
   implemented. The check itself would have to run before the commit's
-  first durable write, not at step 3, or a refused commit spends the
-  bytes it is protecting — see `resource-limits.md`, "Cumulative
-  storage growth".)
+  first write to disk, not at the durability boundary, or a refused
+  commit spends the bytes it is protecting — see `storage-growth.md`.)
 
 ## Namespace operations
 

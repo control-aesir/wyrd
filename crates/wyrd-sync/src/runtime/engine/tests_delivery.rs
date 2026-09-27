@@ -303,6 +303,7 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
         2,
         &[secret(0xAA), secret(0xBB)],
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode();
     let sealed = seal_rotation(
         &member_drive(),
@@ -553,6 +554,7 @@ fn plant_stale_obligation(
         2,
         &held,
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode();
     let wrap = Capability::mint(member_drive(), member, &state, admit, held)
         .expect("recipient is a member")
@@ -815,6 +817,7 @@ fn non_owner_stale_obligation_commits_no_replacement() {
         2,
         &held,
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode();
     let wrap = Capability::mint(member_drive(), engine_device, &state, &admit, held)
         .expect("engine is a member")
@@ -926,6 +929,7 @@ fn stale_obligation_without_secrets_stays_pending() {
         2,
         &held,
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode();
     let wrap = Capability::mint(member_drive(), engine_device, &state, &admit, held)
         .expect("engine is a member")

@@ -395,11 +395,31 @@ encryption key ‖ epoch); the plaintext repeats
 `drive ‖ device ‖ epoch`, then the counted transition bytes the
 membership machine verifies, the counted wrapped-capability bytes, and
 the counted owner proof. The owner proof is the owner's BIP-340
-signature over `domain ‖ drive ‖ recipient ‖ transition_id ‖ epoch ‖
-digest(epoch_secret_vector)`, the digest a domain-separated
-commitment to a count-prefixed canonical vector — never the secret
-bytes themselves. It exists because the two authorities are distinct:
-the mailbox seal authenticates the *sender* (delivery authority, held
+signature over a challenge derived from an exact preimage — never
+over the secret bytes themselves — constructed byte for byte as:
+
+```text
+CANONICAL(secret_vector) = u32_le(count) ‖ secret[0] ‖ … ‖ secret[count-1]
+secret_digest            = BLAKE3-derive-key("wyrd epoch secret vector v1", CANONICAL)
+preimage                 = "wyrd owner proof v1" ‖ drive (32) ‖ recipient (32)
+                           ‖ transition (32) ‖ epoch u64 LE (8) ‖ secret_digest (32)
+challenge                = BLAKE3-derive-key("wyrd owner proof v1", preimage)
+signature                = BIP-340(challenge), deterministic nonce
+proof encoding           = signer DeviceId (32) ‖ signature (64)
+```
+
+The preimage is 155 bytes, fixed: every field is fixed-width, so no
+concatenation is ambiguous. The secret-vector context is distinct
+from the proof context on purpose — a digest can never be replayed
+as a preimage or vice versa. The signature is always produced through a signer session
+scoped to the `OwnerProofV1` domain (`0x02` in the closed NIP-46
+signing-domain enum, continuing the Wyrd-private `0x00`/`0x01`
+allocation; standard NIP-46 defines method names, never signing
+domains, so there is no upstream value to reuse): a session that
+does not authorize the owner-proof domain refuses rather than
+minting under a confused authority. It exists because the two
+authorities are distinct: the mailbox seal authenticates the
+*sender* (delivery authority, held
 by any member of the authorizing state), while the proof authenticates
 the *origin* of the secret material (mint authority, held only by an
 owner of the pre-state). Intake verifies the proof against the

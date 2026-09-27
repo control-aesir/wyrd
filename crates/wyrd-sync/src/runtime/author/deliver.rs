@@ -599,6 +599,9 @@ fn mint_fresh_rotation_bytes(
     // Mint authority, distinct from delivery authority: the owner signs
     // a commitment to this exact vector, so any member may later relay
     // the sealed bytes while only an owner can have originated them.
+    // The signature goes through the local signer session under the
+    // owner-proof domain: a narrower remote session would refuse here
+    // rather than mint under a confused authority.
     let proof = OwnerProof::sign(
         &engine.identity_secret,
         &engine.drive,
@@ -606,7 +609,7 @@ fn mint_fresh_rotation_bytes(
         &transition.transition_id(),
         epoch,
         &secrets,
-    );
+    )?;
     let sealed = seal_rotation(
         &engine.drive,
         recipient,

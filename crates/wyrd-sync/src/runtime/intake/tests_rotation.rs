@@ -110,6 +110,7 @@ fn owner_proof(
         transition.epoch,
         secrets,
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode()
 }
 
@@ -657,6 +658,7 @@ fn member_signed_proof_is_refused() {
         3,
         &forged,
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode();
     assert_ne!(
         member,
@@ -813,6 +815,7 @@ fn incoming_owner_cannot_mint_the_handover_vector() {
         4,
         &forged,
     )
+    .expect("local signer authorizes the owner-proof domain")
     .encode();
     let wrapped = mint_wrap(&chain, &handover, device, forged);
     let rotation = rotation_delivery(&fixture, 4, &handover, wrapped, proof);

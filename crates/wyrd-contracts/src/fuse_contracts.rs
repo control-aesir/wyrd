@@ -19,12 +19,8 @@ use crate::support::{
 #[test]
 fn changed_descendants_never_create_directory_path_conflicts() {
     let mut store = MemoryObjectStore::default();
-    let keep = store
-        .insert(wyrd_format::ObjectKind::Chunk, b"keep")
-        .unwrap();
-    let fresh = store
-        .insert(wyrd_format::ObjectKind::Chunk, b"fresh")
-        .unwrap();
+    let keep = store.insert(ObjectKind::Chunk, b"keep").unwrap();
+    let fresh = store.insert(ObjectKind::Chunk, b"fresh").unwrap();
     let sub_keep = Tree::from_entries(vec![Entry::file("keep.txt", 4, false, vec![keep]).unwrap()])
         .unwrap()
         .insert_into(&mut store)
@@ -93,7 +89,7 @@ fn open_fds_remain_stable_across_head_advancement() {
     // stability, not the materialization path.
     let two_chunk = loaded
         .objects
-        .insert(wyrd_format::ObjectKind::Chunk, b"version two")
+        .insert(ObjectKind::Chunk, b"version two")
         .unwrap();
     let tree_two = Tree::from_entries(vec![
         Entry::file("stable.txt", 11, false, vec![two_chunk]).unwrap()
@@ -169,12 +165,8 @@ fn forged_snapshots_are_rejected_before_fuse_head_installation() {
     use wyrd_sync::durable::AuthorizedSnapshot;
 
     let mut store = MemoryObjectStore::default();
-    let good_chunk = store
-        .insert(wyrd_format::ObjectKind::Chunk, b"good")
-        .unwrap();
-    let other_chunk = store
-        .insert(wyrd_format::ObjectKind::Chunk, b"other")
-        .unwrap();
+    let good_chunk = store.insert(ObjectKind::Chunk, b"good").unwrap();
+    let other_chunk = store.insert(ObjectKind::Chunk, b"other").unwrap();
     let good_tree = Tree::from_entries(vec![
         Entry::file("good.txt", 4, false, vec![good_chunk]).unwrap()
     ])
@@ -212,25 +204,28 @@ fn forged_snapshots_are_rejected_before_fuse_head_installation() {
 
 /// Concurrent opens, reads, and head publications never deadlock and
 /// never tear: every read returns one complete published version.
-/// Readers resolve against whichever generation is current per open
-/// while the publisher swaps generations underneath, and captures
-/// are immutable once taken, so a read is always whole-version or
-/// nothing. Completion of every reader under contention is asserted;
-/// the lock discipline that makes it so (projection before handle
-/// tables, never the reverse) is structural — this test would stay
-/// green under an inversion, so it pins the outcome, not the order.
+/// Phase one aligns barrier-started readers against a publishing
+/// thread and asserts every read whole-version on the main thread.
+/// Phase two forces the interleaving deterministically: each cycle
+/// opens before the publication and reads after, pinning that a
+/// capture serves its pre-publication whole version. Completion of
+/// every thread under contention is asserted; the lock discipline
+/// that makes it so (projection before handle tables, never the
+/// reverse) is structural — this test pins the outcome, not the
+/// order.
 #[test]
 fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const VERSIONS: usize = 4;
     const READERS: usize = 4;
     const READS_PER_THREAD: usize = 20;
     const PUBLICATIONS: usize = 12;
+    const RENDEZVOUS_CYCLES: usize = 4;
     /// A deadlock fails here after a minute, it never hangs the
     /// suite: the daemon's own concurrency tests bound themselves
-    /// the same way.
+    /// the same way. The bound covers both directions — readers and
+    /// publisher join on the main thread.
     const HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
     let mut store = MemoryObjectStore::default();
@@ -258,80 +253,126 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
         mount_heads(vec![heads.next().unwrap()]),
     )));
     let published: Vec<_> = heads.collect();
+    let published = Arc::new(published);
     // The bodies in publication order, parallel to `published`: the
     // initial head serves `bodies[0]`, so the rotating set starts at
     // `bodies[1]`.
     let published_bodies: Vec<_> = bodies[1..].to_vec();
     let bodies = Arc::new(bodies);
-    let completed = Arc::new(AtomicUsize::new(0));
-    let start = Arc::new(std::sync::Barrier::new(READERS + 1));
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let rotating = published.len();
 
-    // Readers run on spawned threads (not a scope) so a deadlock
-    // fails at the bounded join below instead of hanging the suite:
-    // every handle shared here is `'static` through its `Arc`.
+    // Workers run on spawned threads (not a scope) so a deadlock
+    // fails at a bounded join instead of hanging the suite: every
+    // handle shared here is `'static` through its `Arc`.
+    let start = Arc::new(std::sync::Barrier::new(READERS + 1));
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
     for _ in 0..READERS {
         let backend = Arc::clone(&backend);
-        let bodies = Arc::clone(&bodies);
-        let completed = Arc::clone(&completed);
         let start = Arc::clone(&start);
-        let done_tx = done_tx.clone();
+        let read_tx = read_tx.clone();
         std::thread::spawn(move || {
             start.wait();
             for _ in 0..READS_PER_THREAD {
                 let handle = backend.open_at("v.txt").unwrap();
                 let bytes = backend.read_handle(handle, 0, 64).unwrap();
-                assert!(
-                    bodies.contains(&bytes),
-                    "a concurrent read is always one whole published version"
-                );
                 backend.release_handle(handle).unwrap();
-                completed.fetch_add(1, Ordering::Relaxed);
+                // No assertion here by design: a panic on a detached
+                // thread never fails this test — the bytes travel to
+                // the main thread, which asserts each one below.
+                read_tx.send(bytes).unwrap();
             }
-            done_tx.send(()).unwrap();
         });
     }
-    // Publish the remaining versions round-robin from the common
-    // start: every publication swaps the served generation under
-    // live opens. The barrier aligns the start; the 80-read vs
-    // 12-publish volume makes the overlap real, and the assertions
-    // below are exact either way.
-    start.wait();
-    let rotating = published.len();
-    for index in 0..PUBLICATIONS {
-        backend
-            .publish_without_revision(DriveView::shared(
-                backend.store_handle().unwrap(),
-                RemoteOnlyMaterialization,
-                mount_heads(vec![published[index % rotating].clone()]),
-            ))
-            .unwrap();
-    }
-    for _ in 0..READERS {
-        done_rx.recv_timeout(HANG_BOUND).expect(
-            "every reader finished within the hang bound: a deadlock fails here, not in a hang",
+    let publish_backend = Arc::clone(&backend);
+    let publish_start = Arc::clone(&start);
+    let publish_heads = Arc::clone(&published);
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        publish_start.wait();
+        for index in 0..PUBLICATIONS {
+            publish_backend
+                .publish_without_revision(DriveView::shared(
+                    publish_backend.store_handle().unwrap(),
+                    RemoteOnlyMaterialization,
+                    mount_heads(vec![publish_heads[index % rotating].clone()]),
+                ))
+                .unwrap();
+        }
+        published_tx.send(()).unwrap();
+    });
+
+    // Phase one: every read is asserted whole-version here on the
+    // main thread, so a tear fails at its own assertion with its own
+    // message instead of surfacing sixty seconds later as a hang.
+    for _ in 0..(READERS * READS_PER_THREAD) {
+        let bytes = read_rx.recv_timeout(HANG_BOUND).expect(
+            "every read arrived within the hang bound: a deadlock fails here, not in a hang",
+        );
+        assert!(
+            bodies.contains(&bytes),
+            "a concurrent read is always one whole published version"
         );
     }
-
-    assert_eq!(
-        completed.load(Ordering::Relaxed),
-        READERS * READS_PER_THREAD,
-        "every reader finished: no deadlock under contention"
-    );
+    published_rx
+        .recv_timeout(HANG_BOUND)
+        .expect("every publication landed within the hang bound: a publisher deadlock fails here");
     assert_eq!(
         backend.generation().unwrap(),
         PUBLICATIONS as u64,
         "every publication landed while reads were in flight"
     );
 
+    // Phase two: forced interleaving. Each cycle opens before the
+    // publication and reads after it — deterministically, every run —
+    // so the read must serve the pre-publication whole version.
+    // `current` tracks the served version on the main thread, which
+    // is exact because publications happen only here.
+    let mut current = published_bodies[(PUBLICATIONS - 1) % rotating].clone();
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (swapped_tx, swapped_rx) = std::sync::mpsc::channel();
+    let (got_tx, got_rx) = std::sync::mpsc::channel();
+    let rendezvous_backend = Arc::clone(&backend);
+    std::thread::spawn(move || {
+        for _ in 0..RENDEZVOUS_CYCLES {
+            let handle = rendezvous_backend.open_at("v.txt").unwrap();
+            opened_tx.send(handle).unwrap();
+            swapped_rx.recv().unwrap();
+            let bytes = rendezvous_backend.read_handle(handle, 0, 64).unwrap();
+            rendezvous_backend.release_handle(handle).unwrap();
+            got_tx.send(bytes).unwrap();
+        }
+    });
+    for cycle in 0..RENDEZVOUS_CYCLES {
+        opened_rx
+            .recv_timeout(HANG_BOUND)
+            .expect("the open precedes its publication");
+        let next = published_bodies[(PUBLICATIONS + cycle) % rotating].clone();
+        let head = published[(PUBLICATIONS + cycle) % rotating].clone();
+        backend
+            .publish_without_revision(DriveView::shared(
+                backend.store_handle().unwrap(),
+                RemoteOnlyMaterialization,
+                mount_heads(vec![head]),
+            ))
+            .unwrap();
+        swapped_tx.send(()).unwrap();
+        let bytes = got_rx
+            .recv_timeout(HANG_BOUND)
+            .expect("the read follows its publication");
+        assert_eq!(
+            bytes, current,
+            "an open that predates a publication serves the pre-publication whole version"
+        );
+        current = next;
+    }
+
     // The observation half: a fresh open after the last publication
     // resolves the last published version, so readers were never
     // pinned to the initial head.
-    let expected = published_bodies[(PUBLICATIONS - 1) % rotating].clone();
     let handle = backend.open_at("v.txt").unwrap();
     assert_eq!(
         backend.read_handle(handle, 0, 64).unwrap(),
-        expected,
+        current,
         "a fresh open sees the last published version"
     );
     backend.release_handle(handle).unwrap();
@@ -347,9 +388,7 @@ fn concurrent_opens_reads_and_publications_never_deadlock_or_tear() {
 #[test]
 fn open_directories_pin_their_enumeration_generation() {
     let mut store = MemoryObjectStore::default();
-    let chunk = store
-        .insert(wyrd_format::ObjectKind::Chunk, b"one")
-        .unwrap();
+    let chunk = store.insert(ObjectKind::Chunk, b"one").unwrap();
     let tree_one = Tree::from_entries(vec![Entry::file("one.txt", 3, false, vec![chunk]).unwrap()])
         .unwrap()
         .insert_into(&mut store)
@@ -370,11 +409,7 @@ fn open_directories_pin_their_enumeration_generation() {
         .store_handle()
         .unwrap()
         .write()
-        .map(|mut store| {
-            store
-                .insert(wyrd_format::ObjectKind::Chunk, b"two")
-                .unwrap()
-        })
+        .map(|mut store| store.insert(ObjectKind::Chunk, b"two").unwrap())
         .unwrap();
     let tree_two = Tree::from_entries(vec![
         Entry::file("one.txt", 3, false, vec![chunk]).unwrap(),
@@ -422,9 +457,7 @@ fn open_directories_pin_their_enumeration_generation() {
 #[test]
 fn disappeared_then_recreated_paths_serve_the_new_bytes() {
     let mut store = MemoryObjectStore::default();
-    let chunk_before = store
-        .insert(wyrd_format::ObjectKind::Chunk, b"before")
-        .unwrap();
+    let chunk_before = store.insert(ObjectKind::Chunk, b"before").unwrap();
     let tree_before =
         Tree::from_entries(vec![
             Entry::file("gone.txt", 6, false, vec![chunk_before]).unwrap()
@@ -466,11 +499,7 @@ fn disappeared_then_recreated_paths_serve_the_new_bytes() {
         .store_handle()
         .unwrap()
         .write()
-        .map(|mut store| {
-            store
-                .insert(wyrd_format::ObjectKind::Chunk, b"after!")
-                .unwrap()
-        })
+        .map(|mut store| store.insert(ObjectKind::Chunk, b"after!").unwrap())
         .unwrap();
     let tree_after = Tree::from_entries(vec![
         Entry::file("gone.txt", 6, false, vec![chunk_after]).unwrap()

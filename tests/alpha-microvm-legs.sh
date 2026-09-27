@@ -188,6 +188,10 @@ leg_fetch_owner() {
 # first, scratch-write to localize the trees the delete needs, and
 # delete stale-1 — all on the post-restart lineage, no fork. Close
 # with the dedupe proof over the step-8 restart's redelivery.
+# Wall-clock envelope (whole guest run shares one 1-hour budget):
+# probes ~130s worst case, owner convergence chain concurrent with
+# the member's recovery, recovery loop 650s worst case, ack waits
+# fail-fast (120s member-side). Typical green run: 4-6 minutes.
 # Two matrix items are deliberately NOT e2e-legged here:
 # timeout-then-completion (the waiter leaves with
 # EIO while the fetch continues (unit-pinned by
@@ -321,8 +325,11 @@ leg_fetch_member() {
   pass "failed fetch recovers after re-announcement without remount"
   # Stay up until the owner confirms convergence: shutting down
   # here would outrun the outbox drain and strand the scratch and
-  # delete announcements this leg's owner polls wait for.
-  poll_until 600 test -f "$E2E_ROOT/owner-converged-done" \
+  # delete announcements this leg's owner polls wait for. Short
+  # budget on purpose: in the normal case the owner acks while this
+  # mount is still recovering, so this only ever costs minutes when
+  # the owner is genuinely stuck.
+  poll_until 120 test -f "$E2E_ROOT/owner-converged-done" \
     || die "owner never converged the scratch and delete"
   touch "$E2E_ROOT/member-recovered-done"
   stop_mount xmember-f TERM

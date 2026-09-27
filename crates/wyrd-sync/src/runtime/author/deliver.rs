@@ -661,10 +661,13 @@ fn mint_fresh_rotation_bytes(
             // A stall with no error is invisible unless it is logged:
             // the variant names the diagnosis, so a permanently
             // mis-wired session reads differently from a dropped one.
-            // `debug!`, not the e2e rotation log: the e2e filter is
-            // `wyrd_core`-scoped and never carries `wyrd_sync`
-            // records — this line is for daemon logs with crate
-            // debug enabled (`--verbose`).
+            // `debug!`, not the e2e rotation log: the e2e harnesses
+            // set no `wyrd_sync` scope (Lima defaults to
+            // `wyrd_core=debug`, microVM to the binary's `info`) —
+            // this line is for daemon logs with crate debug enabled
+            // (`--verbose`). Widening the Lima filter to carry it was
+            // considered and declined: harness config is out of scope
+            // for this change.
             tracing::debug!(epoch, recipient = ?recipient, error = ?e, "owner-proof mint skipped; obligation stays pending");
             return Ok(None);
         }

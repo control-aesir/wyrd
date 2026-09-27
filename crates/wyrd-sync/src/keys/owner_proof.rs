@@ -236,6 +236,8 @@ mod tests {
         )
     }
 
+    /// Local hex decode for pinned vectors; a shared home waits
+    /// for a third in-crate user.
     fn unhex<const N: usize>(hex: &str) -> [u8; N] {
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)

@@ -26,10 +26,8 @@ use wyrd_format::{
 
 const PASSPHRASE: &str = "durable test passphrase";
 
-/// Decode pinned hex in tests: the known-answer vectors below read
-/// as hex literals, and neither this crate nor `wyrd-contracts`
-/// depends on `hex`, so test-only hex parsing stays a local helper
-/// rather than a new dev-dependency.
+/// Decode pinned hex for the known-answer vectors below. Local to
+/// this test module: a shared home waits for a third in-crate user.
 fn unhex<const N: usize>(hex: &str) -> [u8; N] {
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)

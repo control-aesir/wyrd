@@ -200,6 +200,7 @@ fn mkdir_through_backend_commits_and_serves() {
                 serving_flush_budget: Duration::from_secs(5),
                 fetch_pass_budget: Duration::from_secs(10),
                 budgets: ResourceBudgets::default(),
+                retained_bytes: None,
             },
             &mut |_, _| {},
         )
@@ -303,6 +304,7 @@ fn create_at_saturated_table_creates_nothing() {
             max_open_handles: 1,
             ..ResourceBudgets::default()
         },
+        retained_bytes: None,
     };
     let (live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
     // The test takes the composer role: the backend is built from the

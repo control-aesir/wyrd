@@ -7,10 +7,10 @@ screens which bounds could be enforced before GC exists. A later GC
 design should start here, so this document's job is to give it a defined
 adversary rather than an open assumption.
 
-Within this document, the fixed-overhead table and the two "Already
-bounded" rows describe enforced current behavior, each with the code
-that closes it. Everything else is analysis, screening, or a proposal.
-The per-device quota is a proposal, not code.
+Within this document, the fixed-overhead table, the two "Already
+bounded" rows, and the per-device retained-bytes quota describe enforced
+current behavior, each with the code that closes it. The remaining
+candidates are screening, not code.
 
 ## Why retention is separate
 
@@ -206,9 +206,10 @@ rather than decided here.
 
 ## Pre-GC bounds: what could be enforced
 
-**Nothing in this subsection is implemented.** It records which bounds
-survive the durability contract, so the GC design starts from a screened
-list rather than re-testing rejected options.
+One bound here is implemented: the per-device retained-bytes quota. The
+rest are the record of which candidates were screened out, so the GC
+design starts from a settled list rather than re-testing rejected
+options.
 
 Enforcement must not contradict the durability contract. Three of the
 obvious candidates fail that test, and the fourth is deferred:
@@ -232,7 +233,7 @@ existing error path unchanged:
 
 | Bound | Enforcement | Why it is safe |
 |---|---|---|
-| Per-device retained-bytes quota (proposed) | Refuse the commit before its first write to disk, reporting `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see `resource-limits.md`, Disk classification). A quota is a smaller disk, not a weaker promise |
+| Per-device retained-bytes quota | Refuse the commit before its first write to disk, reporting `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see `resource-limits.md`, Disk classification). A quota is a smaller disk, not a weaker promise. Implemented: `ResourceBudgets::retained_bytes_quota` (default `None`, unlimited), enforced by `LiveNode::enforce_retained_quota` ahead of every arm of `apply_mutation`, counted by `wyrd_format::RetainedBytes` |
 
 The refusal point is load-bearing and easy to get wrong, in the one
 place where being off by a step is the failure mode being designed
@@ -262,11 +263,19 @@ Refusing there strands no facts either, which is what makes it the
 latest consistent choice, but by then the commit's bytes are already
 spent, which is why it is not the byte ceiling's point.
 
-A quota would bound the author's own device and convert a silent
-unbounded growth into an explicit, documented, POSIX-legitimate refusal.
-It would not bound the author **on other devices, nor in the vault**.
-Nothing in v0 can bound the author, because a member's commits are valid
-work and GC is the only mechanism that can make old bytes stop existing.
+The quota bounds the author's own device and converts a silent unbounded
+growth into an explicit, documented, POSIX-legitimate refusal. It does
+not bound the author **on other devices, nor in the vault**: a member's
+commits are valid work, and GC is the only mechanism that can make old
+bytes stop existing. That is open question 1, and it is a `trust.md`
+authorization change rather than a resource limit.
+
+Two limits are worth stating plainly, because both are narrower than
+"a ceiling on storage". The count covers the **object store only** — the
+sync vault's retained ciphertext is a second writer and is not yet
+counted, so a vault-heavy deployment sees a higher real total than the
+accountant reports. And the ceiling is on the *authoring* device: it
+bounds what this node retains, never what it is made to accept.
 
 ## Open questions
 
@@ -281,15 +290,23 @@ work and GC is the only mechanism that can make old bytes stop existing.
    the serving boundary, an eviction-under-pressure rule (which trades
    against the recovery property that motivates the append-only store),
    or accepting unbounded peer growth until GC. Not decided here.
-2. **Quota granularity and check sequencing**: per device, per drive, or
-   per member-set, and how the check interleaves with a commit already
-   in flight. The refusal point is settled above (before the commit's
-   first write to disk, with the fact-commit as the latest consistent
-   fallback); what stays open is the accounting for a commit that is
-   already underway when the quota is crossed, and the interaction with
-   the announcement obligation, whose facts share that final fact-commit
-   — so a refusal must land before it and leave no durable obligation
-   behind.
+2. **Quota accounting still open.** The refusal point shipped as
+   decided above: before the commit's first write to disk, so a refused
+   commit retains nothing. What the implementation leaves open, and
+   what a follow-up should settle:
+   - **Counting the vault.** `RetainedBytes` covers the object store
+     only. The sync vault retains ciphertext per representation and is
+     a second writer, so the reported total is lower than the bytes
+     this device actually holds.
+   - **In-flight accounting.** The check compares bytes already
+     retained, so the effective ceiling is the quota plus the one
+     commit that was already underway when the quota was crossed. That
+     is bounded and small, but it is not zero, and a stricter reading
+     would reserve the in-flight delta up front.
+   - **Granularity.** The bound is per device. Per drive would bound the
+     *author* across its devices; per member-set would bound a group.
+     The device scope is the conservative choice and is the only one
+     that needs no membership state at the write boundary.
 
 Tracked by the two follow-ups raised with this document:
 `protocol(storage): decide whether peers and vaults get a retention

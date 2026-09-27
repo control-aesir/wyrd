@@ -7,8 +7,8 @@
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
-    chunk, ContentId, Entry, FetchStatus, ObjectStore, SharedStore, SnapshotId, StoreError,
-    StoreFailure, Tree,
+    chunk, ContentId, Entry, FetchStatus, ObjectStore, RetainedBytes, SharedStore, SnapshotId,
+    StoreError, StoreFailure, Tree,
 };
 use wyrd_sync::closure::ClosureError;
 use wyrd_sync::durable::{AuthorizedSnapshot, DurableError};
@@ -176,6 +176,18 @@ pub struct LiveSummary {
 }
 
 /// Supervision policy for [`LiveNode::run_loop`].
+/// Why a live composition was refused. Distinct from every runtime
+/// error in this module: nothing is running yet, so there is no drive,
+/// no mount, and no POSIX boundary to report through. The composer
+/// surfaces it at startup, where a misconfiguration belongs.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompositionError {
+    /// `budgets.retained_bytes_quota` is set but `LiveConfig::retained_bytes`
+    /// is not, so no byte count exists to compare the ceiling against.
+    #[error("budgets.retained_bytes_quota is set with no retained_bytes accountant wired: the ceiling would compare against nothing")]
+    QuotaWithoutAccountant,
+}
+
 pub struct LiveConfig {
     /// Idle pacing deadline between passes: the staleness bound, not a
     /// poll interval. Producers (mutation submissions, mailbox intake,
@@ -223,6 +235,13 @@ pub struct LiveConfig {
     /// at most this per pass instead of wedging the loop behind one
     /// dial per pending item; the rest resumes next pass.
     pub fetch_pass_budget: Duration,
+    /// The object store's byte accountant, shared with the store that
+    /// writes it. Required whenever `budgets.retained_bytes_quota` is
+    /// set: the ceiling is a comparison against this number, so a quota
+    /// without it would read as permanently zero — a bound that either
+    /// refuses everything or looks enforced while bounding nothing.
+    /// Composition refuses that pairing rather than accepting it.
+    pub retained_bytes: Option<Arc<RetainedBytes>>,
 }
 
 impl Default for LiveConfig {
@@ -236,6 +255,7 @@ impl Default for LiveConfig {
             max_mutation_wait: Duration::from_secs(30),
             serving_flush_budget: Duration::from_secs(5),
             fetch_pass_budget: Duration::from_secs(10),
+            retained_bytes: None,
         }
     }
 }
@@ -360,6 +380,10 @@ pub struct LiveNode<V: NamespaceView> {
     /// The admission cap paces demand; the registries and backend
     /// hold their own copies for their own refusals.
     pub(super) budgets: ResourceBudgets,
+    /// The store's byte accountant, when a retention ceiling is
+    /// configured. `None` means no ceiling and no accounting, which is
+    /// the default and costs one `Option` test per commit.
+    pub(super) retained_bytes: Option<Arc<RetainedBytes>>,
     /// Deadline for deferred mutations, copied from the composition
     /// config: a held mutation that outwaits it fails `TimedOut`.
     pub(super) max_mutation_wait: Duration,
@@ -544,7 +568,14 @@ where
         revision: u64,
         open_timeout: Duration,
         config: &LiveConfig,
-    ) -> (Self, LiveParts<V>) {
+    ) -> Result<(Self, LiveParts<V>), CompositionError> {
+        // A retention ceiling is a comparison against a number the store
+        // maintains. Without the accountant there is nothing to compare,
+        // so refuse the composition instead of accepting a bound that
+        // would read as permanently zero.
+        if config.budgets.retained_bytes_quota.is_some() && config.retained_bytes.is_none() {
+            return Err(CompositionError::QuotaWithoutAccountant);
+        }
         let baseline = Projection::initial(baseline, revision);
         let projection = Arc::new(RwLock::new(Arc::new(baseline)));
         let budgets = config.budgets;
@@ -577,13 +608,14 @@ where
             })
             .unwrap_or_default();
         let published_heads = observed_heads.len();
-        (
+        Ok((
             LiveNode {
                 engine,
                 store,
                 projection,
                 wants,
                 mutations,
+                retained_bytes: config.retained_bytes.clone(),
                 published_revision: revision,
                 published_heads,
                 observed_heads,
@@ -597,7 +629,7 @@ where
                 fetch_pass_budget: config.fetch_pass_budget,
             },
             parts,
-        )
+        ))
     }
     /// Mark content wanted locally (`Cached`) so fetch plans retrieve
     /// it: the composer's manual fetch-policy lever on top of the
@@ -1128,6 +1160,38 @@ where
         })
     }
 
+    /// The retention ceiling, checked before the commit's first write.
+    ///
+    /// Placement is the whole point. Every arm of `apply_mutation` opens
+    /// by writing objects — chunks and rebuilt tree nodes — and only
+    /// then authors, so a check placed at or after authoring refuses a
+    /// commit whose bytes are already on disk, and with no GC nothing
+    /// reclaims them. A member could then write a maximum-size file,
+    /// be refused, and repeat: the ceiling would hold while the device
+    /// grew by one commit per attempt, which is the outcome the bound
+    /// exists to prevent.
+    ///
+    /// So the comparison is `>=` against bytes already retained, and it
+    /// runs before the match: there is no arm-specific cost to
+    /// estimate, and no path that reaches a first write without passing
+    /// here. The effective ceiling is therefore the quota plus at most
+    /// the one commit already in flight when the quota was crossed.
+    fn enforce_retained_quota(&self) -> Result<(), MutationError> {
+        let (Some(limit), Some(retained)) =
+            (self.budgets.retained_bytes_quota, &self.retained_bytes)
+        else {
+            return Ok(());
+        };
+        if retained.get() >= limit {
+            // StorageFull is the classification that already means "full
+            // disk" to every reader of this store, and it reaches the
+            // mount as ENOSPC — so a quota reads as the smaller disk it
+            // is, with no new error variant and no new errno mapping.
+            return Err(MutationError::Store(StoreFailure::StorageFull));
+        }
+        Ok(())
+    }
+
     /// Apply one mutation to the current single live head and author a
     /// snapshot over the result. The base is read fresh (the previous
     /// mutation's committed state, under the queue's total order); a
@@ -1140,6 +1204,7 @@ where
         kind: &MutationKind,
         pinned: Option<SnapshotId>,
     ) -> Result<MutationOutcome, MutationError> {
+        self.enforce_retained_quota()?;
         match kind {
             MutationKind::Mkdir { path } => {
                 let heads = self.eval_heads(pinned, path)?;
@@ -2281,25 +2346,7 @@ mod prereq_tests {
         store: MemoryObjectStore,
         heads: &[AuthorizedSnapshot],
     ) -> LiveNode<FileView> {
-        let revision = engine.current();
-        let materialization = RuntimeMaterialization {
-            runtime: engine.runtime_state().unwrap(),
-        };
-        let store = Arc::new(RwLock::new(store));
-        let baseline = FileView::open_shared(
-            Arc::clone(&store),
-            materialization,
-            heads.iter().cloned().map(Head::new).collect(),
-        );
-        LiveNode::split(
-            engine,
-            store,
-            baseline,
-            revision,
-            Duration::from_secs(30),
-            &LiveConfig::default(),
-        )
-        .0
+        live_over_configured(engine, store, heads, &LiveConfig::default())
     }
 
     /// Reading a prefix of a remote-only file defers on the file's
@@ -2674,6 +2721,200 @@ mod prereq_tests {
         drop(node);
         drop(guard);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live node over the scratch drive with an explicit config, so a
+    /// test can wire a resource bound the default config does not carry.
+    fn live_over_configured(
+        engine: Engine,
+        store: MemoryObjectStore,
+        heads: &[AuthorizedSnapshot],
+        config: &LiveConfig,
+    ) -> LiveNode<FileView> {
+        let revision = engine.current();
+        let materialization = RuntimeMaterialization {
+            runtime: engine.runtime_state().unwrap(),
+        };
+        let store = Arc::new(RwLock::new(store));
+        let baseline = FileView::open_shared(
+            Arc::clone(&store),
+            materialization,
+            heads.iter().cloned().map(Head::new).collect(),
+        );
+        LiveNode::split(
+            engine,
+            store,
+            baseline,
+            revision,
+            Duration::from_secs(30),
+            config,
+        )
+        .expect("the default config carries no quota, so composition cannot be refused")
+        .0
+    }
+
+    /// The retained-bytes quota refuses the commit at its first write.
+    /// With the ceiling already reached, a mutation fails
+    /// `StorageFull` — the classification that reaches the mount as
+    /// `ENOSPC` — and, critically, spends nothing: no object is
+    /// written, no snapshot is authored, and so no announcement
+    /// obligation is left behind for a snapshot that does not exist.
+    /// A check placed after the object insert would still fail the
+    /// commit while permanently retaining the bytes it refused, which
+    /// is the leak the ceiling exists to close.
+    #[test]
+    fn a_reached_retained_quota_refuses_the_commit_before_it_spends() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("retained-quota");
+        let retained = Arc::new(RetainedBytes::default());
+        let store = store.with_retained(Arc::clone(&retained));
+        // The scratch drive's own history is already counted, so the
+        // zero ceiling is genuinely reached rather than trivially empty.
+        let seeded = retained.get();
+        assert!(
+            seeded > 0,
+            "attaching seeds from what the store already holds"
+        );
+        let mut config = LiveConfig::default();
+        config.budgets.retained_bytes_quota = Some(0);
+        config.retained_bytes = Some(Arc::clone(&retained));
+        let mut node = live_over_configured(engine, store, &[head], &config);
+
+        let committed = node.engine.current();
+        let error = node
+            .apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Store(StoreFailure::StorageFull),
+            "a quota refusal is ENOSPC at the boundary, not a generic failure: {error:?}"
+        );
+        assert_eq!(
+            node.engine.current(),
+            committed,
+            "a quota-refused commit authors nothing"
+        );
+        assert_eq!(
+            retained.get(),
+            seeded,
+            "the refusal precedes the commit's first write, so it retains nothing"
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Under the ceiling the commit proceeds and the retained count
+    /// grows by the content it actually keeps. Without this the quota
+    /// could be satisfied by refusing everything, which is a bound with
+    /// no useful side.
+    #[test]
+    fn a_commit_under_the_quota_lands_and_counts_its_retained_bytes() {
+        let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("retained-under");
+        let retained = Arc::new(RetainedBytes::default());
+        let store = store.with_retained(Arc::clone(&retained));
+        let seeded = retained.get();
+        let mut config = LiveConfig::default();
+        // Generous enough that the commit lands whatever it retains.
+        config.budgets.retained_bytes_quota = Some(u64::MAX);
+        config.retained_bytes = Some(Arc::clone(&retained));
+        let mut node = live_over_configured(engine, store, &[head], &config);
+
+        let committed = node.engine.current();
+        node.apply_mutation(&MutationKind::Mkdir { path: "g".into() }, None)
+            .unwrap();
+        assert_eq!(
+            node.engine.current(),
+            committed + 1,
+            "a commit under the quota authors exactly one snapshot"
+        );
+        assert!(
+            retained.get() > seeded,
+            "the commit's own objects are counted against the ceiling"
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Re-inserting content the store already holds retains nothing, so
+    /// the count tracks *retained* bytes rather than bytes written. If
+    /// it counted writes instead, a long session re-authoring unchanged
+    /// subtrees would climb toward the ceiling on its own and the quota
+    /// would stop describing anything real.
+    #[test]
+    fn reinserting_held_content_is_not_charged_twice() {
+        let (engine, dir, store, chunk, _root, head) = scratch_file_drive("retained-dedup");
+        let retained = Arc::new(RetainedBytes::default());
+        let store = store.with_retained(Arc::clone(&retained));
+        let mut config = LiveConfig::default();
+        config.budgets.retained_bytes_quota = Some(u64::MAX);
+        config.retained_bytes = Some(Arc::clone(&retained));
+        let mut node = live_over_configured(engine, store, &[head], &config);
+
+        let payload = b"the very same bytes";
+        node.apply_mutation(
+            &MutationKind::CommitFile {
+                path: "f".into(),
+                base: FileIdentity::new(11, false, vec![chunk]),
+                executable: false,
+                content: payload.to_vec(),
+            },
+            None,
+        )
+        .unwrap();
+        let after_first = retained.get();
+        assert!(after_first > 0, "the first commit retains its new chunk");
+
+        for _ in 0..4 {
+            node.apply_mutation(
+                &MutationKind::CommitFile {
+                    path: "f".into(),
+                    base: FileIdentity::new(payload.len() as u64, false, vec![chunk]),
+                    executable: false,
+                    content: payload.to_vec(),
+                },
+                None,
+            )
+            .ok();
+        }
+        assert_eq!(
+            retained.get(),
+            after_first,
+            "re-presenting identical content retains no additional bytes"
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A quota with no accountant wired is a silent no-op — the ceiling
+    /// would read as zero forever and either refuse everything or, worse,
+    /// look enforced while bounding nothing. Composition refuses it
+    /// instead, so the misconfiguration is loud at startup.
+    #[test]
+    fn a_quota_without_an_accountant_refuses_to_compose() {
+        let (engine, _dir, store, _chunk, _root, head) = scratch_file_drive("retained-unwired");
+        let mut config = LiveConfig::default();
+        config.budgets.retained_bytes_quota = Some(1024);
+        config.retained_bytes = None;
+        let revision = engine.current();
+        let materialization = RuntimeMaterialization {
+            runtime: engine.runtime_state().unwrap(),
+        };
+        let store = Arc::new(RwLock::new(store));
+        let baseline =
+            FileView::open_shared(Arc::clone(&store), materialization, vec![Head::new(head)]);
+        let error = LiveNode::<FileView>::split(
+            engine,
+            store,
+            baseline,
+            revision,
+            Duration::from_secs(30),
+            &config,
+        )
+        .err()
+        .expect("a quota with nothing counting bytes must not compose");
+        assert!(
+            error.to_string().contains("retained_bytes_quota"),
+            "the refusal names the wiring that is missing: {error}"
+        );
     }
 
     /// An incomplete closure never spends the fatal engine-error
@@ -3066,6 +3307,7 @@ mod parent_mutation_tests {
             Duration::from_secs(30),
             &LiveConfig::default(),
         )
+        .expect("the default config carries no quota, so composition cannot be refused")
         .0
     }
 

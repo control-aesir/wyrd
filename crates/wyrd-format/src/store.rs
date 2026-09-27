@@ -4,6 +4,7 @@
 
 use crate::identity::{ContentId, ObjectKind};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
@@ -126,11 +127,49 @@ pub enum FetchStatus {
     Corrupt,
 }
 
+/// Monotonic count of the bytes one device *retains* in its object
+/// store, shared between the store that writes and the node that
+/// enforces a ceiling on it.
+///
+/// This exists because the store is append-only with no GC, so the only
+/// thing a device can bound about its own growth is how much it already
+/// holds — every other live bound caps one operation and is released
+/// when that operation ends (`docs/storage-growth.md`). The count
+/// tracks *retained* bytes, not bytes written: re-presenting content
+/// the store already holds adds nothing, so a session that re-authors
+/// unchanged subtrees does not climb toward the ceiling on its own.
+///
+/// A reopened drive must not restart the count at zero, or the ceiling
+/// resets on every restart. Stores therefore seed the counter from what
+/// they already hold when they are attached (see
+/// [`MemoryObjectStore::with_retained`]), which costs one walk at open
+/// and none per commit.
+#[derive(Debug, Default)]
+pub struct RetainedBytes(AtomicU64);
+
+impl RetainedBytes {
+    /// A fresh counter. Stores and the node share it by `Arc`.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Charge bytes that were not previously held.
+    pub fn add(&self, bytes: u64) {
+        self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes currently charged.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// An in-memory [`ObjectStore`]: test and bench scaffolding. Network-backed
 /// stores are a sync-layer concern.
 #[derive(Debug, Default, Clone)]
 pub struct MemoryObjectStore {
     objects: HashMap<ContentId, (ObjectKind, Vec<u8>)>,
+    retained: Option<Arc<RetainedBytes>>,
 }
 
 /// The only way a memory store fails: an identity mismatch on a verified
@@ -153,6 +192,26 @@ impl MemoryStoreError {
 }
 
 impl MemoryObjectStore {
+    /// Attach a byte accountant, seeded from what this store already
+    /// holds. Seeding here rather than leaving it to the caller is what
+    /// keeps a reopened drive's count honest: a store that already holds
+    /// a drive's history starts counted, not empty.
+    pub fn with_retained(mut self, retained: Arc<RetainedBytes>) -> Self {
+        retained.add(self.retained_bytes());
+        self.retained = Some(retained);
+        self
+    }
+
+    /// Bytes this store holds. The seeding figure for
+    /// [`Self::with_retained`], and the composition root's cross-check
+    /// for a mounted store.
+    pub fn retained_bytes(&self) -> u64 {
+        self.objects
+            .values()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum()
+    }
+
     #[cfg(test)]
     pub(crate) fn stored_count(&self) -> usize {
         self.objects.len()
@@ -164,7 +223,16 @@ impl ObjectStore for MemoryObjectStore {
 
     fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
         let id = ContentId::derive(kind, data);
+        // Charge only what this call newly retains: the store is
+        // content-addressed, so a repeat of held content writes nothing
+        // and must not move the count.
+        let fresh = !self.objects.contains_key(&id);
         self.objects.entry(id).or_insert((kind, data.to_vec()));
+        if fresh {
+            if let Some(retained) = &self.retained {
+                retained.add(data.len() as u64);
+            }
+        }
         Ok(id)
     }
 

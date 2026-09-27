@@ -485,11 +485,11 @@ Write-time and commit-time failures are distinct surfaces:
   store/authoring/durability failure; `EFBIG` when the resulting file or
   tree exceeds a protocol ingest ceiling; `ENOSPC` when a protocol object
   budget is exceeded. A `write` that succeeded never implies the later
-  commit will. (A reserved per-device retained-bytes quota would report
-  `ENOSPC` here too, reusing this reporting path unchanged; it is not
-  implemented. The check itself would have to run before the commit's
-  first write to disk, not at the durability boundary, or a refused
-  commit spends the bytes it is protecting — see `storage-growth.md`.)
+  commit will. (A configured per-device retained-bytes quota reports
+  `ENOSPC` here, reusing this reporting path unchanged. The check runs
+  before the commit's first write to disk, not at the durability
+  boundary, so a refused commit spends nothing — see
+  `storage-growth.md`.)
 
 ## Namespace operations
 

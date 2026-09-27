@@ -74,6 +74,7 @@ fn spawn_teardown_loop<M: Mailbox + Send + 'static>(
             max_mutation_wait: Duration::from_secs(30),
             serving_flush_budget: Duration::from_secs(5),
             fetch_pass_budget: Duration::from_secs(10),
+            retained_bytes: None,
         },
         trigger,
         |_, _| {},

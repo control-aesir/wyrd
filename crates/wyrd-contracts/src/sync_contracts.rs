@@ -1850,6 +1850,7 @@ fn conflicted_drive_rejects_mounted_writes() {
                 max_mutation_wait: Duration::from_secs(30),
                 serving_flush_budget: Duration::from_secs(5),
                 fetch_pass_budget: Duration::from_secs(10),
+                retained_bytes: None,
             },
             &mut |_, _| {},
         )

@@ -60,6 +60,12 @@ pub const DEFAULT_MAX_OPEN_HANDLES: usize = 4096;
 /// the 129th concurrent one does not.
 pub const DEFAULT_MAX_OPEN_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
 
+/// No retention ceiling by default. An unset quota is what keeps
+/// existing deployments byte-for-byte unchanged, and it is the honest
+/// default for an append-only store: a ceiling nobody chose is a policy
+/// decision, not a safety limit. Operators opt in.
+pub const DEFAULT_RETAINED_BYTES_QUOTA: Option<u64> = None;
+
 /// The node-side resource bounds, threaded from the live config into
 /// the loop, the registries, and the backend at composition time.
 /// Every field has a constructor-level override for tests
@@ -92,6 +98,26 @@ pub struct ResourceBudgets {
     /// Most retained open-capture bytes across all open handles
     /// (`ENOSPC` past it).
     pub max_open_capture_bytes: usize,
+    /// Ceiling on the bytes this device retains in its object store
+    /// (`ENOSPC` at the commit that would cross it). `None` — the
+    /// default — is unlimited, so unconfigured deployments behave
+    /// exactly as before and the count costs only a relaxed atomic
+    /// load per commit.
+    ///
+    /// This is the one pre-GC bound the storage-growth screen kept,
+    /// because every other candidate either contradicts the durability
+    /// contract or cannot be enforced without something to prune: the
+    /// store is append-only, so the device's own growth is the only
+    /// thing it can refuse. It bounds the *authoring* device; what a
+    /// peer or vault is made to retain is a `trust.md` authorization
+    /// question, not a resource limit.
+    ///
+    /// Refusal happens before the commit's first write, so a refused
+    /// commit retains nothing — the alternative is a ceiling that
+    /// charges the attacker for each attempt it declines. A quota set
+    /// without a wired accountant is refused at composition rather
+    /// than silently ignored; see [`crate::live::LiveConfig`].
+    pub retained_bytes_quota: Option<u64>,
 }
 
 impl Default for ResourceBudgets {
@@ -106,6 +132,7 @@ impl Default for ResourceBudgets {
             write_dirty_handles: MAX_DIRTY_HANDLES,
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
+            retained_bytes_quota: DEFAULT_RETAINED_BYTES_QUOTA,
         }
     }
 }

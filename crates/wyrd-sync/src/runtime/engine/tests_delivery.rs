@@ -19,6 +19,19 @@ use crate::transport::mailbox::{
     MailboxEnvelope, MailboxError,
 };
 
+/// A planted stale obligation: given a fixture, an admission
+/// transition, a recipient, and the admission id, populate the
+/// keyring the way intake does and commit one pending obligation
+/// sealed under a stale shape. Returns the stale bytes. Both
+/// parameterized drivers — the crash matrix and the authority check —
+/// are built on this concept.
+type PlantObligation = fn(
+    &mut crate::runtime::test_util::Fixture,
+    &MembershipTransition,
+    wyrd_format::DeviceId,
+    &wyrd_format::TransitionId,
+) -> Vec<u8>;
+
 /// Drains a two-transition world (genesis plus one rotation) into
 /// the intake fixture: the log resolves both transitions, so
 /// delivery tests start from authorized state, not orphans.
@@ -1100,14 +1113,7 @@ fn preframing_without_secrets_stays_pending() {
 /// but the trigger bytes — and therefore the classifier arm that
 /// reaches it — differ per path, and the matrix is what proves each
 /// arm lands on the same durable successor.
-fn replacement_crash_matrix(
-    plant: fn(
-        &mut crate::runtime::test_util::Fixture,
-        &MembershipTransition,
-        wyrd_format::DeviceId,
-        &wyrd_format::TransitionId,
-    ) -> Vec<u8>,
-) {
+fn replacement_crash_matrix(plant: PlantObligation) {
     use crate::durable::CrashStage;
 
     let mut saw_previous = 0;
@@ -1333,14 +1339,7 @@ fn non_owner_world() -> (
 /// still pending for an authorized signer, stale fact byte-identical.
 /// Parameterized like `replacement_crash_matrix` so the arms carry
 /// identical evidence rather than three hand-rolled copies.
-fn non_owner_leaves_stale_fact(
-    plant: fn(
-        &mut crate::runtime::test_util::Fixture,
-        &MembershipTransition,
-        wyrd_format::DeviceId,
-        &wyrd_format::TransitionId,
-    ) -> Vec<u8>,
-) {
+fn non_owner_leaves_stale_fact(plant: PlantObligation) {
     let (mut fx, admit, admit_id, engine) = non_owner_world();
     let stale = plant(&mut fx, &admit, engine, &admit_id);
     // The plants populate the keyring themselves: authority, not

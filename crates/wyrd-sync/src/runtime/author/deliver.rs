@@ -38,9 +38,8 @@ pub(crate) fn deliver_pending(
     // fans out over many recipients); the capability loop keeps none
     // (pairs are unique per pass, and stale arms supersede durably —
     // memory does not survive the outage the recovery exists for).
-    // No re-read per pair: a newcomer
-    // catch-up or a large fan-out costs one log decode, not one per
-    // obligation.
+    // No re-read per pair: a newcomer catch-up or a large fan-out
+    // costs one log decode, not one per obligation.
     let rebuilt = engine.store.rebuild(engine.device)?;
     let mut sent = 0usize;
     sent += deliver_transitions(engine, mailbox, &rebuilt)?;

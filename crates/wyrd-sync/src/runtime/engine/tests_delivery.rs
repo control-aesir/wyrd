@@ -1283,15 +1283,20 @@ fn replacement_crash_matrix(
             .capability_sealed_bytes(2, member)
             .map(<[u8]>::to_vec)
             .expect("the obligation still exists either way");
-        assert!(
-            after == stale || after.first() == Some(&ROTATION_VERSION),
-            "{stage:?}: the obligation is the stale fact or a complete replacement"
-        );
-        // Both outcomes must actually occur, or this matrix would pin
-        // only one branch of the commit protocol while looking thorough.
+        // Reload is previous-or-complete, never a hybrid. The two
+        // shapes read differently — a `0x01` stale fact is versioned
+        // apart from its replacement, while a `0x02`-framed stale fact
+        // is not — so the split is stated as previous-vs-changed, not
+        // as a version disjunct: anything that is not the planted
+        // bytes is a complete current-framing replacement.
         if after == stale {
             saw_previous += 1;
         } else {
+            assert_eq!(
+                after.first(),
+                Some(&ROTATION_VERSION),
+                "{stage:?}: a changed obligation is a complete current-framing replacement"
+            );
             saw_committed += 1;
         }
 
@@ -1400,10 +1405,10 @@ fn plant_preframing_obligation(
 
 /// A stale-registration obligation whose sender lacks mint authority
 /// is left alone: no replacement, no transmission marker, and the
-/// obligation still pending for an authorized signer. The Mint arm
-/// routes through the same supersede path as the version-stale arm, so
-/// the gate holds identically — this pins the arm, not just the shared
-/// function beneath it.
+/// obligation still pending for an authorized signer. The Supersede
+/// arm routes through the same supersede path as the version-stale
+/// arm, so the gate holds identically — this pins the arm, not just
+/// the shared function beneath it.
 #[test]
 fn non_owner_stale_registration_commits_no_replacement() {
     use crate::control::seal_rotation;
@@ -1529,6 +1534,94 @@ fn non_owner_stale_registration_commits_no_replacement() {
         Some(stale.as_slice()),
         "the stale fact is left exactly as it was"
     );
+}
+
+/// A world where the engine is a member but holds no mint authority:
+/// the gate — not knowledge — is what must stop every mint below.
+/// Returns the fixture, the admission transition and its id, and the
+/// engine device the obligations are planted for. The plants populate
+/// the keyring themselves, so authority stays the binding constraint.
+fn non_owner_world() -> (
+    crate::runtime::test_util::Fixture,
+    MembershipTransition,
+    wyrd_format::TransitionId,
+    wyrd_format::DeviceId,
+) {
+    let mut fx = fixture();
+    let engine_device = fx.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admit = admit_engine(&mut builder, engine_device);
+    let admit_id = admit.transition_id();
+    let mail = vec![
+        deliver(&fx, 1, &transition_message(&genesis)),
+        deliver(&fx, 1, &transition_message(&admit)),
+    ];
+    queue(&mut fx, mail);
+    assert_eq!(drain(&mut fx).accepted, 2, "world transitions commit");
+    // The engine is a member of this world but not one of its owners.
+    let state = fx.engine.log.state_of(&admit_id).expect("admit is valid");
+    assert!(
+        !state.owners.contains(&engine_device),
+        "the engine holds no mint authority here"
+    );
+    (fx, admit, admit_id, engine_device)
+}
+
+/// One authority check per stale shape: without mint authority the
+/// obligation is left alone — no replacement, no transmission marker,
+/// still pending for an authorized signer, stale fact byte-identical.
+/// Parameterized like `replacement_crash_matrix` so the arms carry
+/// identical evidence rather than three hand-rolled copies.
+fn non_owner_leaves_stale_fact(
+    plant: fn(
+        &mut crate::runtime::test_util::Fixture,
+        &MembershipTransition,
+        wyrd_format::DeviceId,
+        &wyrd_format::TransitionId,
+    ) -> Vec<u8>,
+) {
+    let (mut fx, admit, admit_id, engine) = non_owner_world();
+    let stale = plant(&mut fx, &admit, engine, &admit_id);
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fx.relay,
+        owner: engine,
+    };
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        0,
+        "an unauthorized sender sends nothing"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_sealed_replaced.is_empty(),
+        "no replacement is committed without mint authority"
+    );
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "nothing is marked transmitted"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_capabilities(),
+        vec![(2, engine)],
+        "the obligation stays pending for an authorized signer"
+    );
+    assert_eq!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .capability_sealed_bytes(2, engine),
+        Some(stale.as_slice()),
+        "the stale fact is left exactly as it was"
+    );
+}
+
+/// A pre-framing epoch-sealed obligation whose sender lacks mint
+/// authority is left alone: the third arm through the same gate, with
+/// the same four outcomes. Completes the per-arm authority evidence
+/// the other two shapes already carry.
+#[test]
+fn non_owner_preframing_commits_no_replacement() {
+    non_owner_leaves_stale_fact(plant_preframing_obligation);
 }
 
 /// A pending obligation sealed under the pre-framing epoch-sealed

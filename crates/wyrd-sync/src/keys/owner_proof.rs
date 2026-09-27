@@ -279,10 +279,8 @@ mod tests {
         let (owner, drive, recipient, transition, secrets) = fixture();
         // A real key, just not the one that signed: the report
         // parses, and the verification against it fails.
-        let (sign_key, reported) = (
-            SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
-            unrelated_identity().1,
-        );
+        let sign_key = SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar");
+        let (_, reported) = unrelated_identity();
         let mismatched = MismatchedSession::new(sign_key, reported);
         assert_eq!(
             OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),

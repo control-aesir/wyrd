@@ -10,6 +10,19 @@
 //! hold the raw bytes under [`ZeroizeOnDrop`] and mint a transient
 //! `SecretKey` only at the curve-API boundary. The transient never
 //! outlives the call.
+//!
+//! Residency policy: the engine owns both secrets for the process
+//! lifetime, and intake/inbox paths borrow them per call — no second
+//! owned copy inside the crate. Clones exist for exactly two further
+//! owners: the authoring pass's local signer session (cloned once per
+//! pass — the obligation loop holds `&mut Engine` while minting
+//! through the session, so it cannot borrow) and the composer's own
+//! wrapper, which outlives the engine move and is inventoried under
+//! "Signer secret boundary" in `wyrd-core`'s mailbox docs. Every copy
+//! scrubs on drop via [`ZeroizeOnDrop`], including the pass-local
+//! session. Derived `Clone` stays for these owners; nothing else may
+//! retain the bytes, and raw export is crate-private (encryption
+//! only, for the keystore wraps) so no downstream layer can either.
 
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
 use zeroize::ZeroizeOnDrop;
@@ -65,12 +78,6 @@ macro_rules! device_secret {
                 }
             }
 
-            /// The raw secret bytes. Callers must treat these as secret
-            /// material.
-            pub fn as_bytes(&self) -> &[u8; 32] {
-                &self.0
-            }
-
             /// A transient curve key for one API call. Short-lived by
             /// construction: convert, call, drop. Crate-private so no
             /// downstream layer can bind the bare key to a local or a
@@ -92,6 +99,17 @@ impl DeviceIdentitySecret {
     pub fn device_id(&self) -> DeviceId {
         let keypair = Keypair::from_secret_key(SECP256K1, &self.secret_key());
         DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&keypair).0.serialize())
+    }
+
+    /// Mint the local Nostr signer keys for the mailbox endpoint: the
+    /// typed exit for the identity scalar. The CLI and the mailbox
+    /// tests build their `Keys` through here instead of parsing raw
+    /// bytes — the parse is the single validated one in
+    /// [`Self::secret_key`], and no caller ever sees bytes. The
+    /// returned `Keys` is itself a holder and is inventoried under
+    /// "Signer secret boundary" in `wyrd-core`'s mailbox docs.
+    pub fn signer_keys(&self) -> nostr::key::Keys {
+        nostr::key::Keys::new(self.secret_key().into())
     }
 }
 
@@ -120,6 +138,17 @@ impl SignerSession for DeviceIdentitySecret {
 }
 
 impl DeviceEncryptionSecret {
+    /// The raw secret bytes, crate-private: the only production
+    /// users are the keystore wraps that must seal the scalar
+    /// itself (bootstrap custody, pairing staging). The identity
+    /// secret has no such export — its off-wrapper needs are met
+    /// by the transient and the typed
+    /// [`DeviceIdentitySecret::signer_keys`] exit. Raw bytes never
+    /// cross the crate boundary.
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// The encryption key this secret names: the x-only public key
     /// shared with the owner at pairing time. Public output only, same
     /// transient-key discipline as [`DeviceIdentitySecret::device_id`].

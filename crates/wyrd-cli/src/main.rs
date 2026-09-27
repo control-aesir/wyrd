@@ -552,21 +552,17 @@ fn mount(
     // are the same key by construction, which is exactly the identity
     // binding `LiveMailbox` enforces. Two mailbox holders by necessity
     // (signer `Keys` plus `open_keys`): the generic signer boundary
-    // forbids sharing one holder, so the clone is structural, not
-    // gratuitous. The full process graph — this identity, its engine
-    // clone above, the two transient bare keys here, and both `Keys`
-    // — is inventoried under "Signer secret boundary" in `wyrd-core`'s
-    // mailbox docs. Delegating signing to a NIP-46 session is a
-    // separate tracked issue.
-    let nostr_secret = nostr::key::SecretKey::from_slice(identity.as_bytes())
-        .map_err(|_| CliError::IdentityFormat)?;
+    // forbids sharing one holder, so the open-secret clone out of the
+    // signer `Keys` is structural, not gratuitous. The full process
+    // graph — this identity, its engine clone above, the one bare key
+    // moved into `open_keys`, and both `Keys` — is inventoried under
+    // "Signer secret boundary" in `wyrd-core`'s mailbox docs.
+    // Delegating signing to a NIP-46 session is a separate tracked
+    // issue.
+    let signer_keys = identity.signer_keys();
+    let open_secret = signer_keys.secret_key().clone();
     let seen_path = drive_dir.join("mailbox.seen");
-    let mailbox = LiveMailbox::connect(
-        nostr::key::Keys::new(nostr_secret.clone()),
-        nostr_secret,
-        relays.clone(),
-        seen_path,
-    )?;
+    let mailbox = LiveMailbox::connect(signer_keys, open_secret, relays.clone(), seen_path)?;
     // New mail wakes intake immediately: the drainer pokes the same
     // pacing signal the loop parks on, so delivery latency is bound by
     // the relay round trip, not the five-second idle interval.

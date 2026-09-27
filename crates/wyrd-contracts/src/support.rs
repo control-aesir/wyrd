@@ -68,7 +68,7 @@ pub(crate) fn device(seed: u8) -> Device {
     let identity = DeviceIdentitySecret::from_bytes(signing.secret_bytes()).unwrap();
     let encryption_bytes = [seed.wrapping_add(0x40); 32];
     let encryption = DeviceEncryptionSecret::from_bytes(encryption_bytes).unwrap();
-    let encryption_sk = SecretKey::from_slice(encryption.as_bytes()).unwrap();
+    let encryption_sk = SecretKey::from_slice(&encryption_bytes).unwrap();
     let encryption_kp = Keypair::from_secret_key(secp256k1::SECP256K1, &encryption_sk);
     let (xonly, _) = XOnlyPublicKey::from_keypair(&encryption_kp);
     Device {

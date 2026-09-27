@@ -32,10 +32,10 @@ fn hex_identity_files_are_supported() {
     let temp = TempDir::new();
     let identity_file = temp.0.join("identity");
     write_secret(&identity_file, format!("{}\r\n", hex::encode([0x11; 32])));
-    assert_eq!(
-        read_identity(&identity_file).unwrap().as_bytes(),
-        &[0x11; 32]
-    );
+    let expected = DeviceIdentitySecret::from_bytes([0x11; 32])
+        .unwrap()
+        .device_id();
+    assert_eq!(read_identity(&identity_file).unwrap().device_id(), expected);
 }
 
 #[test]

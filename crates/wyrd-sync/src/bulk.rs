@@ -75,13 +75,16 @@ pub enum BulkError {
     /// report it: a full-share attempt (the only or last candidate,
     /// or any single-route fetch) reports [`BulkError::Transport`] on
     /// expiry exactly as before, so a hanging route with no one
-    /// behind it still backs off. `slice` is the budget the attempt
-    /// was granted and expired — the diagnostic identity of a budget
-    /// event (zero when the walk stopped before granting any).
-    /// Instant failures under a slice — refused dials, protocol
-    /// errors, oversize — stay [`BulkError::Transport`]: those
-    /// completed observations are fault information even when the
-    /// budget is tight.
+    /// behind it still backs off. `slice` is the budget that actually
+    /// expired at the reporting site: the attempt's slice at the
+    /// outer timeout, the dial's slice (`FETCH_DIAL_TIMEOUT` capped)
+    /// at the dial timeout — the two coincide at default budgets and
+    /// diverge only when a pass budget exceeds the dial bound.
+    /// Zero when the walk stopped before granting any. Instant
+    /// failures under a slice — refused dials, protocol errors,
+    /// oversize — stay [`BulkError::Transport`]: those completed
+    /// observations are fault information even when the budget is
+    /// tight.
     #[error("bulk attempt ran out of its {slice:?} pass-budget slice")]
     Deadline { slice: std::time::Duration },
     #[error("sealed representation of {bytes} bytes exceeds the {max}-byte fetch ceiling")]

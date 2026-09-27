@@ -157,12 +157,16 @@ fn execute_inner(
                     engine.note_fetch_transport_failure(&body_key);
                 }
                 // A sliced attempt is budget evidence, never
-                // representation evidence: it counts toward
-                // burn-backoff but never strikes, and the item stays
-                // pending for the next run.
-                FetchOutcome::Deadline => {
+                // representation evidence: it always counts, but only
+                // a nonzero grant burns — a zero grant means the walk
+                // stopped before asking, which carries no information
+                // about the representation. The item stays pending for
+                // the next run either way.
+                FetchOutcome::Deadline { slice } => {
                     report.deadlines += 1;
-                    engine.note_fetch_deadline(&body_key);
+                    if !slice.is_zero() {
+                        engine.note_fetch_deadline(&body_key);
+                    }
                 }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
@@ -205,12 +209,14 @@ fn execute_inner(
                     report.transport_errors += 1;
                     engine.note_fetch_transport_failure(&root_key);
                 }
-                // Budget evidence, not representation evidence: counts
-                // toward burn-backoff, never strikes; the item stays
-                // pending.
-                FetchOutcome::Deadline => {
+                // Budget evidence, not representation evidence: always
+                // counts, burns only on a nonzero grant (a zero grant
+                // was never attempted); the item stays pending.
+                FetchOutcome::Deadline { slice } => {
                     report.deadlines += 1;
-                    engine.note_fetch_deadline(&root_key);
+                    if !slice.is_zero() {
+                        engine.note_fetch_deadline(&root_key);
+                    }
                 }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
@@ -253,12 +259,14 @@ fn execute_inner(
                     report.transport_errors += 1;
                     engine.note_fetch_transport_failure(&child_key);
                 }
-                // Budget evidence, not representation evidence: counts
-                // toward burn-backoff, never strikes; the item stays
-                // pending.
-                FetchOutcome::Deadline => {
+                // Budget evidence, not representation evidence: always
+                // counts, burns only on a nonzero grant (a zero grant
+                // was never attempted); the item stays pending.
+                FetchOutcome::Deadline { slice } => {
                     report.deadlines += 1;
-                    engine.note_fetch_deadline(&child_key);
+                    if !slice.is_zero() {
+                        engine.note_fetch_deadline(&child_key);
+                    }
                 }
                 FetchOutcome::Local => report.local_failures += 1,
                 FetchOutcome::Store(fatal) => return Err(EngineError::Store(fatal)),
@@ -310,8 +318,10 @@ fn execute_inner(
             for storage in &attempt.transport_failed {
                 engine.note_fetch_transport_failure(&FetchKey::Storage(*storage));
             }
-            for storage in &attempt.deadline_sliced {
-                engine.note_fetch_deadline(&FetchKey::Storage(*storage));
+            for (storage, slice) in &attempt.deadline_sliced {
+                if !slice.is_zero() {
+                    engine.note_fetch_deadline(&FetchKey::Storage(*storage));
+                }
             }
             match attempt.aggregate {
                 FetchOutcome::Fulfilled(()) => {
@@ -329,7 +339,7 @@ fn execute_inner(
                 FetchOutcome::Invalid => {
                     report.invalid += 1;
                 }
-                FetchOutcome::Deadline => {
+                FetchOutcome::Deadline { .. } => {
                     report.deadlines += 1;
                 }
                 FetchOutcome::Missing => report.missing += 1,

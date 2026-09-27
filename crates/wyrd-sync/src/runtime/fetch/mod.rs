@@ -32,12 +32,16 @@ pub(super) enum FetchOutcome<T> {
     /// Bulk transport failure.
     Transport,
     /// The attempt ran out of its pass-budget slice before completing:
-    /// budget evidence, never provider evidence. The plan neither
-    /// strikes nor counts it — the pass-level unfulfilled total already
-    /// carries the budget signal, as with unstarted work past a spent
-    /// deadline. Falls back everywhere transport failures fall back;
-    /// only the terminal verdict differs.
-    Deadline,
+    /// budget evidence, never provider evidence. The plan counts every
+    /// deadline but only burns on a nonzero `slice`: a zero grant
+    /// means the walk stopped before attempting, which carries no
+    /// information about the representation — counting it keeps
+    /// budget pressure visible, backing off on it would cool a
+    /// provider that was never asked. Falls back everywhere transport
+    /// failures fall back; only the terminal verdict differs.
+    Deadline {
+        slice: std::time::Duration,
+    },
     /// Verified bytes the local store refused.
     Local,
     /// The local disk cannot take more bytes (full) or this process
@@ -131,7 +135,7 @@ pub(super) fn root(
                 Ok(Some(_)) => return FetchOutcome::Invalid,
                 Ok(None) => None,
                 Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-                Err(BulkError::Deadline { .. }) => return FetchOutcome::Deadline,
+                Err(BulkError::Deadline { slice }) => return FetchOutcome::Deadline { slice },
                 Err(_) => return FetchOutcome::Transport,
             }
         }
@@ -184,7 +188,7 @@ pub(super) fn snapshot_body(
         None => match bulk.fetch_snapshot(snapshot, Limits::V0.max_object_bytes) {
             Ok(served) => served,
             Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-            Err(BulkError::Deadline { .. }) => return FetchOutcome::Deadline,
+            Err(BulkError::Deadline { slice }) => return FetchOutcome::Deadline { slice },
             Err(_) => return FetchOutcome::Transport,
         },
     };
@@ -237,7 +241,7 @@ pub(super) fn child(
         // transport trouble: the boundary classified them already. A
         // sliced attempt is budget trouble, not transport trouble.
         Err(BulkError::Oversize { .. }) => return FetchOutcome::Invalid,
-        Err(BulkError::Deadline { .. }) => return FetchOutcome::Deadline,
+        Err(BulkError::Deadline { slice }) => return FetchOutcome::Deadline { slice },
         Err(_) => return FetchOutcome::Transport,
     };
     let Some(sealed) = sealed else {
@@ -337,7 +341,9 @@ pub(super) struct ObjectAttempt {
     /// Candidates whose attempt ran out of its budget slice: the plan
     /// counts these toward burn-backoff (a hanging route must still
     /// stop being retried every pass) without striking them as faulty.
-    pub deadline_sliced: Vec<StorageId>,
+    /// The slice rides along so a zero grant — the walk stopped before
+    /// asking — counts but never backs off.
+    pub deadline_sliced: Vec<(StorageId, std::time::Duration)>,
     pub fulfilled: Option<StorageId>,
 }
 
@@ -396,10 +402,13 @@ pub(super) fn object(
             }
             // A sliced attempt is budget evidence, never representation
             // evidence: it ranks into the aggregate and attributes
-            // burn-backoff, but never strikes.
-            Err(BulkError::Deadline { .. }) => {
-                aggregate = worse(aggregate, FetchOutcome::Deadline);
-                deadline_sliced.push(candidate.storage_id);
+            // burn-backoff, but never strikes. The granted slice rides
+            // along so the plan burns only attempts that consumed
+            // budget — a zero grant means the walk stopped before
+            // asking, which must count but never back off.
+            Err(BulkError::Deadline { slice }) => {
+                aggregate = worse(aggregate, FetchOutcome::Deadline { slice });
+                deadline_sliced.push((candidate.storage_id, slice));
                 continue;
             }
             Err(_) => {
@@ -487,7 +496,7 @@ fn worse(first: FetchOutcome<()>, second: FetchOutcome<()>) -> FetchOutcome<()> 
     fn rank(outcome: &FetchOutcome<()>) -> u8 {
         match outcome {
             FetchOutcome::Missing => 0,
-            FetchOutcome::Deadline => 1,
+            FetchOutcome::Deadline { .. } => 1,
             FetchOutcome::UnavailableKey => 2,
             FetchOutcome::Invalid => 3,
             FetchOutcome::Local => 4,
@@ -523,7 +532,7 @@ impl<T> FetchOutcome<T> {
             FetchOutcome::Missing
             | FetchOutcome::UnavailableKey
             | FetchOutcome::Transport
-            | FetchOutcome::Deadline
+            | FetchOutcome::Deadline { .. }
             | FetchOutcome::Store(_) => FetchStatus::Unavailable,
             FetchOutcome::Invalid | FetchOutcome::Local => FetchStatus::Corrupt,
         }

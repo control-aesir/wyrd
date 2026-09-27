@@ -14,6 +14,13 @@ use wyrd_format::DeviceId;
 
 use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
 
+/// What a signer session can report instead of a signature.
+/// Retryability, stated (error-conventions.md): `Unreachable` is
+/// transient, and `IdentityMismatch` is plausibly so (a session that
+/// reconnects under a rotated key) — callers leave the work pending
+/// for the next pass on either. `Refused` is static configuration
+/// and `MalformedResponse` a broken session; neither converges by
+/// waiting, so callers fail loud on those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SignerError {
     #[error("signer session refused the request")]
@@ -22,6 +29,8 @@ pub enum SignerError {
     Unreachable,
     #[error("signer session returned a signature that does not verify under its reported key")]
     IdentityMismatch,
+    #[error("signer session returned an unparseable key or signature")]
+    MalformedResponse,
 }
 
 /// A scoped Wyrd signer session: `get_public_key` and `sign_message`

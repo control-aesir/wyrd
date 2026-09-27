@@ -133,18 +133,18 @@ impl OwnerProof {
 
     /// Sign the commitment to `secrets` for `recipient` under
     /// `transition` through a signer session scoped to
-    /// [`SignDomain::OwnerProofV1`]. The signature is produced under a
-    /// named domain rather than an ad hoc context: a session that does
-    /// not authorize the owner-proof domain refuses, so a compromised
-    /// client cannot talk a narrower signer (a bunker scoped to
-    /// snapshots, say) into minting authority. The returned signature
-    /// is verified against the session's reported key before it is
-    /// accepted, so a session that signs with one key and reports
-    /// another cannot launder an unverifiable proof into the outbox.
-    /// Deterministic BIP-340 under the local session, matching every
-    /// other signature in the system; a remote session follows BIP-340
-    /// and the protocol requires only that the 64 bytes verify
-    /// against the challenge.
+    /// [`SignDomain::OwnerProofV1`]. The domain is always named in
+    /// the request; enforcement is remote-session behavior — a
+    /// remote session that does not authorize the owner-proof domain
+    /// refuses, so a compromised client cannot talk a narrower signer
+    /// (a bunker scoped to snapshots, say) into minting authority.
+    /// The returned signature is verified against the session's
+    /// reported key before it is accepted, so a session that signs
+    /// with one key and reports another cannot launder an
+    /// unverifiable proof into the outbox. Deterministic BIP-340
+    /// under the local session, matching every other signature in
+    /// the system; a remote session follows BIP-340 and the protocol
+    /// requires only that the 64 bytes verify against the challenge.
     pub fn sign<S: SignerSession + ?Sized>(
         session: &S,
         drive: &DriveId,
@@ -163,9 +163,9 @@ impl OwnerProof {
         })?;
         let signer = session.get_public_key()?;
         let public = XOnlyPublicKey::from_slice(signer.as_bytes())
-            .map_err(|_| SignerError::IdentityMismatch)?;
+            .map_err(|_| SignerError::MalformedResponse)?;
         let signature = Signature::from_slice(&response.signature)
-            .map_err(|_| SignerError::IdentityMismatch)?;
+            .map_err(|_| SignerError::MalformedResponse)?;
         SECP256K1
             .verify_schnorr(&signature, &challenge, &public)
             .map_err(|_| SignerError::IdentityMismatch)?;
@@ -295,16 +295,60 @@ mod tests {
     /// `sign` never accepts a proof its own signer field cannot
     /// verify: a mismatched session is refused at mint time, before
     /// any caller can commit the bytes as a discharged obligation.
+    /// An unparseable session response is a different failure with
+    /// its own diagnosis.
     #[test]
     fn sign_refuses_a_signature_that_mismatches_the_reported_key() {
+        use secp256k1::Keypair;
         let (owner, drive, recipient, transition, secrets) = fixture();
+        // A real key, just not the one that signed: the report
+        // parses, and the verification against it fails.
+        let other = Keypair::from_secret_key(
+            SECP256K1,
+            &SecretKey::from_slice(&[0x22; 32]).expect("scalar"),
+        );
         let mismatched = MismatchedSession {
             sign_key: SecretKey::from_slice(owner.as_bytes()).expect("fixture scalar"),
-            reported: DeviceId::from_bytes([0x99; 32]),
+            reported: DeviceId::from_bytes(XOnlyPublicKey::from_keypair(&other).0.serialize()),
         };
         assert_eq!(
             OwnerProof::sign(&mismatched, &drive, &recipient, &transition, 3, &secrets),
             Err(SignerError::IdentityMismatch)
+        );
+    }
+
+    /// A session answering with garbage: the 32-byte signer field is
+    /// not an x-only key, so there is nothing to verify against.
+    struct GarbageSession;
+
+    impl SignerSession for GarbageSession {
+        fn get_public_key(&self) -> Result<DeviceId, SignerError> {
+            Ok(DeviceId::from_bytes([0xFF; 32]))
+        }
+
+        fn sign_message(
+            &self,
+            _request: SignMessageRequest,
+        ) -> Result<crate::control::nip46::SignMessageResponse, SignerError> {
+            Ok(crate::control::nip46::SignMessageResponse {
+                signature: [0xFF; 64],
+            })
+        }
+    }
+
+    #[test]
+    fn sign_refuses_an_unparseable_session_response() {
+        let (_, drive, recipient, transition, secrets) = fixture();
+        assert_eq!(
+            OwnerProof::sign(
+                &GarbageSession,
+                &drive,
+                &recipient,
+                &transition,
+                3,
+                &secrets
+            ),
+            Err(SignerError::MalformedResponse)
         );
     }
 

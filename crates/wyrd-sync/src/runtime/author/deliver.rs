@@ -321,6 +321,11 @@ fn deliver_capabilities(
 ) -> Result<usize, EngineError> {
     let mut pending = rebuilt.runtime.pending_capabilities();
     pending.sort();
+    if pending.is_empty() {
+        // Nothing to mint: skip the chain walk and the session
+        // clone below, so an idle pass copies no key material.
+        return Ok(0);
+    }
     // The canonical chain's epoch-to-transition map, walked once:
     // capability wraps bind to the epoch's canonical transition.
     let mut chain: BTreeMap<u64, TransitionId> = BTreeMap::new();
@@ -612,12 +617,16 @@ fn mint_fresh_rotation_bytes(
     // Mint authority, distinct from delivery authority: the owner signs
     // a commitment to this exact vector, so any member may later relay
     // the sealed bytes while only an owner can have originated them.
-    // Raise vs count, stated (error-conventions.md): a session that is
-    // momentarily unreachable leaves the obligation pending for the
-    // next pass, exactly like a missing secret or registration — retry
-    // may heal it. A domain refusal or an identity mismatch is a
-    // misconfiguration retry will not heal, so it fails loudly rather
-    // than stalling the outbox silently.
+    // Raise vs count, stated (error-conventions.md): a session
+    // that is momentarily unreachable — or one whose key rotated
+    // under it — leaves the obligation pending for the next pass,
+    // exactly like a missing secret or registration. A domain
+    // refusal or a malformed session response is static
+    // misconfiguration, so it fails loudly rather than stalling the
+    // outbox silently. Loudness aborts the whole pass, not just this
+    // obligation: the error propagates through `deliver_pending`,
+    // and the live loop counts it toward its consecutive-error
+    // budget.
     let proof = match OwnerProof::sign(
         session,
         &engine.drive,
@@ -627,8 +636,8 @@ fn mint_fresh_rotation_bytes(
         &secrets,
     ) {
         Ok(proof) => proof,
-        Err(SignerError::Unreachable) => return Ok(None),
-        Err(e @ (SignerError::Refused | SignerError::IdentityMismatch)) => {
+        Err(SignerError::Unreachable | SignerError::IdentityMismatch) => return Ok(None),
+        Err(e @ (SignerError::Refused | SignerError::MalformedResponse)) => {
             return Err(e.into());
         }
     };

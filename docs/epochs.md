@@ -299,8 +299,9 @@ A **capability** delivered to a member of epoch N:
   owner's BIP-340 signature over the challenge trust.md pins byte
   for byte (155-byte preimage: domain tag ‖ drive ‖ recipient ‖
   transition ‖ epoch LE ‖ secret-vector digest; deterministic under
-  the local session, verified-not-compared in general; always minted
-  through an `OwnerProofV1`-scoped signer session).
+  the local session, verified-not-compared in general). The request
+  always names the `OwnerProofV1` signer-session domain; enforcement
+  of the domain is remote-session behavior.
   The secret bytes are never the signed message, only a
   commitment to them. This keeps the protocol's two authorities
   distinct, which is easy to conflate and was the exploit's root:

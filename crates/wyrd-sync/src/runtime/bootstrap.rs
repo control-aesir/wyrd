@@ -1388,6 +1388,75 @@ mod tests {
     }
 
     #[test]
+    fn escrow_restore_is_control_keys_only() {
+        // T13 scope pin: the sidecar restore refills vacant epoch
+        // control keys and does nothing else — it commits no durable
+        // facts, so no keyring the facts authorize can change under
+        // it. If a future guardian path installs unwrapped secrets
+        // durably, this test fails until that path carries its own
+        // authorization context and doc updates.
+        //
+        // Scope note: epoch 1 is the pre-existing exception. The
+        // keystore custody record carries its own epoch-1 escrow, so
+        // an owner open whose keyring lacks the genesis secret
+        // reinstalls it through install_self_capability (idempotent:
+        // present material wins, no rewrite); the sidecar restore
+        // itself covers epochs 2+ only.
+        let dir = TestDir::new("escrow-restore-control-keys-only");
+        let owner = DeviceIdentitySecret::generate().unwrap();
+        let mut engine = Engine::create(dir.path.clone(), "test-pass", owner.clone()).unwrap();
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        engine
+            .admit_device(newcomer.device_id(), newcomer_encryption.encryption_key())
+            .unwrap();
+        let epoch2_key = engine
+            .epoch_keys
+            .get(&2)
+            .cloned()
+            .expect("authoring installs the fresh control key");
+        engine.rotate_epoch().unwrap();
+        let epoch3_key = engine
+            .epoch_keys
+            .get(&3)
+            .cloned()
+            .expect("rotation installs its control key");
+        drop(engine);
+        let mut engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
+        let facts_before = engine.store.load().unwrap();
+        // Vacate the later control keys, exactly like the sibling
+        // restore test; the restore must refill them with the exact
+        // keys, and change nothing else.
+        engine.epoch_keys.remove(&2);
+        engine.epoch_keys.remove(&3);
+        restore_escrowed_epochs(&mut engine).unwrap();
+        assert_eq!(
+            engine.epoch_keys.get(&2),
+            Some(&epoch2_key),
+            "root custody alone restores epoch 2"
+        );
+        assert_eq!(
+            engine.epoch_keys.get(&3),
+            Some(&epoch3_key),
+            "root custody alone restores epoch 3"
+        );
+        // Set-wise, not just point-wise: the restore refilled exactly
+        // the vacated epochs — epoch 1 untouched, nothing else added.
+        // This is the assertion behind the "epochs 2+ only" scope note.
+        let held: Vec<u64> = engine.epoch_keys.keys().copied().collect();
+        assert_eq!(held, vec![1, 2, 3], "restore covers exactly epochs 2+");
+        // The no-install half: the durable facts are byte-identical
+        // across the restore, so no keyring the facts authorize could
+        // have changed under it either (keyring rebuilds are a pure
+        // function of these facts).
+        let facts_after = engine.store.load().unwrap();
+        assert_eq!(
+            facts_after, facts_before,
+            "escrow restore commits nothing durable"
+        );
+    }
+
+    #[test]
     fn conflicting_escrow_sidecar_fails_owner_open_closed() {
         // A valid same-root sidecar holding a DIFFERENT secret for an
         // epoch the keyring covers: owner open fails with

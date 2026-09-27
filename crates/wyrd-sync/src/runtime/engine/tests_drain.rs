@@ -9,9 +9,8 @@ use crate::durable::AuthorizedSnapshot;
 use crate::durable::{atomic_write, commit_name, encode_commit};
 use crate::durable::{Fact, TAG_ANNOUNCEMENT_SEALED};
 use crate::membership::test_util::drive as member_drive;
-use crate::runtime::test_util::MemoryMailbox;
 use crate::transport::mailbox::{
-    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, MemoryMailbox,
 };
 
 #[test]

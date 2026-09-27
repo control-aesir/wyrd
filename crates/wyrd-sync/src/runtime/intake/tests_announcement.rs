@@ -10,8 +10,9 @@ use crate::membership::test_util::{
 use crate::membership::ForceUnclassifiedGuard;
 use crate::runtime::test_util::{
     announcement_for, announcement_msg, announcement_msg_routed, control_key, deliver, drain,
-    fixture, identity_secret, owner, queue, transition_message, MemoryMailbox,
+    fixture, identity_secret, owner, queue, transition_message,
 };
+use crate::transport::mailbox::MemoryMailbox;
 use wyrd_format::{BaoRoot, ContentId};
 #[test]
 fn announcement_defers_until_membership_lands() {

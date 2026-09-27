@@ -10,8 +10,9 @@ use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::membership::MembershipLog;
 use crate::runtime::test_util::{
     admit_engine, announcement_for, capability_message, deliver, drain, encryption_key, fixture,
-    queue, transition_message, MemoryMailbox,
+    queue, transition_message,
 };
+use crate::transport::mailbox::MemoryMailbox;
 
 #[test]
 fn pending_holds_are_bounded() {

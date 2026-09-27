@@ -10,7 +10,8 @@ use crate::keys::capability::WrappedCapability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::test_util::{drive as member_drive, key};
 use crate::runtime::engine::{Engine, EngineError};
-use crate::runtime::test_util::{encryption_key, MemoryMailbox, MemoryRelay, TestDir};
+use crate::runtime::test_util::{encryption_key, TestDir};
+use crate::transport::mailbox::{MemoryMailbox, MemoryRelay};
 use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 
 /// Admit a reader through the owner engine: returns the owner dir

@@ -10,10 +10,11 @@ use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
     capability_message_for, encryption_key, identity, publish_into, transition_message,
-    MemoryMailbox, MemoryRelay, PublishedSnapshot, TestDir,
+    PublishedSnapshot, TestDir,
 };
 use crate::transport::mailbox::{
     seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    MemoryMailbox, MemoryRelay,
 };
 
 /// One scenario epoch secret (capability-delivered knowledge).

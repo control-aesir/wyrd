@@ -7,9 +7,9 @@ use crate::control::{KeyRotation, Message, TransitionPayload};
 use crate::membership::test_util::Builder;
 use crate::runtime::test_util::{
     announcement_for, announcement_msg_routed, announcement_msg_with, control_key, deliver, drain,
-    fixture, identity, queue, reopen, transition_message, MemoryMailbox,
+    fixture, identity, queue, reopen, transition_message,
 };
-use crate::transport::mailbox::MAX_MAILBOX_CIPHERTEXT_LEN;
+use crate::transport::mailbox::{MemoryMailbox, MAX_MAILBOX_CIPHERTEXT_LEN};
 
 #[test]
 fn intake_commits_transitions_and_announcements() {

@@ -11,10 +11,8 @@ use crate::durable::AuthorizedSnapshot;
 use crate::durable::Fact;
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
-use crate::runtime::test_util::{
-    admit_engine, deliver, drain, fixture, queue, transition_message, MemoryMailbox,
-};
-use crate::transport::mailbox::Mailbox;
+use crate::runtime::test_util::{admit_engine, deliver, drain, fixture, queue, transition_message};
+use crate::transport::mailbox::{Mailbox, MemoryMailbox};
 
 // --- local snapshot authoring -------------------------------------
 

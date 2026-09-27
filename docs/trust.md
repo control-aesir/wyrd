@@ -239,15 +239,14 @@ Rules:
    sidecar epochs (2+) it does **not** restore historical encrypted
    content: without membership/capability state there is no
    authorized v0 path to install raw epoch secrets into a fresh
-   keyring. Epoch 1 is the exception: the keystore custody
-   record carries its own escrow, so an owner open whose keyring
-   lacks the genesis secret reinstalls it through the
-   self-capability path. Full-history recovery, installing every
-   unwrapped secret into a rebuilt keyring,
-   belongs to the post-v0 guardian recovery design: guardians
-   reconstructing the root establish the authorized recovery context
-   that install path requires. **Recovery composes across that
-   boundary.**
+   keyring. Epoch 1 is the exception: the keystore custody record
+   carries its own escrow, so an owner open whose keyring lacks the
+   genesis secret reinstalls it through the self-capability path.
+   Full-history recovery, installing every unwrapped secret into a
+   rebuilt keyring, belongs to the post-v0 guardian recovery design:
+   guardians reconstructing the root establish the authorized
+   recovery context that install path requires. **Recovery composes
+   across that boundary.**
 
 ## Control plane: Nostr is the mailbox, iroh is the data plane (decided)
 

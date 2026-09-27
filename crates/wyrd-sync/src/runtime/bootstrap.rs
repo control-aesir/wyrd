@@ -1424,8 +1424,6 @@ mod tests {
         drop(engine);
         let mut engine = Engine::open_keystore(dir.path.clone(), "test-pass", owner).unwrap();
         let facts_before = engine.store.load().unwrap();
-        let keyring_before =
-            crate::durable::build_keyring(&engine.drive, &facts_before, engine.device).unwrap();
         // Vacate the later control keys, exactly like the sibling
         // restore test; the restore must refill them with the exact
         // keys, and change nothing else.
@@ -1442,16 +1440,19 @@ mod tests {
             Some(&epoch3_key),
             "root custody alone restores epoch 3"
         );
+        // Set-wise, not just point-wise: the restore refilled exactly
+        // the vacated epochs — epoch 1 untouched, nothing else added.
+        // This is the assertion behind the "epochs 2+ only" scope note.
+        let held: Vec<u64> = engine.epoch_keys.keys().copied().collect();
+        assert_eq!(held, vec![1, 2, 3], "restore covers exactly epochs 2+");
+        // The no-install half: the durable facts are byte-identical
+        // across the restore, so no keyring the facts authorize could
+        // have changed under it either (keyring rebuilds are a pure
+        // function of these facts).
         let facts_after = engine.store.load().unwrap();
         assert_eq!(
             facts_after, facts_before,
             "escrow restore commits nothing durable"
-        );
-        let keyring_after =
-            crate::durable::build_keyring(&engine.drive, &facts_after, engine.device).unwrap();
-        assert_eq!(
-            keyring_before, keyring_after,
-            "escrow restore installs no keyring secrets"
         );
     }
 

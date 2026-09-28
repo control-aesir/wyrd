@@ -161,6 +161,14 @@ fi
 WYRD_BIN="$WYRD_OUT/bin/wyrd"
 [[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see run/logs/nix-build-wyrd.log)"
 echo "    $WYRD_BIN"
+# Pinned nak for the opacity probe (see the flake comment): same
+# no-link pattern as wyrd, so the suite never floats the registry.
+if ! NAK_OUT="$(nix build "$ROOT#packages.x86_64-linux.nak" --no-link --print-out-paths --print-build-logs 2>"$RUN/logs/nix-build-nak.log" | tail -n 1)"; then
+  die "host nak build failed (see run/logs/nix-build-nak.log)"
+fi
+NAK_BIN="$NAK_OUT/bin/nak"
+[[ -x "$NAK_BIN" ]] || die "host build produced no nak binary (see run/logs/nix-build-nak.log)"
+echo "    $NAK_BIN"
 for role in peer-o peer-n relay; do
   nix build "$ROOT#nixosConfigurations.wyrd-$role.config.microvm.runner.qemu" \
     --out-link "$WORK/runner-$role" --print-build-logs 2>&1 | tee "$RUN/logs/nix-build-$role.log"
@@ -249,6 +257,7 @@ timeout 3600 env \
   "STATE_DIR=$STATE_DIR" \
   "SSH_KEY=$SSH_KEY" \
   "WYRD_BIN=$WYRD_BIN" \
+  "NAK_BIN=$NAK_BIN" \
   "RELAY_URL=ws://$NET.10:18761" \
   "PEER_O=e2e@$NET.11" \
   "PEER_N=e2e@$NET.12" \

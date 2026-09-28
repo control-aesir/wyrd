@@ -461,12 +461,14 @@ mod tests {
     }
 
     #[test]
-    fn sealed_envelope_is_stock_nip44_openable_by_any_conforming_peer() {
-        // The interop contract: our ciphertext opens with a direct
+    fn sealed_envelope_is_plain_nip44_v2_with_no_wrapper() {
+        // The wire-format pin: our ciphertext opens with a direct
         // NIP-44 v2 decrypt under the recipient's identity secret and
-        // the sender's identity public key — no Wyrd wrapper needed.
-        // Any conforming NIP-44 implementation holding those keys
-        // opens our mail; the relay only ever carries this ciphertext.
+        // the sender's identity public key — no Wyrd layer in between,
+        // so the relay only ever carries stock NIP-44. This is not
+        // cross-implementation interop: seal and decrypt both come
+        // from the same nostr-sdk module, so no second NIP-44 stack is
+        // exercised (that gap is tracked at docs/architecture.md:186).
         let (sender_sk, sender) = identity(0x01);
         let (recipient_sk, recipient) = identity(0x02);
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();

@@ -352,11 +352,15 @@ leg_fetch_member() {
   pass "redelivery grows the dedupe log without double-appending"
   # Growth-bound backstop (seen_store.rs:21-25): the durable file
   # never exceeds twice the 65,536 production retention bound,
-  # regardless of lifetime history. The suite generates ~100 acks,
-  # so this pins the invariant in the hardened gate rather than
-  # exercising compaction — that stays pinned by unit tests at the
-  # 512 test bound.
-  [[ "$(wc -l < "$d/mailbox.seen")" -le 131072 ]] \
+  # regardless of lifetime history. Asserted in bytes, not lines: the
+  # module's promise is a disk bound, and every record is exactly
+  # MAX_RECORD_LEN (65) bytes, so 131072 * 65 fails closed on a
+  # corrupt long line too. The suite generates ~100 acks, so this
+  # pins the invariant in the hardened gate rather than exercising
+  # compaction — that stays pinned by unit tests at the 512 test
+  # bound. The literal below is a copy of MAX_SEEN_ENTRIES * 2;
+  # update it if the production const moves.
+  [[ "$(wc -c < "$d/mailbox.seen")" -le 8519680 ]] \
     || die "mailbox.seen exceeds the durable growth bound"
   pass "dedupe log stays within the durable growth bound"
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"

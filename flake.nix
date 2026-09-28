@@ -114,6 +114,11 @@
       packages = forAllSystems (system: {
         wyrd = wyrdFor system;
         wyrd-dist = distFor system;
+        # Pinned relay-query tool for the microVM opacity probe
+        # (tests/alpha-microvm.sh): root carries no test tooling by
+        # design, so the runner builds nak from this pin and exports
+        # NAK_BIN next to WYRD_BIN instead of floating nixpkgs#nak.
+        nak = (pkgsFor system).nak;
         default = self.packages.${system}.wyrd;
       });
       apps = forAllSystems (system: {

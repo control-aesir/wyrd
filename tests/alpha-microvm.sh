@@ -11,7 +11,8 @@
 #   2. second member natively on peer-n (pair there, invite+join here —
 #      invitation files are the portable artifact by design)
 #   3. cross-host convergence legs in parallel (guest legs, done-file
-#      rendezvous on the shared state root)
+#      rendezvous on the shared state root) plus the host-side relay
+#      opacity probe (addressed kind-1059 wraps only, never cleartext)
 #   4. serving-restart legs (fresh endpoint, route update, no repair)
 #   5. fetch-plane legs (blocking cold open, bounded EIO on dead
 #      routes, recovery without remount after the owner returns on a
@@ -22,18 +23,19 @@
 # (concurrent commits, StaleHandle, ConflictedHeads, name@N export):
 # nostr:nevent1qqsfe3tgav2h5xe0sdsj5508zxdpknamd9l48tr35fxyugda23df9dcpz9mhxue69uhkwunpwdczuap49eehgcy9luf.
 # Control-plane remainder closed here: NIP-44 wire interop is pinned
-# by sealed_envelope_is_stock_nip44_openable_by_any_conforming_peer,
-# the seen growth bound by the fetch-member dedupe proof plus unit
-# compaction tests, and relay opacity by the phase-7 probe above
+# by sealed_envelope_is_plain_nip44_v2_with_no_wrapper, the seen
+# growth bound by the fetch-member dedupe proof plus unit compaction
+# tests, and relay opacity by the convergence-phase probe above
 # (addressed kind-1059 wraps only, never cleartext rumors).
-# Resolves:
-# nostr:nevent1qqsw5yaj93c8556axtlamjcgh2y8lhelw49pv5cqcfsyhz4q24dm6cspz9mhxue69uhkwunpwdczuap49eehgyz9qww.
+# (Issue closure runs through the PR description, which carries the
+# Resolves: keyword — shell headers are invisible to the parser.)
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
 RUN="$STATE_DIR/run"
 SSH_KEY="$STATE_DIR/sshkey"
 WYRD_BIN="${WYRD_BIN:?runner sets WYRD_BIN from the host build}"
+NAK_BIN="${NAK_BIN:?runner sets NAK_BIN from the host build}"
 RELAY_URL="${RELAY_URL:-ws://10.0.7.10:18761}"
 PEER_O="${PEER_O:-e2e@10.0.7.11}"
 PEER_N="${PEER_N:-e2e@10.0.7.12}"
@@ -122,28 +124,44 @@ LEG_O=$!
 wait "$LEG_N" || die "member convergence leg failed (see logs/leg-member.out)"
 wait "$LEG_O" || die "owner convergence leg failed (see logs/leg-owner.out)"
 pass "owner and member converge across hosts"
-# Control-plane opacity (control-plane issue remainder): the relay
-# must only ever carry kind-1059 gift wraps — the 9501 rumor travels
-# inside the NIP-59 seal+wrap (trust.md T16), never in cleartext.
-# Observed on odin at the proving run: 202 wraps with ephemeral
-# authors and p-tag recipients, zero bare 9501s. nak runs hermetically
-# from nixpkgs (root carries no test tooling by design); the runner
-# already gated on relay readiness, so an empty answer is a failure,
-# not a connection flakiness.
-NAK="nix run --quiet nixpkgs#nak --"
-# Stdin filter form (not -k/-l flags): nixpkgs nak 0.17.4 answers
+# Control-plane opacity: the relay must only ever carry kind-1059
+# gift wraps — the 9501 rumor travels inside the NIP-59 seal+wrap
+# (trust.md T16), never in cleartext. Observed on odin at the
+# proving run: ~200 wraps with ephemeral authors and p-tag
+# recipients, zero bare 9501s. nak comes pinned from the flake
+# (NAK_BIN); the runner already gated on relay readiness, so an
+# empty answer is a failure, not connection flakiness.
+# Stdin filter form (not -k/-l flags): the pinned nak 0.17.4 answers
 # flag-built filters with zero events on this relay while the stdin
 # form reads fine — observed on odin, so pin the working form.
 REQ1059='{"kinds":[1059],"limit":500}'
 REQ9501='{"kinds":[9501],"limit":500}'
-WRAPS="$(printf '%s' "$REQ1059" | $NAK req "$RELAY_URL" 2>/dev/null | grep '"kind":1059' || true)"
-[[ -n "$WRAPS" ]] || die "no kind-1059 wraps on the relay: control plane never flowed"
+WRAPS="$(printf '%s' "$REQ1059" | "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-1059.err" | grep '"kind":1059' || true)"
+[[ -n "$WRAPS" ]] || die "no kind-1059 wraps on the relay: control plane never flowed (see logs/nak-1059.err)"
 [[ -z "$(printf '%s\n' "$WRAPS" | grep -v '"p"' || true)" ]] \
   || die "gift wraps without recipient p tags on the relay"
 pass "control plane crossed the relay as addressed gift wraps only"
-if printf '%s' "$REQ9501" | $NAK req "$RELAY_URL" 2>/dev/null | grep -q '"kind":9501'; then
-  die "relay carries a bare kind-9501 rumor: control leaked in cleartext"
-fi
+# Identity shape: exactly the two devices of this topology are
+# addressed, and no wrap is signed by a device key — authors are
+# discarded ephemeral keys (trust.md T16). Base64 ciphertext holds
+# no quotes, so '"p","<hex>"' only matches relay JSON structure
+# (tags are arrays, hence the comma).
+P_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"p","[0-9a-f]{64}' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
+[[ "$(printf '%s\n' "$P_HEX" | wc -l)" == 2 ]] \
+  || die "relay p tags do not name exactly the two devices (see logs/nak-1059.err)"
+AUTHORS_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"pubkey":"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
+[[ -n "$AUTHORS_HEX" ]] || die "no wrap authors on the relay (see logs/nak-1059.err)"
+while IFS= read -r author; do
+  printf '%s\n' "$P_HEX" | grep -qxF "$author" \
+    && die "gift wrap signed by device key $author: authors must be ephemeral (see logs/nak-1059.err)"
+done <<< "$AUTHORS_HEX"
+pass "wraps address the two devices and no device key signs"
+# Capture-then-assert (never grep -q in the pipeline): grep -q
+# exits at the first match and SIGPIPEs nak, which under pipefail
+# turns a real multi-event leak into a silent pass. Draining grep
+# plus || true keeps the die reachable exactly when it matters.
+RUMORS="$(printf '%s' "$REQ9501" | "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-9501.err" | grep '"kind":9501' || true)"
+[[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
 pass "relay carries no cleartext control rumors"
 
 # --- phase 4: serving restart -------------------------------------------

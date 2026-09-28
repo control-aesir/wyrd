@@ -19,18 +19,15 @@
 #   6. offline reopen of both drives on the host
 #
 # Out of scope, tracked as follow-up: relay-partition conflict legs
-# (concurrent commits, StaleHandle, ConflictedHeads, name@N export).
-# Narrow remainder on the control-plane issue (relay-opacity probe:
-# assert the relay only ever carried kind-1059 ciphertext):
+# (concurrent commits, StaleHandle, ConflictedHeads, name@N export):
+# nostr:nevent1qqsfe3tgav2h5xe0sdsj5508zxdpknamd9l48tr35fxyugda23df9dcpz9mhxue69uhkwunpwdczuap49eehgcy9luf.
+# Control-plane remainder closed here: NIP-44 wire interop is pinned
+# by sealed_envelope_is_stock_nip44_openable_by_any_conforming_peer,
+# the seen growth bound by the fetch-member dedupe proof plus unit
+# compaction tests, and relay opacity by the phase-7 probe above
+# (addressed kind-1059 wraps only, never cleartext rumors).
+# Resolves:
 # nostr:nevent1qqsw5yaj93c8556axtlamjcgh2y8lhelw49pv5cqcfsyhz4q24dm6cspz9mhxue69uhkwunpwdczuap49eehgyz9qww.
-# Closed here: NIP-44 wire interop is pinned by
-# sealed_envelope_is_stock_nip44_openable_by_any_conforming_peer
-# (ciphertext opens with a direct NIP-44 v2 decrypt, so any
-# conforming peer opens our mail), and the seen growth bound by the
-# fetch-member dedupe proof plus unit compaction tests. The topology
-# supports the opacity probe (the relay answers host websocket REQ);
-# the assertion needs the relay event shape observed on odin first,
-# not encoded blind.
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
@@ -125,6 +122,24 @@ LEG_O=$!
 wait "$LEG_N" || die "member convergence leg failed (see logs/leg-member.out)"
 wait "$LEG_O" || die "owner convergence leg failed (see logs/leg-owner.out)"
 pass "owner and member converge across hosts"
+# Control-plane opacity (control-plane issue remainder): the relay
+# must only ever carry kind-1059 gift wraps — the 9501 rumor travels
+# inside the NIP-59 seal+wrap (trust.md T16), never in cleartext.
+# Observed on odin at the proving run: 202 wraps with ephemeral
+# authors and p-tag recipients, zero bare 9501s. nak runs hermetically
+# from nixpkgs (root carries no test tooling by design); the runner
+# already gated on relay readiness, so an empty answer is a failure,
+# not a connection flakiness.
+NAK="nix run --quiet nixpkgs#nak --"
+WRAPS="$($NAK req -k 1059 -l 500 "$RELAY_URL" 2>/dev/null | grep '"kind":1059' || true)"
+[[ -n "$WRAPS" ]] || die "no kind-1059 wraps on the relay: control plane never flowed"
+[[ -z "$(printf '%s\n' "$WRAPS" | grep -v '"p"' || true)" ]] \
+  || die "gift wraps without recipient p tags on the relay"
+pass "control plane crossed the relay as addressed gift wraps only"
+if $NAK req -k 9501 -l 500 "$RELAY_URL" 2>/dev/null | grep -q '"kind":9501'; then
+  die "relay carries a bare kind-9501 rumor: control leaked in cleartext"
+fi
+pass "relay carries no cleartext control rumors"
 
 # --- phase 4: serving restart -------------------------------------------
 echo "=== microvm 8: serving restart ==="

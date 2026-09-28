@@ -269,16 +269,19 @@ pub struct ExecuteReport {
     /// both retry later, only one needs investigating.
     pub transport_errors: usize,
     /// Attempts that ran out of their pass-budget slice this run,
-    /// counted per sliced representation (single-representation items
-    /// contribute one): budget evidence, never provider evidence.
-    /// Zero grants count too — dry budget is still budget pressure —
-    /// but never burn. Only when the zero grant is the
-    /// representation's whole story: a fallback zero grant masked by
-    /// a primary outcome is not counted. Counted so a budget-starved pass is visible in
-    /// diagnostics (rather than a silent pile of `unfulfilled`);
-    /// never struck as faulty, but repeated nonzero slices back the
-    /// representation off on the separate burn ledger. Every burn has
-    /// its deadline counted beside it.
+    /// counted per sliced representation per convergence pass
+    /// (single-representation items contribute one per pass): budget
+    /// evidence, never provider evidence. Zero grants count too —
+    /// dry budget is still budget pressure — when the zero grant is
+    /// the representation's whole story; a fallback zero grant
+    /// masked by a primary outcome is not counted — but never burn.
+    /// The count is a lower bound on budget pressure, not a total:
+    /// a nonzero primary slice discarded when the fallback reports
+    /// absence is nowhere in the report. Counted so a budget-starved
+    /// pass is visible in diagnostics (rather than a silent pile of
+    /// `unfulfilled`); never struck as faulty, but repeated nonzero
+    /// slices back the representation off on the separate burn
+    /// ledger. Every burn has its deadline counted beside it.
     pub deadlines: usize,
     /// Attempts finding peer absence: no bytes served, or no usable
     /// fetch candidate at all.

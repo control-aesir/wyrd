@@ -476,6 +476,10 @@ mod tests {
         assert_eq!(envelope.recipient, recipient);
         let sk = nostr_secret(&recipient_sk.secret_key()).unwrap();
         let pk = NostrPublicKey::from_byte_array(*sender.as_bytes());
+        // Version pin: the nip44 dependency exposes only V2
+        // (Version and Nonce have no V1 variant to regress to), and
+        // the seal site passes Nonce::V2 explicitly above — so any
+        // wire-format change fails compilation, not this test.
         let opened = nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).unwrap();
         assert_eq!(opened, b"control bytes");
         // Fresh nonces: two seals of the same bytes never share

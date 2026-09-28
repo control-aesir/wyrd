@@ -128,18 +128,21 @@ pass "owner and member converge across hosts"
 # gift wraps — the 9501 rumor travels inside the NIP-59 seal+wrap
 # (trust.md T16), never in cleartext. Observed on odin at the
 # proving run: ~200 wraps with ephemeral authors and p-tag
-# recipients, zero bare 9501s. nak comes pinned from the flake
-# (NAK_BIN); the runner already gated on relay readiness, so an
-# empty answer is a failure, not connection flakiness.
-# Stdin filter form (not -k/-l flags): the pinned nak 0.17.4 answers
+# recipients, zero bare 9501s. nak comes pinned from the flake's
+# nixpkgs channel (NAK_BIN); the runner already gated on relay
+# readiness, so an empty answer is a failure, not connection
+# flakiness. Both queries below are sample-relative at limit 500 —
+# comfortable headroom at ~200 wraps, but a leak past the window
+# would be invisible; raise the limit if mail volume grows.
+# Stdin filter form (not -k/-l flags): the channel's nak answers
 # flag-built filters with zero events on this relay while the stdin
 # form reads fine — observed on odin, so pin the working form.
 REQ1059='{"kinds":[1059],"limit":500}'
 REQ9501='{"kinds":[9501],"limit":500}'
-WRAPS="$(printf '%s' "$REQ1059" | "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-1059.err" | grep '"kind":1059' || true)"
+WRAPS="$(printf '%s' "$REQ1059" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-1059.err" | grep '"kind":1059' || true)"
 [[ -n "$WRAPS" ]] || die "no kind-1059 wraps on the relay: control plane never flowed (see logs/nak-1059.err)"
 [[ -z "$(printf '%s\n' "$WRAPS" | grep -v '"p"' || true)" ]] \
-  || die "gift wraps without recipient p tags on the relay"
+  || die "gift wraps without recipient p tags on the relay (see logs/nak-1059.err)"
 pass "control plane crossed the relay as addressed gift wraps only"
 # Identity shape: the member device is addressed, and no wrap is
 # signed by a device key — authors are discarded ephemeral keys
@@ -154,16 +157,20 @@ printf '%s\n' "$P_HEX" | grep -qxF "$DEV" \
   || die "member device $DEV never addressed on the relay (see logs/nak-1059.err)"
 AUTHORS_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"pubkey":"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
 [[ -n "$AUTHORS_HEX" ]] || die "no wrap authors on the relay (see logs/nak-1059.err)"
-while IFS= read -r author; do
-  printf '%s\n' "$P_HEX" | grep -qxF "$author" \
-    && die "gift wrap signed by device key $author: authors must be ephemeral (see logs/nak-1059.err)"
-done <<< "$AUTHORS_HEX"
-pass "wraps address the member device and no device key signs"
+# The member device must never author: of the two device keys the
+# host provably holds one ($DEV), so this is the precise half of
+# "no device key signs" — the owner half is not established here
+# (its pubkey never appears as a proven p recipient), and the check
+# stays on the 1059 layer only (the inner kind-13 seal is the
+# sender's identity key by design, trust.md T16).
+printf '%s\n' "$AUTHORS_HEX" | grep -qxF "$DEV" \
+  && die "member device $DEV authored a gift wrap: authors must be ephemeral (see logs/nak-1059.err)"
+pass "wraps address the member device and it never authors"
 # Capture-then-assert (never grep -q in the pipeline): grep -q
 # exits at the first match and SIGPIPEs nak, which under pipefail
 # turns a real multi-event leak into a silent pass. Draining grep
 # plus || true keeps the die reachable exactly when it matters.
-RUMORS="$(printf '%s' "$REQ9501" | "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-9501.err" | grep '"kind":9501' || true)"
+RUMORS="$(printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-9501.err" | grep '"kind":9501' || true)"
 [[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
 pass "relay carries no cleartext control rumors"
 

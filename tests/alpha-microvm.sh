@@ -20,12 +20,17 @@
 #
 # Out of scope, tracked as follow-up: relay-partition conflict legs
 # (concurrent commits, StaleHandle, ConflictedHeads, name@N export).
-# Still tracked on the control-plane issue (NIP-44 sealing interop
-# over the relay, mailbox.seen dedupe-log growth):
+# Narrow remainder on the control-plane issue (relay-opacity probe:
+# assert the relay only ever carried kind-1059 ciphertext):
 # nostr:nevent1qqsw5yaj93c8556axtlamjcgh2y8lhelw49pv5cqcfsyhz4q24dm6cspz9mhxue69uhkwunpwdczuap49eehgyz9qww.
-# The topology supports them (relay is a VM service the host can
-# stop); the assertions need product behavior observed on odin
-# first, not encoded blind.
+# Closed here: NIP-44 wire interop is pinned by
+# sealed_envelope_is_stock_nip44_openable_by_any_conforming_peer
+# (ciphertext opens with a direct NIP-44 v2 decrypt, so any
+# conforming peer opens our mail), and the seen growth bound by the
+# fetch-member dedupe proof plus unit compaction tests. The topology
+# supports the opacity probe (the relay answers host websocket REQ);
+# the assertion needs the relay event shape observed on odin first,
+# not encoded blind.
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"

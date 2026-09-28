@@ -350,6 +350,15 @@ leg_fetch_member() {
   [[ -z "$(sort "$d/mailbox.seen" | uniq -d)" ]] \
     || die "mailbox.seen holds duplicate ids: redelivery double-appended"
   pass "redelivery grows the dedupe log without double-appending"
+  # Growth-bound backstop (seen_store.rs:21-25): the durable file
+  # never exceeds twice the 65,536 production retention bound,
+  # regardless of lifetime history. The suite generates ~100 acks,
+  # so this pins the invariant in the hardened gate rather than
+  # exercising compaction — that stays pinned by unit tests at the
+  # 512 test bound.
+  [[ "$(wc -l < "$d/mailbox.seen")" -le 131072 ]] \
+    || die "mailbox.seen exceeds the durable growth bound"
+  pass "dedupe log stays within the durable growth bound"
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 

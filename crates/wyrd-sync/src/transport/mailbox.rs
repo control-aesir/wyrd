@@ -461,6 +461,28 @@ mod tests {
     }
 
     #[test]
+    fn sealed_envelope_is_stock_nip44_openable_by_any_conforming_peer() {
+        // The interop contract: our ciphertext opens with a direct
+        // NIP-44 v2 decrypt under the recipient's identity secret and
+        // the sender's identity public key — no Wyrd wrapper needed.
+        // Any conforming NIP-44 implementation holding those keys
+        // opens our mail; the relay only ever carries this ciphertext.
+        let (sender_sk, sender) = identity(0x01);
+        let (recipient_sk, recipient) = identity(0x02);
+        let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        assert_eq!(envelope.sender, sender);
+        assert_eq!(envelope.recipient, recipient);
+        let sk = nostr_secret(&recipient_sk.secret_key()).unwrap();
+        let pk = NostrPublicKey::from_byte_array(*sender.as_bytes());
+        let opened = nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).unwrap();
+        assert_eq!(opened, b"control bytes");
+        // Fresh nonces: two seals of the same bytes never share
+        // ciphertext, so the relay cannot correlate deliveries by content.
+        let again = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        assert_ne!(envelope.ciphertext, again.ciphertext);
+    }
+
+    #[test]
     fn wrong_recipient_secret_cannot_open() {
         let (sender_sk, _sender) = identity(0x01);
         let (_, recipient) = identity(0x02);

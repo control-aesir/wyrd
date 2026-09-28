@@ -233,6 +233,67 @@ fn redelivered_announcement_collapses_to_duplicate_noop() {
     loaded.rig.teardown();
 }
 
+/// A redelivered announcement after an engine restart is still
+/// dedupe, not state: the commit-dedupe survives the restart
+/// through the durable seen set, not process memory, so the
+/// replayed bytes commit nothing and the single head stands. The
+/// contract-suite flavor of the intake restart tests, over the
+/// public engine open path.
+#[test]
+fn redelivered_announcement_after_restart_stays_a_duplicate() {
+    use wyrd_sync::runtime::MaterializationState;
+
+    let mut loaded = Loaded::new("keeper.txt", b"keeper");
+    let envelope = loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+    let first = loaded.drain();
+    assert_eq!(first.accepted, 2, "capability and announcement commit");
+
+    // Fetch the announced content so one head stands before the
+    // redelivery and the restart.
+    {
+        let ids = loaded.content.content_ids.clone();
+        let engine = loaded.rig.engine_mut();
+        for id in &ids {
+            engine
+                .set_materialization(*id, MaterializationState::Cached)
+                .unwrap();
+        }
+        engine
+            .execute_plan(&mut loaded.bulk, &mut loaded.objects)
+            .unwrap();
+        assert_eq!(
+            engine.live_heads().unwrap().len(),
+            1,
+            "the fetched snapshot projects one head"
+        );
+    }
+
+    // Repeated redelivery before the restart: duplicates twice.
+    loaded.rig.relay.queue([envelope.clone()]);
+    let second = loaded.drain();
+    assert_eq!(second.accepted, 0, "nothing commits twice");
+    assert_eq!(second.duplicates, 1, "the replay is a duplicate");
+
+    // Restart: a fresh engine over the same directory, the same
+    // identical bytes offered again.
+    let dir = loaded.rig.dir.clone();
+    let recipient = loaded.rig.recipient.id;
+    let identity = loaded.rig.recipient.identity.clone();
+    let encryption = loaded.rig.recipient.encryption.clone();
+    drop(loaded.rig.take_engine());
+    let mut engine = Engine::open(dir, drive(), recipient, "contracts", identity, encryption)
+        .expect("the committed state reopens");
+    let mut relay = Relay::new();
+    relay.queue([envelope]);
+    let report = engine.drain(&mut relay).expect("redelivery drains");
+    assert_eq!(report.accepted, 0, "the replay commits nothing durable");
+    assert_eq!(report.duplicates, 1, "dedupe survives the restart");
+    let heads = engine.live_heads().expect("heads project");
+    assert_eq!(heads.len(), 1, "exactly the one committed head stands");
+    loaded.rig.teardown();
+}
+
 /// A failed pass must not strand a durable commit behind a stale
 /// projection. Intake commits the capability, settlement fails, and
 /// the pass aborts before republication — the backend stays empty.

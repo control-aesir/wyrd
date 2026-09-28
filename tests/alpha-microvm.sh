@@ -141,21 +141,24 @@ WRAPS="$(printf '%s' "$REQ1059" | "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-1
 [[ -z "$(printf '%s\n' "$WRAPS" | grep -v '"p"' || true)" ]] \
   || die "gift wraps without recipient p tags on the relay"
 pass "control plane crossed the relay as addressed gift wraps only"
-# Identity shape: exactly the two devices of this topology are
-# addressed, and no wrap is signed by a device key — authors are
-# discarded ephemeral keys (trust.md T16). Base64 ciphertext holds
-# no quotes, so '"p","<hex>"' only matches relay JSON structure
-# (tags are arrays, hence the comma).
+# Identity shape: the member device is addressed, and no wrap is
+# signed by a device key — authors are discarded ephemeral keys
+# (trust.md T16). No census: shared-core step 4 mints throwaway
+# pairing devices that leave their own relay traces, so the p set
+# legitimately holds more than this run's pair. Base64 ciphertext
+# holds no quotes, so '"p","<hex>"' only matches relay JSON
+# structure (tags are arrays, hence the comma).
 P_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"p","[0-9a-f]{64}' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
-[[ "$(printf '%s\n' "$P_HEX" | wc -l)" == 2 ]] \
-  || die "relay p tags do not name exactly the two devices (see logs/nak-1059.err)"
+[[ -n "$P_HEX" ]] || die "no recipient p tags on the relay (see logs/nak-1059.err)"
+printf '%s\n' "$P_HEX" | grep -qxF "$DEV" \
+  || die "member device $DEV never addressed on the relay (see logs/nak-1059.err)"
 AUTHORS_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"pubkey":"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
 [[ -n "$AUTHORS_HEX" ]] || die "no wrap authors on the relay (see logs/nak-1059.err)"
 while IFS= read -r author; do
   printf '%s\n' "$P_HEX" | grep -qxF "$author" \
     && die "gift wrap signed by device key $author: authors must be ephemeral (see logs/nak-1059.err)"
 done <<< "$AUTHORS_HEX"
-pass "wraps address the two devices and no device key signs"
+pass "wraps address the member device and no device key signs"
 # Capture-then-assert (never grep -q in the pipeline): grep -q
 # exits at the first match and SIGPIPEs nak, which under pipefail
 # turns a real multi-event leak into a silent pass. Draining grep

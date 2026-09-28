@@ -335,6 +335,7 @@ fn loop_announces_mounted_writes() {
                 serving_flush_budget: Duration::from_secs(5),
                 fetch_pass_budget: Duration::from_secs(10),
                 budgets: ResourceBudgets::default(),
+                retained_bytes: None,
             },
             &mut |_, _| {},
         )

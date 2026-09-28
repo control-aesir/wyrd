@@ -35,7 +35,7 @@ use thiserror::Error;
 
 use crate::durable::{Durability, PublishError};
 use crate::identity::{ContentId, ObjectKind};
-use crate::store::{ObjectStore, StoreError, StoreFailure};
+use crate::store::{ObjectStore, RetainedBytes, StoreError, StoreFailure};
 
 /// Filesystem store failures: I/O plus the identity violations the
 /// [`ObjectStore`] contract makes the store's job to catch.
@@ -99,6 +99,10 @@ pub struct FsObjectStore {
     /// Publication durability and its pending-directory recovery state,
     /// shared across clones of the same store.
     durability: Arc<Durability>,
+    /// Byte accountant for a retention ceiling. `None` when no ceiling
+    /// is configured, which is the default: counting is only worth its
+    /// per-write branch when something reads the number.
+    retained: Option<Arc<RetainedBytes>>,
 }
 
 /// All envelope kind bytes: `get`/`has` take an id without a kind, so
@@ -123,13 +127,71 @@ impl FsObjectStore {
     /// Open (or create) the store at `dir`, sweeping stale `.tmp` files
     /// from crashed writers.
     pub fn open(dir: PathBuf) -> Result<Self, FsStoreError> {
+        FsObjectStore::open_with(dir, None)
+    }
+
+    /// Open the store with a byte accountant attached, seeded from the
+    /// objects already on disk. The seed is one directory walk at open,
+    /// never a walk per commit: without it a restarted drive would
+    /// restart its count at zero and the ceiling would reset with it.
+    pub fn open_with(
+        dir: PathBuf,
+        retained: Option<Arc<RetainedBytes>>,
+    ) -> Result<Self, FsStoreError> {
         let store = FsObjectStore {
             dir,
             durability: Arc::new(Durability::new()),
+            retained,
         };
         fs::create_dir_all(store.objects_dir()).map_err(FsStoreError::io)?;
-        store.sweep_temps()?;
+        // One traversal either way; the total is asked for only when an
+        // accountant is attached, because `open()` is the shipped
+        // constructor and nothing reads the number without one.
+        let mut seeded = 0u64;
+        let wanted = store.retained.is_some();
+        store.sweep(if wanted { Some(&mut seeded) } else { None })?;
+        if let Some(retained) = &store.retained {
+            // One accountant per store. The seed is additive, so two
+            // stores sharing one tally over one directory would count the
+            // same disk twice and halve the ceiling; attach a fresh
+            // `RetainedBytes` per store, or none at all.
+            retained.add(seeded);
+        }
         Ok(store)
+    }
+
+    /// Bytes of published objects on disk, counted without touching
+    /// anything. This is the composition root's cross-check: comparing it
+    /// against a configured quota at startup turns "every write is
+    /// `ENOSPC`" into a diagnosis at boot.
+    ///
+    /// Read-only on purpose, and deliberately a separate walk from
+    /// [`Self::sweep`]. Merging them would make this query delete `.tmp`
+    /// debris, which no reader of a byte count expects and which would
+    /// contradict the store's stated rule that only `open` removes temps.
+    /// It is on no current path, and `open` still walks the tree once.
+    pub fn retained_bytes(&self) -> Result<u64, FsStoreError> {
+        let mut total = 0u64;
+        let mut stack = vec![self.objects_dir()];
+        while let Some(current) = stack.pop() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(FsStoreError::io(error)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(FsStoreError::io)?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_none_or(|ext| ext != "tmp") {
+                    // Temps are excluded: one is by definition not yet
+                    // retained content, and this walk removes nothing.
+                    total += entry.metadata().map_err(FsStoreError::io)?.len();
+                }
+            }
+        }
+        Ok(total)
     }
 
     fn objects_dir(&self) -> PathBuf {
@@ -152,27 +214,52 @@ impl FsObjectStore {
             .find(|(_, path)| path.is_file())
     }
 
-    /// Remove every `.tmp` file under the store: debris from writers
-    /// that crashed between temp-write and rename.
-    fn sweep_temps(&self) -> Result<(), FsStoreError> {
+    /// Walk the object tree, removing every `.tmp` file, and total the
+    /// published objects when `total` asks for it.
+    ///
+    /// One traversal, two jobs, and the total is opt-in: `metadata()` per
+    /// object is a real cost on a store holding millions of them, and the
+    /// shipped `open()` path has no accountant, so it pays only for the
+    /// debris sweep — the traversal master had. Only a store with a
+    /// `RetainedBytes` attached asks for the number.
+    ///
+    /// The two totals in this file (here and [`Self::retained_bytes`])
+    /// must agree, or the startup cross-check cannot diagnose anything.
+    /// They differ only in what they do with an entry: this one deletes
+    /// temps, that one leaves them. `is_dir` decides recursion in both,
+    /// so symlinks are treated identically.
+    ///
+    /// A `read_dir` that fails with `NotFound` is tolerated and skipped.
+    /// That is a behaviour change from master, which propagated the
+    /// error: a fanout directory removed by a concurrent process is
+    /// debris, not a failure, and a mount that disappeared under us is
+    /// not worth failing `open` over.
+    fn sweep(&self, mut total: Option<&mut u64>) -> Result<(), FsStoreError> {
         let mut stack = vec![self.objects_dir()];
         while let Some(current) = stack.pop() {
-            let entries = fs::read_dir(&current).map_err(FsStoreError::io)?;
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(FsStoreError::io(error)),
+            };
             for entry in entries {
                 let entry = entry.map_err(FsStoreError::io)?;
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "tmp") {
-                    // A concurrent writer may rename the temp into place
-                    // between the listing and the removal: NotFound means
-                    // the file already reached its live name, which is the
-                    // outcome sweeping wants anyway.
+                    // Debris from a writer that crashed between temp-write
+                    // and rename. A concurrent writer may rename the temp
+                    // into place between the listing and the removal:
+                    // NotFound means the file already reached its live
+                    // name, which is the outcome sweeping wants anyway.
                     match fs::remove_file(&path) {
                         Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => return Err(FsStoreError::io(error)),
                     }
+                } else if let Some(total) = total.as_deref_mut() {
+                    *total += entry.metadata().map_err(FsStoreError::io)?.len();
                 }
             }
         }
@@ -249,6 +336,20 @@ impl ObjectStore for FsObjectStore {
             .is_some_and(|bytes| ContentId::derive(kind, &bytes) == id);
         if !valid {
             self.atomic_write(&path, data)?;
+            // Only a real publication retains bytes. A rewrite of a
+            // present-but-unverifiable object is charged, which is
+            // correct: it lands the same bytes under the same name.
+            //
+            // One case over-charges, knowingly: if a concurrent writer
+            // won the rename, `atomic_write` reports success without
+            // this call having published, and the bytes are charged
+            // twice for one object. That needs two store clones or two
+            // processes on one directory, which the module header
+            // already scopes as trusted-directory territory, and the
+            // error is a ceiling reached early rather than one passed.
+            if let Some(retained) = &self.retained {
+                retained.add(data.len() as u64);
+            }
         } else {
             // The object exists, but a prior publication (possibly before
             // a restart) may have installed it without a successful
@@ -317,6 +418,45 @@ mod tests {
 
     fn remove_scratch(dir: &Path) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The byte accountant charges only what a commit newly retains, and
+    /// a reopened drive starts counted from what is already on disk.
+    /// Without the reseed the ceiling would reset on every restart,
+    /// which is the difference between a bound and a suggestion.
+    #[test]
+    fn retained_bytes_counts_new_content_and_reseeds_on_reopen() {
+        let dir = scratch_dir();
+        let retained = RetainedBytes::new();
+        let mut store = FsObjectStore::open_with(dir.clone(), Some(Arc::clone(&retained))).unwrap();
+
+        let payload = b"a chunk's worth of bytes";
+        let id = store.insert(ObjectKind::Chunk, payload).unwrap();
+        let after_first = retained.get();
+        assert_eq!(after_first, payload.len() as u64, "a new object is charged");
+
+        // Re-presenting the same content retains nothing: the store is
+        // content-addressed, so this is a no-op write.
+        store.insert(ObjectKind::Chunk, payload).unwrap();
+        assert_eq!(
+            retained.get(),
+            after_first,
+            "held content is not charged twice"
+        );
+
+        // Reopening walks what is on disk and starts from there, so a
+        // fresh session's ceiling is the drive's real retained size.
+        drop(store);
+        let reopened = RetainedBytes::new();
+        let store = FsObjectStore::open_with(dir.clone(), Some(Arc::clone(&reopened))).unwrap();
+        assert_eq!(
+            reopened.get(),
+            after_first,
+            "a reopened drive starts counted, not empty"
+        );
+        assert!(store.has(&id).unwrap());
+        drop(store);
+        remove_scratch(&dir);
     }
 
     /// Every `.tmp` file under the store (a crashed writer's debris).

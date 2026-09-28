@@ -19,13 +19,13 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use wyrd_core::live::LiveConfig;
-use wyrd_core::mutation::{MutationKind, MutationOutcome};
+use wyrd_core::mutation::{MutationError, MutationKind, MutationOutcome};
 use wyrd_core::node::WyrdNode;
 use wyrd_core::view::{
     Attr, DirEntry, Head, NamespaceView, Node, OpenFile, RuntimeMaterialization, ViewError,
     ViewLockError,
 };
-use wyrd_format::{ContentId, FetchStatus, MemoryObjectStore, ObjectStore};
+use wyrd_format::{ContentId, FetchStatus, MemoryObjectStore, ObjectStore, StoreFailure};
 use wyrd_fuse::{DriveView, ViewHead};
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -207,6 +207,142 @@ fn node_serves_over_a_view_defined_outside_the_fuse_crate() {
     drive_headless_node(node);
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A commit refused at the retention ceiling commits nothing at all: no
+/// snapshot, and therefore no announcement obligation for a snapshot the
+/// drive never took.
+///
+/// The obligation is the half that matters and the half that is easy to
+/// get wrong. It is written in the same single fact-commit as the
+/// snapshot body, so a refusal landing after that call would leave a
+/// durable `AnnouncementQueued` for a snapshot that does not exist —
+/// unreclaimable, and something a later pass would announce to peers. A
+/// refusal before the commit's first write never reaches the fact log.
+///
+/// The witness is the durable fact log itself: its committed segments on
+/// disk, counted before and after. An unchanged count is positive
+/// evidence the log was not appended to, obligation included. (The
+/// pending-announcement backlog would be the direct witness, but a
+/// single-member drive has no recipients, so it is empty either way and
+/// proves nothing.) The errno half of the same refusal is pinned at the
+/// mount boundary in `wyrd-daemon`, which owns the backend composition.
+///
+/// The loop runs on a scope thread because `submit` is synchronous: it
+/// waits for the loop to apply the mutation and reply. Nothing inside
+/// the scope may panic — a panic there would skip the stop flag and the
+/// scope would block forever joining a loop with no reason to exit — so
+/// the outcome is carried out and asserted after the join.
+#[test]
+fn a_quota_refused_commit_commits_nothing_at_all() {
+    const PASS: &str = "headless-test-pass";
+    let dir = headless_dir("contract-retained-quota");
+    let engine =
+        Engine::create(dir.clone(), PASS, DeviceIdentitySecret::generate().unwrap()).unwrap();
+
+    // One ceiling and one accountant, so the count the check reads is
+    // the count the store keeps.
+    let (config, retained) = LiveConfig::with_retained_quota(0);
+    let mut node: WyrdNode<ContractView> =
+        WyrdNode::new(engine, MemoryObjectStore::default().with_retained(retained)).unwrap();
+    publish_hello(&mut node);
+
+    // The drive's own content puts it over a zero ceiling, so the
+    // refusal is genuinely reached rather than an empty store.
+    let facts_before = committed_fact_segments(&dir);
+    assert!(facts_before > 0, "the drive has committed something");
+
+    let (mut live, parts) = node.into_live(Duration::from_secs(5), &config).unwrap();
+    let slot = Arc::clone(&parts.projection);
+    let queue = Arc::clone(&parts.mutations);
+    let stop = Arc::new(AtomicBool::new(false));
+    // The loop paces from the same budgets; the quota is read from the
+    // node's own accountant, not from the loop's copy of the config.
+    let loop_config = LiveConfig {
+        budgets: config.budgets,
+        interval: Duration::from_millis(10),
+        ..LiveConfig::default()
+    };
+
+    let outcome = std::thread::scope(|scope| {
+        let loop_stop = Arc::clone(&stop);
+        scope.spawn(move || {
+            let mut mailbox = SilentMailbox;
+            live.run_loop(
+                &mut mailbox,
+                None::<&mut MemoryBulkSource>,
+                &loop_stop,
+                &loop_config,
+                &mut |_, _| {},
+            )
+        });
+
+        let outcome = queue.submit(MutationKind::Mkdir {
+            path: "denied".to_string(),
+        });
+        // Idle passes, so the final segment count is attributable to
+        // the refused commit: this shows fifty ordinary passes append
+        // nothing of their own. It is deliberately not the witness for
+        // the obligation — an obligation whose snapshot body was never
+        // committed would not be announced either, because
+        // `announce_pending` finds no body and `reannounce_one` commits
+        // nothing when no announcement matches. The count below is the
+        // witness, and it works because the obligation is written in the
+        // same fact-commit as the body.
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        outcome
+    });
+
+    let error = outcome.expect_err("a commit at the ceiling is refused, not queued");
+    assert!(
+        matches!(error, MutationError::Store(StoreFailure::StorageFull)),
+        "the refusal is the store-full classification, which reaches the \
+         mount as ENOSPC: {error}"
+    );
+    assert_eq!(
+        committed_fact_segments(&dir),
+        facts_before,
+        "a quota-refused commit commits no facts: no snapshot, and no \
+         announcement obligation for a snapshot that does not exist"
+    );
+    // The namespace never saw the refused mutation, and the drive still
+    // serves what it had before.
+    let projection = slot.read().unwrap();
+    assert!(
+        projection.view().lookup("denied").is_err(),
+        "the refused mkdir left no directory"
+    );
+    assert_serves_hello(projection.view());
+    drop(projection);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Committed fact-log segments on disk. The durable store keeps one file
+/// per fact-commit, so this is the count a refusal would have to leave
+/// alone. Read from the filesystem rather than the engine because
+/// `Engine::open` needs the drive and encryption secrets that `create`
+/// generates internally, and re-deriving them is not worth a witness the
+/// directory layout states directly.
+fn committed_fact_segments(dir: &std::path::Path) -> usize {
+    let commits = dir.join("commits");
+    let Ok(entries) = std::fs::read_dir(&commits) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let path = entry.path();
+            // Skip temps: the durable store writes `commits/<name>.tmp`
+            // and renames it into place, so counting them would make this
+            // witness one in-flight commit away from a spurious failure.
+            // The same skip the read-only object-store walk uses.
+            path.is_file() && path.extension().is_none_or(|ext| ext != "tmp")
+        })
+        .count()
 }
 
 /// A fresh engine directory for one headless composition.

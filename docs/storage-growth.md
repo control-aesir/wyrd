@@ -1,16 +1,17 @@
 # Storage growth and the retention bound
 
-Analysis, not an enforced bound. `resource-limits.md` is the normative
-document for bounds the daemon enforces; this one states the resource
-none of them can cap — how much the store **retains** over time — and
-screens which bounds could be enforced before GC exists. A later GC
-design should start here, so this document's job is to give it a defined
-adversary rather than an open assumption.
+`resource-limits.md` is the normative document for bounds the daemon
+enforces. This one states the resource none of them can cap — how much
+the store **retains** over time — and specifies the one bound that
+survives the append-only store, together with what it does not cover. A
+later GC design should start here, so this document's job is to give it a
+defined adversary rather than an open assumption.
 
-Within this document, the fixed-overhead table and the two "Already
-bounded" rows describe enforced current behavior, each with the code
-that closes it. Everything else is analysis, screening, or a proposal.
-The per-device quota is a proposal, not code.
+The per-device retained-bytes quota and the two "Already bounded" rows
+are enforced current behavior, each with the code that closes it. The
+rest is analysis and screening, not code. Read the quota's limits below
+before treating it as a ceiling on disk: it is a ceiling on one write
+path, not on the device.
 
 ## Why retention is separate
 
@@ -206,9 +207,10 @@ rather than decided here.
 
 ## Pre-GC bounds: what could be enforced
 
-**Nothing in this subsection is implemented.** It records which bounds
-survive the durability contract, so the GC design starts from a screened
-list rather than re-testing rejected options.
+One bound here is implemented: the per-device retained-bytes quota. The
+rest are the record of which candidates were screened out, so the GC
+design starts from a settled list rather than re-testing rejected
+options.
 
 Enforcement must not contradict the durability contract. Three of the
 obvious candidates fail that test, and the fourth is deferred:
@@ -232,7 +234,7 @@ existing error path unchanged:
 
 | Bound | Enforcement | Why it is safe |
 |---|---|---|
-| Per-device retained-bytes quota (proposed) | Refuse the commit before its first write to disk, reporting `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see `resource-limits.md`, Disk classification). A quota is a smaller disk, not a weaker promise |
+| Per-device retained-bytes quota | Refuse the commit before its first write to disk, reporting `ENOSPC` | `ENOSPC` from `flush`/`fsync` is already a legitimate reportable outcome, and quota-full already classifies as `StoreFailure::StorageFull` → `ENOSPC` for mount writes (see `resource-limits.md`, Disk classification). A quota is a smaller disk, not a weaker promise. Implemented: `ResourceBudgets::retained_bytes_quota` (default `None`, unlimited), enforced by `LiveNode::enforce_retained_quota` ahead of every arm of `apply_mutation`, counted by `wyrd_format::RetainedBytes` |
 
 The refusal point is load-bearing and easy to get wrong, in the one
 place where being off by a step is the failure mode being designed
@@ -262,11 +264,76 @@ Refusing there strands no facts either, which is what makes it the
 latest consistent choice, but by then the commit's bytes are already
 spent, which is why it is not the byte ceiling's point.
 
-A quota would bound the author's own device and convert a silent
-unbounded growth into an explicit, documented, POSIX-legitimate refusal.
-It would not bound the author **on other devices, nor in the vault**.
-Nothing in v0 can bound the author, because a member's commits are valid
-work and GC is the only mechanism that can make old bytes stop existing.
+The quota bounds the author's own device and converts a silent unbounded
+growth into an explicit, documented, POSIX-legitimate refusal. It does
+not bound the author **on other devices, nor in the vault**: a member's
+commits are valid work, and GC is the only mechanism that can make old
+bytes stop existing. That is open question 1, and it is a `trust.md`
+authorization change rather than a resource limit.
+
+The quota is narrower than "a ceiling on storage" in three ways, and each
+one is a place where the number understates what the device holds. The
+fourth thing below is not that: it is what running into the ceiling costs,
+which is a different question and the one an operator meets first.
+
+**Only the mounted write path refuses.** The check sits in the live
+node's commit boundary, ahead of every arm of `apply_mutation`. Four
+writers raise the count with nothing to refuse them: the sync pass
+fetching objects into the same store, the vault retaining ciphertext per
+representation, the fact log growing per commit / per accepted intake
+message / per delivery, and the node's own `put_file` and `remove`, which
+insert chunks and tree nodes and author a snapshot with no quota in scope.
+(The fact log is not unbounded by a pass — materialization commits are
+idempotent, as "Already bounded" records — it simply is not metered here.)
+
+That last one is the narrowest and the most likely to be assumed covered,
+because those methods sit on the same type that carries the accountant.
+But `into_live` consumes the node, so it is the pre-live and
+headless-embedder window rather than a hole in the mounted path. Either
+way the device's retained bytes are *not* bounded by the configured
+number, and the number can be crossed by paths that
+have no ceiling at all.
+
+**And that makes it an interference channel.** Because those unrefused paths
+do charge the accountant, a remote author can spend a peer's headroom
+simply by authoring content — the peer accepts the closure, its count
+climbs past the quota, and the first refusal lands on the peer's own next
+local write as `ENOSPC`. Nothing is deleted and no logical state changes;
+the drive looks healthy while the local author is locked out of writing.
+This is a consequence of *this* bound rather than a pre-existing
+property, and it is the strongest practical argument for open question 1:
+until peers have a refusal right, a local quota is a lever a remote member
+can pull.
+
+**The overshoot is one whole commit.** The check compares bytes already
+retained, so a commit that starts one byte under the quota is admitted
+and can take the total to `quota + N` for whatever that commit retains. On
+the author path `N` is the handle's buffered image plus the tree nodes
+rebuilt on the changed path: 64 MiB of write buffer
+(`MAX_WRITE_BUFFER_BYTES`) plus namespace-sized nodes, which are the
+separate step-1 row in the fixed-cost table above and do not scale with
+the write. On the fetch path nothing bounds `N` at all. No commit is ever
+refused *for crossing* the ceiling — only once it is already over.
+
+**And it is one-way.** Nothing lowers the count: no GC, no eviction, and
+bytes charged by a fetch or by a commit that failed after its inserts stay
+charged forever. A quota set at or below current retention therefore
+leaves the device permanently unable to take a local write, and raising
+the quota is the only remedy. At the ceiling every local mutation is
+refused, including ones that would retain nothing new — unlike a real full
+disk, where a zero-byte write still succeeds.
+
+**A refusal costs the open handle its buffer.** The commit takes the
+handle's buffered image before submitting, so an `ENOSPC` at `fsync`
+discards those uncommitted bytes and every later operation on that
+descriptor returns `EIO`. A program that writes and `close`s without an
+explicit sync gets no errno at all — `release` commits best-effort, logs,
+and returns success — so that path loses the write silently. This is
+master's policy for every commit failure and exactly what a genuinely
+full disk does, which is the sense in which a quota is a smaller disk and
+not a weaker promise. It is stated here because an operator deciding
+whether to set a ceiling should know that running into it costs open
+handles, not just the write in hand.
 
 ## Open questions
 
@@ -281,15 +348,37 @@ work and GC is the only mechanism that can make old bytes stop existing.
    the serving boundary, an eviction-under-pressure rule (which trades
    against the recovery property that motivates the append-only store),
    or accepting unbounded peer growth until GC. Not decided here.
-2. **Quota granularity and check sequencing**: per device, per drive, or
-   per member-set, and how the check interleaves with a commit already
-   in flight. The refusal point is settled above (before the commit's
-   first write to disk, with the fact-commit as the latest consistent
-   fallback); what stays open is the accounting for a commit that is
-   already underway when the quota is crossed, and the interaction with
-   the announcement obligation, whose facts share that final fact-commit
-   — so a refusal must land before it and leave no durable obligation
-   behind.
+2. **Quota accounting still open.** The refusal point shipped as
+   decided above: before the commit's first write to disk, so a refused
+   commit retains nothing. What the implementation leaves open, and
+   what a follow-up should settle:
+   - **Counting the other two writers.** `RetainedBytes` covers the
+     object store only. The sync vault retains ciphertext per
+     representation, and the fact log grows per commit, per accepted
+     intake message, and per delivery; both are writers the tally never
+     sees, so the reported total is lower than the bytes this device
+     actually holds.
+   - **Refusing the unrefused paths.** Fetched objects cross the quota
+     with no ceiling in scope, which is what turns a local quota into the
+     interference channel above. Whether a peer may decline to retain is
+     open question 1 and a `trust.md` decision; until it is made, the
+     honest options are a fetch-side refusal (new protocol surface) or
+     documenting the interference and leaving the quota to local-write
+     protection only.
+   - **In-flight accounting.** The check compares bytes already
+     retained, so the effective ceiling is the quota plus whatever the
+     next admitted commit retains. A stricter reading would reserve the
+     in-flight delta up front.
+   - **A startup cross-check.** `FsObjectStore::retained_bytes` is the
+     composition root's cross-check — a mounted store is an
+     `FsObjectStore`, so that is the one that matters — and nothing
+     calls it yet, so a quota set below current retention is discovered
+     as a stream of `ENOSPC` at the first write rather than as a startup
+     diagnosis.
+   - **Granularity.** The bound is per device. Per drive would bound the
+     *author* across its devices; per member-set would bound a group.
+     The device scope is the conservative choice and is the only one
+     that needs no membership state at the write boundary.
 
 Tracked by the two follow-ups raised with this document:
 `protocol(storage): decide whether peers and vaults get a retention

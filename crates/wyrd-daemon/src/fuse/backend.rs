@@ -1811,10 +1811,14 @@ where
     /// With no writable handle, both fields go in a single `SetAttrs`
     /// mutation, so the syscall publishes exactly one snapshot. A size
     /// through a writable handle truncates that handle's buffered image;
-    /// a size through a read-only handle is `EBADF`; a mode change is
-    /// always path-addressed. Combining size and mode through a writable
-    /// handle is refused (`EOPNOTSUPP`): the buffered image and a
-    /// path-addressed exec change cannot be one snapshot.
+    /// a size through a read-only handle is `EBADF`; a size through an
+    /// append handle is `EOPNOTSUPP`. A mode change is path-addressed on
+    /// every handle *except* a writable non-append one, where it
+    /// re-flags the buffered image and commits only under `O_SYNC` —
+    /// `O_APPEND` is the default for `>>`, so that arm is not exotic.
+    /// Combining size and mode through a writable handle is refused
+    /// (`EOPNOTSUPP`): the buffered image and a path-addressed exec
+    /// change cannot be one snapshot.
     pub fn setattr_attrs(
         &self,
         ino: u64,

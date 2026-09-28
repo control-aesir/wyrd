@@ -68,6 +68,11 @@ pub struct WyrdNode<V: NamespaceView> {
 pub enum NodeError {
     #[error("runtime state could not be reconstructed: {0}")]
     Runtime(#[from] wyrd_sync::runtime::EngineError),
+    /// The live composition was refused: a configured bound with
+    /// nothing to measure it against. Surfaced at startup, where a
+    /// misconfiguration belongs, rather than as a runtime failure.
+    #[error("live composition refused: {0}")]
+    Composition(#[from] crate::live::CompositionError),
 }
 
 impl<V> WyrdNode<V>
@@ -322,13 +327,14 @@ where
         }
         let revision = self.engine.current();
         let store = self.view.store_handle();
-        Ok(LiveNode::split(
+        LiveNode::split(
             self.engine,
             store,
             self.view,
             revision,
             open_timeout,
             config,
-        ))
+        )
+        .map_err(NodeError::from)
     }
 }

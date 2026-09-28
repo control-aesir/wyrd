@@ -262,7 +262,10 @@ const FETCH_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// against an unroutable provider. A dial cut short by subdivision
 /// reports [`BulkError::Deadline`] instead of transport failure: a
 /// timeout under an artificially shortened deadline carries no fault
-/// information. Instant dial failures (refused, unreachable) stay
+/// information. The class follows the walk's subdivision grant
+/// (`bound`), not the dial's own expiry — under a shared slice even
+/// a faultily slow provider reads as budget pressure.
+/// Instant dial failures (refused, unreachable) stay
 /// transport errors — those completed even under the slice.
 async fn dial(
     endpoint: &Endpoint,

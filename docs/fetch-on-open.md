@@ -197,7 +197,8 @@ Decided properties:
    the truth; the daemon merges them at publish and the view exposes
    the result. FUSE never mutates materialization state, so
    "FUSE says Fetching while engine says Cached" cannot arise.
-8. **Every eligible provider is attempted each pass.** A
+ 8. **Each pass attempts every eligible provider the walk reaches.**
+    A
    representation may name several providers (a dead route beside a
    live one after a serving restart). Under a pass budget each
    remaining candidate gets a fair share of the time left, floored so
@@ -205,7 +206,9 @@ Decided properties:
    candidate takes more than half of what's left, so a dead-first
    provider cannot spend the whole slice — but tails shrink
    geometrically, so with several hanging candidates ahead a late
-   live route can get an unusably small slice. Candidate lists are
+   live route can get an unusably small slice, and a spent walk
+   leaves the remaining candidates unattempted until the next pass.
+   Candidate lists are
    short in practice (bounded by the distinct recorded providers for
    one address), so the walk reaches the live route. Two bounds
    apply: a cooled representation is not attempted at all, so a
@@ -217,8 +220,10 @@ Decided properties:
    single-route fetch outside a walk, which is the production case)
    expires as a transport failure exactly as before, so a hanging
    route with no one behind it still backs off. A zero-grant
-   deadline (the walk stopped before attempting) counts but never
-   backs off: a provider never asked carries no evidence.
+   deadline (the walk stopped before attempting) counts — when it
+   is the representation's whole story; a fallback zero grant
+   masked by a primary outcome is not counted — but never backs
+   off: a provider never asked carries no evidence.
 
 ## What open() materializes vs what read() demands
 

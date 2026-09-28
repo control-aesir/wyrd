@@ -272,7 +272,9 @@ pub struct ExecuteReport {
     /// counted per sliced representation (single-representation items
     /// contribute one): budget evidence, never provider evidence.
     /// Zero grants count too — dry budget is still budget pressure —
-    /// but never burn. Counted so a budget-starved pass is visible in
+    /// but never burn. Only when the zero grant is the
+    /// representation's whole story: a fallback zero grant masked by
+    /// a primary outcome is not counted. Counted so a budget-starved pass is visible in
     /// diagnostics (rather than a silent pile of `unfulfilled`);
     /// never struck as faulty, but repeated nonzero slices back the
     /// representation off on the separate burn ledger. Every burn has

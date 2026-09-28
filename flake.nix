@@ -114,6 +114,11 @@
       packages = forAllSystems (system: {
         wyrd = wyrdFor system;
         wyrd-dist = distFor system;
+        # Pinned relay-query tool for the microVM opacity probe
+        # (tests/alpha-microvm.sh): reproducibility is the reason —
+        # the runner builds nak from this pin and exports NAK_BIN
+        # next to WYRD_BIN instead of floating nixpkgs#nak.
+        nak = (pkgsFor system).nak;
         default = self.packages.${system}.wyrd;
       });
       apps = forAllSystems (system: {
@@ -143,6 +148,9 @@
           self.nixosConfigurations.wyrd-peer-n.config.microvm.runner.qemu;
         wyrd-microvm-relay =
           self.nixosConfigurations.wyrd-relay.config.microvm.runner.qemu;
+        # The opacity probe's relay-query tool: attest the attribute
+        # the gate introduced, on the platform that runs it.
+        wyrd-microvm-nak = self.packages.${system}.nak;
       });
       # Hardened e2e topology: two peers plus a relay, each a microVM
       # definition (see nix/microvm/). x86_64-linux only: KVM hosts

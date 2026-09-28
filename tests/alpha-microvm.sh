@@ -11,7 +11,8 @@
 #   2. second member natively on peer-n (pair there, invite+join here —
 #      invitation files are the portable artifact by design)
 #   3. cross-host convergence legs in parallel (guest legs, done-file
-#      rendezvous on the shared state root)
+#      rendezvous on the shared state root) plus the host-side relay
+#      opacity probe (addressed kind-1059 wraps only, never cleartext)
 #   4. serving-restart legs (fresh endpoint, route update, no repair)
 #   5. fetch-plane legs (blocking cold open, bounded EIO on dead
 #      routes, recovery without remount after the owner returns on a
@@ -19,19 +20,23 @@
 #   6. offline reopen of both drives on the host
 #
 # Out of scope, tracked as follow-up: relay-partition conflict legs
-# (concurrent commits, StaleHandle, ConflictedHeads, name@N export).
-# Still tracked on the control-plane issue (NIP-44 sealing interop
-# over the relay, mailbox.seen dedupe-log growth):
-# nostr:nevent1qqsw5yaj93c8556axtlamjcgh2y8lhelw49pv5cqcfsyhz4q24dm6cspz9mhxue69uhkwunpwdczuap49eehgyz9qww.
-# The topology supports them (relay is a VM service the host can
-# stop); the assertions need product behavior observed on odin
-# first, not encoded blind.
+# (concurrent commits, StaleHandle, ConflictedHeads, name@N export):
+# nostr:nevent1qqsfe3tgav2h5xe0sdsj5508zxdpknamd9l48tr35fxyugda23df9dcpz9mhxue69uhkwunpwdczuap49eehgcy9luf.
+# Control-plane remainder closed here: NIP-44 wire interop is pinned
+# by sealed_envelope_is_plain_nip44_v2_with_no_wrapper, the seen
+# growth bound by the fetch-member dedupe proof plus unit compaction
+# tests, and relay opacity by the convergence-phase probe above
+# (addressed kind-1059 wraps only, never cleartext rumors).
+# (The control-plane issue reference lives in the PR cover note;
+# the Resolves: keyword goes on the merge commit, which is what the
+# auto-resolve parser reads.)
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
 RUN="$STATE_DIR/run"
 SSH_KEY="$STATE_DIR/sshkey"
 WYRD_BIN="${WYRD_BIN:?runner sets WYRD_BIN from the host build}"
+NAK_BIN="${NAK_BIN:?runner sets NAK_BIN from the host build}"
 RELAY_URL="${RELAY_URL:-ws://10.0.7.10:18761}"
 PEER_O="${PEER_O:-e2e@10.0.7.11}"
 PEER_N="${PEER_N:-e2e@10.0.7.12}"
@@ -120,6 +125,61 @@ LEG_O=$!
 wait "$LEG_N" || die "member convergence leg failed (see logs/leg-member.out)"
 wait "$LEG_O" || die "owner convergence leg failed (see logs/leg-owner.out)"
 pass "owner and member converge across hosts"
+# Control-plane opacity: the relay must only ever carry kind-1059
+# gift wraps — the 9501 rumor travels inside the NIP-59 seal+wrap
+# (trust.md T16), never in cleartext. Observed on odin at the
+# proving run: ~200 wraps with ephemeral authors and p-tag
+# recipients, zero bare 9501s. nak comes pinned from the flake's
+# nixpkgs channel (NAK_BIN); the runner already gated on relay
+# readiness, so an empty answer is a failure, not connection
+# flakiness. Both queries below are sample-relative at limit 500 —
+# comfortable headroom at ~200 wraps, but a leak past the window
+# would be invisible; raise the limit if mail volume grows.
+# Stdin filter form (not -k/-l flags): the channel's nak answers
+# flag-built filters with zero events on this relay while the stdin
+# form reads fine — observed on odin, so pin the working form.
+REQ1059='{"kinds":[1059],"limit":500}'
+REQ9501='{"kinds":[9501],"limit":500}'
+WRAPS="$(printf '%s' "$REQ1059" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-1059.err" | grep '"kind":1059' || true)"
+[[ -n "$WRAPS" ]] || die "no kind-1059 wraps on the relay: control plane never flowed (see logs/nak-1059.err)"
+[[ -z "$(printf '%s\n' "$WRAPS" | grep -v '"p"' || true)" ]] \
+  || die "gift wraps without recipient p tags on the relay (see logs/nak-1059.err)"
+pass "control plane crossed the relay as addressed gift wraps only"
+# Identity shape: the member device is addressed, and no wrap is
+# signed by a device key — authors are discarded ephemeral keys
+# (trust.md T16). No census: shared-core step 4 mints throwaway
+# pairing devices that leave their own relay traces, so the p set
+# legitimately holds more than this run's pair. Base64 ciphertext
+# holds no quotes, so '"p","<hex>"' only matches relay JSON
+# structure (tags are arrays, hence the comma).
+P_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"p","[0-9a-f]{64}' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
+[[ -n "$P_HEX" ]] || die "no recipient p tags on the relay (see logs/nak-1059.err)"
+printf '%s\n' "$P_HEX" | grep -qxF "$DEV" \
+  || die "member device $DEV never addressed on the relay (see logs/nak-1059.err)"
+AUTHORS_HEX="$(printf '%s\n' "$WRAPS" | grep -oE '"pubkey":"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | sort -u || true)"
+[[ -n "$AUTHORS_HEX" ]] || die "no wrap authors on the relay (see logs/nak-1059.err)"
+# The member device must never author: of the two device keys the
+# host provably holds one ($DEV), so this is the precise half of
+# "no device key signs" — the owner half is not established here
+# (its pubkey never appears as a proven p recipient), and the check
+# stays on the 1059 layer only (the inner kind-13 seal is the
+# sender's identity key by design, trust.md T16).
+printf '%s\n' "$AUTHORS_HEX" | grep -qxF "$DEV" \
+  && die "member device $DEV authored a gift wrap: authors must be ephemeral (see logs/nak-1059.err)"
+pass "wraps address the member device and it never authors"
+# Capture-then-assert (never grep -q in the pipeline): grep -q
+# exits at the first match and SIGPIPEs nak, which under pipefail
+# turns a real multi-event leak into a silent pass. Draining grep
+# plus || true keeps the die reachable exactly when it matters.
+nak_status=0
+RUMORS="$( { printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" \
+  2>"$RUN/logs/nak-9501.err" || nak_status=$?; } | grep '"kind":9501' || true)"
+# The leak query's real bound is the timeout above, not limit 500: a
+# zero-result subscription depends on the relay terminating it, so
+# "no rumor in thirty seconds" is what the pass below proves.
+[[ "$nak_status" != 124 ]] || die "9501 query timed out: leak check inconclusive (see logs/nak-9501.err)"
+[[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
+pass "relay carries no cleartext control rumors"
 
 # --- phase 4: serving restart -------------------------------------------
 echo "=== microvm 8: serving restart ==="

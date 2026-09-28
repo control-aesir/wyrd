@@ -461,6 +461,35 @@ mod tests {
     }
 
     #[test]
+    fn sealed_envelope_is_plain_nip44_v2_with_no_wrapper() {
+        // The wire-format pin: our ciphertext opens with a direct
+        // NIP-44 v2 decrypt under the recipient's identity secret and
+        // the sender's identity public key — no Wyrd layer in between,
+        // so the relay only ever carries stock NIP-44. This is not
+        // cross-implementation interop: seal and decrypt both come
+        // from the nip44 feature of the nostr crate, so no second
+        // NIP-44 stack is exercised (that gap is tracked at
+        // docs/architecture.md:186).
+        let (sender_sk, sender) = identity(0x01);
+        let (recipient_sk, recipient) = identity(0x02);
+        let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        assert_eq!(envelope.sender, sender);
+        assert_eq!(envelope.recipient, recipient);
+        let sk = nostr_secret(&recipient_sk.secret_key()).unwrap();
+        let pk = NostrPublicKey::from_byte_array(*sender.as_bytes());
+        // Version pin: the nip44 feature of the nostr crate exposes
+        // only V2 (Version and Nonce have no V1 variant to regress
+        // to), and the seal site passes Nonce::V2 explicitly above —
+        // so any wire-format change fails compilation, not this test.
+        let opened = nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).unwrap();
+        assert_eq!(opened, b"control bytes");
+        // Fresh nonces: two seals of the same bytes never share
+        // ciphertext, so the relay cannot correlate deliveries by content.
+        let again = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
+        assert_ne!(envelope.ciphertext, again.ciphertext);
+    }
+
+    #[test]
     fn wrong_recipient_secret_cannot_open() {
         let (sender_sk, _sender) = identity(0x01);
         let (_, recipient) = identity(0x02);

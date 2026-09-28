@@ -363,11 +363,12 @@ leg_fetch_member() {
   [[ "$(wc -c < "$d/mailbox.seen")" -le 8519680 ]] \
     || die "mailbox.seen exceeds the durable growth bound"
   pass "dedupe log stays within the durable growth bound"
-  # Companion that can actually fail: every record is exactly one
-  # 64-hex id plus newline (MAX_RECORD_LEN, 65), so a longer line is
-  # a torn or corrupt record — and the byte ceiling above assumes it.
-  # (Use > 65, not != 65: a torn tail with no newline is 64 bytes.)
-  awk 'length($0) > 65 { exit 1 }' "$d/mailbox.seen" \
+  # Companion that can actually fail: every record is one 64-hex
+  # id plus newline (MAX_RECORD_LEN is 65 including the newline), so
+  # a longer line is a torn or corrupt record — and the byte ceiling
+  # above assumes it. (Use > 64: a torn tail with no newline is
+  # exactly 64 bytes, which is legitimate.)
+  awk 'length($0) > 64 { exit 1 }' "$d/mailbox.seen" \
     || die "mailbox.seen holds an over-long record"
   pass "dedupe log holds only well-formed records"
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"

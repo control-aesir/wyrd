@@ -467,8 +467,9 @@ mod tests {
         // the sender's identity public key — no Wyrd layer in between,
         // so the relay only ever carries stock NIP-44. This is not
         // cross-implementation interop: seal and decrypt both come
-        // from the same nostr-sdk module, so no second NIP-44 stack is
-        // exercised (that gap is tracked at docs/architecture.md:186).
+        // from the nip44 feature of the nostr crate, so no second
+        // NIP-44 stack is exercised (that gap is tracked at
+        // docs/architecture.md:186).
         let (sender_sk, sender) = identity(0x01);
         let (recipient_sk, recipient) = identity(0x02);
         let envelope = seal_for_recipient(&sender_sk, recipient, b"control bytes").unwrap();
@@ -476,10 +477,10 @@ mod tests {
         assert_eq!(envelope.recipient, recipient);
         let sk = nostr_secret(&recipient_sk.secret_key()).unwrap();
         let pk = NostrPublicKey::from_byte_array(*sender.as_bytes());
-        // Version pin: the nip44 dependency exposes only V2
-        // (Version and Nonce have no V1 variant to regress to), and
-        // the seal site passes Nonce::V2 explicitly above — so any
-        // wire-format change fails compilation, not this test.
+        // Version pin: the nip44 feature of the nostr crate exposes
+        // only V2 (Version and Nonce have no V1 variant to regress
+        // to), and the seal site passes Nonce::V2 explicitly above —
+        // so any wire-format change fails compilation, not this test.
         let opened = nip44::decrypt_to_bytes(&sk, &pk, &envelope.ciphertext).unwrap();
         assert_eq!(opened, b"control bytes");
         // Fresh nonces: two seals of the same bytes never share

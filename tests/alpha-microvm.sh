@@ -27,8 +27,9 @@
 # growth bound by the fetch-member dedupe proof plus unit compaction
 # tests, and relay opacity by the convergence-phase probe above
 # (addressed kind-1059 wraps only, never cleartext rumors).
-# (Issue closure runs through the PR description, which carries the
-# Resolves: keyword — shell headers are invisible to the parser.)
+# (The control-plane issue reference lives in the PR cover note;
+# the Resolves: keyword goes on the merge commit, which is what the
+# auto-resolve parser reads.)
 set -euo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
@@ -170,7 +171,13 @@ pass "wraps address the member device and it never authors"
 # exits at the first match and SIGPIPEs nak, which under pipefail
 # turns a real multi-event leak into a silent pass. Draining grep
 # plus || true keeps the die reachable exactly when it matters.
-RUMORS="$(printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>"$RUN/logs/nak-9501.err" | grep '"kind":9501' || true)"
+nak_status=0
+RUMORS="$( { printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" \
+  2>"$RUN/logs/nak-9501.err" || nak_status=$?; } | grep '"kind":9501' || true)"
+# The leak query's real bound is the timeout above, not limit 500: a
+# zero-result subscription depends on the relay terminating it, so
+# "no rumor in thirty seconds" is what the pass below proves.
+[[ "$nak_status" != 124 ]] || die "9501 query timed out: leak check inconclusive (see logs/nak-9501.err)"
 [[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
 pass "relay carries no cleartext control rumors"
 

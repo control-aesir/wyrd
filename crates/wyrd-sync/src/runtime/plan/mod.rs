@@ -318,6 +318,11 @@ fn execute_inner(
             for storage in &attempt.transport_failed {
                 engine.note_fetch_transport_failure(&FetchKey::Storage(*storage));
             }
+            // Counted per sliced representation, not per item: the
+            // aggregate cannot undercount, so a burn always has its
+            // deadline counted beside it. Zero grants count too (dry
+            // budget is still budget pressure) but never burn.
+            report.deadlines += attempt.deadline_sliced.len();
             for (storage, slice) in &attempt.deadline_sliced {
                 if !slice.is_zero() {
                     engine.note_fetch_deadline(&FetchKey::Storage(*storage));
@@ -339,9 +344,10 @@ fn execute_inner(
                 FetchOutcome::Invalid => {
                     report.invalid += 1;
                 }
-                FetchOutcome::Deadline { .. } => {
-                    report.deadlines += 1;
-                }
+                // No count here: sliced representations are counted
+                // per candidate above, so the aggregate cannot
+                // undercount them.
+                FetchOutcome::Deadline { .. } => {}
                 FetchOutcome::Missing => report.missing += 1,
                 FetchOutcome::UnavailableKey => report.unavailable_keys += 1,
                 FetchOutcome::Transport => report.transport_errors += 1,

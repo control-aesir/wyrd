@@ -268,12 +268,15 @@ pub struct ExecuteReport {
     /// a failing transport is worth distinguishing for operators:
     /// both retry later, only one needs investigating.
     pub transport_errors: usize,
-    /// Attempts that ran out of their pass-budget slice this run:
-    /// budget evidence, never provider evidence. Counted so a
-    /// budget-starved pass is visible in diagnostics (rather than a
-    /// silent pile of `unfulfilled`); never struck as faulty, but
-    /// repeated slices back the representation off on the separate
-    /// burn ledger.
+    /// Attempts that ran out of their pass-budget slice this run,
+    /// counted per sliced representation (single-representation items
+    /// contribute one): budget evidence, never provider evidence.
+    /// Zero grants count too — dry budget is still budget pressure —
+    /// but never burn. Counted so a budget-starved pass is visible in
+    /// diagnostics (rather than a silent pile of `unfulfilled`);
+    /// never struck as faulty, but repeated nonzero slices back the
+    /// representation off on the separate burn ledger. Every burn has
+    /// its deadline counted beside it.
     pub deadlines: usize,
     /// Attempts finding peer absence: no bytes served, or no usable
     /// fetch candidate at all.
@@ -1307,10 +1310,13 @@ impl Engine {
     /// bulk transport error ........ unfulfilled plus transport_errors, retried
     ///                               next run; repeated failures back the
     ///                               representation off like invalid data
-    /// budget-sliced attempt ....... unfulfilled plus deadlines, retried next
-    ///                               run; never struck as faulty, but repeated
-    ///                               slices back the representation off on the
-    ///                               separate burn ledger
+    /// budget-sliced attempt ....... unfulfilled plus deadlines (one per
+    ///                               sliced representation), retried next
+    ///                               run; never struck as faulty, but
+    ///                               repeated nonzero slices back the
+    ///                               representation off on the separate
+    ///                               burn ledger (a zero grant counts
+    ///                               without backing off)
     /// epoch capability unheld ..... unfulfilled plus unavailable_keys, retried next run
     /// over fetch ceiling .......... unfulfilled plus invalid, never committed
     /// over ingest limits .......... unfulfilled plus invalid, never committed

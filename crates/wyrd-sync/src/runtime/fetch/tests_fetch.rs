@@ -998,6 +998,174 @@ fn strikes_and_burns_accumulate_separately_and_clear_together() {
     assert!(fixture.engine.fetch_budget_burns.is_empty());
 }
 
+/// Deadlines count per sliced representation, not per item: one
+/// content advertised by two providers that both slice records two
+/// deadlines and two burns (one key each), where per-item counting
+/// would record one. Two snapshots share one chunk content under two
+/// seals (fresh nonces, two storage addresses); the plan merges both
+/// providers under the one content id, so a single item carries two
+/// candidates.
+#[test]
+fn deadlines_count_per_representation_not_per_item() {
+    use crate::runtime::test_util::{announce_snapshot, intake_body_with_tree};
+
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let secrets = vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()];
+    // One chunk content, sealed twice: two storage addresses, two
+    // transport roots, one content id.
+    let plaintext = b"shared representation";
+    let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+    let object_key = epoch_secret.object_key(
+        &member_drive(),
+        admission.epoch,
+        &content,
+        ObjectKind::Chunk,
+        SEAL_VERSION,
+    );
+    let manifest_key_for = |snapshot: &SnapshotId| {
+        epoch_secret.manifest_key(&member_drive(), admission.epoch, snapshot)
+    };
+    let mut storages = Vec::new();
+    let mut transports = Vec::new();
+    let mut snapshots = Vec::new();
+    for tree_byte in [0xC1, 0xC2] {
+        let body =
+            intake_body_with_tree(&builder, &admission, ContentId::from_bytes([tree_byte; 32]));
+        let snapshot = body.snapshot_id();
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let entry = entry_for(
+            ObjectKind::Chunk,
+            admission.epoch,
+            &sealed_object,
+            &content,
+            plaintext,
+        )
+        .unwrap();
+        let root = Manifest::new(snapshot, vec![entry.clone()], Vec::new()).unwrap();
+        let (root_id, sealed_root) = seal_manifest(&manifest_key_for(&snapshot), &root).unwrap();
+        bulk.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: root_id,
+                sealed: sealed_root.encode(),
+            },
+        );
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+        bulk.publish_transport(sealed_root.encode());
+        bulk.publish_transport(sealed_object.encode());
+        storages.push(sealed_object.storage_id());
+        transports.push(entry.transport);
+        snapshots.push((body, snapshot, root_id, sealed_root));
+    }
+    // First snapshot through the full intake (capability included),
+    // second as an announcement against installed state.
+    let (_, _, root_a, sealed_a) = &snapshots[0];
+    let roots_a = AnnouncedRoots {
+        manifest: *root_a,
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_a.encode()).as_bytes()),
+    };
+    let _ = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        secrets.clone(),
+        roots_a,
+    );
+    let (body_b, _, root_b, sealed_b) = &snapshots[1];
+    let roots_b = AnnouncedRoots {
+        manifest: *root_b,
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_b.encode()).as_bytes()),
+    };
+    assert_eq!(
+        announce_snapshot(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &admission,
+            body_b,
+            roots_b
+        ),
+        1,
+        "the second announcement lands alone"
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(content, MaterializationState::Pinned)
+        .unwrap();
+    let sliced = |peer: &MemoryBulkSource| SlicedObjectRoutes {
+        inner: peer.clone(),
+        sliced_storage: storages.iter().cloned().collect(),
+        sliced_roots: transports.iter().cloned().collect(),
+        slice: std::time::Duration::from_millis(50),
+    };
+
+    // First call converges both bodies and roots (one pass — the
+    // link-less manifests carry their entries directly), then
+    // attempts the one item with both candidates: two deadlines for
+    // one item, which per-item counting would report as one.
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 2, "one per sliced representation");
+    assert_eq!(report.transport_errors, 0);
+    assert_eq!(report.invalid, 0);
+    // Steady calls slice both representations once per run.
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 2, "one per sliced representation");
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Both representation keys burned toward backoff together, and
+    // neither struck as faulty.
+    assert_eq!(
+        fixture.engine.fetch_budget_burns.len(),
+        2,
+        "one burn ledger entry per sliced representation"
+    );
+    assert!(
+        fixture.engine.fetch_strikes.is_empty(),
+        "slices never strike"
+    );
+    // Past the cooldown both representations retry together.
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 0, "burning off");
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Healing fulfills through the first candidate on the next run.
+    // Both backoff entries are gone: expiry cleared them on
+    // eligibility, and fulfillment clears the serving one (the
+    // alternate was attempted never — the early return after
+    // fulfillment — so it re-burns nothing).
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "shared content fulfills once");
+    assert!(
+        fixture.engine.fetch_budget_burns.is_empty(),
+        "expiry plus fulfillment cleared both burns"
+    );
+}
+
 /// The other half of the classification rule: an instant transport
 /// failure under an armed budget is still fault evidence and still
 /// strikes. Same harness as the cooldown twin above, but every run

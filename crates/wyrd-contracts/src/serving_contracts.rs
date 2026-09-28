@@ -236,3 +236,131 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
     loaded.rig.teardown();
     let _ = std::fs::remove_dir_all(&serve_dir);
 }
+
+/// Item-1 probe, boundary half: the same dead route as the restart
+/// test above, but every attempt runs under a 3 s pass slice — far
+/// shorter than a dead loopback dial. Each representation has exactly
+/// one provider, so every attempt holds the full remaining share and
+/// expires as a transport failure exactly as before: the slice
+/// shortens nothing, so the expiry is fault evidence and strikes.
+/// The dead phase must therefore count transport errors, cool the
+/// representations after the strike threshold, and recover past the
+/// cooldown after the restart — pinning end to end that the
+/// deadline/fault boundary did not move single-route behavior.
+/// (The multi-candidate walk itself is pinned in-crate by the
+/// budgeted walk tests over real iroh in `wyrd-sync/src/bulk.rs`,
+/// where candidate lists can be built dead-first by hand — route
+/// publication replaces, never prepends, so engine state cannot
+/// order a dead provider first.)
+///
+/// No slow gate needed: the slice caps every dead attempt at ~3 s, so
+/// the dead phase costs seconds, not dial timeouts.
+#[test]
+fn full_share_sliced_attempts_strike_like_master() {
+    let mut loaded = Loaded::new("full-share-dead.txt", b"full share dead contract");
+    let serve_dir = scratch_dir("serving-full-share-dead");
+    let vault = Vault::open(&serve_dir).unwrap();
+    vault.import(&loaded.snapshot.encode()).unwrap();
+    vault.import(&loaded.content.root.sealed.clone()).unwrap();
+    for (_, sealed) in &loaded.content.objects {
+        vault.import(sealed).unwrap();
+    }
+    let serving = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    serving.flush().unwrap();
+    loaded.publish_body_and_announcement(Some(serving.node_addr_bytes()));
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+
+    let mut engine = loaded.rig.take_engine();
+    let mut bulk = loopback_bulk_source();
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+    let mut objects = loaded.objects.clone();
+    // Converge everything structural while serving is up; objects
+    // stay unwanted, so only body and manifests land.
+    let first = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+    assert_eq!(first.snapshot_bodies, 1);
+    assert_eq!(first.manifests, 1);
+    // The recorded manifests add their entry routes: republish so the
+    // objects are addressable before serving dies.
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+
+    // Serving dies with the objects still unfetched. Every attempt
+    // holds the full remaining share against a dial that would stall
+    // for 30 s: full-share expiries are fault evidence, so the dead
+    // phase counts transport errors and cools the representations
+    // after the strike threshold — the backoff a hanging route with
+    // no one behind it must keep.
+    serving
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.want_all(&mut engine);
+    // Only the first object fits each 3 s budget: it burns the whole
+    // slice hanging, reports transport, and strikes, while the second
+    // is skipped by the spent guard (no trace — not starvation: it
+    // runs once the first cools). The two representations strike on
+    // alternate runs and both back off together at the end — the
+    // fault duty cycle, preserved under a slice.
+    for run in 0..8 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let report = engine
+            .execute_plan_sliced(&mut bulk, &mut objects, Some(deadline))
+            .unwrap();
+        assert_eq!(report.objects, 0, "nothing fulfills over the dead route");
+        assert_eq!(report.unfulfilled, 2, "both objects stay pending");
+        if run < 6 {
+            assert_eq!(
+                report.transport_errors, 1,
+                "full-share expiries count while striking"
+            );
+        } else {
+            assert_eq!(
+                report.transport_errors, 0,
+                "struck representations back off"
+            );
+        }
+    }
+
+    // Serving restarts on a fresh endpoint; the reannouncement's route
+    // update rotates the recorded route. Past their (desynchronized —
+    // the spent guard alternated the dead-phase strikes) cooldowns
+    // the attempts resume over the live route and both objects land
+    // with no fetching-side restart. Each lands on its own run, so
+    // the loop watches the store, not a single report.
+    let restarted = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    loaded.publish_body_and_announcement(Some(restarted.node_addr_bytes()));
+    let report = engine.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(report.accepted, 1, "the route update reannouncement");
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+    let mut landed = false;
+    for _ in 0..12 {
+        engine.execute_plan(&mut bulk, &mut objects).unwrap();
+        if loaded
+            .content
+            .content_ids
+            .iter()
+            .all(|id| objects.get(id).unwrap().is_some())
+        {
+            landed = true;
+            break;
+        }
+    }
+    assert!(
+        landed,
+        "the objects land over the new route past the cooldown"
+    );
+    for id in &loaded.content.content_ids {
+        assert!(
+            objects.get(id).unwrap().is_some(),
+            "every sealed object landed over live transport"
+        );
+    }
+    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    restarted
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.rig.teardown();
+    let _ = std::fs::remove_dir_all(&serve_dir);
+}

@@ -371,10 +371,22 @@ pub(crate) struct AnnouncedRoots {
 /// id computed here is the id `intake_snapshot` will announce — tests
 /// build manifests against this id before the control plane lands.
 pub(crate) fn intake_body(builder: &Builder, admission: &MembershipTransition) -> Snapshot {
+    intake_body_with_tree(builder, admission, ContentId::from_bytes([0xC1; 32]))
+}
+
+/// `intake_body` over an explicit tree: a second snapshot for tests
+/// whose shapes need two announcements (two roots converging, one
+/// shared chunk). The tree is the only input that varies between
+/// snapshots from one builder and admission.
+pub(crate) fn intake_body_with_tree(
+    builder: &Builder,
+    admission: &MembershipTransition,
+    tree: ContentId,
+) -> Snapshot {
     let owner = *builder.owners.iter().next().expect("tracked owner");
     let mut body = Snapshot::new(
         Vec::new(),
-        ContentId::from_bytes([0xC1; 32]),
+        tree,
         owner,
         admission.transition_id(),
         admission.epoch,
@@ -384,6 +396,34 @@ pub(crate) fn intake_body(builder: &Builder, admission: &MembershipTransition) -
     .unwrap();
     crate::authorization::test_util::sign_snapshot(&mut body, &builder.sk, &member_drive());
     body
+}
+
+/// Announce one more snapshot against already-installed capability
+/// and membership state: publishes the body bytes and queues only
+/// the announcement (no transitions, no capability redelivery), for
+/// tests that converge several snapshots in one fixture. Returns the
+/// drain's accepted count — one for a new announcement.
+pub(crate) fn announce_snapshot(
+    fixture: &mut Fixture,
+    bulk: &mut MemoryBulkSource,
+    builder: &Builder,
+    admission: &MembershipTransition,
+    body: &Snapshot,
+    roots: AnnouncedRoots,
+) -> usize {
+    bulk.publish_snapshot(body.snapshot_id(), body.encode());
+    bulk.publish_transport(body.encode());
+    let bound = announcement_msg_with(
+        &identity_secret(&builder.sk),
+        body.snapshot_id(),
+        admission.epoch,
+        admission.transition_id(),
+        body_root(body),
+        roots.manifest,
+        roots.transport,
+    );
+    queue(fixture, vec![deliver(fixture, admission.epoch, &bound)]);
+    drain(fixture).accepted
 }
 
 /// Seal and publish an empty root manifest for the snapshot under the

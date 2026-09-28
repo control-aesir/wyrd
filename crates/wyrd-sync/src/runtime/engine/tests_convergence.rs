@@ -138,6 +138,7 @@ fn repeated_restarts_are_idempotent() {
                 objects: 0,
                 unfulfilled: 0,
                 transport_errors: 0,
+                deadlines: 0,
                 missing: 0,
                 invalid: 0,
                 unavailable_keys: 0,

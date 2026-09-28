@@ -640,6 +640,833 @@ fn transport_failures_enter_cooldown_like_invalid_data() {
     assert_eq!(report.transport_errors, 1, "retried after the cooldown");
 }
 
+/// A peer whose object routes run out of pass budget (every sealed
+/// and transport fetch slices) while manifests and bodies still flow:
+/// the model of a pass too tight for the content provider, rather
+/// than a provider that went away. The injected `slice` keeps the
+/// two deadline meanings apart: nonzero models an attempt that
+/// consumed budget (burn-worthy), zero models a walk that stopped
+/// before asking (counted, never burned) — the same values the real
+/// boundary produces, so the plan cannot tell fixture from network.
+struct SlicedObjectRoutes {
+    inner: MemoryBulkSource,
+    sliced_storage: BTreeSet<StorageId>,
+    sliced_roots: BTreeSet<BaoRoot>,
+    slice: std::time::Duration,
+}
+
+impl AttemptBudget for SlicedObjectRoutes {}
+
+impl BulkSource for SlicedObjectRoutes {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.sliced_storage.contains(storage) {
+            return Err(BulkError::Deadline { slice: self.slice });
+        }
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.sliced_roots.contains(root) {
+            return Err(BulkError::Deadline { slice: self.slice });
+        }
+        self.inner.fetch_transport(root, max)
+    }
+}
+
+/// One representation dead, one sliced: the aggregate verdict
+/// carries the completed fault while the deadline count carries only
+/// the sliced representation. The model of a re-announced route
+/// beside a route that went away for good.
+struct DeadAndSlicedObjectRoutes {
+    inner: MemoryBulkSource,
+    dead_storage: BTreeSet<StorageId>,
+    dead_roots: BTreeSet<BaoRoot>,
+    sliced_storage: BTreeSet<StorageId>,
+    sliced_roots: BTreeSet<BaoRoot>,
+    slice: std::time::Duration,
+}
+
+impl AttemptBudget for DeadAndSlicedObjectRoutes {}
+
+impl BulkSource for DeadAndSlicedObjectRoutes {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.dead_storage.contains(storage) {
+            return Err(BulkError::Transport("route dead".into()));
+        }
+        if self.sliced_storage.contains(storage) {
+            return Err(BulkError::Deadline { slice: self.slice });
+        }
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.dead_roots.contains(root) {
+            return Err(BulkError::Transport("route dead".into()));
+        }
+        if self.sliced_roots.contains(root) {
+            return Err(BulkError::Deadline { slice: self.slice });
+        }
+        self.inner.fetch_transport(root, max)
+    }
+}
+
+/// A sliced attempt is budget evidence, never representation evidence:
+/// it counts toward burn-backoff but never strikes as faulty. The
+/// item stays pending, repeated slices back it off on the separate
+/// burn ledger (same duty cycle as strikes, so hanging routes stop
+/// being retried every pass), and healing the route fulfills — with
+/// the strike ledger provably untouched throughout.
+#[test]
+fn deadline_slices_burn_backoff_without_striking() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"sliced budget",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    // The content object's routes slice while manifests, trees, and
+    // bodies keep flowing: the model of a pass too tight for the
+    // provider rather than a provider that went away. Nonzero slice:
+    // these attempts consumed budget, so they burn.
+    let sliced = |peer: &MemoryBulkSource| SlicedObjectRoutes {
+        inner: peer.clone(),
+        sliced_storage: BTreeSet::from([published.object_storage]),
+        sliced_roots: BTreeSet::from([published.object_transport]),
+        slice: std::time::Duration::from_millis(50),
+    };
+
+    // The first call converges manifests (two passes, two slices);
+    // every later call slices once. Slices count as deadlines, never
+    // as transport errors or invalid data.
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 2, "sliced while converging");
+    assert_eq!(report.transport_errors, 0);
+    assert_eq!(report.invalid, 0);
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 1, "sliced while burning");
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // The burn threshold backs the representation off like a strike
+    // would — without striking: attempts stop, the item stays
+    // pending, and the fault ledger stays empty.
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 0, "burning off");
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    assert!(
+        fixture.engine.fetch_strikes.is_empty(),
+        "burns must never strike as faulty"
+    );
+    assert!(
+        !fixture.engine.fetch_budget_burns.is_empty(),
+        "slices must burn toward backoff"
+    );
+    // Past the cooldown the attempts resume, still slicing.
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 1, "retried after the burn cooldown");
+    // Healing the route fulfills on the very next run.
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "healed route fulfills after burns");
+}
+
+/// The zero-grant twin of the burn test: a walk that stops before
+/// asking counts its deadline but records nothing — no strike, no
+/// burn — so a provider that was never asked can never cool. After
+/// more runs than would cool any backoff, healing fulfills
+/// immediately: the ledger must be empty, not just expired.
+#[test]
+fn zero_grant_deadlines_count_without_backing_off() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"zero grant",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    // Zero slice: the model of a walk that stopped before asking.
+    let unasked = |peer: &MemoryBulkSource| SlicedObjectRoutes {
+        inner: peer.clone(),
+        sliced_storage: BTreeSet::from([published.object_storage]),
+        sliced_roots: BTreeSet::from([published.object_transport]),
+        slice: std::time::Duration::ZERO,
+    };
+
+    // More runs than any backoff survives, and every run shows the
+    // same shape: counted, pending, never cooled.
+    let mut last = 0;
+    for _ in 0..u64::from(FETCH_MAX_STRIKES) + FETCH_COOLDOWN_PASSES + 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut unasked(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.objects, 0);
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+        last = report.deadlines;
+    }
+    assert!(last > 0, "zero grants count toward deadlines");
+    assert!(
+        fixture.engine.fetch_strikes.is_empty(),
+        "unasked providers never strike"
+    );
+    assert!(
+        fixture.engine.fetch_budget_burns.is_empty(),
+        "unasked providers never burn"
+    );
+    // Healing fulfills on the very next run: nothing cooled, nothing
+    // to wait out.
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "healed route fulfills with no backoff");
+}
+
+/// Strikes and burns are separate ledgers with one shared cooldown:
+/// interleaved faults and slices accumulate independently, either
+/// threshold cools, expiry clears both, and fulfillment clears both.
+/// This pins the interplay directly instead of relying on
+/// `fetch_eligible` to imply it.
+#[test]
+fn strikes_and_burns_accumulate_separately_and_clear_together() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"both ledgers",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    let dead = |peer: &MemoryBulkSource| DeadObjectRoutes {
+        inner: peer.clone(),
+        dead_storage: BTreeSet::from([published.object_storage]),
+        dead_roots: BTreeSet::from([published.object_transport]),
+    };
+    let sliced = |peer: &MemoryBulkSource| SlicedObjectRoutes {
+        inner: peer.clone(),
+        sliced_storage: BTreeSet::from([published.object_storage]),
+        sliced_roots: BTreeSet::from([published.object_transport]),
+        slice: std::time::Duration::from_millis(50),
+    };
+
+    // Alternate faults and slices: strikes and burns climb together,
+    // and the third strike cools while burns sit at two.
+    for (run, faulty) in [true, false, true, false, true].iter().enumerate() {
+        let report = if *faulty {
+            fixture.engine.execute_plan(&mut dead(&bulk), &mut objects)
+        } else {
+            fixture
+                .engine
+                .execute_plan(&mut sliced(&bulk), &mut objects)
+        }
+        .unwrap();
+        if run == 0 {
+            // First call converges manifests (two passes).
+            assert_eq!(report.transport_errors + report.deadlines, 2);
+        } else if *faulty {
+            assert_eq!(report.transport_errors, 1);
+        } else {
+            assert_eq!(report.deadlines, 1);
+        }
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    assert_eq!(fixture.engine.fetch_strikes.len(), 1, "three faults struck");
+    assert_eq!(
+        fixture.engine.fetch_budget_burns.len(),
+        1,
+        "two slices burned"
+    );
+    // Cooled: the next eight runs attempt nothing on either fixture
+    // (exactly FETCH_COOLDOWN_PASSES skipped calls — the run that
+    // struck is R, cooldown ends past R+8, so these eight stay under).
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut dead(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.deadlines, 0);
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 1, "retried after the cooldown");
+    assert!(
+        fixture.engine.fetch_strikes.is_empty(),
+        "expiry cleared the strikes"
+    );
+    assert_eq!(
+        fixture.engine.fetch_budget_burns.values().next(),
+        Some(&(1, fixture.engine.fetch_run)),
+        "burns restarted from one"
+    );
+    // Healing fulfills and clears everything.
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1);
+    assert!(fixture.engine.fetch_budget_burns.is_empty());
+}
+
+/// Deadlines count per sliced representation, not per item: one
+/// content advertised by two providers that both slice records two
+/// deadlines and two burns (one key each), where per-item counting
+/// would record one. Two snapshots share one chunk content under two
+/// seals (fresh nonces, two storage addresses); the plan merges both
+/// providers under the one content id, so a single item carries two
+/// candidates.
+#[test]
+fn deadlines_count_per_representation_not_per_item() {
+    use crate::runtime::test_util::{announce_snapshot, intake_body_with_tree};
+
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let secrets = vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()];
+    // One chunk content, sealed twice: two storage addresses, two
+    // transport roots, one content id.
+    let plaintext = b"shared representation";
+    let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+    let object_key = epoch_secret.object_key(
+        &member_drive(),
+        admission.epoch,
+        &content,
+        ObjectKind::Chunk,
+        SEAL_VERSION,
+    );
+    let manifest_key_for = |snapshot: &SnapshotId| {
+        epoch_secret.manifest_key(&member_drive(), admission.epoch, snapshot)
+    };
+    let mut storages = Vec::new();
+    let mut transports = Vec::new();
+    let mut snapshots = Vec::new();
+    for tree_byte in [0xC1, 0xC2] {
+        let body =
+            intake_body_with_tree(&builder, &admission, ContentId::from_bytes([tree_byte; 32]));
+        let snapshot = body.snapshot_id();
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let entry = entry_for(
+            ObjectKind::Chunk,
+            admission.epoch,
+            &sealed_object,
+            &content,
+            plaintext,
+        )
+        .unwrap();
+        let root = Manifest::new(snapshot, vec![entry.clone()], Vec::new()).unwrap();
+        let (root_id, sealed_root) = seal_manifest(&manifest_key_for(&snapshot), &root).unwrap();
+        bulk.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: root_id,
+                sealed: sealed_root.encode(),
+            },
+        );
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+        bulk.publish_transport(sealed_root.encode());
+        bulk.publish_transport(sealed_object.encode());
+        storages.push(sealed_object.storage_id());
+        transports.push(entry.transport);
+        snapshots.push((body, snapshot, root_id, sealed_root));
+    }
+    // First snapshot through the full intake (capability included),
+    // second as an announcement against installed state.
+    let (_, _, root_a, sealed_a) = &snapshots[0];
+    let roots_a = AnnouncedRoots {
+        manifest: *root_a,
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_a.encode()).as_bytes()),
+    };
+    let _ = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        secrets.clone(),
+        roots_a,
+    );
+    let (body_b, _, root_b, sealed_b) = &snapshots[1];
+    let roots_b = AnnouncedRoots {
+        manifest: *root_b,
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_b.encode()).as_bytes()),
+    };
+    assert_eq!(
+        announce_snapshot(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &admission,
+            body_b,
+            roots_b
+        ),
+        1,
+        "the second announcement lands alone"
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(content, MaterializationState::Pinned)
+        .unwrap();
+    let sliced = |peer: &MemoryBulkSource| SlicedObjectRoutes {
+        inner: peer.clone(),
+        sliced_storage: storages.iter().cloned().collect(),
+        sliced_roots: transports.iter().cloned().collect(),
+        slice: std::time::Duration::from_millis(50),
+    };
+
+    // First call converges both bodies and roots (one pass — the
+    // link-less manifests carry their entries directly), then
+    // attempts the one item with both candidates: two deadlines for
+    // one item, which per-item counting would report as one.
+    let report = fixture
+        .engine
+        .execute_plan(&mut sliced(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 2, "one per sliced representation");
+    assert_eq!(report.transport_errors, 0);
+    assert_eq!(report.invalid, 0);
+    // Steady calls slice both representations once per run.
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 2, "one per sliced representation");
+        assert_eq!(report.transport_errors, 0);
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Both representation keys burned toward backoff together, and
+    // neither struck as faulty.
+    assert_eq!(
+        fixture.engine.fetch_budget_burns.len(),
+        2,
+        "one burn ledger entry per sliced representation"
+    );
+    assert!(
+        fixture.engine.fetch_strikes.is_empty(),
+        "slices never strike"
+    );
+    // Past the cooldown both representations retry together.
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut sliced(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 0, "burning off");
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Healing fulfills through the first candidate on the next run.
+    // Both backoff entries are gone: expiry cleared them on
+    // eligibility, and fulfillment clears the serving one (the
+    // alternate was attempted never — the early return after
+    // fulfillment — so it re-burns nothing).
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "shared content fulfills once");
+    assert!(
+        fixture.engine.fetch_budget_burns.is_empty(),
+        "expiry plus fulfillment cleared both burns"
+    );
+}
+
+/// The aggregate-outranks-deadline twin of the per-representation
+/// test: a sliced representation beside one whose completed fault
+/// wins the aggregate. The count is 1 while the verdict is
+/// `transport_errors`, the burn ledger holds only the sliced key,
+/// and the strike ledger holds only the dead one — so a future
+/// change re-introducing an aggregate count (2 with no test
+/// objecting) fails here.
+#[test]
+fn deadline_beside_completed_fault_counts_one_with_fault_verdict() {
+    use crate::runtime::test_util::{announce_snapshot, intake_body_with_tree};
+
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let secrets = vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()];
+    // One chunk content, sealed twice: two storage addresses, two
+    // transport roots, one content id.
+    let plaintext = b"split verdict representation";
+    let content = ContentId::derive(ObjectKind::Chunk, plaintext);
+    let object_key = epoch_secret.object_key(
+        &member_drive(),
+        admission.epoch,
+        &content,
+        ObjectKind::Chunk,
+        SEAL_VERSION,
+    );
+    let manifest_key_for = |snapshot: &SnapshotId| {
+        epoch_secret.manifest_key(&member_drive(), admission.epoch, snapshot)
+    };
+    let mut storages = Vec::new();
+    let mut transports = Vec::new();
+    let mut snapshots = Vec::new();
+    for tree_byte in [0xC1, 0xC2] {
+        let body =
+            intake_body_with_tree(&builder, &admission, ContentId::from_bytes([tree_byte; 32]));
+        let snapshot = body.snapshot_id();
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, plaintext).unwrap();
+        let entry = entry_for(
+            ObjectKind::Chunk,
+            admission.epoch,
+            &sealed_object,
+            &content,
+            plaintext,
+        )
+        .unwrap();
+        let root = Manifest::new(snapshot, vec![entry.clone()], Vec::new()).unwrap();
+        let (root_id, sealed_root) = seal_manifest(&manifest_key_for(&snapshot), &root).unwrap();
+        bulk.publish_root(
+            snapshot,
+            SealedManifest {
+                content_id: root_id,
+                sealed: sealed_root.encode(),
+            },
+        );
+        bulk.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+        bulk.publish_transport(sealed_root.encode());
+        bulk.publish_transport(sealed_object.encode());
+        storages.push(sealed_object.storage_id());
+        transports.push(entry.transport);
+        snapshots.push((body, snapshot, root_id, sealed_root));
+    }
+    // First snapshot through the full intake (capability included),
+    // second as an announcement against installed state.
+    let (_, _, root_a, sealed_a) = &snapshots[0];
+    let roots_a = AnnouncedRoots {
+        manifest: *root_a,
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_a.encode()).as_bytes()),
+    };
+    let _ = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        secrets.clone(),
+        roots_a,
+    );
+    let (body_b, _, root_b, sealed_b) = &snapshots[1];
+    let roots_b = AnnouncedRoots {
+        manifest: *root_b,
+        transport: BaoRoot::from_bytes(*blake3::hash(&sealed_b.encode()).as_bytes()),
+    };
+    assert_eq!(
+        announce_snapshot(
+            &mut fixture,
+            &mut bulk,
+            &builder,
+            &admission,
+            body_b,
+            roots_b
+        ),
+        1,
+        "the second announcement lands alone"
+    );
+    let healthy = bulk.clone();
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(content, MaterializationState::Pinned)
+        .unwrap();
+    // First representation dead, second sliced: the walk attempts
+    // both, the fault wins the aggregate, the count keeps only the
+    // slice.
+    let routed = |peer: &MemoryBulkSource| DeadAndSlicedObjectRoutes {
+        inner: peer.clone(),
+        dead_storage: BTreeSet::from([storages[0]]),
+        dead_roots: BTreeSet::from([transports[0]]),
+        sliced_storage: BTreeSet::from([storages[1]]),
+        sliced_roots: BTreeSet::from([transports[1]]),
+        slice: std::time::Duration::from_millis(50),
+    };
+
+    let report = fixture
+        .engine
+        .execute_plan(&mut routed(&bulk), &mut objects)
+        .unwrap();
+    assert_eq!(report.deadlines, 1, "only the sliced representation counts");
+    assert_eq!(
+        report.transport_errors, 1,
+        "the completed fault wins the aggregate"
+    );
+    assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    assert_eq!(
+        fixture.engine.fetch_budget_burns.len(),
+        1,
+        "only the sliced representation burns"
+    );
+    assert_eq!(
+        fixture.engine.fetch_strikes.len(),
+        1,
+        "only the dead representation strikes"
+    );
+    // Steady runs keep the pairing: one deadline, one fault.
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut routed(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 1, "only the sliced representation counts");
+        assert_eq!(
+            report.transport_errors, 1,
+            "the completed fault wins the aggregate"
+        );
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Past the cooldown both representations retry together.
+    for _ in 0..FETCH_COOLDOWN_PASSES {
+        let report = fixture
+            .engine
+            .execute_plan(&mut routed(&bulk), &mut objects)
+            .unwrap();
+        assert_eq!(report.deadlines, 0, "burning off");
+        assert_eq!(report.transport_errors, 0, "striking off");
+        assert_eq!(report.unfulfilled, 1, "the item stays pending");
+    }
+    // Healing fulfills through either candidate on the next run.
+    let report = fixture
+        .engine
+        .execute_plan(&mut healthy.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "shared content fulfills once");
+}
+
+/// The other half of the classification rule: an instant transport
+/// failure under an armed budget is still fault evidence and still
+/// strikes. Same harness as the cooldown twin above, but every run
+/// executes under a generous slice — nothing actually expires, so a
+/// `Transport` here completed its observation and must back off
+/// exactly like the unbounded run.
+#[test]
+fn transport_faults_still_strike_under_budget() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"budgeted fault",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    let dead = |peer: &MemoryBulkSource| DeadObjectRoutes {
+        inner: peer.clone(),
+        dead_storage: BTreeSet::from([published.object_storage]),
+        dead_roots: BTreeSet::from([published.object_transport]),
+    };
+    let sliced_run = |engine: &mut crate::runtime::engine::Engine,
+                      bulk: &mut DeadObjectRoutes,
+                      objects: &mut MemoryObjectStore| {
+        engine.execute_plan_sliced(
+            bulk,
+            objects,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        )
+    };
+
+    // The first call converges manifests (two passes), so the object
+    // is attempted in both while striking once; every later call
+    // attempts once, striking once per run — budget armed throughout.
+    let report = sliced_run(&mut fixture.engine, &mut dead(&bulk), &mut objects).unwrap();
+    assert_eq!(report.transport_errors, 2, "attempted while striking");
+    for _ in 0..FETCH_MAX_STRIKES - 1 {
+        let report = sliced_run(&mut fixture.engine, &mut dead(&bulk), &mut objects).unwrap();
+        assert_eq!(report.transport_errors, 1, "attempted while striking");
+    }
+    // The strike threshold cools the representation even with the
+    // budget armed: faults back off, slices burn off, same duty
+    // cycle, separate ledgers.
+    let report = sliced_run(&mut fixture.engine, &mut dead(&bulk), &mut objects).unwrap();
+    assert_eq!(report.transport_errors, 0, "backing off");
+    assert_eq!(report.unfulfilled, 1, "the item stays pending");
+}
+
 #[test]
 fn fulfillment_clears_fetch_strikes() {
     let mut fixture = fixture();

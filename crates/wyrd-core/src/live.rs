@@ -1168,6 +1168,7 @@ where
             objects = fetched.objects,
             unfulfilled = fetched.unfulfilled,
             transport_errors = fetched.transport_errors,
+            deadlines = fetched.deadlines,
             missing = fetched.missing,
             invalid = fetched.invalid,
             unavailable_keys = fetched.unavailable_keys,

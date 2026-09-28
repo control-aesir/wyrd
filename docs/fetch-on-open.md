@@ -197,17 +197,33 @@ Decided properties:
    the truth; the daemon merges them at publish and the view exposes
    the result. FUSE never mutates materialization state, so
    "FUSE says Fetching while engine says Cached" cannot arise.
-8. **Every eligible provider is attempted each pass.** A
+ 8. **Each pass attempts every eligible provider the walk reaches.**
+    A
    representation may name several providers (a dead route beside a
    live one after a serving restart). Under a pass budget each
-   remaining candidate gets a fair share of the time left, so a
-   slow-first provider cannot spend the whole slice on its dial and
-   starve the rest: the pass attempts every candidate. Two bounds
+   remaining candidate gets a fair share of the time left, floored so
+   an early slow-but-live candidate gets a usable attempt. No
+   candidate takes more than half of what's left, so a dead-first
+   provider cannot spend the whole slice — but tails shrink
+   geometrically, so with several hanging candidates ahead a late
+   live route can get an unusably small slice, and a spent walk
+   leaves the remaining candidates unattempted until the next pass.
+   Candidate lists are
+   short in practice (bounded by the distinct recorded providers for
+   one address), so the walk reaches the live route. Two bounds
    apply: a cooled representation is not attempted at all, so a
    re-announced route is fetched once its cooldown lapses, not
-   necessarily in the pass that learns it; and a share that expires
-   strikes like any transport failure, so a slow-but-live candidate
-   can cool under a tight budget (no floor yet).
+   necessarily in the pass that learns it; and only subdivided
+   attempts expire as deadlines — counted, and repeated nonzero
+   slices back the representation off on the separate burn ledger —
+   while a full-share attempt (the only or last candidate, or any
+   single-route fetch outside a walk, which is the production case)
+   expires as a transport failure exactly as before, so a hanging
+   route with no one behind it still backs off. A zero-grant
+   deadline (the walk stopped before attempting) counts — when it
+   is the representation's whole story; a fallback zero grant
+   masked by a primary outcome is not counted — but never backs
+   off: a provider never asked carries no evidence.
 
 ## What open() materializes vs what read() demands
 
@@ -304,8 +320,10 @@ Test matrix (each locks a decided invariant):
   budget far shorter than a dead dial, the run still attempts the
   live route and fulfills → a re-announced route recovers without a
   restart once its cooldown lapses, and a dead candidate never
-  starves the rest (a slow-but-live candidate gets a smaller share
-  and can strike on expiry — no floor yet).
+  starves the rest (an early slow-but-live candidate gets a floored
+  share; a subdivided share that expires reports a counted,
+  unstriking deadline with burn-backoff, while a full-share expiry
+  still strikes).
 - **Want coalescing**: `Want(X)` ×3 → one in-flight X → three waiters
   complete (and a terminal failure wakes all three with failure).
 - **Timeout then completion**: want times out → `EIO` → materialization

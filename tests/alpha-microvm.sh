@@ -131,12 +131,17 @@ pass "owner and member converge across hosts"
 # already gated on relay readiness, so an empty answer is a failure,
 # not a connection flakiness.
 NAK="nix run --quiet nixpkgs#nak --"
-WRAPS="$($NAK req -k 1059 -l 500 "$RELAY_URL" 2>/dev/null | grep '"kind":1059' || true)"
+# Stdin filter form (not -k/-l flags): nixpkgs nak 0.17.4 answers
+# flag-built filters with zero events on this relay while the stdin
+# form reads fine — observed on odin, so pin the working form.
+REQ1059='{"kinds":[1059],"limit":500}'
+REQ9501='{"kinds":[9501],"limit":500}'
+WRAPS="$(printf '%s' "$REQ1059" | $NAK req "$RELAY_URL" 2>/dev/null | grep '"kind":1059' || true)"
 [[ -n "$WRAPS" ]] || die "no kind-1059 wraps on the relay: control plane never flowed"
 [[ -z "$(printf '%s\n' "$WRAPS" | grep -v '"p"' || true)" ]] \
   || die "gift wraps without recipient p tags on the relay"
 pass "control plane crossed the relay as addressed gift wraps only"
-if $NAK req -k 9501 -l 500 "$RELAY_URL" 2>/dev/null | grep -q '"kind":9501'; then
+if printf '%s' "$REQ9501" | $NAK req "$RELAY_URL" 2>/dev/null | grep -q '"kind":9501'; then
   die "relay carries a bare kind-9501 rumor: control leaked in cleartext"
 fi
 pass "relay carries no cleartext control rumors"

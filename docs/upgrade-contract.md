@@ -44,14 +44,18 @@ Releases are not required to write every format they read:
    (`object-model.md` decision 30). Manifests are the one exception:
    entry versions are seal versions hashed into the manifest payload,
    so a seal-version fork moves the manifest identities that name it.
-2. **Every persistent format has an explicit version.** Object envelopes
-   carry `wyrd_format::envelope::VERSION` (the object framing, distinct
-   from sealed-object envelopes); sealed objects carry `SEAL_VERSION`;
-   rotation deliveries carry `ROTATION_VERSION`; escrow sidecar records
-   carry `ESCROW_VERSION`; drive custody records carry `KEYSTORE_VERSION`
-   (owner) and `MEMBER_KEYSTORE_VERSION` (member) — the one format that
-   already reads two versions at once; commit envelopes carry
-   `COMMIT_VERSION`; control messages carry `CONTROL_VERSION`.
+2. **Every persistent format has an explicit version.** Membership in
+   this list is: formats persisted at rest or recorded in signed archive
+   state. Object envelopes carry `wyrd_format::envelope::VERSION` (the
+   object framing, distinct from sealed-object envelopes); sealed objects
+   carry `SEAL_VERSION`; rotation deliveries carry `ROTATION_VERSION`;
+   escrow sidecar records carry `ESCROW_VERSION`; drive custody records
+   carry `KEYSTORE_VERSION` (owner) and `MEMBER_KEYSTORE_VERSION`
+   (member) — the one format that already reads two versions at once;
+   node addresses carry `NODE_ADDR_VERSION` (recorded in signed
+   announcements); bootstrap envelopes carry `BOOTSTRAP_VERSION`;
+   commit envelopes carry `COMMIT_VERSION`; control messages carry
+   `CONTROL_VERSION`.
    Documented exception: durable fact *payloads* are versioned
    before the v1 freeze (open issue, v0.9.0 milestone), so until
    then replay normalizes only the envelope layer and the payload

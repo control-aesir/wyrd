@@ -1,5 +1,8 @@
 //! Sync-layer ingest limits: attacker-controlled bytes meet the decoders
-//! here, before transport exists to hand them over.
+//! here, before transport exists to hand them over. (Currently reachable
+//! from tests only: production object paths derive straight from
+//! plaintext bodies, so this module specifies the seam rather than
+//! serving a live wire path.)
 //!
 //! Two layers, and the split is deliberate:
 //!

@@ -1,6 +1,11 @@
 //! Sync-layer ingest limits: attacker-controlled bytes meet the decoders
 //! here, before transport exists to hand them over.
 //!
+//! One function is the exception to that liveness: [`accept_envelope`]
+//! is currently reachable from tests only (production object paths
+//! derive straight from plaintext bodies), so it specifies the
+//! framing/identity seam rather than serving a live wire path.
+//!
 //! Two layers, and the split is deliberate:
 //!
 //! 1. [`accept_envelope`] enforces framing plus total-bytes ceilings
@@ -530,6 +535,28 @@ mod tests {
                 bytes: SMALL.max_chunk_bytes - HEADER_LEN + 1,
                 max: SMALL.max_chunk_bytes - HEADER_LEN,
             })
+        );
+    }
+
+    #[test]
+    fn accept_envelope_framing_does_not_move_content_identity() {
+        // object-model.md decision 30 at the framing/identity seam as
+        // specified: a framed object accepted at the boundary derives
+        // the same ContentId as its bare payload. (`accept_envelope`
+        // has no non-test caller today — the production object paths
+        // derive straight from plaintext bodies — so this pins the
+        // specified seam, not a live wire path.)
+        let payload = b"boundary framing payload";
+        let framed = Envelope {
+            kind: ObjectKind::Chunk,
+            payload: payload.to_vec(),
+        }
+        .encode();
+        let env = accept_envelope(&SMALL, &framed).unwrap();
+        assert_eq!(env.kind, ObjectKind::Chunk);
+        assert_eq!(
+            ContentId::derive(env.kind, &env.payload),
+            ContentId::derive(ObjectKind::Chunk, payload)
         );
     }
 }

@@ -2,7 +2,10 @@
 //! test per invariant direction, composed end to end over the public
 //! APIs — the same single-shape rule as the rest of the suite (all
 //! contracts are `#[cfg(test)]` mods in `src/`, no `tests/` integration
-//! targets).
+//! targets). The one entry outside that scope is contract 42,
+//! `content_identity_is_payload_based_across_framing`, which pins
+//! `object-model.md` decision 30 end to end and lives here because the
+//! memory/disk store seam is its acceptance boundary.
 //!
 //! Fixture convention, decided on the contract issue: fixtures are
 //! data-only under `tests/fixtures/stores/<release>/`, read at runtime
@@ -24,7 +27,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
-use wyrd_format::{FsObjectStore, ObjectKind, ObjectStore};
+use wyrd_format::{
+    ContentId, FsObjectStore, FsStoreError, MemoryObjectStore, MemoryStoreError, ObjectKind,
+    ObjectStore,
+};
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
 use wyrd_sync::durable::{DurableStore, Fact};
 use wyrd_sync::keys::EpochSecret;
@@ -525,4 +531,52 @@ fn upgrade_unknown_refuses_loudly() {
         store.load().is_err(),
         "a flipped commit version refuses to load"
     );
+}
+
+/// Object-identity decision 30 (`object-model.md`): ContentId derives
+/// exclusively from the canonical payload under the identity-domain
+/// context (contract 42). Scoped honestly: this entry pins
+/// framing-invariance at the store boundary (memory and disk) and kind
+/// separation from the derivation context; the store-boundary kind
+/// refusal is `insert_verified_uses_payload_identity_not_envelope_identity`
+/// in `wyrd-format`, and identity-domain forking rides the golden vectors
+/// there.
+/// End-to-end over the public APIs: memory and disk stores as the
+/// acceptance boundary, Envelope as the framing.
+#[test]
+fn content_identity_is_payload_based_across_framing() {
+    let payload = b"contract payload preimage";
+    let expected = ContentId::derive(ObjectKind::Chunk, payload);
+    // Same payload + same context through the framing round-trip.
+    let framed = Envelope {
+        kind: ObjectKind::Chunk,
+        payload: payload.to_vec(),
+    }
+    .encode();
+    let decoded = Envelope::decode(&framed).unwrap();
+    let mut mem = MemoryObjectStore::default();
+    mem.insert_verified(ObjectKind::Chunk, &expected, &decoded.payload)
+        .unwrap();
+    // Framing bytes are not payload: rejected under the same expectation,
+    // naming the variant the way the disk leg does.
+    assert!(matches!(
+        mem.insert_verified(ObjectKind::Chunk, &expected, &framed),
+        Err(MemoryStoreError::IdentityMismatch { .. })
+    ));
+    // Same boundary on disk: the payload verifies and reads back, while
+    // the framed bytes are refused as a foreign preimage.
+    let dir = scratch_dir("identity-framing");
+    let mut disk = FsObjectStore::open(dir).unwrap();
+    disk.insert_verified(ObjectKind::Chunk, &expected, payload)
+        .unwrap();
+    assert_eq!(disk.get(&expected).unwrap().as_deref(), Some(&payload[..]));
+    assert!(matches!(
+        disk.insert_verified(ObjectKind::Chunk, &expected, &framed),
+        Err(FsStoreError::IdentityMismatch { .. })
+    ));
+    // Kind separation rides the context, not the framing; the
+    // identity-domain fork property itself is carried by the golden
+    // vectors (object-model.md decision 30).
+    let other = ContentId::derive(ObjectKind::Tree, payload);
+    assert_ne!(expected, other);
 }

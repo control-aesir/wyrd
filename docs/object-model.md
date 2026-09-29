@@ -28,7 +28,7 @@ Three distinct concerns, never collapsed:
 | Identity | Definition | Used by | Seen by |
 |---|---|---|---|
 | **DriveId** | random 256-bit, minted once per drive | namespaces everything: manifests, announcements, signatures | drive members; harmless if leaked |
-| **ContentId** | `BLAKE3-derive_key("wyrd content v1/<kind>", plaintext)` | Merkle trees, snapshots, local dedup | drive members only |
+| **ContentId** | `BLAKE3-derive_key("wyrd content v1/<kind>", canonical payload)` — payload-based identity (decision 30) | Merkle trees, snapshots, local dedup | drive members only |
 | **StorageId** | `BLAKE3-derive_key("wyrd storage v1", ciphertext)` | object placement, fetch addresses | everyone, including vaults |
 | **TransitionId** | `BLAKE3-derive_key("wyrd transition id v1", signing preimage ‖ signature)` | membership log, snapshot authorization | drive members only |
 
@@ -67,16 +67,50 @@ plaintext must also hash to the expected Content ID. Full construction in
 
 ## Canonical encoding
 
-Every object is a typed envelope; identity is defined over exactly these
-bytes:
+Every object has a canonical payload and a typed envelope carrying it:
 
 ```
 offset  size  field
 0       4     magic      = "wyrd"
-4       1     version    = 0x00 (v0)
+4       1     envelope version = 0x00 (v0 representation)
 5       1     kind       = 0x00 chunk | 0x01 tree | 0x02 snapshot | 0x03 manifest
 6       ..    payload    (kind-specific, canonical)
 ```
+
+An object's ContentId is derived exclusively from its canonical payload
+under the object's identity-domain context
+(`BLAKE3-derive_key("wyrd content v1/<kind>", payload)`). The envelope is
+the object's versioned representation and transport/storage framing;
+envelope framing bytes (magic, envelope version, kind byte) are not part
+of the ContentId input.
+
+Two versions, two jobs — never use `VERSION` unqualified in normative
+identity prose:
+
+| Version | Lives in | Job |
+|---|---|---|
+| **Identity-domain version** | the ContentId derivation context (`... v1/...`) | changing it intentionally forks identity |
+| **Envelope version** | the envelope framing byte | describes the serialized representation; not hashed into ContentId unless a future contract explicitly declares that representation version identity-bearing |
+
+| Component | ContentId binding |
+|---|---|
+| payload | hashed |
+| kind | derive-key context |
+| identity-generation version | derive-key context |
+| envelope magic | not identity-bearing |
+| envelope representation version | not identity-bearing by itself |
+
+Deriving a ContentId from envelope bytes is a contract violation unless
+the identity-domain contract has explicitly changed. A representation
+change declared identity-neutral by the contract must not move ContentId
+for the same payload and context; a semantic or identity-contract change
+takes a new derivation context and produces a new representation, while
+existing objects stay immutable and readable under their original
+contract. Manifests are the explicit exception: each manifest entry
+carries the referenced representation's seal version inside the hashed
+payload, so a seal-version fork moves manifest identities that name the
+new version (the entry field is documented at the type, not as envelope
+framing).
 
 Canonical rules (apply to every payload):
 - integers are little-endian, fixed-width
@@ -90,8 +124,13 @@ Canonical rules (apply to every payload):
   self-delimiting encoding of the signed fields declared in `trust.md` —
   never "the envelope minus the signature"
 
-Changing the encoding means a new `version` byte and new derived-key context
-strings. Old objects never change meaning.
+Changing the payload encoding or the identity contract means new
+derived-key context strings (an identity fork); a framing-only change
+takes a new envelope version byte without moving ContentId, and only
+where the contract declares that framing identity-neutral. Manifest
+entry versions are seal versions inside the hashed payload, not framing,
+and follow the seal's own versioning. Old objects
+never change meaning.
 
 ## Chunks
 
@@ -349,7 +388,7 @@ writes, stale-temp sweep on open, verify-on-read scrub.
 | # | Decision | Rationale |
 |---|---|---|
 | 1 | Snapshot DAG over linear log | concurrency is normal, not exceptional; heads model makes "current" a policy |
-| 2 | Canonical byte-level encoding with typed envelope | encoding changes must not silently change identity |
+| 2 | Canonical byte-level encoding with typed envelope | encoding changes must not silently change identity (identity itself is payload-based — decision 30: framing changes do not implicitly fork it) |
 | 3 | Domain-separated hashing (derive_key contexts) | object kinds cannot collide; addressing is a format property, not caller discipline |
 | 4 | Content drive: content + minimal entry fields; metadata list explicit | Wyrd is a content drive; snapshot identity stays a function of content |
 | 5 | FastCDC, 16/64/256 KiB, frozen at v1 | range-stable dedup for edited files and large media; benchmark before freezing |
@@ -367,8 +406,8 @@ writes, stale-temp sweep on open, verify-on-read scrub.
 | 17 | `Change` canonical encoding: tag bytes 0x00 Admit, 0x01 Remove, 0x02 Rotate, 0x03 SetOwners, 0x04 AdmitReader (counted `u32` vector); a membership transition's canonical serialization is its **signing preimage ‖ signature** (no envelope kind — sealed documents, not CAS objects); the preimage commits to three set roots (members, owners, readers); `TransitionId` is its own type, distinct from `ContentId` | byte-exact BIP-340 needs one declared field order (trust.md); transitions travel sealed to the drive, so envelope framing would add nothing; the type system keeps sealed documents out of the content world |
 | 18 | Set roots (`members_root`/`owners_root`/`readers_root`) and BIP-340 challenges are domain-separated BLAKE3 `derive_key` with pinned contexts: `wyrd member set v1` / `wyrd owner set v1` / `wyrd reader set v1` over `u32` LE count + ascending 32-byte pubkeys (duplicates removed); challenges `wyrd membership challenge v1` / `wyrd snapshot challenge v1` over the signing message | every derived constant must agree byte-for-byte across implementations (the TransitionId lesson, decision 17); all hashing stays BLAKE3 |
 | 19 | `Admit` carries `{ device: DeviceId, encryption_key: [u8; 32] }` — the encryption key is the device-local capability-ECDH target, never the identity key | the NIP-46 boundary stays signing-only; "who am I" and "how are secrets delivered to me" are different keys with different risk profiles |
-| 20 | Manifest entry layout: fixed 82 bytes `content_id (32) ‖ kind (1) ‖ version (1) ‖ storage_id (32) ‖ encryption_epoch u64 LE ‖ plaintext size u64 LE`; entries sorted by `(content_id, kind, version)`, decoders reject unsorted vectors | one logical object may map several representations (epochs, versions) without ambiguity; size rides along because vaults already see ciphertext size — it buys allocation without a round trip and costs no privacy |
-| 21 | Subtree linkage by `(child tree ContentId, child manifest ContentId, sealed child manifest StorageId)` (96-byte records): the full identity pair, since the manifest ContentId is the AAD the child seal opens under; no names in manifests; all subtree manifests of a snapshot seal under that snapshot's manifest key | names stay in trees; the parent manifest is sealed, so vaults see only unlinkable StorageId fetches; revocation granularity stays snapshots (trust.md) while per-entry epochs let dedup survive rotation |
+| 20 | Manifest entry layout: fixed 114 bytes `content_id (32) ‖ kind (1) ‖ version (1, seal version of the referenced representation) ‖ storage_id (32) ‖ encryption_epoch u64 LE ‖ plaintext size u64 LE ‖ transport root (32)`; entries sorted by `(content_id, kind, version)`, decoders reject unsorted vectors | one logical object may map several representations (epochs, versions) without ambiguity; size rides along because vaults already see ciphertext size — it buys allocation without a round trip and costs no privacy |
+| 21 | Subtree linkage by `(child tree ContentId, child manifest ContentId, sealed child manifest StorageId, child transport root)` (128-byte records): the full identity pair, since the manifest ContentId is the AAD the child seal opens under; no names in manifests; all subtree manifests of a snapshot seal under that snapshot's manifest key | names stay in trees; the parent manifest is sealed, so vaults see only unlinkable StorageId fetches; revocation granularity stays snapshots (trust.md) while per-entry epochs let dedup survive rotation |
 | 22 | `EncryptedObject` envelope `version (1) ‖ kind (1) ‖ nonce (24) ‖ ciphertext`; `StorageId` is derived over the sealed bytes; `ObjectKind::Manifest = 0x03` gives sealed manifests a kind byte (plaintext keeps a member-only ContentId; the sealed form is StorageId-addressed, no `ManifestId`) | equal plaintexts sealed twice stay unlinkable (fresh nonces); the kind byte keeps the AAD binding uniform across content and manifests without a new identity type |
 | 23 | Sync-layer ingest limits (`Limits::V0`): 64 MiB object ceiling pre-decode, structural count ceilings post-decode (64 parents/changes/resolves, 1M tree entries and manifest children, 750K manifest mappings calibrated to fit the byte ceiling, 1024-byte names, 65K chunks per file, 256 KiB chunks, 16 owners); format maxima stay generous | attacker-controlled bytes meet bounded allocation everywhere: the total-bytes gate fires before decode, counts validate after decode over pre-allocation-bounded decoders |
 | 24 | Bootstrap invitations under their own framing, never an epoch control key: `version ‖ drive ‖ ephemeral pk ‖ recipient ‖ encryption key ‖ inviter ‖ nonce ‖ ciphertext` (ECDH to the invitee key, owner signature over the payload inside); sealed control kinds carry no invitation tag | sealing an invitation under the key it delivers is a hard bootstrap cycle; delivery (ECDH) and authorship (owner signature) stay separate checks |
@@ -378,3 +417,4 @@ writes, stale-temp sweep on open, verify-on-read scrub.
 | 27 | **Tree/manifest closure correspondence** is an explicit invariant: tree nodes are structural (`snapshot.tree`, `ChildManifest::tree`); authoring self-maps each with a `Tree` entry (always fetched; must match a reachable tree and its size); manifest entries cover exactly the reachable chunks; every directory subtree has a child manifest and vice versa; no unreachable mapping is admitted. The tree's declared file size is not part of the invariant; chunk representation sizes are enforced by `seal`'s checks at fetch. Verifier: `wyrd_sync::closure::verify_snapshot_manifest`, run as an authoring self-check **and** as the daemon's receiving-side head gate (`verify_head_closure`): a head is installed only when its closure is complete locally and corresponds | A valid author can sign a body over tree T1 and publish a valid snapshot-bound manifest describing T2, producing an authenticated but broken replica. Fetchability and the gate close that case without a format change: tree nodes ride existing manifest-entry machinery |
 | 28 | A recognized membership conflict resolution is **final for that conflict**: the resolution is the designated successor of the winning tip, and later valid work on the voided branches (or any other valid child of the winning tip) is VOIDED evidence that never reopens the conflict, in any arrival order. Recognition is monotonic; a permanent freeze on any valid losing-branch descendant was considered and rejected | validity is evaluated per branch, so a losing branch’s author holds that branch’s own epoch secrets and can always emit more valid work. Honoring the freeze let a stale or duplicated device retroactively void an owner-signed resolution and freeze the whole drive with no in-protocol remedy (a later resolution’s `resolves` entries must sit one epoch below the freeze, and the chain never gets a canonical tip past it), and the owner can neither observe nor prevent such a write, so the error was never actionable. A second contradictory resolution still re-freezes, so the owner keeps a remedy against a forked signer |
 | 29 | Capability outbox and owner-proof encodings, pinned byte for byte (trust.md carries the rationale; this row is the format of record): `CapabilityQueued (epoch, recipient)` (0x10, 40 bytes: epoch u64 LE ‖ recipient), `CapabilitySealed (epoch, recipient, sealed bytes)` (0x11: epoch u64 LE ‖ recipient ‖ sealed capability envelope), `CapabilityDelivered (epoch, recipient)` (0x12, 40 bytes), `CapabilitySealedReplaced (epoch, recipient, supersedes, replacement)` (0x16: epoch u64 LE ‖ recipient ‖ supersedes (32) ‖ replacement bytes); the supersession identity is `BLAKE3-derive-key("wyrd capability supersede id v1", "wyrd capability supersede id v1" ‖ epoch u64 LE ‖ recipient ‖ exact sealed bytes)` — the context string doubles as the preimage prefix and the derive-key context; the owner proof is `BLAKE3-derive-key("wyrd epoch secret vector v1", u32_le(count) ‖ secrets)` then `BLAKE3-derive-key("wyrd owner proof v1", "wyrd owner proof v1" ‖ drive ‖ recipient ‖ transition ‖ epoch u64 LE ‖ digest)` signed BIP-340 (155-byte preimage; deterministic under the local session, verified-not-compared in general; proof encoding signer ‖ signature, 96 bytes), always minted through an `OwnerProofV1` (0x02) signer-session domain | the mint-authority guarantee rests on the proof being unforgeable outside the pre-state owner set and the replacement guarantee on the supersession id naming exactly one sealed fact; both were correct by construction and review but pinned nowhere, so a one-character domain-string edit stayed green while silently invalidating every prior proof and replacement parent — on a format that promises announced incompatibility, never silent reinterpretation |
+| 30 | **ContentId identity is payload-based.** ContentId is BLAKE3 derive-key over the canonical object payload, using an object-specific identity-domain context for kind separation and identity-generation versioning. The envelope's magic, representation version, and kind fields are framing and interpretation metadata, not serialized bytes in the ContentId input. Envelope changes therefore do not implicitly change identity; a semantic or identity-contract change requires a new derivation context and produces a new representation, while existing objects stay immutable and readable under their original contract. Compatibility: no migration — existing ContentIds, stores, manifests, snapshots, and fixtures remain valid; documentation is corrected to match the normative payload-based contract. An envelope-identity scheme would be an identity-contract fork (new contexts, new representations, cross-crate propagation into manifests, snapshots, stores, and signatures), not a mere envelope-format change. Structural proof, not just prose history: `seal` derives ContentId from the same raw payload bytes it encrypts (`wyrd-sync/src/seal.rs:132-144`), and `EncryptedObject` carries seal version, kind, nonce, and ciphertext with no object framing at all — so a framing change provably cannot move identity and cannot force re-sealing. Consequence, stated plainly: ContentId no longer commits to the stored representation, so two nodes may legitimately hold one ContentId under different on-disk framing; harmless today because the store persists payloads only and regenerates framing at exchange. Explicit exception: manifest entries carry the referenced representation's seal version inside the hashed payload, so a seal-version fork moves manifest identities that name the new version — separability holds per kind, and the manifest case follows the seal's versioning, not the envelope's | the prior canonical-encoding prose said identity was defined over the envelope bytes while the store, derivation sites, and envelope framing all implemented payload identity; encoding changes must not silently change identity, and the upgrade contract already depends on representation and identity versioning staying separable |

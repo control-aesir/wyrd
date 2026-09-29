@@ -36,8 +36,10 @@ pub enum MergeSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergePlan {
     /// The selected heads, ascending: the `@N` basis (`heads[N-1]`
-    /// is `@N`, the same numbering the `name@N` conflict siblings
-    /// use).
+    /// is `@N`) for `--take`/`--default` over this selection. This
+    /// is head-wise numbering over the selection — not the mount's
+    /// per-path `name@N` siblings, which skip heads that lack the
+    /// path.
     pub heads: Vec<SnapshotId>,
     /// Every root path any selected head holds, ascending by path,
     /// with each head's version beside it: a resolver renders one
@@ -58,8 +60,11 @@ pub struct MergePath {
 impl MergePath {
     /// Whether every head holds the same entry-or-absent: agreed
     /// paths take themselves, and a spec line naming one is an
-    /// error. Comparison is semantic — kind plus referenced bytes —
-    /// via entry equality (names match by construction).
+    /// error. Comparison is full entry equality — kind, size and
+    /// executable bit, chunks, subtree, or symlink target — so two
+    /// heads holding identical chunks under different recorded
+    /// metadata still count as conflicted, in the conservative
+    /// direction. (Names match by construction of the lookup.)
     pub fn agreed(&self) -> bool {
         let mut versions = self.versions.values();
         let Some(first) = versions.next() else {
@@ -104,6 +109,18 @@ where
             return Err(EngineError::DuplicateMergeHead(pair[0]));
         }
     }
+    // A merge parents onto every selected head, and intake drops
+    // snapshots past the parent ceiling — so an oversized merge
+    // would commit a head every peer rejects while the local view
+    // calls it eligible. Refuse up front naming the ceiling, so the
+    // operator coalesces in stages instead of debugging silent
+    // non-convergence.
+    if sorted.len() > Limits::V0.max_snapshot_parents {
+        return Err(EngineError::TooManyMergeHeads(
+            sorted.len(),
+            Limits::V0.max_snapshot_parents,
+        ));
+    }
 
     let rebuilt = engine.store.rebuild(engine.device)?;
     let mut dag = SnapshotDag::new(engine.drive);
@@ -136,18 +153,27 @@ where
                 .map(|entry| entry.name.as_str().to_owned())
         })
         .collect();
+    // One lockstep pass per head over the canonically sorted entry
+    // lists: entries sort bytewise by name at construction and the
+    // name set walks the same bytewise order, so each head's cursor
+    // only advances. A nested scan per name would be quadratic in
+    // the root size against the million-entry ceiling; this stays
+    // linear per head.
+    let mut cursors: Vec<usize> = vec![0; sorted.len()];
     let mut paths = Vec::with_capacity(names.len());
     for name in names {
         let mut versions = BTreeMap::new();
-        for head in &sorted {
-            let entry = roots
-                .get(head)
-                .and_then(|tree| {
-                    tree.entries()
-                        .iter()
-                        .find(|entry| entry.name.as_str() == name)
-                })
-                .cloned();
+        for (head, cursor) in sorted.iter().zip(cursors.iter_mut()) {
+            let entries = roots.get(head).expect("loaded above").entries();
+            while *cursor < entries.len() && entries[*cursor].name.as_str() < name.as_str() {
+                *cursor += 1;
+            }
+            let entry =
+                if *cursor < entries.len() && entries[*cursor].name.as_str() == name.as_str() {
+                    Some(entries[*cursor].clone())
+                } else {
+                    None
+                };
             versions.insert(*head, entry);
         }
         paths.push(MergePath {
@@ -188,6 +214,33 @@ where
     S::Error: std::fmt::Debug,
 {
     let plan = plan(engine, objects, heads)?;
+    let taken = validate_spec(&plan, default, &spec)?;
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    for entry in &taken {
+        check_local(engine, objects, &rebuilt, entry)?;
+    }
+
+    let merged = Tree::from_entries(taken)
+        .map_err(|error| EngineError::MergeTreeInvalid(format!("{error:?}")))?;
+    let bytes = merged.encode();
+    let tree = objects
+        .insert(ObjectKind::Tree, &bytes)
+        .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?;
+    debug_assert_eq!(ContentId::derive(ObjectKind::Tree, &bytes), tree);
+    author_with_parents(engine, objects, tree, plan.heads)
+}
+
+/// Prove the merge spec closed over the plan and resolve it to the
+/// adopted entries, in canonical order: agreed paths take
+/// themselves, conflicted paths take their spec line or the
+/// default, dropped paths vanish. Pure over the plan — no store
+/// reads, no commits — so both the refusal tests and any future
+/// resolver UI exercise exactly this function.
+fn validate_spec(
+    plan: &MergePlan,
+    default: Option<SnapshotId>,
+    spec: &BTreeMap<String, MergeSelection>,
+) -> Result<Vec<Entry>, EngineError> {
     if let Some(id) = default {
         if !plan.heads.contains(&id) {
             return Err(EngineError::MergeDefaultNotAHead(id));
@@ -236,19 +289,7 @@ where
             }
         }
     }
-    let rebuilt = engine.store.rebuild(engine.device)?;
-    for entry in &taken {
-        check_local(engine, objects, &rebuilt, entry)?;
-    }
-
-    let merged = Tree::from_entries(taken)
-        .map_err(|error| EngineError::MergeTreeInvalid(format!("{error:?}")))?;
-    let bytes = merged.encode();
-    let tree = objects
-        .insert(ObjectKind::Tree, &bytes)
-        .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?;
-    debug_assert_eq!(ContentId::derive(ObjectKind::Tree, &bytes), tree);
-    author_with_parents(engine, objects, tree, plan.heads)
+    Ok(taken)
 }
 
 /// The root tree one source head commits, address- and limit-checked

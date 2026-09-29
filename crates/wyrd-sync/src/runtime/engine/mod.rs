@@ -71,6 +71,7 @@ use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey};
 use crate::membership::MembershipLog;
+use crate::membership::TransitionStatus;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
@@ -119,6 +120,8 @@ pub enum EngineError {
     ResolutionMismatch,
     #[error("merging needs at least two source heads")]
     MergeNeedsTwoHeads,
+    #[error("merge selects {0} heads, above the {1}-parent ceiling; coalesce in stages")]
+    TooManyMergeHeads(usize, usize),
     #[error("duplicate merge head {0}")]
     DuplicateMergeHead(SnapshotId),
     #[error("snapshot {0} is not a current eligible head")]
@@ -843,6 +846,31 @@ impl Engine {
         voided: Vec<TransitionId>,
     ) -> Result<MembershipTransition, EngineError> {
         super::author::resolve_conflict(self, winner, voided)
+    }
+
+    /// The live contenders the frozen membership epoch waits on,
+    /// ascending: the rival tips `member status` lists and `member
+    /// resolve` names. Empty when nothing is frozen. One derivation
+    /// shared by display and authoring, so the status view can never
+    /// list a rival the resolver then refuses.
+    pub fn frozen_contenders(&self) -> Vec<TransitionId> {
+        let Some(epoch) = self.log.frozen_at() else {
+            return Vec::new();
+        };
+        let mut rivals: Vec<TransitionId> = self
+            .log
+            .statuses()
+            .into_iter()
+            .filter_map(|(id, status)| {
+                if !matches!(status, TransitionStatus::Contested) {
+                    return None;
+                }
+                let transition = self.log.transition(&id)?;
+                (transition.epoch == epoch).then_some(id)
+            })
+            .collect();
+        rivals.sort();
+        rivals
     }
 
     /// Merge explicit snapshot heads into one snapshot: the

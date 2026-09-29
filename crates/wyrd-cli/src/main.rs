@@ -205,9 +205,10 @@ enum MemberAction {
 }
 
 /// One snapshot inspection or merge action. Head references are
-/// `@N` over the live heads in ascending SnapshotId order — the
-/// same numbering the `name@N` conflict siblings use — so `@1` on
-/// the command line is `@1` in the mount and on disk.
+/// `@N` over the selected heads in ascending SnapshotId order —
+/// head-wise, not the mount's per-path `name@N` numbering (which
+/// skips heads that lack the path), and relative to the selection
+/// when `--head` narrows it.
 #[derive(Debug, Subcommand)]
 enum SnapshotAction {
     /// List the live heads with their `@N` numbers.
@@ -216,6 +217,16 @@ enum SnapshotAction {
     /// voided, pending, or rejected. Eligible heads carry their
     /// `@N` merge numbers.
     Heads,
+    /// Preview a merge without authoring: one row per root path
+    /// with each selected head's version, so the operator sees
+    /// which paths are agreed and which need a `--take` line.
+    /// Sources default to all live heads, like `merge`.
+    Plan {
+        /// Source head, 64 hex characters. Repeatable; omitted means
+        /// all live heads.
+        #[arg(long = "head")]
+        heads: Vec<String>,
+    },
     /// Merge source heads into one snapshot. Sources default to all
     /// live heads; `--head` narrows to an explicit subset (at least
     /// two). Conflicted root paths take `--take path=@N`, drop with
@@ -1068,6 +1079,14 @@ fn snapshot(
             print!("{}", snapshot_heads_report(&engine)?);
             Ok(())
         }
+        SnapshotAction::Plan { heads } => {
+            let selected = select_merge_heads(&engine, &heads)?;
+            let store = FsObjectStore::open(drive_dir.to_path_buf())
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            let plan = engine.merge_plan(&store, selected)?;
+            print!("{}", snapshot_plan_report(&plan));
+            Ok(())
+        }
         SnapshotAction::Merge {
             heads,
             default,
@@ -1077,19 +1096,7 @@ fn snapshot(
             // Sources default to every live head; explicit ids narrow
             // to a subset. Sorted ascending, so `@N` numbers the
             // selection in SnapshotId byte order.
-            let mut selected: Vec<SnapshotId> = if heads.is_empty() {
-                engine
-                    .live_heads()?
-                    .iter()
-                    .map(|head| head.snapshot().snapshot_id())
-                    .collect()
-            } else {
-                heads
-                    .iter()
-                    .map(|head| parse_snapshot_id(head))
-                    .collect::<Result<_, _>>()?
-            };
-            selected.sort();
+            let selected = select_merge_heads(&engine, &heads)?;
             let resolve_ref = |reference: &str| -> Result<SnapshotId, CliError> {
                 let number: usize = reference
                     .strip_prefix('@')
@@ -1149,6 +1156,27 @@ fn snapshot(
             Ok(())
         }
     }
+}
+
+/// Resolve merge sources: every live head by default, or an
+/// explicit id subset. Sorted ascending, so `@N` numbers the
+/// selection in SnapshotId byte order — the basis `merge` and
+/// `plan` share.
+fn select_merge_heads(engine: &Engine, heads: &[String]) -> Result<Vec<SnapshotId>, CliError> {
+    let mut selected: Vec<SnapshotId> = if heads.is_empty() {
+        engine
+            .live_heads()?
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect()
+    } else {
+        heads
+            .iter()
+            .map(|head| parse_snapshot_id(head))
+            .collect::<Result<_, _>>()?
+    };
+    selected.sort();
+    Ok(selected)
 }
 
 /// One merge-spec path: a root entry name. v0 merges at root-entry
@@ -1495,21 +1523,16 @@ fn member_status_report(engine: &Engine) -> Result<String, CliError> {
     let frozen_line = match log.frozen_at() {
         Some(epoch) => {
             // Rival tips: the live contenders the frozen epoch waits
-            // on. Sorted for stable output; the resolver names one of
-            // these as winner and the rest as voided.
-            let mut rivals: Vec<_> = log
-                .statuses()
+            // on, from the same derivation the resolver validates
+            // against — status can never list a rival resolve then
+            // refuses. Sorted for stable output.
+            let rivals = engine
+                .frozen_contenders()
                 .into_iter()
-                .filter_map(|(id, status)| {
-                    if !matches!(status, TransitionStatus::Contested) {
-                        return None;
-                    }
-                    let t = log.transition(&id)?;
-                    (t.epoch == epoch).then_some(id.to_string())
-                })
-                .collect();
-            rivals.sort();
-            format!("frozen at epoch {epoch}\nrivals: {}", rivals.join(" "))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("frozen at epoch {epoch}\nrivals: {rivals}")
         }
         None => "frozen: no".into(),
     };
@@ -1585,6 +1608,42 @@ fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
         ));
     }
     Ok(out)
+}
+
+/// Preview a merge without authoring: one row per root path over
+/// the plan's `@N` basis, naming each head's version. Agreed paths
+/// take themselves; conflicted rows are the `--take` lines the
+/// merge still needs. Built as a string so tests assert the
+/// rendering without capturing stdout.
+fn snapshot_plan_report(plan: &wyrd_sync::runtime::MergePlan) -> String {
+    use wyrd_format::EntryContent;
+    let mut out = format!("merge plan ({} heads):\n", plan.heads.len());
+    for path in &plan.paths {
+        if path.agreed() {
+            out.push_str(&format!("{}: agreed\n", path.path));
+            continue;
+        }
+        let mut versions = Vec::new();
+        for (number, head) in plan.heads.iter().enumerate() {
+            let version = match path.versions.get(head).and_then(|version| version.as_ref()) {
+                None => "absent".to_owned(),
+                Some(entry) => match &entry.content {
+                    EntryContent::File { size, chunks, .. } => {
+                        format!("file:{size}B,{}chunks", chunks.len())
+                    }
+                    EntryContent::Dir { .. } => "dir".to_owned(),
+                    EntryContent::Symlink { .. } => "symlink".to_owned(),
+                },
+            };
+            versions.push(format!("@{}={}", number + 1, version));
+        }
+        out.push_str(&format!(
+            "{}: conflicted {}\n",
+            path.path,
+            versions.join(" ")
+        ));
+    }
+    out
 }
 
 /// One-word head class for the heads view; parked and rejected

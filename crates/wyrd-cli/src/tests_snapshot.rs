@@ -214,3 +214,61 @@ fn snapshot_merge_rejects_bad_sources() {
         "every refusal authored nothing"
     );
 }
+
+/// Planning without two heads fails with the engine's verdict,
+/// authoring nothing.
+#[test]
+fn snapshot_plan_needs_two_heads() {
+    let fixture = Fixture::new();
+    let error = command(fixture.args(vec!["plan".into()])).unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::MergeNeedsTwoHeads)),
+        "unexpected: {error:?}"
+    );
+    let error =
+        command(fixture.args(vec!["plan".into(), "--head".into(), "not-hex".into()])).unwrap_err();
+    assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
+}
+
+/// The plan preview names agreed paths and each head's version of
+/// conflicted ones over the `@N` basis.
+#[test]
+fn snapshot_plan_report_renders_versions_per_head() {
+    use std::collections::BTreeMap;
+    use wyrd_format::{ContentId, EntryContent};
+    use wyrd_sync::runtime::{MergePath, MergePlan};
+    let first = SnapshotId::from_bytes([0x11; 32]);
+    let second = SnapshotId::from_bytes([0x22; 32]);
+    let chunk = ContentId::from_bytes([0x33; 32]);
+    let entry = Entry::file("a", 3, false, vec![chunk]).unwrap();
+    assert!(matches!(entry.content, EntryContent::File { .. }));
+    let plan = MergePlan {
+        heads: vec![first, second],
+        paths: vec![
+            MergePath {
+                path: "a".to_owned(),
+                versions: BTreeMap::from([(first, Some(entry)), (second, None)]),
+            },
+            MergePath {
+                path: "same".to_owned(),
+                versions: BTreeMap::from([
+                    (
+                        first,
+                        Some(Entry::file("same", 1, false, vec![chunk]).unwrap()),
+                    ),
+                    (
+                        second,
+                        Some(Entry::file("same", 1, false, vec![chunk]).unwrap()),
+                    ),
+                ]),
+            },
+        ],
+    };
+    let report = snapshot_plan_report(&plan);
+    assert!(report.contains("merge plan (2 heads)"), "names the basis");
+    assert!(
+        report.contains("a: conflicted @1=file:3B,1chunks @2=absent"),
+        "conflicted row names each version: {report}"
+    );
+    assert!(report.contains("same: agreed"), "agreed row takes itself");
+}

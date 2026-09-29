@@ -8,7 +8,7 @@ use wyrd_format::{Change, MembershipTransition, TransitionId};
 use super::admission::next_epoch;
 use super::common::commit_new_epoch;
 use crate::keys::EpochSecret;
-use crate::membership::{sign_transition, TransitionStatus};
+use crate::membership::sign_transition;
 use crate::runtime::engine::{Engine, EngineError};
 
 /// Resolve a frozen membership conflict: author, sign, and commit the
@@ -32,22 +32,15 @@ pub(crate) fn resolve_conflict(
     winner: TransitionId,
     voided: Vec<TransitionId>,
 ) -> Result<MembershipTransition, EngineError> {
-    let conflict_epoch = engine
+    engine
         .log
         .frozen_at()
         .ok_or(EngineError::NoFrozenConflict)?;
     // The live contender set, derived from the frozen analysis —
-    // never from the caller's list.
-    let contenders: HashSet<TransitionId> = engine
-        .log
-        .statuses()
-        .into_iter()
-        .filter(|(_, status)| matches!(status, TransitionStatus::Contested))
-        .filter_map(|(id, _)| {
-            let t = engine.log.transition(&id)?;
-            (t.epoch == conflict_epoch).then_some(id)
-        })
-        .collect();
+    // never from the caller's list. Shared with the status display
+    // through `Engine::frozen_contenders`, so one derivation serves
+    // both.
+    let contenders: HashSet<TransitionId> = engine.frozen_contenders().into_iter().collect();
     if !contenders.contains(&winner) {
         return Err(EngineError::NotContender(winner));
     }

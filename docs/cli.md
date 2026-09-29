@@ -166,9 +166,13 @@ authors one snapshot with ordinary member authority through the
 engine, which enforces head eligibility and the merge-spec contract
 — the CLI never decides authorization itself. Announcements for the
 merge queue with the usual outbox, delivered on the next mounted
-sync. Head references are `@N` over the live heads in ascending
-SnapshotId order: the same numbering the `name@N` conflict siblings
-use, so `@1` on the command line is `@1` in the mount and on disk.
+sync. Head references are `@N` over the *selected* heads in ascending
+SnapshotId order — head-wise, not path-wise. The mount and export
+number the versions of one path (`name@N`), skipping heads that lack
+the path, so a present-vs-absent conflict's `@N` there is not the
+merge's `@N`. And with `--head` narrowing, `@N` counts the selection,
+not the full live-head set: re-check the numbers before copying them
+from `snapshot list` into a narrowed merge.
 
 - `list`: the live heads with their `@N` numbers, epochs, authors,
   trees, and parent counts.
@@ -188,6 +192,13 @@ use, so `@1` on the command line is `@1` in the mount and on disk.
   on an agreed path, a path no source holds, an uncovered conflict,
   or a source whose bytes are not locally servable all fail closed
   with nothing committed. No membership change, no epoch change.
+  The choice is one-way from the CLI: the unselected versions
+  survive only inside the merge's parent heads, which no v0 surface
+  reads back.
+- `plan [--head <id>...]`: preview a merge without authoring —
+  one row per root path over the same `@N` basis, naming each
+  head's version, so the operator sees which paths are agreed and
+  which need a `--take` line before merging.
 
 ### `device` — pair this device with a drive
 

@@ -10,7 +10,7 @@ use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive as member_drive, key, sign};
 use crate::membership::TransitionStatus;
 use crate::runtime::engine::{Engine, EngineError};
-use crate::runtime::test_util::{encryption_key, identity_secret, TestDir};
+use crate::runtime::test_util::{encryption_key, TestDir};
 
 use wyrd_format::membership::{
     set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
@@ -187,4 +187,14 @@ fn resolve_rejects_non_owner_author() {
         mengine.resolve_conflict(winner, vec![rival]),
         Err(EngineError::NotOwner)
     ));
+}
+
+/// The contender listing names exactly the frozen rivals, sorted —
+/// the same set the status display shows and the resolver accepts.
+#[test]
+fn frozen_contenders_names_the_sorted_rivals() {
+    let (_dir, engine, _owner, _genesis, winner, rival) = frozen_engine("contenders-list");
+    let mut expected = [winner, rival];
+    expected.sort();
+    assert_eq!(engine.frozen_contenders(), expected);
 }

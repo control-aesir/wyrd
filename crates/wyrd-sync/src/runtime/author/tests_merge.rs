@@ -78,13 +78,31 @@ fn forks(
 /// A same-epoch fork beside the authored heads, committed directly:
 /// the body verifies (so the head is eligible) without authoring
 /// any manifests.
+/// The id of a tree built over one chunk, without holding anything:
+/// the bytes arrive later (or never). Content addressing makes the
+/// later insert resolve to this same id.
+fn unheld_tree(name: &str, bytes: &[u8]) -> ContentId {
+    let mut scratch = MemoryObjectStore::default();
+    multi_tree(&mut scratch, &[(name, bytes)])
+}
+
 fn commit_fork(
     engine: &mut Engine,
     genesis: wyrd_format::TransitionId,
     tree: ContentId,
 ) -> SnapshotId {
     let (owner_sk, _) = key(10);
-    let timestamp = engine.live_heads().unwrap()[0].snapshot().timestamp + 1;
+    // Past every observed timestamp: identical trees must still
+    // author distinct bodies, or repeated forks would collapse onto
+    // one id and undercount the head set.
+    let timestamp = engine
+        .live_heads()
+        .unwrap()
+        .iter()
+        .map(|head| head.snapshot().timestamp)
+        .max()
+        .unwrap_or(0)
+        + 1;
     let mut fork =
         Snapshot::new(Vec::new(), tree, engine.device(), genesis, 1, 0, timestamp).unwrap();
     sign_snapshot(&mut fork, &owner_sk, &member_drive());
@@ -468,6 +486,37 @@ fn merge_plan_rejects_bad_heads() {
         .unwrap_err();
     assert!(
         matches!(error, EngineError::NotEligibleHead(id) if id == unknown),
+        "unexpected: {error:?}"
+    );
+}
+
+/// A merge past the parent ceiling fails before anything commits:
+/// intake would drop the snapshot on every peer while the local
+/// view called it eligible, so the operator coalesces in stages
+/// instead.
+#[test]
+fn merge_plan_refuses_more_heads_than_the_parent_ceiling() {
+    use crate::ingest::Limits;
+    let (_dir, mut engine, genesis) = owner_engine("merge-ceiling");
+    let remote = unheld_tree("a.txt", b"a");
+    let mut heads = Vec::new();
+    for _ in 0..=Limits::V0.max_snapshot_parents {
+        heads.push(commit_fork(&mut engine, genesis, remote));
+    }
+    assert_eq!(
+        heads.len(),
+        Limits::V0.max_snapshot_parents + 1,
+        "one past the ceiling"
+    );
+
+    let objects = MemoryObjectStore::default();
+    let error = engine.merge_plan(&objects, heads).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            EngineError::TooManyMergeHeads(count, max)
+            if count == Limits::V0.max_snapshot_parents + 1 && max == Limits::V0.max_snapshot_parents
+        ),
         "unexpected: {error:?}"
     );
 }

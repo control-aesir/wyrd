@@ -247,6 +247,22 @@ fn frozen_hint_names_the_conflict() {
     assert!(hint.contains("member resolve"), "names the resolver");
 }
 
+/// The engine-to-operator seam maps only the freeze to guidance:
+/// every other refusal passes through untouched.
+#[test]
+fn merge_error_mapping_guides_only_the_freeze() {
+    let mapped = map_merge_error(EngineError::MergeBlockedByFreeze(2));
+    assert!(
+        matches!(&mapped, CliError::Usage(hint) if hint.contains("epoch 2")),
+        "the freeze becomes usage guidance: {mapped:?}"
+    );
+    let mapped = map_merge_error(EngineError::MergeNeedsTwoHeads);
+    assert!(
+        matches!(mapped, CliError::Engine(EngineError::MergeNeedsTwoHeads)),
+        "other refusals pass through: {mapped:?}"
+    );
+}
+
 /// The plan preview names agreed paths and each head's version of
 /// conflicted ones over the `@N` basis.
 #[test]

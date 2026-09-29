@@ -126,7 +126,10 @@ characters (x-only pubkeys).
   ends at the removal boundary while its history stays valid.
   Removing the sole owner is valid but terminal — it empties the owner
   set and no future transition can be authorized — so it requires
-  `--yes`.
+  `--yes`. Like `rotate` and `set-owner` below, `remove` fails on a
+  membership-frozen drive with "transition leaves a membership
+  conflict frozen; resolve it first": nothing new is canonical while
+  frozen, so the conflict resolves before any of the three commits.
 - `rotate`: force a fresh epoch secret. Membership unchanged; every
   current member and reader is owed the new-epoch wrap.
 - `set-owner <device>`: hand ownership to a member (v0 ownership is
@@ -193,18 +196,21 @@ from `snapshot list` into a narrowed merge.
   with `--drop path`, or fall back to `--default @N`. A spec line
   on an agreed path, a path no source holds, an uncovered conflict,
   or a source whose bytes are not locally servable all fail closed
-  with nothing committed. A membership-frozen drive is refused
-  outright with a pointer to `member resolve`, since the conflict
-  snapshots park as pending and no selection reaches two eligible
-  heads. No membership change, no epoch change.
+  with nothing committed. A short selection with no eligible heads
+  on a membership-frozen drive is refused with a pointer to `member
+  resolve`, since the conflict snapshots park as pending; a frozen
+  drive carrying a genuine pre-conflict fork still merges, binding
+  the still-canonical pre-conflict tip. No membership change, no
+  epoch change.
   The choice is one-way from the CLI: the unselected versions
   survive only inside the merge's parent heads, which no v0 surface
   reads back.
 - `plan [--head <id>...]`: preview a merge without authoring —
   one row per root path over the same `@N` basis, naming each
   head's version, so the operator sees which paths are agreed and
-  which need a `--take` line before merging. Refused like `merge`
-  on a membership-frozen drive.
+  which need a `--take` line before merging. Refused with a pointer
+  to `member resolve` where a short selection meets no eligible
+  heads on a membership-frozen drive.
 
 ### `device` — pair this device with a drive
 

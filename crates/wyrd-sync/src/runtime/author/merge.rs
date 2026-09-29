@@ -124,21 +124,29 @@ where
     for body in rebuilt.runtime.snapshot_bodies.values() {
         dag.observe(body.clone());
     }
-    // Fewer than two heads merges nothing — but on a frozen drive
-    // even the default selection stalls below two, because the
-    // conflict snapshots park as pending instead of eligible. Name
-    // the freeze there instead of sending the operator to add a
-    // head; the rule lives here, beside the count, so both front
-    // ends and the tests share it.
-    if sorted.len() < 2 {
+    // Eligibility derives inside from the fresh rebuild — never from
+    // the caller's list — so a retained stale handle fails closed.
+    let eligible: HashSet<SnapshotId> = dag.eligible_heads(&rebuilt.log).into_iter().collect();
+    // Fewer than two heads merges nothing — but the diagnosis
+    // keys on the eligible set, not the selection length. An
+    // explicit single head amid two live heads is a narrowing
+    // problem, not a freeze; a short selection with no eligible
+    // heads on a frozen drive names the freeze, because the
+    // conflict snapshots park as pending instead of eligible. The
+    // rule lives here, beside the count, so both front ends and
+    // the tests share it. A frozen drive carrying a genuine
+    // pre-conflict fork still merges: those heads bind the
+    // still-canonical pre-conflict tip, so they are eligible and
+    // the merge below proceeds.
+    if sorted.len() < 2 && eligible.len() < 2 {
         return match rebuilt.log.frozen_at() {
             Some(epoch) => Err(EngineError::MergeBlockedByFreeze(epoch)),
             None => Err(EngineError::MergeNeedsTwoHeads),
         };
     }
-    // Eligibility derives inside from the fresh rebuild — never from
-    // the caller's list — so a retained stale handle fails closed.
-    let eligible: HashSet<SnapshotId> = dag.eligible_heads(&rebuilt.log).into_iter().collect();
+    if sorted.len() < 2 {
+        return Err(EngineError::MergeNeedsTwoHeads);
+    }
     for head in &sorted {
         if !eligible.contains(head) {
             return Err(EngineError::NotEligibleHead(*head));
@@ -348,9 +356,10 @@ where
             continue;
         }
         // Same address- and limit-checked load the walk applies to
-        // every node it reads.
-        for child in load_root(objects, id)?.entries().to_vec() {
-            check_entry(engine, objects, rebuilt, &child, &mut stack)?;
+        // every node it reads; the temporary lives for the loop, so
+        // no entry is cloned to satisfy the shape.
+        for child in load_root(objects, id)?.entries() {
+            check_entry(engine, objects, rebuilt, child, &mut stack)?;
         }
     }
     Ok(())

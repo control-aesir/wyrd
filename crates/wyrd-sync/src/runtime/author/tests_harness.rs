@@ -130,26 +130,13 @@ pub(super) fn device_of(identity: &DeviceIdentitySecret) -> wyrd_format::DeviceI
     wyrd_format::DeviceId::from_bytes(xonly.serialize())
 }
 
-/// An owner engine frozen at epoch 2: canonical rotate plus a rival
-/// admission observed directly. Returns the engine, the owner id,
-/// and the two contender ids (rotate first). The fork is built with
-/// one production-authored contender (rotate) plus one crafted rival
-/// committed durably, so validators meet a genuine frozen analysis
-/// rather than a staged one.
-pub(super) fn frozen_engine(
-    label: &str,
-) -> (
-    TestDir,
-    Engine,
-    DeviceId,
-    TransitionId,
-    TransitionId,
-    TransitionId,
-) {
-    let (dir, mut engine, genesis) = owner_engine(label);
+/// A rival admission at epoch 2 over `genesis`: the crafted half
+/// of every frozen-drive fixture. Owner-signed like production
+/// intake would deliver it; committing it beside a canonical
+/// epoch-2 child freezes the drive at 2 with the pre-conflict tip
+/// still canonical.
+pub(super) fn craft_rival(genesis: TransitionId) -> MembershipTransition {
     let (owner_sk, owner_id) = key(10);
-    let winner = engine.rotate_epoch().expect("canonical rotate");
-    let winner_id = winner.transition_id();
     let (third_sk, third_id) = key(30);
     let _ = third_sk;
     let third_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE3; 32]).unwrap());
@@ -168,6 +155,30 @@ pub(super) fn frozen_engine(
     )
     .unwrap();
     sign(&mut rival, &owner_sk, &member_drive());
+    rival
+}
+
+/// An owner engine frozen at epoch 2: canonical rotate plus a rival
+/// admission observed directly. Returns the engine, the owner id,
+/// and the two contender ids (rotate first). The fork is built with
+/// one production-authored contender (rotate) plus one crafted rival
+/// committed durably, so validators meet a genuine frozen analysis
+/// rather than a staged one.
+pub(super) fn frozen_engine(
+    label: &str,
+) -> (
+    TestDir,
+    Engine,
+    DeviceId,
+    TransitionId,
+    TransitionId,
+    TransitionId,
+) {
+    let (dir, mut engine, genesis) = owner_engine(label);
+    let (_owner_sk, owner_id) = key(10);
+    let winner = engine.rotate_epoch().expect("canonical rotate");
+    let winner_id = winner.transition_id();
+    let rival = craft_rival(genesis);
     let rival_id = rival.transition_id();
     // The rival must be durable, not just observed: commit resyncs
     // from the store, so an in-memory-only observation would vanish

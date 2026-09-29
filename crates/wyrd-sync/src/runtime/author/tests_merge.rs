@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use super::author_with_parents;
 use super::merge::MergeSelection;
-use super::tests_harness::{frozen_engine, owner_engine};
+use super::tests_harness::{craft_rival, frozen_engine, owner_engine};
 use crate::authorization::test_util::sign_snapshot;
 use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::membership::test_util::{drive as member_drive, key};
@@ -698,5 +698,44 @@ fn merge_plan_names_the_freeze_instead_of_short_heads() {
     assert!(
         matches!(error, EngineError::MergeBlockedByFreeze(2)),
         "the freeze blocks before eligibility: {error:?}"
+    );
+}
+
+/// A frozen drive carrying a genuine pre-conflict fork still
+/// merges: the heads bind the still-canonical pre-conflict tip, so
+/// they are eligible and the freeze refusal must not fire. The
+/// merged snapshot binds that same tip at the same epoch.
+#[test]
+fn merge_succeeds_over_a_pre_conflict_fork_on_a_frozen_drive() {
+    let (_dir, mut engine, genesis) = owner_engine("merge-frozen-fork");
+    let mut objects = MemoryObjectStore::default();
+    let base = multi_tree(&mut objects, &[("base", b"base")]);
+    let t1 = multi_tree(&mut objects, &[("a", b"a1")]);
+    let t2 = multi_tree(&mut objects, &[("a", b"a2")]);
+    let heads = forks(&mut engine, &mut objects, base, &[t1, t2]);
+    // Freeze the membership under the fork without touching it:
+    // rotate first so the rival contradicts a canonical child.
+    engine.rotate_epoch().unwrap();
+    let rival = craft_rival(genesis);
+    engine.log.observe(rival.clone());
+    engine.commit_facts(&[Fact::Transition(rival)]).unwrap();
+    assert_eq!(engine.log.frozen_at(), Some(2));
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        2,
+        "the pre-conflict fork stays eligible under the freeze"
+    );
+
+    let merged = engine
+        .merge_heads(&mut objects, heads.clone(), Some(heads[0]), BTreeMap::new())
+        .unwrap();
+    let mut parents = heads.clone();
+    parents.sort();
+    assert_eq!(merged.snapshot().parents, parents);
+    assert_eq!(merged.snapshot().epoch, 1, "bound to the pre-conflict tip");
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        1,
+        "the merge closes the fork"
     );
 }

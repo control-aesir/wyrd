@@ -223,9 +223,9 @@ enum SnapshotAction {
     /// Preview a merge without authoring: one row per root path
     /// with each selected head's version, so the operator sees
     /// which paths are agreed and which need a `--take` line.
-    /// Sources default to all live heads, like `merge`. Refused
-    /// with a pointer to `member resolve` on a membership-frozen
-    /// drive, where no selection reaches two eligible heads.
+    /// Sources default to all live heads, like `merge`. A short
+    /// selection with no eligible heads on a membership-frozen
+    /// drive is refused with a pointer to `member resolve`.
     Plan {
         /// Source head, 64 hex characters. Repeatable; omitted means
         /// all live heads.
@@ -238,8 +238,9 @@ enum SnapshotAction {
     /// `--drop path`, or fall back to `--default @N`; paths every
     /// source agrees on take themselves. The merged snapshot parents
     /// onto exactly the selected heads at the current epoch. A
+    /// short selection with no eligible heads on a
     /// membership-frozen drive is refused with a pointer to `member
-    /// resolve`.
+    /// resolve`; a pre-conflict fork still merges.
     Merge {
         /// Source head, 64 hex characters. Repeatable; omitted means
         /// all live heads.

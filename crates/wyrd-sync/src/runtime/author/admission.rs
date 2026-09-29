@@ -144,6 +144,7 @@ fn admit(
     // the committed state.
     let mut staged = engine.log.clone();
     staged.observe(transition.clone());
+    super::common::refuse_frozen_transition(&staged)?;
     // Secrets `1..=epoch`: the keyring holds every past epoch (each
     // installed from an authorized capability), plus the fresh one.
     let rebuilt = engine.store.rebuild(engine.device)?;

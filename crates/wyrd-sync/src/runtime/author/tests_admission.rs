@@ -1088,3 +1088,26 @@ fn admission_queues_the_lineage_closure_for_the_newcomer() {
         "late joiner with full lineage adopts the head"
     );
 }
+
+/// Admission onto a frozen log fails closed instead of becoming a
+/// third contender: the staged transition would leave the conflict
+/// frozen, which intake would never elect.
+#[test]
+fn admit_on_a_frozen_drive_fails_closed() {
+    use super::tests_harness::frozen_engine;
+    let (_dir, mut engine, _owner, _genesis, _winner, _rival) = frozen_engine("admit-frozen");
+    let seq = engine.current();
+    let newcomer_id = identity(0x58).1;
+    let newcomer_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE8; 32]).unwrap());
+
+    let error = match admit_device(&mut engine, newcomer_id, newcomer_key) {
+        Ok(_) => panic!("admission onto a frozen log must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, EngineError::FrozenConflictRemains),
+        "unexpected: {error:?}"
+    );
+    assert_eq!(engine.log.frozen_at(), Some(2), "still frozen");
+    assert_eq!(engine.current(), seq, "nothing committed");
+}

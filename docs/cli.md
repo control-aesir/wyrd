@@ -118,7 +118,9 @@ characters (x-only pubkeys).
   resolution — every id a live contender at the frozen epoch, the
   void set exactly the winner's rivals, owner authority in the
   pre-transition state — before authoring; anything less fails
-  closed with no commit.
+  closed with no transition. The carry obligations staged ahead of
+  authoring still commit on a refusal — benign: the next drain
+  discharges them without authoring while the heads stay eligible.
 - `remove <device>`: author a removal transition. The removed device —
   member or reader — receives no new-epoch material; its acquisition
   ends at the removal boundary while its history stays valid.

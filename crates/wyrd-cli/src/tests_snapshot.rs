@@ -216,7 +216,8 @@ fn snapshot_merge_rejects_bad_sources() {
 }
 
 /// Planning without two heads fails with the engine's verdict,
-/// authoring nothing.
+/// authoring nothing — including on a headed drive, where no
+/// membership freeze diverts the error.
 #[test]
 fn snapshot_plan_needs_two_heads() {
     let fixture = Fixture::new();
@@ -228,6 +229,23 @@ fn snapshot_plan_needs_two_heads() {
     let error =
         command(fixture.args(vec!["plan".into(), "--head".into(), "not-hex".into()])).unwrap_err();
     assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
+
+    write_file(&fixture, "kept.txt", b"kept");
+    let error = command(fixture.args(vec!["plan".into()])).unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::MergeNeedsTwoHeads)),
+        "one eligible head is still one head short: {error:?}"
+    );
+}
+
+/// The frozen hint names the epoch and the resolver when merging
+/// stalls on a membership conflict, and stays silent otherwise.
+#[test]
+fn frozen_hint_names_the_conflict() {
+    assert_eq!(frozen_merge_hint(None), None);
+    let hint = frozen_merge_hint(Some(2)).expect("hint");
+    assert!(hint.contains("epoch 2"), "names the frozen epoch");
+    assert!(hint.contains("member resolve"), "names the resolver");
 }
 
 /// The plan preview names agreed paths and each head's version of

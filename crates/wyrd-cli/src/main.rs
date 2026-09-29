@@ -168,7 +168,10 @@ enum MemberAction {
     /// proves the closed resolution (all ids live contenders at the
     /// frozen epoch, void set exactly the winner's rivals,
     /// pre-transition owner authority) before authoring; anything
-    /// less fails closed with no commit.
+    /// less fails closed with no transition. The carry obligations
+    /// staged ahead of authoring still commit on a refusal — benign:
+    /// the next drain discharges them without authoring while the
+    /// heads stay eligible.
     Resolve {
         /// Winning tip, 64 hex characters.
         winner: String,
@@ -1176,7 +1179,27 @@ fn select_merge_heads(engine: &Engine, heads: &[String]) -> Result<Vec<SnapshotI
             .collect::<Result<_, _>>()?
     };
     selected.sort();
+    // A frozen drive holds no second eligible head: the conflict
+    // snapshots park as pending, so the default selection stalls at
+    // the pre-conflict tip. Name the freeze instead of sending the
+    // operator to add a head.
+    if selected.len() < 2 {
+        if let Some(hint) = frozen_merge_hint(engine.membership_log().frozen_at()) {
+            return Err(CliError::Usage(hint));
+        }
+    }
     Ok(selected)
+}
+
+/// Where snapshot merging stalls on a membership conflict: the
+/// operator resolves with `member resolve`, never by adding heads.
+fn frozen_merge_hint(frozen: Option<u64>) -> Option<String> {
+    frozen.map(|epoch| {
+        format!(
+            "membership frozen at epoch {epoch}: resolve it with `member resolve` \
+            (see `member status`) before merging snapshots"
+        )
+    })
 }
 
 /// One merge-spec path: a root entry name. v0 merges at root-entry

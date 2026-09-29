@@ -520,3 +520,34 @@ fn merge_plan_refuses_more_heads_than_the_parent_ceiling() {
         "unexpected: {error:?}"
     );
 }
+
+/// The planner's cursor walk pins name gaps: heads holding
+/// disjoint-plus-shared names classify each path with exactly the
+/// heads that hold it — the cursor advancing past one head's last
+/// entry while staying put on the other.
+#[test]
+fn merge_plan_pins_versions_across_name_gaps() {
+    let (_dir, mut engine, _genesis) = owner_engine("merge-gaps");
+    let mut objects = MemoryObjectStore::default();
+    let base = multi_tree(&mut objects, &[("base", b"base")]);
+    let left = multi_tree(&mut objects, &[("a", b"a1"), ("c", b"c1")]);
+    let right = multi_tree(&mut objects, &[("b", b"b2"), ("c", b"c1")]);
+    let heads = forks(&mut engine, &mut objects, base, &[left, right]);
+    let (left_id, right_id) = (heads[0], heads[1]);
+
+    let plan = engine.merge_plan(&objects, heads).unwrap();
+    assert_eq!(plan.paths.len(), 3, "a, b, c");
+    let names: Vec<&str> = plan.paths.iter().map(|path| path.path.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"], "ascending paths");
+    let a = &plan.paths[0];
+    assert!(!a.agreed(), "a is head one's alone");
+    assert!(a.versions[&left_id].is_some());
+    assert!(a.versions[&right_id].is_none());
+    let b = &plan.paths[1];
+    assert!(!b.agreed(), "b is head two's alone");
+    assert!(b.versions[&left_id].is_none());
+    assert!(b.versions[&right_id].is_some());
+    let c = &plan.paths[2];
+    assert!(c.agreed(), "shared c takes itself");
+    assert!(c.agreed_entry().is_some());
+}

@@ -137,9 +137,8 @@ leg_fetch_owner() {
   # authors anything: the member converges this head first, so the
   # scratch and the delete extend the post-restart lineage instead
   # of forking it (the conflict phase forks deliberately later, on a
-  # different path). The new
-  # announcement also carries the fresh route the member needs for
-  # serving. File presence in the member's own view is the
+  # different path). The new announcement also carries the fresh
+  # route the member needs for serving. File presence in the member's own view is the
   # self-synchronizing signal — no sleeps. Reading the scratch file
   # later also localizes its bytes: phase 6 exports this drive
   # offline and fails closed on remote-only content.
@@ -189,7 +188,8 @@ leg_fetch_owner() {
 # first, scratch-write to localize the trees the delete needs, and
 # delete stale-1 — all on the post-restart lineage, no fork. Close
 # with the dedupe proof over the step-8 restart's redelivery.
-# Wall-clock envelope (whole guest run shares one 1-hour budget):
+# Wall-clock envelope (whole guest run shares the 90-minute
+# whole-run budget):
 # probes ~130s worst case, owner convergence chain concurrent with
 # the member's recovery, recovery loop 650s worst case, ack waits
 # fail-fast (120s member-side). Typical green run: 4-6 minutes.
@@ -389,6 +389,7 @@ leg_conflict_owner() {
   local d="$1" c="$2" relay="$3"
   step 10 "partition-conflict owner leg"
   start_mount xowner-c "$c" "$d" "$MNTS/xowner-c" --relay "$relay"
+  conflict_assert_reachable "$relay"
   echo "victim" > "$MNTS/xowner-c/rename-victim.txt"
   poll_until 120 test -f "$E2E_ROOT/conflict-rename-member-ready" \
     || die "member never opened the rename victim"
@@ -417,10 +418,10 @@ leg_conflict_owner() {
 # open across the owner's rename (stale-handle EIO pin), then commit
 # the same conflict path from this side of the partition and assert
 # the merged conflict identically to the owner.
-  # Staleness is relative to the converged head: the held fd is opened
-  # O_RDWR (spelled `exec 3<>`, which is O_RDWR|O_CREAT — the open
-  # itself commits nothing only because the preceding `converged`
-  # proved the victim exists, so O_CREAT is a no-op here) and stays
+# Staleness is relative to the converged head: the held fd is opened
+# O_RDWR (spelled `exec 3<>`, which is O_RDWR|O_CREAT — the open
+# itself commits nothing only because the preceding `converged`
+# proved the victim exists, so O_CREAT is a no-op here) and stays
 # pinned to the pre-rename generation — reads on it still serve the
 # captured identity until release — so the member must converge the
 # rename FIRST (renamed.txt reads the victim bytes) and only then
@@ -433,6 +434,7 @@ leg_conflict_member() {
   local rc=0 crc=0
   step 10 "partition-conflict member leg"
   start_mount xmember-c "$c" "$d" "$MNTS/xmember-c" --relay "$relay"
+  conflict_assert_reachable "$relay"
   poll_until 120 converged "$MNTS/xmember-c/rename-victim.txt" "victim" \
     || die "member never converged the rename victim"
   exec 3<>"$MNTS/xmember-c/rename-victim.txt" \
@@ -473,13 +475,36 @@ leg_conflict_member() {
 # failed tap-down would let both writes converge onto one head and
 # the leg would die much later at the @1 read with a misleading
 # message.
-conflict_assert_partitioned() {
+# conflict_relay_hostport <relay>: split ws(s)://host:port/path into
+# "$host $port" for /dev/tcp probes.
+conflict_relay_hostport() {
   local relay="$1" hostport host port
   hostport="${relay#ws://}"
   hostport="${hostport#wss://}"
   host="${hostport%%:*}"
   port="${hostport##*:}"
   port="${port%%/*}"
+  printf '%s %s' "$host" "$port"
+}
+
+# conflict_assert_reachable <relay>: positive control for the
+# partition probe below — the same /dev/tcp connect must SUCCEED
+# while the relay is up, so the later must-fail probe is a real
+# two-sided assertion rather than a vacuously passing one (bad
+# parse, missing /dev/tcp, or a miswired relay would all fail
+# here, loudly, pre-partition).
+conflict_assert_reachable() {
+  local host port
+  read -r host port <<< "$(conflict_relay_hostport "$1")"
+  if ! timeout 5 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+    die "relay $host:$port unreachable pre-partition"
+  fi
+  pass "relay reachable pre-partition"
+}
+
+conflict_assert_partitioned() {
+  local host port
+  read -r host port <<< "$(conflict_relay_hostport "$1")"
   if timeout 5 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
     die "relay $host:$port reachable while partitioned"
   fi
@@ -500,15 +525,22 @@ conflict_assert_partitioned() {
 conflict_assert_converged() {
   local m="$1" side="$2"
   local wrc=0
+  # Envelope note: poll_until counts 0.2s sleeps, not wall clock, so
+  # with 60s-bounded cats inside the real bound is budget x command
+  # time, not 300 seconds. The happy path converges in seconds; the
+  # wide budget is pathology cover for a genuinely regressing
+  # conflict phase, carried by the raised whole-run cap.
   poll_until 300 bash -c "timeout 60 cat '$m/conflict-c.txt@1' >/dev/null 2>&1 && timeout 60 cat '$m/conflict-c.txt@2' >/dev/null 2>&1" \
     || die "conflict versions never became readable on $m"
   pass "both conflict versions readable"
   [[ -d "$m/conflict-c.txt" ]] \
     || die "conflicted path does not present as a directory on $m"
   pass "conflicted path presents as a directory"
-  if ls "$m" | grep -q '@'; then
-    die "readdir lists a version-qualified name on $m"
+  if ! listing="$(ls "$m")"; then
+    die "readdir failed on $m: the mount is unhealthy"
   fi
+  [[ "$listing" != *conflict-c.txt@* ]] \
+    || die "readdir lists a version-qualified name on $m"
   pass "readdir omits version-qualified names"
   local got want
   got="$(printf '%s\n' "$(cat "$m/conflict-c.txt@1")" "$(cat "$m/conflict-c.txt@2")" | sort)"
@@ -520,11 +552,12 @@ conflict_assert_converged() {
     die "third conflict version on $m: more than two heads"
   fi
   pass "no third head"
-  # Write refusal, error text first: the attempt runs in a child (a
-  # FUSE-EIO-at-open on the main shell's own redirection killed the
-  # leg silently even behind `||` under set -e), the text is the
-  # gate and the exit code the secondary check.
-  wrc=0
+  # Write refusal: the attempt runs in a child (a FUSE-EIO-at-open
+  # on the main shell's own redirection killed the leg silently
+  # even behind `||` under set -e). The text is checked first;
+  # the exit code then pins the observed behavior — create on a
+  # conflicted drive fails at open (rc 1) on odin — rather than
+  # merely echoing the text gate.
   bash -c "echo after > '$m/post-conflict.txt'" 2>"$LOGDIR/conflict-eio-write-$side.stderr" || wrc=$?
   grep -q "Input/output error" "$LOGDIR/conflict-eio-write-$side.stderr" \
     || die "conflicted-drive write was not EIO on $m (rc $wrc)"

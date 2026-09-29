@@ -251,10 +251,11 @@ wait_conflict_file() { # <seconds> <file> <what> <leg-pid>
   local budget="$1" f="$2" what="$3" leg="$4" i
   for ((i = 0; i < budget * 2; i++)); do
     [[ -f "$f" ]] && return 0
-    # A dead leg never touches its file: fail fast with the leg log
-    # instead of burning the whole budget on a corpse. The pid is
-    # per-file (the sibling leg may already have finished fine).
-    kill -0 "$leg" 2>/dev/null || die "a conflict leg exited early (see logs/leg-conflict-*.out)"
+    # A dead leg never touches its file: fail fast instead of burning
+    # the whole budget on a corpse. The pid is per-file (the sibling
+    # leg may already have finished fine); $what names the awaited
+    # rendezvous and its leg log.
+    kill -0 "$leg" 2>/dev/null || die "$what (leg exited early)"
     sleep 0.5
   done
   die "$what"

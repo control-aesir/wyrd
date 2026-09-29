@@ -415,15 +415,15 @@ leg_conflict_owner() {
 # open across the owner's rename (stale-handle EIO pin), then commit
 # the same conflict path from this side of the partition and assert
 # the merged conflict identically to the owner.
-# Staleness timing: the held handle is opened O_RDWR (no truncate, so
-# the open itself commits nothing) and the owner's rename signal
-# arrives over the shared state root in milliseconds while relay
-# convergence takes seconds — but if the rename converges first the
-# handle is fresh and the write below would correctly succeed, so a
-# converge guard fails the test void-loud instead of passing blind.
-# Either write-time or close-time EIO counts (buffered writes may
-# fail at flush, not at write): both are asserted, and success at
-# both is a lost-update violation, not a pass.
+# Staleness is relative to the converged head: the held fd is opened
+# O_RDWR (no truncate, so the open itself commits nothing) and stays
+# pinned to the pre-rename generation — reads on it still serve the
+# captured identity until release — so the member must converge the
+# rename FIRST (renamed.txt reads the victim bytes) and only then
+# write via the held fd, which addresses a superseded parent and
+# must fail EIO. Either write-time or close-time EIO counts
+# (buffered writes may fail at flush, not at write): both are
+# asserted, and success at both is a lost-update violation.
 leg_conflict_member() {
   local d="$1" c="$2" relay="$3"
   local rc=0 crc=0
@@ -436,9 +436,8 @@ leg_conflict_member() {
   touch "$E2E_ROOT/conflict-rename-member-ready"
   poll_until 120 test -f "$E2E_ROOT/conflict-rename-owner-done" \
     || die "owner never committed the rename"
-  if [[ -e "$MNTS/xmember-c/renamed.txt" ]]; then
-    die "member converged the rename before the stale write: test void"
-  fi
+  poll_until 180 converged "$MNTS/xmember-c/renamed.txt" "victim" \
+    || die "member never converged the rename"
   echo "stale-write" >&3 2>"$E2E_ROOT/rename-stale.err" || rc=$?
   exec 3>&- 2>>"$E2E_ROOT/rename-stale.err" || crc=$?
   [[ "$rc" == 1 || "$crc" == 1 ]] \

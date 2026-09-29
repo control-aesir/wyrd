@@ -535,9 +535,12 @@ mod tests {
 
     #[test]
     fn accept_envelope_framing_does_not_move_content_identity() {
-        // object-model.md decision 30 at the only production site where
-        // framing meets identity: a framed object accepted at the
-        // boundary derives the same ContentId as its bare payload.
+        // object-model.md decision 30 at the framing/identity seam as
+        // specified: a framed object accepted at the boundary derives
+        // the same ContentId as its bare payload. (`accept_envelope`
+        // has no non-test caller today — the production object paths
+        // derive straight from plaintext bodies — so this pins the
+        // specified seam, not a live wire path.)
         let payload = b"boundary framing payload";
         let framed = Envelope {
             kind: ObjectKind::Chunk,

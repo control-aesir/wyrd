@@ -374,6 +374,126 @@ leg_fetch_member() {
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# leg_conflict_owner <drive> <creds> <relay>: mount, drive the rename
+# half of the StaleHandle pin (rename the victim after the member
+# holds it open), then the partition half: concurrent same-file
+# commit under tap-r down, conflict assertions after heal.
+# The rename half runs pre-partition (it needs convergence); the
+# conflict half runs post-partition-signal (shared-fs rendezvous,
+# no relay needed). Observed on odin: partitioned same-path commits
+# both succeed locally (single head each); after heal the two heads
+# surface as name@N versions with SnapshotId byte-order numbering,
+# a further write fails EIO (ConflictedHeads), reads keep serving.
+leg_conflict_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 10 "partition-conflict owner leg"
+  start_mount xowner-c "$c" "$d" "$MNTS/xowner-c" --relay "$relay"
+  echo "victim" > "$MNTS/xowner-c/rename-victim.txt"
+  poll_until 120 test -f "$E2E_ROOT/conflict-rename-member-ready" \
+    || die "member never opened the rename victim"
+  mv "$MNTS/xowner-c/rename-victim.txt" "$MNTS/xowner-c/renamed.txt" \
+    || die "owner rename failed"
+  touch "$E2E_ROOT/conflict-rename-owner-done"
+  poll_until 120 test -f "$E2E_ROOT/conflict-rename-member-done" \
+    || die "member never finished the stale-handle probe"
+  pass "rename committed while the member holds the victim open"
+  poll_until 180 test -f "$E2E_ROOT/conflict-partitioned" \
+    || die "host never partitioned the relay"
+  echo "owner-conflict-1" > "$MNTS/xowner-c/conflict-c.txt"
+  touch "$E2E_ROOT/conflict-owner-written"
+  poll_until 180 test -f "$E2E_ROOT/conflict-healed" \
+    || die "host never healed the relay"
+  conflict_assert_converged "$MNTS/xowner-c"
+  touch "$E2E_ROOT/conflict-owner-done"
+  poll_until 240 test -f "$E2E_ROOT/conflict-member-done" \
+    || die "member never finished the conflict assertions"
+  stop_mount xowner-c INT
+  check_no_leaks "$LOGDIR/mount-xowner-c.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_conflict_member <drive> <creds> <relay>: mount, hold the victim
+# open across the owner's rename (stale-handle EIO pin), then commit
+# the same conflict path from this side of the partition and assert
+# the merged conflict identically to the owner.
+# Staleness timing: the held handle is opened O_RDWR (no truncate, so
+# the open itself commits nothing) and the owner's rename signal
+# arrives over the shared state root in milliseconds while relay
+# convergence takes seconds — but if the rename converges first the
+# handle is fresh and the write below would correctly succeed, so a
+# converge guard fails the test void-loud instead of passing blind.
+# Either write-time or close-time EIO counts (buffered writes may
+# fail at flush, not at write): both are asserted, and success at
+# both is a lost-update violation, not a pass.
+leg_conflict_member() {
+  local d="$1" c="$2" relay="$3"
+  local rc=0 crc=0
+  step 10 "partition-conflict member leg"
+  start_mount xmember-c "$c" "$d" "$MNTS/xmember-c" --relay "$relay"
+  poll_until 120 converged "$MNTS/xmember-c/rename-victim.txt" "victim" \
+    || die "member never converged the rename victim"
+  exec 3<>"$MNTS/xmember-c/rename-victim.txt" \
+    || die "member cannot hold the victim handle open"
+  touch "$E2E_ROOT/conflict-rename-member-ready"
+  poll_until 120 test -f "$E2E_ROOT/conflict-rename-owner-done" \
+    || die "owner never committed the rename"
+  if [[ -e "$MNTS/xmember-c/renamed.txt" ]]; then
+    die "member converged the rename before the stale write: test void"
+  fi
+  echo "stale-write" >&3 2>"$E2E_ROOT/rename-stale.err" || rc=$?
+  exec 3>&- 2>>"$E2E_ROOT/rename-stale.err" || crc=$?
+  [[ "$rc" == 1 || "$crc" == 1 ]] \
+    || die "stale-handle write returned rc $rc/$crc, want EIO (1)"
+  grep -q "Input/output error" "$E2E_ROOT/rename-stale.err" \
+    || die "stale-handle write was not EIO: $(cat "$E2E_ROOT/rename-stale.err")"
+  pass "rename breaks a held writable handle across hosts (EIO)"
+  touch "$E2E_ROOT/conflict-rename-member-done"
+  poll_until 180 test -f "$E2E_ROOT/conflict-partitioned" \
+    || die "host never partitioned the relay"
+  echo "member-conflict-1" > "$MNTS/xmember-c/conflict-c.txt"
+  touch "$E2E_ROOT/conflict-member-written"
+  poll_until 180 test -f "$E2E_ROOT/conflict-healed" \
+    || die "host never healed the relay"
+  conflict_assert_converged "$MNTS/xmember-c"
+  touch "$E2E_ROOT/conflict-member-done"
+  poll_until 240 test -f "$E2E_ROOT/conflict-owner-done" \
+    || die "owner never finished the conflict assertions"
+  stop_mount xmember-c TERM
+  check_no_leaks "$LOGDIR/mount-xmember-c.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# conflict_assert_converged <mnt>: shared post-heal assertions for
+# both conflict legs. Same-path commits from both sides of the
+# partition surface as name@N versions (deterministic SnapshotId
+# byte-order numbering — order pinned nowhere, so the version set
+# is compared, identically on both sides), the conflicted path
+# presents as a directory, a further write fails EIO while reads
+# keep serving, and both versions are fetched local: phase 6
+# exports offline and fails closed on remote-only content.
+conflict_assert_converged() {
+  local m="$1"
+  local rc=0
+  poll_until 300 bash -c "timeout 60 cat '$m/conflict-c.txt@1' >/dev/null 2>&1 && timeout 60 cat '$m/conflict-c.txt@2' >/dev/null 2>&1" \
+    || die "conflict versions never became readable on $m"
+  pass "both conflict versions readable"
+  [[ -d "$m/conflict-c.txt" ]] \
+    || die "conflicted path does not present as a directory on $m"
+  pass "conflicted path presents as a directory"
+  local got want
+  got="$(printf '%s\n' "$(cat "$m/conflict-c.txt@1")" "$(cat "$m/conflict-c.txt@2")" | sort)"
+  want="$(printf '%s\n' "owner-conflict-1" "member-conflict-1" | sort)"
+  [[ "$got" == "$want" ]] \
+    || die "conflict version set mismatch on $m: got [$got]"
+  pass "conflict versions read identically (owner + member takes)"
+  rc=0
+  echo "after" > "$m/post-conflict.txt" 2>"$E2E_ROOT/conflict-eio.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "conflicted-drive write returned rc $rc, want EIO (1)"
+  grep -q "Input/output error" "$E2E_ROOT/conflict-eio.err" \
+    || die "conflicted-drive write was not EIO: $(cat "$E2E_ROOT/conflict-eio.err")"
+  [[ "$(cat "$m/conflict-c.txt@1")" != "" ]] \
+    || die "conflicted drive stopped serving reads on $m"
+  pass "conflicted drive fails writes EIO and still serves reads"
+}
+
 case "${1:-}" in
   converge-owner) leg_converge_owner "$2" "$3" "$4" ;;
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
@@ -381,6 +501,8 @@ case "${1:-}" in
   restart-member) leg_restart_member "$2" "$3" "$4" ;;
   fetch-owner) leg_fetch_owner "$2" "$3" "$4" ;;
   fetch-member) leg_fetch_member "$2" "$3" "$4" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member <drive> <creds> <relay>" >&2; exit 2 ;;
+  conflict-owner) leg_conflict_owner "$2" "$3" "$4" ;;
+  conflict-member) leg_conflict_member "$2" "$3" "$4" ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member <drive> <creds> <relay>" >&2; exit 2 ;;
 esac
 echo "legs: $PASS_COUNT checks passed"

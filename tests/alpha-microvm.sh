@@ -17,11 +17,15 @@
 #   5. fetch-plane legs (blocking cold open, bounded EIO on dead
 #      routes, recovery without remount after the owner returns on a
 #      fresh endpoint, dedupe log with no double-append)
-#   6. offline reopen of both drives on the host
+#   6. relay-partition conflict legs: rename-then-commit StaleHandle,
+#      concurrent same-file commits under tap-r down, ConflictedHeads
+#      write EIO with reads still serving, name@N versions identical
+#      on both sides (issue: microvm relay-partition conflict legs v2)
+#   7. offline reopen of both drives on the host (exports now assert
+#      the conflict siblings too)
 #
-# Out of scope, tracked as follow-up: relay-partition conflict legs
-# (concurrent commits, StaleHandle, ConflictedHeads, name@N export):
-# nostr:nevent1qqsfe3tgav2h5xe0sdsj5508zxdpknamd9l48tr35fxyugda23df9dcpz9mhxue69uhkwunpwdczuap49eehgcy9luf.
+# The relay is a VM service the host stops/starts per conflict leg
+# via its tap (tap-r down/up); see nix/microvm/run-microvm.sh.
 # Control-plane remainder closed here: NIP-44 wire interop is pinned
 # by sealed_envelope_is_plain_nip44_v2_with_no_wrapper, the seen
 # growth bound by the fetch-member dedupe proof plus unit compaction
@@ -218,13 +222,65 @@ wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
 wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
 pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
 
+# --- phase 5.5: relay-partition conflict -------------------------------
+# Rename half runs pre-partition (it needs convergence); the host
+# partitions only after both rename-done files land, then heals
+# after both conflict writes. Partition is host-side tap surgery
+# (tap-r is the relay's tap; see TAP_DEV in run-microvm.sh) — the
+# orchestrator runs as root, so no privilege dance. Done-file
+# rendezvous rides the shared state root, unaffected by the
+# partition. The 1059 count is the publish witness: conflict
+# announcements must cross the relay, so it grows across the heal.
+echo "=== microvm 10: relay-partition conflict ==="
+rm -f "$RUN"/conflict-rename-member-ready "$RUN"/conflict-rename-owner-done \
+  "$RUN"/conflict-rename-member-done "$RUN"/conflict-partitioned \
+  "$RUN"/conflict-owner-written "$RUN"/conflict-member-written \
+  "$RUN"/conflict-healed "$RUN"/conflict-owner-done "$RUN"/conflict-member-done \
+  "$RUN"/rename-stale.err "$RUN"/conflict-eio.err
+wait_conflict_file() { # <seconds> <file> <what>
+  local budget="$1" f="$2" what="$3" i
+  for ((i = 0; i < budget * 2; i++)); do
+    [[ -f "$f" ]] && return 0
+    sleep 0.5
+  done
+  die "$what"
+}
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh conflict-member $GMD $GMC $RELAY_URL" \
+  >"$RUN/logs/leg-conflict-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh conflict-owner $OD $OC $RELAY_URL" \
+  >"$RUN/logs/leg-conflict-owner.out" 2>&1 &
+LEG_O=$!
+wait_conflict_file 300 "$RUN/conflict-rename-owner-done" \
+  "owner rename leg never finished (see logs/leg-conflict-owner.out)"
+wait_conflict_file 120 "$RUN/conflict-rename-member-done" \
+  "member stale-handle probe never finished (see logs/leg-conflict-member.out)"
+pass "rename breaks a held handle across hosts before the partition"
+COUNT_BEFORE="$(printf '%s' "$REQ1059" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>/dev/null | grep -c '"kind":1059' || true)"
+ip link set tap-r down || die "host could not partition tap-r"
+touch "$RUN/conflict-partitioned"
+wait_conflict_file 180 "$RUN/conflict-owner-written" \
+  "owner never committed under partition (see logs/leg-conflict-owner.out)"
+wait_conflict_file 180 "$RUN/conflict-member-written" \
+  "member never committed under partition (see logs/leg-conflict-member.out)"
+pass "both sides commit the same path under partition"
+ip link set tap-r up || die "host could not heal tap-r"
+touch "$RUN/conflict-healed"
+wait "$LEG_N" || die "conflict member leg failed (see logs/leg-conflict-member.out)"
+wait "$LEG_O" || die "conflict owner leg failed (see logs/leg-conflict-owner.out)"
+pass "conflict versions, EIO writes, and serving reads hold across hosts"
+COUNT_AFTER="$(printf '%s' "$REQ1059" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>/dev/null | grep -c '"kind":1059' || true)"
+[[ "$COUNT_AFTER" -gt "$COUNT_BEFORE" ]] \
+  || die "relay 1059 count did not grow across the heal ($COUNT_BEFORE -> $COUNT_AFTER): conflict announcements never flowed"
+pass "conflict announcements crossed the relay"
+
 # --- phase 6: offline reopen --------------------------------------------
 # Depends on phase 5's delete (fetch-member removes stale-1.txt once
 # the scratch write has localized the trees it needs): the export
 # below fails closed on remote-only content, so without that delete
 # this phase dies at the member export. Correct product behavior,
 # coupled phases.
-echo "=== microvm 10: offline reopen ==="
+echo "=== microvm 11: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"
 as_guest "$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
@@ -254,6 +310,21 @@ as_guest "$WYRD_BIN" export \
 [[ "$(cat "$RUN/export-member/cold-2.txt")" == "cold-bytes" ]] \
   || die "member export lost the fetched cold-2.txt"
 pass "flush-committed state survives restart on both drives"
+# Conflict siblings: the conflict legs localized both versions on
+# both drives (cat of @1/@2 in-leg), so the offline export emits
+# both takes as name@N siblings. Numbering is SnapshotId byte
+# order — pinned nowhere, so compare the set, per drive.
+for side in owner member; do
+  for v in 1 2; do
+    [[ -f "$RUN/export-$side/conflict-c.txt@$v" ]] \
+      || die "$side export lost conflict-c.txt@$v"
+  done
+  got="$(printf '%s\n' "$(cat "$RUN/export-$side/conflict-c.txt@1")" "$(cat "$RUN/export-$side/conflict-c.txt@2")" | sort)"
+  want="$(printf '%s\n' "owner-conflict-1" "member-conflict-1" | sort)"
+  [[ "$got" == "$want" ]] \
+    || die "$side export sibling set mismatch: [$got]"
+done
+pass "conflict versions export as name@N siblings on both drives"
 
 # Host-side leak check over every log the host wrote (guest logs
 # are checked in-guest by each leg). All four credential secrets,

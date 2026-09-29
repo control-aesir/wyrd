@@ -1,20 +1,28 @@
 //! The canonical object envelope (see `docs/object-model.md`,
-//! "Canonical encoding"). Every object is a typed envelope and identity is
-//! defined over exactly these bytes, so the framing must stay byte-exact
-//! and inflexible:
+//! "Canonical encoding"). Every object has a canonical payload and a typed
+//! envelope carrying it, so the framing must stay byte-exact and
+//! inflexible:
 //!
 //! ```text
 //! offset  size  field
 //! 0       4     magic   = "wyrd"
-//! 4       1     version = 0x00 (v0)
-//! 5       1     kind    = 0x00 chunk | 0x01 tree | 0x02 snapshot
+//! 4       1     envelope version = 0x00 (v0 representation)
+//! 5       1     kind    = 0x00 chunk | 0x01 tree | 0x02 snapshot | 0x03 manifest
 //! 6       ..    payload (kind-specific, canonical)
 //! ```
 //!
-//! The version byte is validated, not stored: changing it means a new
-//! format with new derived-key contexts, which is a new type, not a field
-//! value. Payload canonicality (counted vectors etc.) is owned by the
-//! kind-specific decoders; this layer only guarantees the framing.
+//! The envelope is the versioned representation and transport/storage
+//! framing — not the identity preimage. An object's ContentId derives
+//! exclusively from its canonical payload under the identity-domain
+//! context; framing bytes are not hashed into it (object-model.md
+//! decision 30). Deriving identity from envelope bytes is a contract
+//! violation.
+//!
+//! The envelope version byte is validated, not stored: a new
+//! representation takes a new version byte, and only an explicit
+//! identity-contract change takes new derived-key contexts. Payload
+//! canonicality (counted vectors etc.) is owned by the kind-specific
+//! decoders; this layer only guarantees the framing.
 
 use crate::identity::ObjectKind;
 use thiserror::Error;
@@ -22,8 +30,9 @@ use thiserror::Error;
 /// Envelope magic bytes.
 pub const MAGIC: [u8; 4] = *b"wyrd";
 
-/// The only accepted envelope version. Bumping it is a format change with
-/// new derived-key contexts, never a runtime branch on this value.
+/// The only accepted envelope representation version. A new representation
+/// takes a new version byte; identity forks only on a new identity-domain
+/// context (object-model.md decision 30), never implicitly from framing.
 pub const VERSION: u8 = 0x00;
 
 /// magic (4) + version (1) + kind (1).

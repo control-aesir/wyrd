@@ -1,11 +1,18 @@
 //! Identity types. Two identity worlds, enforced by the type system:
 //!
-//! - `ContentId` — domain-separated BLAKE3 over *plaintext*; the logical
-//!   world (trees, snapshots, local dedup). Drive members only.
+//! - `ContentId` — domain-separated BLAKE3 over the *canonical payload*
+//!   under the object's identity-domain context; the logical world
+//!   (trees, snapshots, local dedup). Drive members only.
 //! - `StorageId` — domain-separated BLAKE3 over *ciphertext*; the physical
 //!   world (vaults, fetch addresses). Safe for untrusted peers.
 //! - `SnapshotId` — a `ContentId` of a snapshot object, its own type so the
 //!   compiler can tell DAG references from file content.
+//!
+//! Two versions, two jobs: the **identity-domain version** lives in the
+//! derivation context and forks identity when it changes; the **envelope
+//! version** describes the serialized representation and is not hashed
+//! into ContentId. Deriving identity from envelope bytes is a contract
+//! violation (object-model.md decision 30).
 //!
 //! Never construct identifiers by hashing raw bytes with a bare hash call;
 //! always go through the domain-separated derivations here. See
@@ -163,8 +170,11 @@ arrival (object-model.md decision 26)."
 );
 
 impl ContentId {
-    /// Derive the Content ID for plaintext of the given kind. The identity
-    /// includes the object kind: a chunk and a tree can never collide.
+    /// Derive the Content ID for the canonical payload of the given kind.
+    /// The identity includes the object kind and identity-domain version
+    /// via the derivation context: a chunk and a tree can never collide,
+    /// and a new context forks identity. Envelope framing bytes are never
+    /// part of the input — hashing them is a contract violation.
     pub fn derive(kind: ObjectKind, plaintext: &[u8]) -> Self {
         Self(RawId(blake3::derive_key(kind.content_context(), plaintext)))
     }
@@ -256,6 +266,72 @@ mod tests {
     fn unknown_kind_bytes_are_rejected() {
         assert_eq!(ObjectKind::from_byte(0x04), None);
         assert_eq!(ObjectKind::from_byte(0xFF), None);
+    }
+
+    #[test]
+    fn content_identity_is_payload_based_not_framing_based() {
+        // Normative contract (object-model.md): ContentId derives
+        // exclusively from the canonical payload under the object's
+        // identity-domain context. Envelope framing bytes (magic,
+        // representation version, kind byte) are not part of the
+        // ContentId input.
+        let payload = b"identity preimage";
+        let id = ContentId::derive(ObjectKind::Chunk, payload);
+        let envelope_bytes = crate::Envelope {
+            kind: ObjectKind::Chunk,
+            payload: payload.to_vec(),
+        }
+        .encode();
+        // Deriving over the envelope bytes must give a different answer:
+        // if code ever hashes framing into identity, this fails loudly.
+        let framed = ContentId::derive(ObjectKind::Chunk, &envelope_bytes);
+        assert_ne!(
+            id, framed,
+            "envelope framing must not be the ContentId preimage"
+        );
+        // And the payload-derived id is stable across encode/decode.
+        let decoded = crate::Envelope::decode(&envelope_bytes).unwrap();
+        assert_eq!(ContentId::derive(ObjectKind::Chunk, &decoded.payload), id);
+    }
+
+    #[test]
+    fn content_identity_forks_on_context_not_framing() {
+        // Same payload under different identity-domain contexts forks
+        // identity; same payload+context under different (identity-neutral)
+        // framing does not.
+        let payload = b"same bytes, different domain";
+        let chunk = ContentId::derive(ObjectKind::Chunk, payload);
+        let tree = ContentId::derive(ObjectKind::Tree, payload);
+        assert_ne!(
+            chunk, tree,
+            "identity fork rides the derivation context, not framing"
+        );
+        // Framing invariance: the envelope version byte is representation
+        // metadata gated at decode time, while ContentId is a pure
+        // function of payload + context. A future representation version
+        // declared identity-neutral by the contract must not change
+        // ContentId for the same payload+context.
+        let v0 = crate::Envelope {
+            kind: ObjectKind::Chunk,
+            payload: payload.to_vec(),
+        }
+        .encode();
+        let mut v_next = v0.clone();
+        v_next[4] = 0x01; // hypothetical future framing version
+                          // The framing gate refuses the unknown representation...
+        assert!(matches!(
+            crate::Envelope::decode(&v_next),
+            Err(crate::EnvelopeError::UnknownVersion(0x01))
+        ));
+        // ...while identity for the same payload+context does not move.
+        assert_eq!(
+            ContentId::derive(
+                ObjectKind::Chunk,
+                &crate::Envelope::decode(&v0).unwrap().payload
+            ),
+            ContentId::derive(ObjectKind::Chunk, payload),
+            "framing version must not move ContentId while the identity context is fixed"
+        );
     }
 
     #[test]

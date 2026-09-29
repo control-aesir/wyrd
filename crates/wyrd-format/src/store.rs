@@ -21,7 +21,8 @@ use thiserror::Error;
 /// domain-separated per kind: opaque bytes alone are not enough to derive
 /// their address. Raw payload bytes are stored, not envelopes — framing is
 /// reconstructed by [`crate::envelope::Envelope`] when objects are
-/// exchanged.
+/// exchanged, and deriving identity from envelope bytes is a contract
+/// violation (object-model.md decision 30).
 /// How a store failure limits the caller: the classification the
 /// daemon and sync layers branch on instead of matching rendered error
 /// strings. Data faults (identity mismatch, corruption) stay error
@@ -406,6 +407,72 @@ mod tests {
             store.get(&expected).unwrap().as_deref(),
             Some(b"network bytes".as_slice())
         );
+    }
+
+    #[test]
+    fn insert_verified_uses_payload_identity_not_envelope_identity() {
+        // Acceptance-boundary form of the payload-based contract: the
+        // store verifies the canonical payload, never the envelope
+        // framing. Framing explicitly declared identity-neutral by the
+        // contract must not move the accepted identity.
+        use crate::Envelope;
+        let payload = b"acceptance boundary payload";
+        let expected = chunk_id(payload);
+        let envelope = Envelope {
+            kind: ObjectKind::Chunk,
+            payload: payload.to_vec(),
+        };
+        let framed = envelope.encode();
+        // The payload round-trips through the envelope and verifies.
+        let decoded = Envelope::decode(&framed).unwrap();
+        let mut store = MemoryObjectStore::default();
+        store
+            .insert_verified(ObjectKind::Chunk, &expected, &decoded.payload)
+            .unwrap();
+        assert!(store.has(&expected).unwrap());
+        // Envelope bytes as a whole are not acceptable payload: they
+        // derive a different identity and must be rejected under the
+        // payload-derived expectation.
+        let err = store
+            .insert_verified(ObjectKind::Chunk, &expected, &framed)
+            .unwrap_err();
+        assert!(matches!(err, MemoryStoreError::IdentityMismatch { .. }));
+    }
+
+    #[test]
+    fn content_identity_golden_vectors_pin_context_and_payload() {
+        // Cross-language anchors: (kind, identity context, canonical
+        // payload bytes) -> ContentId hex. Context strings are format
+        // constants; changing one forks every identity derived with it.
+        let vectors: &[(ObjectKind, &str, &[u8], &str)] = &[
+            (
+                ObjectKind::Chunk,
+                "wyrd content v1/chunk",
+                b"hello",
+                "0b777bf8fce636256ebc6d35ec2e87a63a029e1afe81e787453d9e6ce7808979",
+            ),
+            (
+                ObjectKind::Chunk,
+                "wyrd content v1/chunk",
+                b"",
+                "e22d16eda19658d2def3850238abacc49599972c12899931c26430a0b2cca5b2",
+            ),
+            (
+                ObjectKind::Tree,
+                "wyrd content v1/tree",
+                &[0, 0, 0, 0],
+                "d30be76ce3928d05c9dfa745ae34d2040846e15a24bd56acb3d1793430b7c7f8",
+            ),
+        ];
+        for (kind, context, payload, expected_hex) in vectors {
+            assert_eq!(*context, kind.content_context());
+            let id = ContentId::derive(*kind, payload);
+            assert_eq!(
+                &hex::encode(id.as_bytes()),
+                expected_hex,
+                "golden vector for {context} over {payload:?}"
+            );
+        }
     }
 
     #[test]

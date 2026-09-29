@@ -526,3 +526,38 @@ fn upgrade_unknown_refuses_loudly() {
         "a flipped commit version refuses to load"
     );
 }
+
+/// Object-identity P2 decision (object-model.md): ContentId derives
+/// exclusively from the canonical payload under the identity-domain
+/// context. Envelope framing explicitly declared identity-neutral by
+/// the contract must not move identity; a new identity-domain context
+/// forks it. End-to-end over the public APIs: FsObjectStore as the
+/// acceptance boundary, Envelope as the framing.
+#[test]
+fn content_identity_is_payload_based_across_framing() {
+    use wyrd_format::{ContentId, MemoryObjectStore};
+    let payload = b"contract payload preimage";
+    let expected = ContentId::derive(ObjectKind::Chunk, payload);
+    // Same payload + same context through the framing round-trip.
+    let envelope = wyrd_format::Envelope {
+        kind: ObjectKind::Chunk,
+        payload: payload.to_vec(),
+    };
+    let framed = envelope.encode();
+    let decoded = wyrd_format::Envelope::decode(&framed).unwrap();
+    let mut mem = MemoryObjectStore::default();
+    mem.insert_verified(ObjectKind::Chunk, &expected, &decoded.payload)
+        .unwrap();
+    // Framing bytes are not payload: rejected under the same expectation.
+    assert!(mem
+        .insert_verified(ObjectKind::Chunk, &expected, &framed)
+        .is_err());
+    // Same boundary on disk.
+    let dir = scratch_dir("identity-framing");
+    let mut disk = FsObjectStore::open(dir).unwrap();
+    disk.insert_verified(ObjectKind::Chunk, &expected, payload)
+        .unwrap();
+    // Identity fork rides the context, not the framing.
+    let other = ContentId::derive(ObjectKind::Tree, payload);
+    assert_ne!(expected, other);
+}

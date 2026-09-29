@@ -17,7 +17,13 @@
 //! ManifestEntry (fixed 114 bytes):
 //!     content_id:       32 bytes (the logical object)
 //!     kind:             u8 (ObjectKind byte of the referenced object)
-//!     version:          u8 (envelope version of the referenced representation)
+//!     version:          u8 (seal version of the referenced representation:
+//!                       the EncryptedObject version production seals with,
+//!                       currently SEAL_VERSION. This byte is hashed into
+//!                       the manifest's own ContentId, so it is an
+//!                       identity-bearing crypto domain byte — not envelope
+//!                       framing — and a seal-version fork moves every
+//!                       manifest identity that names the new version)
 //!     storage_id:       32 bytes (the sealed representation to fetch)
 //!     encryption_epoch: u64 LE (the capability epoch that decrypts it)
 //!     size:             u64 LE (plaintext byte length; allocation hint)
@@ -75,6 +81,10 @@ pub const CHILD_LEN: usize = 128;
 pub struct ManifestEntry {
     pub content_id: ContentId,
     pub kind: ObjectKind,
+    /// Seal version of the referenced representation (production fills
+    /// this from the sealing object's version). Hashed into the
+    /// manifest's own ContentId: a seal-version fork moves manifest
+    /// identities that name the new version.
     pub version: u8,
     pub storage_id: StorageId,
     pub encryption_epoch: u64,

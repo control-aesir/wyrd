@@ -277,7 +277,18 @@ mod tests {
         // every identity derived with it. Payloads are real canonical
         // encodings (`Tree::encode`, `Snapshot::encode`,
         // `Manifest::canonical_bytes`), so the vectors anchor the
-        // encoding step as well as the hashing step.
+        // encoding step as well as the hashing step. The fork property
+        // (same payload, different context -> different identity) is
+        // carried by these rows: each kind hashes under its own context
+        // to its own hex, and `content_id_is_deterministic_per_kind`
+        // pins the pairwise inequality directly. The manifest row's
+        // entry version is pinned at the envelope constant deliberately:
+        // production fills that field from the seal version, which this
+        // crate cannot name (hard rule: no sync dependency), and both
+        // constants are 0x00 today. A seal-version fork moves production
+        // manifest identities without moving this vector — the field's
+        // identity-bearing role is documented at `ManifestEntry`, and
+        // this vector pins the mechanics, not production's constant.
         use crate::{Manifest, ManifestEntry, Snapshot, Tree};
         let tree_payload = Tree::empty().encode();
         let snapshot_payload = Snapshot::new(
@@ -373,11 +384,10 @@ mod tests {
 
     #[test]
     fn content_identity_is_invariant_across_envelope_round_trip_for_all_kinds() {
-        // Framing invariance across every object kind with real
-        // canonical payloads: the same payload + context derives the
-        // same ContentId before and after envelope framing. A future
-        // representation version declared identity-neutral by the
-        // contract must preserve this property.
+        // Decode preserves payload bytes for all four kinds with real
+        // canonical payloads, so identity survives a framing round trip
+        // under the current representation. (Framing-gate behavior for
+        // unknown versions lives in `envelope.rs`, not here.)
         use crate::{Manifest, Snapshot, Tree};
         let chunk_payload = b"framing invariance".to_vec();
         let tree_payload = Tree::empty().encode();
@@ -415,19 +425,6 @@ mod tests {
                 "ContentId must survive envelope round-trip for {kind:?}"
             );
         }
-    }
-
-    #[test]
-    fn content_identity_forks_on_context_not_framing() {
-        // Same payload under different identity-domain contexts forks
-        // identity; the fork rides the derivation context, not framing.
-        let payload = b"same bytes, different domain";
-        let chunk = ContentId::derive(ObjectKind::Chunk, payload);
-        let tree = ContentId::derive(ObjectKind::Tree, payload);
-        assert_ne!(
-            chunk, tree,
-            "identity fork rides the derivation context, not framing"
-        );
     }
 
     #[test]

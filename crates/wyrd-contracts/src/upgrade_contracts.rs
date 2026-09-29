@@ -2,7 +2,10 @@
 //! test per invariant direction, composed end to end over the public
 //! APIs — the same single-shape rule as the rest of the suite (all
 //! contracts are `#[cfg(test)]` mods in `src/`, no `tests/` integration
-//! targets).
+//! targets). The one entry outside that scope is contract 42,
+//! `content_identity_is_payload_based_across_framing`, which pins
+//! `object-model.md` decision 30 end to end and lives here because the
+//! memory/disk store seam is its acceptance boundary.
 //!
 //! Fixture convention, decided on the contract issue: fixtures are
 //! data-only under `tests/fixtures/stores/<release>/`, read at runtime

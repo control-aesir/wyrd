@@ -148,6 +148,19 @@ enum MemberAction {
         /// The new owner, 64 hex characters.
         device: String,
     },
+    /// Resolve a frozen membership conflict (owner-only): name the
+    /// winning tip and exactly the voided siblings. The engine
+    /// proves the closed resolution (all ids live contenders at the
+    /// frozen epoch, void set exactly the winner's rivals,
+    /// pre-transition owner authority) before authoring; anything
+    /// less fails closed with no commit.
+    Resolve {
+        /// Winning tip, 64 hex characters.
+        winner: String,
+        /// Voided sibling, repeatable, 64 hex characters each.
+        #[arg(long = "void")]
+        voided: Vec<String>,
+    },
     /// Admit a device (owner-only) and write its sealed invitation to
     /// a file for out-of-band delivery. The transition commits with
     /// the usual catch-up obligations; the newcomer joins from the
@@ -897,6 +910,28 @@ fn member(
             );
             Ok(())
         }
+        MemberAction::Resolve { winner, voided } => {
+            let winner = parse_transition_id(&winner)?;
+            let mut void_ids = Vec::with_capacity(voided.len());
+            for id in &voided {
+                void_ids.push(parse_transition_id(id)?);
+            }
+            let (transition, carried) = transition_with_carry(&mut engine, &drive_dir, |engine| {
+                engine.resolve_conflict(winner, void_ids.clone())
+            })?;
+            println!(
+                "resolved at epoch {} (prev {}, {} voided, {} carried)",
+                transition.epoch,
+                transition
+                    .prev
+                    .map(|id| id.to_string())
+                    .as_deref()
+                    .unwrap_or("genesis"),
+                transition.resolves().len(),
+                carried
+            );
+            Ok(())
+        }
         MemberAction::Invite {
             device,
             encryption_key,
@@ -1144,6 +1179,18 @@ fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
     Ok(DeviceId::from_bytes(bytes))
 }
 
+/// Parse a membership transition id from 64 hex characters (the
+/// winner and voided siblings named by `member resolve`).
+fn parse_transition_id(hex: &str) -> Result<TransitionId, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage("transition must be 64 hex characters naming a transition id".into())
+        })?;
+    Ok(TransitionId::from_bytes(bytes))
+}
+
 /// Parse a device encryption key from 64 hex characters (x-only
 /// pubkey, from the newcomer's pairing-request output).
 fn parse_encryption_key(hex: &str) -> Result<DeviceEncryptionKey, CliError> {
@@ -1261,7 +1308,24 @@ fn member_status_report(engine: &Engine) -> Result<String, CliError> {
         .collect::<Vec<_>>()
         .join(" ");
     let frozen_line = match log.frozen_at() {
-        Some(epoch) => format!("frozen at epoch {epoch}"),
+        Some(epoch) => {
+            // Rival tips: the live contenders the frozen epoch waits
+            // on. Sorted for stable output; the resolver names one of
+            // these as winner and the rest as voided.
+            let mut rivals: Vec<_> = log
+                .statuses()
+                .into_iter()
+                .filter_map(|(id, status)| {
+                    if !matches!(status, TransitionStatus::Contested) {
+                        return None;
+                    }
+                    let t = log.transition(&id)?;
+                    (t.epoch == epoch).then_some(id.to_string())
+                })
+                .collect();
+            rivals.sort();
+            format!("frozen at epoch {epoch}\nrivals: {}", rivals.join(" "))
+        }
         None => "frozen: no".into(),
     };
     Ok(format!(

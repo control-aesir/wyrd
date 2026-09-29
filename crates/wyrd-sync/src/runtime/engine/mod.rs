@@ -110,6 +110,12 @@ pub enum EngineError {
     NotMember,
     #[error("an owner with co-owners can only leave via SetOwners")]
     RemovingOwner,
+    #[error("no frozen membership conflict to resolve")]
+    NoFrozenConflict,
+    #[error("transition {0:?} is not a live contender in the frozen conflict")]
+    NotContender(TransitionId),
+    #[error("void set does not exactly name the winner's rival contenders")]
+    ResolutionMismatch,
     #[error("device identity was previously removed and cannot be re-admitted; use a new device identity")]
     RetiredDevice,
     #[error("no held epoch secret for epoch {0}")]
@@ -793,6 +799,20 @@ impl Engine {
     /// member. See [`super::author::set_owners`].
     pub fn set_owners(&mut self, new_owner: DeviceId) -> Result<MembershipTransition, EngineError> {
         super::author::set_owners(self, new_owner)
+    }
+
+    /// Resolve a frozen membership conflict: author, sign, and commit
+    /// the owner-signed resolution naming the winning tip in `prev`
+    /// and exactly the voided siblings in `resolves` (one new epoch,
+    /// membership unchanged apart from the voiding). Only an owner
+    /// resolves, and only a live contender wins. See
+    /// [`super::author::resolve_conflict`].
+    pub fn resolve_conflict(
+        &mut self,
+        winner: TransitionId,
+        voided: Vec<TransitionId>,
+    ) -> Result<MembershipTransition, EngineError> {
+        super::author::resolve_conflict(self, winner, voided)
     }
 
     /// Send every undischarged transition- and capability-delivery

@@ -58,6 +58,12 @@ use crate::ingest::{check_manifest, check_tree, IngestError, Limits};
 /// failure carrying its own classification: it is neither pending
 /// progress nor permanent damage, and callers route it to the store
 /// failure policy.
+///
+/// Batch policy (raise and count): the head-closure gate verifies
+/// every classified head, counts each rejection by
+/// [`ClosureError::rejection_class`], and raises the first damage as
+/// the batch error — so one damaged head still fails its pass
+/// closed while the counts describe the whole batch.
 #[derive(Debug, Error)]
 pub enum ClosureError {
     #[error("root manifest describes snapshot {found}, not {expected}")]
@@ -173,16 +179,33 @@ impl ClosureError {
     /// `ObjectStore` I/O failure carries the store's own
     /// classification and callers route it to the store failure
     /// policy, never to the closure counts.
+    ///
+    /// Every variant is listed explicitly — no wildcard — so adding
+    /// a variant fails compilation until its class is decided here.
     pub fn rejection_class(&self) -> Option<RejectionClass> {
         if self.is_pending() {
             return Some(RejectionClass::Incomplete);
         }
         match self {
+            ClosureError::RootSnapshotMismatch { .. }
+            | ClosureError::NonCanonicalManifest
+            | ClosureError::InvalidTree(_)
+            | ClosureError::AmbiguousTreeMapping { .. }
+            | ClosureError::MissingChildManifest { .. }
+            | ClosureError::ChildSnapshotMismatch { .. }
+            | ClosureError::UnexpectedChildManifest { .. }
+            | ClosureError::MissingChunkEntry { .. }
+            | ClosureError::UnrelatedEntry { .. }
+            | ClosureError::KindMismatch { .. }
+            | ClosureError::TreeEntrySizeMismatch { .. }
+            | ClosureError::Ingest(_) => Some(RejectionClass::Other),
             ClosureError::RootIdentityMismatch { .. }
             | ClosureError::ChildIdentityMismatch { .. }
             | ClosureError::TreeIdentityMismatch(_) => Some(RejectionClass::IdentityMismatch),
+            ClosureError::RootManifestMissing(_)
+            | ClosureError::TreeUnavailable(_)
+            | ClosureError::MissingChildManifestRecord { .. } => Some(RejectionClass::Incomplete),
             ClosureError::ObjectStore { .. } => None,
-            _ => Some(RejectionClass::Other),
         }
     }
 }
@@ -964,7 +987,7 @@ mod tests {
         assert_eq!(
             cases.len(),
             19,
-            "one case per ClosureError variant: a new variant must pick a class here"
+            "one case per ClosureError variant, mirroring the exhaustive match in rejection_class"
         );
         for (error, expected) in cases {
             assert_eq!(

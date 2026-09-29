@@ -494,12 +494,16 @@ impl HeadPartition {
 /// The closure gate shared by the direct refresh and the live sync
 /// pass. The projection rule is per validity class, not all-or-
 /// nothing: verified heads install, pending heads wait for their
-/// closure, and only a damaged closure fails the caller outright
-/// (before any installation happens, so the last-known-good
-/// projection keeps serving). See
-/// `partition_heads` below. Pending heads are never damage and must
-/// not consume the fatal engine-error budget: they install once
-/// their closure lands.
+/// closure, and a damaged batch yields no installable heads —
+/// [`HeadPartition::into_publishable`] raises the first damage
+/// instead, so the last-known-good projection keeps serving. Pending
+/// heads are never damage and must not consume the fatal
+/// engine-error budget: they install once their closure lands.
+///
+/// Batch bound: one [`verify_head_closure`](wyrd_sync::closure::verify_head_closure)
+/// per classified head, each bounded by [`Limits::V0`](wyrd_sync::ingest::Limits);
+/// verification is read-only, so scanning past damage costs CPU only
+/// (see `docs/resource-limits.md`), never acceptance.
 pub(crate) fn partition_heads<S>(
     runtime: &wyrd_sync::runtime::RuntimeState,
     heads: Vec<AuthorizedSnapshot>,
@@ -509,9 +513,8 @@ where
     S: ObjectStore,
     S::Error: std::fmt::Debug,
 {
-    let mut publishable = Vec::with_capacity(heads.len());
     let mut partition = HeadPartition {
-        publishable: Vec::new(),
+        publishable: Vec::with_capacity(heads.len()),
         pending: 0,
         mismatch: 0,
         other: 0,
@@ -524,14 +527,15 @@ where
             store,
             &wyrd_sync::ingest::Limits::V0,
         ) {
-            Ok(()) => publishable.push(head),
+            Ok(()) => partition.publishable.push(head),
             Err(error) if error.is_pending() => partition.pending += 1,
             // A store that cannot be read is not closure damage: it
             // carries the store's own classification so the failure
             // policy spends the store budget, not the fatal engine
-            // one. Reading further is pointless — every later head
-            // would fail the same way — so the scan stops here,
-            // keeping any earlier damage as the reported error.
+            // one — unless an earlier head already failed damaged,
+            // in which case that damage stays the reported error.
+            // Reading further is pointless either way: every later
+            // head would fail the same read, so the scan stops here.
             Err(ClosureError::ObjectStore { failure, .. }) => {
                 return Err(partition
                     .first_damage
@@ -546,11 +550,22 @@ where
                 // unaffected. The first damage is the reported
                 // error — the same one a fail-fast scan would have
                 // returned — and nothing installs either way.
+                //
+                // The pending and store arms above own `Incomplete`
+                // and `None`: reaching this arm with either is a
+                // logic error, not a new class.
                 match error.rejection_class() {
                     Some(wyrd_sync::closure::RejectionClass::IdentityMismatch) => {
                         partition.mismatch += 1
                     }
-                    _ => partition.other += 1,
+                    Some(wyrd_sync::closure::RejectionClass::Other) => partition.other += 1,
+                    unexpected => {
+                        debug_assert!(
+                            false,
+                            "closure gate saw {unexpected:?}: pending and store failures have their own arms"
+                        );
+                        partition.other += 1;
+                    }
                 }
                 partition.first_damage.get_or_insert(error);
             }
@@ -567,7 +582,6 @@ where
             "head closure gate held heads back"
         );
     }
-    partition.publishable = publishable;
     Ok(partition)
 }
 
@@ -1257,6 +1271,7 @@ where
             sent = sent,
             revision = revision,
             eligible_heads = installed_heads,
+            pending_heads = pending_heads,
             "sync pass published"
         );
         Ok(SyncReport {
@@ -2617,43 +2632,59 @@ mod prereq_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Test-only store probe for the closure gate: serves substitute
+    /// bytes for a swapped tree (an identity mismatch), hides trees
+    /// (still fetching), and fails reads for unreadable ones. Writes
+    /// pass through untouched; the gate only ever reads.
+    struct GateProbeStore {
+        inner: MemoryObjectStore,
+        swapped: Option<(ContentId, Vec<u8>)>,
+        hidden: Vec<ContentId>,
+        unreadable: Vec<ContentId>,
+    }
+    #[derive(Debug)]
+    struct ProbeError;
+    impl StoreError for ProbeError {}
+    impl ObjectStore for GateProbeStore {
+        type Error = ProbeError;
+        fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
+            self.inner.insert(kind, data).map_err(|_| ProbeError)
+        }
+        fn insert_verified(
+            &mut self,
+            kind: ObjectKind,
+            expected: &ContentId,
+            data: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .insert_verified(kind, expected, data)
+                .map_err(|_| ProbeError)
+        }
+        fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+            if self.unreadable.contains(id) {
+                return Err(ProbeError);
+            }
+            if self.hidden.contains(id) {
+                return Ok(None);
+            }
+            if let Some((target, bytes)) = &self.swapped {
+                if id == target {
+                    return Ok(Some(bytes.clone()));
+                }
+            }
+            self.inner.get(id).map_err(|_| ProbeError)
+        }
+        fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
+            self.inner.has(id).map_err(|_| ProbeError)
+        }
+    }
+
     /// The gate counts rejections by class without changing the
     /// fail-closed outcome: a verified head installs with zero
     /// counts, an unfetched tree counts as pending, and swapped tree
     /// bytes count as a mismatch that still fails closed.
     #[test]
     fn head_gate_counts_rejections_by_class() {
-        /// A read-only view over a memory store with one tree's bytes
-        /// swapped: serving foreign bytes for a live head is exactly
-        /// the mismatch the gate must count, never install.
-        struct SwappedTreeStore {
-            inner: MemoryObjectStore,
-            target: ContentId,
-            substitute: Vec<u8>,
-        }
-        impl ObjectStore for SwappedTreeStore {
-            type Error = wyrd_format::MemoryStoreError;
-            fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
-                self.inner.insert(kind, data)
-            }
-            fn insert_verified(
-                &mut self,
-                kind: ObjectKind,
-                expected: &ContentId,
-                data: &[u8],
-            ) -> Result<(), Self::Error> {
-                self.inner.insert_verified(kind, expected, data)
-            }
-            fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
-                if id == &self.target {
-                    return Ok(Some(self.substitute.clone()));
-                }
-                self.inner.get(id)
-            }
-            fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
-                self.inner.has(id)
-            }
-        }
         let (engine, dir, store, chunk, root, _head) = scratch_file_drive("gate-counts");
         let runtime = engine.runtime_state().unwrap();
         // Baseline: the authored closure verifies against its own
@@ -2684,10 +2715,11 @@ mod prereq_tests {
         let decoy = Tree::from_entries(vec![Entry::file("g", 11, false, vec![chunk]).unwrap()])
             .unwrap()
             .encode();
-        let swapped = SwappedTreeStore {
+        let swapped = GateProbeStore {
             inner: store,
-            target: root,
-            substitute: decoy,
+            swapped: Some((root, decoy)),
+            hidden: Vec::new(),
+            unreadable: Vec::new(),
         };
         let partition = partition_heads(&runtime, engine.live_heads().unwrap(), &swapped).unwrap();
         assert_eq!(
@@ -2704,6 +2736,89 @@ mod prereq_tests {
                 EngineError::Closure(ClosureError::TreeIdentityMismatch(_))
             ),
             "the mismatch error survives the count: {error:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A second head authored into the same store, for multi-head
+    /// gate batches: the batch order is the caller's `Vec` order, so
+    /// tests place damage and pending exactly where they probe.
+    fn two_head_drive(
+        tag: &str,
+    ) -> (
+        Engine,
+        std::path::PathBuf,
+        MemoryObjectStore,
+        ContentId,
+        ContentId,
+        AuthorizedSnapshot,
+        AuthorizedSnapshot,
+    ) {
+        let (mut engine, dir, mut store, chunk, root, head) = scratch_file_drive(tag);
+        let root2 = Tree::from_entries(vec![Entry::file("g", 11, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        let head2 = engine.author_snapshot(&store, root2).unwrap();
+        (engine, dir, store, root, root2, head, head2)
+    }
+
+    /// A head behind a damaged head is still classified: the batch
+    /// counts the pending head instead of stopping at the damage,
+    /// and the first damage stays the reported error.
+    #[test]
+    fn head_gate_classifies_past_the_first_damage() {
+        let (engine, dir, store, root, root2, head, head2) = two_head_drive("gate-two-head");
+        // Serve the second head's own tree bytes for the first head's
+        // tree: valid bytes, wrong identity — a mismatch, not damage
+        // to the probe itself.
+        let decoy = store.get(&root2).unwrap().unwrap();
+        let probe = GateProbeStore {
+            inner: store,
+            swapped: Some((root, decoy)),
+            hidden: vec![root2],
+            unreadable: Vec::new(),
+        };
+        let runtime = engine.runtime_state().unwrap();
+        let partition = partition_heads(&runtime, vec![head, head2], &probe).unwrap();
+        assert!(partition.publishable.is_empty());
+        assert_eq!(
+            (partition.pending, partition.mismatch, partition.other),
+            (1, 1, 0),
+            "the pending head behind the damage is still counted"
+        );
+        let error = partition
+            .into_publishable()
+            .expect_err("damage still fails the batch closed");
+        assert!(
+            matches!(
+                error,
+                EngineError::Closure(ClosureError::TreeIdentityMismatch(_))
+            ),
+            "the first damage stays the reported error: {error:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Damage before a store failure keeps the damage as the reported
+    /// error: the failure policy must see the closure verdict for a
+    /// batch that was already doomed, not a store-budget spend.
+    #[test]
+    fn head_gate_reports_earlier_damage_over_later_store_failure() {
+        let (engine, dir, store, root, root2, head, head2) = two_head_drive("gate-damage-store");
+        let decoy = store.get(&root2).unwrap().unwrap();
+        let probe = GateProbeStore {
+            inner: store,
+            swapped: Some((root, decoy)),
+            hidden: Vec::new(),
+            unreadable: vec![root2],
+        };
+        let runtime = engine.runtime_state().unwrap();
+        let error = partition_heads(&runtime, vec![head, head2], &probe)
+            .expect_err("a damaged batch with an unreadable store still fails");
+        assert!(
+            matches!(error, EngineError::Closure(_)),
+            "earlier damage wins over later store failure: {error:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -536,8 +536,11 @@ fn upgrade_unknown_refuses_loudly() {
 /// Object-identity decision 30 (`object-model.md`): ContentId derives
 /// exclusively from the canonical payload under the identity-domain
 /// context (contract 42). Scoped honestly: this entry pins
-/// framing-invariance and kind separation at the store boundary;
-/// identity-domain forking rides the golden vectors in `wyrd-format`.
+/// framing-invariance at the store boundary (memory and disk) and kind
+/// separation from the derivation context; the store-boundary kind
+/// refusal is `insert_verified_uses_payload_identity_not_envelope_identity`
+/// in `wyrd-format`, and identity-domain forking rides the golden vectors
+/// there.
 /// End-to-end over the public APIs: memory and disk stores as the
 /// acceptance boundary, Envelope as the framing.
 #[test]

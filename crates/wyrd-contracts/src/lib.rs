@@ -184,8 +184,9 @@
 //!
 //! 42. `content_identity_is_payload_based_across_framing` — ContentId
 //!     derives exclusively from the canonical payload under the
-//!     identity-domain context; framing-invariance and kind separation
-//!     at the store boundary, identity-domain forking in the
+//!     identity-domain context; framing-invariance at the store
+//!     boundary (memory and disk) and kind separation from the
+//!     derivation context, identity-domain forking in the
 //!     `wyrd-format` golden vectors.
 
 #[cfg(test)]

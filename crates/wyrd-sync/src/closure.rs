@@ -182,10 +182,9 @@ impl ClosureError {
     ///
     /// Every variant is listed explicitly — no wildcard — so adding
     /// a variant fails compilation until its class is decided here.
+    /// This is the single source of truth for the pending set: keep
+    /// it in sync with [`is_pending`](ClosureError::is_pending).
     pub fn rejection_class(&self) -> Option<RejectionClass> {
-        if self.is_pending() {
-            return Some(RejectionClass::Incomplete);
-        }
         match self {
             ClosureError::RootSnapshotMismatch { .. }
             | ClosureError::NonCanonicalManifest

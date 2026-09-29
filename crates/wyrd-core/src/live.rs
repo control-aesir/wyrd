@@ -502,8 +502,9 @@ impl HeadPartition {
 ///
 /// Batch bound: one [`verify_head_closure`](wyrd_sync::closure::verify_head_closure)
 /// per classified head, each bounded by [`Limits::V0`](wyrd_sync::ingest::Limits);
-/// verification is read-only, so scanning past damage costs CPU only
-/// (see `docs/resource-limits.md`), never acceptance.
+/// verification is read-only, so scanning past damage costs CPU plus
+/// the store read-guard hold (see `docs/resource-limits.md`), never
+/// acceptance.
 pub(crate) fn partition_heads<S>(
     runtime: &wyrd_sync::runtime::RuntimeState,
     heads: Vec<AuthorizedSnapshot>,
@@ -534,8 +535,8 @@ where
             // policy spends the store budget, not the fatal engine
             // one — unless an earlier head already failed damaged,
             // in which case that damage stays the reported error.
-            // Reading further is pointless either way: every later
-            // head would fail the same read, so the scan stops here.
+            // Either way the batch cannot complete, so the scan stops
+            // here; later heads are simply not classified this run.
             Err(ClosureError::ObjectStore { failure, .. }) => {
                 return Err(partition
                     .first_damage
@@ -571,15 +572,24 @@ where
             }
         }
     }
-    if partition.pending + partition.mismatch + partition.other > 0 {
+    if partition.mismatch + partition.other > 0 {
         // One summary for both install sites (the live pass and the
         // direct refresh share this gate): counts by class, never
         // identities — the error itself already names the head.
-        tracing::debug!(
+        // Damage is an operational fault, not a trace: like the
+        // mirror queue above, it lands at warn so it is visible at
+        // the default info filter, while pending alone — ordinary
+        // fetch progress — stays debug.
+        tracing::warn!(
             pending = partition.pending,
             mismatch = partition.mismatch,
             other = partition.other,
-            "head closure gate held heads back"
+            "head closure gate held damaged heads back"
+        );
+    } else if partition.pending > 0 {
+        tracing::debug!(
+            pending = partition.pending,
+            "head closure gate waits for fetching closures"
         );
     }
     Ok(partition)

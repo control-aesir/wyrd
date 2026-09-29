@@ -535,11 +535,11 @@ fn upgrade_unknown_refuses_loudly() {
 
 /// Object-identity decision 30 (`object-model.md`): ContentId derives
 /// exclusively from the canonical payload under the identity-domain
-/// context (contract 42). Envelope framing explicitly declared
-/// identity-neutral by the contract must not move identity; a new
-/// identity-domain context forks it. End-to-end over the public APIs:
-/// memory and disk stores as the acceptance boundary, Envelope as the
-/// framing.
+/// context (contract 42). Scoped honestly: this entry pins
+/// framing-invariance and kind separation at the store boundary;
+/// identity-domain forking rides the golden vectors in `wyrd-format`.
+/// End-to-end over the public APIs: memory and disk stores as the
+/// acceptance boundary, Envelope as the framing.
 #[test]
 fn content_identity_is_payload_based_across_framing() {
     let payload = b"contract payload preimage";

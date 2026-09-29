@@ -163,6 +163,10 @@ pub struct SyncReport {
     /// The served generation after the pass (bumped exactly when
     /// `published`).
     pub generation: u64,
+    /// Classified heads whose closure is still fetching: not
+    /// installed, retried next pass. Zero on idle passes (the gate
+    /// never ran) and on passes whose damage failed closed.
+    pub pending_heads: usize,
 }
 
 /// How far a [`LiveNode::run_loop`] run got before stopping or
@@ -452,6 +456,41 @@ pub struct LiveParts<V: NamespaceView> {
     pub open_timeout: Duration,
 }
 
+/// What the closure gate decided for one batch of classified
+/// heads. `publishable` installs; every other head is held back and
+/// counted by rejection class so operators can tell pending fetch
+/// progress from damage without rerunning the verifier.
+#[derive(Debug)]
+pub(crate) struct HeadPartition {
+    /// Heads whose closure verified: safe to install and serve.
+    pub publishable: Vec<AuthorizedSnapshot>,
+    /// Heads whose closure is still fetching (may heal): retried
+    /// next pass, never fatal.
+    pub pending: usize,
+    /// Heads whose bytes do not hash back (will not heal).
+    pub mismatch: usize,
+    /// Remaining damaged heads (contradicted mappings,
+    /// non-canonical documents, unreachable entries, ...).
+    pub other: usize,
+    /// The first damage seen, in head order: the error a fail-fast
+    /// scan would have returned. Carried separately so the counts
+    /// stay observable even when the batch fails closed.
+    first_damage: Option<ClosureError>,
+}
+
+impl HeadPartition {
+    /// The installable heads, or the first damage when any head
+    /// failed closed. Callers always propagate the error: a damaged
+    /// closure never installs, and the last-known-good projection
+    /// keeps serving.
+    pub(crate) fn into_publishable(self) -> Result<Vec<AuthorizedSnapshot>, EngineError> {
+        match self.first_damage {
+            Some(error) => Err(EngineError::Closure(error)),
+            None => Ok(self.publishable),
+        }
+    }
+}
+
 /// The closure gate shared by the direct refresh and the live sync
 /// pass. The projection rule is per validity class, not all-or-
 /// nothing: verified heads install, pending heads wait for their
@@ -465,13 +504,19 @@ pub(crate) fn partition_heads<S>(
     runtime: &wyrd_sync::runtime::RuntimeState,
     heads: Vec<AuthorizedSnapshot>,
     store: &S,
-) -> Result<(Vec<AuthorizedSnapshot>, usize), EngineError>
+) -> Result<HeadPartition, EngineError>
 where
     S: ObjectStore,
     S::Error: std::fmt::Debug,
 {
     let mut publishable = Vec::with_capacity(heads.len());
-    let mut pending = 0usize;
+    let mut partition = HeadPartition {
+        publishable: Vec::new(),
+        pending: 0,
+        mismatch: 0,
+        other: 0,
+        first_damage: None,
+    };
     for head in heads {
         match wyrd_sync::closure::verify_head_closure(
             runtime,
@@ -480,18 +525,50 @@ where
             &wyrd_sync::ingest::Limits::V0,
         ) {
             Ok(()) => publishable.push(head),
-            Err(error) if error.is_pending() => pending += 1,
+            Err(error) if error.is_pending() => partition.pending += 1,
             // A store that cannot be read is not closure damage: it
             // carries the store's own classification so the failure
             // policy spends the store budget, not the fatal engine
-            // one.
+            // one. Reading further is pointless — every later head
+            // would fail the same way — so the scan stops here,
+            // keeping any earlier damage as the reported error.
             Err(ClosureError::ObjectStore { failure, .. }) => {
-                return Err(EngineError::Store(failure))
+                return Err(partition
+                    .first_damage
+                    .take()
+                    .map(EngineError::Closure)
+                    .unwrap_or(EngineError::Store(failure)))
             }
-            Err(error) => return Err(EngineError::Closure(error)),
+            Err(error) => {
+                // Damage fails closed, but the scan continues: the
+                // per-class counts must describe the whole batch,
+                // and verification is read-only so later heads are
+                // unaffected. The first damage is the reported
+                // error — the same one a fail-fast scan would have
+                // returned — and nothing installs either way.
+                match error.rejection_class() {
+                    Some(wyrd_sync::closure::RejectionClass::IdentityMismatch) => {
+                        partition.mismatch += 1
+                    }
+                    _ => partition.other += 1,
+                }
+                partition.first_damage.get_or_insert(error);
+            }
         }
     }
-    Ok((publishable, pending))
+    if partition.pending + partition.mismatch + partition.other > 0 {
+        // One summary for both install sites (the live pass and the
+        // direct refresh share this gate): counts by class, never
+        // identities — the error itself already names the head.
+        tracing::debug!(
+            pending = partition.pending,
+            mismatch = partition.mismatch,
+            other = partition.other,
+            "head closure gate held heads back"
+        );
+    }
+    partition.publishable = publishable;
+    Ok(partition)
 }
 
 /// How one queued entry resolved in an apply sweep: recorded
@@ -1073,6 +1150,7 @@ where
                 fetched,
                 published: false,
                 generation,
+                pending_heads: 0,
             });
         }
         // Per-class projection: verified heads publish, pending ones
@@ -1080,10 +1158,12 @@ where
         // with the previous generation still serving (see
         // `partition_heads`).
         let heads = self.engine.live_heads()?;
-        let (heads, pending_heads) = {
+        let partition = {
             let store = self.store.read().map_err(|_| LiveError::Lock)?;
             partition_heads(&completed_runtime, heads, &*store)?
         };
+        let pending_heads = partition.pending;
+        let heads = partition.into_publishable()?;
         if heads.is_empty() && pending_heads > 0 {
             // Every eligible head is still mid-fetch: keep the current
             // generation serving and try again next pass. This is
@@ -1111,6 +1191,7 @@ where
                 fetched,
                 published: false,
                 generation,
+                pending_heads,
             });
         }
         let installed_heads = heads.len();
@@ -1183,6 +1264,7 @@ where
             fetched,
             published: true,
             generation: generation + 1,
+            pending_heads,
         })
     }
 
@@ -2535,6 +2617,97 @@ mod prereq_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The gate counts rejections by class without changing the
+    /// fail-closed outcome: a verified head installs with zero
+    /// counts, an unfetched tree counts as pending, and swapped tree
+    /// bytes count as a mismatch that still fails closed.
+    #[test]
+    fn head_gate_counts_rejections_by_class() {
+        /// A read-only view over a memory store with one tree's bytes
+        /// swapped: serving foreign bytes for a live head is exactly
+        /// the mismatch the gate must count, never install.
+        struct SwappedTreeStore {
+            inner: MemoryObjectStore,
+            target: ContentId,
+            substitute: Vec<u8>,
+        }
+        impl ObjectStore for SwappedTreeStore {
+            type Error = wyrd_format::MemoryStoreError;
+            fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
+                self.inner.insert(kind, data)
+            }
+            fn insert_verified(
+                &mut self,
+                kind: ObjectKind,
+                expected: &ContentId,
+                data: &[u8],
+            ) -> Result<(), Self::Error> {
+                self.inner.insert_verified(kind, expected, data)
+            }
+            fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+                if id == &self.target {
+                    return Ok(Some(self.substitute.clone()));
+                }
+                self.inner.get(id)
+            }
+            fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
+                self.inner.has(id)
+            }
+        }
+        let (engine, dir, store, chunk, root, _head) = scratch_file_drive("gate-counts");
+        let runtime = engine.runtime_state().unwrap();
+        // Baseline: the authored closure verifies against its own
+        // store — one installable head, zero rejections.
+        let partition = partition_heads(&runtime, engine.live_heads().unwrap(), &store).unwrap();
+        assert_eq!(partition.publishable.len(), 1);
+        assert_eq!(
+            (partition.pending, partition.mismatch, partition.other),
+            (0, 0, 0),
+            "a verified closure reports no rejections"
+        );
+        // An empty store leaves the tree unfetched: pending progress,
+        // not damage — nothing installable, nothing fatal.
+        let partition = partition_heads(
+            &runtime,
+            engine.live_heads().unwrap(),
+            &MemoryObjectStore::default(),
+        )
+        .unwrap();
+        assert!(partition.publishable.is_empty());
+        assert_eq!(
+            (partition.pending, partition.mismatch, partition.other),
+            (1, 0, 0),
+            "an unfetched closure counts as pending"
+        );
+        // Swapped tree bytes do not hash back: a mismatch, and the
+        // batch still fails closed with the mismatch error.
+        let decoy = Tree::from_entries(vec![Entry::file("g", 11, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .encode();
+        let swapped = SwappedTreeStore {
+            inner: store,
+            target: root,
+            substitute: decoy,
+        };
+        let partition = partition_heads(&runtime, engine.live_heads().unwrap(), &swapped).unwrap();
+        assert_eq!(
+            (partition.pending, partition.mismatch, partition.other),
+            (0, 1, 0),
+            "foreign tree bytes count as a mismatch"
+        );
+        let error = partition
+            .into_publishable()
+            .expect_err("a mismatched closure never installs");
+        assert!(
+            matches!(
+                error,
+                EngineError::Closure(ClosureError::TreeIdentityMismatch(_))
+            ),
+            "the mismatch error survives the count: {error:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Authoring over a classified store failure keeps the resource
     /// errno: a full disk is `ENOSPC` and an unwritable store is
     /// `EACCES` at the boundary, never opaque `Engine`.
@@ -3092,6 +3265,10 @@ mod prereq_tests {
             )
             .unwrap();
         assert!(!report.published, "the incomplete closure remains deferred");
+        assert_eq!(
+            report.pending_heads, 1,
+            "the deferred head is reported as pending, not silently skipped"
+        );
         assert!(!queue.validate_parent("f", token));
         assert!(queue.capture_parent("f").is_some());
         drop(node);

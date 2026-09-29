@@ -74,6 +74,7 @@ use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
+pub use super::author::MergeSelection;
 pub use super::bootstrap::PairingRequest;
 
 /// Engine failures: durable-commit, runtime-record, and mailbox-
@@ -116,6 +117,24 @@ pub enum EngineError {
     NotContender(TransitionId),
     #[error("void set does not exactly name the winner's rival contenders")]
     ResolutionMismatch,
+    #[error("merging needs at least two source heads")]
+    MergeNeedsTwoHeads,
+    #[error("duplicate merge head {0}")]
+    DuplicateMergeHead(SnapshotId),
+    #[error("snapshot {0} is not a current eligible head")]
+    NotEligibleHead(SnapshotId),
+    #[error("merge default {0} is not one of the selected heads")]
+    MergeDefaultNotAHead(SnapshotId),
+    #[error("merge selection names {0}, which is not one of the selected heads")]
+    MergeSelectionNotAHead(SnapshotId),
+    #[error("merge spec names {0:?}, which no selected head contains")]
+    UnknownMergePath(String),
+    #[error("merge spec names {0:?}, which all selected heads agree on")]
+    MergePathAgreed(String),
+    #[error("no selection for conflicted path {0:?}: name it in the spec or pass a default")]
+    UnresolvedMergePath(String),
+    #[error("merged tree failed construction: {0}")]
+    MergeTreeInvalid(String),
     #[error("device identity was previously removed and cannot be re-admitted; use a new device identity")]
     RetiredDevice,
     #[error("no held epoch secret for epoch {0}")]
@@ -515,6 +534,17 @@ pub(super) enum FetchKey {
     Body(SnapshotId),
 }
 
+/// One observed DAG head with its authorization classification
+/// and bound epoch (when the body is still recorded). The
+/// presentation layer numbers the eligible heads of this listing to
+/// address merge sources as `@N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotHead {
+    pub id: SnapshotId,
+    pub classification: crate::authorization::Classification,
+    pub epoch: Option<u64>,
+}
+
 /// The intake driver for one device on one drive.
 pub struct Engine {
     pub(super) drive: DriveId,
@@ -815,6 +845,28 @@ impl Engine {
         super::author::resolve_conflict(self, winner, voided)
     }
 
+    /// Merge explicit snapshot heads into one snapshot: the
+    /// deterministic merged tree over the selected heads plus the
+    /// merge spec (`Take` one head's version per conflicted root
+    /// path, or drop it), parented onto exactly the selected heads.
+    /// Heads must be current eligible heads (at least two); paths
+    /// the heads agree on are taken automatically and conflicted
+    /// paths need a spec line or the default. Ordinary member
+    /// authority, current epoch, existing announcement outbox — no
+    /// membership change. See [`super::author::merge`].
+    pub fn merge_heads<S: ObjectStore>(
+        &mut self,
+        objects: &mut S,
+        heads: Vec<SnapshotId>,
+        default: Option<SnapshotId>,
+        spec: std::collections::BTreeMap<String, super::author::MergeSelection>,
+    ) -> Result<AuthorizedSnapshot, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::merge(self, objects, heads, default, spec)
+    }
+
     /// Send every undischarged transition- and capability-delivery
     /// obligation, returning the number of envelopes sent this call.
     /// Transitions go before capabilities; a mid-loop transport
@@ -1012,6 +1064,41 @@ impl Engine {
                     .map_err(EngineError::InvalidHead)
             })
             .collect()
+    }
+
+    /// One DAG head with its authorization classification: the
+    /// inspection basis for merges. Only [`Eligible`] heads may
+    /// advance the live view or serve as merge sources; every other
+    /// class is retained history with its reason attached. Sorted
+    /// ascending by id, like every other head listing.
+    ///
+    /// [`Eligible`]: crate::authorization::Classification::Eligible
+    pub fn snapshot_heads(&self) -> Result<Vec<SnapshotHead>, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        let live: HashSet<SnapshotId> = dag.heads().into_iter().collect();
+        let mut heads: Vec<SnapshotHead> = dag
+            .classify(&rebuilt.log)
+            .into_iter()
+            .filter(|(id, _)| live.contains(id))
+            .map(|(id, classification)| {
+                let epoch = rebuilt
+                    .runtime
+                    .snapshot_bodies
+                    .get(&id)
+                    .map(|body| body.epoch);
+                SnapshotHead {
+                    id,
+                    classification,
+                    epoch,
+                }
+            })
+            .collect();
+        heads.sort_by_key(|head| head.id);
+        Ok(heads)
     }
 
     /// Author a new snapshot over `tree`, signed by this device and bound

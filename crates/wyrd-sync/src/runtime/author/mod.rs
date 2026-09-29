@@ -23,6 +23,7 @@ mod admission;
 mod announce;
 mod common;
 mod deliver;
+mod merge;
 mod remove_device;
 mod resolve_conflict;
 mod rotate_epoch;
@@ -37,6 +38,8 @@ mod tests_carry;
 mod tests_harness;
 #[cfg(test)]
 mod tests_lifecycle;
+#[cfg(test)]
+mod tests_merge;
 #[cfg(test)]
 mod tests_reader;
 #[cfg(test)]
@@ -56,6 +59,8 @@ pub(super) use admission::reissue_invitation;
 pub use admission::AdmitOutcome;
 pub(super) use announce::{announce, announce_pending};
 pub(super) use deliver::deliver_pending;
+pub(super) use merge::merge;
+pub use merge::MergeSelection;
 pub(super) use remove_device::remove_device;
 pub(super) use resolve_conflict::resolve_conflict;
 pub(super) use rotate_epoch::rotate_epoch;

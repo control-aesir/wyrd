@@ -110,7 +110,15 @@ characters (x-only pubkeys).
 - `status`: known tip epoch and id, member/owner counts, frozen
   state, and held epoch secrets. Knowledge is not possession: a
   known epoch without its secret authorizes nothing until the
-  capability arrives.
+  capability arrives. A frozen conflict epoch lists its rival tips —
+  the live contenders the epoch waits on.
+- `resolve <winner> --void <sibling>...`: resolve a frozen
+  membership conflict (owner-only) by naming the winning tip and
+  exactly the voided siblings. The engine proves the closed
+  resolution — every id a live contender at the frozen epoch, the
+  void set exactly the winner's rivals, owner authority in the
+  pre-transition state — before authoring; anything less fails
+  closed with no commit.
 - `remove <device>`: author a removal transition. The removed device —
   member or reader — receives no new-epoch material; its acquisition
   ends at the removal boundary while its history stays valid.
@@ -150,6 +158,36 @@ characters (x-only pubkeys).
 Membership state beyond the CLI: device identity is single-use
 within a membership chain — a removed device returns only under a
 fresh identity (`docs/epochs.md`).
+
+### `snapshot` — inspect snapshots and merge conflicted heads
+
+Reads project the snapshot DAG offline over the keystore; a merge
+authors one snapshot with ordinary member authority through the
+engine, which enforces head eligibility and the merge-spec contract
+— the CLI never decides authorization itself. Announcements for the
+merge queue with the usual outbox, delivered on the next mounted
+sync. Head references are `@N` over the live heads in ascending
+SnapshotId order: the same numbering the `name@N` conflict siblings
+use, so `@1` on the command line is `@1` in the mount and on disk.
+
+- `list`: the live heads with their `@N` numbers, epochs, authors,
+  trees, and parent counts.
+- `heads`: every DAG head with its authorization classification
+  (`eligible`, `canonical-history`, `superseded`, `stranded`,
+  `voided`, `pending:<reason>`, `rejected:<reason>`) and epoch.
+  Eligible heads carry their `@N` merge numbers; every other class
+  is retained history with its reason attached.
+- `merge [--head <id>...] [--default @N] [--take path=@N]...
+  [--drop path]...`: merge source heads — all live heads by
+  default, or an explicit subset of at least two — into one
+  snapshot parented onto exactly the selected heads at the current
+  epoch. The merged tree is a deterministic function of the
+  sources plus the spec: paths every source agrees on take
+  themselves, conflicted root paths take `--take path=@N`, drop
+  with `--drop path`, or fall back to `--default @N`. A spec line
+  on an agreed path, a path no source holds, an uncovered conflict,
+  or a source whose bytes are not locally servable all fail closed
+  with nothing committed. No membership change, no epoch change.
 
 ### `device` — pair this device with a drive
 

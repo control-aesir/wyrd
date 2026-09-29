@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -19,11 +20,11 @@ use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LoopError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
-use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
+use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use wyrd_sync::control::SealedBootstrap;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
-use wyrd_sync::runtime::{Engine, EngineError};
+use wyrd_sync::runtime::{Engine, EngineError, MergeSelection};
 use zeroize::Zeroizing;
 
 /// The `wyrd` binary: create a drive, mount its live projection,
@@ -102,6 +103,20 @@ enum Command {
         drive_dir: PathBuf,
         #[command(subcommand)]
         action: MemberAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Inspect snapshots and merge conflicted heads: list the live
+    /// heads, classify every DAG head, or author one merge snapshot
+    /// over explicit sources plus a path spec. Reads are offline
+    /// projections of the keystore; a merge authors one snapshot
+    /// with ordinary member authority and queues the usual
+    /// announcements for the next mounted sync.
+    Snapshot {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: SnapshotAction,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -186,6 +201,44 @@ enum MemberAction {
         device: String,
         /// Where to write the sealed invitation.
         out: PathBuf,
+    },
+}
+
+/// One snapshot inspection or merge action. Head references are
+/// `@N` over the live heads in ascending SnapshotId order — the
+/// same numbering the `name@N` conflict siblings use — so `@1` on
+/// the command line is `@1` in the mount and on disk.
+#[derive(Debug, Subcommand)]
+enum SnapshotAction {
+    /// List the live heads with their `@N` numbers.
+    List,
+    /// Classify every DAG head: eligible, superseded, stranded,
+    /// voided, pending, or rejected. Eligible heads carry their
+    /// `@N` merge numbers.
+    Heads,
+    /// Merge source heads into one snapshot. Sources default to all
+    /// live heads; `--head` narrows to an explicit subset (at least
+    /// two). Conflicted root paths take `--take path=@N`, drop with
+    /// `--drop path`, or fall back to `--default @N`; paths every
+    /// source agrees on take themselves. The merged snapshot parents
+    /// onto exactly the selected heads at the current epoch.
+    Merge {
+        /// Source head, 64 hex characters. Repeatable; omitted means
+        /// all live heads.
+        #[arg(long = "head")]
+        heads: Vec<String>,
+        /// Default source for conflicted paths without a `--take`
+        /// line, `@N` over the selected heads.
+        #[arg(long)]
+        default: Option<String>,
+        /// Take a conflicted root path from one source,
+        /// `path=@N`. Repeatable, one line per path.
+        #[arg(long = "take")]
+        takes: Vec<String>,
+        /// Drop a conflicted root path from the merge.
+        /// Repeatable.
+        #[arg(long = "drop")]
+        drops: Vec<String>,
     },
 }
 
@@ -286,6 +339,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
         Command::Member { credentials, .. } => read_credentials(credentials)?,
+        Command::Snapshot { credentials, .. } => read_credentials(credentials)?,
         Command::Device { credentials, .. } => read_credentials(credentials)?,
     };
 
@@ -307,6 +361,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Member {
             drive_dir, action, ..
         } => member(drive_dir, action, &passphrase, identity),
+        Command::Snapshot {
+            drive_dir, action, ..
+        } => snapshot(drive_dir, action, &passphrase, identity),
         Command::Device {
             drive_dir, action, ..
         } => device(drive_dir, action, &passphrase, identity),
@@ -990,6 +1047,122 @@ fn member(
     }
 }
 
+/// Inspect snapshots and merge conflicted heads offline over the
+/// keystore. Merging authors one snapshot with ordinary member
+/// authority (the engine enforces eligibility and the merge-spec
+/// contract, never the CLI) and queues the usual announcements for
+/// the next mounted sync.
+fn snapshot(
+    drive_dir: PathBuf,
+    action: SnapshotAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let mut engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
+    match action {
+        SnapshotAction::List => {
+            print!("{}", snapshot_list_report(&engine)?);
+            Ok(())
+        }
+        SnapshotAction::Heads => {
+            print!("{}", snapshot_heads_report(&engine)?);
+            Ok(())
+        }
+        SnapshotAction::Merge {
+            heads,
+            default,
+            takes,
+            drops,
+        } => {
+            // Sources default to every live head; explicit ids narrow
+            // to a subset. Sorted ascending, so `@N` numbers the
+            // selection in SnapshotId byte order.
+            let mut selected: Vec<SnapshotId> = if heads.is_empty() {
+                engine
+                    .live_heads()?
+                    .iter()
+                    .map(|head| head.snapshot().snapshot_id())
+                    .collect()
+            } else {
+                heads
+                    .iter()
+                    .map(|head| parse_snapshot_id(head))
+                    .collect::<Result<_, _>>()?
+            };
+            selected.sort();
+            let resolve_ref = |reference: &str| -> Result<SnapshotId, CliError> {
+                let number: usize = reference
+                    .strip_prefix('@')
+                    .and_then(|number| number.parse().ok())
+                    .filter(|number| *number >= 1)
+                    .ok_or_else(|| {
+                        CliError::Usage(format!("head reference must be @N, got {reference:?}"))
+                    })?;
+                selected.get(number - 1).copied().ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "@{number} names no selected head: {} selected",
+                        selected.len()
+                    ))
+                })
+            };
+            let default = default
+                .map(|reference| resolve_ref(&reference))
+                .transpose()?;
+            let mut spec = BTreeMap::new();
+            for take in &takes {
+                let (path, reference) = take.split_once('=').ok_or_else(|| {
+                    CliError::Usage(format!("--take must be path=@N, got {take:?}"))
+                })?;
+                let id = resolve_ref(reference)?;
+                if spec
+                    .insert(check_merge_path(path)?, MergeSelection::Take(id))
+                    .is_some()
+                {
+                    return Err(CliError::Usage(format!(
+                        "duplicate selection for path {path:?}"
+                    )));
+                }
+            }
+            for drop in &drops {
+                let path = check_merge_path(drop)?;
+                if spec.insert(path.clone(), MergeSelection::Absent).is_some() {
+                    return Err(CliError::Usage(format!(
+                        "duplicate selection for path {path:?}"
+                    )));
+                }
+            }
+            let mut store = FsObjectStore::open(drive_dir.to_path_buf())
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            let merged = engine.merge_heads(&mut store, selected, default, spec)?;
+            let parents = merged
+                .snapshot()
+                .parents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "merged {} at epoch {} (parents {parents})",
+                merged.snapshot().snapshot_id(),
+                merged.snapshot().epoch,
+            );
+            Ok(())
+        }
+    }
+}
+
+/// One merge-spec path: a root entry name. v0 merges at root-entry
+/// granularity (a conflicting subtree is taken or dropped whole),
+/// so anything deeper is refused at the argument boundary.
+fn check_merge_path(path: &str) -> Result<String, CliError> {
+    if path.is_empty() || path.contains('/') {
+        return Err(CliError::Usage(format!(
+            "merge paths are root entries, got {path:?}"
+        )));
+    }
+    Ok(path.to_owned())
+}
+
 /// Author a membership transition plus its namespace carry in one
 /// offline step: stage the served heads as durable obligations,
 /// commit the transition via `author`, then drain the carry queue
@@ -1179,6 +1352,18 @@ fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
     Ok(DeviceId::from_bytes(bytes))
 }
 
+/// Parse a snapshot id from 64 hex characters (the merge sources
+/// named by `snapshot merge --head`).
+fn parse_snapshot_id(hex: &str) -> Result<SnapshotId, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage("snapshot must be 64 hex characters naming a snapshot id".into())
+        })?;
+    Ok(SnapshotId::from_bytes(bytes))
+}
+
 /// Parse a membership transition id from 64 hex characters (the
 /// winner and voided siblings named by `member resolve`).
 fn parse_transition_id(hex: &str) -> Result<TransitionId, CliError> {
@@ -1337,6 +1522,86 @@ fn member_status_report(engine: &Engine) -> Result<String, CliError> {
     ))
 }
 
+/// Live heads with their `@N` merge numbers, ascending by id —
+/// the same order the `name@N` conflict siblings use. Built as a
+/// string so tests assert the rendering without capturing stdout.
+fn snapshot_list_report(engine: &Engine) -> Result<String, CliError> {
+    let heads = engine.live_heads()?;
+    if heads.is_empty() {
+        return Ok("live heads: none\n".into());
+    }
+    let mut out = String::from("live heads:\n");
+    for (number, head) in heads.iter().enumerate() {
+        let snapshot = head.snapshot();
+        out.push_str(&format!(
+            "@{} {} epoch {} author {} tree {} parents {}\n",
+            number + 1,
+            snapshot.snapshot_id(),
+            snapshot.epoch,
+            snapshot.author,
+            snapshot.tree,
+            snapshot.parents.len(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Every DAG head with its authorization classification; eligible
+/// heads carry their `@N` merge numbers. Built as a string so tests
+/// assert the rendering without capturing stdout.
+fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
+    let heads = engine.snapshot_heads()?;
+    if heads.is_empty() {
+        return Ok("heads: none\n".into());
+    }
+    let mut eligible: Vec<SnapshotId> = heads
+        .iter()
+        .filter(|head| {
+            matches!(
+                head.classification,
+                wyrd_sync::authorization::Classification::Eligible
+            )
+        })
+        .map(|head| head.id)
+        .collect();
+    eligible.sort();
+    let mut out = String::from("heads:\n");
+    for head in &heads {
+        let number = eligible
+            .iter()
+            .position(|id| *id == head.id)
+            .map(|number| format!(" @{}", number + 1))
+            .unwrap_or_default();
+        let epoch = head
+            .epoch
+            .map(|epoch| format!(" epoch {epoch}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}{} {}{}\n",
+            head.id,
+            number,
+            render_classification(&head.classification),
+            epoch,
+        ));
+    }
+    Ok(out)
+}
+
+/// One-word head class for the heads view; parked and rejected
+/// heads carry their machine reason.
+fn render_classification(class: &wyrd_sync::authorization::Classification) -> String {
+    use wyrd_sync::authorization::Classification;
+    match class {
+        Classification::Eligible => "eligible".into(),
+        Classification::CanonicalHistory => "canonical-history".into(),
+        Classification::Superseded => "superseded".into(),
+        Classification::Stranded => "stranded".into(),
+        Classification::Voided => "voided".into(),
+        Classification::Pending(pendency) => format!("pending:{pendency:?}"),
+        Classification::Rejected(rejection) => format!("rejected:{rejection:?}"),
+    }
+}
+
 /// One-word canonical status for the log view; invalid transitions
 /// carry their machine reason.
 fn render_status(status: &TransitionStatus) -> String {
@@ -1406,3 +1671,5 @@ mod tests_member;
 mod tests_mount;
 #[cfg(test)]
 mod tests_probes;
+#[cfg(test)]
+mod tests_snapshot;

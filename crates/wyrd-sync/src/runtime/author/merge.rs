@@ -99,9 +99,6 @@ pub(crate) fn plan<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    if heads.len() < 2 {
-        return Err(EngineError::MergeNeedsTwoHeads);
-    }
     let mut sorted = heads;
     sorted.sort();
     for pair in sorted.windows(2) {
@@ -126,6 +123,18 @@ where
     let mut dag = SnapshotDag::new(engine.drive);
     for body in rebuilt.runtime.snapshot_bodies.values() {
         dag.observe(body.clone());
+    }
+    // Fewer than two heads merges nothing — but on a frozen drive
+    // even the default selection stalls below two, because the
+    // conflict snapshots park as pending instead of eligible. Name
+    // the freeze there instead of sending the operator to add a
+    // head; the rule lives here, beside the count, so both front
+    // ends and the tests share it.
+    if sorted.len() < 2 {
+        return match rebuilt.log.frozen_at() {
+            Some(epoch) => Err(EngineError::MergeBlockedByFreeze(epoch)),
+            None => Err(EngineError::MergeNeedsTwoHeads),
+        };
     }
     // Eligibility derives inside from the fresh rebuild — never from
     // the caller's list — so a retained stale handle fails closed.
@@ -200,7 +209,7 @@ where
 /// well-formedness (known paths only, no lines on agreed paths, every
 /// conflicted path covered by spec or default), and the locality
 /// gate (every adopted chunk byte-local or covered by a held
-/// recorded mapping; every adopted subtree byte-local) all pass
+/// recorded mapping, at every depth of adopted subtrees) all pass
 /// before the merged tree is inserted or anything commits. A remote-
 /// only source fails closed here, never mid-authoring.
 pub(crate) fn merge<S: ObjectStore>(
@@ -312,12 +321,16 @@ where
 }
 
 /// The locality gate: everything the merged tree adopts must be
-/// servable without fetching. File chunks go through the same two
-/// doors the manifest walk resolves through — byte-local plaintext,
-/// else a recorded representation the device both holds the epoch
-/// capability for and holds the vault copy of — while adopted
-/// subtrees must be byte-local outright (the walk seals trees fresh,
-/// with no recorded fallback). Symlinks name no content.
+/// servable without fetching, at every depth. File chunks go
+/// through the same two doors the manifest walk resolves through —
+/// byte-local plaintext, else a recorded representation the device
+/// both holds the epoch capability for and holds the vault copy
+/// of — while adopted subtrees must be byte-local outright (the
+/// walk seals trees fresh, with no recorded fallback), descending
+/// into the nested files whose chunks face the same gate.
+/// Symlinks name no content. Read-only (`get`/`has`, never insert)
+/// over a visited set, so a faulty store claiming a reference cycle
+/// terminates instead of looping.
 fn check_local<S: ObjectStore>(
     engine: &Engine,
     objects: &S,
@@ -327,66 +340,76 @@ fn check_local<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
+    let mut stack: Vec<ContentId> = Vec::new();
+    check_entry(engine, objects, rebuilt, entry, &mut stack)?;
+    let mut seen: HashSet<ContentId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        // Same address- and limit-checked load the walk applies to
+        // every node it reads.
+        for child in load_root(objects, id)?.entries().to_vec() {
+            check_entry(engine, objects, rebuilt, &child, &mut stack)?;
+        }
+    }
+    Ok(())
+}
+
+/// Gate one adopted entry: files check every chunk now, dirs queue
+/// their subtree for the visited walk above, symlinks hold nothing.
+fn check_entry<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    entry: &Entry,
+    stack: &mut Vec<ContentId>,
+) -> Result<(), EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
     match &entry.content {
         EntryContent::File { chunks, .. } => {
             for chunk in chunks {
-                if objects
-                    .has(chunk)
-                    .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?
-                {
-                    continue;
-                }
-                let mut servable = false;
-                for mapping in rebuilt.runtime.recorded_mappings(chunk) {
-                    let held = rebuilt.keyring.secret(mapping.encryption_epoch).is_some();
-                    let served = engine
-                        .vault
-                        .sealed(&mapping.transport)
-                        .map_err(EngineError::from)?
-                        .is_some();
-                    if held && served {
-                        servable = true;
-                        break;
-                    }
-                }
-                if !servable {
-                    return Err(EngineError::ChunkUnavailable(*chunk));
-                }
+                check_chunk(engine, objects, rebuilt, *chunk)?;
             }
         }
-        EntryContent::Dir { subtree } => check_subtree(objects, *subtree)?,
+        EntryContent::Dir { subtree } => stack.push(*subtree),
         EntryContent::Symlink { .. } => {}
     }
     Ok(())
 }
 
-/// Every tree node an adopted subtree references, byte-local. Read-
-/// only (`get`, never insert) over a visited set, so a faulty store
-/// claiming a reference cycle terminates instead of looping.
-fn check_subtree<S: ObjectStore>(objects: &S, root: ContentId) -> Result<(), EngineError>
+/// One chunk's two doors: byte-local plaintext, else a recorded
+/// representation the device both holds the epoch capability for
+/// and holds the vault copy of — mirroring the manifest walk's
+/// resolve, so the pre-pass and the walk accept exactly the same
+/// set.
+fn check_chunk<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    chunk: ContentId,
+) -> Result<(), EngineError>
 where
     S::Error: std::fmt::Debug,
 {
-    let mut seen: HashSet<ContentId> = HashSet::new();
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let bytes = objects
-            .get(&id)
-            .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?
-            .ok_or(EngineError::TreeUnavailable(id))?;
-        if ContentId::derive(ObjectKind::Tree, &bytes) != id {
-            return Err(EngineError::TreeMismatch(id));
-        }
-        let tree = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(id))?;
-        check_tree(&Limits::V0, &tree).map_err(EngineError::Ingest)?;
-        for entry in tree.entries() {
-            if let EntryContent::Dir { subtree } = &entry.content {
-                stack.push(*subtree);
-            }
+    if objects
+        .has(&chunk)
+        .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?
+    {
+        return Ok(());
+    }
+    for mapping in rebuilt.runtime.recorded_mappings(&chunk) {
+        let held = rebuilt.keyring.secret(mapping.encryption_epoch).is_some();
+        let served = engine
+            .vault
+            .sealed(&mapping.transport)
+            .map_err(EngineError::from)?
+            .is_some();
+        if held && served {
+            return Ok(());
         }
     }
-    Ok(())
+    Err(EngineError::ChunkUnavailable(chunk))
 }

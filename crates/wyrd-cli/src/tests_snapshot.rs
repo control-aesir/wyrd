@@ -239,11 +239,10 @@ fn snapshot_plan_needs_two_heads() {
 }
 
 /// The frozen hint names the epoch and the resolver when merging
-/// stalls on a membership conflict, and stays silent otherwise.
+/// stalls on a membership conflict.
 #[test]
 fn frozen_hint_names_the_conflict() {
-    assert_eq!(frozen_merge_hint(None), None);
-    let hint = frozen_merge_hint(Some(2)).expect("hint");
+    let hint = frozen_merge_hint(2);
     assert!(hint.contains("epoch 2"), "names the frozen epoch");
     assert!(hint.contains("member resolve"), "names the resolver");
 }

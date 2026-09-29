@@ -82,6 +82,14 @@ pub(super) fn commit_new_epoch(
     let tip_id = transition.transition_id();
     let mut staged = engine.log.clone();
     staged.observe(transition.clone());
+    // A transition that leaves a conflict frozen is a false
+    // success: intake would never elect it, but the author would
+    // print one. A valid resolution unfreezes by construction, so
+    // refusing while the staged log stays frozen only ever stops
+    // contradictions and third contenders — never legitimate work.
+    if staged.frozen_at().is_some() {
+        return Err(EngineError::FrozenConflictRemains);
+    }
     let rebuilt = engine.store.rebuild(engine.device())?;
     let mut secrets = Vec::with_capacity(epoch as usize);
     for past in 1..epoch {

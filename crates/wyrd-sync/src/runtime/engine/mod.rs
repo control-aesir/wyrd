@@ -118,8 +118,14 @@ pub enum EngineError {
     NotContender(TransitionId),
     #[error("void set does not exactly name the winner's rival contenders")]
     ResolutionMismatch,
+    #[error("transition leaves a membership conflict frozen; resolve it first")]
+    FrozenConflictRemains,
     #[error("merging needs at least two source heads")]
     MergeNeedsTwoHeads,
+    #[error(
+        "membership frozen at epoch {0}: resolve the membership conflict before merging snapshots"
+    )]
+    MergeBlockedByFreeze(u64),
     #[error("merge selects {0} heads, above the {1}-parent ceiling; coalesce in stages")]
     TooManyMergeHeads(usize, usize),
     #[error("duplicate merge head {0}")]
@@ -538,14 +544,13 @@ pub(super) enum FetchKey {
 }
 
 /// One observed DAG head with its authorization classification
-/// and bound epoch (when the body is still recorded). The
-/// presentation layer numbers the eligible heads of this listing to
-/// address merge sources as `@N`.
+/// and bound epoch. The presentation layer numbers the eligible
+/// heads of this listing to address merge sources as `@N`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotHead {
     pub id: SnapshotId,
     pub classification: crate::authorization::Classification,
-    pub epoch: Option<u64>,
+    pub epoch: u64,
 }
 
 /// The intake driver for one device on one drive.
@@ -1127,21 +1132,20 @@ impl Engine {
             dag.observe(body.clone());
         }
         let live: HashSet<SnapshotId> = dag.heads().into_iter().collect();
+        // Heads join their bodies for the epoch: a head without its
+        // body is dropped, never listed with a guessed epoch — the
+        // safe direction, matching the eligible-head projection.
         let mut heads: Vec<SnapshotHead> = dag
             .classify(&rebuilt.log)
             .into_iter()
             .filter(|(id, _)| live.contains(id))
-            .map(|(id, classification)| {
-                let epoch = rebuilt
-                    .runtime
-                    .snapshot_bodies
-                    .get(&id)
-                    .map(|body| body.epoch);
-                SnapshotHead {
+            .filter_map(|(id, classification)| {
+                let epoch = rebuilt.runtime.snapshot_bodies.get(&id)?.epoch;
+                Some(SnapshotHead {
                     id,
                     classification,
                     epoch,
-                }
+                })
             })
             .collect();
         heads.sort_by_key(|head| head.id);

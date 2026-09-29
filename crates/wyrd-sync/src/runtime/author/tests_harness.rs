@@ -7,14 +7,18 @@ use crate::control::seal;
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
-use crate::membership::test_util::{drive as member_drive, key, Builder};
+use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
+use crate::membership::TransitionStatus;
 use crate::runtime::engine::Engine;
 use crate::runtime::test_util::{
-    control_key, identity, identity_secret, transition_message, TestDir,
+    control_key, encryption_key, identity, identity_secret, transition_message, TestDir,
 };
 use crate::transport::mailbox::{seal_for_recipient, MemoryMailbox, MemoryRelay};
 
-use wyrd_format::TransitionId;
+use wyrd_format::membership::{
+    set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+};
+use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
 use zeroize::Zeroizing;
 
 /// An owner engine holding epoch 1: genesis drained, epoch key
@@ -124,4 +128,61 @@ pub(super) fn device_of(identity: &DeviceIdentitySecret) -> wyrd_format::DeviceI
     let kp = Keypair::from_secret_key(SECP256K1, &identity.secret_key());
     let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
     wyrd_format::DeviceId::from_bytes(xonly.serialize())
+}
+
+/// An owner engine frozen at epoch 2: canonical rotate plus a rival
+/// admission observed directly. Returns the engine, the owner id,
+/// and the two contender ids (rotate first). The fork is built with
+/// one production-authored contender (rotate) plus one crafted rival
+/// committed durably, so validators meet a genuine frozen analysis
+/// rather than a staged one.
+pub(super) fn frozen_engine(
+    label: &str,
+) -> (
+    TestDir,
+    Engine,
+    DeviceId,
+    TransitionId,
+    TransitionId,
+    TransitionId,
+) {
+    let (dir, mut engine, genesis) = owner_engine(label);
+    let (owner_sk, owner_id) = key(10);
+    let winner = engine.rotate_epoch().expect("canonical rotate");
+    let winner_id = winner.transition_id();
+    let (third_sk, third_id) = key(30);
+    let _ = third_sk;
+    let third_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE3; 32]).unwrap());
+    let mut rival = MembershipTransition::new(
+        2,
+        Some(genesis),
+        Vec::new(),
+        vec![Change::Admit(Admission {
+            device: third_id,
+            encryption_key: third_key,
+        })],
+        set_root(MEMBER_SET_CONTEXT, &[owner_id, third_id]).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &[owner_id]).unwrap(),
+        set_root(READER_SET_CONTEXT, &[]).unwrap(),
+        owner_id,
+    )
+    .unwrap();
+    sign(&mut rival, &owner_sk, &member_drive());
+    let rival_id = rival.transition_id();
+    // The rival must be durable, not just observed: commit resyncs
+    // from the store, so an in-memory-only observation would vanish
+    // mid-resolve (in production the rival arrives via intake, which
+    // commits it the same way).
+    engine.log.observe(rival.clone());
+    engine
+        .commit_facts(&[Fact::Transition(rival.clone())])
+        .unwrap();
+    assert_eq!(engine.log.frozen_at(), Some(2), "fork freezes at 2");
+    for id in [winner_id, rival_id] {
+        assert!(
+            matches!(engine.log.status(&id), Some(TransitionStatus::Contested)),
+            "contender {id:?} contested"
+        );
+    }
+    (dir, engine, owner_id, genesis, winner_id, rival_id)
 }

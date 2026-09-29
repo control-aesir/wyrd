@@ -4,72 +4,18 @@
 //! observed directly, so the validator meets a genuine frozen
 //! analysis rather than a staged one.
 
-use super::tests_harness::owner_engine;
+use super::tests_harness::{frozen_engine, owner_engine};
 use crate::durable::Fact;
 use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive as member_drive, key, sign};
 use crate::membership::TransitionStatus;
 use crate::runtime::engine::{Engine, EngineError};
-use crate::runtime::test_util::{encryption_key, TestDir};
+use crate::runtime::test_util::TestDir;
 
 use wyrd_format::membership::{
-    set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
+    set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
 };
 use wyrd_format::{Change, DeviceId, MembershipTransition, TransitionId};
-
-/// An owner engine frozen at epoch 2: canonical rotate plus a rival
-/// admission observed directly. Returns the engine, the owner id,
-/// and the two contender ids (rotate first).
-fn frozen_engine(
-    label: &str,
-) -> (
-    TestDir,
-    Engine,
-    DeviceId,
-    TransitionId,
-    TransitionId,
-    TransitionId,
-) {
-    let (dir, mut engine, genesis) = owner_engine(label);
-    let (owner_sk, owner_id) = key(10);
-    let winner = engine.rotate_epoch().expect("canonical rotate");
-    let winner_id = winner.transition_id();
-    let (third_sk, third_id) = key(30);
-    let _ = third_sk;
-    let third_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE3; 32]).unwrap());
-    let mut rival = MembershipTransition::new(
-        2,
-        Some(genesis),
-        Vec::new(),
-        vec![Change::Admit(Admission {
-            device: third_id,
-            encryption_key: third_key,
-        })],
-        set_root(MEMBER_SET_CONTEXT, &[owner_id, third_id]).unwrap(),
-        set_root(OWNER_SET_CONTEXT, &[owner_id]).unwrap(),
-        set_root(READER_SET_CONTEXT, &[]).unwrap(),
-        owner_id,
-    )
-    .unwrap();
-    sign(&mut rival, &owner_sk, &member_drive());
-    let rival_id = rival.transition_id();
-    // The rival must be durable, not just observed: commit resyncs
-    // from the store, so an in-memory-only observation would vanish
-    // mid-resolve (in production the rival arrives via intake, which
-    // commits it the same way).
-    engine.log.observe(rival.clone());
-    engine
-        .commit_facts(&[Fact::Transition(rival.clone())])
-        .unwrap();
-    assert_eq!(engine.log.frozen_at(), Some(2), "fork freezes at 2");
-    for id in [winner_id, rival_id] {
-        assert!(
-            matches!(engine.log.status(&id), Some(TransitionStatus::Contested)),
-            "contender {id:?} contested"
-        );
-    }
-    (dir, engine, owner_id, genesis, winner_id, rival_id)
-}
 
 #[test]
 fn resolve_names_winner_and_voids_sibling() {
@@ -197,4 +143,58 @@ fn frozen_contenders_names_the_sorted_rivals() {
     let mut expected = [winner, rival];
     expected.sort();
     assert_eq!(engine.frozen_contenders(), expected);
+}
+
+/// A resolution over an already-contradicted conflict fails closed
+/// instead of printing success: two disagreeing resolutions re-freeze
+/// one epoch up, and a third resolution names contenders the
+/// canonicality walk never examines — so it would commit, print
+/// "resolved", and leave the freeze standing.
+#[test]
+fn resolve_over_a_contradicted_conflict_fails_closed() {
+    let (_dir, mut engine, owner, _genesis, winner, rival) = frozen_engine("resolve-refreeze");
+    // The first resolution commits: the only candidate, so it
+    // unfreezes by construction.
+    let first = engine.resolve_conflict(winner, vec![rival]).unwrap();
+    let first_id = first.transition_id();
+    assert_eq!(engine.log.frozen_at(), None);
+    // A contradicting resolution observed directly (the intake
+    // path): prev names the other contender, resolves names the
+    // winner, roots match the rival-tip state.
+    let pre = engine.log.state_of(&rival).expect("rival state");
+    let members: Vec<DeviceId> = pre.members.iter().copied().collect();
+    let owners: Vec<DeviceId> = pre.owners.iter().copied().collect();
+    let readers: Vec<DeviceId> = pre.readers.iter().copied().collect();
+    let (owner_sk, _) = key(10);
+    let mut second = MembershipTransition::new(
+        3,
+        Some(rival),
+        vec![winner],
+        vec![Change::Rotate],
+        set_root(MEMBER_SET_CONTEXT, &members).unwrap(),
+        set_root(OWNER_SET_CONTEXT, &owners).unwrap(),
+        set_root(READER_SET_CONTEXT, &readers).unwrap(),
+        owner,
+    )
+    .unwrap();
+    sign(&mut second, &owner_sk, &member_drive());
+    let second_id = second.transition_id();
+    engine.log.observe(second.clone());
+    engine.commit_facts(&[Fact::Transition(second)]).unwrap();
+    assert_eq!(
+        engine.log.frozen_at(),
+        Some(3),
+        "contradiction re-freezes one epoch up"
+    );
+
+    let seq = engine.current();
+    let error = engine
+        .resolve_conflict(first_id, vec![second_id])
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::FrozenConflictRemains),
+        "unexpected: {error:?}"
+    );
+    assert_eq!(engine.log.frozen_at(), Some(3), "still frozen");
+    assert_eq!(engine.current(), seq, "nothing committed");
 }

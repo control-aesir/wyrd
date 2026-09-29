@@ -223,7 +223,9 @@ enum SnapshotAction {
     /// Preview a merge without authoring: one row per root path
     /// with each selected head's version, so the operator sees
     /// which paths are agreed and which need a `--take` line.
-    /// Sources default to all live heads, like `merge`.
+    /// Sources default to all live heads, like `merge`. Refused
+    /// with a pointer to `member resolve` on a membership-frozen
+    /// drive, where no selection reaches two eligible heads.
     Plan {
         /// Source head, 64 hex characters. Repeatable; omitted means
         /// all live heads.
@@ -235,7 +237,9 @@ enum SnapshotAction {
     /// two). Conflicted root paths take `--take path=@N`, drop with
     /// `--drop path`, or fall back to `--default @N`; paths every
     /// source agrees on take themselves. The merged snapshot parents
-    /// onto exactly the selected heads at the current epoch.
+    /// onto exactly the selected heads at the current epoch. A
+    /// membership-frozen drive is refused with a pointer to `member
+    /// resolve`.
     Merge {
         /// Source head, 64 hex characters. Repeatable; omitted means
         /// all live heads.
@@ -1086,7 +1090,9 @@ fn snapshot(
             let selected = select_merge_heads(&engine, &heads)?;
             let store = FsObjectStore::open(drive_dir.to_path_buf())
                 .map_err(|error| CliError::Store(error.to_string()))?;
-            let plan = engine.merge_plan(&store, selected)?;
+            let plan = engine
+                .merge_plan(&store, selected)
+                .map_err(map_merge_error)?;
             print!("{}", snapshot_plan_report(&plan));
             Ok(())
         }
@@ -1143,7 +1149,9 @@ fn snapshot(
             }
             let mut store = FsObjectStore::open(drive_dir.to_path_buf())
                 .map_err(|error| CliError::Store(error.to_string()))?;
-            let merged = engine.merge_heads(&mut store, selected, default, spec)?;
+            let merged = engine
+                .merge_heads(&mut store, selected, default, spec)
+                .map_err(map_merge_error)?;
             let parents = merged
                 .snapshot()
                 .parents
@@ -1179,27 +1187,25 @@ fn select_merge_heads(engine: &Engine, heads: &[String]) -> Result<Vec<SnapshotI
             .collect::<Result<_, _>>()?
     };
     selected.sort();
-    // A frozen drive holds no second eligible head: the conflict
-    // snapshots park as pending, so the default selection stalls at
-    // the pre-conflict tip. Name the freeze instead of sending the
-    // operator to add a head.
-    if selected.len() < 2 {
-        if let Some(hint) = frozen_merge_hint(engine.membership_log().frozen_at()) {
-            return Err(CliError::Usage(hint));
-        }
-    }
     Ok(selected)
 }
 
 /// Where snapshot merging stalls on a membership conflict: the
 /// operator resolves with `member resolve`, never by adding heads.
-fn frozen_merge_hint(frozen: Option<u64>) -> Option<String> {
-    frozen.map(|epoch| {
-        format!(
-            "membership frozen at epoch {epoch}: resolve it with `member resolve` \
-            (see `member status`) before merging snapshots"
-        )
-    })
+fn frozen_merge_hint(epoch: u64) -> String {
+    format!(
+        "membership frozen at epoch {epoch}: resolve it with `member resolve` \
+        (see `member status`) before merging snapshots"
+    )
+}
+
+/// Map a merge refusal that names the membership freeze to usage
+/// guidance; every other engine verdict passes through untouched.
+fn map_merge_error(error: EngineError) -> CliError {
+    match error {
+        EngineError::MergeBlockedByFreeze(epoch) => CliError::Usage(frozen_merge_hint(epoch)),
+        _ => CliError::Engine(error),
+    }
 }
 
 /// One merge-spec path: a root entry name. v0 merges at root-entry
@@ -1618,16 +1624,12 @@ fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
             .position(|id| *id == head.id)
             .map(|number| format!(" @{}", number + 1))
             .unwrap_or_default();
-        let epoch = head
-            .epoch
-            .map(|epoch| format!(" epoch {epoch}"))
-            .unwrap_or_default();
         out.push_str(&format!(
-            "{}{} {}{}\n",
+            "{}{} {} epoch {}\n",
             head.id,
             number,
             render_classification(&head.classification),
-            epoch,
+            head.epoch,
         ));
     }
     Ok(out)

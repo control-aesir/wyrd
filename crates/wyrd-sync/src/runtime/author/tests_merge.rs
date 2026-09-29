@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use super::author_with_parents;
 use super::merge::MergeSelection;
-use super::tests_harness::owner_engine;
+use super::tests_harness::{frozen_engine, owner_engine};
 use crate::authorization::test_util::sign_snapshot;
 use crate::durable::{AuthorizedSnapshot, Fact};
 use crate::membership::test_util::{drive as member_drive, key};
@@ -530,15 +530,33 @@ fn merge_plan_pins_versions_across_name_gaps() {
     let (_dir, mut engine, _genesis) = owner_engine("merge-gaps");
     let mut objects = MemoryObjectStore::default();
     let base = multi_tree(&mut objects, &[("base", b"base")]);
-    let left = multi_tree(&mut objects, &[("a", b"a1"), ("c", b"c1")]);
-    let right = multi_tree(&mut objects, &[("b", b"b2"), ("c", b"c1")]);
+    // A shared symlink rides both heads: the agreed arm covers
+    // non-file entries too.
+    let link = Entry::symlink("s", "tgt").unwrap();
+    let mut left_entries = vec![link.clone()];
+    let chunk_a = objects.insert(ObjectKind::Chunk, b"a1").unwrap();
+    left_entries.push(Entry::file("a", 2, false, vec![chunk_a]).unwrap());
+    let chunk_c = objects.insert(ObjectKind::Chunk, b"c1").unwrap();
+    left_entries.push(Entry::file("c", 2, false, vec![chunk_c]).unwrap());
+    let left = Tree::from_entries(left_entries)
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let mut right_entries = vec![link];
+    let chunk_b = objects.insert(ObjectKind::Chunk, b"b2").unwrap();
+    right_entries.push(Entry::file("b", 2, false, vec![chunk_b]).unwrap());
+    right_entries.push(Entry::file("c", 2, false, vec![chunk_c]).unwrap());
+    let right = Tree::from_entries(right_entries)
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
     let heads = forks(&mut engine, &mut objects, base, &[left, right]);
     let (left_id, right_id) = (heads[0], heads[1]);
 
     let plan = engine.merge_plan(&objects, heads).unwrap();
-    assert_eq!(plan.paths.len(), 3, "a, b, c");
+    assert_eq!(plan.paths.len(), 4, "a, b, c, s");
     let names: Vec<&str> = plan.paths.iter().map(|path| path.path.as_str()).collect();
-    assert_eq!(names, ["a", "b", "c"], "ascending paths");
+    assert_eq!(names, ["a", "b", "c", "s"], "ascending paths");
     let a = &plan.paths[0];
     assert!(!a.agreed(), "a is head one's alone");
     assert!(a.versions[&left_id].is_some());
@@ -550,4 +568,135 @@ fn merge_plan_pins_versions_across_name_gaps() {
     let c = &plan.paths[2];
     assert!(c.agreed(), "shared c takes itself");
     assert!(c.agreed_entry().is_some());
+    let s = &plan.paths[3];
+    assert!(s.agreed(), "shared symlink takes itself");
+    assert!(
+        matches!(
+            s.agreed_entry().and_then(|entry| match entry.content {
+                wyrd_format::EntryContent::Symlink { target } => Some(target),
+                _ => None,
+            }),
+            Some(target) if target == "tgt"
+        ),
+        "the agreed symlink survives classification"
+    );
+}
+
+/// A subtree adopted whole still gates its nested files: tree
+/// bytes local but chunk bytes remote fails before anything
+/// commits — the pre-pass descends, so the walk never discovers
+/// the gap mid-authoring.
+#[test]
+fn merge_refuses_a_remote_chunk_nested_in_an_adopted_subtree() {
+    let (_dir, mut engine, genesis) = owner_engine("merge-nested-remote");
+    let mut objects = MemoryObjectStore::default();
+    let other = multi_tree(&mut objects, &[("e", b"e2")]);
+    let first = engine.author_snapshot(&objects, other).unwrap();
+    let first_id = first.snapshot().snapshot_id();
+    // The fork's body is committed directly: authoring it would
+    // need the chunk, but observing a head needs only the body.
+    // Tree bytes local, nested chunk bytes remote.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"nested").unwrap();
+    let inner = Entry::file("inner.txt", 6, false, vec![chunk]).unwrap();
+    let sub_bytes = Tree::from_entries(vec![inner]).unwrap().encode();
+    let sub_id = ContentId::derive(ObjectKind::Tree, &sub_bytes);
+    objects
+        .insert_verified(ObjectKind::Tree, &sub_id, &sub_bytes)
+        .unwrap();
+    let dir_bytes = Tree::from_entries(vec![Entry::dir("d", sub_id).unwrap()])
+        .unwrap()
+        .encode();
+    let dir_id = ContentId::derive(ObjectKind::Tree, &dir_bytes);
+    objects
+        .insert_verified(ObjectKind::Tree, &dir_id, &dir_bytes)
+        .unwrap();
+    let fork = commit_fork(&mut engine, genesis, dir_id);
+    assert_eq!(engine.live_heads().unwrap().len(), 2);
+
+    let error = engine
+        .merge_heads(
+            &mut objects,
+            vec![first_id, fork],
+            Some(fork),
+            BTreeMap::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::ChunkUnavailable(missing) if missing == chunk),
+        "unexpected: {error:?}"
+    );
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        2,
+        "the refusal committed nothing"
+    );
+}
+
+/// The same nested shape with the chunk bytes held merges: the
+/// descent gates without false-positiving, and the adopted subtree
+/// rides the merged tree whole.
+#[test]
+fn merge_adopts_a_held_nested_subtree_whole() {
+    let (_dir, mut engine, _genesis) = owner_engine("merge-nested-held");
+    let mut objects = MemoryObjectStore::default();
+    objects.insert(ObjectKind::Chunk, b"nested").unwrap();
+    let mut scratch = MemoryObjectStore::default();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"nested").unwrap();
+    let inner = Entry::file("inner.txt", 6, false, vec![chunk]).unwrap();
+    let sub_bytes = Tree::from_entries(vec![inner]).unwrap().encode();
+    let sub_id = ContentId::derive(ObjectKind::Tree, &sub_bytes);
+    objects
+        .insert_verified(ObjectKind::Tree, &sub_id, &sub_bytes)
+        .unwrap();
+    let with_dir = Tree::from_entries(vec![Entry::dir("d", sub_id).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let base = multi_tree(&mut objects, &[("base", b"base")]);
+    let other = multi_tree(&mut objects, &[("e", b"e2")]);
+    let heads = forks(&mut engine, &mut objects, base, &[with_dir, other]);
+    let (holder, _) = (heads[0], heads[1]);
+
+    let merged = engine
+        .merge_heads(&mut objects, heads, Some(holder), BTreeMap::new())
+        .unwrap();
+    let root_bytes = objects.get(&merged.snapshot().tree).unwrap().unwrap();
+    let root = Tree::decode(&root_bytes).unwrap();
+    assert_eq!(root.entries().len(), 1, "d adopted, e dropped by default");
+    assert!(
+        matches!(
+            &root.entries()[0].content,
+            wyrd_format::EntryContent::Dir { subtree } if *subtree == sub_id
+        ),
+        "the adopted subtree rides whole"
+    );
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        1,
+        "the merge closes the fork"
+    );
+}
+
+/// On a membership-frozen drive even an empty selection names the
+/// freeze instead of reporting one head short: the conflict
+/// snapshots park as pending, so no selection reaches two eligible
+/// heads, and the operator belongs at `member resolve`.
+#[test]
+fn merge_plan_names_the_freeze_instead_of_short_heads() {
+    let (_dir, engine, _owner, _genesis, _winner, _rival) = frozen_engine("merge-frozen");
+    assert_eq!(engine.log.frozen_at(), Some(2));
+    let objects = MemoryObjectStore::default();
+
+    let error = engine.merge_plan(&objects, vec![]).unwrap_err();
+    assert!(
+        matches!(error, EngineError::MergeBlockedByFreeze(2)),
+        "unexpected: {error:?}"
+    );
+    let unknown = SnapshotId::from_bytes([0xFC; 32]);
+    let error = engine.merge_plan(&objects, vec![unknown]).unwrap_err();
+    assert!(
+        matches!(error, EngineError::MergeBlockedByFreeze(2)),
+        "the freeze blocks before eligibility: {error:?}"
+    );
 }

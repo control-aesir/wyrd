@@ -568,7 +568,9 @@ fn content_identity_is_payload_based_across_framing() {
         disk.insert_verified(ObjectKind::Chunk, &expected, &framed),
         Err(FsStoreError::IdentityMismatch { .. })
     ));
-    // Identity fork rides the context, not the framing.
+    // Kind separation rides the context, not the framing; the
+    // identity-domain fork property itself is carried by the golden
+    // vectors (object-model.md decision 30).
     let other = ContentId::derive(ObjectKind::Tree, payload);
     assert_ne!(expected, other);
 }

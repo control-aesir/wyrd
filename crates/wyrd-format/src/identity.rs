@@ -282,13 +282,14 @@ mod tests {
         // carried by these rows: each kind hashes under its own context
         // to its own hex, and `content_id_is_deterministic_per_kind`
         // pins the pairwise inequality directly. The manifest row's
-        // entry version is pinned at the envelope constant deliberately:
-        // production fills that field from the seal version, which this
-        // crate cannot name (hard rule: no sync dependency), and both
-        // constants are 0x00 today. A seal-version fork moves production
-        // manifest identities without moving this vector — the field's
-        // identity-bearing role is documented at `ManifestEntry`, and
-        // this vector pins the mechanics, not production's constant.
+        // entry version is a fixed `0x00` preimage byte, not a live
+        // constant: production fills that field from the seal version,
+        // which this crate cannot name (hard rule: no sync dependency),
+        // and both constants are 0x00 today. A seal-version fork moves
+        // production manifest identities without moving this vector —
+        // the field's identity-bearing role is documented at
+        // `ManifestEntry`, and this vector pins the mechanics, not
+        // production's constant.
         use crate::{Manifest, ManifestEntry, Snapshot, Tree};
         let tree_payload = Tree::empty().encode();
         let snapshot_payload = Snapshot::new(
@@ -307,7 +308,13 @@ mod tests {
             vec![ManifestEntry {
                 content_id: ContentId::derive(ObjectKind::Chunk, b"anchored"),
                 kind: ObjectKind::Chunk,
-                version: crate::envelope::VERSION,
+                // Fixed preimage byte for this vector, not a reference
+                // to the envelope constant: the entry version is the
+                // seal version (see `ManifestEntry`), and wiring the
+                // vector to a live framing constant would turn a free
+                // framing-only change into a red suite that claims an
+                // identity fork.
+                version: 0x00,
                 storage_id: StorageId::derive(b"anchored sealed bytes"),
                 encryption_epoch: 1,
                 size: 8,
@@ -384,12 +391,12 @@ mod tests {
 
     #[test]
     fn content_identity_is_invariant_across_envelope_round_trip_for_all_kinds() {
-        // Decode preserves payload bytes for all four kinds with real
-        // canonical payloads, so identity survives a framing round trip
-        // under the current representation. (Framing-gate behavior for
-        // unknown versions lives in `envelope.rs`, not here.)
+        // Decode preserves payload bytes, so identity survives a framing
+        // round trip. Kept narrow on purpose: the envelope suite already
+        // covers the round trip itself, so this asserts only the part it
+        // does not — non-empty canonical payloads for tree, snapshot,
+        // and manifest.
         use crate::{Manifest, Snapshot, Tree};
-        let chunk_payload = b"framing invariance".to_vec();
         let tree_payload = Tree::empty().encode();
         let snapshot_payload = Snapshot::new(
             Vec::new(),
@@ -407,7 +414,6 @@ mod tests {
                 .unwrap()
                 .canonical_bytes();
         for (kind, payload) in [
-            (ObjectKind::Chunk, chunk_payload),
             (ObjectKind::Tree, tree_payload),
             (ObjectKind::Snapshot, snapshot_payload),
             (ObjectKind::Manifest, manifest_payload),

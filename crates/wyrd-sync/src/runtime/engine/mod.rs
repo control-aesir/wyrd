@@ -74,7 +74,7 @@ use crate::membership::MembershipLog;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
-pub use super::author::MergeSelection;
+pub use super::author::{MergePath, MergePlan, MergeSelection};
 pub use super::bootstrap::PairingRequest;
 
 /// Engine failures: durable-commit, runtime-record, and mailbox-
@@ -865,6 +865,25 @@ impl Engine {
         S::Error: std::fmt::Debug,
     {
         super::author::merge(self, objects, heads, default, spec)
+    }
+
+    /// Plan a merge over explicit snapshot heads without authoring
+    /// anything: the per-path classification a resolver shows the
+    /// user before they select. Read-only; shares the
+    /// classification [`merge_heads`] validates against, so a
+    /// future graphical resolver consumes this instead of
+    /// reimplementing it. See [`super::author::merge`].
+    ///
+    /// [`merge_heads`]: Engine::merge_heads
+    pub fn merge_plan<S: ObjectStore>(
+        &self,
+        objects: &S,
+        heads: Vec<SnapshotId>,
+    ) -> Result<super::author::MergePlan, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::plan_merge(self, objects, heads)
     }
 
     /// Send every undischarged transition- and capability-delivery

@@ -23,28 +23,74 @@ pub enum MergeSelection {
     Absent,
 }
 
-/// Merge explicit source heads into one snapshot: validate the whole
-/// merge-spec contract, build the deterministic merged tree, and
-/// author it parenting onto exactly the selected heads (sorted
-/// ascending, so the parent order is a function of the set). The
-/// merge binds the current epoch with ordinary member authority and
-/// queues the existing announcement outbox like any authoring — no
-/// membership transition, no epoch change, exactly one new snapshot.
+/// The inspectable merge plan: everything a resolver needs to
+/// present the merge without reimplementing classification. Two
+/// front ends, one merge: the CLI spec and a future graphical
+/// resolver (a File Provider conflict entry point included) both
+/// construct `(heads, spec)` pairs over this plan, and
+/// [`Engine::merge_heads`] validates and authors from the same
+/// classification — the GUI never parses a spec file, and the CLI
+/// never grows presentation semantics.
 ///
-/// Validation precedes every mutation: head eligibility, spec
-/// well-formedness (known paths only, no lines on agreed paths, every
-/// conflicted path covered by spec or default), and the locality
-/// gate (every adopted chunk byte-local or covered by a held
-/// recorded mapping; every adopted subtree byte-local) all pass
-/// before the merged tree is inserted or anything commits. A remote-
-/// only source fails closed here, never mid-authoring.
-pub(crate) fn merge<S: ObjectStore>(
-    engine: &mut Engine,
-    objects: &mut S,
+/// [`Engine::merge_heads`]: crate::runtime::engine::Engine::merge_heads
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePlan {
+    /// The selected heads, ascending: the `@N` basis (`heads[N-1]`
+    /// is `@N`, the same numbering the `name@N` conflict siblings
+    /// use).
+    pub heads: Vec<SnapshotId>,
+    /// Every root path any selected head holds, ascending by path,
+    /// with each head's version beside it: a resolver renders one
+    /// row per path with one column per head from exactly this.
+    pub paths: Vec<MergePath>,
+}
+
+/// One root path's versions across the selected heads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePath {
+    pub path: String,
+    /// What each selected head holds here: its entry, or `None`
+    /// where the head lacks the path (a present-vs-absent conflict
+    /// when the heads disagree).
+    pub versions: BTreeMap<SnapshotId, Option<Entry>>,
+}
+
+impl MergePath {
+    /// Whether every head holds the same entry-or-absent: agreed
+    /// paths take themselves, and a spec line naming one is an
+    /// error. Comparison is semantic — kind plus referenced bytes —
+    /// via entry equality (names match by construction).
+    pub fn agreed(&self) -> bool {
+        let mut versions = self.versions.values();
+        let Some(first) = versions.next() else {
+            return true;
+        };
+        versions.all(|version| version == first)
+    }
+
+    /// The agreed entry, when the heads agree on a present entry.
+    /// Plans only list paths some head holds, so an agreed path
+    /// with no entry here is a shared absence the merge skips.
+    pub fn agreed_entry(&self) -> Option<Entry> {
+        if !self.agreed() {
+            return None;
+        }
+        self.versions.values().find_map(|version| version.clone())
+    }
+}
+
+/// Plan a merge over explicit source heads: validate the heads and
+/// classify every root path across them. Read-only — planning
+/// commits nothing and suits a resolver UI that must show the
+/// conflict before the user selects anything. The heads must be
+/// current eligible heads (at least two); a retained stale handle
+/// fails closed here, derived inside from the fresh rebuild rather
+/// than trusted from the caller.
+pub(crate) fn plan<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
     heads: Vec<SnapshotId>,
-    default: Option<SnapshotId>,
-    spec: BTreeMap<String, MergeSelection>,
-) -> Result<crate::durable::AuthorizedSnapshot, EngineError>
+) -> Result<MergePlan, EngineError>
 where
     S::Error: std::fmt::Debug,
 {
@@ -56,23 +102,6 @@ where
     for pair in sorted.windows(2) {
         if pair[0] == pair[1] {
             return Err(EngineError::DuplicateMergeHead(pair[0]));
-        }
-    }
-    if let Some(id) = default {
-        if !sorted.contains(&id) {
-            return Err(EngineError::MergeDefaultNotAHead(id));
-        }
-    }
-    for selection in spec.values() {
-        if let MergeSelection::Take(id) = selection {
-            if !sorted.contains(id) {
-                return Err(EngineError::MergeSelectionNotAHead(*id));
-            }
-        }
-    }
-    for name in spec.keys() {
-        if Component::new(name).is_err() {
-            return Err(EngineError::UnknownMergePath(name.clone()));
         }
     }
 
@@ -107,37 +136,107 @@ where
                 .map(|entry| entry.name.as_str().to_owned())
         })
         .collect();
+    let mut paths = Vec::with_capacity(names.len());
+    for name in names {
+        let mut versions = BTreeMap::new();
+        for head in &sorted {
+            let entry = roots
+                .get(head)
+                .and_then(|tree| {
+                    tree.entries()
+                        .iter()
+                        .find(|entry| entry.name.as_str() == name)
+                })
+                .cloned();
+            versions.insert(*head, entry);
+        }
+        paths.push(MergePath {
+            path: name,
+            versions,
+        });
+    }
+    Ok(MergePlan {
+        heads: sorted,
+        paths,
+    })
+}
+
+/// Merge explicit source heads into one snapshot: validate the whole
+/// merge-spec contract over the [`plan`], build the deterministic
+/// merged tree, and author it parenting onto exactly the selected
+/// heads (sorted ascending, so the parent order is a function of
+/// the set). The merge binds the current epoch with ordinary member
+/// authority and queues the existing announcement outbox like any
+/// authoring — no membership transition, no epoch change, exactly
+/// one new snapshot.
+///
+/// Validation precedes every mutation: head eligibility, spec
+/// well-formedness (known paths only, no lines on agreed paths, every
+/// conflicted path covered by spec or default), and the locality
+/// gate (every adopted chunk byte-local or covered by a held
+/// recorded mapping; every adopted subtree byte-local) all pass
+/// before the merged tree is inserted or anything commits. A remote-
+/// only source fails closed here, never mid-authoring.
+pub(crate) fn merge<S: ObjectStore>(
+    engine: &mut Engine,
+    objects: &mut S,
+    heads: Vec<SnapshotId>,
+    default: Option<SnapshotId>,
+    spec: BTreeMap<String, MergeSelection>,
+) -> Result<crate::durable::AuthorizedSnapshot, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let plan = plan(engine, objects, heads)?;
+    if let Some(id) = default {
+        if !plan.heads.contains(&id) {
+            return Err(EngineError::MergeDefaultNotAHead(id));
+        }
+    }
+    for selection in spec.values() {
+        if let MergeSelection::Take(id) = selection {
+            if !plan.heads.contains(id) {
+                return Err(EngineError::MergeSelectionNotAHead(*id));
+            }
+        }
+    }
     for name in spec.keys() {
-        if !names.contains(name) {
+        if Component::new(name).is_err() {
             return Err(EngineError::UnknownMergePath(name.clone()));
         }
-        if agreed(&roots, &sorted, name) {
+        let path = plan
+            .paths
+            .iter()
+            .find(|path| &path.path == name)
+            .ok_or_else(|| EngineError::UnknownMergePath(name.clone()))?;
+        if path.agreed() {
             return Err(EngineError::MergePathAgreed(name.clone()));
         }
     }
 
     let mut taken: Vec<Entry> = Vec::new();
-    for name in &names {
-        if agreed(&roots, &sorted, name) {
-            if let Some(entry) = at(&roots, &sorted, name) {
+    for path in &plan.paths {
+        if path.agreed() {
+            if let Some(entry) = path.agreed_entry() {
                 taken.push(entry);
             }
             continue;
         }
         let selection = spec
-            .get(name)
+            .get(&path.path)
             .copied()
             .or(default.map(MergeSelection::Take));
         match selection {
-            None => return Err(EngineError::UnresolvedMergePath(name.clone())),
+            None => return Err(EngineError::UnresolvedMergePath(path.path.clone())),
             Some(MergeSelection::Absent) => {}
             Some(MergeSelection::Take(id)) => {
-                if let Some(entry) = at_id(&roots, &id, name) {
+                if let Some(entry) = path.versions.get(&id).and_then(|version| version.clone()) {
                     taken.push(entry);
                 }
             }
         }
     }
+    let rebuilt = engine.store.rebuild(engine.device)?;
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;
     }
@@ -149,7 +248,7 @@ where
         .insert(ObjectKind::Tree, &bytes)
         .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?;
     debug_assert_eq!(ContentId::derive(ObjectKind::Tree, &bytes), tree);
-    author_with_parents(engine, objects, tree, sorted)
+    author_with_parents(engine, objects, tree, plan.heads)
 }
 
 /// The root tree one source head commits, address- and limit-checked
@@ -169,33 +268,6 @@ where
     let root = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree))?;
     check_tree(&Limits::V0, &root).map_err(EngineError::Ingest)?;
     Ok(root)
-}
-
-/// Whether every selected head holds the same entry-or-absent at
-/// `name`. Comparison is semantic — kind plus referenced bytes —
-/// via entry equality (names match by construction of the lookup).
-fn agreed(roots: &BTreeMap<SnapshotId, Tree>, heads: &[SnapshotId], name: &str) -> bool {
-    let mut variants = heads.iter().map(|head| at_id(roots, head, name));
-    let Some(first) = variants.next() else {
-        return true;
-    };
-    variants.all(|variant| variant == first)
-}
-
-/// The entry `head` holds at `name`, if any.
-fn at_id(roots: &BTreeMap<SnapshotId, Tree>, head: &SnapshotId, name: &str) -> Option<Entry> {
-    roots
-        .get(head)?
-        .entries()
-        .iter()
-        .find(|entry| entry.name.as_str() == name)
-        .cloned()
-}
-
-/// The agreed entry at `name`: the first head's version, which
-/// [`agreed`] proved every head shares.
-fn at(roots: &BTreeMap<SnapshotId, Tree>, heads: &[SnapshotId], name: &str) -> Option<Entry> {
-    at_id(roots, &heads[0], name)
 }
 
 /// The locality gate: everything the merged tree adopts must be

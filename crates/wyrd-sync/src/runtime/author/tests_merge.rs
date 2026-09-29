@@ -408,3 +408,66 @@ fn merge_refuses_an_unheld_adopted_chunk() {
         "the refusal committed nothing"
     );
 }
+
+/// Planning classifies every path without authoring: agreed paths
+/// take themselves, conflicted paths name each head's version, and
+/// the plan commits nothing.
+#[test]
+fn merge_plan_classifies_paths_read_only() {
+    let (_dir, mut engine, _genesis) = owner_engine("merge-plan");
+    let mut objects = MemoryObjectStore::default();
+    let base = multi_tree(&mut objects, &[("base", b"base")]);
+    let trees = [
+        multi_tree(&mut objects, &[("a", b"a1"), ("same", b"s")]),
+        multi_tree(&mut objects, &[("a", b"a2"), ("same", b"s")]),
+    ];
+    let heads = forks(&mut engine, &mut objects, base, &trees);
+    let seq = engine.current();
+
+    let plan = engine.merge_plan(&objects, heads.clone()).unwrap();
+    let mut sorted = heads.clone();
+    sorted.sort();
+    assert_eq!(plan.heads, sorted, "@N basis is ascending");
+    assert_eq!(plan.paths.len(), 2, "a plus same");
+    assert_eq!(plan.paths[0].path, "a");
+    assert_eq!(plan.paths[1].path, "same");
+    assert!(!plan.paths[0].agreed(), "a is conflicted");
+    assert_eq!(plan.paths[0].versions.len(), 2, "one version per head");
+    assert!(plan.paths[0].agreed_entry().is_none(), "no agreed entry");
+    assert!(plan.paths[1].agreed(), "same is agreed");
+    assert!(
+        plan.paths[1].agreed_entry().is_some(),
+        "agreed paths take themselves"
+    );
+    assert_eq!(engine.current(), seq, "planning commits nothing");
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        2,
+        "planning authors nothing"
+    );
+}
+
+/// Planning enforces the same head contract as merging: two or
+/// more current eligible heads, and nothing else.
+#[test]
+fn merge_plan_rejects_bad_heads() {
+    let (_dir, mut engine, _genesis) = owner_engine("merge-plan-bad");
+    let mut objects = MemoryObjectStore::default();
+    let base = multi_tree(&mut objects, &[("base", b"base")]);
+    let trees = [multi_tree(&mut objects, &[("a", b"a1")])];
+    let heads = forks(&mut engine, &mut objects, base, &trees);
+    let unknown = SnapshotId::from_bytes([0xFD; 32]);
+
+    let error = engine.merge_plan(&objects, vec![heads[0]]).unwrap_err();
+    assert!(
+        matches!(error, EngineError::MergeNeedsTwoHeads),
+        "unexpected: {error:?}"
+    );
+    let error = engine
+        .merge_plan(&objects, vec![heads[0], unknown])
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::NotEligibleHead(id) if id == unknown),
+        "unexpected: {error:?}"
+    );
+}

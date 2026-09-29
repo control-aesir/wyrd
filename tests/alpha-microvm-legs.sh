@@ -439,11 +439,14 @@ leg_conflict_member() {
   poll_until 180 converged "$MNTS/xmember-c/renamed.txt" "victim" \
     || die "member never converged the rename"
   echo "stale-write" >&3 2>"$E2E_ROOT/rename-stale.err" || rc=$?
+  # Close may be where the EIO surfaces (buffered write accepted,
+  # flush refused at commit) — but bash prints a close-flush error
+  # without propagating it to $?, so the error TEXT is the gate
+  # here, not the close status. A fully silent success at both
+  # points is the lost update this leg exists to forbid.
   exec 3>&- 2>>"$E2E_ROOT/rename-stale.err" || crc=$?
-  [[ "$rc" == 1 || "$crc" == 1 ]] \
-    || die "stale-handle write returned rc $rc/$crc, want EIO (1)"
   grep -q "Input/output error" "$E2E_ROOT/rename-stale.err" \
-    || die "stale-handle write was not EIO: $(cat "$E2E_ROOT/rename-stale.err")"
+    || die "stale-handle write showed no EIO (rc $rc/$crc)"
   pass "rename breaks a held writable handle across hosts (EIO)"
   touch "$E2E_ROOT/conflict-rename-member-done"
   poll_until 180 test -f "$E2E_ROOT/conflict-partitioned" \

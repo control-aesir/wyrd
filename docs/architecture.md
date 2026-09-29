@@ -76,8 +76,10 @@ lives with sync control, never ambient across the node.
 
 ## Invariants (hold everywhere, always)
 
-1. **Objects are immutable.** ContentId = domain-separated BLAKE3 of
-   plaintext; StorageId = domain-separated BLAKE3 of ciphertext. Both are
+1. **Objects are immutable.** ContentId = domain-separated BLAKE3 of the
+   canonical payload under the identity-domain context (payload-based
+   identity, `object-model.md` decision 30); StorageId = domain-separated
+   BLAKE3 of ciphertext. Both are
    distinct Rust types — the compiler enforces the boundary. Writing the
    same content twice is a no-op.
 2. **Deletion is a state change.** A new snapshot without the path; objects

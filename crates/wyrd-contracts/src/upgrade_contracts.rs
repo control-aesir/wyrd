@@ -24,7 +24,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
-use wyrd_format::{FsObjectStore, ObjectKind, ObjectStore};
+use wyrd_format::{
+    ContentId, FsObjectStore, FsStoreError, MemoryObjectStore, ObjectKind, ObjectStore,
+};
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
 use wyrd_sync::durable::{DurableStore, Fact};
 use wyrd_sync::keys::EpochSecret;
@@ -527,24 +529,24 @@ fn upgrade_unknown_refuses_loudly() {
     );
 }
 
-/// Object-identity P2 decision (object-model.md): ContentId derives
+/// Object-identity decision 30 (`object-model.md`): ContentId derives
 /// exclusively from the canonical payload under the identity-domain
-/// context. Envelope framing explicitly declared identity-neutral by
-/// the contract must not move identity; a new identity-domain context
-/// forks it. End-to-end over the public APIs: FsObjectStore as the
-/// acceptance boundary, Envelope as the framing.
+/// context (contract 42). Envelope framing explicitly declared
+/// identity-neutral by the contract must not move identity; a new
+/// identity-domain context forks it. End-to-end over the public APIs:
+/// memory and disk stores as the acceptance boundary, Envelope as the
+/// framing.
 #[test]
 fn content_identity_is_payload_based_across_framing() {
-    use wyrd_format::{ContentId, MemoryObjectStore};
     let payload = b"contract payload preimage";
     let expected = ContentId::derive(ObjectKind::Chunk, payload);
     // Same payload + same context through the framing round-trip.
-    let envelope = wyrd_format::Envelope {
+    let framed = Envelope {
         kind: ObjectKind::Chunk,
         payload: payload.to_vec(),
-    };
-    let framed = envelope.encode();
-    let decoded = wyrd_format::Envelope::decode(&framed).unwrap();
+    }
+    .encode();
+    let decoded = Envelope::decode(&framed).unwrap();
     let mut mem = MemoryObjectStore::default();
     mem.insert_verified(ObjectKind::Chunk, &expected, &decoded.payload)
         .unwrap();
@@ -552,11 +554,17 @@ fn content_identity_is_payload_based_across_framing() {
     assert!(mem
         .insert_verified(ObjectKind::Chunk, &expected, &framed)
         .is_err());
-    // Same boundary on disk.
+    // Same boundary on disk: the payload verifies and reads back, while
+    // the framed bytes are refused as a foreign preimage.
     let dir = scratch_dir("identity-framing");
     let mut disk = FsObjectStore::open(dir).unwrap();
     disk.insert_verified(ObjectKind::Chunk, &expected, payload)
         .unwrap();
+    assert_eq!(disk.get(&expected).unwrap().as_deref(), Some(&payload[..]));
+    assert!(matches!(
+        disk.insert_verified(ObjectKind::Chunk, &expected, &framed),
+        Err(FsStoreError::IdentityMismatch { .. })
+    ));
     // Identity fork rides the context, not the framing.
     let other = ContentId::derive(ObjectKind::Tree, payload);
     assert_ne!(expected, other);

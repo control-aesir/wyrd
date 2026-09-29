@@ -38,6 +38,10 @@ Releases are not required to write every format they read:
 1. **Immutable data is never migrated in place.** A new encoding is a new
    object representation with an explicit version; old objects keep their
    ContentIds and stay readable. New writes use the new representation.
+   Representation and identity versioning stay separable: a framing-only
+   change takes a new envelope version byte and does not fork ContentId;
+   the identity fork rides the ContentId derivation context
+   (`object-model.md` decision 30).
 2. **Every persistent format has an explicit version.** Envelopes carry
    `wyrd_format::envelope::VERSION`; commit envelopes carry
    `COMMIT_VERSION`; control messages carry `CONTROL_VERSION`.

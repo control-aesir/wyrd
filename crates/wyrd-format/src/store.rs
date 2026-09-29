@@ -440,42 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn content_identity_golden_vectors_pin_context_and_payload() {
-        // Cross-language anchors: (kind, identity context, canonical
-        // payload bytes) -> ContentId hex. Context strings are format
-        // constants; changing one forks every identity derived with it.
-        let vectors: &[(ObjectKind, &str, &[u8], &str)] = &[
-            (
-                ObjectKind::Chunk,
-                "wyrd content v1/chunk",
-                b"hello",
-                "0b777bf8fce636256ebc6d35ec2e87a63a029e1afe81e787453d9e6ce7808979",
-            ),
-            (
-                ObjectKind::Chunk,
-                "wyrd content v1/chunk",
-                b"",
-                "e22d16eda19658d2def3850238abacc49599972c12899931c26430a0b2cca5b2",
-            ),
-            (
-                ObjectKind::Tree,
-                "wyrd content v1/tree",
-                &[0, 0, 0, 0],
-                "d30be76ce3928d05c9dfa745ae34d2040846e15a24bd56acb3d1793430b7c7f8",
-            ),
-        ];
-        for (kind, context, payload, expected_hex) in vectors {
-            assert_eq!(*context, kind.content_context());
-            let id = ContentId::derive(*kind, payload);
-            assert_eq!(
-                &hex::encode(id.as_bytes()),
-                expected_hex,
-                "golden vector for {context} over {payload:?}"
-            );
-        }
-    }
-
-    #[test]
     fn insert_verified_rejects_identity_mismatch() {
         let mut store = MemoryObjectStore::default();
         let expected = chunk_id(b"what was promised");

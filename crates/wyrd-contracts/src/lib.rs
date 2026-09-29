@@ -179,6 +179,13 @@
 //! `upgrade_replays_previous_fact_payload_versions` (fact-payload
 //! versioning, v0.9.0) and `upgrade_full_version_matrix_synchronizes`
 //! (capability negotiation).
+//!
+//! The format-identity contract (`docs/object-model.md`, decision 30):
+//!
+//! 42. `content_identity_is_payload_based_across_framing` — ContentId
+//!     derives exclusively from the canonical payload under the
+//!     identity-domain context; identity-neutral framing never moves
+//!     it, a new context forks it.
 
 #[cfg(test)]
 mod egress_contracts;

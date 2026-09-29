@@ -269,68 +269,164 @@ mod tests {
     }
 
     #[test]
+    fn content_identity_golden_vectors_pin_context_and_payload() {
+        // Cross-language anchors beside the derivation they pin
+        // (`ContentId::derive`, `ObjectKind::content_context` above):
+        // (kind, identity context, canonical payload bytes) -> ContentId
+        // hex. Context strings are format constants; changing one forks
+        // every identity derived with it. Payloads are real canonical
+        // encodings (`Tree::encode`, `Snapshot::encode`,
+        // `Manifest::canonical_bytes`), so the vectors anchor the
+        // encoding step as well as the hashing step.
+        use crate::{Manifest, ManifestEntry, Snapshot, Tree};
+        let tree_payload = Tree::empty().encode();
+        let snapshot_payload = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x20; 32]),
+            DeviceId::from_bytes([0x30; 32]),
+            TransitionId::from_bytes([0x40; 32]),
+            1,
+            0,
+            100,
+        )
+        .unwrap()
+        .encode();
+        let manifest_payload = Manifest::new(
+            SnapshotId::from_bytes([0x11; 32]),
+            vec![ManifestEntry {
+                content_id: ContentId::derive(ObjectKind::Chunk, b"anchored"),
+                kind: ObjectKind::Chunk,
+                version: crate::envelope::VERSION,
+                storage_id: StorageId::derive(b"anchored sealed bytes"),
+                encryption_epoch: 1,
+                size: 8,
+                transport: BaoRoot::from_bytes([0x22; 32]),
+            }],
+            Vec::new(),
+        )
+        .unwrap()
+        .canonical_bytes();
+        let vectors: &[(ObjectKind, &str, &[u8], &str)] = &[
+            (
+                ObjectKind::Chunk,
+                "wyrd content v1/chunk",
+                b"hello",
+                "0b777bf8fce636256ebc6d35ec2e87a63a029e1afe81e787453d9e6ce7808979",
+            ),
+            (
+                ObjectKind::Tree,
+                "wyrd content v1/tree",
+                &tree_payload,
+                "d30be76ce3928d05c9dfa745ae34d2040846e15a24bd56acb3d1793430b7c7f8",
+            ),
+            (
+                ObjectKind::Snapshot,
+                "wyrd content v1/snapshot",
+                &snapshot_payload,
+                "85da4e2a3e987ca85a5f5b2093e4f0350e77276d3df93ed58811aa03bc5ec8d8",
+            ),
+            (
+                ObjectKind::Manifest,
+                "wyrd content v1/manifest",
+                &manifest_payload,
+                "6aa28379e55731e144596cd7935b5a59878fc38bd9d5b31d0d81099226605209",
+            ),
+        ];
+        for (kind, context, payload, expected_hex) in vectors {
+            assert_eq!(*context, kind.content_context());
+            let id = ContentId::derive(*kind, payload);
+            assert_eq!(
+                &hex::encode(id.as_bytes()),
+                expected_hex,
+                "golden vector for {context} over {payload:?}"
+            );
+        }
+    }
+
+    #[test]
     fn content_identity_is_payload_based_not_framing_based() {
-        // Normative contract (object-model.md): ContentId derives
-        // exclusively from the canonical payload under the object's
-        // identity-domain context. Envelope framing bytes (magic,
-        // representation version, kind byte) are not part of the
-        // ContentId input.
+        // Normative contract (object-model.md decision 30): ContentId
+        // derives exclusively from the canonical payload under the
+        // object's identity-domain context. The fixed hex below is the
+        // regression detector: any derivation change (including one
+        // that hashed framing bytes) moves it. The `assert_ne!` beside
+        // it documents the contract shape — envelope bytes are a
+        // different preimage by construction.
         let payload = b"identity preimage";
         let id = ContentId::derive(ObjectKind::Chunk, payload);
+        assert_eq!(
+            hex::encode(id.as_bytes()),
+            "ddc449ea9f8758c15ff9909aa7625c1ea07e601046debf68218bcdf95000b7ed",
+            "payload-based golden anchor for the framing test"
+        );
         let envelope_bytes = crate::Envelope {
             kind: ObjectKind::Chunk,
             payload: payload.to_vec(),
         }
         .encode();
-        // Deriving over the envelope bytes must give a different answer:
-        // if code ever hashes framing into identity, this fails loudly.
         let framed = ContentId::derive(ObjectKind::Chunk, &envelope_bytes);
         assert_ne!(
             id, framed,
             "envelope framing must not be the ContentId preimage"
         );
-        // And the payload-derived id is stable across encode/decode.
-        let decoded = crate::Envelope::decode(&envelope_bytes).unwrap();
-        assert_eq!(ContentId::derive(ObjectKind::Chunk, &decoded.payload), id);
+    }
+
+    #[test]
+    fn content_identity_is_invariant_across_envelope_round_trip_for_all_kinds() {
+        // Framing invariance across every object kind with real
+        // canonical payloads: the same payload + context derives the
+        // same ContentId before and after envelope framing. A future
+        // representation version declared identity-neutral by the
+        // contract must preserve this property.
+        use crate::{Manifest, Snapshot, Tree};
+        let chunk_payload = b"framing invariance".to_vec();
+        let tree_payload = Tree::empty().encode();
+        let snapshot_payload = Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x20; 32]),
+            DeviceId::from_bytes([0x30; 32]),
+            TransitionId::from_bytes([0x40; 32]),
+            1,
+            0,
+            100,
+        )
+        .unwrap()
+        .encode();
+        let manifest_payload =
+            Manifest::new(SnapshotId::from_bytes([0x11; 32]), Vec::new(), Vec::new())
+                .unwrap()
+                .canonical_bytes();
+        for (kind, payload) in [
+            (ObjectKind::Chunk, chunk_payload),
+            (ObjectKind::Tree, tree_payload),
+            (ObjectKind::Snapshot, snapshot_payload),
+            (ObjectKind::Manifest, manifest_payload),
+        ] {
+            let envelope_bytes = crate::Envelope {
+                kind,
+                payload: payload.clone(),
+            }
+            .encode();
+            let decoded = crate::Envelope::decode(&envelope_bytes).unwrap();
+            assert_eq!(decoded.kind, kind);
+            assert_eq!(
+                ContentId::derive(kind, &decoded.payload),
+                ContentId::derive(kind, &payload),
+                "ContentId must survive envelope round-trip for {kind:?}"
+            );
+        }
     }
 
     #[test]
     fn content_identity_forks_on_context_not_framing() {
         // Same payload under different identity-domain contexts forks
-        // identity; same payload+context under different (identity-neutral)
-        // framing does not.
+        // identity; the fork rides the derivation context, not framing.
         let payload = b"same bytes, different domain";
         let chunk = ContentId::derive(ObjectKind::Chunk, payload);
         let tree = ContentId::derive(ObjectKind::Tree, payload);
         assert_ne!(
             chunk, tree,
             "identity fork rides the derivation context, not framing"
-        );
-        // Framing invariance: the envelope version byte is representation
-        // metadata gated at decode time, while ContentId is a pure
-        // function of payload + context. A future representation version
-        // declared identity-neutral by the contract must not change
-        // ContentId for the same payload+context.
-        let v0 = crate::Envelope {
-            kind: ObjectKind::Chunk,
-            payload: payload.to_vec(),
-        }
-        .encode();
-        let mut v_next = v0.clone();
-        v_next[4] = 0x01; // hypothetical future framing version
-                          // The framing gate refuses the unknown representation...
-        assert!(matches!(
-            crate::Envelope::decode(&v_next),
-            Err(crate::EnvelopeError::UnknownVersion(0x01))
-        ));
-        // ...while identity for the same payload+context does not move.
-        assert_eq!(
-            ContentId::derive(
-                ObjectKind::Chunk,
-                &crate::Envelope::decode(&v0).unwrap().payload
-            ),
-            ContentId::derive(ObjectKind::Chunk, payload),
-            "framing version must not move ContentId while the identity context is fixed"
         );
     }
 

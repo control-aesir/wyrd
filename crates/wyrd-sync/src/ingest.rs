@@ -532,4 +532,23 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn accept_envelope_framing_does_not_move_content_identity() {
+        // object-model.md decision 30 at the only production site where
+        // framing meets identity: a framed object accepted at the
+        // boundary derives the same ContentId as its bare payload.
+        let payload = b"boundary framing payload";
+        let framed = Envelope {
+            kind: ObjectKind::Chunk,
+            payload: payload.to_vec(),
+        }
+        .encode();
+        let env = accept_envelope(&SMALL, &framed).unwrap();
+        assert_eq!(env.kind, ObjectKind::Chunk);
+        assert_eq!(
+            ContentId::derive(env.kind, &env.payload),
+            ContentId::derive(ObjectKind::Chunk, payload)
+        );
+    }
 }

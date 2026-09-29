@@ -148,13 +148,15 @@ where
         // Pending heads (closure still fetching) simply do not install
         // yet — the live loop's publication gate retries; a damaged
         // closure still fails closed here.
-        let (heads, pending) = {
+        let partition = {
             let store = self
                 .view
                 .store_read()
                 .map_err(|error| wyrd_sync::runtime::EngineError::ObjectStore(error.to_string()))?;
             partition_heads(&runtime, heads, &*store)?
         };
+        let pending = partition.pending;
+        let heads = partition.into_publishable()?;
         // All-pending keeps the last-known-good projection: a head
         // still fetching must never blank the view a healthy head is
         // serving. (The live loop defers publication for the same

@@ -58,6 +58,12 @@ use crate::ingest::{check_manifest, check_tree, IngestError, Limits};
 /// failure carrying its own classification: it is neither pending
 /// progress nor permanent damage, and callers route it to the store
 /// failure policy.
+///
+/// Batch policy (raise and count): the head-closure gate verifies
+/// every classified head, counts each rejection by
+/// [`ClosureError::rejection_class`], and raises the first damage as
+/// the batch error — so one damaged head still fails its pass
+/// closed while the counts describe the whole batch.
 #[derive(Debug, Error)]
 pub enum ClosureError {
     #[error("root manifest describes snapshot {found}, not {expected}")]
@@ -130,6 +136,25 @@ pub enum ClosureError {
     },
 }
 
+/// Operator-facing class of a head-closure rejection: what the
+/// gate's verdict means for the head, not which check produced it.
+/// Callers report counts by class so an operator can tell "still
+/// fetching" from "invalid remote data" without rerunning the
+/// verifier by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionClass {
+    /// The closure has not been fetched yet: ordinary fetch
+    /// progress, and the head installs once its records land.
+    Incomplete,
+    /// Stored bytes do not hash back to their content identity:
+    /// invalid remote data that will not heal with more fetching.
+    IdentityMismatch,
+    /// Every other structural verdict: a contradicted mapping, a
+    /// non-canonical document, an unreachable entry, an ingest
+    /// ceiling. Fail-closed damage, never progress.
+    Other,
+}
+
 impl ClosureError {
     /// Whether this failure means "the closure has not been fetched
     /// yet" rather than "the closure is wrong". The pending arm is
@@ -147,6 +172,40 @@ impl ClosureError {
                 | ClosureError::TreeUnavailable(_)
                 | ClosureError::MissingChildManifestRecord { .. }
         )
+    }
+
+    /// The operator-facing rejection class for this failure, or
+    /// `None` when the failure is not a rejection at all: an
+    /// `ObjectStore` I/O failure carries the store's own
+    /// classification and callers route it to the store failure
+    /// policy, never to the closure counts.
+    ///
+    /// Every variant is listed explicitly — no wildcard — so adding
+    /// a variant fails compilation until its class is decided here.
+    /// This is the single source of truth for the pending set: keep
+    /// it in sync with [`is_pending`](ClosureError::is_pending).
+    pub fn rejection_class(&self) -> Option<RejectionClass> {
+        match self {
+            ClosureError::RootSnapshotMismatch { .. }
+            | ClosureError::NonCanonicalManifest
+            | ClosureError::InvalidTree(_)
+            | ClosureError::AmbiguousTreeMapping { .. }
+            | ClosureError::MissingChildManifest { .. }
+            | ClosureError::ChildSnapshotMismatch { .. }
+            | ClosureError::UnexpectedChildManifest { .. }
+            | ClosureError::MissingChunkEntry { .. }
+            | ClosureError::UnrelatedEntry { .. }
+            | ClosureError::KindMismatch { .. }
+            | ClosureError::TreeEntrySizeMismatch { .. }
+            | ClosureError::Ingest(_) => Some(RejectionClass::Other),
+            ClosureError::RootIdentityMismatch { .. }
+            | ClosureError::ChildIdentityMismatch { .. }
+            | ClosureError::TreeIdentityMismatch(_) => Some(RejectionClass::IdentityMismatch),
+            ClosureError::RootManifestMissing(_)
+            | ClosureError::TreeUnavailable(_)
+            | ClosureError::MissingChildManifestRecord { .. } => Some(RejectionClass::Incomplete),
+            ClosureError::ObjectStore { .. } => None,
+        }
     }
 }
 
@@ -809,5 +868,132 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ClosureError::TreeUnavailable(_)));
+    }
+
+    /// Every rejection classifies for the operator summary: unfetched
+    /// closures read as incomplete (may heal), bytes that do not hash
+    /// back read as identity mismatches (will not heal), and the
+    /// remaining structural verdicts read as other damage. Store I/O
+    /// is not a rejection — it keeps the store's own classification.
+    #[test]
+    fn rejection_classes_cover_every_variant() {
+        use RejectionClass::{IdentityMismatch, Incomplete, Other};
+        let id = ContentId::from_bytes([0x11; 32]);
+        let sid = SnapshotId::from_bytes([0x22; 32]);
+        let cases: Vec<(ClosureError, Option<RejectionClass>)> = vec![
+            (
+                ClosureError::RootSnapshotMismatch {
+                    expected: sid,
+                    found: sid,
+                },
+                Some(Other),
+            ),
+            (ClosureError::RootManifestMissing(sid), Some(Incomplete)),
+            (
+                ClosureError::RootIdentityMismatch {
+                    found: id,
+                    derived: id,
+                },
+                Some(IdentityMismatch),
+            ),
+            (
+                ClosureError::ChildIdentityMismatch {
+                    expected: id,
+                    derived: id,
+                },
+                Some(IdentityMismatch),
+            ),
+            (ClosureError::NonCanonicalManifest, Some(Other)),
+            (ClosureError::TreeUnavailable(id), Some(Incomplete)),
+            (
+                ClosureError::TreeIdentityMismatch(id),
+                Some(IdentityMismatch),
+            ),
+            (ClosureError::InvalidTree(id), Some(Other)),
+            (
+                ClosureError::AmbiguousTreeMapping {
+                    tree: id,
+                    first: id,
+                    second: id,
+                },
+                Some(Other),
+            ),
+            (
+                ClosureError::MissingChildManifest {
+                    tree: id,
+                    child: id,
+                },
+                Some(Other),
+            ),
+            (
+                ClosureError::MissingChildManifestRecord {
+                    child: id,
+                    manifest: id,
+                },
+                Some(Incomplete),
+            ),
+            (
+                ClosureError::ChildSnapshotMismatch { manifest: id },
+                Some(Other),
+            ),
+            (
+                ClosureError::UnexpectedChildManifest {
+                    tree: id,
+                    child: id,
+                },
+                Some(Other),
+            ),
+            (
+                ClosureError::MissingChunkEntry {
+                    tree: id,
+                    chunk: id,
+                },
+                Some(Other),
+            ),
+            (ClosureError::UnrelatedEntry { content: id }, Some(Other)),
+            (
+                ClosureError::KindMismatch {
+                    content: id,
+                    expected: ObjectKind::Chunk,
+                    found: ObjectKind::Tree,
+                },
+                Some(Other),
+            ),
+            (
+                ClosureError::TreeEntrySizeMismatch {
+                    content: id,
+                    expected: 1,
+                    found: 2,
+                },
+                Some(Other),
+            ),
+            (
+                ClosureError::Ingest(IngestError::TooLarge {
+                    what: "tree",
+                    bytes: 9,
+                    max: 8,
+                }),
+                Some(Other),
+            ),
+            (
+                ClosureError::ObjectStore {
+                    failure: StoreFailure::StorageFull,
+                    detail: "simulated".to_string(),
+                },
+                None,
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            19,
+            "one case per ClosureError variant, mirroring the exhaustive match in rejection_class"
+        );
+        for (error, expected) in cases {
+            assert_eq!(
+                error.rejection_class(),
+                expected,
+                "wrong operator class for {error:?}"
+            );
+        }
     }
 }

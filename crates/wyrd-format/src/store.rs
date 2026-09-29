@@ -437,6 +437,14 @@ mod tests {
             .insert_verified(ObjectKind::Chunk, &expected, &framed)
             .unwrap_err();
         assert!(matches!(err, MemoryStoreError::IdentityMismatch { .. }));
+        // The fork property at the same boundary: the same payload
+        // under a different kind derives a different identity, so a
+        // Tree-derived id presented with Chunk bytes is refused.
+        let tree_id = ContentId::derive(ObjectKind::Tree, payload);
+        let err = store
+            .insert_verified(ObjectKind::Chunk, &tree_id, payload)
+            .unwrap_err();
+        assert!(matches!(err, MemoryStoreError::IdentityMismatch { .. }));
     }
 
     #[test]

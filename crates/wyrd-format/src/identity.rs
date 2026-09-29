@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn content_identity_is_invariant_across_envelope_round_trip_for_all_kinds() {
+    fn content_identity_is_invariant_across_envelope_round_trip_for_canonical_payloads() {
         // Decode preserves payload bytes, so identity survives a framing
         // round trip. Kept narrow on purpose: the envelope suite already
         // covers the round trip itself, so this asserts only the part it

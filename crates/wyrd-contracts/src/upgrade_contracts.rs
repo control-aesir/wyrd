@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
 use wyrd_format::{
-    ContentId, FsObjectStore, FsStoreError, MemoryObjectStore, ObjectKind, ObjectStore,
+    ContentId, FsObjectStore, FsStoreError, MemoryObjectStore, MemoryStoreError, ObjectKind,
+    ObjectStore,
 };
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
 use wyrd_sync::durable::{DurableStore, Fact};
@@ -553,10 +554,12 @@ fn content_identity_is_payload_based_across_framing() {
     let mut mem = MemoryObjectStore::default();
     mem.insert_verified(ObjectKind::Chunk, &expected, &decoded.payload)
         .unwrap();
-    // Framing bytes are not payload: rejected under the same expectation.
-    assert!(mem
-        .insert_verified(ObjectKind::Chunk, &expected, &framed)
-        .is_err());
+    // Framing bytes are not payload: rejected under the same expectation,
+    // naming the variant the way the disk leg does.
+    assert!(matches!(
+        mem.insert_verified(ObjectKind::Chunk, &expected, &framed),
+        Err(MemoryStoreError::IdentityMismatch { .. })
+    ));
     // Same boundary on disk: the payload verifies and reads back, while
     // the framed bytes are refused as a foreign preimage.
     let dir = scratch_dir("identity-framing");

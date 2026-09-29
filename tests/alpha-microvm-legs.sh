@@ -473,7 +473,6 @@ leg_conflict_member() {
 # exports offline and fails closed on remote-only content.
 conflict_assert_converged() {
   local m="$1"
-  local rc=0
   poll_until 300 bash -c "timeout 60 cat '$m/conflict-c.txt@1' >/dev/null 2>&1 && timeout 60 cat '$m/conflict-c.txt@2' >/dev/null 2>&1" \
     || die "conflict versions never became readable on $m"
   pass "both conflict versions readable"
@@ -486,11 +485,14 @@ conflict_assert_converged() {
   [[ "$got" == "$want" ]] \
     || die "conflict version set mismatch on $m: got [$got]"
   pass "conflict versions read identically (owner + member takes)"
-  rc=0
-  echo "after" > "$m/post-conflict.txt" 2>"$E2E_ROOT/conflict-eio.err" || rc=$?
-  [[ "$rc" == 1 ]] || die "conflicted-drive write returned rc $rc, want EIO (1)"
-  grep -q "Input/output error" "$E2E_ROOT/conflict-eio.err" \
-    || die "conflicted-drive write was not EIO: $(cat "$E2E_ROOT/conflict-eio.err")"
+  # Write refusal via expect_exit, not an inline redirect: a
+  # FUSE-EIO-at-open on the main shell's own redirection killed the
+  # leg silently even behind `||` (guest bash + set -e), while the
+  # helper runs the attempt isolated in a child with set +e — the
+  # same pattern the fetch legs use for their EIO probes.
+  expect_exit 1 conflict-eio-write bash -c "echo after > '$m/post-conflict.txt'" >/dev/null
+  grep -q "Input/output error" "$LOGDIR/conflict-eio-write.stderr" \
+    || die "conflicted-drive write was not EIO: $(cat "$LOGDIR/conflict-eio-write.stderr")"
   [[ "$(cat "$m/conflict-c.txt@1")" != "" ]] \
     || die "conflicted drive stopped serving reads on $m"
   pass "conflicted drive fails writes EIO and still serves reads"

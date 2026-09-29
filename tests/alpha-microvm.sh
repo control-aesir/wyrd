@@ -5,24 +5,29 @@
 # its EXIT trap would reap guest pid files from the host pid
 # namespace, so the host keeps its own minimal pass/die.
 #
-# Flow (issue: microvm.nix reproducible suite):
-#   1. shared core steps 1-5 inside peer-o (unmodified Lima script,
-#      E2E_ONLY_STEP prefix closure, relay untouched)
-#   2. second member natively on peer-n (pair there, invite+join here —
-#      invitation files are the portable artifact by design)
-#   3. cross-host convergence legs in parallel (guest legs, done-file
-#      rendezvous on the shared state root) plus the host-side relay
-#      opacity probe (addressed kind-1059 wraps only, never cleartext)
-#   4. serving-restart legs (fresh endpoint, route update, no repair)
-#   5. fetch-plane legs (blocking cold open, bounded EIO on dead
-#      routes, recovery without remount after the owner returns on a
-#      fresh endpoint, dedupe log with no double-append)
-#   6. relay-partition conflict legs: rename-then-commit StaleHandle,
-#      concurrent same-file commits under tap-r down, ConflictedHeads
-#      write EIO with reads still serving, name@N versions identical
-#      on both sides (issue: microvm relay-partition conflict legs v2)
-#   7. offline reopen of both drives on the host (exports now assert
-#      the conflict siblings too)
+# Flow (issue: microvm.nix reproducible suite,
+# nostr:nevent1qqsfe3tgav2h5xe0sdsj5508zxdpknamd9l48tr35fxyugda23df9dcpz9mhxue69uhkwunpwdczuap49eehgcy9luf
+# for the conflict legs):
+#   microvm 1-5. shared core steps 1-5 inside peer-o (unmodified
+#      Lima script, E2E_ONLY_STEP prefix closure, relay untouched)
+#   microvm 6. second member natively on peer-n (pair there,
+#      invite+join here — invitation files are the portable artifact
+#      by design)
+#   microvm 7. cross-host convergence legs in parallel (guest legs,
+#      done-file rendezvous on the shared state root) plus the
+#      host-side relay opacity probe (addressed kind-1059 wraps
+#      only, never cleartext)
+#   microvm 8. serving-restart legs (fresh endpoint, route update,
+#      no repair)
+#   microvm 9. fetch-plane legs (blocking cold open, bounded EIO on
+#      dead routes, recovery without remount after the owner returns
+#      on a fresh endpoint, dedupe log with no double-append)
+#   microvm 10. relay-partition conflict legs: rename-then-commit
+#      StaleHandle, concurrent same-file commits under tap-r down,
+#      ConflictedHeads write EIO with reads still serving, name@N
+#      versions identical on both sides
+#   microvm 11. offline reopen of both drives on the host (exports
+#      now assert the conflict siblings too)
 #
 # The relay is a VM service the host stops/starts per conflict leg
 # via its tap (tap-r down/up); see nix/microvm/run-microvm.sh.
@@ -222,25 +227,34 @@ wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
 wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
 pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
 
-# --- phase 5.5: relay-partition conflict -------------------------------
+# --- phase: microvm 10 (relay-partition conflict) ---------------------
 # Rename half runs pre-partition (it needs convergence); the host
 # partitions only after both rename-done files land, then heals
 # after both conflict writes. Partition is host-side tap surgery
 # (tap-r is the relay's tap; see TAP_DEV in run-microvm.sh) — the
 # orchestrator runs as root, so no privilege dance. Done-file
 # rendezvous rides the shared state root, unaffected by the
-# partition. The 1059 count is the publish witness: conflict
-# announcements must cross the relay, so it grows across the heal.
+# partition. No relay query witness: the in-leg @1/@2 reads cannot
+# succeed unless the peer's announcement crossed the relay and its
+# content crossed iroh, so a count would only re-prove what the
+# legs already pin (and saturate at its query limit one day).
+# A host EXIT trap re-ups tap-r: any die between down and up must
+# not strand the relay unreachable in a --keep run.
 echo "=== microvm 10: relay-partition conflict ==="
 rm -f "$RUN"/conflict-rename-member-ready "$RUN"/conflict-rename-owner-done \
   "$RUN"/conflict-rename-member-done "$RUN"/conflict-partitioned \
   "$RUN"/conflict-owner-written "$RUN"/conflict-member-written \
   "$RUN"/conflict-healed "$RUN"/conflict-owner-done "$RUN"/conflict-member-done \
-  "$RUN"/rename-stale.err "$RUN"/conflict-eio.err
-wait_conflict_file() { # <seconds> <file> <what>
-  local budget="$1" f="$2" what="$3" i
+  "$RUN"/rename-stale.err "$RUN/logs"/conflict-eio-write-owner.stderr \
+  "$RUN/logs"/conflict-eio-write-member.stderr
+wait_conflict_file() { # <seconds> <file> <what> <leg-pid>
+  local budget="$1" f="$2" what="$3" leg="$4" i
   for ((i = 0; i < budget * 2; i++)); do
     [[ -f "$f" ]] && return 0
+    # A dead leg never touches its file: fail fast with the leg log
+    # instead of burning the whole budget on a corpse. The pid is
+    # per-file (the sibling leg may already have finished fine).
+    kill -0 "$leg" 2>/dev/null || die "a conflict leg exited early (see logs/leg-conflict-*.out)"
     sleep 0.5
   done
   die "$what"
@@ -252,29 +266,27 @@ on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh conflict-o
   >"$RUN/logs/leg-conflict-owner.out" 2>&1 &
 LEG_O=$!
 wait_conflict_file 300 "$RUN/conflict-rename-owner-done" \
-  "owner rename leg never finished (see logs/leg-conflict-owner.out)"
+  "owner rename leg never finished (see logs/leg-conflict-owner.out)" "$LEG_O"
 wait_conflict_file 120 "$RUN/conflict-rename-member-done" \
-  "member stale-handle probe never finished (see logs/leg-conflict-member.out)"
+  "member stale-handle probe never finished (see logs/leg-conflict-member.out)" "$LEG_N"
 pass "rename breaks a held handle across hosts before the partition"
-COUNT_BEFORE="$(printf '%s' "$REQ1059" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>/dev/null | grep -c '"kind":1059' || true)"
+heal_tap() { ip link set tap-r up 2>/dev/null || true; }
+trap heal_tap EXIT
 ip link set tap-r down || die "host could not partition tap-r"
 touch "$RUN/conflict-partitioned"
 wait_conflict_file 180 "$RUN/conflict-owner-written" \
-  "owner never committed under partition (see logs/leg-conflict-owner.out)"
+  "owner never committed under partition (see logs/leg-conflict-owner.out)" "$LEG_O"
 wait_conflict_file 180 "$RUN/conflict-member-written" \
-  "member never committed under partition (see logs/leg-conflict-member.out)"
+  "member never committed under partition (see logs/leg-conflict-member.out)" "$LEG_N"
 pass "both sides commit the same path under partition"
 ip link set tap-r up || die "host could not heal tap-r"
+trap - EXIT
 touch "$RUN/conflict-healed"
 wait "$LEG_N" || die "conflict member leg failed (see logs/leg-conflict-member.out)"
 wait "$LEG_O" || die "conflict owner leg failed (see logs/leg-conflict-owner.out)"
 pass "conflict versions, EIO writes, and serving reads hold across hosts"
-COUNT_AFTER="$(printf '%s' "$REQ1059" | timeout 30 "$NAK_BIN" req "$RELAY_URL" 2>/dev/null | grep -c '"kind":1059' || true)"
-[[ "$COUNT_AFTER" -gt "$COUNT_BEFORE" ]] \
-  || die "relay 1059 count did not grow across the heal ($COUNT_BEFORE -> $COUNT_AFTER): conflict announcements never flowed"
-pass "conflict announcements crossed the relay"
 
-# --- phase 6: offline reopen --------------------------------------------
+# --- phase: microvm 11 (offline reopen) ---------------------------------
 # Depends on phase 5's delete (fetch-member removes stale-1.txt once
 # the scratch write has localized the trees it needs): the export
 # below fails closed on remote-only content, so without that delete

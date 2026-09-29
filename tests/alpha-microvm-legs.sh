@@ -136,7 +136,8 @@ leg_fetch_owner() {
   # over the same drive) and write a new file BEFORE the member
   # authors anything: the member converges this head first, so the
   # scratch and the delete extend the post-restart lineage instead
-  # of forking it (the suite has no conflict legs). The new
+  # of forking it (the conflict phase forks deliberately later, on a
+  # different path). The new
   # announcement also carries the fresh route the member needs for
   # serving. File presence in the member's own view is the
   # self-synchronizing signal — no sleeps. Reading the scratch file
@@ -399,11 +400,12 @@ leg_conflict_owner() {
   pass "rename committed while the member holds the victim open"
   poll_until 180 test -f "$E2E_ROOT/conflict-partitioned" \
     || die "host never partitioned the relay"
+  conflict_assert_partitioned "$relay"
   echo "owner-conflict-1" > "$MNTS/xowner-c/conflict-c.txt"
   touch "$E2E_ROOT/conflict-owner-written"
   poll_until 180 test -f "$E2E_ROOT/conflict-healed" \
     || die "host never healed the relay"
-  conflict_assert_converged "$MNTS/xowner-c"
+  conflict_assert_converged "$MNTS/xowner-c" owner
   touch "$E2E_ROOT/conflict-owner-done"
   poll_until 240 test -f "$E2E_ROOT/conflict-member-done" \
     || die "member never finished the conflict assertions"
@@ -415,8 +417,10 @@ leg_conflict_owner() {
 # open across the owner's rename (stale-handle EIO pin), then commit
 # the same conflict path from this side of the partition and assert
 # the merged conflict identically to the owner.
-# Staleness is relative to the converged head: the held fd is opened
-# O_RDWR (no truncate, so the open itself commits nothing) and stays
+  # Staleness is relative to the converged head: the held fd is opened
+  # O_RDWR (spelled `exec 3<>`, which is O_RDWR|O_CREAT — the open
+  # itself commits nothing only because the preceding `converged`
+  # proved the victim exists, so O_CREAT is a no-op here) and stays
 # pinned to the pre-rename generation — reads on it still serve the
 # captured identity until release — so the member must converge the
 # rename FIRST (renamed.txt reads the victim bytes) and only then
@@ -451,11 +455,12 @@ leg_conflict_member() {
   touch "$E2E_ROOT/conflict-rename-member-done"
   poll_until 180 test -f "$E2E_ROOT/conflict-partitioned" \
     || die "host never partitioned the relay"
+  conflict_assert_partitioned "$relay"
   echo "member-conflict-1" > "$MNTS/xmember-c/conflict-c.txt"
   touch "$E2E_ROOT/conflict-member-written"
   poll_until 180 test -f "$E2E_ROOT/conflict-healed" \
     || die "host never healed the relay"
-  conflict_assert_converged "$MNTS/xmember-c"
+  conflict_assert_converged "$MNTS/xmember-c" member
   touch "$E2E_ROOT/conflict-member-done"
   poll_until 240 test -f "$E2E_ROOT/conflict-owner-done" \
     || die "owner never finished the conflict assertions"
@@ -463,36 +468,68 @@ leg_conflict_member() {
   check_no_leaks "$LOGDIR/mount-xmember-c.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
-# conflict_assert_converged <mnt>: shared post-heal assertions for
-# both conflict legs. Same-path commits from both sides of the
-# partition surface as name@N versions (deterministic SnapshotId
-# byte-order numbering — order pinned nowhere, so the version set
-# is compared, identically on both sides), the conflicted path
-# presents as a directory, a further write fails EIO while reads
-# keep serving, and both versions are fetched local: phase 6
-# exports offline and fails closed on remote-only content.
+# conflict_assert_partitioned <relay>: guest-side proof the partition
+# took — the relay TCP endpoint must be unreachable. Without this a
+# failed tap-down would let both writes converge onto one head and
+# the leg would die much later at the @1 read with a misleading
+# message.
+conflict_assert_partitioned() {
+  local relay="$1" hostport host port
+  hostport="${relay#ws://}"
+  hostport="${hostport#wss://}"
+  host="${hostport%%:*}"
+  port="${hostport##*:}"
+  port="${port%%/*}"
+  if timeout 5 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+    die "relay $host:$port reachable while partitioned"
+  fi
+  pass "partition verified guest-side"
+}
+
+# conflict_assert_converged <mnt> <side>: shared post-heal
+# assertions for both conflict legs. Same-path commits from both
+# sides of the partition surface as name@N versions (deterministic
+# SnapshotId byte-order numbering — order pinned nowhere, so the
+# version set is compared, identically on both sides), the
+# conflicted path presents as a directory, a further write fails
+# EIO while reads keep serving, and both versions are fetched
+# local: phase 6 exports offline and fails closed on remote-only
+# content. <side> (owner/member) namespaces the probe stderr:
+# LOGDIR is shared across guests, and one O_TRUNC file would let
+# each side's text gate pass on the sibling's attempt.
 conflict_assert_converged() {
-  local m="$1"
+  local m="$1" side="$2"
+  local wrc=0
   poll_until 300 bash -c "timeout 60 cat '$m/conflict-c.txt@1' >/dev/null 2>&1 && timeout 60 cat '$m/conflict-c.txt@2' >/dev/null 2>&1" \
     || die "conflict versions never became readable on $m"
   pass "both conflict versions readable"
   [[ -d "$m/conflict-c.txt" ]] \
     || die "conflicted path does not present as a directory on $m"
   pass "conflicted path presents as a directory"
+  if ls "$m" | grep -q '@'; then
+    die "readdir lists a version-qualified name on $m"
+  fi
+  pass "readdir omits version-qualified names"
   local got want
   got="$(printf '%s\n' "$(cat "$m/conflict-c.txt@1")" "$(cat "$m/conflict-c.txt@2")" | sort)"
   want="$(printf '%s\n' "owner-conflict-1" "member-conflict-1" | sort)"
   [[ "$got" == "$want" ]] \
     || die "conflict version set mismatch on $m: got [$got]"
   pass "conflict versions read identically (owner + member takes)"
-  # Write refusal via expect_exit, not an inline redirect: a
+  if test -e "$m/conflict-c.txt@3"; then
+    die "third conflict version on $m: more than two heads"
+  fi
+  pass "no third head"
+  # Write refusal, error text first: the attempt runs in a child (a
   # FUSE-EIO-at-open on the main shell's own redirection killed the
-  # leg silently even behind `||` (guest bash + set -e), while the
-  # helper runs the attempt isolated in a child with set +e — the
-  # same pattern the fetch legs use for their EIO probes.
-  expect_exit 1 conflict-eio-write bash -c "echo after > '$m/post-conflict.txt'" >/dev/null
-  grep -q "Input/output error" "$LOGDIR/conflict-eio-write.stderr" \
-    || die "conflicted-drive write was not EIO: $(cat "$LOGDIR/conflict-eio-write.stderr")"
+  # leg silently even behind `||` under set -e), the text is the
+  # gate and the exit code the secondary check.
+  wrc=0
+  bash -c "echo after > '$m/post-conflict.txt'" 2>"$LOGDIR/conflict-eio-write-$side.stderr" || wrc=$?
+  grep -q "Input/output error" "$LOGDIR/conflict-eio-write-$side.stderr" \
+    || die "conflicted-drive write was not EIO on $m (rc $wrc)"
+  [[ "$wrc" == 1 ]] \
+    || die "conflicted-drive write exited $wrc, want 1, on $m"
   [[ "$(cat "$m/conflict-c.txt@1")" != "" ]] \
     || die "conflicted drive stopped serving reads on $m"
   pass "conflicted drive fails writes EIO and still serves reads"

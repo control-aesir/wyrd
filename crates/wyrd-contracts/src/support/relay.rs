@@ -72,7 +72,11 @@ impl Mailbox for Relay {
         id: DeliveryId,
         disposition: Disposition,
     ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
-        if matches!(disposition, Disposition::Ack) {
+        if matches!(disposition, Disposition::Ack | Disposition::Poison) {
+            // The fake keeps no durable log, so poison and consumption
+            // settle identically: drop the slot. A Poison left live
+            // would re-offer forever, hanging the drain instead of
+            // failing it.
             for slot in &mut self.live {
                 if slot.as_ref().is_some_and(|(i, _)| *i == id) {
                     *slot = None;

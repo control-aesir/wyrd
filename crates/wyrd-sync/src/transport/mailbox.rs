@@ -229,7 +229,8 @@ pub trait Mailbox {
 
     /// Hand over the next envelope addressed to this mailbox's owner,
     /// if any. The handover does NOT consume the envelope: it stays
-    /// available for redelivery until settled with [`Disposition::Ack`].
+    /// available for redelivery until settled with [`Disposition::Ack`]
+    /// or [`Disposition::Poison`].
     /// A later `recv` MAY re-offer an unsettled delivery, always under
     /// the same id; the drain loop offers each id once per pass, so a
     /// pass always terminates. Ids must be stable across re-offers and
@@ -241,6 +242,11 @@ pub trait Mailbox {
     /// idempotent over redelivery (dedupe the inner message id from
     /// durable facts).
     ///
+    /// A drain loop must settle what it takes: held handovers are
+    /// re-offered round-robin, so collecting deliveries without
+    /// settling rotates the same held mail forever instead of
+    /// draining.
+    ///
     /// The `Err` case is a broken mailbox, not missing mail: a poisoned
     /// channel lock or an exhausted id space fails the drain pass with
     /// [`MailboxError::Transport`] instead of panicking the process, and
@@ -250,10 +256,13 @@ pub trait Mailbox {
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError>;
 
     /// Settle one handover: `Ack` consumes (the relay may discard the
-    /// envelope), `Retry` retains it for redelivery. Consumption is
+    /// envelope), `Poison` consumes terminal poison memory-only (the
+    /// relay may discard the envelope, but nothing is recorded
+    /// durably), `Retry` retains it for redelivery. Consumption is
     /// durable but not eternal under bounded retention — see `recv`.
-    /// Settling is idempotent — a repeated `Ack` is a no-op — and
-    /// dropping a [`Delivery`] without settling is an implicit `Retry`.
+    /// Settling is idempotent — a repeated settle of any kind is a
+    /// no-op — and dropping a [`Delivery`] without settling is an
+    /// implicit `Retry`.
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError>;
 }
 
@@ -323,6 +332,15 @@ pub enum Disposition {
     /// responsibility: they settle `Retry` so the relay keeps the
     /// crash backstop.
     Ack,
+    /// Terminal poison: the bytes can never become a message, so the
+    /// relay may discard the envelope — but the mailbox records it
+    /// memory-only, never durably. A poison flood must not buy
+    /// durable writes or retention slots one per wrap: the live
+    /// mailbox holds poison ids in its bounded session cache, and a
+    /// crash forgets them, so redelivery re-poisons at bounded
+    /// per-delivery cost (one reject, no growth). Safe to repeat for
+    /// the same reason as `Ack`.
+    Poison,
     /// Leave for redelivery: the engine holds nothing for this
     /// envelope, so the relay MUST retain it.
     Retry,
@@ -388,7 +406,9 @@ impl Mailbox for MemoryMailbox<'_> {
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
         if let Some(pos) = self.relay.queue.iter().position(|s| s.id == id) {
             match disposition {
-                Disposition::Ack => {
+                Disposition::Ack | Disposition::Poison => {
+                    // The fake keeps no durable log, so poison and
+                    // consumption settle identically: drop the slot.
                     self.relay.queue.remove(pos);
                 }
                 // Retry requeues at the back: the envelope is offered

@@ -551,12 +551,86 @@ fn oversize_envelope_discarded_without_commit() {
     let report = drain(&mut fixture);
     assert_eq!(report.discarded, 1);
     assert_eq!(fixture.engine.current(), 0);
-    // Bytes that never decoded write no durable fact, and the ack
-    // consumed the handover: a second pass sees nothing.
+    // Bytes that never decoded write no durable fact, and the poison
+    // settle consumed the handover: a second pass sees nothing.
     let facts = fixture.engine.store.load().expect("loads");
     assert!(facts.announcements.is_empty());
     let report = drain(&mut fixture);
     assert_eq!(report.discarded, 0);
+}
+
+/// Terminal poison settles `Poison`, not `Ack`: the engine's discard
+/// verdict must reach the mailbox as memory-only consumption, never
+/// as a durable ack.
+#[test]
+fn discarded_envelope_settles_poison_not_ack() {
+    use crate::transport::mailbox::{Delivery, DeliveryId, Mailbox, MailboxEnvelope, MailboxError};
+    struct RecordingMailbox<'a> {
+        inner: MemoryMailbox<'a>,
+        settled: Vec<(DeliveryId, Disposition)>,
+    }
+    impl Mailbox for RecordingMailbox<'_> {
+        fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+            self.inner.send(envelope)
+        }
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            self.inner.recv()
+        }
+        fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+            self.settled.push((id, disposition));
+            self.inner.settle(id, disposition)
+        }
+    }
+    let mut fixture = fixture();
+    let genesis_id = Builder::genesis(10).1.transition_id();
+    let mut envelope = deliver(&fixture, 1, &announcement_for(1, genesis_id));
+    envelope.ciphertext.pop();
+    queue(&mut fixture, vec![envelope]);
+    let recipient = fixture.recipient;
+    let mut mailbox = RecordingMailbox {
+        inner: MemoryMailbox {
+            relay: &mut fixture.relay,
+            owner: recipient,
+        },
+        settled: Vec::new(),
+    };
+    let report = fixture.engine.drain(&mut mailbox).unwrap();
+    assert_eq!(report.discarded, 1);
+    assert_eq!(mailbox.settled.len(), 1);
+    assert_eq!(
+        mailbox.settled[0].1,
+        Disposition::Poison,
+        "discards settle Poison, not Ack"
+    );
+}
+
+/// Oversized floods retain nothing per delivery: 100k unique
+/// over-ceiling envelopes each reject before decryption, settle
+/// Poison, and leave no state — one envelope at a time, so the flood
+/// measures per-delivery retention, not bulk allocation.
+#[test]
+fn oversize_flood_retains_nothing_per_delivery() {
+    let mut fixture = fixture();
+    let genesis_id = Builder::genesis(10).1.transition_id();
+    let base = deliver(&fixture, 1, &announcement_for(1, genesis_id));
+    let mut discarded_total = 0;
+    for index in 0..100_000 {
+        let mut envelope = base.clone();
+        // Unique per iteration and over the ceiling either way: the
+        // prefix varies, the length forces rejection before NIP-44
+        // decryption.
+        envelope.ciphertext = format!("{index:09}") + &"A".repeat(MAX_MAILBOX_CIPHERTEXT_LEN + 1);
+        queue(&mut fixture, vec![envelope]);
+        discarded_total += drain(&mut fixture).discarded;
+    }
+    assert_eq!(discarded_total, 100_000);
+    assert_eq!(fixture.engine.current(), 0);
+    let report = drain(&mut fixture);
+    assert_eq!(
+        (report.accepted, report.discarded),
+        (0, 0),
+        "nothing retained across the flood"
+    );
 }
 
 #[test]

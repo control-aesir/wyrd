@@ -1,3 +1,4 @@
+use super::mini_relay::MiniRelay;
 use super::*;
 use nostr::event::FinalizeEvent;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +67,20 @@ pub(super) fn wait_for_delivery(
 
 pub(super) fn assert_quiet(mailbox: &mut LiveMailbox<Keys>) {
     assert!(wait_for_delivery(mailbox, QUIET_TIMEOUT).is_none());
+}
+
+/// Wait until the relay holds the mailbox's subscription (or time
+/// out): the initial REQ races the relay core loop, so floods inject
+/// after registration instead of assuming it.
+pub(super) fn wait_for_subscription(relay: &MiniRelay, timeout: Duration) {
+    let start = Instant::now();
+    while relay.subscription_count() != 1 {
+        assert!(
+            start.elapsed() < timeout,
+            "initial subscribe registers once"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Poll `health` until it reads the expected liveness (or time out):

@@ -38,8 +38,12 @@
 //! can always drain room free. Framing-level garbage (wrong kind, missing or
 //! foreign recipient tag, failed signature) is rejected at the boundary
 //! and never queued; because it is not persisted, it costs only one
-//! rejection per relay redelivery — the same re-discard-per-pass cost the
-//! engine already pays for Wyrd-level poison.
+//! rejection per relay redelivery. Wyrd-level poison (an envelope that
+//! opens but never decodes) settles [`Disposition::Poison`]: the wrap id
+//! joins the bounded session cache, never the durable log, so a poison
+//! flood buys no fsync and no retention slot per wrap. A crash forgets
+//! the cache and redelivery re-poisons at bounded per-delivery cost —
+//! the explicit retention policy for poison, in one place.
 //!
 //! Delivery is at-least-once, not exactly-once: an ack forgotten to
 //! retention eviction may redeliver after a restart or resubscribe, and
@@ -201,6 +205,8 @@ mod tests_harness;
 mod tests_interop;
 #[cfg(test)]
 mod tests_mailbox;
+#[cfg(test)]
+mod tests_poison;
 #[cfg(test)]
 mod tests_signer_boundary;
 
@@ -636,9 +642,10 @@ pub struct LiveMailbox<S> {
     outstanding: HashSet<DeliveryId>,
     next_delivery: u64,
     seen: SeenStore,
-    /// Wrap ids that failed envelope extraction this session: never
-    /// recorded durably, remembered boundedly so the same garbage is
-    /// not re-decrypted on every replay. Evicted poison simply
+    /// Wrap ids settled as poison this session — framing garbage that
+    /// failed envelope extraction and engine-level discards alike:
+    /// never recorded durably, remembered boundedly so the same wraps
+    /// are not re-decrypted on every replay. Evicted poison simply
     /// decrypts again on its next receipt; restarts re-decrypt once
     /// and re-discard.
     poison: BoundedIds,
@@ -976,6 +983,27 @@ where
     #[cfg(test)]
     fn settled_below(&self) -> u64 {
         self.settled_below
+    }
+
+    /// Forget a settled handover: drop it from the held queue and
+    /// advance the settlement watermark. Shared by consumption and
+    /// poison — both are terminal, so both must keep the watermark
+    /// moving, or ids settled after a poisoned one would accumulate
+    /// in the outstanding set without bound.
+    fn forget_held(&mut self, pos: usize, id: DeliveryId) {
+        self.unacked.remove(pos);
+        // Idempotent-settlement bookkeeping: ids are dense
+        // from 1 per boot, so consumed ids collapse into a
+        // low-water mark; only settled ids with still-held
+        // predecessors stay in the outstanding set.
+        self.outstanding.insert(id);
+        while self
+            .settled_below
+            .checked_add(1)
+            .is_some_and(|next| self.outstanding.remove(&DeliveryId::new(next)))
+        {
+            self.settled_below += 1;
+        }
     }
 }
 
@@ -1501,32 +1529,33 @@ where
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
         match self.unacked.iter().position(|held| held.id == id) {
             Some(pos) => {
-                if matches!(disposition, Disposition::Ack) {
-                    // Durable consume point: record before forgetting, so
-                    // a log failure keeps the delivery held for redelivery.
-                    let wrap_id = self.unacked[pos].wrap_id;
-                    self.seen.record(&wrap_id)?;
-                    self.unacked.remove(pos);
-                    // Idempotent-settlement bookkeeping: ids are dense
-                    // from 1 per boot, so consumed ids collapse into a
-                    // low-water mark; only settled ids with still-held
-                    // predecessors stay in the outstanding set.
-                    self.outstanding.insert(id);
-                    while self
-                        .settled_below
-                        .checked_add(1)
-                        .is_some_and(|next| self.outstanding.remove(&DeliveryId::new(next)))
-                    {
-                        self.settled_below += 1;
+                match disposition {
+                    Disposition::Ack => {
+                        // Durable consume point: record before forgetting, so
+                        // a log failure keeps the delivery held for redelivery.
+                        let wrap_id = self.unacked[pos].wrap_id;
+                        self.seen.record(&wrap_id)?;
+                        self.forget_held(pos, id);
                     }
+                    Disposition::Poison => {
+                        // Terminal poison consumes memory-only: recording it
+                        // durably would let a poison flood buy an fsync and
+                        // a retention slot per wrap. The wrap id joins the
+                        // bounded session cache instead; a crash forgets it
+                        // and redelivery re-poisons at bounded cost.
+                        let wrap_id = self.unacked[pos].wrap_id;
+                        self.poison.insert(wrap_id);
+                        self.forget_held(pos, id);
+                    }
+                    // Retry leaves the delivery held; recv rotates held mail
+                    // round-robin, so a retry is re-offered on a later pass
+                    // behind everything else.
+                    Disposition::Retry => {}
                 }
-                // Retry leaves the delivery held; recv rotates held mail
-                // round-robin, so a retry is re-offered on a later pass
-                // behind everything else.
                 Ok(())
             }
             // Idempotent settlement: an id already consumed this session
-            // is a no-op for either disposition — a lost ack response or
+            // is a no-op for any disposition — a lost response or
             // repeated settlement must not fail the engine's drain.
             None if id.value() <= self.settled_below || self.outstanding.contains(&id) => Ok(()),
             None => Err(MailboxError::Transport("unknown delivery".into())),

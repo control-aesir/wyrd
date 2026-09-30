@@ -280,7 +280,9 @@ impl Mailbox for QueueMailbox {
             return Err(MailboxError::Transport("unknown delivery".into()));
         };
         match disposition {
-            Disposition::Ack => {
+            Disposition::Ack | Disposition::Poison => {
+                // The fake keeps no durable log, so poison and
+                // consumption settle identically: drop the slot.
                 self.queue.remove(pos);
             }
             Disposition::Retry => {

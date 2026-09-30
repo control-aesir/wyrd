@@ -9,11 +9,12 @@ use nostr::event::FinalizeEvent;
 use std::time::{Duration, Instant};
 
 /// Useless-but-valid flood stays bounded on disk: wraps that decrypt
-/// and deliver but carry no useful content are acked (the engine
-/// discards them), and today every ack appends a permanent dedupe
-/// line — an attacker can manufacture unique ones forever. The flood
-/// stays below broadcast-wrap volume (no drops, fast converge) but
-/// past twice the retention bound, so eviction and compaction must
+/// and deliver but carry no useful content are settled `Ack` here for
+/// the consumption path (the engine itself discards them as `Poison`
+/// now — see `tests_poison`), and every consumption ack appends a
+/// dedupe line — an attacker can manufacture unique ones forever. The
+/// flood stays below broadcast-wrap volume (no drops, fast converge)
+/// but past twice the retention bound, so eviction and compaction must
 /// engage. Sized to stay local-fast (~25s): below broadcast-wrap
 /// volume, so convergence needs no replayed history.
 #[test]

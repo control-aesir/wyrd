@@ -49,9 +49,10 @@ enum Outcome {
     Skipped,
     /// Terminal poison (unopenable outer seal, undecodable payload):
     /// the bytes can never become a message, so the drain settles
-    /// `Ack` without writing any fact. There is no message id to
-    /// record — the bytes never decoded — and nothing legitimate is
-    /// lost by consuming them.
+    /// `Poison` without writing any fact: the relay may discard the
+    /// envelope, and the mailbox records it memory-only. There is no
+    /// message id to record — the bytes never decoded — and nothing
+    /// legitimate is lost by consuming them.
     Discarded,
 }
 
@@ -94,7 +95,7 @@ pub(super) fn drain(
             }
             Outcome::Discarded => {
                 report.discarded += 1;
-                Disposition::Ack
+                Disposition::Poison
             }
         };
         mailbox.settle(delivery.id(), disposition)?;

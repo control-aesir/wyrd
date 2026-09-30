@@ -65,11 +65,16 @@ store lock, run under the operator's own hand, and stream one row
 per reachable file — on a very large drive, redirect the report to
 a file instead of budgeting it as a live operation. The policy
 commit batch is the second unbounded dimension there: one pin
-commits the whole subtree in a single file, with no cap. Deliberate
-— chunking the batch would trade per-operation atomicity for a
-bound, and a torn single file is discarded whole on reopen while a
-torn chunk sequence is not — so the batch stays whole and stays
-named here instead of bounded.
+commits the whole subtree in a single file, with no write-side cap
+(the 64 MiB `MAX_COMMIT_BYTES` ceiling is checked on load, not on
+commit, so an oversized batch would fail the whole store on reopen
+rather than refuse the batch — at ~38 bytes per record that takes
+on the order of two million identities in one subtree, far outside
+practice, but the direction of the failure is worth inheriting
+accurately). Deliberate — chunking the batch would trade
+per-operation atomicity for a bound, and a torn single file is
+discarded whole on reopen while a torn chunk sequence is not — so
+the batch stays whole and stays named here instead of bounded.
 
 ## Intake computational budgets
 

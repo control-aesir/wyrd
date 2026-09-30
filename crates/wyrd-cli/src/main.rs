@@ -1329,13 +1329,16 @@ fn cache_policy_render(census: &ResidencyCensus) -> String {
     out.push_str(&cache_quadrant_summary(census));
     // Totals silently skip conflicted subtrees, so name the gap:
     // without this the numbers read as complete on a drive where
-    // whole paths were never walked.
+    // whole paths were never walked. One row per path, like the
+    // status report, instead of one unbounded joined line.
     if !census.conflicts.is_empty() {
         out.push_str(&format!(
-            "conflicts: {} (skipped: {})\n",
-            census.conflicts.len(),
-            census.conflicts.join(", ")
+            "conflicts: {} skipped (never walked):\n",
+            census.conflicts.len()
         ));
+        for conflict in &census.conflicts {
+            out.push_str(&format!("  {conflict}\n"));
+        }
     }
     out.push_str("budgets (effective):\n");
     match budgets.retained_bytes_quota {

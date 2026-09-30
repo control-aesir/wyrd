@@ -1,6 +1,6 @@
 //! Control-plane intake and message classification for the runtime engine.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use wyrd_format::{DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use zeroize::Zeroizing;
@@ -19,9 +19,79 @@ use crate::transport::mailbox::{open_from_sender, Disposition, Mailbox, MailboxE
 
 const MAX_PENDING_MESSAGES: usize = super::engine::MAX_PENDING_MESSAGES;
 
+/// Max facts committed per drain pass, across all senders: past this
+/// many, committable envelopes shed relay-held for the next pass. The
+/// relay retains everything, so deferral is the same safe backpressure
+/// shape as the pending bound — paced, never dropped. Counts facts,
+/// not envelopes: the abuse being bounded is fact-log growth (disk and
+/// restart/replay cost), and one envelope can flush a parked batch on
+/// top of its own facts.
+const MAX_INTAKE_COMMITS_PER_PASS: usize = 1024;
+
+/// Max facts one sender's envelopes may commit per drain pass: past
+/// this many, that sender's further committable envelopes shed
+/// relay-held while other senders still admit, so one device cannot
+/// consume the whole pass budget. Keyed by the mailbox sender, which
+/// is authenticated transport metadata, not a message claim.
+const MAX_INTAKE_COMMITS_PER_SENDER_PER_PASS: usize = 256;
+
+/// The per-pass intake commit budget: committed facts total plus per
+/// mailbox-sender committed facts. Pass-local (created fresh per
+/// drain): a shed envelope's redelivery re-admits against the next
+/// pass's empty budget, so pacing converges without any carried
+/// state. Flushed parked entries charge the triggering sender — their
+/// own sender is not recorded on the pending entry, and the trigger
+/// is what chose to unblock them this pass.
+#[derive(Debug, Default)]
+struct IntakeBudget {
+    commits: usize,
+    per_sender: HashMap<DeviceId, usize>,
+}
+
+impl IntakeBudget {
+    /// Charge `facts` against the budget, or refuse when either
+    /// the pass budget or the sender quota would overflow. A zero
+    /// charge always admits (duplicate and suppression paths carry no
+    /// facts, and must never trip the bound).
+    fn admit(&mut self, sender: DeviceId, facts: usize) -> bool {
+        if !self.would_admit(sender, facts) {
+            return false;
+        }
+        self.commits += facts;
+        *self.per_sender.entry(sender).or_insert(0) += facts;
+        true
+    }
+
+    /// Whether `admit` would succeed, without charging: the
+    /// classification arms shed over-budget messages before spending
+    /// verification or mutating any view, so a shed leaves the log,
+    /// the projection, and the pending queue exactly as found.
+    fn would_admit(&self, sender: DeviceId, facts: usize) -> bool {
+        if self.commits + facts > MAX_INTAKE_COMMITS_PER_PASS {
+            return false;
+        }
+        self.per_sender.get(&sender).unwrap_or(&0) + facts <= MAX_INTAKE_COMMITS_PER_SENDER_PER_PASS
+    }
+}
+
 #[derive(Debug)]
 enum Action {
     Commit(Vec<Fact>),
+    /// Already recorded: a byte-identical announcement, or a
+    /// transition already in the observed set (the transition id
+    /// covers every byte, so same id means same document). Commits
+    /// nothing — a fresh seal over equivalent payload buys no new
+    /// durable fact — and acks, so the relay drops the envelope.
+    /// Restart-safe: redelivery re-derives the same verdict from
+    /// durable state.
+    Duplicate,
+    /// Over the pass commit budget or the sender quota: the envelope
+    /// sheds relay-held for the next pass, like the pending-overflow
+    /// shed. Unlike `Defer`, nothing parks in the pending queue —
+    /// redelivery revalidates from scratch against a fresh budget.
+    /// Decided before any verification or view mutation, so a shed
+    /// leaves the log, the projection, and the queue untouched.
+    Shed,
     /// Deterministic suppression verdict: the message is invalid and
     /// will never become processable. Commits nothing durable — the
     /// verdict is cached memory-only and bounded — so unique invalid
@@ -61,6 +131,7 @@ pub(super) fn drain(
     mailbox: &mut impl Mailbox,
 ) -> Result<DrainReport, EngineError> {
     let mut report = DrainReport::default();
+    let mut budget = IntakeBudget::default();
     // Each handover is offered once per pass: a re-offered id ends the
     // pass with the envelope still unacked, so a pass always terminates
     // even when every envelope is retried.
@@ -72,7 +143,7 @@ pub(super) fn drain(
         if !offered.insert(delivery.id()) {
             break;
         }
-        let disposition = match accept_envelope(engine, delivery.envelope())? {
+        let disposition = match accept_envelope(engine, delivery.envelope(), &mut budget)? {
             Outcome::Accepted => {
                 report.accepted += 1;
                 Disposition::Ack
@@ -106,6 +177,7 @@ pub(super) fn drain(
 fn accept_envelope(
     engine: &mut Engine,
     envelope: &MailboxEnvelope,
+    budget: &mut IntakeBudget,
 ) -> Result<Outcome, EngineError> {
     let bytes = match open_from_sender(&engine.identity_secret, engine.device, envelope) {
         // The outer seal opens with our always-held identity key or
@@ -129,7 +201,7 @@ fn accept_envelope(
     // rotation header's ephemeral bytes would otherwise land where the
     // control envelope keeps its kind tag).
     if bytes.first() == Some(&ROTATION_VERSION) {
-        let outcome = accept_rotation(engine, envelope, &bytes)?;
+        let outcome = accept_rotation(engine, envelope, &bytes, budget)?;
         tracing::debug!(kind = "rotation-delivery", outcome = ?outcome, "intake verdict");
         return Ok(outcome);
     }
@@ -150,33 +222,52 @@ fn accept_envelope(
         }
         Ok(IngestReport::Duplicate) => match sealed_id(&bytes) {
             Some(id) => match engine.take_pending(&id) {
-                Some(entry) => commit_action(engine, &id, &entry.message, false, Some(entry.wait)),
+                Some(entry) => commit_action(
+                    engine,
+                    envelope.sender,
+                    &id,
+                    &entry.message,
+                    false,
+                    Some(entry.wait),
+                    budget,
+                ),
                 None => Ok(Outcome::Duplicate),
             },
             None => Ok(Outcome::Duplicate),
         },
         Ok(IngestReport::Accepted { id, message }) => {
-            commit_action(engine, &id, &message, true, None)
+            commit_action(engine, envelope.sender, &id, &message, true, None, budget)
         }
     }
 }
 
 fn commit_action(
     engine: &mut Engine,
+    sender: DeviceId,
     id: &ControlMessageId,
     message: &Message,
     is_new: bool,
     held: Option<DeferredWait>,
+    budget: &mut IntakeBudget,
 ) -> Result<Outcome, EngineError> {
     // Announcements this pass would commit, validated against each other
     // as well as the hydrated projection: a transition landing may flush
     // several pending messages into one commit, and a fork must never
     // reach the fact log merely because two deferrals resolved together.
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
-    let action = message_action(engine, id, message, &mut staged);
+    let action = message_action(engine, id, message, &mut staged, sender, budget);
     tracing::debug!(kind = ?message.kind(), id = ?id, action = ?action, "intake verdict");
     let mut facts = match action {
         Ok(Action::Commit(facts)) => facts,
+        Ok(Action::Duplicate) => return Ok(Outcome::Duplicate),
+        Ok(Action::Shed) => {
+            // Shed before any view mutated: forget the ingest marking
+            // so redelivery ingests fresh, and leave the envelope to
+            // the relay. The per-pass budget is the only state the
+            // shed consulted, and it resets every pass.
+            engine.inbox.forget(id);
+            return Ok(Outcome::RelayHeld);
+        }
         Ok(Action::Suppress) => {
             engine.inbox.suppress(id);
             return Ok(Outcome::Accepted);
@@ -212,8 +303,23 @@ fn commit_action(
         }
     };
     if !is_new {
-        facts.clear();
-        staged.clear();
+        // A redelivered pending-taken message revalidates but never
+        // re-commits: its facts were either committed by the pass that
+        // took it or shed back to the relay, and either way this
+        // envelope carries nothing new.
+        return Ok(Outcome::Duplicate);
+    }
+    if facts.is_empty() {
+        return Ok(Outcome::Duplicate);
+    }
+    // Charge the envelope's own facts before the flush can mutate
+    // the pending queue: the classification already shed over-budget
+    // messages above (so this always admits — it is the charge, not
+    // the decision), and the flush paces its own batches below.
+    // Past this point the envelope commits.
+    if !budget.admit(sender, facts.len()) {
+        engine.inbox.forget(id);
+        return Ok(Outcome::RelayHeld);
     }
     if matches!(message, Message::MembershipTransition(_)) {
         // A newly committed transition flushes the volatile pending
@@ -221,16 +327,13 @@ fn commit_action(
         // epoch-sealed or carried by a rotation delivery. Entries held
         // on other unseen transitions stay parked without re-drive.
         let committed = committed_transition(message);
-        match flush_pending(engine, &mut staged, committed) {
+        match flush_pending(engine, &mut staged, committed, sender, budget) {
             Ok(more) => facts.extend(more),
             Err(error) => {
                 let _ = engine.resync();
                 return Err(error);
             }
         }
-    }
-    if facts.is_empty() {
-        return Ok(Outcome::Duplicate);
     }
     if let Err(error) = engine.commit_facts(&facts) {
         let _ = engine.resync();
@@ -280,10 +383,19 @@ fn committed_transition(message: &Message) -> Option<TransitionId> {
 /// observations and verdicts left behind go away with the caller's
 /// resync, which must run after the restore — resync rebuilds from
 /// durable facts and never touches the volatile queue.
+///
+/// The flush paces itself against the pass budget: an entry whose
+/// facts would overflow the budget (or the triggering sender's quota)
+/// is restored to its slot and the flush stops, leaving the rest
+/// parked for the next pass. Unvisited entries are never removed, so
+/// stopping early loses nothing — the relay still holds every parked
+/// envelope, and the next commit re-wakes them.
 fn flush_pending(
     engine: &mut Engine,
     staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
     committed: Option<TransitionId>,
+    sender: DeviceId,
+    budget: &mut IntakeBudget,
 ) -> Result<Vec<Fact>, EngineError> {
     // Snapshot the wake set up front: the index, not a full queue
     // walk. Later re-drives in this loop only reinsert, never remove
@@ -294,8 +406,25 @@ fn flush_pending(
         let Some(entry) = engine.pending.remove_seq(seq) else {
             continue;
         };
-        match message_action(engine, &entry.id, &entry.message, staged) {
-            Ok(Action::Commit(more)) => facts.extend(more),
+        match message_action(engine, &entry.id, &entry.message, staged, sender, budget) {
+            Ok(Action::Commit(more)) => {
+                if budget.admit(sender, more.len()) {
+                    facts.extend(more);
+                } else {
+                    engine.pending.restore(seq, entry);
+                    break;
+                }
+            }
+            Ok(Action::Duplicate) => {
+                // Already recorded: the entry is consumed, like a
+                // committed one, but contributes no facts.
+            }
+            Ok(Action::Shed) => {
+                // Over budget mid-flush: the entry returns to its
+                // slot and the rest stay parked for the next pass.
+                engine.pending.restore(seq, entry);
+                break;
+            }
             Ok(Action::Suppress) => {
                 engine.inbox.suppress(&entry.id);
             }
@@ -351,6 +480,8 @@ fn message_action(
     id: &ControlMessageId,
     message: &Message,
     staged: &mut BTreeMap<SnapshotId, SnapshotAnnouncement>,
+    sender: DeviceId,
+    budget: &mut IntakeBudget,
 ) -> Result<Action, EngineError> {
     match message {
         Message::MembershipTransition(payload) => {
@@ -361,8 +492,20 @@ fn message_action(
                 Ok(transition) => transition,
                 Err(_) => return Ok(Action::Suppress),
             };
+            // Already recorded: the transition id covers every byte,
+            // so an observed id means this exact document committed —
+            // a reseal under a fresh message id buys no new fact.
+            if engine.log.contains(&transition.transition_id()) {
+                return Ok(Action::Duplicate);
+            }
             if check_transition(&Limits::V0, &transition).is_err() {
                 return Ok(Action::Suppress);
+            }
+            // Shed before observing: an observation without a commit
+            // would validate later envelopes against uncommitted
+            // state for the rest of the pass.
+            if !budget.would_admit(sender, 2) {
+                return Ok(Action::Shed);
             }
             engine.log.observe(transition.clone());
             Ok(Action::Commit(vec![
@@ -386,6 +529,13 @@ fn message_action(
                 None => Ok(Action::Defer(DeferredWait::Unseen(announcement.membership))),
                 Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
                 Some(_) => {
+                    // Shed before spending verification: an
+                    // over-budget envelope revalidates against the
+                    // next pass's fresh budget instead of burning
+                    // curve work this pass.
+                    if !budget.would_admit(sender, 2) {
+                        return Ok(Action::Shed);
+                    }
                     // Authorship: an announcement is evidence only when
                     // the author's signature verifies against the
                     // drive-bound challenge. A bad signature is
@@ -423,30 +573,26 @@ fn message_action(
                             // hydrated projection, or an announcement staged
                             // earlier in this commit batch. Route updates
                             // (mutable `node_addr` only) commit a fresh fact;
-                            // the last accepted route wins. An immutable fork is
-                            // the sender's invalid data: the verdict is final
-                            // but memory-only, and no announcement fact is
-                            // written, so replay never meets a conflict intake
-                            // could have detected.
+                            // the last accepted route wins. A byte-identical
+                            // replay is already recorded and commits nothing.
+                            // An immutable fork is the sender's invalid data:
+                            // the verdict is final but memory-only, and no
+                            // announcement fact is written, so replay never
+                            // meets a conflict intake could have detected.
                             let known = engine
                                 .announcements
                                 .get(&announcement.snapshot)
                                 .or_else(|| staged.get(&announcement.snapshot));
-                            let committable = match known {
-                                None => true,
-                                Some(existing) => !matches!(
-                                    existing.check_update(announcement),
-                                    AnnouncementUpdate::Fork
-                                ),
-                            };
-                            if committable {
-                                staged.insert(announcement.snapshot, announcement.clone());
-                                Ok(Action::Commit(vec![
-                                    Fact::Announcement(announcement.clone()),
-                                    Fact::ControlMessage(*id),
-                                ]))
-                            } else {
-                                Ok(Action::Suppress)
+                            match known.map(|existing| existing.check_update(announcement)) {
+                                None | Some(AnnouncementUpdate::RouteUpdate) => {
+                                    staged.insert(announcement.snapshot, announcement.clone());
+                                    Ok(Action::Commit(vec![
+                                        Fact::Announcement(announcement.clone()),
+                                        Fact::ControlMessage(*id),
+                                    ]))
+                                }
+                                Some(AnnouncementUpdate::Same) => Ok(Action::Duplicate),
+                                Some(AnnouncementUpdate::Fork) => Ok(Action::Suppress),
                             }
                         }
                         Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
@@ -478,7 +624,7 @@ fn message_action(
         // becomes a commit or a deferral; until then no durable record
         // distinguishes consumed from never-recorded (see trust.md).
         Message::KeyRotation(_) => Ok(Action::Suppress),
-        Message::Capability(payload) => Ok(capability_action(engine, id, payload)),
+        Message::Capability(payload) => Ok(capability_action(engine, id, payload, sender, budget)),
     }
 }
 
@@ -486,6 +632,8 @@ fn capability_action(
     engine: &Engine,
     id: &ControlMessageId,
     payload: &CapabilityPayload,
+    sender: DeviceId,
+    budget: &mut IntakeBudget,
 ) -> Action {
     let capability = match WrappedCapability::from_bytes(payload.wrapped.clone())
         .unwrap(&engine.encryption_secret)
@@ -510,10 +658,18 @@ fn capability_action(
     // fact, so poison is never parked for retry.
     let transition_id = capability.transition;
     match AuthorizedCapability::authorize(capability, engine.drive(), &engine.log, &transition_id) {
-        Ok(authorized) => Action::Commit(vec![
-            Fact::Capability(authorized),
-            Fact::ControlMessage(*id),
-        ]),
+        Ok(authorized) => {
+            // Shed before committing: authorization is spent work, but
+            // the facts are not yet recorded and no view mutated, so
+            // the envelope can still shed cleanly.
+            if !budget.would_admit(sender, 2) {
+                return Action::Shed;
+            }
+            Action::Commit(vec![
+                Fact::Capability(authorized),
+                Fact::ControlMessage(*id),
+            ])
+        }
         // Unseen or gap-pending history may still arrive or resolve:
         // hold on the transition with the matching wake rule (exact
         // for unseen, every-commit for observed-but-blocked).
@@ -555,6 +711,7 @@ fn accept_rotation(
     engine: &mut Engine,
     envelope: &MailboxEnvelope,
     bytes: &[u8],
+    budget: &mut IntakeBudget,
 ) -> Result<Outcome, EngineError> {
     // No tip-based sender pre-check here, deliberately: a delivery
     // authored by a member of epoch N may arrive after the receiver
@@ -579,7 +736,7 @@ fn accept_rotation(
         // duplicate has nothing to re-drive.
         Ok(RotationIngest::Duplicate) => Ok(Outcome::Duplicate),
         Ok(RotationIngest::Accepted { id, delivery }) => {
-            rotation_commit(engine, &id, sender, &delivery)
+            rotation_commit(engine, &id, sender, &delivery, budget)
         }
     }
 }
@@ -599,6 +756,7 @@ fn rotation_commit(
     id: &ControlMessageId,
     sender: DeviceId,
     delivery: &RotationDelivery,
+    budget: &mut IntakeBudget,
 ) -> Result<Outcome, EngineError> {
     let suppress = |engine: &mut Engine, reason: &'static str| {
         // Suppressions ack without a fact, so the reason is the only
@@ -736,6 +894,20 @@ fn rotation_commit(
         // announcement arm fails loudly on, not sender data.
         None => return Err(EngineError::TransitionUnclassified(transition_id)),
     }
+    // The commit budget gates before the live log observes: an
+    // observation without a commit would validate later envelopes
+    // against uncommitted state for the rest of the pass. The charge
+    // is exact — a rotation delivery always commits these three facts
+    // — and the flush paces its own batches below. No
+    // semantic-duplicate check here: the carried transition may
+    // already be committed via the control framing while its
+    // capability is still unrecorded, and dropping the delivery would
+    // stall the device on a missing epoch secret — the budget paces
+    // rotation redelivery instead.
+    if !budget.admit(sender, 3) {
+        engine.inbox.forget(id);
+        return Ok(Outcome::RelayHeld);
+    }
     engine.log.observe(transition.clone());
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
     let mut facts = vec![
@@ -743,7 +915,7 @@ fn rotation_commit(
         Fact::Capability(authorized),
         Fact::ControlMessage(*id),
     ];
-    match flush_pending(engine, &mut staged, Some(transition_id)) {
+    match flush_pending(engine, &mut staged, Some(transition_id), sender, budget) {
         Ok(more) => facts.extend(more),
         Err(error) => {
             let _ = engine.resync();

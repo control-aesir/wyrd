@@ -274,7 +274,9 @@ pub struct DrainReport {
     pub accepted: usize,
     /// Redeliveries of already-committed messages.
     pub duplicates: usize,
-    /// Messages held for a future transition.
+    /// Messages held for a future transition, plus envelopes shed past
+    /// the intake commit budget or sender quota (relay-held for the
+    /// next pass).
     pub deferred: usize,
     /// Envelopes not yet processable (unknown epoch key); left unacked
     /// for redelivery.

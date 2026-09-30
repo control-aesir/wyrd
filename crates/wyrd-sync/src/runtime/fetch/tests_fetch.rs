@@ -1873,8 +1873,8 @@ fn cooled_fetch_recovers_after_cooldown_without_restart() {
     assert!(cooled, "transport failures cooled the representation");
     // The re-announcement: identical immutable core under a fresh
     // seal (fresh message id, as a remounting owner produces). Intake
-    // accepts it without disturbing the pending fetch — the duplicate
-    // announcement fact is a no-op at record time.
+    // acks it as a byte-identical duplicate without appending another
+    // fact or disturbing the pending fetch.
     let reannounce = announcement_msg_with(
         &identity_secret(&builder.sk),
         body.snapshot_id(),
@@ -1886,11 +1886,9 @@ fn cooled_fetch_recovers_after_cooldown_without_restart() {
     );
     let envelope = deliver(&fixture, admission.epoch, &reannounce);
     queue(&mut fixture, vec![envelope]);
-    assert_eq!(
-        drain(&mut fixture).accepted,
-        1,
-        "the re-announcement lands without fork or poison"
-    );
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 0, "the re-announcement duplicates");
+    assert_eq!(report.duplicates, 1, "already recorded, no fork or poison");
     // The provider returns: the same bytes servable again. Attempts
     // resume past the cooldown and the fetch fulfills — no restart.
     let mut landed = false;

@@ -216,12 +216,14 @@ fn rotation_converges_without_the_epoch_key_in_one_drain() {
     assert_eq!(facts.transitions.len(), 3);
 
     // The epoch-sealed transition, retained from before the keys
-    // landed, now opens — committing redundantly, which the set-based
-    // machines absorb.
+    // landed, now opens — but its document already committed via the
+    // rotation delivery, so it acks as a duplicate instead of
+    // committing redundantly.
     let mail = vec![deliver(&fixture, 3, &transition_message(&c.admission))];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
-    assert_eq!(report.accepted, 1);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.duplicates, 1);
     assert_eq!(fixture.engine.log.known_state().map(|s| s.epoch), Some(3));
 
     // Redelivery of the rotation itself is dedupe, not state.

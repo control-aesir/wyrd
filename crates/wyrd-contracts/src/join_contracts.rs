@@ -252,7 +252,11 @@ fn invited_device_converges_on_reversed_catch_up() {
 
     let mut relay = newcomer_relay(reversed);
     let report = joined.drain(&mut relay).unwrap();
-    assert_eq!(report.accepted, 2);
+    assert_eq!(
+        report.accepted, 1,
+        "rotation commits; the transition duplicates"
+    );
+    assert_eq!(report.duplicates, 1, "already recorded via rotation");
     assert_eq!(report.skipped, 0);
     assert_eq!(report.deferred, 0);
     assert_eq!(joined.pending_count(), 0, "nothing held");
@@ -283,7 +287,7 @@ fn invited_device_converges_on_duplicated_catch_up() {
 /// A missing transition does not block the rotation: the delivery
 /// carries the transition it needs, so the grant commits while the
 /// epoch-sealed transition is still in flight — and the late
-/// transition commits redundantly, which the set-based machines
+/// transition acks as a duplicate, which the set-based machines
 /// absorb.
 #[test]
 fn invited_device_converges_after_gap_then_redelivery() {
@@ -301,10 +305,12 @@ fn invited_device_converges_after_gap_then_redelivery() {
     assert_eq!(report.skipped, 0);
     assert_eq!(joined.pending_count(), 0, "nothing held");
 
-    // The transition lands later: redundant commit, nothing lost.
+    // The transition lands later: already recorded via the
+    // rotation, so it duplicates — nothing lost.
     let mut relay = newcomer_relay(vec![envelopes[0].clone()]);
     let report = joined.drain(&mut relay).unwrap();
-    assert_eq!(report.accepted, 1);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.duplicates, 1);
     assert_eq!(report.skipped, 0);
     assert_eq!(joined.pending_count(), 0, "gap healed");
 }
@@ -374,9 +380,12 @@ fn offline_device_catch_up_accumulates_contiguously() {
     assert_eq!(report.skipped, 1, "pre-key offer retained, not lost");
     assert_eq!(joined.pending_count(), 0, "nothing held");
     // The retained transition opens under the rotation-installed key:
-    // opening it is the public proof the epoch-3 secret landed.
+    // opening it is the public proof the epoch-3 secret landed — but
+    // its document already committed via the rotation, so it
+    // duplicates instead of committing redundantly.
     let report = joined.drain(&mut relay).unwrap();
-    assert_eq!(report.accepted, 1);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.duplicates, 1);
     assert_eq!(report.skipped, 0);
     assert_eq!(joined.pending_count(), 0, "nothing held");
     // Settled: the third drain goes quiet.
@@ -458,9 +467,11 @@ fn two_newcomers_converge_from_one_delivery_pass() {
     );
     assert_eq!(report_b.skipped, 1, "pre-key offer retained, not lost");
     // The retained epoch-3 transition opens under the
-    // rotation-installed key; then the drain goes quiet.
+    // rotation-installed key — but its document already committed
+    // via the rotation, so it duplicates; then the drain goes quiet.
     let report_b = joined_b.drain(&mut relay_b).unwrap();
-    assert_eq!(report_b.accepted, 1);
+    assert_eq!(report_b.accepted, 0);
+    assert_eq!(report_b.duplicates, 1);
     assert_eq!(report_b.skipped, 0);
     let report_b = joined_b.drain(&mut relay_b).unwrap();
     assert_eq!(report_b.accepted, 0);

@@ -1528,19 +1528,36 @@ fn deferred_messages_survive_queue_pressure() {
         "the bound holds the rest"
     );
 
-    // The transition lands: the held messages commit with it. The
-    // relay-held overflow was offered first in arrival order, so it
-    // sheds once more and waits for the next pass.
+    // The transition lands: the held messages start committing with
+    // it — paced by the per-pass commit budget, since every envelope
+    // shares the rig's single sender quota. The relay-held overflow
+    // was offered first in arrival order, so it sheds once more and
+    // waits for the next pass.
     rig.enqueue_transition(&child, 1);
     let report = rig.drain();
     assert_eq!(report.accepted, 1, "the child transition");
-    assert_eq!(rig.engine_pending(), 0, "the held messages committed");
+    assert!(
+        rig.engine_pending() < PENDING_BOUND,
+        "the flush paces forward under the budget"
+    );
 
-    // Next pass the overflow re-offers against resolved state and
-    // commits instead of staying lost.
-    let report = rig.drain();
-    assert_eq!(report.accepted, 1, "the shed envelope");
-    assert_eq!(rig.engine_pending(), 0);
+    // Pacing converges: bounded passes commit the parked remainder,
+    // and the shed overflow re-offers against resolved state instead
+    // of staying lost.
+    for _ in 0..32 {
+        let report = rig.drain();
+        if rig.engine_pending() == 0
+            && report.accepted == 0
+            && report.deferred == 0
+            && report.skipped == 0
+            && report.duplicates == 0
+            && report.discarded == 0
+        {
+            break;
+        }
+    }
+    assert_eq!(rig.engine_pending(), 0, "pacing converges");
+
     let runtime = rig.runtime_state();
     assert!(
         runtime.announcement(&id_for(1)).is_some(),

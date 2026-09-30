@@ -252,8 +252,13 @@ fn reader_converges_across_a_later_rotation() {
     let settled = joined.drain(&mut receiver).unwrap();
     assert_eq!(
         report.accepted + settled.accepted,
-        2,
-        "transition plus capability both land"
+        1,
+        "transition lands once; its second framing duplicates"
+    );
+    assert_eq!(
+        report.duplicates + settled.duplicates,
+        1,
+        "the rotation-committed document is already recorded"
     );
     assert_eq!(settled.skipped, 0, "the settling drain goes quiet");
     let state = joined.log.known_state().expect("canonical tip");

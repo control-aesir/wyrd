@@ -13,7 +13,8 @@ use wyrd_format::{DeviceId, DriveId};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::codec::{
-    decode_commit_file, encode_commit, encode_fact, MAX_COMMIT_BYTES, STORE_KEY_AAD,
+    decode_commit_file, encode_commit, encode_fact, MAX_COMMIT_BYTES, MAX_RECORDS_PER_COMMIT,
+    STORE_KEY_AAD,
 };
 use super::replay::{self, LoadedFacts, Rebuilt};
 use super::{DurableError, Fact};
@@ -260,6 +261,17 @@ impl DurableStore {
     ) -> Result<u64, DurableError> {
         if facts.is_empty() {
             return Ok(self.current);
+        }
+        // Refuse before writing what load would reject: the record
+        // ceiling is load-checked, so a batch over it would advance
+        // CURRENT and then fail every reopen with CorruptCommit —
+        // wedging the drive instead of the batch. The policy commit
+        // batch is the first caller whose fact count is a function
+        // of an operator-named path rather than a live budget, which
+        // is why the check lives here for every committer instead
+        // of at one call site.
+        if facts.len() > MAX_RECORDS_PER_COMMIT {
+            return Err(DurableError::TooManyRecords { count: facts.len() });
         }
         // Refresh against disk: a crashed predecessor may have advanced
         // CURRENT further than this handle saw.

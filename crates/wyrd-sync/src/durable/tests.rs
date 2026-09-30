@@ -1505,3 +1505,30 @@ fn sealed_rotation_bytes(
     sealed.version = version;
     sealed.encode()
 }
+
+/// An overlarge batch is refused before writing, not on the next
+/// reopen: the record ceiling binds on load, so advancing CURRENT
+/// onto an unreadable commit would wedge the drive instead of the
+/// batch. The refusal advances nothing and the store stays healthy.
+#[test]
+fn commit_rejects_overlarge_batches_before_writing() {
+    use super::codec::MAX_RECORDS_PER_COMMIT;
+    let dir = TestDir::new("commit-record-ceiling");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let facts: Vec<Fact> = (0u32..=MAX_RECORDS_PER_COMMIT as u32)
+        .map(|n| {
+            let mut bytes = [0xC4; 32];
+            bytes[0..4].copy_from_slice(&n.to_le_bytes());
+            Fact::Materialization(ContentId::from_bytes(bytes), MaterializationState::Pinned)
+        })
+        .collect();
+    assert_eq!(facts.len(), MAX_RECORDS_PER_COMMIT + 1);
+    assert!(matches!(
+        store.commit(&facts),
+        Err(DurableError::TooManyRecords { .. })
+    ));
+    assert_eq!(store.current(), 0, "the rejected batch advances nothing");
+    // The store stays healthy: a capped batch commits as sequence 1.
+    store.commit(&facts[..MAX_RECORDS_PER_COMMIT]).unwrap();
+    assert_eq!(store.current(), 1);
+}

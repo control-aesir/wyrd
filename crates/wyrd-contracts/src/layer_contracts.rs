@@ -417,16 +417,40 @@ fn nostr_holding_subsystems(files: &[(&str, &str)]) -> BTreeSet<String> {
 /// `nostr*` use inside `wyrd-core` must stay within a single top-level
 /// `src/` subsystem directory (the mailbox decision: control-plane
 /// framing lives with sync control, never ambient across the node).
+/// The walk fails closed: unreadable directories and files are
+/// violations naming the path (never silent skips), and a walk that
+/// examines no `.rs` files at all fails too — an empty file set
+/// proves nothing, so "no `nostr*` references" and "nothing examined"
+/// are different verdicts.
 fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
     let mut files: Vec<(String, String)> = Vec::new();
-    fn walk(dir: &Path, src: &Path, files: &mut Vec<(String, String)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
+    let mut errors: Vec<String> = Vec::new();
+    let mut examined = 0usize;
+    fn walk(
+        dir: &Path,
+        src: &Path,
+        files: &mut Vec<(String, String)>,
+        errors: &mut Vec<String>,
+        examined: &mut usize,
+    ) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                errors.push(format!("cannot read directory `{}`: {err}", dir.display()));
+                return;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    errors.push(format!("cannot list entry in `{}`: {err}", dir.display()));
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.is_dir() {
-                walk(&path, src, files);
+                walk(&path, src, files, errors, examined);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let rel = path
                     .strip_prefix(src)
@@ -435,13 +459,30 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
                     .into_owned();
                 // Prefix with `src/` so the subsystem is always at
                 // component index 1, matching the test convention.
-                let text = fs::read_to_string(&path).unwrap_or_default();
-                files.push((format!("src/{rel}"), text));
+                match fs::read_to_string(&path) {
+                    Ok(text) => {
+                        *examined += 1;
+                        files.push((format!("src/{rel}"), text));
+                    }
+                    Err(err) => {
+                        errors.push(format!("cannot read file `{}`: {err}", path.display()));
+                    }
+                }
             }
         }
     }
     let src = core_dir.join("src");
-    walk(&src, &src, &mut files);
+    walk(&src, &src, &mut files, &mut errors, &mut examined);
+    if !errors.is_empty() {
+        return errors;
+    }
+    if examined == 0 {
+        return vec![format!(
+            "`nostr*` scope check examined no `.rs` files under `{}`: \
+             an empty walk proves nothing, failing closed",
+            src.display()
+        )];
+    }
     let refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(p, t)| (p.as_str(), t.as_str()))
@@ -562,6 +603,21 @@ fn crate_dependencies_follow_the_layered_dag() {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Scratch `wyrd-core`-shaped root (`<root>/src/`) under the temp
+    /// dir. The caller owns cleanup; tests remove the tree before
+    /// asserting so a failure never leaks a permission-stripped dir.
+    fn scratch_core_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "wyrd-nostr-scope-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).expect("scratch src dir is creatable");
+        root
+    }
 
     fn empty_ws() -> toml::Table {
         toml::Table::new()
@@ -801,6 +857,87 @@ mod policy_tests {
         assert_eq!(
             nostr_holding_subsystems(&files),
             BTreeSet::from(["mailbox".to_owned()])
+        );
+    }
+
+    #[test]
+    fn nostr_scope_fails_when_source_tree_is_missing() {
+        let missing =
+            std::env::temp_dir().join(format!("wyrd-nostr-scope-missing-{}", std::process::id()));
+        // A crashed earlier run must not leave the tree behind and
+        // flip this to the empty-dir case.
+        let _ = fs::remove_dir_all(&missing);
+        let violations = check_core_nostr_scope(&missing);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains(&*missing.join("src").to_string_lossy()),
+            "failure must name the unreadable tree: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn nostr_scope_fails_when_no_files_are_examined() {
+        let root = scratch_core_dir();
+        let violations = check_core_nostr_scope(&root);
+        fs::remove_dir_all(&root).expect("scratch cleanup");
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("no `.rs` files"),
+            "an empty walk must fail closed: {violations:?}"
+        );
+    }
+
+    /// Permission-stripping tests no-op (pass silently) for elevated
+    /// runners: root reads through `0o000`, so the guard restores the
+    /// tree and returns instead of asserting a failure that cannot
+    /// happen there.
+    #[cfg(unix)]
+    #[test]
+    fn nostr_scope_surfaces_an_unreadable_nested_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_core_dir();
+        let mailbox = root.join("src").join("mailbox");
+        fs::create_dir_all(&mailbox).expect("scratch mailbox dir");
+        fs::write(mailbox.join("mod.rs"), "use nostr_sdk::prelude::Client;").expect("scratch file");
+        let opaque = root.join("src").join("opaque");
+        fs::create_dir_all(&opaque).expect("scratch opaque dir");
+        fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).expect("strip permissions");
+        if fs::read_dir(&opaque).is_ok() {
+            fs::set_permissions(&opaque, fs::Permissions::from_mode(0o755)).expect("restore");
+            fs::remove_dir_all(&root).expect("scratch cleanup");
+            return;
+        }
+        let violations = check_core_nostr_scope(&root);
+        fs::set_permissions(&opaque, fs::Permissions::from_mode(0o755)).expect("restore");
+        fs::remove_dir_all(&root).expect("scratch cleanup");
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("opaque"),
+            "nested read failure must surface: {violations:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nostr_scope_surfaces_an_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_core_dir();
+        let file = root.join("src").join("mailbox").join("mod.rs");
+        fs::create_dir_all(file.parent().expect("file has a parent")).expect("scratch dirs");
+        fs::write(&file, "use nostr_sdk::prelude::Client;").expect("scratch file");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("strip permissions");
+        if fs::read_to_string(&file).is_ok() {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("restore");
+            fs::remove_dir_all(&root).expect("scratch cleanup");
+            return;
+        }
+        let violations = check_core_nostr_scope(&root);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("restore");
+        fs::remove_dir_all(&root).expect("scratch cleanup");
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("mod.rs"),
+            "unreadable file must surface: {violations:?}"
         );
     }
 }

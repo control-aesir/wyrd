@@ -51,10 +51,13 @@ pub enum RetentionPolicy {
     RemoteOnly,
 }
 
-/// Whether the verified bytes are in the local store right now.
-/// Orthogonal to policy: eviction changes intent, never deletes
-/// bytes, so `REMOTE_ONLY` + `PRESENT` is an ordinary state, not a
-/// contradiction.
+/// Whether the durable log records the bytes as local. Orthogonal
+/// to policy: eviction changes intent, never deletes bytes, so
+/// `REMOTE_ONLY` + `PRESENT` is an ordinary state, not a
+/// contradiction. Recorded, not probed: bytes that landed in a torn
+/// batch the log ignored report `ABSENT` until refetch records them
+/// (see `docs/crash-consistency.md`), even while physically present
+/// and readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPresence {
     /// Verified bytes are local and readable.
@@ -116,7 +119,9 @@ pub enum PolicyError {
 pub struct SubtreeContent {
     /// Every distinct chunk identity under the path.
     pub chunks: Vec<ContentId>,
-    /// Files walked (including version-addressed ones).
+    /// Files walked. A version-addressed root (`path@N`) arrives
+    /// here as an ordinary file; `readdir` never lists versioned
+    /// names, so deeper versioned entries cannot appear mid-walk.
     pub files: u64,
     /// Directories walked.
     pub dirs: u64,
@@ -195,6 +200,11 @@ pub struct FileResidency {
     pub path: String,
     /// Chunk identities backing the file.
     pub chunks: Vec<ContentId>,
+    /// The subset of `chunks` carrying a `Pinned` promise. Policy is
+    /// per identity, so a shared chunk appears here for every file
+    /// that references it — file-level `policy` still requires the
+    /// whole set (see below).
+    pub pinned_chunks: Vec<ContentId>,
     /// What this device intends to retain.
     pub policy: RetentionPolicy,
     /// What bytes happen to exist locally. A file is `Present`
@@ -212,6 +222,11 @@ pub struct FileResidency {
 #[derive(Debug, Default)]
 pub struct ResidencyCensus {
     pub files: Vec<FileResidency>,
+    /// Conflicted paths met during the walk: recorded, never
+    /// traversed. One conflict costs a row, not the report — the
+    /// mutating commands still refuse these paths outright, but a
+    /// read-only report must survive the ordinary multi-head state.
+    pub conflicts: Vec<String>,
     pub dirs: u64,
     pub symlinks_skipped: u64,
 }
@@ -222,6 +237,18 @@ impl ResidencyCensus {
         self.files
             .iter()
             .filter(|file| file.policy == RetentionPolicy::Pinned)
+    }
+
+    /// Every distinct pinned identity reachable under the walk root,
+    /// deduplicated across files that share chunks. This is the
+    /// per-identity number — "what the device has promised" — as
+    /// opposed to per-file counts, which over- or under-count
+    /// shared chunks by construction.
+    pub fn pinned_chunk_union(&self) -> BTreeSet<ContentId> {
+        self.files
+            .iter()
+            .flat_map(|file| file.pinned_chunks.iter().copied())
+            .collect()
     }
 
     /// Count files per (policy, presence) quadrant.
@@ -255,27 +282,32 @@ pub fn residency_census<V: NamespaceView>(
         }
         match node {
             Node::File { chunks, .. } => {
-                let mut policy = RetentionPolicy::Pinned;
+                let mut pinned_chunks = Vec::new();
                 let mut local = LocalPresence::Present;
                 for id in &chunks {
                     let (file_policy, file_local) =
                         classify(runtime.materialization(id), runtime.is_local(id));
-                    if file_policy == RetentionPolicy::RemoteOnly {
-                        // The file reads only when every chunk is
-                        // promised: one unpinned chunk breaks the
-                        // retention guarantee for the whole file, even
-                        // when a shared chunk is pinned through
-                        // another path. An empty file (no chunks) is
-                        // vacuously fully retained.
-                        policy = RetentionPolicy::RemoteOnly;
+                    if file_policy == RetentionPolicy::Pinned {
+                        pinned_chunks.push(*id);
                     }
                     if file_local == LocalPresence::Absent {
                         local = LocalPresence::Absent;
                     }
                 }
+                // The file reads with a promise only when every chunk
+                // is promised: one unpinned chunk breaks the retention
+                // guarantee for the whole file, even when a shared
+                // chunk is pinned through another path. An empty file
+                // (no chunks) is vacuously fully retained.
+                let policy = if pinned_chunks.len() == chunks.len() {
+                    RetentionPolicy::Pinned
+                } else {
+                    RetentionPolicy::RemoteOnly
+                };
                 census.files.push(FileResidency {
                     path: at,
                     chunks,
+                    pinned_chunks,
                     policy,
                     local,
                 });
@@ -298,11 +330,12 @@ pub fn residency_census<V: NamespaceView>(
             Node::Symlink { .. } => {
                 census.symlinks_skipped += 1;
             }
-            Node::Conflict { versions } => {
-                return Err(PolicyError::Conflict {
-                    path: at,
-                    versions: versions.len(),
-                });
+            Node::Conflict { .. } => {
+                // Recorded, not traversed: the report survives the
+                // conflict, and the path is named so the operator
+                // knows exactly what was skipped. Mutating commands
+                // still refuse these paths outright.
+                census.conflicts.push(at);
             }
         }
     }
@@ -342,16 +375,17 @@ pub fn pin_subtree<V: NamespaceView>(
 ) -> Result<PinReport, PolicyError> {
     let content = collect_subtree_content(view, path)?;
     let runtime = engine.runtime_state()?;
-    let mut pinned = 0u64;
-    let mut already_pinned = 0u64;
-    for id in &content.chunks {
-        if runtime.materialization(id) == MaterializationState::Pinned {
-            already_pinned += 1;
-        } else {
-            engine.set_materialization(*id, MaterializationState::Pinned)?;
-            pinned += 1;
-        }
-    }
+    // One durable commit for the whole subtree: a crash or failure
+    // leaves the previous state or the full new state, never a
+    // partial pin the census would report as unpromised files.
+    let changes: Vec<(ContentId, MaterializationState)> = content
+        .chunks
+        .iter()
+        .filter(|id| runtime.materialization(id) != MaterializationState::Pinned)
+        .map(|id| (*id, MaterializationState::Pinned))
+        .collect();
+    let already_pinned = content.chunks.len() as u64 - changes.len() as u64;
+    let pinned = engine.set_materializations(&changes)? as u64;
     Ok(PinReport {
         files: content.files,
         dirs: content.dirs,
@@ -388,16 +422,14 @@ pub fn unpin_subtree<V: NamespaceView>(
 ) -> Result<UnpinReport, PolicyError> {
     let content = collect_subtree_content(view, path)?;
     let runtime = engine.runtime_state()?;
-    let mut released = 0u64;
-    let mut already_unpinned = 0u64;
-    for id in &content.chunks {
-        if runtime.materialization(id) == MaterializationState::Pinned {
-            engine.set_materialization(*id, MaterializationState::Cached)?;
-            released += 1;
-        } else {
-            already_unpinned += 1;
-        }
-    }
+    let changes: Vec<(ContentId, MaterializationState)> = content
+        .chunks
+        .iter()
+        .filter(|id| runtime.materialization(id) == MaterializationState::Pinned)
+        .map(|id| (*id, MaterializationState::Cached))
+        .collect();
+    let already_unpinned = content.chunks.len() as u64 - changes.len() as u64;
+    let released = engine.set_materializations(&changes)? as u64;
     Ok(UnpinReport {
         files: content.files,
         dirs: content.dirs,
@@ -450,16 +482,14 @@ pub fn evict_subtree<V: NamespaceView>(
             pinned,
         });
     }
-    let mut released = 0u64;
-    let mut already_remote = 0u64;
-    for id in &content.chunks {
-        if runtime.materialization(id) == MaterializationState::RemoteOnly {
-            already_remote += 1;
-        } else {
-            engine.set_materialization(*id, MaterializationState::RemoteOnly)?;
-            released += 1;
-        }
-    }
+    let changes: Vec<(ContentId, MaterializationState)> = content
+        .chunks
+        .iter()
+        .filter(|id| runtime.materialization(id) != MaterializationState::RemoteOnly)
+        .map(|id| (*id, MaterializationState::RemoteOnly))
+        .collect();
+    let already_remote = content.chunks.len() as u64 - changes.len() as u64;
+    let released = engine.set_materializations(&changes)? as u64;
     Ok(EvictReport {
         files: content.files,
         dirs: content.dirs,
@@ -838,10 +868,11 @@ mod tests {
         let (mut engine, dir) = scratch_engine();
         let view = tree_view();
         pin_subtree(&mut engine, &view, "docs/a.txt").unwrap();
-        // Scoped to docs: the root holds the conflicted probe path,
-        // which refuses the whole walk by contract.
-        let census = residency_census(&engine, &view, "docs").unwrap();
+        // Walked from the root: the conflicted probe path costs a
+        // row, not the report.
+        let census = residency_census(&engine, &view, "").unwrap();
         assert_eq!(census.files.len(), 2);
+        assert_eq!(census.conflicts, vec!["split".to_string()]);
         // a.txt is fully pinned; b.txt shares one pinned chunk but
         // its other chunk is unpinned, so the file as a readable
         // unit carries no retention promise.
@@ -849,7 +880,10 @@ mod tests {
         let remote = census.quadrant(RetentionPolicy::RemoteOnly, LocalPresence::Absent);
         assert_eq!(pinned, 1);
         assert_eq!(remote, 1);
-        assert_eq!(census.symlinks_skipped, 0);
+        // Per-identity union: a.txt's two chunks, deduplicated —
+        // the shared chunk counts once even though b.txt names it.
+        assert_eq!(census.pinned_chunk_union().len(), 2);
+        assert_eq!(census.symlinks_skipped, 1);
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
     }

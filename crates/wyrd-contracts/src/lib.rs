@@ -188,6 +188,12 @@
 //!     boundary (memory and disk) and kind separation from the
 //!     derivation context, identity-domain forking in the
 //!     `wyrd-format` golden vectors.
+//!
+//! The policy contracts (`docs/architecture.md`, invariant 7):
+//!
+//! 43. `policy_commits_change_no_replicated_state` — pin, unpin, and
+//!     evict leave the head set byte-identical and the durable
+//!     outbox empty: policy facts never enter replicated state.
 
 #[cfg(test)]
 mod egress_contracts;
@@ -199,6 +205,8 @@ mod join_contracts;
 mod layer_contracts;
 #[cfg(test)]
 mod node_contracts;
+#[cfg(test)]
+mod policy_contracts;
 #[cfg(test)]
 mod removal_contracts;
 #[cfg(test)]

@@ -125,7 +125,11 @@ Peer role and materialization are independent parameters:
 A desktop is `mirror + full`; a laptop `mirror + partial`; a phone
 `on-demand` with a pinned subset; a NAS `vault + full`. Pin/evict decisions
 are local device policy — they change what the device holds, never what the
-drive contains.
+drive contains. The CLI surface for this is `wyrd pin` / `unpin` / `evict`
+plus `wyrd cache status|policy` (`docs/cli.md`): policy facts stay in the
+device's durable log and are never published. The CLI reports two policy
+values, not three — fetched-by-access `CACHED` carries no retention promise
+and collapses into `REMOTE_ONLY`; only an explicit pin promises retention.
 
 ## Encryption and keys
 

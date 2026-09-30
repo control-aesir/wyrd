@@ -352,7 +352,9 @@ retention promise and reports as `REMOTE_ONLY` policy.
   chunk shared with files outside the subtree carries the promise
   there too.
 - `unpin <path>`: release the promise (pinned returns to cacheable
-  policy). Never deletes bytes, never refuses.
+  policy). Never deletes bytes, never refuses. Promises are per
+  content identity, not per path: unpinning a subtree releases
+  shared chunks other pinned paths also relied on.
 - `evict <path>`: return unpinned content to `REMOTE_ONLY` policy.
   Refuses the whole subtree while any of it is pinned (unpin
   first) — a partial evict would let overlapping paths silently
@@ -365,10 +367,18 @@ retention promise and reports as `REMOTE_ONLY` policy.
   effective retention and fetch budgets. Facts are per identity,
   not per path, so pinned paths are not listed.
 
-Conflicted paths refuse every policy command: resolve first, or
-address one version through the existing `path@N` grammar. One
+Conflicted paths refuse every mutating policy command: resolve
+first, or address one version through the existing `path@N`
+grammar. `cache status` instead renders them as `CONFLICT` rows —
+a read-only report survives the ordinary multi-head state. One
 invocation walks one generation — heads install once up front, so
-a concurrent local write cannot mix generations into it.
+a concurrent local write cannot mix generations into it. Policy
+commands need the drive un-mounted regardless: the durable store
+takes an exclusive lock, so a policy command against a mounted
+drive fails closed with the lock error. And pinning promises
+retention without fetching: a pinned-but-never-fetched subtree
+still fails closed offline (export names the unheld bytes) until
+a sync or mount lands the bytes.
 
 ## Credential files
 

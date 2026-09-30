@@ -104,14 +104,6 @@ where
         &self.engine
     }
 
-    /// The durable engine, mutably, for the same offline
-    /// administration. Committing policy facts here does not touch
-    /// heads — heads advance only through `refresh_live_heads` — so a
-    /// pin/evict command observes and leaves the same head set.
-    pub fn engine_mut(&mut self) -> &mut Engine {
-        &mut self.engine
-    }
-
     /// The engine and the read view together, as disjoint borrows.
     /// Policy operations resolve paths through the view and commit
     /// through the engine in one call; without the split the two

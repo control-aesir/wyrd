@@ -128,9 +128,11 @@ fn policy_renderers_name_counts_and_quadrants() {
         files: vec![wyrd_core::policy::FileResidency {
             path: "a.txt".into(),
             chunks: Vec::new(),
+            pinned_chunks: Vec::new(),
             policy: RetentionPolicy::Pinned,
             local: LocalPresence::Present,
         }],
+        conflicts: vec!["split".into()],
         dirs: 0,
         symlinks_skipped: 0,
     };
@@ -138,6 +140,8 @@ fn policy_renderers_name_counts_and_quadrants() {
     assert!(rendered.contains("PINNED"));
     assert!(rendered.contains("PRESENT"));
     assert!(rendered.contains("a.txt"));
+    assert!(rendered.contains("CONFLICT"));
+    assert!(rendered.contains("split"));
     let rendered = cache_policy_render(&census);
     assert!(rendered.contains("pinned files: 1"));
     assert!(rendered.contains("retained_bytes_quota: unlimited"));

@@ -179,7 +179,9 @@ enum Command {
     },
     /// Release retention promises under `path`: pinned content
     /// returns to cacheable policy. Never deletes bytes, never
-    /// touches heads. Offline by construction.
+    /// touches heads. Promises are per content identity, so
+    /// unpinning a subtree also releases shared chunks other paths
+    /// relied on. Offline by construction.
     Unpin {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -1283,6 +1285,9 @@ fn cache_status_render(path: &str, census: &ResidencyCensus) -> String {
             file.path
         ));
     }
+    for conflict in &census.conflicts {
+        out.push_str(&format!("{:<12} {:<8} {}\n", "CONFLICT", "-", conflict));
+    }
     out.push_str(&cache_quadrant_summary(census));
     if census.symlinks_skipped > 0 {
         out.push_str(&format!(
@@ -1314,7 +1319,9 @@ fn cache_quadrant_summary(census: &ResidencyCensus) -> String {
 fn cache_policy_render(census: &ResidencyCensus) -> String {
     let pinned_files = census.quadrant(RetentionPolicy::Pinned, LocalPresence::Present)
         + census.quadrant(RetentionPolicy::Pinned, LocalPresence::Absent);
-    let pinned_chunks: usize = census.pinned().map(|file| file.chunks.len()).sum();
+    // Per identity, deduplicated across files that share chunks: a
+    // chunk pinned through two paths is one promise, not two.
+    let pinned_chunks = census.pinned_chunk_union().len();
     let budgets = LiveConfig::for_local_sync().budgets;
     let mut out = format!(
         "cache policy (reachable content)\npinned files: {pinned_files}\npinned chunks: {pinned_chunks}\n",

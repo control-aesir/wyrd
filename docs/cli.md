@@ -17,6 +17,7 @@ wyrd mount [--relay <url>...] [--verbose] \
 wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir>
 wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
 wyrd device --identity-file <path> --passphrase-file <path> <drive_dir> (id | pairing-request <out> | join <invitation>)
+wyrd sync [--relay <url>...] --identity-file <path> --passphrase-file <path> <drive_dir> (status | now)
 ```
 
 ### `init` — create a drive
@@ -247,6 +248,79 @@ wyrd member --identity-file ... --passphrase-file ... <owner-dir> invite <device
 # newcomer, with the invitation file
 wyrd device --identity-file ... --passphrase-file ... <newcomer-dir> join invitation
 ```
+
+### `sync` — headless sync without mounting
+
+The two commands have deliberately different contracts:
+
+```text
+sync status
+    = durable observation
+    = never connects, sends, drains, or touches the seen log
+    = never mutates the outbox or materialization
+    = needs the drive un-mounted (exclusive store lock)
+
+sync now
+    = bounded synchronization run
+    = connects
+    = may mutate durable state
+    = reports network liveness
+    = either converges or explicitly reports incomplete
+```
+
+- `status`: pending outbox obligations with their queued,
+  delivered, and pending split (announcements per snapshot,
+  transitions per transition id, capabilities per epoch), the known
+  membership tip against held epoch secrets (knowledge is not
+  possession), live heads with classification counts over every DAG
+  head, and mailbox posture. Read-only against durable state only:
+  with no `--relay` the mailbox reads idle, and with relays it
+  reports the configured count — status never connects, so there is
+  no liveness to show and no seen log, delivery mark, outbox
+  discharge, or retry mutation to make. Liveness belongs to `now`
+  and `mount`. Two precise limits: opening the keystore can commit
+  owner-bootstrap resume facts (an interrupted genesis, the
+  self-capability install), so "never mutates" means no intake, no
+  send, no seen log, and no outbox or materialization mutation —
+  not zero writes in every corner; and the store lock is exclusive,
+  so status needs the drive un-mounted and fails closed with the
+  lock error while a mount holds it.
+- `now`: runs the mount's sync machinery (drain, deliver,
+  announce, fetch through `sync_once`) with the mount's live
+  budgets and no FUSE session: vaults and NAS replicas converge
+  without mounting. Stops on the first quiet pass and prints pass
+  and intake/fetch totals with the obligations still pending.
+  At most 32 passes: a peer that keeps intake non-idle forever
+  (which a mount absorbs by running forever) trips the cap, which
+  reports `stopped: pass limit (32) reached; sync may be
+  incomplete` and exits non-zero — a capped run is never reported
+  as converged. A run that stops with known-but-unfetchable heads
+  exits zero: the outbox is empty and there is nothing local left
+  to do, so a non-zero exit would only invite pointless retries —
+  automate on the `unfetchable heads` count, not the exit status,
+  when that distinction matters.
+  Quiet is never trusted on first sight: relay delivery races the
+  first drain, so a quiet verdict parks a short settle window
+  (arrival short-circuits it) and confirms with a second pass.
+  A head whose closure is not local is a remote
+  condition, not local work: after one grace pass it stops the run
+  as quiet with an explicit `N unfetchable heads` count instead of
+  burning the cap. Zero-progress passes park the settle window too,
+  so dead churn waits on the relay instead of spinning.
+- `--relay <url>` (repeatable, shared parsing with `mount`): with
+  none given, intake stays idle and `now` discharges local
+  obligations and fetches nothing new.
+
+Route-less authoring is intentional, not an omission: `now` binds
+no serving endpoint, so its announcements carry no retrieval
+route. A snapshot authored or fetched headless is announced as
+known-but-unfetchable — peers learn it through intake (which
+accepts the announcement) and report absence (never corruption)
+until a route arrives. Mounting later publishes the route through
+the normal route-update path and the content becomes serveable.
+A headless process is never left reachable after the command
+exits, advertises no address, and creates no new durable serving
+obligation.
 
 ## Credential files
 

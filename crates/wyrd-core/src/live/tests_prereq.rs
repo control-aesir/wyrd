@@ -1279,3 +1279,384 @@ fn local_content_keeps_its_mappings() {
     assert_eq!(node.current_node(&heads, "gone").unwrap(), None);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A pass that publishes is not quiet, and the outbox it
+/// discharges is what later passes observe empty: admitting a
+/// peer queues transition, capability, and announcement
+/// obligations, the first pass publishes (sends through the
+/// no-op mailbox and commits delivered markers), a follow-up
+/// pass republishes the advanced revision, and only then is the
+/// node quiet. One `sync_once` is never assumed to be
+/// convergence.
+#[test]
+fn publish_blocks_quiet_until_the_outbox_drains() {
+    let (mut engine, dir, store, _chunk, _root, head) = scratch_file_drive("quiet-publish");
+    let peer = wyrd_sync::keys::DeviceIdentitySecret::generate().unwrap();
+    let encryption = wyrd_sync::keys::DeviceEncryptionSecret::generate().unwrap();
+    engine
+        .admit_device(peer.device_id(), encryption.encryption_key())
+        .unwrap();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let first = node
+        .sync_once(
+            &mut NoopMailbox,
+            None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+        )
+        .unwrap();
+    assert!(first.published, "the owed announcement publishes");
+    assert!(!node.is_quiet(&first).unwrap());
+    let mut passes = 1u32;
+    loop {
+        let report = node
+            .sync_once(
+                &mut NoopMailbox,
+                None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+            )
+            .unwrap();
+        passes += 1;
+        if node.is_quiet(&report).unwrap() {
+            break;
+        }
+        assert!(passes < 8, "the outbox must drain, not churn");
+    }
+    assert!(
+        passes > 1,
+        "discharge plus republication take more than one pass"
+    );
+    assert!(
+        node.pending_obligations().unwrap().is_empty(),
+        "the outbox converges empty"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// An idle report is not quiet while obligations remain: the
+/// predicate reads the durable outbox, not just the counters, so
+/// a pass that changed nothing locally still returns non-quiet
+/// when a restart-queued outbox awaits its sends.
+#[test]
+fn idle_counters_are_not_quiet_with_pending_outbound() {
+    let (mut engine, dir, store, _chunk, _root, head) = scratch_file_drive("quiet-outbound");
+    let peer = wyrd_sync::keys::DeviceIdentitySecret::generate().unwrap();
+    let encryption = wyrd_sync::keys::DeviceEncryptionSecret::generate().unwrap();
+    engine
+        .admit_device(peer.device_id(), encryption.encryption_key())
+        .unwrap();
+    let node = live_over_fake(engine, store, &[head]);
+    assert!(
+        node.engine.has_pending_outbound().unwrap(),
+        "admission queues catch-up obligations"
+    );
+    assert!(!node.is_quiet(&SyncReport::default()).unwrap());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Deferred, skipped, duplicate, and discarded intake alone do
+/// not demand a follow-up pass: they wait on remote state or are
+/// already settled, so an immediate retry could not advance
+/// them. Only accepted intake, fetched content, publication,
+/// pending heads, or a non-empty outbox keep the loop going.
+#[test]
+fn settled_intake_alone_is_quiet() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("quiet-settled");
+    let mut node = live_over_fake(engine, store, &[head]);
+    // Run to quiet first so only the report's intake section
+    // varies below.
+    loop {
+        let report = node
+            .sync_once(
+                &mut NoopMailbox,
+                None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+            )
+            .unwrap();
+        if node.is_quiet(&report).unwrap() {
+            break;
+        }
+    }
+    let report = SyncReport {
+        drained: wyrd_sync::runtime::DrainReport {
+            duplicates: 2,
+            deferred: 1,
+            skipped: 1,
+            discarded: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(node.is_quiet(&report).unwrap());
+    let accepted = SyncReport {
+        drained: wyrd_sync::runtime::DrainReport {
+            accepted: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(!node.is_quiet(&accepted).unwrap());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A pending head blocks quiet even with otherwise idle
+/// counters: a pass that reports an unclosable head is
+/// outstanding work by definition, and the predicate must not let
+/// zero intake/fetch counters hide it. (The head reaches the
+/// predicate through the report; the idle branch is what keeps
+/// that report honest — see `idle_pass_reports_a_pending_head`.)
+#[test]
+fn pending_head_blocks_quiet_on_idle_counters() {
+    let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("quiet-pending");
+    // The view store holds nothing: the head cannot close.
+    let node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+    let report = SyncReport {
+        pending_heads: 1,
+        ..Default::default()
+    };
+    assert!(!node.is_quiet(&report).unwrap());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The idle short-circuit reports pending heads honestly: with an
+/// empty outbox and an unclosable head, the pass takes the idle
+/// branch but still names the pending head instead of a
+/// hardcoded zero — otherwise `is_quiet` would read converged
+/// while a known head is outstanding.
+#[test]
+fn idle_pass_reports_a_pending_head() {
+    let (engine, dir, _store, _chunk, _root, head) = scratch_file_drive("quiet-idle-head");
+    let mut node = live_over_fake(engine, MemoryObjectStore::default(), &[head]);
+    let report = node
+        .sync_once(
+            &mut NoopMailbox,
+            None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+        )
+        .unwrap();
+    assert!(!report.published);
+    assert_eq!(report.pending_heads, 1);
+    assert!(!node.is_quiet(&report).unwrap());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Replays A's outbound envelopes to B and records B's outbound:
+/// the in-process stand-in for two mailboxes plus one relay. Ids
+/// are a local counter, stable across re-offers; settlement
+/// mirrors the queue-mailbox contract (Ack consumes, Retry
+/// requeues at the back).
+struct ReplayMailbox {
+    queue: std::collections::VecDeque<(
+        wyrd_sync::transport::mailbox::DeliveryId,
+        wyrd_sync::transport::mailbox::MailboxEnvelope,
+    )>,
+    next: u64,
+}
+
+impl ReplayMailbox {
+    fn new(envelopes: Vec<wyrd_sync::transport::mailbox::MailboxEnvelope>) -> Self {
+        let mut mailbox = ReplayMailbox {
+            queue: std::collections::VecDeque::new(),
+            next: 1,
+        };
+        for envelope in envelopes {
+            mailbox.push(envelope);
+        }
+        mailbox
+    }
+
+    fn push(&mut self, envelope: wyrd_sync::transport::mailbox::MailboxEnvelope) {
+        use wyrd_sync::transport::mailbox::DeliveryId;
+        self.queue.push_back((DeliveryId::new(self.next), envelope));
+        self.next += 1;
+    }
+}
+
+impl wyrd_sync::transport::mailbox::Mailbox for ReplayMailbox {
+    fn send(
+        &mut self,
+        envelope: wyrd_sync::transport::mailbox::MailboxEnvelope,
+    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+        self.push(envelope);
+        Ok(())
+    }
+
+    fn recv(
+        &mut self,
+    ) -> Result<
+        Option<wyrd_sync::transport::mailbox::Delivery>,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
+        use wyrd_sync::transport::mailbox::Delivery;
+        Ok(self
+            .queue
+            .front()
+            .map(|(id, envelope)| Delivery::new(*id, envelope.clone())))
+    }
+
+    fn settle(
+        &mut self,
+        id: wyrd_sync::transport::mailbox::DeliveryId,
+        disposition: wyrd_sync::transport::mailbox::Disposition,
+    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+        use wyrd_sync::transport::mailbox::{Disposition, MailboxError};
+        let Some(pos) = self.queue.iter().position(|(held, _)| *held == id) else {
+            return Err(MailboxError::Transport("unknown delivery".into()));
+        };
+        match disposition {
+            Disposition::Ack | Disposition::Poison => {
+                // The replay keeps no durable log, so poison and
+                // consumption settle identically: drop the slot.
+                self.queue.remove(pos);
+            }
+            Disposition::Retry => {
+                let held = self.queue.remove(pos).expect("position is valid");
+                self.queue.push_back(held);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Inbound convergence across two devices, through the loop: A
+/// authors a file and admits B; B joins from the invitation, then
+/// converges to A's heads — intake, manifest/body fetch,
+/// publication, quiet. The staging is the machinery's own (each
+/// pass does what its inputs allow), and B's bulk peer is A's
+/// serving vault, so the fetch plane is genuine. No pinning: bodies,
+/// manifests, and trees suffice for head convergence, and file
+/// chunks stay remote-only. (The settle-and-confirm half of the
+/// production loop lives in the CLI's `drive_quiet`, composed with
+/// head descent in `headless_sync_now_converges_a_joined_device_to_current_heads`.)
+#[test]
+fn headless_loop_converges_a_new_device_to_current_heads() {
+    use wyrd_sync::keys::DeviceEncryptionSecret;
+
+    // Device A: one file, eleven bytes in one chunk.
+    let dir_a = std::env::temp_dir().join(format!(
+        "wyrd-core-inbound-a-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let identity_a = DeviceIdentitySecret::generate().unwrap();
+    let mut engine_a = Engine::create(dir_a.clone(), "core-test-pass", identity_a).unwrap();
+    let mut store_a = MemoryObjectStore::default();
+    let chunk = store_a.insert(ObjectKind::Chunk, b"remote-base").unwrap();
+    let root = Tree::from_entries(vec![Entry::file("f", 11, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut store_a)
+        .unwrap();
+    let head_a = engine_a.author_snapshot(&store_a, root).unwrap();
+    // Admit B with the product carry path, then collect A's
+    // outbound envelopes for B.
+    let identity_b = DeviceIdentitySecret::generate().unwrap();
+    let encryption_b = DeviceEncryptionSecret::generate().unwrap();
+    engine_a.stage_carry_heads().unwrap();
+    let outcome = engine_a
+        .admit_device(identity_b.device_id(), encryption_b.encryption_key())
+        .unwrap();
+    engine_a.carry_pending(&store_a).unwrap();
+    let outbound = {
+        use wyrd_sync::transport::mailbox::{Mailbox, MailboxEnvelope};
+        struct Recorder {
+            sent: Vec<MailboxEnvelope>,
+        }
+        impl Mailbox for Recorder {
+            fn send(
+                &mut self,
+                envelope: MailboxEnvelope,
+            ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+                self.sent.push(envelope);
+                Ok(())
+            }
+            fn recv(
+                &mut self,
+            ) -> Result<
+                Option<wyrd_sync::transport::mailbox::Delivery>,
+                wyrd_sync::transport::mailbox::MailboxError,
+            > {
+                Ok(None)
+            }
+            fn settle(
+                &mut self,
+                _id: wyrd_sync::transport::mailbox::DeliveryId,
+                _disposition: wyrd_sync::transport::mailbox::Disposition,
+            ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+                Ok(())
+            }
+        }
+        let mut recorder = Recorder { sent: Vec::new() };
+        engine_a.deliver_pending(&mut recorder).unwrap();
+        engine_a.announce_pending(&mut recorder, None).unwrap();
+        recorder.sent
+    };
+    assert!(!outbound.is_empty(), "admission owes B catch-up");
+    // Device B joins from the invitation, then loops: intake,
+    // fetch, publish, quiet. B's bulk peer is A's serving
+    // vault over A's durable state.
+    let dir_b = std::env::temp_dir().join(format!(
+        "wyrd-core-inbound-b-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let engine_b = Engine::accept_invitation(
+        dir_b.clone(),
+        "core-test-pass",
+        identity_b,
+        encryption_b,
+        &outcome.invitation,
+    )
+    .unwrap();
+    let state_a = engine_a.runtime_state().unwrap();
+    let mut bulk = wyrd_sync::serving::VaultSource::from_state(&state_a, engine_a.vault()).unwrap();
+    drop(state_a);
+    let mut node_b = live_over_configured(
+        engine_b,
+        MemoryObjectStore::default(),
+        &[],
+        &LiveConfig::for_local_sync(),
+    );
+    let mut mailbox = ReplayMailbox::new(outbound);
+    let mut passes = 0u32;
+    let mut saw_fetch = false;
+    loop {
+        let pass = node_b.sync_once(&mut mailbox, Some(&mut bulk)).unwrap();
+        passes += 1;
+        saw_fetch = saw_fetch
+            || pass.fetched.manifests > 0
+            || pass.fetched.snapshot_bodies > 0
+            || pass.fetched.objects > 0;
+        // No pinning: bodies, manifests, and trees suffice for head
+        // convergence — file chunks stay remote-only, the way a
+        // device that wants the namespace before the bytes behaves.
+        if node_b.is_quiet(&pass).unwrap() {
+            break;
+        }
+        assert!(passes < 12, "inbound convergence must terminate");
+    }
+    assert!(saw_fetch, "convergence fetched, not just drained");
+    assert!(
+        passes >= 2,
+        "intake-plus-fetch and quiet cannot share one pass: {passes}"
+    );
+    let heads_b = node_b.engine.live_heads().unwrap();
+    assert_eq!(heads_b.len(), 1, "B projects one head");
+    // The admission carried A's head forward, so B's head is the
+    // carry: same tree, parented on A's snapshot, at the new
+    // epoch. Convergence means the carried lineage, not the
+    // pre-admission id.
+    assert_eq!(
+        heads_b[0].snapshot().tree,
+        head_a.snapshot().tree,
+        "B serves A's files"
+    );
+    assert!(
+        heads_b[0]
+            .snapshot()
+            .parents
+            .contains(&head_a.snapshot().snapshot_id()),
+        "B's head descends from A's snapshot"
+    );
+    std::fs::remove_dir_all(dir_a).unwrap();
+    std::fs::remove_dir_all(dir_b).unwrap();
+}

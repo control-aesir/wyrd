@@ -18,6 +18,6 @@ pub mod lifecycle;
 
 pub use core::{
     FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, NodeError,
-    ResourceBudgets, RuntimeMaterialization, SyncReport, WyrdNode,
+    PendingObligations, ResourceBudgets, RuntimeMaterialization, SyncReport, WyrdNode,
 };
 pub use lifecycle::{LoopError, LoopReturn, Supervisor, Wake, WakeSignal};

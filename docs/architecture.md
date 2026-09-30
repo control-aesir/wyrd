@@ -171,7 +171,10 @@ from scratch (identity, root custody, genesis membership); the daemon
 composes a live NIP-59 relay mailbox (`LiveMailbox`: kind 1059 gift
 wraps over a durable seen-event-id dedupe log, supervised with relay
 health polling and capped-backoff drainer recovery) and the `wyrd` binary
-provides local init/mount. The demand machinery for fetch-on-open has
+provides local init/mount plus headless sync (`wyrd sync status`
+observes durable sync state without connecting; `wyrd sync now`
+runs the mount's sync machinery without mounting — see
+`docs/cli.md`). The demand machinery for fetch-on-open has
 landed (`docs/fetch-on-open.md`): a want registry on its own lock,
 blocking `open`/`read` with a bounded deadline (`EIO` on expiry), and
 read-side chunk demand — proven against the bulk-source contract. The

@@ -97,3 +97,41 @@ fn snapshot_admission_rebuilds_once_for_many_identities() {
         "the snapshot refreshes on commit"
     );
 }
+
+/// Batched policy commits land in one durable commit: N identities
+/// (with duplicates) advance the log by exactly one, no-ops commit
+/// nothing, and the count reports genuine transitions only — so a
+/// subtree pin is crash-atomic and pays one replay plus one fsync.
+#[test]
+fn batched_materializations_commit_once() {
+    let dir = TestDir::new("materialization-batch");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    let ids: Vec<ContentId> = (0u8..4)
+        .map(|byte| ContentId::derive(ObjectKind::Chunk, &[byte]))
+        .collect();
+
+    let committed = engine.current();
+    let mut changes: Vec<(ContentId, MaterializationState)> = ids
+        .iter()
+        .map(|id| (*id, MaterializationState::Pinned))
+        .collect();
+    // Duplicates ride along the way shared chunks do.
+    changes.push((ids[0], MaterializationState::Pinned));
+    changes.push((ids[1], MaterializationState::Pinned));
+    let fact_count = engine.set_materializations(&changes).unwrap();
+    assert_eq!(fact_count, ids.len());
+    assert_eq!(
+        engine.current(),
+        committed + 1,
+        "one batch commits one commit file"
+    );
+    // Repeating the batch commits nothing and reports zero.
+    let fact_count = engine.set_materializations(&changes).unwrap();
+    assert_eq!(fact_count, 0);
+    assert_eq!(engine.current(), committed + 1);
+    let runtime = engine.runtime_state().unwrap();
+    for id in &ids {
+        assert_eq!(runtime.materialization(id), MaterializationState::Pinned);
+    }
+}

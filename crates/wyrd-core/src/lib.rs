@@ -16,6 +16,7 @@ pub mod live;
 pub mod mailbox;
 pub mod mutation;
 pub mod node;
+pub mod policy;
 pub mod projection;
 pub mod session;
 pub mod status;

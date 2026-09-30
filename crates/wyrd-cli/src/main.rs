@@ -16,6 +16,10 @@ use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::LiveMailbox;
+use wyrd_core::policy::{
+    evict_subtree, pin_subtree, residency_census, unpin_subtree, LocalPresence, ResidencyCensus,
+    RetentionPolicy,
+};
 use wyrd_core::status::{observe, SyncStatus};
 use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
@@ -159,6 +163,54 @@ enum Command {
         relays: RelayArgs,
         #[command(subcommand)]
         action: SyncAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Promise retention for a subtree: every byte under `path` is
+    /// pinned durably on this device. Policy only — never fetches,
+    /// never authors, never touches heads. Offline by construction.
+    Pin {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Drive path to pin (drive-relative; empty means the root).
+        path: String,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Release retention promises under `path`: pinned content
+    /// returns to cacheable policy. Never deletes bytes, never
+    /// touches heads. Promises are per content identity, so
+    /// unpinning a subtree also releases shared chunks other paths
+    /// relied on. Offline by construction.
+    Unpin {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Drive path to unpin (drive-relative; empty means the root).
+        path: String,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Return unpinned content under `path` to REMOTE_ONLY policy.
+    /// Refuses the whole subtree while any of it is pinned (unpin
+    /// first). Changes intent only: no bytes are deleted, files that
+    /// stay fully local keep reading, heads are untouched. Offline
+    /// by construction.
+    Evict {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Drive path to evict (drive-relative; empty means the root).
+        path: String,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Report residency: per-file retention policy against physical
+    /// presence, or device totals plus the effective budgets. Reads
+    /// durable state only; never connects, never mutates.
+    Cache {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: CacheAction,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -332,6 +384,32 @@ enum SyncAction {
     Now,
 }
 
+/// One cache reporting action. Both read durable state only: never
+/// connect, never mutate, and need the drive un-mounted like every
+/// other offline command.
+#[derive(Debug, Subcommand)]
+enum CacheAction {
+    /// Show every reachable file under `path` with its retention
+    /// policy (PINNED / REMOTE_ONLY — what this device intends to
+    /// retain) against physical presence (PRESENT / ABSENT — what
+    /// bytes happen to exist locally). The two columns are
+    /// independent: REMOTE_ONLY + PRESENT is ordinary (eviction
+    /// releases intent, never deletes bytes), and only all-chunks
+    /// PINNED + PRESENT reads with a retention promise.
+    Status {
+        /// Drive path to report (drive-relative; empty means the
+        /// whole drive).
+        #[arg(default_value = "")]
+        path: String,
+    },
+    /// Show device totals over reachable content (pinned files and
+    /// chunks, quadrant counts) plus the effective retention and
+    /// fetch budgets. Policy facts are per content identity, not per
+    /// path, so pinned paths are not listed — only what they amount
+    /// to.
+    Policy,
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn current_uid() -> u32 {
@@ -375,6 +453,8 @@ pub(crate) enum CliError {
     Bulk(std::io::Error),
     #[error("export failed: {0}")]
     Export(#[from] wyrd_core::export::ExportError),
+    #[error("policy failed: {0}")]
+    Policy(#[from] wyrd_core::policy::PolicyError),
     /// A bounded headless run stopped at the pass limit with work
     /// still owed: rerun to continue converging. Reported, never
     /// silent, so automation cannot mistake a capped run for a
@@ -413,6 +493,10 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Snapshot { credentials, .. } => read_credentials(credentials)?,
         Command::Device { credentials, .. } => read_credentials(credentials)?,
         Command::Sync { credentials, .. } => read_credentials(credentials)?,
+        Command::Pin { credentials, .. } => read_credentials(credentials)?,
+        Command::Unpin { credentials, .. } => read_credentials(credentials)?,
+        Command::Evict { credentials, .. } => read_credentials(credentials)?,
+        Command::Cache { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
@@ -452,6 +536,18 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             action,
             ..
         } => sync(drive_dir, relays.relay, action, &passphrase, identity),
+        Command::Pin {
+            drive_dir, path, ..
+        } => pin(drive_dir, &path, &passphrase, identity),
+        Command::Unpin {
+            drive_dir, path, ..
+        } => unpin(drive_dir, &path, &passphrase, identity),
+        Command::Evict {
+            drive_dir, path, ..
+        } => evict(drive_dir, &path, &passphrase, identity),
+        Command::Cache {
+            drive_dir, action, ..
+        } => cache(drive_dir, action, &passphrase, identity),
     }
 }
 
@@ -991,6 +1087,269 @@ fn export(
         out_dir.display()
     );
     Ok(())
+}
+
+/// Offline policy node: the engine plus its read view over the
+/// drive's own store, heads installed once up front. Every
+/// pin/unpin/evict/cache command composes this shape — no loop, no
+/// mailbox, no bulk source — so policy changes never depend on
+/// network availability. Heads install once and the walk never
+/// re-refreshes: one invocation observes one generation, and a
+/// concurrent local write cannot mix generations into it.
+type PolicyNode = WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>>;
+
+fn open_policy_node(
+    drive_dir: PathBuf,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<PolicyNode, CliError> {
+    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
+    let mut node: PolicyNode = WyrdNode::new(
+        engine,
+        FsObjectStore::open(drive_dir.clone())
+            .map_err(|error| CliError::Store(error.to_string()))?,
+    )?;
+    node.refresh_live_heads()?;
+    Ok(node)
+}
+
+/// Promise retention for a subtree, durably and offline.
+fn pin(
+    drive_dir: PathBuf,
+    path: &str,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let mut node = open_policy_node(drive_dir, passphrase, identity)?;
+    let report = {
+        let (engine, view) = node.parts_mut();
+        pin_subtree(engine, view, path)?
+    };
+    print!("{}", pin_render(path, &report));
+    Ok(())
+}
+
+/// Structured first, rendered below: what one pin promised.
+fn pin_render(path: &str, report: &wyrd_core::policy::PinReport) -> String {
+    let mut out = format!(
+        "pinned {} objects ({} already pinned) across {} files, {} dirs under {}\n",
+        report.pinned,
+        report.already_pinned,
+        report.files,
+        report.dirs,
+        display_policy_path(path),
+    );
+    if report.symlinks_skipped > 0 {
+        out.push_str(&format!(
+            "note: {} symlinks skipped (a link names no content of its own)\n",
+            report.symlinks_skipped
+        ));
+    }
+    out
+}
+
+/// Release retention promises under a path, durably and offline.
+fn unpin(
+    drive_dir: PathBuf,
+    path: &str,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let mut node = open_policy_node(drive_dir, passphrase, identity)?;
+    let report = {
+        let (engine, view) = node.parts_mut();
+        unpin_subtree(engine, view, path)?
+    };
+    print!("{}", unpin_render(path, &report));
+    Ok(())
+}
+
+fn unpin_render(path: &str, report: &wyrd_core::policy::UnpinReport) -> String {
+    let mut out = format!(
+        "unpinned {} objects ({} already unpinned) across {} files, {} dirs under {}\n",
+        report.released,
+        report.already_unpinned,
+        report.files,
+        report.dirs,
+        display_policy_path(path),
+    );
+    out.push_str("note: released content returns to cacheable policy; bytes stay local\n");
+    if report.symlinks_skipped > 0 {
+        out.push_str(&format!(
+            "note: {} symlinks skipped (a link names no content of its own)\n",
+            report.symlinks_skipped
+        ));
+    }
+    out
+}
+
+/// Return unpinned content under a path to REMOTE_ONLY policy.
+/// Intent only: bytes stay, heads stay.
+fn evict(
+    drive_dir: PathBuf,
+    path: &str,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let mut node = open_policy_node(drive_dir, passphrase, identity)?;
+    let report = {
+        let (engine, view) = node.parts_mut();
+        evict_subtree(engine, view, path)?
+    };
+    print!("{}", evict_render(path, &report));
+    Ok(())
+}
+
+fn evict_render(path: &str, report: &wyrd_core::policy::EvictReport) -> String {
+    let mut out = format!(
+        "evicted {} objects ({} already remote-only) across {} files, {} dirs under {}\n",
+        report.released,
+        report.already_remote,
+        report.files,
+        report.dirs,
+        display_policy_path(path),
+    );
+    out.push_str("note: eviction releases intent only — no bytes deleted, files that stay fully local keep reading\n");
+    if report.symlinks_skipped > 0 {
+        out.push_str(&format!(
+            "note: {} symlinks skipped (a link names no content of its own)\n",
+            report.symlinks_skipped
+        ));
+    }
+    out
+}
+
+/// Report residency: per-file policy vs presence, or device totals
+/// plus the effective budgets.
+fn cache(
+    drive_dir: PathBuf,
+    action: CacheAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let node = open_policy_node(drive_dir, passphrase, identity)?;
+    match action {
+        CacheAction::Status { path } => {
+            let (engine, view) = node.parts();
+            let census = residency_census(engine, view, &path)?;
+            print!("{}", cache_status_render(&path, &census));
+            Ok(())
+        }
+        CacheAction::Policy => {
+            let (engine, view) = node.parts();
+            let census = residency_census(engine, view, "")?;
+            print!("{}", cache_policy_render(&census));
+            Ok(())
+        }
+    }
+}
+
+/// Empty path addresses the drive root; render it as `/` so the
+/// report reads like a path instead of an empty string.
+fn display_policy_path(path: &str) -> &str {
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
+}
+
+fn policy_word(policy: RetentionPolicy) -> &'static str {
+    match policy {
+        RetentionPolicy::Pinned => "PINNED",
+        RetentionPolicy::RemoteOnly => "REMOTE_ONLY",
+    }
+}
+
+fn presence_word(local: LocalPresence) -> &'static str {
+    match local {
+        LocalPresence::Present => "PRESENT",
+        LocalPresence::Absent => "ABSENT",
+    }
+}
+
+/// Structured data first; the CLI renders text, future consumers
+/// render their own. One row per reachable file plus quadrant
+/// totals — the rows name what is held, the totals name what it
+/// amounts to.
+fn cache_status_render(path: &str, census: &ResidencyCensus) -> String {
+    let mut out = format!(
+        "cache status under {}\nPOLICY       LOCAL    PATH\n",
+        display_policy_path(path)
+    );
+    for file in &census.files {
+        out.push_str(&format!(
+            "{:<12} {:<8} {}\n",
+            policy_word(file.policy),
+            presence_word(file.local),
+            file.path
+        ));
+    }
+    for conflict in &census.conflicts {
+        out.push_str(&format!("{:<12} {:<8} {}\n", "CONFLICT", "-", conflict));
+    }
+    out.push_str(&cache_quadrant_summary(census));
+    if census.symlinks_skipped > 0 {
+        out.push_str(&format!(
+            "note: {} symlinks skipped (a link names no content of its own)\n",
+            census.symlinks_skipped
+        ));
+    }
+    out
+}
+
+fn cache_quadrant_summary(census: &ResidencyCensus) -> String {
+    format!(
+        "files: {} (PINNED/PRESENT: {}, PINNED/ABSENT: {}, REMOTE_ONLY/PRESENT: {}, REMOTE_ONLY/ABSENT: {}), dirs: {}\n",
+        census.files.len(),
+        census.quadrant(RetentionPolicy::Pinned, LocalPresence::Present),
+        census.quadrant(RetentionPolicy::Pinned, LocalPresence::Absent),
+        census.quadrant(RetentionPolicy::RemoteOnly, LocalPresence::Present),
+        census.quadrant(RetentionPolicy::RemoteOnly, LocalPresence::Absent),
+        census.dirs,
+    )
+}
+
+/// Device totals over reachable content plus the budgets that
+/// bound retention and fetch. The budgets are the live loop's own
+/// (`for_local_sync`, the same config mount runs): what the report
+/// calls effective is what the daemon enforces, not a parallel
+/// copy. Only the retention- and fetch-relevant bounds print here;
+/// the full table lives in `docs/resource-limits.md`.
+fn cache_policy_render(census: &ResidencyCensus) -> String {
+    let pinned_files = census.quadrant(RetentionPolicy::Pinned, LocalPresence::Present)
+        + census.quadrant(RetentionPolicy::Pinned, LocalPresence::Absent);
+    // Per identity, deduplicated across files that share chunks: a
+    // chunk pinned through two paths is one promise, not two.
+    let pinned_chunks = census.pinned_chunk_union().len();
+    let budgets = LiveConfig::for_local_sync().budgets;
+    let mut out = format!(
+        "cache policy (reachable content)\npinned files: {pinned_files}\npinned chunks: {pinned_chunks}\n",
+    );
+    out.push_str(&cache_quadrant_summary(census));
+    // Totals silently skip conflicted subtrees, so name the gap:
+    // without this the numbers read as complete on a drive where
+    // whole paths were never walked. One row per path, like the
+    // status report, instead of one unbounded joined line.
+    if !census.conflicts.is_empty() {
+        out.push_str(&format!(
+            "conflicts: {} skipped (never walked):\n",
+            census.conflicts.len()
+        ));
+        for conflict in &census.conflicts {
+            out.push_str(&format!("  {conflict}\n"));
+        }
+    }
+    out.push_str("budgets (effective):\n");
+    match budgets.retained_bytes_quota {
+        Some(quota) => out.push_str(&format!("  retained_bytes_quota: {quota}\n")),
+        None => out.push_str("  retained_bytes_quota: unlimited\n"),
+    }
+    out.push_str(&format!(
+        "  max_admit_per_pass: {}\n  max_pending_wants: {}\n",
+        budgets.max_admit_per_pass, budgets.max_pending_wants,
+    ));
+    out
 }
 
 /// Safety cap on one headless run: a peer that keeps intake
@@ -2236,6 +2595,8 @@ mod tests_harness;
 mod tests_member;
 #[cfg(test)]
 mod tests_mount;
+#[cfg(test)]
+mod tests_policy;
 #[cfg(test)]
 mod tests_probes;
 #[cfg(test)]

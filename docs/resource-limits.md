@@ -59,7 +59,26 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 The mailbox and engine-intake bounds stay constants: they are
 protocol-adjacent, already bounded and backpressure-tested, and not
 operational tuning. The daemon-side bounds above are the configurable
-ones.
+ones. Offline one-shot walks (`wyrd cache status` over a subtree)
+are outside this table by construction: they hold the exclusive
+store lock, run under the operator's own hand, and stream one row
+per reachable file — on a very large drive, redirect the report to
+a file instead of budgeting it as a live operation. The policy
+commit batch is the second unbounded dimension there: one pin
+commits the whole subtree in a single file. The bound that bites
+is the per-commit record ceiling — 65,536 records, enforced on the
+write path (an oversized batch is refused before CURRENT advances,
+so the drive never wedges on a commit no reopen could read).
+Every other commit's fact count is bounded by a live budget (the
+plan pass counts down its admission remainder); the policy batch
+is the first whose fact count is a function of an operator-named
+path, which is why the ceiling is enforced for every committer
+rather than budgeted at one call site. The byte ceiling binds the
+same way for mixed batches a record count cannot see — many small
+records alongside one large `SnapshotBody` or `Manifest` meet
+64 MiB before they meet 65,536 records. A pin whose new transitions
+exceed 65,536 is refused whole — nothing commits; address subpaths
+to pin in pieces.
 
 ## Intake computational budgets
 

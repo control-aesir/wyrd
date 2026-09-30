@@ -1505,3 +1505,66 @@ fn sealed_rotation_bytes(
     sealed.version = version;
     sealed.encode()
 }
+
+/// An overlarge batch is refused before writing, not on the next
+/// reopen: the record ceiling binds on load, so advancing CURRENT
+/// onto an unreadable commit would wedge the drive instead of the
+/// batch. The refusal advances nothing and the store stays healthy.
+#[test]
+fn commit_rejects_overlarge_batches_before_writing() {
+    use super::codec::MAX_RECORDS_PER_COMMIT;
+    let dir = TestDir::new("commit-record-ceiling");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let facts: Vec<Fact> = (0u32..=MAX_RECORDS_PER_COMMIT as u32)
+        .map(|n| {
+            let mut bytes = [0xC4; 32];
+            bytes[0..4].copy_from_slice(&n.to_le_bytes());
+            Fact::Materialization(ContentId::from_bytes(bytes), MaterializationState::Pinned)
+        })
+        .collect();
+    assert_eq!(facts.len(), MAX_RECORDS_PER_COMMIT + 1);
+    let error = store.commit(&facts).unwrap_err();
+    // The operator-facing string carries the ceiling and the remedy;
+    // pinning it here keeps either from silently regressing.
+    assert_eq!(
+        error.to_string(),
+        "commit batch of 65537 records exceeds the per-commit ceiling of 65536 records; split the batch and retry"
+    );
+    assert_eq!(store.current(), 0, "the rejected batch advances nothing");
+    // The refusal's whole justification is the read side: reopen and
+    // prove the drive loads instead of wedging on CorruptCommit.
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.load().unwrap();
+    assert_eq!(store.current(), 0);
+    // The store stays healthy: a capped batch commits as sequence 1.
+    let mut store = store;
+    store.commit(&facts[..MAX_RECORDS_PER_COMMIT]).unwrap();
+    assert_eq!(store.current(), 1);
+}
+
+/// Both write-side ceilings as pure boundaries: the record count
+/// ahead of the encode loop, the encoded size after it. The
+/// end-to-end refusal above proves the wiring; this pins the exact
+/// edges without allocating a 64 MiB commit.
+#[test]
+fn commit_fit_boundaries_match_the_load_ceilings() {
+    use super::codec::{MAX_COMMIT_BYTES, MAX_RECORDS_PER_COMMIT};
+    use super::store::check_commit_fits;
+    assert!(check_commit_fits(0, 0).is_ok());
+    assert!(check_commit_fits(MAX_RECORDS_PER_COMMIT, MAX_COMMIT_BYTES as usize).is_ok());
+    let Err(DurableError::TooManyRecords { count, max }) =
+        check_commit_fits(MAX_RECORDS_PER_COMMIT + 1, 0)
+    else {
+        panic!("one record over the ceiling refuses");
+    };
+    assert_eq!(count, MAX_RECORDS_PER_COMMIT + 1);
+    assert_eq!(max, MAX_RECORDS_PER_COMMIT);
+    let Err(DurableError::CommitTooLarge { bytes, max }) =
+        check_commit_fits(1, MAX_COMMIT_BYTES as usize + 1)
+    else {
+        panic!("one byte over the ceiling refuses");
+    };
+    assert_eq!(bytes, MAX_COMMIT_BYTES as usize as u64 + 1);
+    assert_eq!(max, MAX_COMMIT_BYTES);
+}

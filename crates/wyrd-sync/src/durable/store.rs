@@ -13,7 +13,8 @@ use wyrd_format::{DeviceId, DriveId};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::codec::{
-    decode_commit_file, encode_commit, encode_fact, MAX_COMMIT_BYTES, STORE_KEY_AAD,
+    decode_commit_file, encode_commit, encode_fact, MAX_COMMIT_BYTES, MAX_RECORDS_PER_COMMIT,
+    STORE_KEY_AAD,
 };
 use super::replay::{self, LoadedFacts, Rebuilt};
 use super::{DurableError, Fact};
@@ -261,6 +262,18 @@ impl DurableStore {
         if facts.is_empty() {
             return Ok(self.current);
         }
+        // Refuse before writing what load would reject. Both load
+        // ceilings bind here: the record count (checked below, ahead
+        // of the encode loop) and the encoded byte size (checked
+        // after `encode_commit`, covering batches inside the count
+        // that mix many records with large ones). Either would
+        // otherwise advance CURRENT onto a commit no reopen could
+        // read — wedging the drive instead of the batch. The policy
+        // commit batch is the first caller whose fact count is a
+        // function of an operator-named path rather than a live
+        // budget, which is why the checks live here for every
+        // committer instead of at one call site.
+        check_commit_fits(facts.len(), 0)?;
         // Refresh against disk: a crashed predecessor may have advanced
         // CURRENT further than this handle saw.
         let (disk_current, disk_hash) = Self::read_current(&self.dir)?;
@@ -277,6 +290,9 @@ impl DurableStore {
             .checked_add(1)
             .ok_or(DurableError::SequenceExhausted)?;
         let (bytes, hash) = encode_commit(&self.drive, seq, &self.last_hash, &records);
+        // `records.len()` is the count the encoder wrote and the
+        // decoder reads back — not `facts.len()` by assumption.
+        check_commit_fits(records.len(), bytes.len())?;
         let name = commit_name(seq);
         let commits = self.commits_dir();
 
@@ -388,4 +404,26 @@ impl DurableStore {
     pub(crate) fn rebuild_count(&self) -> u64 {
         self.rebuilds.load(Ordering::Relaxed)
     }
+}
+
+/// Refuse before writing what load would reject. Both ceilings bind
+/// on the read path, so advancing CURRENT past either wedges the
+/// drive instead of the batch: the record count is checked ahead of
+/// the encode loop (callers pass 0 bytes there), the encoded size
+/// after `encode_commit`. Pure so the boundaries stay unit-tested
+/// without allocating a 64 MiB commit.
+pub(super) fn check_commit_fits(records: usize, bytes: usize) -> Result<(), DurableError> {
+    if records > MAX_RECORDS_PER_COMMIT {
+        return Err(DurableError::TooManyRecords {
+            count: records,
+            max: MAX_RECORDS_PER_COMMIT,
+        });
+    }
+    if bytes as u64 > MAX_COMMIT_BYTES {
+        return Err(DurableError::CommitTooLarge {
+            bytes: bytes as u64,
+            max: MAX_COMMIT_BYTES,
+        });
+    }
+    Ok(())
 }

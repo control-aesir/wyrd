@@ -3,6 +3,7 @@ use super::*;
 use wyrd_fuse::DriveView;
 use wyrd_sync::{runtime::Engine, transport::mailbox::Mailbox};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,12 +36,19 @@ impl Mailbox for NoopMailbox {
     }
 }
 
+/// Scratch-dir disambiguator: parallel tests can start in the same
+/// nanosecond under one pid, and `Engine::create` refuses an
+/// occupied dir with `StoreLocked`. The clock alone cannot separate
+/// them; the counter can.
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// An isolated engine over a scratch directory, removed by the caller
 /// after the daemon (and with it the store lock) is dropped.
 pub(super) fn scratch_engine() -> (Engine, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
-        "wyrd-daemon-core-{}-{}",
+        "wyrd-daemon-core-{}-{}-{}",
         std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -65,8 +73,9 @@ pub(super) fn scratch_engine() -> (Engine, std::path::PathBuf) {
 /// dropped.
 pub(super) fn scratch_drive() -> (Engine, std::path::PathBuf, DeviceIdentitySecret) {
     let dir = std::env::temp_dir().join(format!(
-        "wyrd-daemon-write-{}-{}",
+        "wyrd-daemon-write-{}-{}-{}",
         std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

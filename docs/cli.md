@@ -18,6 +18,10 @@ wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir
 wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
 wyrd device --identity-file <path> --passphrase-file <path> <drive_dir> (id | pairing-request <out> | join <invitation>)
 wyrd sync [--relay <url>...] --identity-file <path> --passphrase-file <path> <drive_dir> (status | now)
+wyrd pin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
+wyrd unpin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
+wyrd evict --identity-file <path> --passphrase-file <path> <drive_dir> <path>
+wyrd cache --identity-file <path> --passphrase-file <path> <drive_dir> (status [path] | policy)
 ```
 
 ### `init` — create a drive
@@ -321,6 +325,60 @@ the normal route-update path and the content becomes serveable.
 A headless process is never left reachable after the command
 exits, advertises no address, and creates no new durable serving
 obligation.
+
+### `pin` / `unpin` / `evict` / `cache` — local materialization policy
+
+What this device intends to retain, declared per subtree and stored
+durably in this device's log. Policy facts are never published,
+never authorize anything, and never alter a snapshot — pinning a
+subtree changes nothing any other device can observe.
+
+Two independent columns, never merged:
+
+```text
+POLICY       what this device intends to retain (PINNED / REMOTE_ONLY)
+LOCAL        what bytes happen to exist (PRESENT / ABSENT)
+```
+
+The store is append-only with no GC, so `REMOTE_ONLY` + `PRESENT`
+is ordinary: eviction releases intent, never deletes bytes. A file
+reads with a retention promise only at `PINNED` + `PRESENT` over
+every chunk. The fetch loop's arrival marking (`Cached`) carries no
+retention promise and reports as `REMOTE_ONLY` policy.
+
+- `pin <path>`: promise every byte under `path`. Offline,
+  idempotent, never fetches — the next sync or mount fetches what
+  the policy now requires. Policy is per content identity, so a
+  chunk shared with files outside the subtree carries the promise
+  there too.
+- `unpin <path>`: release the promise (pinned returns to cacheable
+  policy). Never deletes bytes, never refuses. Promises are per
+  content identity, not per path: unpinning a subtree releases
+  shared chunks other pinned paths also relied on.
+- `evict <path>`: return unpinned content to `REMOTE_ONLY` policy.
+  Refuses the whole subtree while any of it is pinned (unpin
+  first) — a partial evict would let overlapping paths silently
+  narrow a promise. Intent only: no bytes deleted, files that stay
+  fully local keep reading.
+- `cache status [path]`: one row per reachable file with its
+  policy/presence pair, plus quadrant totals. Reachable content
+  only — the object store as a whole is never scanned.
+- `cache policy`: device totals over reachable content plus the
+  effective retention and fetch budgets. Facts are per identity,
+  not per path, so pinned paths are not listed.
+
+Conflicted paths refuse every mutating policy command: resolve
+first, or address one version through the existing `path@N`
+grammar. `cache status` instead renders them as `CONFLICT` rows —
+a read-only report survives the ordinary multi-head state. One
+invocation walks one generation — heads install once up front, so
+a concurrent local write cannot mix generations into it. Policy
+commands need the drive un-mounted regardless: the durable store
+takes an exclusive lock, so a policy command against a mounted
+drive fails closed with the lock error. And pinning promises
+retention without fetching: a pinned-but-never-fetched subtree
+still fails closed offline (export names the unheld bytes) until
+a sync or mount lands the bytes.
 
 ## Credential files
 

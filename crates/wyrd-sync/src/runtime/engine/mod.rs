@@ -1430,6 +1430,52 @@ impl Engine {
         Ok(())
     }
 
+    /// Set the residency policy for many content objects in one
+    /// durable commit. One rebuild filters no-ops, one
+    /// [`DurableStore::commit`](crate::durable::DurableStore::commit)
+    /// appends the genuine transitions, so a subtree policy change
+    /// pays one replay and one fsync no matter how many identities
+    /// it covers — and a crash or mid-batch failure leaves the
+    /// previous state or the full new state, never a partial pin
+    /// the census would report as unpromised files. Duplicate pairs
+    /// commit once. Contradictory pairs for one identity (two states
+    /// for the same content) are not reconciled — replay applies
+    /// them in file order, so the caller's intent must already be
+    /// consistent; the policy callers each build a homogeneous list.
+    /// A batch over the per-commit record ceiling is refused before
+    /// writing ([`DurableError::TooManyRecords`](crate::durable::DurableError)):
+    /// nothing commits, and the caller splits the path and retries.
+    /// Returns the number of facts committed.
+    ///
+    /// The subtree policy surface; single-identity callers keep
+    /// [`Engine::set_materialization`].
+    pub fn set_materializations(
+        &mut self,
+        changes: &[(ContentId, MaterializationState)],
+    ) -> Result<usize, EngineError> {
+        let runtime = self.store.rebuild(self.device)?.runtime;
+        let mut pairs: Vec<(ContentId, MaterializationState)> = Vec::new();
+        for (content, state) in changes {
+            if runtime.materialization(content) != *state {
+                pairs.push((*content, *state));
+            }
+        }
+        // Sorted and deduped before the commit: the same identity
+        // arriving twice (shared chunks across files) commits one
+        // fact, deterministically ordered.
+        pairs.sort_by_key(|(content, state)| (*content.as_bytes(), *state as u8));
+        pairs.dedup();
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let facts: Vec<Fact> = pairs
+            .into_iter()
+            .map(|(content, state)| Fact::Materialization(content, state))
+            .collect();
+        self.store.commit(&facts)?;
+        Ok(facts.len())
+    }
+
     /// Set the residency policy against a caller-owned durable
     /// snapshot, committing only on a genuine transition and
     /// refreshing the snapshot in memory so a pass pays one rebuild

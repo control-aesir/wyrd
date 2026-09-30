@@ -316,7 +316,11 @@ fn commit_action(
     // the pending queue: the classification already shed over-budget
     // messages above (so this always admits — it is the charge, not
     // the decision), and the flush paces its own batches below.
-    // Past this point the envelope commits.
+    // Past this point the envelope commits. The debug assert keeps
+    // that ordering claim machine-checked: every Commit arm returns
+    // exactly the facts it pre-checked, so admitting here cannot fail
+    // after message_action already observed and staged.
+    debug_assert!(budget.would_admit(sender, facts.len()));
     if !budget.admit(sender, facts.len()) {
         engine.inbox.forget(id);
         return Ok(Outcome::RelayHeld);
@@ -514,36 +518,21 @@ fn message_action(
             ]))
         }
         Message::SnapshotAnnouncement(announcement) => {
-            // Cheap rejection first: the membership lookup and the
-            // epoch agreement are hash-map reads, while the signature
-            // verify below is curve work. An announcement for an
-            // unseen transition defers (only that transition's arrival
-            // unblocks it) and an epoch-mismatched one suppresses —
-            // both without spending verification on bytes that cannot
-            // commit yet. Verification still gates every commit: a
-            // deferred message revalidates fully when flushed, so a
-            // bad signature only buys a bounded pending slot, never a
-            // fact.
+            // Cheap rejection first: the membership lookup, the epoch
+            // agreement, and the standing read are hash-map work,
+            // while the signature verify below is curve work. An
+            // announcement for an unseen transition defers (only that
+            // transition's arrival unblocks it) and an epoch-mismatched
+            // one suppresses — both without spending verification on
+            // bytes that cannot commit yet. Verification still gates
+            // every commit: a deferred message revalidates fully when
+            // flushed, so a bad signature only buys a bounded pending
+            // slot, never a fact.
             match engine.log.transition(&announcement.membership) {
                 // Unseen: only the arrival of this transition unblocks.
                 None => Ok(Action::Defer(DeferredWait::Unseen(announcement.membership))),
                 Some(t) if t.epoch != announcement.epoch => Ok(Action::Suppress),
                 Some(_) => {
-                    // Shed before spending verification: an
-                    // over-budget envelope revalidates against the
-                    // next pass's fresh budget instead of burning
-                    // curve work this pass.
-                    if !budget.would_admit(sender, 2) {
-                        return Ok(Action::Shed);
-                    }
-                    // Authorship: an announcement is evidence only when
-                    // the author's signature verifies against the
-                    // drive-bound challenge. A bad signature is
-                    // malformed evidence like an unparsable
-                    // transition — suppress memory-only, never defer.
-                    if verify_announcement(&engine.drive(), announcement).is_err() {
-                        return Ok(Action::Suppress);
-                    }
                     match engine.log.status(&announcement.membership) {
                         Some(TransitionStatus::Canonical) => {
                             // Authorship role: readers hold epoch secrets and
@@ -574,16 +563,37 @@ fn message_action(
                             // earlier in this commit batch. Route updates
                             // (mutable `node_addr` only) commit a fresh fact;
                             // the last accepted route wins. A byte-identical
-                            // replay is already recorded and commits nothing.
-                            // An immutable fork is the sender's invalid data:
-                            // the verdict is final but memory-only, and no
-                            // announcement fact is written, so replay never
-                            // meets a conflict intake could have detected.
+                            // replay is already recorded and acks free: the
+                            // check needs no budget because the verdict
+                            // commits nothing. An immutable fork is the
+                            // sender's invalid data: the verdict is final
+                            // but memory-only, and no announcement fact is
+                            // written, so replay never meets a conflict intake
+                            // could have detected.
                             let known = engine
                                 .announcements
                                 .get(&announcement.snapshot)
                                 .or_else(|| staged.get(&announcement.snapshot));
-                            match known.map(|existing| existing.check_update(announcement)) {
+                            let update = known.map(|existing| existing.check_update(announcement));
+                            if update == Some(AnnouncementUpdate::Same) {
+                                return Ok(Action::Duplicate);
+                            }
+                            // Shed before spending verification: an
+                            // over-budget envelope revalidates against the
+                            // next pass's fresh budget instead of burning
+                            // curve work this pass.
+                            if !budget.would_admit(sender, 2) {
+                                return Ok(Action::Shed);
+                            }
+                            // Authorship: an announcement is evidence only when
+                            // the author's signature verifies against the
+                            // drive-bound challenge. A bad signature is
+                            // malformed evidence like an unparsable
+                            // transition — suppress memory-only, never defer.
+                            if verify_announcement(&engine.drive(), announcement).is_err() {
+                                return Ok(Action::Suppress);
+                            }
+                            match update {
                                 None | Some(AnnouncementUpdate::RouteUpdate) => {
                                     staged.insert(announcement.snapshot, announcement.clone());
                                     Ok(Action::Commit(vec![
@@ -591,6 +601,9 @@ fn message_action(
                                         Fact::ControlMessage(*id),
                                     ]))
                                 }
+                                // Decided above; unreachable here, kept so
+                                // the gate stays exhaustive over the
+                                // reannouncement cases.
                                 Some(AnnouncementUpdate::Same) => Ok(Action::Duplicate),
                                 Some(AnnouncementUpdate::Fork) => Ok(Action::Suppress),
                             }

@@ -258,7 +258,7 @@ fn spam_announcement(admission: &MembershipTransition, index: u32) -> Message {
 }
 
 #[test]
-fn sustained_flood_commits_bounded_facts_per_pass_and_converges() {
+fn sustained_spam_commits_bounded_facts_per_pass_and_converges() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let (mut builder, genesis) = Builder::genesis(10);
@@ -272,9 +272,11 @@ fn sustained_flood_commits_bounded_facts_per_pass_and_converges() {
             EpochSecret::from_bytes([0x09; 32]),
         ],
     );
-    // Eight senders, one hundred distinct announcements each: every
+    // Eight senders, seventy distinct announcements each: every
     // sender stays under its per-sender quota, so only the global
-    // per-pass budget binds.
+    // per-pass budget binds. (Named off the "flood" substring so the
+    // live-mailbox serial group in .config/nextest.toml does not sweep
+    // up this MemoryMailbox-only test.)
     let senders: Vec<_> = (0..8u8).map(|i| identity(0x10 + i).0).collect();
     let mut mail = vec![
         deliver(&fixture, 1, &transition_message(&genesis)),
@@ -282,34 +284,34 @@ fn sustained_flood_commits_bounded_facts_per_pass_and_converges() {
         deliver(&fixture, 2, &cap),
     ];
     for (s, sender) in senders.iter().enumerate() {
-        for j in 0..100u32 {
+        for j in 0..70u32 {
             mail.push(deliver_from(
                 &fixture,
                 sender,
                 2,
-                &spam_announcement(&admission, s as u32 * 100 + j),
+                &spam_announcement(&admission, s as u32 * 70 + j),
             ));
         }
     }
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
     // Six overhead facts plus 509 announcements (1018 facts) reach the
-    // 1024-fact per-pass budget; the remaining 291 stay relay-held for
+    // 1024-fact per-pass budget; the remaining 51 stay relay-held for
     // the next pass — paced, never dropped.
     assert_eq!(report.accepted, 512);
-    assert_eq!(report.deferred, 291);
+    assert_eq!(report.deferred, 51);
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.announcements.len(), 509);
     // Nothing was lost: the next pass converges everything deferred.
     let report = drain(&mut fixture);
-    assert_eq!(report.accepted, 291);
+    assert_eq!(report.accepted, 51);
     assert_eq!(report.deferred, 0);
     let facts = fixture.engine.store.load().expect("loads");
-    assert_eq!(facts.announcements.len(), 800);
+    assert_eq!(facts.announcements.len(), 560);
 }
 
 #[test]
-fn per_sender_quota_keeps_one_flood_from_starving_others() {
+fn per_sender_quota_keeps_one_spammer_from_starving_others() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let (mut builder, genesis) = Builder::genesis(10);

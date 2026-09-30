@@ -1490,11 +1490,13 @@ fn a_bootstrapped_drive_serves_its_first_authored_snapshot() {
 }
 
 /// The pending bound sheds to the relay without consuming: a drained
-/// overflow stays the relay's problem, every held message commits
-/// once its transition lands, and the shed envelope re-offers against
-/// resolved state instead of staying lost. Every delivery carries a
-/// fresh seal and therefore a distinct message id; one delivery
-/// beyond the engine's configured pending capacity.
+/// overflow stays the relay's problem, held messages commit over
+/// bounded passes once their transition lands (paced by the per-pass
+/// intake budget — pacing is the correct trade, since the alternative
+/// is an unbounded single-pass commit), and the shed envelope
+/// re-offers against resolved state instead of staying lost. Every
+/// delivery carries a fresh seal and therefore a distinct message id;
+/// one delivery beyond the engine's configured pending capacity.
 #[test]
 fn deferred_messages_survive_queue_pressure() {
     let mut rig = Rig::new();

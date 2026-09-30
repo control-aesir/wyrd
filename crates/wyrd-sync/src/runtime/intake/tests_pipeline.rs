@@ -512,8 +512,13 @@ fn unknown_epoch_skips_without_commit_then_lands() {
     mail.push(deliver(&fixture, 9, &bound));
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
-    assert_eq!(report.accepted, 10);
-    assert_eq!(fixture.engine.current(), 10);
+    // Nine transitions commit; the retained first seal defers, lands
+    // with the tip's flush, and the second seal of the same
+    // announcement acks as a byte-identical duplicate — one
+    // announcement, one fact.
+    assert_eq!(report.accepted, 9);
+    assert_eq!(report.duplicates, 1);
+    assert_eq!(fixture.engine.current(), 9);
 }
 
 #[test]

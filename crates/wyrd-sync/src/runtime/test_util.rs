@@ -113,8 +113,20 @@ pub(crate) fn fixture() -> Fixture {
 
 /// Seal a control message and address it to the fixture device.
 pub(crate) fn deliver(fixture: &Fixture, epoch: u64, message: &Message) -> MailboxEnvelope {
+    deliver_from(fixture, &fixture.sender_sk, epoch, message)
+}
+
+/// `deliver` from an explicit sender identity: the mailbox sender is
+/// authenticated transport metadata, so per-sender intake behavior
+/// (quotas, starvation) needs mail from distinct senders.
+pub(crate) fn deliver_from(
+    fixture: &Fixture,
+    sender: &DeviceIdentitySecret,
+    epoch: u64,
+    message: &Message,
+) -> MailboxEnvelope {
     let sealed = seal(&control_key(epoch), &member_drive(), epoch, message).unwrap();
-    seal_for_recipient(&fixture.sender_sk, fixture.recipient, &sealed.encode()).unwrap()
+    seal_for_recipient(sender, fixture.recipient, &sealed.encode()).unwrap()
 }
 
 pub(crate) fn queue(fixture: &mut Fixture, envelopes: Vec<MailboxEnvelope>) {

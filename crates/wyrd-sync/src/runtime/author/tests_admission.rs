@@ -767,8 +767,10 @@ fn rotate_delivers_the_new_epoch_secret_to_a_current_member() {
         "rotation-epoch secret installed from the pushed delivery"
     );
     // Second drain: with the secret held, the redelivered transition
-    // opens and the tip advances — the two-pass convergence the live
-    // loop performs every few seconds.
+    // opens — but its document already committed via the rotation
+    // delivery, so it acks as a duplicate instead of committing
+    // redundantly. The two-pass convergence the live loop performs
+    // every few seconds.
     {
         let mut receiver = MemoryMailbox {
             relay: &mut relay,
@@ -776,7 +778,8 @@ fn rotate_delivers_the_new_epoch_secret_to_a_current_member() {
         };
         let report = joined.drain(&mut receiver).unwrap();
         assert_eq!(report.skipped, 0, "nothing waits anymore");
-        assert_eq!(report.accepted, 1, "redelivered transition commits");
+        assert_eq!(report.accepted, 0, "redelivered transition duplicates");
+        assert_eq!(report.duplicates, 1, "already recorded via rotation");
     }
     let state = joined.log.known_state().expect("canonical tip");
     assert_eq!(state.epoch, 3, "catch-up reaches the rotation");
@@ -1060,7 +1063,11 @@ fn admission_queues_the_lineage_closure_for_the_newcomer() {
         assert_eq!(first.accepted, 3, "chain transition, capability, delivery");
         assert_eq!(first.skipped, 1, "transition waits for its epoch key");
         let second = joined.drain(&mut receiver).unwrap();
-        assert_eq!(second.accepted, 1, "redelivered transition commits");
+        assert_eq!(
+            second.accepted, 0,
+            "redelivered transition duplicates its rotation-committed document"
+        );
+        assert_eq!(second.duplicates, 1, "already recorded via rotation");
     }
     joined
         .commit_facts(&[

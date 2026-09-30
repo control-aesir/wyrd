@@ -271,10 +271,11 @@ Pinned by
 `destroy_commits_dirty_write_handles_while_queue_live`,
 `destroy_after_queue_shutdown_clears_without_hanging`
 (`wyrd-daemon/src/fuse/tests_backend.rs`),
-`close_deadline_reports_a_stalled_close`
+`close_deadline_reports_a_stalled_close` and
+`zero_deadline_trips_a_stalled_stop_but_spares_a_ready_one`
 (`wyrd-sync/src/close.rs`),
 `live_close_returns_past_a_zero_deadline` (`wyrd-sync/src/bulk.rs`),
-`live_serving_close_trips_a_zero_deadline` and
+`live_serving_stop_returns_past_a_zero_deadline` and
 `poisoned_mirror_lock_reports_but_still_shuts_down`
 (`wyrd-sync/src/serving.rs`), and
 `combine_status_reports_transport_shutdown_failures`

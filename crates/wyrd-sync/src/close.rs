@@ -89,12 +89,14 @@ mod tests {
             "a stalled stop must report TimedOut under any deadline"
         );
         // ...but a zero deadline is "don't wait", not "always
-        // fail": a stop that is already complete on first poll
-        // reports clean. A live transport stop is never in that
-        // state — it always needs task turns — so entry-point
-        // tests accept either outcome and only pin the bounded
-        // return (see the live-stop serving test) instead of
-        // asserting TimedOut against an idle router.
+        // fail": `Timeout` polls the stop first, so a stop that
+        // is already complete on first poll reports clean. The
+        // serving entry-point test therefore accepts `Ok` too
+        // and only pins the bounded return — asserting
+        // `TimedOut` against a live router flaked, because a
+        // stop whose run loop already exited resolves on first
+        // poll, and a panicked run task surfaces as a plain
+        // error: neither is `TimedOut`.
         let clean = runtime.block_on(with_deadline(
             async {},
             std::time::Duration::ZERO,

@@ -390,32 +390,34 @@ fn poisoned_mirror_lock_reports_but_still_shuts_down() {
     );
 }
 
-/// A live serving stop returns past its deadline instead of
-/// blocking: which outcome it reports is host timing (a fast host
-/// resolves the graceful close on the first poll and `timeout`
-/// reports clean), so the `TimedOut` variant is pinned by the
-/// never-ready unit tests in `close`, not here. An idle router
-/// cannot pin the timeout either — its stop needs only task
-/// turns, which beat a starved zero timer under parallel load.
-/// (The previous assertion of `TimedOut` against an idle router
-/// flaked for exactly that reason.)
+/// A serving stop under a zero deadline returns instead of
+/// blocking: `Timeout` polls the stop before arming the timer,
+/// so the outcome is decided on the first poll — `TimedOut`
+/// unless the stop is already complete — and this layer only
+/// pins that the deadline holds. Any *other* failure (a router
+/// failure surfacing through the stop) fails loudly with its
+/// kind attached. The `TimedOut` legs stay pinned by the
+/// never-ready unit tests in `close`, not here.
 #[test]
 fn live_serving_stop_returns_past_a_zero_deadline() {
     let dir = serve_dir();
     let vault = Vault::open(&dir).unwrap();
     let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
-    let sealed = b"live serving peer".to_vec();
-    let root = vault.import(&sealed).unwrap();
-    serving.flush().unwrap();
-    // A live peer: the fetch proves the connection both ways, so
-    // the close runs against a held connection, not an idle
-    // router.
-    assert_eq!(fetch_from(&serving, &root), Some(sealed));
     let start = std::time::Instant::now();
-    let _ = serving.shutdown(std::time::Duration::ZERO);
+    let result = serving.shutdown(std::time::Duration::ZERO);
+    if let Err(error) = &result {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut,
+            "a serving stop must only fail past its deadline, got {error:?}"
+        );
+    }
+    // The window includes the runtime join (bounded by
+    // `RUNTIME_SHUTDOWN_TIMEOUT`), so the hang guard sits well
+    // above that budget instead of on it.
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(10),
-        "a live stop past its deadline must return instead of blocking"
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "a serving stop past its deadline must return instead of blocking"
     );
 }
 

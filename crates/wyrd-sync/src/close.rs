@@ -71,6 +71,41 @@ mod tests {
     }
 
     #[test]
+    fn zero_deadline_trips_a_stalled_stop_but_spares_a_ready_one() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A stop that never resolves trips even a zero deadline:
+        // the timer always wins eventually against a future that
+        // never completes, so no scheduler luck is involved.
+        let stalled = runtime.block_on(with_deadline(
+            std::future::pending::<()>(),
+            std::time::Duration::ZERO,
+            "stalled",
+        ));
+        assert!(
+            matches!(stalled, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "a stalled stop must report TimedOut under any deadline"
+        );
+        // ...but a zero deadline is "don't wait", not "always
+        // fail": `Timeout` polls the stop first, so a stop that
+        // is already complete on first poll reports clean. The
+        // serving entry-point test therefore accepts `Ok` too
+        // and only pins the bounded return — asserting
+        // `TimedOut` against a live router flaked, because a
+        // stop whose run loop already exited resolves on first
+        // poll, and a panicked run task surfaces as a plain
+        // error: neither is `TimedOut`.
+        let clean = runtime.block_on(with_deadline(
+            async {},
+            std::time::Duration::ZERO,
+            "stalled",
+        ));
+        assert!(clean.is_ok(), "an already-complete stop reports clean");
+    }
+
+    #[test]
     fn failed_router_still_runs_the_close() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

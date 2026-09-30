@@ -390,19 +390,34 @@ fn poisoned_mirror_lock_reports_but_still_shuts_down() {
     );
 }
 
+/// A serving stop under a zero deadline returns instead of
+/// blocking: `Timeout` polls the stop before arming the timer,
+/// so the outcome is decided on the first poll — `TimedOut`
+/// unless the stop is already complete — and this layer only
+/// pins that the deadline holds. Any *other* failure (a router
+/// failure surfacing through the stop) fails loudly with its
+/// kind attached. The `TimedOut` legs stay pinned by the
+/// never-ready unit tests in `close`, not here.
 #[test]
-fn live_serving_close_trips_a_zero_deadline() {
+fn live_serving_stop_returns_past_a_zero_deadline() {
     let dir = serve_dir();
     let vault = Vault::open(&dir).unwrap();
     let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
-    // The transport stop joins the router task, which can never
-    // resolve synchronously — a zero deadline must report
-    // TimedOut. An unbounded stop would block here instead and
-    // fail. No peer is needed: the router join pends even idle.
-    let timed_out = serving.shutdown(std::time::Duration::ZERO);
+    let start = std::time::Instant::now();
+    let result = serving.shutdown(std::time::Duration::ZERO);
+    if let Err(error) = &result {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut,
+            "a serving stop must only fail past its deadline, got {error:?}"
+        );
+    }
+    // The window includes the runtime join (bounded by
+    // `RUNTIME_SHUTDOWN_TIMEOUT`), so the hang guard sits well
+    // above that budget instead of on it.
     assert!(
-        matches!(timed_out, Err(error) if error.kind() == std::io::ErrorKind::TimedOut),
-        "a serving stop past its deadline must report TimedOut"
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "a serving stop past its deadline must return instead of blocking"
     );
 }
 

@@ -739,6 +739,8 @@ fn mint_wrap(
     Some(cap.wrap().ok()?.as_bytes().to_vec())
 }
 
+// Sibling test file under the workspace tests_* naming: #[path] is required
+// because default resolution from this parent would look for tests.rs, not this name.
 #[cfg(test)]
 #[path = "deliver/tests_deliver.rs"]
 mod tests;

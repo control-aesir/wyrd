@@ -2233,6 +2233,8 @@ pub fn admit_wants<E>(
     Ok(admitted)
 }
 
+// Sibling test files under the workspace tests_* naming: #[path] is required
+// because default resolution from this parent would look for <mod-name>.rs, not these names.
 #[cfg(test)]
 #[path = "live/tests_backoff.rs"]
 mod backoff_tests;

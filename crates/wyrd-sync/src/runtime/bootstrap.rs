@@ -875,6 +875,8 @@ fn read_drive(dir: &Path) -> Result<DriveId, EngineError> {
     Ok(DriveId::from_bytes(id))
 }
 
+// Sibling test file under the workspace tests_* naming: #[path] is required
+// because default resolution from this parent would look for tests.rs, not this name.
 #[cfg(test)]
 #[path = "bootstrap/tests_bootstrap.rs"]
 mod tests;

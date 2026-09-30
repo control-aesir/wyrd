@@ -825,6 +825,8 @@ pub(super) enum DecodedFact {
     CarryDone(SnapshotId),
 }
 
+// Sibling test file under the workspace tests_* naming: #[path] is required
+// because default resolution from this parent would look for tests.rs, not this name.
 #[cfg(test)]
 #[path = "codec/tests_codec.rs"]
 mod tests;

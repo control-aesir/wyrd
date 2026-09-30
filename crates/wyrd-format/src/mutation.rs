@@ -551,6 +551,8 @@ fn upsert(entries: &mut Vec<Entry>, entry: Entry) {
     }
 }
 
+// Sibling test file under the workspace tests_* naming: #[path] is required
+// because default resolution from this parent would look for tests.rs, not this name.
 #[cfg(test)]
 #[path = "mutation/tests_mutation.rs"]
 mod tests;

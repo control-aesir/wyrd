@@ -683,6 +683,8 @@ fn create_symlink(_target: &str, _dest: &Path) -> Result<(), ExportError> {
     Err(ExportError::SymlinkUnsupported)
 }
 
+// Sibling test file under the workspace tests_* naming: #[path] is required
+// because default resolution from this parent would look for tests.rs, not this name.
 #[cfg(test)]
 #[path = "export/tests_export.rs"]
 mod tests;

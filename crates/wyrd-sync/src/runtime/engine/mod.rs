@@ -1442,6 +1442,9 @@ impl Engine {
     /// for the same content) are not reconciled — replay applies
     /// them in file order, so the caller's intent must already be
     /// consistent; the policy callers each build a homogeneous list.
+    /// A batch over the per-commit record ceiling is refused before
+    /// writing ([`DurableError::TooManyRecords`](crate::durable::DurableError)):
+    /// nothing commits, and the caller splits the path and retries.
     /// Returns the number of facts committed.
     ///
     /// The subtree policy surface; single-identity callers keep

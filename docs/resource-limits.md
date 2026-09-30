@@ -73,10 +73,9 @@ Every other commit's fact count is bounded by a live budget (the
 plan pass counts down its admission remainder); the policy batch
 is the first whose fact count is a function of an operator-named
 path, which is why the ceiling is enforced for every committer
-rather than budgeted at one call site. A subtree past 65,537
-distinct chunk identities (on the order of four gibibytes of
-distinct content at the 64 KiB target chunk size) pins in pieces,
-not at once.
+rather than budgeted at one call site. A pin whose new transitions
+exceed 65,536 is refused whole — nothing commits; address subpaths
+to pin in pieces.
 
 ## Intake computational budgets
 

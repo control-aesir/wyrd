@@ -168,8 +168,17 @@ pub enum DurableError {
     /// (`MAX_RECORDS_PER_COMMIT`): refused before writing, so the
     /// store never advances CURRENT onto a commit no reopen could
     /// read. Split the batch and retry.
-    #[error("commit batch of {count} records exceeds the per-commit record ceiling")]
-    TooManyRecords { count: usize },
+    #[error(
+        "commit batch of {count} records exceeds the per-commit ceiling of {max} records; split the batch and retry"
+    )]
+    TooManyRecords { count: usize, max: usize },
+    /// A commit encodes larger than load accepts (`MAX_COMMIT_BYTES`):
+    /// refused before writing, like the record ceiling above. Split
+    /// the batch and retry.
+    #[error(
+        "commit of {bytes} bytes exceeds the per-commit ceiling of {max} bytes; split the batch and retry"
+    )]
+    CommitTooLarge { bytes: u64, max: u64 },
 }
 
 // --- facts -----------------------------------------------------------------

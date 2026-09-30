@@ -1528,7 +1528,34 @@ fn commit_rejects_overlarge_batches_before_writing() {
         Err(DurableError::TooManyRecords { .. })
     ));
     assert_eq!(store.current(), 0, "the rejected batch advances nothing");
+    // The refusal's whole justification is the read side: reopen and
+    // prove the drive loads instead of wedging on CorruptCommit.
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.load().unwrap();
+    assert_eq!(store.current(), 0);
     // The store stays healthy: a capped batch commits as sequence 1.
+    let mut store = store;
     store.commit(&facts[..MAX_RECORDS_PER_COMMIT]).unwrap();
     assert_eq!(store.current(), 1);
+}
+
+/// Both write-side ceilings as pure boundaries: the record count
+/// ahead of the encode loop, the encoded size after it. The
+/// end-to-end refusal above proves the wiring; this pins the exact
+/// edges without allocating a 64 MiB commit.
+#[test]
+fn commit_fit_boundaries_match_the_load_ceilings() {
+    use super::codec::{MAX_COMMIT_BYTES, MAX_RECORDS_PER_COMMIT};
+    use super::store::check_commit_fits;
+    assert!(check_commit_fits(0, 0).is_ok());
+    assert!(check_commit_fits(MAX_RECORDS_PER_COMMIT, MAX_COMMIT_BYTES as usize).is_ok());
+    assert!(matches!(
+        check_commit_fits(MAX_RECORDS_PER_COMMIT + 1, 0),
+        Err(DurableError::TooManyRecords { .. })
+    ));
+    assert!(matches!(
+        check_commit_fits(1, MAX_COMMIT_BYTES as usize + 1),
+        Err(DurableError::CommitTooLarge { .. })
+    ));
 }

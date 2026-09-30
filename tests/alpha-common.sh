@@ -45,7 +45,10 @@ HOST_LOGS="${HOST_LOGS:-}"
 
 collect_logs() {
   [[ -n "$HOST_LOGS" ]] || return 0
-  mkdir -p "$HOST_LOGS"
+  # Unmasked failures here would flip a passing run to failed: this
+  # runs in EXIT traps under `set -e`, on shares the guest may not
+  # be able to write.
+  mkdir -p "$HOST_LOGS" 2>/dev/null || true
   cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null || true
   echo "logs collected under $HOST_LOGS"
 }

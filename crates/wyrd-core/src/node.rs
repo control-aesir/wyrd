@@ -95,6 +95,38 @@ where
         &self.view
     }
 
+    /// The durable engine behind the view. Offline administration
+    /// (membership, snapshots, materialization policy) programs the
+    /// engine directly without composing a live loop; policy reads go
+    /// straight to durable state, so a policy commit never needs the
+    /// view's materialization projection refreshed to be observed.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// The durable engine, mutably, for the same offline
+    /// administration. Committing policy facts here does not touch
+    /// heads — heads advance only through `refresh_live_heads` — so a
+    /// pin/evict command observes and leaves the same head set.
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
+    }
+
+    /// The engine and the read view together, as disjoint borrows.
+    /// Policy operations resolve paths through the view and commit
+    /// through the engine in one call; without the split the two
+    /// borrows would conflict on the node. Read-only twin for
+    /// census-style observations against one consistent pair.
+    pub fn parts(&self) -> (&Engine, &V) {
+        (&self.engine, &self.view)
+    }
+
+    /// Mutable twin of [`WyrdNode::parts`]: program the engine
+    /// against the view in one call.
+    pub fn parts_mut(&mut self) -> (&mut Engine, &V) {
+        (&mut self.engine, &self.view)
+    }
+
     /// Drain control-plane messages and refresh the materialization projection.
     pub fn drain(
         &mut self,

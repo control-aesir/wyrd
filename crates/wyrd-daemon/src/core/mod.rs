@@ -16,6 +16,8 @@ mod tests_harness;
 #[cfg(test)]
 mod tests_mount;
 #[cfg(test)]
+mod tests_policy;
+#[cfg(test)]
 mod tests_publish;
 #[cfg(test)]
 mod tests_run_loop;

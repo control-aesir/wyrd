@@ -18,6 +18,7 @@ pub mod mutation;
 pub mod node;
 pub mod projection;
 pub mod session;
+pub mod status;
 pub mod view;
 pub mod wake;
 pub mod want;

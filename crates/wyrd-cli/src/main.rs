@@ -16,23 +16,29 @@ use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::LiveMailbox;
+use wyrd_core::status::{observe, SyncStatus};
+use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
-use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LoopError, Supervisor, WyrdNode};
+use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LiveNode, LoopError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
-use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, SnapshotId, TransitionId};
+use wyrd_format::{
+    DeviceEncryptionKey, DeviceId, MembershipTransition, ObjectStore, SnapshotId, TransitionId,
+};
 use wyrd_sync::control::SealedBootstrap;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
-use wyrd_sync::runtime::{Engine, EngineError, MergeSelection};
+use wyrd_sync::runtime::{Engine, EngineError, MergeSelection, RoutePublishing};
+use wyrd_sync::transport::mailbox::Mailbox;
 use zeroize::Zeroizing;
 
 /// The `wyrd` binary: create a drive, mount its live projection,
 /// export its namespace to a plain directory tree, administer its
-/// membership, or pair a new device. All subcommands need the
+/// membership, pair a new device, or sync headless. All subcommands need the
 /// credential files (read and hardened by wyrd code, never by clap);
-/// `--relay` is mount-only deployment state — nothing in the
-/// keystore names relays, so they arrive as flags.
+/// `--relay` is deployment state shared by every networked
+/// subcommand — nothing in the keystore names relays, so they arrive
+/// as flags.
 /// Export is offline by construction: no relays, no serving, no FUSE.
 #[derive(Debug, Parser)]
 #[command(name = "wyrd", version, about)]
@@ -52,6 +58,19 @@ struct Credentials {
     passphrase_file: PathBuf,
 }
 
+/// Control-plane relays: repeatable deployment state shared by every
+/// networked subcommand. Nothing in the keystore names relays, so
+/// they arrive as flags with identical parsing and identical
+/// empty-means-idle semantics everywhere — mount and sync must never
+/// drift into subtly different relay handling.
+#[derive(Debug, Args)]
+struct RelayArgs {
+    /// Control-plane relay; repeatable. With none given, intake
+    /// stays idle and the command runs offline.
+    #[arg(long, value_name = "URL")]
+    relay: Vec<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create a new drive: identity, root custody, genesis membership.
@@ -67,10 +86,8 @@ enum Command {
         drive_dir: PathBuf,
         /// Where to serve the projection.
         mountpoint: PathBuf,
-        /// Control-plane relay; repeatable. With none given, intake
-        /// stays idle.
-        #[arg(long, value_name = "URL")]
-        relay: Vec<String>,
+        #[command(flatten)]
+        relays: RelayArgs,
         /// Verbose mount diagnostics: debug-level FUSE request logs
         /// (opcode + latency + reply errno) in stderr and `mount.log`.
         /// Without it the mount logs at info level, and each request
@@ -129,6 +146,19 @@ enum Command {
         drive_dir: PathBuf,
         #[command(subcommand)]
         action: DeviceAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Headless sync: report sync state or run a bounded sync without
+    /// mounting. Status never connects and never mutates durable
+    /// state; `now` connects, may mutate it, and reports liveness.
+    Sync {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(flatten)]
+        relays: RelayArgs,
+        #[command(subcommand)]
+        action: SyncAction,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -286,6 +316,22 @@ enum DeviceAction {
     },
 }
 
+/// One headless sync action. Status observes durable state only;
+/// `now` runs the same sync machinery the mount runs, headless.
+#[derive(Debug, Subcommand)]
+enum SyncAction {
+    /// Show pending outbox obligations (queued, delivered, pending
+    /// per snapshot, transition, and epoch), the membership tip
+    /// against held epoch secrets, live heads with classification,
+    /// and mailbox posture. Never connects, sends, or touches the
+    /// seen log or outbox; needs the drive un-mounted.
+    Status,
+    /// Run bounded sync passes headless: drain, deliver, announce,
+    /// fetch — no FUSE session, same live budgets as mount. Stops on
+    /// the first quiet pass; the pass limit reports incomplete.
+    Now,
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn current_uid() -> u32 {
@@ -329,6 +375,12 @@ pub(crate) enum CliError {
     Bulk(std::io::Error),
     #[error("export failed: {0}")]
     Export(#[from] wyrd_core::export::ExportError),
+    /// A bounded headless run stopped at the pass limit with work
+    /// still owed: rerun to continue converging. Reported, never
+    /// silent, so automation cannot mistake a capped run for a
+    /// converged device. Exits non-zero like any other failure.
+    #[error("sync incomplete: pass limit ({passes}) reached with {pending} obligations pending")]
+    Incomplete { passes: u32, pending: usize },
     #[error("macOS FUSE preflight failed: {0}")]
     #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
@@ -360,6 +412,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Member { credentials, .. } => read_credentials(credentials)?,
         Command::Snapshot { credentials, .. } => read_credentials(credentials)?,
         Command::Device { credentials, .. } => read_credentials(credentials)?,
+        Command::Sync { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
@@ -370,10 +423,17 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Mount {
             drive_dir,
             mountpoint,
-            relay,
+            relays,
             verbose,
             ..
-        } => mount(drive_dir, mountpoint, relay, verbose, &passphrase, identity),
+        } => mount(
+            drive_dir,
+            mountpoint,
+            relays.relay,
+            verbose,
+            &passphrase,
+            identity,
+        ),
         Command::Export {
             drive_dir, out_dir, ..
         } => export(drive_dir, out_dir, &passphrase, identity),
@@ -386,6 +446,12 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Device {
             drive_dir, action, ..
         } => device(drive_dir, action, &passphrase, identity),
+        Command::Sync {
+            drive_dir,
+            relays,
+            action,
+            ..
+        } => sync(drive_dir, relays.relay, action, &passphrase, identity),
     }
 }
 
@@ -612,8 +678,11 @@ fn mount(
 
     // Operational policy in one place: the loop and the serving
     // backend share this config's budgets, wired into both halves
-    // by `into_live` below.
-    let config = LiveConfig::default();
+    // by `into_live` below. Constructed through `for_local_sync`
+    // (never `Default` directly) so headless sync shares these exact
+    // budgets and ceilings — several are correctness boundaries, and
+    // a mount-only default must never silently diverge them.
+    let config = LiveConfig::for_local_sync();
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // Flush the serving endpoint before announcing its address, so the
     // first seal carries a route peers can already dial. The loop owns
@@ -922,6 +991,419 @@ fn export(
         out_dir.display()
     );
     Ok(())
+}
+
+/// Safety cap on one headless run: a peer that keeps intake
+/// non-idle forever (a mount absorbs that by running forever) must
+/// not turn a one-shot command into an unbounded loop. Reaching the
+/// cap reports incomplete, never converged. The cap bounds
+/// iterations; each pass is separately bounded by the fetch budget
+/// and each non-progressing pass additionally parks the settle
+/// window, so the whole-run bound is
+/// `MAX_SYNC_NOW_PASSES × (settle + fetch_pass_budget)` of wall
+/// clock plus actual work — bounded waiting, never a tight loop.
+const MAX_SYNC_NOW_PASSES: u32 = 32;
+
+/// Settle window for intake races: relay delivery is asynchronous
+/// after the subscription REQ, and `recv` is non-blocking, so a pass
+/// that drains immediately after connect normally sees nothing. A
+/// quiet verdict is only trusted after mail has had one relay round
+/// trip (+ margin) to arrive; arrival pokes the waker and
+/// short-circuits the wait, so only the no-mail case burns the full
+/// window. Distinct from the mount's five-second staleness bound —
+/// this covers the subscribe gap, not steady-state cadence. Skipped
+/// entirely with no relays configured (intake is idle by
+/// construction, so there is nothing to settle).
+const SYNC_NOW_SETTLE: Duration = Duration::from_secs(2);
+
+/// How one headless run stopped: converged, converged with heads
+/// whose closure is not local, or capped with work still owed. The
+/// three states are distinct in the type — not just in rendered
+/// text — so automation can tell converged from stuck-but-remote:
+/// `Quiet` means nothing is owed anywhere, `RemoteStalled` means
+/// the outbox is empty but known heads are not locally closable (a
+/// rerun without external change — a route, bytes, or a capability
+/// — cannot advance them), and `PassLimit` means the cap tripped
+/// with local work still owed (a rerun may advance it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// A pass left no actionable work.
+    Quiet,
+    /// The outbox is empty but known heads are not locally
+    /// closable. Exits 0: locally there is nothing more to do, so
+    /// a non-zero exit would only invite pointless retries.
+    RemoteStalled,
+    /// The pass cap tripped with obligations still pending.
+    PassLimit,
+}
+
+/// Totals across one headless run: per-pass intake/fetch sums plus
+/// the stopping outcome, the obligations still owed, and heads whose
+/// closure is not local. Structured data first; the CLI renders it
+/// to text below, future consumers render their own.
+#[derive(Debug)]
+struct SyncRunReport {
+    passes: u32,
+    accepted: usize,
+    duplicates: usize,
+    deferred: usize,
+    skipped: usize,
+    discarded: usize,
+    manifests: usize,
+    snapshot_bodies: usize,
+    objects: usize,
+    unfulfilled: usize,
+    outcome: RunOutcome,
+    pending: usize,
+    /// Heads known but not locally closable at the last pass: a
+    /// remote condition (no route, no bytes, no capability yet),
+    /// never local work. Reported, never spun on.
+    unfetchable_heads: usize,
+}
+
+/// Drive bounded sync passes until the first settled-quiet pass,
+/// a remote stall, or the pass cap: drain, deliver, announce, fetch per pass through
+/// the shared `sync_once` machinery — never a reimplementation. A
+/// failed pass fails the run closed like the mount's loop abort.
+/// Quiet is never trusted on first sight: relay delivery races the
+/// first drain, so a quiet verdict parks one settle window (arrival
+/// short-circuits it) and confirms with a second pass. A head
+/// closure that is not local is a remote condition, not local work:
+/// two consecutive zero-progress passes with pending heads and an
+/// empty outbox stop the run as `RemoteStalled` rather than
+/// burning the cap — the second pass is the grace one, because
+/// per-pass budgets replenish and backoff ledgers evolve, so a
+/// single stalled pass may precede a completing one, while two
+/// identical ones cannot advance. Zero-progress passes park the
+/// settle window too, so dead churn waits on the relay instead of
+/// spinning; active passes continue immediately.
+fn drive_quiet<V, M, B>(
+    live: &mut LiveNode<V>,
+    mailbox: &mut M,
+    bulk: &mut Option<B>,
+    settle: Option<Duration>,
+) -> Result<SyncRunReport, LiveError>
+where
+    V: NamespaceView<Materialization = RuntimeMaterialization>,
+    V::Store: ObjectStore,
+    <V::Store as ObjectStore>::Error: std::fmt::Debug,
+    M: Mailbox,
+    B: RoutePublishing,
+{
+    let mut report = SyncRunReport {
+        passes: 0,
+        accepted: 0,
+        duplicates: 0,
+        deferred: 0,
+        skipped: 0,
+        discarded: 0,
+        manifests: 0,
+        snapshot_bodies: 0,
+        objects: 0,
+        unfulfilled: 0,
+        outcome: RunOutcome::Quiet,
+        pending: 0,
+        unfetchable_heads: 0,
+    };
+    // Consecutive zero-progress passes with pending heads and an
+    // empty outbox: the first is grace, the second stops the run.
+    let mut stalled_streak = 0u32;
+    let stop = AtomicBool::new(false);
+    let park = |live: &LiveNode<V>| {
+        if let Some(window) = settle {
+            live.waker().wait(&stop, window);
+        }
+    };
+    loop {
+        let pass = live.sync_once(mailbox, bulk.as_mut())?;
+        report.passes += 1;
+        report.accepted += pass.drained.accepted;
+        report.duplicates += pass.drained.duplicates;
+        report.deferred += pass.drained.deferred;
+        report.skipped += pass.drained.skipped;
+        report.discarded += pass.drained.discarded;
+        report.manifests += pass.fetched.manifests;
+        report.snapshot_bodies += pass.fetched.snapshot_bodies;
+        report.objects += pass.fetched.objects;
+        report.unfulfilled += pass.fetched.unfulfilled;
+        report.unfetchable_heads = pass.pending_heads;
+        let progressed = pass.drained.accepted > 0
+            || pass.fetched.manifests > 0
+            || pass.fetched.snapshot_bodies > 0
+            || pass.fetched.objects > 0
+            || pass.published;
+        if live.is_quiet(&pass)? {
+            // Settle then confirm: mail in flight during the verdict
+            // shows up here instead of being missed by the exit.
+            park(live);
+            let confirm = live.sync_once(mailbox, bulk.as_mut())?;
+            report.passes += 1;
+            report.accepted += confirm.drained.accepted;
+            report.duplicates += confirm.drained.duplicates;
+            report.deferred += confirm.drained.deferred;
+            report.skipped += confirm.drained.skipped;
+            report.discarded += confirm.drained.discarded;
+            report.manifests += confirm.fetched.manifests;
+            report.snapshot_bodies += confirm.fetched.snapshot_bodies;
+            report.objects += confirm.fetched.objects;
+            report.unfulfilled += confirm.fetched.unfulfilled;
+            report.unfetchable_heads = confirm.pending_heads;
+            if live.is_quiet(&confirm)? {
+                report.outcome = RunOutcome::Quiet;
+                break;
+            }
+            stalled_streak = 0;
+        } else if !progressed && pass.pending_heads > 0 && live.pending_obligations()?.is_empty() {
+            stalled_streak += 1;
+            if stalled_streak >= 2 {
+                report.outcome = RunOutcome::RemoteStalled;
+                break;
+            }
+            park(live);
+        } else {
+            stalled_streak = 0;
+            if !progressed {
+                park(live);
+            }
+        }
+        if report.passes >= MAX_SYNC_NOW_PASSES {
+            report.outcome = RunOutcome::PassLimit;
+            break;
+        }
+    }
+    report.pending = live.pending_obligations()?.len();
+    Ok(report)
+}
+
+/// Render a structured status report. Built as a string so tests
+/// assert the rendering without capturing stdout.
+fn sync_status_render(status: &SyncStatus) -> String {
+    /// Group pending pairs by their leading identity for per-item
+    /// display: one line per snapshot, transition, or epoch. A renderer
+    /// helper, kept next to its only consumer rather than in the
+    /// observation module.
+    fn group_pending<T: Ord + Copy>(pairs: &[(T, wyrd_format::DeviceId)]) -> BTreeMap<T, usize> {
+        let mut grouped = BTreeMap::new();
+        for (id, _) in pairs {
+            *grouped.entry(*id).or_insert(0) += 1;
+        }
+        grouped
+    }
+    let mut out = String::new();
+    match &status.tip {
+        Some(tip) => {
+            out.push_str(&format!("epoch {} tip {}\n", tip.epoch, tip.transition_id));
+            let held = status
+                .held_epochs
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!("held secrets: {held}\n"));
+        }
+        None => out.push_str("membership: none observed\n"),
+    }
+    let totals = &status.totals;
+    let pending = &status.obligations;
+    out.push_str(&format!(
+        "outbox announcements: {} queued, {} delivered, {} pending\n",
+        totals.announcements_queued,
+        totals.announcements_delivered,
+        pending.announcements.len(),
+    ));
+    for (snapshot, count) in group_pending(&pending.announcements) {
+        out.push_str(&format!("  snapshot {snapshot}: {count} pending\n"));
+    }
+    out.push_str(&format!(
+        "outbox transitions: {} queued, {} delivered, {} pending\n",
+        totals.transitions_queued,
+        totals.transitions_delivered,
+        pending.transitions.len(),
+    ));
+    for (id, count) in group_pending(&pending.transitions) {
+        out.push_str(&format!("  transition {id}: {count} pending\n"));
+    }
+    out.push_str(&format!(
+        "outbox capabilities: {} queued, {} delivered, {} pending\n",
+        totals.capabilities_queued,
+        totals.capabilities_delivered,
+        pending.capabilities.len(),
+    ));
+    for (epoch, count) in group_pending(&pending.capabilities) {
+        out.push_str(&format!("  epoch {epoch}: {count} pending\n"));
+    }
+    if status.live_heads.is_empty() {
+        out.push_str("live heads: none\n");
+    } else {
+        out.push_str(&format!("live heads: {}\n", status.live_heads.len()));
+        for head in &status.live_heads {
+            out.push_str(&format!(
+                "  {} epoch {} author {}\n",
+                head.id, head.epoch, head.author
+            ));
+        }
+    }
+    let classes = &status.head_classes;
+    out.push_str(&format!(
+        "heads classified: {} eligible, {} canonical-history, {} superseded, {} stranded, {} voided, {} pending, {} rejected\n",
+        classes.eligible,
+        classes.canonical_history,
+        classes.superseded,
+        classes.stranded,
+        classes.voided,
+        classes.pending,
+        classes.rejected,
+    ));
+    if status.mailbox.configured_relays == 0 {
+        out.push_str("mailbox: idle (no --relay given)\n");
+    } else {
+        out.push_str(&format!(
+            "mailbox: {} relays configured (liveness visible on sync now or mount)\n",
+            status.mailbox.configured_relays
+        ));
+    }
+    out
+}
+
+/// Render a headless run report. Built as a string so tests assert
+/// the rendering without capturing stdout.
+fn sync_now_render(report: &SyncRunReport) -> String {
+    let mut out = format!(
+        "sync now: {} passes, intake {} accepted ({} duplicates, {} deferred, {} skipped, {} discarded), fetch {} manifests, {} bodies, {} objects ({} unfulfilled), {} obligations pending, {} unfetchable heads\n",
+        report.passes,
+        report.accepted,
+        report.duplicates,
+        report.deferred,
+        report.skipped,
+        report.discarded,
+        report.manifests,
+        report.snapshot_bodies,
+        report.objects,
+        report.unfulfilled,
+        report.pending,
+        report.unfetchable_heads,
+    );
+    match report.outcome {
+        RunOutcome::Quiet => out.push_str("completed: quiet\n"),
+        RunOutcome::RemoteStalled => out.push_str(&format!(
+            "completed: quiet with {} unfetchable heads (known but not local)\n",
+            report.unfetchable_heads,
+        )),
+        RunOutcome::PassLimit => out.push_str(&format!(
+            "stopped: pass limit ({MAX_SYNC_NOW_PASSES}) reached; sync may be incomplete\n"
+        )),
+    }
+    out
+}
+
+/// Map a headless run outcome to the process result: quiet and
+/// remote-stalled succeed (the latter has nothing local left to
+/// do), a capped run fails as incomplete with its pass and pending
+/// counts. Tested directly; `sync_now` channels through it.
+fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
+    match report.outcome {
+        RunOutcome::Quiet | RunOutcome::RemoteStalled => Ok(()),
+        RunOutcome::PassLimit => Err(CliError::Incomplete {
+            passes: report.passes,
+            pending: report.pending,
+        }),
+    }
+}
+
+/// Headless sync over the keystore: `status` observes durable state
+/// only (no intake, no send, no seen-log or outbox mutation — the
+/// relay list only labels the mailbox line), `now` runs the mount's
+/// sync machinery without any presentation backend.
+fn sync(
+    drive_dir: PathBuf,
+    relays: Vec<String>,
+    action: SyncAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    match action {
+        SyncAction::Status => {
+            let engine = Engine::open_keystore(drive_dir, passphrase, identity)?;
+            let status = observe(&engine, relays.len())?;
+            print!("{}", sync_status_render(&status));
+            Ok(())
+        }
+        SyncAction::Now => sync_now(drive_dir, relays, passphrase, identity),
+    }
+}
+
+/// One bounded headless run: the mount's composition minus
+/// presentation. No FUSE session, no serving endpoint — so
+/// announcements discharge without a retrieval route (route-less
+/// authoring: the snapshot is authored and announced, and peers
+/// learn it as known-but-unfetchable until a later mount publishes
+/// a route). Same live budgets as mount via `for_local_sync`.
+fn sync_now(
+    drive_dir: PathBuf,
+    relays: Vec<String>,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> = WyrdNode::new(
+        engine,
+        FsObjectStore::open(drive_dir.clone())
+            .map_err(|error| CliError::Store(error.to_string()))?,
+    )?;
+    daemon.refresh_live_heads()?;
+    let config = LiveConfig::for_local_sync();
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
+    // The headless consumer has no presentation backend: the live
+    // parts (projection handle, wants, mutations) are owned but
+    // never served. Dropping them here is the same shape the
+    // composition tests use; the queue stays open but nobody
+    // submits, so passes only ever see intake and fetch work.
+    drop(parts);
+    let signer_keys = identity.signer_keys();
+    let open_secret = signer_keys.secret_key().clone();
+    let seen_path = drive_dir.join("mailbox.seen");
+    let mut mailbox = LiveMailbox::connect(signer_keys, open_secret, relays.clone(), seen_path)?;
+    // Arrival short-circuits the settle parks below the way it
+    // short-circuits the mount's idle wait: without this, every park
+    // burns its full window even as mail lands.
+    mailbox.attach_waker(Arc::clone(live.waker()));
+    let settle = if relays.is_empty() {
+        eprintln!("warning: no --relay given; control-plane intake stays idle");
+        None
+    } else {
+        Some(SYNC_NOW_SETTLE)
+    };
+    let mut bulk = Some(bind_bulk_source()?);
+    let report = drive_quiet(&mut live, &mut mailbox, &mut bulk, settle);
+    // Liveness as observed, not inferred: the run connected, so it
+    // reports what the relay attachment actually did.
+    let health = mailbox.health();
+    println!(
+        "mailbox: {} ({} of {} relays connected)",
+        if health.is_live() { "live" } else { "degraded" },
+        health.connected_relays,
+        health.total_relays,
+    );
+    // Teardown mirrors mount's transport shutdown in miniature: stop
+    // the mailbox tasks under a bounded deadline, then close bulk.
+    // A sync failure still tears transport down before returning it.
+    mailbox.shutdown(SHUTDOWN_DEADLINE);
+    let bulk_status = bulk
+        .take()
+        .map(|bulk| bulk.shutdown(TRANSPORT_SHUTDOWN_DEADLINE))
+        .unwrap_or(Ok(()))
+        .map_err(CliError::Bulk);
+    drop(bulk);
+    drop(live);
+    let report = report?;
+    print!("{}", sync_now_render(&report));
+    let outcome = run_outcome_error(&report);
+    combine_status(TeardownStatus {
+        loop_result: outcome,
+        session_result: Ok(()),
+        bulk_result: bulk_status,
+        serving_result: Ok(()),
+    })
 }
 
 /// Bind the fetch side's iroh endpoint (N0 relays for peer
@@ -1758,3 +2240,5 @@ mod tests_mount;
 mod tests_probes;
 #[cfg(test)]
 mod tests_snapshot;
+#[cfg(test)]
+mod tests_sync;

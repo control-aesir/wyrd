@@ -295,3 +295,31 @@ fn credential_contents_never_appear_in_errors() {
     let text = format!("{error}");
     assert!(!text.contains("ssss"), "oversized content leaked: {text}");
 }
+
+/// Every `src/*.rs` file is reachable from a `mod` declaration: an
+/// orphaned test module compiles nothing and fails nothing, so the
+/// wiring itself needs a pin. Reads the source tree at the
+/// build-time manifest directory; every file but `main.rs` must be
+/// named by a `mod <stem>;` line in `main.rs`.
+#[test]
+fn every_src_file_is_a_declared_module() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let main = fs::read_to_string(src.join("main.rs")).unwrap();
+    let mut orphaned = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&src).unwrap().collect();
+    entries.sort_by_key(|entry| entry.as_ref().unwrap().file_name());
+    for entry in entries {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
+        if stem == "main" {
+            continue;
+        }
+        if !main.contains(&format!("mod {stem};")) {
+            orphaned.push(name);
+        }
+    }
+    assert!(orphaned.is_empty(), "uncompiled modules: {orphaned:?}");
+}

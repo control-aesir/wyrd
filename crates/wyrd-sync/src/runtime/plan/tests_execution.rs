@@ -18,9 +18,9 @@ use crate::durable::CrashStage;
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
-    admit_engine, announcement_msg, announcement_msg_with, body_root, deliver, drain, fixture,
-    identity_secret, intake_body, intake_published, intake_snapshot, publish_into, queue, reopen,
-    AnnouncedRoots, TestDir,
+    admit_engine, announcement_msg, announcement_msg_with, body_root, capability_message, deliver,
+    drain, empty_roots, fixture, identity_secret, intake_body, intake_published, intake_snapshot,
+    publish_into, queue, reopen, transition_message, AnnouncedRoots, TestDir,
 };
 use crate::runtime::MaterializationState;
 use crate::seal::{blob_root, entry_for, seal_manifest, SEAL_VERSION};
@@ -89,6 +89,83 @@ fn planned_body_with_announcement_resolves() {
     runtime.record_announcement(announcement.clone()).unwrap();
     let found = planned_announcement(&runtime, &announcement.snapshot).unwrap();
     assert_eq!(found, &announcement);
+}
+
+/// A route-less announcement is known-but-unfetchable, never
+/// corruption: intake accepts the snapshot into the announcement
+/// projection, and the fetch plan reports absence (`missing`) rather
+/// than rejection (`invalid`). This is the route-less authoring
+/// contract headless sync relies on: a snapshot authored and
+/// announced without a serving route must not poison a peer's intake
+/// or plan — the peer learns the snapshot and waits for a route.
+#[test]
+fn routeless_announcement_is_known_but_unfetchable() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let body = intake_body(&builder, &admission);
+    // Honest roots derived (and served) into a throwaway bulk: the
+    // announcement below names them, but the fetch plane under test
+    // holds nothing.
+    let mut throwaway = MemoryBulkSource::default();
+    let roots = empty_roots(
+        &mut throwaway,
+        &epoch_secret,
+        admission.epoch,
+        &body.snapshot_id(),
+    );
+    let secrets = vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret];
+    let bound = announcement_msg_with(
+        &identity_secret(&builder.sk),
+        body.snapshot_id(),
+        admission.epoch,
+        admission.transition_id(),
+        body_root(&body),
+        roots.manifest,
+        roots.transport,
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(
+            &fixture,
+            admission.epoch,
+            &capability_message(
+                fixture.recipient,
+                admission.transition_id(),
+                admission.epoch,
+                secrets,
+            ),
+        ),
+        deliver(&fixture, admission.epoch, &bound),
+    ];
+    queue(&mut fixture, mail);
+    let drained = drain(&mut fixture);
+    assert_eq!(drained.accepted, 4, "route-less announcement is accepted");
+    // Known: the announcement projection holds the snapshot.
+    let runtime = fixture.engine.runtime_state().unwrap();
+    planned_announcement(&runtime, &body.snapshot_id()).unwrap();
+    // Unfetchable: nothing is served, so the plan reports absence —
+    // missing candidates, never invalid rejections or transport
+    // errors.
+    let mut objects = MemoryObjectStore::default();
+    let mut bulk = MemoryBulkSource::default();
+    let fetched = fixture
+        .engine
+        .execute_plan(&mut bulk, &mut objects)
+        .unwrap();
+    assert!(
+        fetched.unfulfilled > 0,
+        "closure cannot complete without bytes"
+    );
+    assert!(fetched.missing > 0, "no candidate is peer absence");
+    assert_eq!(fetched.invalid, 0, "absence is not corruption");
+    assert_eq!(
+        fetched.transport_errors, 0,
+        "absence is not a failing transport"
+    );
 }
 
 #[test]

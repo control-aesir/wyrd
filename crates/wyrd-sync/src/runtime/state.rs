@@ -42,6 +42,20 @@ pub struct RuntimeReconcile {
     pub pending_objects: BTreeMap<ContentId, Vec<PendingObjectFetch>>,
 }
 
+/// Queued vs delivered outbox counts per obligation class, as
+/// observed from durable state. Pending is always queued minus
+/// delivered; the three numbers travel together so status consumers
+/// never have to infer the arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutboxTotals {
+    pub announcements_queued: usize,
+    pub announcements_delivered: usize,
+    pub transitions_queued: usize,
+    pub transitions_delivered: usize,
+    pub capabilities_queued: usize,
+    pub capabilities_delivered: usize,
+}
+
 /// Durably retained runtime sync state: the live view rebuilds from
 /// committed durable facts (transitions, announcements, manifests,
 /// residency mutations) via the fact/replay path, so this struct
@@ -251,6 +265,22 @@ impl RuntimeState {
         self.announcement_route_sealed
             .get(&(*snapshot, route.to_vec()))
             .map(Vec::as_slice)
+    }
+
+    /// Queued vs delivered obligation counts per class: the durable
+    /// source for pending (= queued minus delivered) displays. Counts
+    /// only; the itemized pending lists come from `pending_*`.
+    /// Built as a value so status consumers observe without touching
+    /// queue internals.
+    pub fn outbox_totals(&self) -> OutboxTotals {
+        OutboxTotals {
+            announcements_queued: self.announcement_queued.len(),
+            announcements_delivered: self.announcement_delivered.len(),
+            transitions_queued: self.transition_queued.len(),
+            transitions_delivered: self.transition_delivered.len(),
+            capabilities_queued: self.capability_queued.len(),
+            capabilities_delivered: self.capability_delivered.len(),
+        }
     }
 
     /// Every still-undischarged obligation, in `(snapshot, recipient)`

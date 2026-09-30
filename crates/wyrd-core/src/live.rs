@@ -7,8 +7,8 @@
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
-    chunk, ContentId, Entry, FetchStatus, ObjectStore, RetainedBytes, SharedStore, SnapshotId,
-    StoreError, StoreFailure, Tree,
+    chunk, ContentId, DeviceId, Entry, FetchStatus, ObjectStore, RetainedBytes, SharedStore,
+    SnapshotId, StoreError, StoreFailure, TransitionId, Tree,
 };
 use wyrd_sync::closure::ClosureError;
 use wyrd_sync::durable::{AuthorizedSnapshot, DurableError};
@@ -151,6 +151,7 @@ pub enum LiveError {
 /// the fetch report (`Default` — all zeros — when no bulk source was
 /// provided and nothing could be fetched), plus whether the pass
 /// published a new serving generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncReport {
     /// Control-plane intake: accepted, duplicates, deferred, skipped,
     /// discarded.
@@ -177,6 +178,34 @@ pub struct LiveSummary {
     pub passes: u64,
     /// Transient pass failures absorbed under the error cap.
     pub errors_retried: u64,
+}
+
+/// Still-undischarged outbox obligations, itemized per class: queued
+/// pairs minus delivered ones, in deterministic order. The status
+/// half of the outbox picture; [`OutboxTotals`] carries the
+/// queued/delivered counts the pending lists subtract.
+///
+/// [`OutboxTotals`]: wyrd_sync::runtime::OutboxTotals
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingObligations {
+    /// `(snapshot, recipient)` pairs still owed an announcement.
+    pub announcements: Vec<(SnapshotId, DeviceId)>,
+    /// `(transition, recipient)` pairs still owed delivery.
+    pub transitions: Vec<(TransitionId, DeviceId)>,
+    /// `(epoch, recipient)` pairs still owed a capability.
+    pub capabilities: Vec<(u64, DeviceId)>,
+}
+
+impl PendingObligations {
+    /// True when nothing is owed anywhere: the converged outbox.
+    pub fn is_empty(&self) -> bool {
+        self.announcements.is_empty() && self.transitions.is_empty() && self.capabilities.is_empty()
+    }
+
+    /// Total pairs owed across all three classes.
+    pub fn len(&self) -> usize {
+        self.announcements.len() + self.transitions.len() + self.capabilities.len()
+    }
 }
 
 /// Supervision policy for [`LiveNode::run_loop`].
@@ -249,6 +278,17 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
+    /// Budgets and ceilings for every local live consumer: the
+    /// mounted projection today, headless sync alongside it. One
+    /// constructor so a future mount-specific tuning cannot silently
+    /// diverge the headless path's safety bounds — several of these
+    /// ceilings are correctness boundaries, not tuning knobs. All
+    /// local live consumers must construct through here; tests keep
+    /// `Default` for targeted overrides.
+    pub fn for_local_sync() -> Self {
+        Self::default()
+    }
+
     /// A config with a retention ceiling, and the accountant to hand to
     /// the store that maintains it.
     ///
@@ -777,6 +817,14 @@ where
         self.node_addr = node_addr;
     }
 
+    /// The retrieval route announcements currently discharge with:
+    /// `None` until a composer with a serving endpoint installs one.
+    /// Headless compositions never set it, so their announcements are
+    /// route-less by construction (known-but-unfetchable to peers).
+    pub fn node_addr(&self) -> Option<&[u8]> {
+        self.node_addr.as_deref()
+    }
+
     /// Install the serving-mirror readiness barrier for announcement
     /// discharge: the composer passes its serving endpoint (shared
     /// ownership — the endpoint lifecycle stays with the composer).
@@ -1159,6 +1207,21 @@ where
             // mail waiting on an epoch key, and nonzero discarded means
             // terminal poison — each a different operator conclusion
             // from the same silent symptom (a peer that never converges).
+            // Pending heads are an honest observation here, not a
+            // hardcoded zero: one-shot consumers loop on `is_quiet`,
+            // and a zero would read as converged while a
+            // known-but-unfetchable head is outstanding. Costs one
+            // closure scan per idle pass; idle passes are otherwise
+            // cheap, and the convergence verdict is worth it.
+            let pending_heads = {
+                let heads = self.engine.live_heads()?;
+                if heads.is_empty() {
+                    0
+                } else {
+                    let store = self.store.read().map_err(|_| LiveError::Lock)?;
+                    partition_heads(&completed_runtime, heads, &*store)?.pending
+                }
+            };
             tracing::debug!(
                 accepted = drained.accepted,
                 duplicates = drained.duplicates,
@@ -1167,6 +1230,7 @@ where
                 discarded = drained.discarded,
                 revision = revision,
                 eligible_heads = self.published_heads,
+                pending_heads = pending_heads,
                 "sync pass idle: revision unchanged, outbox empty"
             );
             return Ok(SyncReport {
@@ -1174,7 +1238,7 @@ where
                 fetched,
                 published: false,
                 generation,
-                pending_heads: 0,
+                pending_heads,
             });
         }
         // Per-class projection: verified heads publish, pending ones
@@ -1972,6 +2036,44 @@ where
         self.engine
             .pending_announcements()
             .map_err(LiveError::Engine)
+    }
+
+    /// Every still-undischarged obligation across all three classes,
+    /// itemized. A pure observation over durable state: it performs
+    /// no sync work and commits nothing.
+    pub fn pending_obligations(&self) -> Result<PendingObligations, LiveError> {
+        let state = self.engine.runtime_state().map_err(LiveError::Engine)?;
+        Ok(PendingObligations {
+            announcements: state.pending_announcements(),
+            transitions: state.pending_transitions(),
+            capabilities: state.pending_capabilities(),
+        })
+    }
+
+    /// Whether the last pass left no actionable work: a pure
+    /// observation over the pass report plus the durable outbox. It
+    /// performs no sync work itself — intake, fetch, and publish
+    /// happen only in `sync_once` — so polling it never advances
+    /// state, and it is the authority one-shot consumers loop on.
+    /// Accepted intake, fetched content, a new publication, pending
+    /// head closures, or a non-empty outbox all mean work remains;
+    /// deferred, skipped, duplicate, and discarded intake do not —
+    /// they wait on remote state or are already settled, so an
+    /// immediate follow-up pass could not advance them.
+    pub fn is_quiet(&self, report: &SyncReport) -> Result<bool, LiveError> {
+        if report.drained.accepted > 0
+            || report.fetched.manifests > 0
+            || report.fetched.snapshot_bodies > 0
+            || report.fetched.objects > 0
+            || report.published
+            || report.pending_heads > 0
+        {
+            return Ok(false);
+        }
+        Ok(!self
+            .engine
+            .has_pending_outbound()
+            .map_err(LiveError::Engine)?)
     }
 
     /// The served generation count. Bumps exactly when a pass

@@ -64,6 +64,10 @@ fn poison_flood_stays_memory_only_at_scale() {
             assert!(start.elapsed() < DEADLINE, "poison flood converges");
             let mut progressed = false;
             while let Some(delivery) = mailbox.recv().unwrap() {
+                // Same guard as the outer loop: a re-offered unsettled
+                // id would spin this inner loop past the deadline
+                // without ever reaching it — fail loudly instead.
+                assert!(start.elapsed() < DEADLINE, "poison flood converges");
                 progressed = true;
                 // Settle inside the drain loop: collecting without
                 // settling would rotate held mail forever instead of
@@ -134,6 +138,7 @@ fn poison_redelivers_after_restart_without_durable_growth() {
     while settled < FLOOD {
         assert!(start.elapsed() < DEADLINE, "poison converges");
         while let Some(delivery) = mailbox.recv().unwrap() {
+            assert!(start.elapsed() < DEADLINE, "poison converges");
             mailbox.settle(delivery.id(), Disposition::Poison).unwrap();
             settled += 1;
         }
@@ -153,6 +158,7 @@ fn poison_redelivers_after_restart_without_durable_growth() {
     while resettled < FLOOD {
         assert!(start.elapsed() < DEADLINE, "poison redelivers");
         while let Some(delivery) = replay.recv().unwrap() {
+            assert!(start.elapsed() < DEADLINE, "poison redelivers");
             replay.settle(delivery.id(), Disposition::Poison).unwrap();
             resettled += 1;
         }
@@ -195,6 +201,7 @@ fn poison_and_ack_share_the_settlement_watermark() {
     while settled < 3 {
         assert!(start.elapsed() < DEADLINE, "mail arrives");
         while let Some(delivery) = mailbox.recv().unwrap() {
+            assert!(start.elapsed() < DEADLINE, "mail arrives");
             if settled == 0 {
                 mailbox.settle(delivery.id(), Disposition::Poison).unwrap();
                 assert_eq!(mailbox.settled_below(), 1);
@@ -288,6 +295,11 @@ fn retry_flood_holds_at_most_one_window() {
         mailbox.settled_below(),
         0,
         "retries settle nothing terminally"
+    );
+    assert_eq!(
+        mailbox.unacked.len(),
+        MAX_UNACKED_DELIVERIES,
+        "a backlog larger than the window keeps the window full — the bound engaged, not just held"
     );
     let lines = std::fs::read_to_string(&seen_path)
         .expect("seen log reads")

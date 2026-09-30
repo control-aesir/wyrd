@@ -113,7 +113,7 @@ fn accept_envelope(
         // retryable unknown. Consume it without a fact. Oversize
         // ciphertext/decrypted bytes (`MailboxError::Oversize`) land here
         // too: the mailbox already rejected them before ingest, and the
-        // relay retains nothing for an acked handover.
+        // relay retains nothing for a settled handover.
         Ok(bytes) => bytes,
         Err(error) => {
             // Per-envelope forensics: a stuck peer shows identical

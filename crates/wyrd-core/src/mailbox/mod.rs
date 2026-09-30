@@ -315,8 +315,11 @@ pub(super) const MAX_SEEN_ENTRIES: usize = 65_536;
 /// Most undecryptable wrap ids remembered in-session. Pre-envelope
 /// garbage is never recorded durably — it cannot become a permanent
 /// entry — but remembering recent poison avoids re-decrypting the same
-/// wraps on every replay. Evicted poison simply decrypts again on its
-/// next receipt; restarts re-decrypt once and re-discard.
+/// wraps on every replay. The budget is shared with engine-level
+/// discards (see `poison`): the two classes evict each other, so under
+/// a mixed flood each class's effective retention is roughly halved
+/// relative to its arrival rate. Evicted poison simply decrypts again
+/// on its next receipt; restarts re-decrypt once and re-discard.
 #[cfg(test)]
 const MAX_POISON_ENTRIES: usize = 128;
 #[cfg(not(test))]
@@ -636,8 +639,14 @@ pub struct LiveMailbox<S> {
     /// boot, so a repeated or delayed settle is an idempotent no-op
     /// (the `Mailbox` contract requires a repeated `Ack` to succeed)
     /// without retaining every consumed id for the mailbox lifetime.
-    /// The outstanding set stays near the unacked depth — it only holds
-    /// settled ids whose predecessors are still held.
+    /// The outstanding set stays near the unacked depth while every
+    /// predecessor settles terminally — it only holds settled ids
+    /// whose predecessors are still held. A predecessor held
+    /// indefinitely (a delivery deferred on an unknown epoch that
+    /// settles `Retry` forever) pins the watermark: every later
+    /// settled id lands in `outstanding` and stays for the process
+    /// lifetime, so the set itself is unbounded in that shape and
+    /// only the per-id cost (~8 bytes) is small.
     settled_below: u64,
     outstanding: HashSet<DeliveryId>,
     next_delivery: u64,
@@ -988,8 +997,10 @@ where
     /// Forget a settled handover: drop it from the held queue and
     /// advance the settlement watermark. Shared by consumption and
     /// poison — both are terminal, so both must keep the watermark
-    /// moving, or ids settled after a poisoned one would accumulate
-    /// in the outstanding set without bound.
+    /// moving whenever predecessors settle terminally too. If a
+    /// predecessor is held indefinitely (endless `Retry`), the mark
+    /// cannot advance past it and later settled ids accumulate in
+    /// `outstanding` — see the field docs.
     fn forget_held(&mut self, pos: usize, id: DeliveryId) {
         self.unacked.remove(pos);
         // Idempotent-settlement bookkeeping: ids are dense

@@ -16,7 +16,12 @@ use std::time::{Duration, Instant};
 fn poison_flood_stays_memory_only_at_scale() {
     const FLOOD: usize = 100_000;
     const CHUNK: usize = 2_000;
-    const DEADLINE: Duration = Duration::from_secs(1200);
+    // Wall-clock generous on purpose: the workload is 100k NIP-59 seals
+    // plus draining, and a 2x-slower runner must still pass — a tight
+    // deadline here would assert machine speed, not the bound. The test
+    // only takes as long as it takes, and it is excluded from the
+    // default profile.
+    const DEADLINE: Duration = Duration::from_secs(3600);
     let relay = MiniRelay::spawn();
     let url = relay.url().to_string();
     let sender = sender_keys();

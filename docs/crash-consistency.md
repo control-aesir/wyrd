@@ -203,11 +203,12 @@ actually rejecting warns at the default log level. Pinned by
 ## Mailbox ack and intake
 
 Commit precedes settle per envelope: accepted/duplicates ack,
-discards settle Poison, deferred/held/skipped retry. A commit failure resyncs and never
-settles that envelope, so it redelivers. Suppression verdicts and
-pending queues are memory-only and revalidate after restart; poison
-settlements are memory-only too, so redelivery re-poisons; the
-durable seen set survives for consumption. Pinned by the intake restart suite
+discards settle Poison, deferred/held/skipped retry. A commit
+failure resyncs and never settles that envelope, so it redelivers.
+Suppression verdicts and pending queues are memory-only and
+revalidate after restart; poison settlements are memory-only too,
+so redelivery re-poisons; the durable seen set survives for
+consumption. Pinned by the intake restart suite
 (`intake/tests_pipeline.rs`: crash-before-commit redelivery,
 suppression revalidation, redelivery-stays-duplicate) and the
 resilience suite (`intake/tests_resilience.rs`).

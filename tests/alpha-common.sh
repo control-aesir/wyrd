@@ -49,13 +49,19 @@ collect_logs() {
   # -e`, on shares the guest may not be able to write, and a
   # teardown failure must never flip the run's verdict. The copy
   # itself is time-boxed — an unwritable 9p share must not turn the
-  # bounded exit this trap exists for into a new hang. Report which
-  # outcome happened; never claim a copy that failed.
+  # bounded exit this trap exists for into a new hang. Report the
+  # real outcome: a timeout (124) means slow, any other status
+  # means failed, and the copy's own stderr carries the reason.
   mkdir -p "$HOST_LOGS" 2>/dev/null || true
-  if timeout 60 cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null; then
+  if timeout 60 cp -r "$LOGDIR/." "$HOST_LOGS/"; then
     echo "logs collected under $HOST_LOGS"
   else
-    echo "log copy failed (share unavailable), logs stay in $LOGDIR" >&2
+    local rc=$?
+    if [[ $rc -eq 124 ]]; then
+      echo "log copy exceeded 60s, logs stay in $LOGDIR" >&2
+    else
+      echo "log copy failed (exit $rc), logs stay in $LOGDIR" >&2
+    fi
   fi
 }
 

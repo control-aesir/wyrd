@@ -46,11 +46,14 @@ corrupted or invalid state from being accepted? Performance work enters v0.2
 only when current behavior violates an operational bound; otherwise the
 sequence is correctness, measure, optimize, prove equivalence.
 
-Project rule, all milestones: the protocol and core layers never know
-whether their consumer is FUSE, a desktop application, iOS, Android, or a
-vault. Presentation surfaces are adapters around `wyrd-core` and the daemon,
-never the architecture. Platform clients may differ in process, lifecycle,
-storage, and IPC architecture; they must nevertheless consume the same core
+Project rule, all milestones: the protocol and synchronization semantics
+never depend on whether the consumer is FUSE, a desktop application, iOS,
+Android, or a vault. Presentation surfaces are adapters around `wyrd-core`
+and the daemon, never the architecture. Platform clients may differ in
+process, lifecycle, storage, and IPC architecture, and legitimate
+platform-specific abstractions (persistence capabilities, lifecycle,
+resource budgets, key storage) are inputs to the core, not knowledge of
+which product is calling; they must nevertheless consume the same core
 synchronization and state semantics rather than reimplementing them. This
 is the constraint that keeps the v0.4 through v0.7 product work from
 turning the daemon into an unmaintainable universal application.
@@ -232,9 +235,10 @@ unattended operation, not the production vault network (see v0.7).
 
 Distribution as dogfood of that operator system: seeder vault, Wyrd drive
 releases, signed manifests, multi-source retrieval, `wyrd-get`, frozen
-public-read subset. Wyrd uses Wyrd to distribute Wyrd. Distribution must
-never become the schedule driver for the core durability and recovery
-work above.
+public-read subset. Wyrd uses Wyrd to distribute Wyrd. Distribution is a
+v0.3 target for dogfooding — an optional validation track, not a v0.3 exit
+criterion — and must never become the schedule driver for the core
+durability and recovery work above.
 
 ### v0.3 architecture: consolidation after the semantics stabilize
 
@@ -317,7 +321,11 @@ Production vault network: multiple independently operated vaults providing
 durable, policy-controlled infrastructure for drives — unattended
 replication, replication and residency policy, storage and bandwidth
 quotas, peer admission and removal, relay configuration, encrypted-at-rest
-storage, monitoring, backup, upgrade, migration, operational alerts, and
+storage, monitoring, a backup and redundancy strategy appropriate to the
+vault's retention and recovery contract (whether "backup" means another
+Wyrd vault holding replicated state or an independent disaster-recovery
+copy with its own retention semantics is a v0.7 design decision, not an
+accident), upgrade, migration, operational alerts, and
 mobile wake and background workflows as a supported operational topology.
 Vaults stay ordinary protocol participants, not privileged servers.
 
@@ -337,8 +345,8 @@ long-lived promises.
 
 Exit condition: no known consumer-facing change requires changing object
 identity, serialization, authorization, membership, epoch, recovery,
-conflict, storage, or compatibility semantics. After this point, changing
-the protocol becomes an exceptional event.
+conflict, storage, compatibility, or user-visible drive semantics. After
+this point, changing the protocol becomes an exceptional event.
 
 Protocol: versioned fact payloads, capability negotiation, mixed-version
 policy, compatibility matrix, migration machinery, retention refusal

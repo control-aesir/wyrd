@@ -93,7 +93,9 @@ Lima for macOS dev iteration and as the refactor guard.)
 - Any background process the harness starts (mounts, the relay) inherits its
   stdout, so a `die` that leaves one running makes the host wrapper wait on a
   pipe that never closes. The harness reaps them in an EXIT trap; keep it that
-  way when adding steps.
+  way when adding steps. Order matters: the relay must be stopped before the
+  trap's bare `wait` reaps (`reap_background` in tests/alpha-lima.sh) — a new
+  background job must join that order, not just the trap.
 - The guest's drive state is under `/tmp/wyrd-e2e` (guest-local disk, never
   the 9p share: FUSE mountpoints and drive dirs over 9p are unsupported);
   logs per run in `/tmp/wyrd-e2e/logs`.

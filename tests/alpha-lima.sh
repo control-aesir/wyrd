@@ -514,16 +514,17 @@ main() {
   mkdir -p "$MNTS" "$LOGDIR"
   cleanup_mounts
   # Any exit — a failed check included — stops the relay first,
-  # then unmounts and reaps. Order is the fix: the relay is a
-  # background job of this shell, so cleanup_mounts' bare `wait`
-  # would block on it forever if it were still alive, and the host's
-  # `limactl shell` would wait on a pipe that never closes. A
-  # surviving background process of any kind strands the run the
-  # same way — this trap, in this order, is what makes a failed
-  # step fail instead of hang.
+  # then unmounts, reaps, and collects the logs. Order is the fix:
+  # the relay is a background job of this shell, so
+  # cleanup_mounts' bare `wait` would block on it forever if it
+  # were still alive, and the host's `limactl shell` would wait on
+  # a pipe that never closes. Mounts and the relay are the two job
+  # classes the suite starts: a new background job must join this
+  # reap order, or it re-creates the hang.
   reap_background() {
     stop_relay
     cleanup_mounts
+    collect_logs
   }
   trap reap_background EXIT
   # A run killed while step 6 throttled loopback leaves the qdisc

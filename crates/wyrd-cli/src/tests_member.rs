@@ -331,3 +331,72 @@ fn member_set_owner_carries_files_forward() {
     assert_eq!(heads[0].snapshot().tree, tree);
     assert_eq!(heads[0].snapshot().parents, vec![first]);
 }
+
+/// Resolve rejects malformed ids at the argument boundary, before any
+/// engine state is touched.
+#[test]
+fn member_resolve_rejects_malformed_ids() {
+    let fixture = Fixture::new();
+    let error = command(fixture.args(vec![
+        "resolve".into(),
+        "not-hex".into(),
+        "--void".into(),
+        "00".into(),
+    ]))
+    .unwrap_err();
+    assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
+}
+
+/// Resolve on an unfrozen drive fails closed with the engine's
+/// verdict, authoring nothing.
+#[test]
+fn member_resolve_without_conflict_fails_closed() {
+    use wyrd_sync::runtime::EngineError;
+    let fixture = Fixture::new();
+    let tip = fixture.open().membership_log().known_state().expect("tip");
+    let error = command(fixture.args(vec![
+        "resolve".into(),
+        tip.transition_id.to_string(),
+        "--void".into(),
+        "00".repeat(32),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::NoFrozenConflict)),
+        "unexpected: {error:?}"
+    );
+    let after = fixture.open().membership_log().known_state().expect("tip");
+    assert_eq!(after.transition_id, tip.transition_id, "nothing authored");
+    assert_eq!(after.epoch, tip.epoch, "no new epoch");
+}
+
+/// A refused resolve stages the live head as a carry obligation
+/// ahead of authoring — benign and visible: the next drain
+/// discharges it without authoring while the head stays eligible.
+/// Membership itself is untouched.
+#[test]
+fn member_resolve_refusal_stages_carry_without_transition() {
+    let fixture = Fixture::new();
+    let (_tree, head) = write_file(&fixture, "kept.txt", b"kept");
+    let tip = fixture.open().membership_log().known_state().expect("tip");
+    let error = command(fixture.args(vec![
+        "resolve".into(),
+        tip.transition_id.to_string(),
+        "--void".into(),
+        "00".repeat(32),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::NoFrozenConflict)),
+        "unexpected: {error:?}"
+    );
+    let engine = fixture.open();
+    let after = engine.membership_log().known_state().expect("tip");
+    assert_eq!(after.transition_id, tip.transition_id, "no transition");
+    assert_eq!(after.epoch, tip.epoch, "no new epoch");
+    assert_eq!(
+        engine.pending_carries().unwrap(),
+        vec![head],
+        "the live head stages as a carry obligation"
+    );
+}

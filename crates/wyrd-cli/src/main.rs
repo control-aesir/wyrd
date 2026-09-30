@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -19,11 +20,11 @@ use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LoopError, Supervisor, WyrdNode};
 use wyrd_format::FsObjectStore;
-use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, TransitionId};
+use wyrd_format::{DeviceEncryptionKey, DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use wyrd_sync::control::SealedBootstrap;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
-use wyrd_sync::runtime::{Engine, EngineError};
+use wyrd_sync::runtime::{Engine, EngineError, MergeSelection};
 use zeroize::Zeroizing;
 
 /// The `wyrd` binary: create a drive, mount its live projection,
@@ -105,6 +106,20 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
+    /// Inspect snapshots and merge conflicted heads: list the live
+    /// heads, classify every DAG head, or author one merge snapshot
+    /// over explicit sources plus a path spec. Reads are offline
+    /// projections of the keystore; a merge authors one snapshot
+    /// with ordinary member authority and queues the usual
+    /// announcements for the next mounted sync.
+    Snapshot {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: SnapshotAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
     /// Pair this device with a drive: identify it, stage pairing
     /// material for the owner, or join from a sealed invitation. The
     /// owner admits the staged key via `member invite`; the invitation
@@ -148,6 +163,22 @@ enum MemberAction {
         /// The new owner, 64 hex characters.
         device: String,
     },
+    /// Resolve a frozen membership conflict (owner-only): name the
+    /// winning tip and exactly the voided siblings. The engine
+    /// proves the closed resolution (all ids live contenders at the
+    /// frozen epoch, void set exactly the winner's rivals,
+    /// pre-transition owner authority) before authoring; anything
+    /// less fails closed with no transition. The carry obligations
+    /// staged ahead of authoring still commit on a refusal — benign:
+    /// the next drain discharges them without authoring while the
+    /// heads stay eligible.
+    Resolve {
+        /// Winning tip, 64 hex characters.
+        winner: String,
+        /// Voided sibling, repeatable, 64 hex characters each.
+        #[arg(long = "void")]
+        voided: Vec<String>,
+    },
     /// Admit a device (owner-only) and write its sealed invitation to
     /// a file for out-of-band delivery. The transition commits with
     /// the usual catch-up obligations; the newcomer joins from the
@@ -173,6 +204,60 @@ enum MemberAction {
         device: String,
         /// Where to write the sealed invitation.
         out: PathBuf,
+    },
+}
+
+/// One snapshot inspection or merge action. Head references are
+/// `@N` over the selected heads in ascending SnapshotId order —
+/// head-wise, not the mount's per-path `name@N` numbering (which
+/// skips heads that lack the path), and relative to the selection
+/// when `--head` narrows it.
+#[derive(Debug, Subcommand)]
+enum SnapshotAction {
+    /// List the live heads with their `@N` numbers.
+    List,
+    /// Classify every DAG head: eligible, superseded, stranded,
+    /// voided, pending, or rejected. Eligible heads carry their
+    /// `@N` merge numbers.
+    Heads,
+    /// Preview a merge without authoring: one row per root path
+    /// with each selected head's version, so the operator sees
+    /// which paths are agreed and which need a `--take` line.
+    /// Sources default to all live heads, like `merge`. A short
+    /// selection with no eligible heads on a membership-frozen
+    /// drive is refused with a pointer to `member resolve`.
+    Plan {
+        /// Source head, 64 hex characters. Repeatable; omitted means
+        /// all live heads.
+        #[arg(long = "head")]
+        heads: Vec<String>,
+    },
+    /// Merge source heads into one snapshot. Sources default to all
+    /// live heads; `--head` narrows to an explicit subset (at least
+    /// two). Conflicted root paths take `--take path=@N`, drop with
+    /// `--drop path`, or fall back to `--default @N`; paths every
+    /// source agrees on take themselves. The merged snapshot parents
+    /// onto exactly the selected heads at the current epoch. A
+    /// short selection with no eligible heads on a
+    /// membership-frozen drive is refused with a pointer to `member
+    /// resolve`; a pre-conflict fork still merges.
+    Merge {
+        /// Source head, 64 hex characters. Repeatable; omitted means
+        /// all live heads.
+        #[arg(long = "head")]
+        heads: Vec<String>,
+        /// Default source for conflicted paths without a `--take`
+        /// line, `@N` over the selected heads.
+        #[arg(long)]
+        default: Option<String>,
+        /// Take a conflicted root path from one source,
+        /// `path=@N`. Repeatable, one line per path.
+        #[arg(long = "take")]
+        takes: Vec<String>,
+        /// Drop a conflicted root path from the merge.
+        /// Repeatable.
+        #[arg(long = "drop")]
+        drops: Vec<String>,
     },
 }
 
@@ -273,6 +358,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
         Command::Member { credentials, .. } => read_credentials(credentials)?,
+        Command::Snapshot { credentials, .. } => read_credentials(credentials)?,
         Command::Device { credentials, .. } => read_credentials(credentials)?,
     };
 
@@ -294,6 +380,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Member {
             drive_dir, action, ..
         } => member(drive_dir, action, &passphrase, identity),
+        Command::Snapshot {
+            drive_dir, action, ..
+        } => snapshot(drive_dir, action, &passphrase, identity),
         Command::Device {
             drive_dir, action, ..
         } => device(drive_dir, action, &passphrase, identity),
@@ -897,6 +986,28 @@ fn member(
             );
             Ok(())
         }
+        MemberAction::Resolve { winner, voided } => {
+            let winner = parse_transition_id(&winner)?;
+            let mut void_ids = Vec::with_capacity(voided.len());
+            for id in &voided {
+                void_ids.push(parse_transition_id(id)?);
+            }
+            let (transition, carried) = transition_with_carry(&mut engine, &drive_dir, |engine| {
+                engine.resolve_conflict(winner, void_ids.clone())
+            })?;
+            println!(
+                "resolved at epoch {} (prev {}, {} voided, {} carried)",
+                transition.epoch,
+                transition
+                    .prev
+                    .map(|id| id.to_string())
+                    .as_deref()
+                    .unwrap_or("genesis"),
+                transition.resolves().len(),
+                carried
+            );
+            Ok(())
+        }
         MemberAction::Invite {
             device,
             encryption_key,
@@ -953,6 +1064,161 @@ fn member(
             Ok(())
         }
     }
+}
+
+/// Inspect snapshots and merge conflicted heads offline over the
+/// keystore. Merging authors one snapshot with ordinary member
+/// authority (the engine enforces eligibility and the merge-spec
+/// contract, never the CLI) and queues the usual announcements for
+/// the next mounted sync.
+fn snapshot(
+    drive_dir: PathBuf,
+    action: SnapshotAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let mut engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
+    match action {
+        SnapshotAction::List => {
+            print!("{}", snapshot_list_report(&engine)?);
+            Ok(())
+        }
+        SnapshotAction::Heads => {
+            print!("{}", snapshot_heads_report(&engine)?);
+            Ok(())
+        }
+        SnapshotAction::Plan { heads } => {
+            let selected = select_merge_heads(&engine, &heads)?;
+            let store = FsObjectStore::open(drive_dir.to_path_buf())
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            let plan = engine
+                .merge_plan(&store, selected)
+                .map_err(map_merge_error)?;
+            print!("{}", snapshot_plan_report(&plan));
+            Ok(())
+        }
+        SnapshotAction::Merge {
+            heads,
+            default,
+            takes,
+            drops,
+        } => {
+            // Sources default to every live head; explicit ids narrow
+            // to a subset. Sorted ascending, so `@N` numbers the
+            // selection in SnapshotId byte order.
+            let selected = select_merge_heads(&engine, &heads)?;
+            let resolve_ref = |reference: &str| -> Result<SnapshotId, CliError> {
+                let number: usize = reference
+                    .strip_prefix('@')
+                    .and_then(|number| number.parse().ok())
+                    .filter(|number| *number >= 1)
+                    .ok_or_else(|| {
+                        CliError::Usage(format!("head reference must be @N, got {reference:?}"))
+                    })?;
+                selected.get(number - 1).copied().ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "@{number} names no selected head: {} selected",
+                        selected.len()
+                    ))
+                })
+            };
+            let default = default
+                .map(|reference| resolve_ref(&reference))
+                .transpose()?;
+            let mut spec = BTreeMap::new();
+            for take in &takes {
+                let (path, reference) = take.split_once('=').ok_or_else(|| {
+                    CliError::Usage(format!("--take must be path=@N, got {take:?}"))
+                })?;
+                let id = resolve_ref(reference)?;
+                if spec
+                    .insert(check_merge_path(path)?, MergeSelection::Take(id))
+                    .is_some()
+                {
+                    return Err(CliError::Usage(format!(
+                        "duplicate selection for path {path:?}"
+                    )));
+                }
+            }
+            for drop in &drops {
+                let path = check_merge_path(drop)?;
+                if spec.insert(path.clone(), MergeSelection::Absent).is_some() {
+                    return Err(CliError::Usage(format!(
+                        "duplicate selection for path {path:?}"
+                    )));
+                }
+            }
+            let mut store = FsObjectStore::open(drive_dir.to_path_buf())
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            let merged = engine
+                .merge_heads(&mut store, selected, default, spec)
+                .map_err(map_merge_error)?;
+            let parents = merged
+                .snapshot()
+                .parents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "merged {} at epoch {} (parents {parents})",
+                merged.snapshot().snapshot_id(),
+                merged.snapshot().epoch,
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Resolve merge sources: every live head by default, or an
+/// explicit id subset. Sorted ascending, so `@N` numbers the
+/// selection in SnapshotId byte order — the basis `merge` and
+/// `plan` share.
+fn select_merge_heads(engine: &Engine, heads: &[String]) -> Result<Vec<SnapshotId>, CliError> {
+    let mut selected: Vec<SnapshotId> = if heads.is_empty() {
+        engine
+            .live_heads()?
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect()
+    } else {
+        heads
+            .iter()
+            .map(|head| parse_snapshot_id(head))
+            .collect::<Result<_, _>>()?
+    };
+    selected.sort();
+    Ok(selected)
+}
+
+/// Where snapshot merging stalls on a membership conflict: the
+/// operator resolves with `member resolve`, never by adding heads.
+fn frozen_merge_hint(epoch: u64) -> String {
+    format!(
+        "membership frozen at epoch {epoch}: resolve it with `member resolve` \
+        (see `member status`) before merging snapshots"
+    )
+}
+
+/// Map a merge refusal that names the membership freeze to usage
+/// guidance; every other engine verdict passes through untouched.
+fn map_merge_error(error: EngineError) -> CliError {
+    match error {
+        EngineError::MergeBlockedByFreeze(epoch) => CliError::Usage(frozen_merge_hint(epoch)),
+        _ => CliError::Engine(error),
+    }
+}
+
+/// One merge-spec path: a root entry name. v0 merges at root-entry
+/// granularity (a conflicting subtree is taken or dropped whole),
+/// so anything deeper is refused at the argument boundary.
+fn check_merge_path(path: &str) -> Result<String, CliError> {
+    if path.is_empty() || path.contains('/') {
+        return Err(CliError::Usage(format!(
+            "merge paths are root entries, got {path:?}"
+        )));
+    }
+    Ok(path.to_owned())
 }
 
 /// Author a membership transition plus its namespace carry in one
@@ -1144,6 +1410,30 @@ fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
     Ok(DeviceId::from_bytes(bytes))
 }
 
+/// Parse a snapshot id from 64 hex characters (the merge sources
+/// named by `snapshot merge --head`).
+fn parse_snapshot_id(hex: &str) -> Result<SnapshotId, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage("snapshot must be 64 hex characters naming a snapshot id".into())
+        })?;
+    Ok(SnapshotId::from_bytes(bytes))
+}
+
+/// Parse a membership transition id from 64 hex characters (the
+/// winner and voided siblings named by `member resolve`).
+fn parse_transition_id(hex: &str) -> Result<TransitionId, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage("transition must be 64 hex characters naming a transition id".into())
+        })?;
+    Ok(TransitionId::from_bytes(bytes))
+}
+
 /// Parse a device encryption key from 64 hex characters (x-only
 /// pubkey, from the newcomer's pairing-request output).
 fn parse_encryption_key(hex: &str) -> Result<DeviceEncryptionKey, CliError> {
@@ -1261,7 +1551,19 @@ fn member_status_report(engine: &Engine) -> Result<String, CliError> {
         .collect::<Vec<_>>()
         .join(" ");
     let frozen_line = match log.frozen_at() {
-        Some(epoch) => format!("frozen at epoch {epoch}"),
+        Some(epoch) => {
+            // Rival tips: the live contenders the frozen epoch waits
+            // on, from the same derivation the resolver validates
+            // against — status can never list a rival resolve then
+            // refuses. Sorted for stable output.
+            let rivals = engine
+                .frozen_contenders()
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("frozen at epoch {epoch}\nrivals: {rivals}")
+        }
         None => "frozen: no".into(),
     };
     Ok(format!(
@@ -1271,6 +1573,118 @@ fn member_status_report(engine: &Engine) -> Result<String, CliError> {
         members.len(),
         owners.len(),
     ))
+}
+
+/// Live heads with their `@N` merge numbers, ascending by id —
+/// the same order the `name@N` conflict siblings use. Built as a
+/// string so tests assert the rendering without capturing stdout.
+fn snapshot_list_report(engine: &Engine) -> Result<String, CliError> {
+    let heads = engine.live_heads()?;
+    if heads.is_empty() {
+        return Ok("live heads: none\n".into());
+    }
+    let mut out = String::from("live heads:\n");
+    for (number, head) in heads.iter().enumerate() {
+        let snapshot = head.snapshot();
+        out.push_str(&format!(
+            "@{} {} epoch {} author {} tree {} parents {}\n",
+            number + 1,
+            snapshot.snapshot_id(),
+            snapshot.epoch,
+            snapshot.author,
+            snapshot.tree,
+            snapshot.parents.len(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Every DAG head with its authorization classification; eligible
+/// heads carry their `@N` merge numbers. Built as a string so tests
+/// assert the rendering without capturing stdout.
+fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
+    let heads = engine.snapshot_heads()?;
+    if heads.is_empty() {
+        return Ok("heads: none\n".into());
+    }
+    let mut eligible: Vec<SnapshotId> = heads
+        .iter()
+        .filter(|head| {
+            matches!(
+                head.classification,
+                wyrd_sync::authorization::Classification::Eligible
+            )
+        })
+        .map(|head| head.id)
+        .collect();
+    eligible.sort();
+    let mut out = String::from("heads:\n");
+    for head in &heads {
+        let number = eligible
+            .iter()
+            .position(|id| *id == head.id)
+            .map(|number| format!(" @{}", number + 1))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}{} {} epoch {}\n",
+            head.id,
+            number,
+            render_classification(&head.classification),
+            head.epoch,
+        ));
+    }
+    Ok(out)
+}
+
+/// Preview a merge without authoring: one row per root path over
+/// the plan's `@N` basis, naming each head's version. Agreed paths
+/// take themselves; conflicted rows are the `--take` lines the
+/// merge still needs. Built as a string so tests assert the
+/// rendering without capturing stdout.
+fn snapshot_plan_report(plan: &wyrd_sync::runtime::MergePlan) -> String {
+    use wyrd_format::EntryContent;
+    let mut out = format!("merge plan ({} heads):\n", plan.heads.len());
+    for path in &plan.paths {
+        if path.agreed() {
+            out.push_str(&format!("{}: agreed\n", path.path));
+            continue;
+        }
+        let mut versions = Vec::new();
+        for (number, head) in plan.heads.iter().enumerate() {
+            let version = match path.versions.get(head).and_then(|version| version.as_ref()) {
+                None => "absent".to_owned(),
+                Some(entry) => match &entry.content {
+                    EntryContent::File { size, chunks, .. } => {
+                        format!("file:{size}B,{}chunks", chunks.len())
+                    }
+                    EntryContent::Dir { .. } => "dir".to_owned(),
+                    EntryContent::Symlink { .. } => "symlink".to_owned(),
+                },
+            };
+            versions.push(format!("@{}={}", number + 1, version));
+        }
+        out.push_str(&format!(
+            "{}: conflicted {}\n",
+            path.path,
+            versions.join(" ")
+        ));
+    }
+    out
+}
+
+/// One-word head class for the heads view; parked and rejected
+/// heads carry their machine reason.
+fn render_classification(class: &wyrd_sync::authorization::Classification) -> String {
+    use wyrd_sync::authorization::Classification;
+    match class {
+        Classification::Eligible => "eligible".into(),
+        Classification::CanonicalHistory => "canonical-history".into(),
+        Classification::Superseded => "superseded".into(),
+        Classification::Stranded => "stranded".into(),
+        Classification::Voided => "voided".into(),
+        Classification::Pending(pendency) => format!("pending:{pendency:?}"),
+        Classification::Rejected(rejection) => format!("rejected:{rejection:?}"),
+    }
 }
 
 /// One-word canonical status for the log view; invalid transitions
@@ -1342,3 +1756,5 @@ mod tests_member;
 mod tests_mount;
 #[cfg(test)]
 mod tests_probes;
+#[cfg(test)]
+mod tests_snapshot;

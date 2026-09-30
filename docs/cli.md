@@ -110,13 +110,26 @@ characters (x-only pubkeys).
 - `status`: known tip epoch and id, member/owner counts, frozen
   state, and held epoch secrets. Knowledge is not possession: a
   known epoch without its secret authorizes nothing until the
-  capability arrives.
+  capability arrives. A frozen conflict epoch lists its rival tips —
+  the live contenders the epoch waits on.
+- `resolve <winner> --void <sibling>...`: resolve a frozen
+  membership conflict (owner-only) by naming the winning tip and
+  exactly the voided siblings. The engine proves the closed
+  resolution — every id a live contender at the frozen epoch, the
+  void set exactly the winner's rivals, owner authority in the
+  pre-transition state — before authoring; anything less fails
+  closed with no transition. The carry obligations staged ahead of
+  authoring still commit on a refusal — benign: the next drain
+  discharges them without authoring while the heads stay eligible.
 - `remove <device>`: author a removal transition. The removed device —
   member or reader — receives no new-epoch material; its acquisition
   ends at the removal boundary while its history stays valid.
   Removing the sole owner is valid but terminal — it empties the owner
   set and no future transition can be authorized — so it requires
-  `--yes`.
+  `--yes`. Like `rotate` and `set-owner` below, `remove` fails on a
+  membership-frozen drive with "transition leaves a membership
+  conflict frozen; resolve it first": nothing new is canonical while
+  frozen, so the conflict resolves before any of the three commits.
 - `rotate`: force a fresh epoch secret. Membership unchanged; every
   current member and reader is owed the new-epoch wrap.
 - `set-owner <device>`: hand ownership to a member (v0 ownership is
@@ -150,6 +163,54 @@ characters (x-only pubkeys).
 Membership state beyond the CLI: device identity is single-use
 within a membership chain — a removed device returns only under a
 fresh identity (`docs/epochs.md`).
+
+### `snapshot` — inspect snapshots and merge conflicted heads
+
+Reads project the snapshot DAG offline over the keystore; a merge
+authors one snapshot with ordinary member authority through the
+engine, which enforces head eligibility and the merge-spec contract
+— the CLI never decides authorization itself. Announcements for the
+merge queue with the usual outbox, delivered on the next mounted
+sync. Head references are `@N` over the *selected* heads in ascending
+SnapshotId order — head-wise, not path-wise. The mount and export
+number the versions of one path (`name@N`), skipping heads that lack
+the path, so a present-vs-absent conflict's `@N` there is not the
+merge's `@N`. And with `--head` narrowing, `@N` counts the selection,
+not the full live-head set: re-check the numbers before copying them
+from `snapshot list` into a narrowed merge.
+
+- `list`: the live heads with their `@N` numbers, epochs, authors,
+  trees, and parent counts.
+- `heads`: every DAG head with its authorization classification
+  (`eligible`, `canonical-history`, `superseded`, `stranded`,
+  `voided`, `pending:<reason>`, `rejected:<reason>`) and epoch.
+  Eligible heads carry their `@N` merge numbers; every other class
+  is retained history with its reason attached.
+- `merge [--head <id>...] [--default @N] [--take path=@N]...
+  [--drop path]...`: merge source heads — all live heads by
+  default, or an explicit subset of at least two — into one
+  snapshot parented onto exactly the selected heads at the current
+  epoch. The merged tree is a deterministic function of the
+  sources plus the spec: paths every source agrees on take
+  themselves, conflicted root paths take `--take path=@N`, drop
+  with `--drop path`, or fall back to `--default @N`. A spec line
+  on an agreed path, a path no source holds, an uncovered conflict,
+  or a source whose bytes are not locally servable all fail closed
+  with nothing committed. A short selection with no eligible heads
+  on a membership-frozen drive is refused with a pointer to `member
+  resolve`, since the conflict snapshots park as pending; a frozen
+  drive carrying a genuine pre-conflict fork still merges, binding
+  the still-canonical pre-conflict tip. No membership change, no
+  epoch change.
+  The choice is one-way from the CLI: the unselected versions
+  survive only inside the merge's parent heads, which no v0 surface
+  reads back.
+- `plan [--head <id>...]`: preview a merge without authoring —
+  one row per root path over the same `@N` basis, naming each
+  head's version, so the operator sees which paths are agreed and
+  which need a `--take` line before merging. Refused with a pointer
+  to `member resolve` where a short selection meets no eligible
+  heads on a membership-frozen drive.
 
 ### `device` — pair this device with a drive
 

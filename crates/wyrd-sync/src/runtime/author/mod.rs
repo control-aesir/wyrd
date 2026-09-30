@@ -23,7 +23,9 @@ mod admission;
 mod announce;
 mod common;
 mod deliver;
+mod merge;
 mod remove_device;
+mod resolve_conflict;
 mod rotate_epoch;
 mod set_owners;
 mod snapshot;
@@ -37,9 +39,13 @@ mod tests_harness;
 #[cfg(test)]
 mod tests_lifecycle;
 #[cfg(test)]
+mod tests_merge;
+#[cfg(test)]
 mod tests_reader;
 #[cfg(test)]
 mod tests_removal;
+#[cfg(test)]
+mod tests_resolution;
 #[cfg(test)]
 mod tests_rotation;
 #[cfg(test)]
@@ -53,7 +59,11 @@ pub(super) use admission::reissue_invitation;
 pub use admission::AdmitOutcome;
 pub(super) use announce::{announce, announce_pending};
 pub(super) use deliver::deliver_pending;
+pub(super) use merge::merge;
+pub(super) use merge::plan as plan_merge;
+pub use merge::{MergePath, MergePlan, MergeSelection};
 pub(super) use remove_device::remove_device;
+pub(super) use resolve_conflict::resolve_conflict;
 pub(super) use rotate_epoch::rotate_epoch;
 pub(super) use set_owners::set_owners;
 pub(super) use snapshot::author;

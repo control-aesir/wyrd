@@ -12,7 +12,7 @@ use wyrd_format::MembershipTransition;
 use crate::durable::{AuthorizedCapability, Fact};
 use crate::keys::capability::Capability;
 use crate::keys::{escrow, EpochSecret};
-use crate::membership::MembershipState;
+use crate::membership::{MembershipLog, MembershipState};
 use crate::runtime::engine::{Engine, EngineError};
 use zeroize::Zeroizing;
 
@@ -60,6 +60,21 @@ pub(super) fn escrow_fresh_secret(
     Ok(())
 }
 
+/// Refuse a staged transition that leaves a membership conflict
+/// frozen: intake would never elect it, but the author would print
+/// success. Every transition-authoring path stages its log before
+/// the batch — `commit_new_epoch` and admission's own tail alike —
+/// so every path calls this before building the batch. A valid
+/// resolution unfreezes by construction, so the refusal only ever
+/// stops contradictions, third contenders, and admissions onto a
+/// frozen log — never legitimate work.
+pub(super) fn refuse_frozen_transition(staged: &MembershipLog) -> Result<(), EngineError> {
+    if staged.frozen_at().is_some() {
+        return Err(EngineError::FrozenConflictRemains);
+    }
+    Ok(())
+}
+
 /// Commit a signed membership transition: stage it against a cloned
 /// log (the live log stays pristine until the batch commits, so any
 /// failure leaves no phantom tip), install the author's self
@@ -82,6 +97,7 @@ pub(super) fn commit_new_epoch(
     let tip_id = transition.transition_id();
     let mut staged = engine.log.clone();
     staged.observe(transition.clone());
+    refuse_frozen_transition(&staged)?;
     let rebuilt = engine.store.rebuild(engine.device())?;
     let mut secrets = Vec::with_capacity(epoch as usize);
     for past in 1..epoch {

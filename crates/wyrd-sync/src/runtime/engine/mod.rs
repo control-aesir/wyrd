@@ -71,9 +71,11 @@ use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey};
 use crate::membership::MembershipLog;
+use crate::membership::TransitionStatus;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
+pub use super::author::{MergePath, MergePlan, MergeSelection};
 pub use super::bootstrap::PairingRequest;
 
 /// Engine failures: durable-commit, runtime-record, and mailbox-
@@ -110,6 +112,38 @@ pub enum EngineError {
     NotMember,
     #[error("an owner with co-owners can only leave via SetOwners")]
     RemovingOwner,
+    #[error("no frozen membership conflict to resolve")]
+    NoFrozenConflict,
+    #[error("transition {0:?} is not a live contender in the frozen conflict")]
+    NotContender(TransitionId),
+    #[error("void set does not exactly name the winner's rival contenders")]
+    ResolutionMismatch,
+    #[error("transition leaves a membership conflict frozen; resolve it first")]
+    FrozenConflictRemains,
+    #[error("merging needs at least two source heads")]
+    MergeNeedsTwoHeads,
+    #[error(
+        "membership frozen at epoch {0}: resolve the membership conflict before merging snapshots"
+    )]
+    MergeBlockedByFreeze(u64),
+    #[error("merge selects {0} heads, above the {1}-parent ceiling; coalesce in stages")]
+    TooManyMergeHeads(usize, usize),
+    #[error("duplicate merge head {0}")]
+    DuplicateMergeHead(SnapshotId),
+    #[error("snapshot {0} is not a current eligible head")]
+    NotEligibleHead(SnapshotId),
+    #[error("merge default {0} is not one of the selected heads")]
+    MergeDefaultNotAHead(SnapshotId),
+    #[error("merge selection names {0}, which is not one of the selected heads")]
+    MergeSelectionNotAHead(SnapshotId),
+    #[error("merge spec names {0:?}, which no selected head contains")]
+    UnknownMergePath(String),
+    #[error("merge spec names {0:?}, which all selected heads agree on")]
+    MergePathAgreed(String),
+    #[error("no selection for conflicted path {0:?}: name it in the spec or pass a default")]
+    UnresolvedMergePath(String),
+    #[error("merged tree failed construction: {0}")]
+    MergeTreeInvalid(String),
     #[error("device identity was previously removed and cannot be re-admitted; use a new device identity")]
     RetiredDevice,
     #[error("no held epoch secret for epoch {0}")]
@@ -509,6 +543,16 @@ pub(super) enum FetchKey {
     Body(SnapshotId),
 }
 
+/// One observed DAG head with its authorization classification
+/// and bound epoch. The presentation layer numbers the eligible
+/// heads of this listing to address merge sources as `@N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotHead {
+    pub id: SnapshotId,
+    pub classification: crate::authorization::Classification,
+    pub epoch: u64,
+}
+
 /// The intake driver for one device on one drive.
 pub struct Engine {
     pub(super) drive: DriveId,
@@ -795,6 +839,86 @@ impl Engine {
         super::author::set_owners(self, new_owner)
     }
 
+    /// Resolve a frozen membership conflict: author, sign, and commit
+    /// the owner-signed resolution naming the winning tip in `prev`
+    /// and exactly the voided siblings in `resolves` (one new epoch,
+    /// membership unchanged apart from the voiding). Only an owner
+    /// resolves, and only a live contender wins. See
+    /// [`super::author::resolve_conflict`].
+    pub fn resolve_conflict(
+        &mut self,
+        winner: TransitionId,
+        voided: Vec<TransitionId>,
+    ) -> Result<MembershipTransition, EngineError> {
+        super::author::resolve_conflict(self, winner, voided)
+    }
+
+    /// The live contenders the frozen membership epoch waits on,
+    /// ascending: the rival tips `member status` lists and `member
+    /// resolve` names. Empty when nothing is frozen. One derivation
+    /// shared by display and authoring, so the status view can never
+    /// list a rival the resolver then refuses.
+    pub fn frozen_contenders(&self) -> Vec<TransitionId> {
+        let Some(epoch) = self.log.frozen_at() else {
+            return Vec::new();
+        };
+        let mut rivals: Vec<TransitionId> = self
+            .log
+            .statuses()
+            .into_iter()
+            .filter_map(|(id, status)| {
+                if !matches!(status, TransitionStatus::Contested) {
+                    return None;
+                }
+                let transition = self.log.transition(&id)?;
+                (transition.epoch == epoch).then_some(id)
+            })
+            .collect();
+        rivals.sort();
+        rivals
+    }
+
+    /// Merge explicit snapshot heads into one snapshot: the
+    /// deterministic merged tree over the selected heads plus the
+    /// merge spec (`Take` one head's version per conflicted root
+    /// path, or drop it), parented onto exactly the selected heads.
+    /// Heads must be current eligible heads (at least two); paths
+    /// the heads agree on are taken automatically and conflicted
+    /// paths need a spec line or the default. Ordinary member
+    /// authority, current epoch, existing announcement outbox — no
+    /// membership change. See [`super::author::merge`].
+    pub fn merge_heads<S: ObjectStore>(
+        &mut self,
+        objects: &mut S,
+        heads: Vec<SnapshotId>,
+        default: Option<SnapshotId>,
+        spec: std::collections::BTreeMap<String, super::author::MergeSelection>,
+    ) -> Result<AuthorizedSnapshot, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::merge(self, objects, heads, default, spec)
+    }
+
+    /// Plan a merge over explicit snapshot heads without authoring
+    /// anything: the per-path classification a resolver shows the
+    /// user before they select. Read-only; shares the
+    /// classification [`merge_heads`] validates against, so a
+    /// future graphical resolver consumes this instead of
+    /// reimplementing it. See [`super::author::merge`].
+    ///
+    /// [`merge_heads`]: Engine::merge_heads
+    pub fn merge_plan<S: ObjectStore>(
+        &self,
+        objects: &S,
+        heads: Vec<SnapshotId>,
+    ) -> Result<super::author::MergePlan, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::plan_merge(self, objects, heads)
+    }
+
     /// Send every undischarged transition- and capability-delivery
     /// obligation, returning the number of envelopes sent this call.
     /// Transitions go before capabilities; a mid-loop transport
@@ -992,6 +1116,40 @@ impl Engine {
                     .map_err(EngineError::InvalidHead)
             })
             .collect()
+    }
+
+    /// One DAG head with its authorization classification: the
+    /// inspection basis for merges. Only [`Eligible`] heads may
+    /// advance the live view or serve as merge sources; every other
+    /// class is retained history with its reason attached. Sorted
+    /// ascending by id, like every other head listing.
+    ///
+    /// [`Eligible`]: crate::authorization::Classification::Eligible
+    pub fn snapshot_heads(&self) -> Result<Vec<SnapshotHead>, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        let live: HashSet<SnapshotId> = dag.heads().into_iter().collect();
+        // Heads join their bodies for the epoch: a head without its
+        // body is dropped, never listed with a guessed epoch — the
+        // safe direction, matching the eligible-head projection.
+        let mut heads: Vec<SnapshotHead> = dag
+            .classify(&rebuilt.log)
+            .into_iter()
+            .filter(|(id, _)| live.contains(id))
+            .filter_map(|(id, classification)| {
+                let epoch = rebuilt.runtime.snapshot_bodies.get(&id)?.epoch;
+                Some(SnapshotHead {
+                    id,
+                    classification,
+                    epoch,
+                })
+            })
+            .collect();
+        heads.sort_by_key(|head| head.id);
+        Ok(heads)
     }
 
     /// Author a new snapshot over `tree`, signed by this device and bound

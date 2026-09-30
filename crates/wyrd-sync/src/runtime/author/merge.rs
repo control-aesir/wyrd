@@ -1,0 +1,424 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use wyrd_format::{
+    Component, ContentId, Entry, EntryContent, ObjectKind, ObjectStore, SnapshotId, Tree,
+};
+
+use super::snapshot::author_with_parents;
+use crate::authorization::SnapshotDag;
+use crate::durable::Rebuilt;
+use crate::ingest::{check_tree, Limits};
+use crate::runtime::engine::{Engine, EngineError};
+
+/// One merge-spec line: which source a conflicted root path takes.
+/// `Take` names one of the selected heads and adopts that head's
+/// version of the path — present or absent as that head holds it —
+/// while `Absent` drops the path from the merge. Paths the selected
+/// heads agree on are taken automatically and must not appear in the
+/// spec; conflicted paths with no spec line fall back to the merge
+/// default, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeSelection {
+    Take(SnapshotId),
+    Absent,
+}
+
+/// The inspectable merge plan: everything a resolver needs to
+/// present the merge without reimplementing classification. Two
+/// front ends, one merge: the CLI spec and a future graphical
+/// resolver (a File Provider conflict entry point included) both
+/// construct `(heads, spec)` pairs over this plan, and
+/// [`Engine::merge_heads`] validates and authors from the same
+/// classification — the GUI never parses a spec file, and the CLI
+/// never grows presentation semantics.
+///
+/// [`Engine::merge_heads`]: crate::runtime::engine::Engine::merge_heads
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePlan {
+    /// The selected heads, ascending: the `@N` basis (`heads[N-1]`
+    /// is `@N`) for `--take`/`--default` over this selection. This
+    /// is head-wise numbering over the selection — not the mount's
+    /// per-path `name@N` siblings, which skip heads that lack the
+    /// path.
+    pub heads: Vec<SnapshotId>,
+    /// Every root path any selected head holds, ascending by path,
+    /// with each head's version beside it: a resolver renders one
+    /// row per path with one column per head from exactly this.
+    pub paths: Vec<MergePath>,
+}
+
+/// One root path's versions across the selected heads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePath {
+    pub path: String,
+    /// What each selected head holds here: its entry, or `None`
+    /// where the head lacks the path (a present-vs-absent conflict
+    /// when the heads disagree).
+    pub versions: BTreeMap<SnapshotId, Option<Entry>>,
+}
+
+impl MergePath {
+    /// Whether every head holds the same entry-or-absent: agreed
+    /// paths take themselves, and a spec line naming one is an
+    /// error. Comparison is full entry equality — kind, size and
+    /// executable bit, chunks, subtree, or symlink target — so two
+    /// heads holding identical chunks under different recorded
+    /// metadata still count as conflicted, in the conservative
+    /// direction. (Names match by construction of the lookup.)
+    pub fn agreed(&self) -> bool {
+        let mut versions = self.versions.values();
+        let Some(first) = versions.next() else {
+            return true;
+        };
+        versions.all(|version| version == first)
+    }
+
+    /// The agreed entry, when the heads agree on a present entry.
+    /// Plans only list paths some head holds, so an agreed path
+    /// with no entry here is a shared absence the merge skips.
+    pub fn agreed_entry(&self) -> Option<Entry> {
+        if !self.agreed() {
+            return None;
+        }
+        self.versions.values().find_map(|version| version.clone())
+    }
+}
+
+/// Plan a merge over explicit source heads: validate the heads and
+/// classify every root path across them. Read-only — planning
+/// commits nothing and suits a resolver UI that must show the
+/// conflict before the user selects anything. The heads must be
+/// current eligible heads (at least two); a retained stale handle
+/// fails closed here, derived inside from the fresh rebuild rather
+/// than trusted from the caller.
+pub(crate) fn plan<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    heads: Vec<SnapshotId>,
+) -> Result<MergePlan, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let mut sorted = heads;
+    sorted.sort();
+    for pair in sorted.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(EngineError::DuplicateMergeHead(pair[0]));
+        }
+    }
+    // A merge parents onto every selected head, and intake drops
+    // snapshots past the parent ceiling — so an oversized merge
+    // would commit a head every peer rejects while the local view
+    // calls it eligible. Refuse up front naming the ceiling, so the
+    // operator coalesces in stages instead of debugging silent
+    // non-convergence.
+    if sorted.len() > Limits::V0.max_snapshot_parents {
+        return Err(EngineError::TooManyMergeHeads(
+            sorted.len(),
+            Limits::V0.max_snapshot_parents,
+        ));
+    }
+
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    let mut dag = SnapshotDag::new(engine.drive);
+    for body in rebuilt.runtime.snapshot_bodies.values() {
+        dag.observe(body.clone());
+    }
+    // Eligibility derives inside from the fresh rebuild — never from
+    // the caller's list — so a retained stale handle fails closed.
+    let eligible: HashSet<SnapshotId> = dag.eligible_heads(&rebuilt.log).into_iter().collect();
+    // Fewer than two heads merges nothing — but the diagnosis
+    // keys on the eligible set, not the selection length. An
+    // explicit single head amid two live heads is a narrowing
+    // problem, not a freeze; a short selection with no eligible
+    // heads on a frozen drive names the freeze, because the
+    // conflict snapshots park as pending instead of eligible. The
+    // rule lives here, beside the count, so both front ends and
+    // the tests share it. A frozen drive carrying a genuine
+    // pre-conflict fork still merges: those heads bind the
+    // still-canonical pre-conflict tip, so they are eligible and
+    // the merge below proceeds.
+    if sorted.len() < 2 && eligible.len() < 2 {
+        return match rebuilt.log.frozen_at() {
+            Some(epoch) => Err(EngineError::MergeBlockedByFreeze(epoch)),
+            None => Err(EngineError::MergeNeedsTwoHeads),
+        };
+    }
+    if sorted.len() < 2 {
+        return Err(EngineError::MergeNeedsTwoHeads);
+    }
+    for head in &sorted {
+        if !eligible.contains(head) {
+            return Err(EngineError::NotEligibleHead(*head));
+        }
+    }
+
+    let mut roots: BTreeMap<SnapshotId, Tree> = BTreeMap::new();
+    for head in &sorted {
+        let body = rebuilt
+            .runtime
+            .snapshot_bodies
+            .get(head)
+            .ok_or(EngineError::NotEligibleHead(*head))?;
+        roots.insert(*head, load_root(objects, body.tree)?);
+    }
+    let names: BTreeSet<String> = roots
+        .values()
+        .flat_map(|tree| {
+            tree.entries()
+                .iter()
+                .map(|entry| entry.name.as_str().to_owned())
+        })
+        .collect();
+    // One lockstep pass per head over the canonically sorted entry
+    // lists: entries sort bytewise by name at construction and the
+    // name set walks the same bytewise order, so each head's cursor
+    // only advances. A nested scan per name would be quadratic in
+    // the root size against the million-entry ceiling; this stays
+    // linear per head.
+    let mut cursors: Vec<usize> = vec![0; sorted.len()];
+    let mut paths = Vec::with_capacity(names.len());
+    for name in names {
+        let mut versions = BTreeMap::new();
+        for (head, cursor) in sorted.iter().zip(cursors.iter_mut()) {
+            let entries = roots.get(head).expect("loaded above").entries();
+            while *cursor < entries.len() && entries[*cursor].name.as_str() < name.as_str() {
+                *cursor += 1;
+            }
+            let entry =
+                if *cursor < entries.len() && entries[*cursor].name.as_str() == name.as_str() {
+                    Some(entries[*cursor].clone())
+                } else {
+                    None
+                };
+            versions.insert(*head, entry);
+        }
+        paths.push(MergePath {
+            path: name,
+            versions,
+        });
+    }
+    Ok(MergePlan {
+        heads: sorted,
+        paths,
+    })
+}
+
+/// Merge explicit source heads into one snapshot: validate the whole
+/// merge-spec contract over the [`plan`], build the deterministic
+/// merged tree, and author it parenting onto exactly the selected
+/// heads (sorted ascending, so the parent order is a function of
+/// the set). The merge binds the current epoch with ordinary member
+/// authority and queues the existing announcement outbox like any
+/// authoring — no membership transition, no epoch change, exactly
+/// one new snapshot.
+///
+/// Validation precedes every mutation: head eligibility, spec
+/// well-formedness (known paths only, no lines on agreed paths, every
+/// conflicted path covered by spec or default), and the locality
+/// gate (every adopted chunk byte-local or covered by a held
+/// recorded mapping, at every depth of adopted subtrees) all pass
+/// before the merged tree is inserted or anything commits. A remote-
+/// only source fails closed here, never mid-authoring.
+pub(crate) fn merge<S: ObjectStore>(
+    engine: &mut Engine,
+    objects: &mut S,
+    heads: Vec<SnapshotId>,
+    default: Option<SnapshotId>,
+    spec: BTreeMap<String, MergeSelection>,
+) -> Result<crate::durable::AuthorizedSnapshot, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let plan = plan(engine, objects, heads)?;
+    let taken = validate_spec(&plan, default, &spec)?;
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    for entry in &taken {
+        check_local(engine, objects, &rebuilt, entry)?;
+    }
+
+    let merged = Tree::from_entries(taken)
+        .map_err(|error| EngineError::MergeTreeInvalid(format!("{error:?}")))?;
+    let bytes = merged.encode();
+    let tree = objects
+        .insert(ObjectKind::Tree, &bytes)
+        .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?;
+    debug_assert_eq!(ContentId::derive(ObjectKind::Tree, &bytes), tree);
+    author_with_parents(engine, objects, tree, plan.heads)
+}
+
+/// Prove the merge spec closed over the plan and resolve it to the
+/// adopted entries, in canonical order: agreed paths take
+/// themselves, conflicted paths take their spec line or the
+/// default, dropped paths vanish. Pure over the plan — no store
+/// reads, no commits — so both the refusal tests and any future
+/// resolver UI exercise exactly this function.
+fn validate_spec(
+    plan: &MergePlan,
+    default: Option<SnapshotId>,
+    spec: &BTreeMap<String, MergeSelection>,
+) -> Result<Vec<Entry>, EngineError> {
+    if let Some(id) = default {
+        if !plan.heads.contains(&id) {
+            return Err(EngineError::MergeDefaultNotAHead(id));
+        }
+    }
+    for selection in spec.values() {
+        if let MergeSelection::Take(id) = selection {
+            if !plan.heads.contains(id) {
+                return Err(EngineError::MergeSelectionNotAHead(*id));
+            }
+        }
+    }
+    for name in spec.keys() {
+        if Component::new(name).is_err() {
+            return Err(EngineError::UnknownMergePath(name.clone()));
+        }
+        let path = plan
+            .paths
+            .iter()
+            .find(|path| &path.path == name)
+            .ok_or_else(|| EngineError::UnknownMergePath(name.clone()))?;
+        if path.agreed() {
+            return Err(EngineError::MergePathAgreed(name.clone()));
+        }
+    }
+
+    let mut taken: Vec<Entry> = Vec::new();
+    for path in &plan.paths {
+        if path.agreed() {
+            if let Some(entry) = path.agreed_entry() {
+                taken.push(entry);
+            }
+            continue;
+        }
+        let selection = spec
+            .get(&path.path)
+            .copied()
+            .or(default.map(MergeSelection::Take));
+        match selection {
+            None => return Err(EngineError::UnresolvedMergePath(path.path.clone())),
+            Some(MergeSelection::Absent) => {}
+            Some(MergeSelection::Take(id)) => {
+                if let Some(entry) = path.versions.get(&id).and_then(|version| version.clone()) {
+                    taken.push(entry);
+                }
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// The root tree one source head commits, address- and limit-checked
+/// exactly like the authoring walk checks every node it reads: a
+/// faulty store cannot launder a wrong address into the merge.
+fn load_root<S: ObjectStore>(objects: &S, tree: ContentId) -> Result<Tree, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let bytes = objects
+        .get(&tree)
+        .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?
+        .ok_or(EngineError::TreeUnavailable(tree))?;
+    if ContentId::derive(ObjectKind::Tree, &bytes) != tree {
+        return Err(EngineError::TreeMismatch(tree));
+    }
+    let root = Tree::decode(&bytes).map_err(|_| EngineError::InvalidTree(tree))?;
+    check_tree(&Limits::V0, &root).map_err(EngineError::Ingest)?;
+    Ok(root)
+}
+
+/// The locality gate: everything the merged tree adopts must be
+/// servable without fetching, at every depth. File chunks go
+/// through the same two doors the manifest walk resolves through —
+/// byte-local plaintext, else a recorded representation the device
+/// both holds the epoch capability for and holds the vault copy
+/// of — while adopted subtrees must be byte-local outright (the
+/// walk seals trees fresh, with no recorded fallback), descending
+/// into the nested files whose chunks face the same gate.
+/// Symlinks name no content. Read-only (`get`/`has`, never insert)
+/// over a visited set, so a faulty store claiming a reference cycle
+/// terminates instead of looping.
+fn check_local<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    entry: &Entry,
+) -> Result<(), EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let mut stack: Vec<ContentId> = Vec::new();
+    check_entry(engine, objects, rebuilt, entry, &mut stack)?;
+    let mut seen: HashSet<ContentId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        // Same address- and limit-checked load the walk applies to
+        // every node it reads; the temporary lives for the loop, so
+        // no entry is cloned to satisfy the shape.
+        for child in load_root(objects, id)?.entries() {
+            check_entry(engine, objects, rebuilt, child, &mut stack)?;
+        }
+    }
+    Ok(())
+}
+
+/// Gate one adopted entry: files check every chunk now, dirs queue
+/// their subtree for the visited walk above, symlinks hold nothing.
+fn check_entry<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    entry: &Entry,
+    stack: &mut Vec<ContentId>,
+) -> Result<(), EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    match &entry.content {
+        EntryContent::File { chunks, .. } => {
+            for chunk in chunks {
+                check_chunk(engine, objects, rebuilt, *chunk)?;
+            }
+        }
+        EntryContent::Dir { subtree } => stack.push(*subtree),
+        EntryContent::Symlink { .. } => {}
+    }
+    Ok(())
+}
+
+/// One chunk's two doors: byte-local plaintext, else a recorded
+/// representation the device both holds the epoch capability for
+/// and holds the vault copy of — mirroring the manifest walk's
+/// resolve, so the pre-pass and the walk accept exactly the same
+/// set.
+fn check_chunk<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    chunk: ContentId,
+) -> Result<(), EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    if objects
+        .has(&chunk)
+        .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?
+    {
+        return Ok(());
+    }
+    for mapping in rebuilt.runtime.recorded_mappings(&chunk) {
+        let held = rebuilt.keyring.secret(mapping.encryption_epoch).is_some();
+        let served = engine
+            .vault
+            .sealed(&mapping.transport)
+            .map_err(EngineError::from)?
+            .is_some();
+        if held && served {
+            return Ok(());
+        }
+    }
+    Err(EngineError::ChunkUnavailable(chunk))
+}

@@ -29,6 +29,14 @@
       ],
       "mustContain": ["Fully automatic repair of corrupted chunks"],
       "forbids": []
+    },
+    {
+      "slot": "roadmap/milestones",
+      "backs": [
+        { "file": "ROADMAP.md", "heading": "# Roadmap" }
+      ],
+      "mustContain": ["Trustworthy live synchronization", "Full Wyrd drive"],
+      "forbids": []
     }
   ]
 }

@@ -399,6 +399,14 @@
   .licence{ margin-top: 32px; font-size: 0.95rem; color: var(--ink-soft); }
   .licence a{ color: var(--seal); text-decoration: underline; text-underline-offset: 3px; }
 
+  /* Roadmap */
+  .map{ margin: 34px 0 0; padding: 0; border-top: 1px solid var(--slate-line); }
+  .map div{ display: grid; grid-template-columns: 64px 1fr; gap: 20px; padding: 11px 0; border-bottom: 1px solid var(--slate-line); }
+  .map dt{ font-family: var(--font-mono); font-size: 0.85rem; color: var(--seal); padding-top: 4px; }
+  .map dd{ margin: 0; font-size: 0.99rem; }
+  .map-note{ margin-top: 26px; font-size: 0.95rem; color: var(--ink-soft); }
+  .map-note a{ color: var(--seal); text-decoration: underline; text-underline-offset: 3px; }
+
   /* Run it */
   .cli{
     margin-top: 28px;
@@ -476,6 +484,7 @@
         <a class="nav-hide" href="#concept">Idea</a>
         <a class="nav-hide" href="#rules">Rules</a>
         <a href="#status">Status</a>
+        <a class="nav-hide" href="#roadmap">Roadmap</a>
         <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd" target="_blank" rel="noopener noreferrer">Source on gitworkshop</a>
       </nav>
     </div>
@@ -641,6 +650,27 @@
           </div>
         </div>
         <p class="licence">MIT licensed. Identity rides on Nostr-style keys; transport runs on iroh. The <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd" target="_blank" rel="noopener noreferrer">repository</a> holds the full status and the normative format spec.</p>
+      </div>
+    </section>
+
+    <section class="section" id="roadmap">
+      <div class="wrap">
+        <h2>Where this goes</h2>
+        <p class="standfirst">Each milestone names the system that has to become trustworthy next. Sync first, then product, then promises.</p>
+        <!-- slot:roadmap/milestones -->
+        <dl class="map">
+          <div><dt>v0.2</dt><dd>Trustworthy live synchronization.</dd></div>
+          <div><dt>v0.3</dt><dd>Durable operation and content recovery.</dd></div>
+          <div><dt>v0.4</dt><dd>Cross-platform desktop product.</dd></div>
+          <div><dt>v0.5</dt><dd>Human-scale history and conflict resolution.</dd></div>
+          <div><dt>v0.6</dt><dd>Mobile synchronization.</dd></div>
+          <div><dt>v0.7</dt><dd>Production vault infrastructure and disaster recovery.</dd></div>
+          <div><dt>v0.8</dt><dd>Protocol compatibility and security freeze.</dd></div>
+          <div><dt>v0.9</dt><dd>Release candidate and soak.</dd></div>
+          <div><dt>v1.0</dt><dd>Full Wyrd drive.</dd></div>
+        </dl>
+        <!-- /slot:roadmap/milestones -->
+        <p class="map-note">The <a href="https://gitworkshop.dev/control@enesis.md/grasp.t5.st/wyrd/tree/master/ROADMAP.md" target="_blank" rel="noopener noreferrer">roadmap</a> states each milestone as a testable thesis, with explicit ship and do-not-ship lists.</p>
       </div>
     </section>
 

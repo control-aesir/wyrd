@@ -1438,7 +1438,11 @@ impl Engine {
     /// it covers — and a crash or mid-batch failure leaves the
     /// previous state or the full new state, never a partial pin
     /// the census would report as unpromised files. Duplicate pairs
-    /// commit once. Returns the number of facts committed.
+    /// commit once. Contradictory pairs for one identity (two states
+    /// for the same content) are not reconciled — replay applies
+    /// them in file order, so the caller's intent must already be
+    /// consistent; the policy callers each build a homogeneous list.
+    /// Returns the number of facts committed.
     ///
     /// The subtree policy surface; single-identity callers keep
     /// [`Engine::set_materialization`].

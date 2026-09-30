@@ -231,10 +231,11 @@ before the commit leaves the previous state, a crash after leaves
 the full new state, and a torn commit file is ignored on reopen
 like any other torn batch — never a partial pin the census would
 report as unpromised files. Pinned by
-`batched_materializations_commit_once`
-(`wyrd-sync/src/runtime/engine/tests_materialization.rs`),
-`pin_dedupes_shared_chunks_and_repin_is_a_noop` (one commit for N
-identities, re-pin commits nothing),
+`batched_materializations_commit_once` (one commit file for N
+identities plus duplicates, re-batch commits nothing;
+`wyrd-sync/src/runtime/engine/tests_materialization.rs`),
+`pin_dedupes_shared_chunks_and_repin_is_a_noop` (re-pin reports
+`pinned == 0, already_pinned == 3`),
 `evict_refuses_pinned_content_without_committing`
 (`wyrd-core/src/policy.rs`), and
 `pin_survives_restart_and_evict_keeps_bytes`

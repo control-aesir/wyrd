@@ -63,7 +63,13 @@ ones. Offline one-shot walks (`wyrd cache status` over a subtree)
 are outside this table by construction: they hold the exclusive
 store lock, run under the operator's own hand, and stream one row
 per reachable file — on a very large drive, redirect the report to
-a file instead of budgeting it as a live operation.
+a file instead of budgeting it as a live operation. The policy
+commit batch is the second unbounded dimension there: one pin
+commits the whole subtree in a single file, with no cap. Deliberate
+— chunking the batch would trade per-operation atomicity for a
+bound, and a torn single file is discarded whole on reopen while a
+torn chunk sequence is not — so the batch stays whole and stays
+named here instead of bounded.
 
 ## Intake computational budgets
 

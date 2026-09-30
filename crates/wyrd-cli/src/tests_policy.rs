@@ -145,4 +145,8 @@ fn policy_renderers_name_counts_and_quadrants() {
     let rendered = cache_policy_render(&census);
     assert!(rendered.contains("pinned files: 1"));
     assert!(rendered.contains("retained_bytes_quota: unlimited"));
+    assert!(
+        rendered.contains("conflicts: 1 (skipped: split)"),
+        "policy totals name the subtrees they never walked"
+    );
 }

@@ -327,6 +327,13 @@ fn a_quota_refused_commit_commits_nothing_at_all() {
 /// `Engine::open` needs the drive and encryption secrets that `create`
 /// generates internally, and re-deriving them is not worth a witness the
 /// directory layout states directly.
+///
+/// Decision: the `return 0` on an unreadable `commits/` is fail-closed,
+/// not fail-open, because of how the sole caller consumes it. The
+/// before-read asserts `facts_before > 0`, so an unreadable tree fails
+/// there; the after-read asserts equality against that bound positive
+/// count, so an unreadable tree fails there too. There is no path on
+/// which both sides read 0 and the comparison passes vacuously.
 fn committed_fact_segments(dir: &std::path::Path) -> usize {
     let commits = dir.join("commits");
     let Ok(entries) = std::fs::read_dir(&commits) else {

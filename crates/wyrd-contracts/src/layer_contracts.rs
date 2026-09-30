@@ -903,6 +903,11 @@ mod policy_tests {
         fs::create_dir_all(&opaque).expect("scratch opaque dir");
         fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).expect("strip permissions");
         if fs::read_dir(&opaque).is_ok() {
+            eprintln!(
+                "SKIP: elevated runner reads through 0o000, so this run proves nothing \
+                 about the nested-dir branch; the unreadable-file proof in \
+                 nostr_scope_surfaces_an_unreadable_file is runner-independent"
+            );
             fs::set_permissions(&opaque, fs::Permissions::from_mode(0o755)).expect("restore");
             fs::remove_dir_all(&root).expect("scratch cleanup");
             return;
@@ -917,22 +922,24 @@ mod policy_tests {
         );
     }
 
+    /// A dangling symlink fails `read_to_string` on every runner,
+    /// including elevated ones that read through `0o000`, so the
+    /// unreadable-file proof is runner-independent. `is_dir` follows
+    /// links (false for a dangling link) and the `rs` extension still
+    /// selects it, landing in exactly the file-error branch.
     #[cfg(unix)]
     #[test]
     fn nostr_scope_surfaces_an_unreadable_file() {
-        use std::os::unix::fs::PermissionsExt;
         let root = scratch_core_dir();
-        let file = root.join("src").join("mailbox").join("mod.rs");
-        fs::create_dir_all(file.parent().expect("file has a parent")).expect("scratch dirs");
-        fs::write(&file, "use nostr_sdk::prelude::Client;").expect("scratch file");
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("strip permissions");
-        if fs::read_to_string(&file).is_ok() {
-            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("restore");
-            fs::remove_dir_all(&root).expect("scratch cleanup");
-            return;
-        }
+        let mailbox = root.join("src").join("mailbox");
+        fs::create_dir_all(&mailbox).expect("scratch dirs");
+        let file = mailbox.join("mod.rs");
+        std::os::unix::fs::symlink("nowhere.rs", &file).expect("dangling symlink");
+        assert!(
+            fs::read_to_string(&file).is_err(),
+            "the dangling link must stay unreadable"
+        );
         let violations = check_core_nostr_scope(&root);
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("restore");
         fs::remove_dir_all(&root).expect("scratch cleanup");
         assert_eq!(violations.len(), 1);
         assert!(

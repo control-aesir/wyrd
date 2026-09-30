@@ -73,7 +73,10 @@ Every other commit's fact count is bounded by a live budget (the
 plan pass counts down its admission remainder); the policy batch
 is the first whose fact count is a function of an operator-named
 path, which is why the ceiling is enforced for every committer
-rather than budgeted at one call site. A pin whose new transitions
+rather than budgeted at one call site. The byte ceiling binds the
+same way for mixed batches a record count cannot see — many small
+records alongside one large `SnapshotBody` or `Manifest` meet
+64 MiB before they meet 65,536 records. A pin whose new transitions
 exceed 65,536 is refused whole — nothing commits; address subpaths
 to pin in pieces.
 

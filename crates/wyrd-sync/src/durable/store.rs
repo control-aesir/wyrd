@@ -290,7 +290,9 @@ impl DurableStore {
             .checked_add(1)
             .ok_or(DurableError::SequenceExhausted)?;
         let (bytes, hash) = encode_commit(&self.drive, seq, &self.last_hash, &records);
-        check_commit_fits(facts.len(), bytes.len())?;
+        // `records.len()` is the count the encoder wrote and the
+        // decoder reads back — not `facts.len()` by assumption.
+        check_commit_fits(records.len(), bytes.len())?;
         let name = commit_name(seq);
         let commits = self.commits_dir();
 

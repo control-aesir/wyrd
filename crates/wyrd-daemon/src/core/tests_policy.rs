@@ -11,7 +11,7 @@ use wyrd_core::policy::{
     evict_subtree, pin_subtree, residency_census, unpin_subtree, LocalPresence, ResidencyCensus,
     RetentionPolicy,
 };
-use wyrd_format::FsObjectStore;
+use wyrd_format::{EntryContent, FsObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_fuse::DriveView;
 use wyrd_sync::runtime::Engine;
 
@@ -190,4 +190,91 @@ fn pin_survives_restart_and_evict_keeps_bytes() {
     assert_eq!(heads, after);
     drop(daemon);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The issue's verification, end to end over one device: pin a
+/// subtree, prove export succeeds for pinned-local bytes, prove
+/// eviction (policy without deletion) keeps export working, and
+/// prove pinned-but-never-fetched content still fails closed naming
+/// the unheld bytes — pinning promises retention, it does not
+/// conjure bytes.
+#[test]
+fn export_against_policy_proves_pin_needs_bytes() {
+    use wyrd_core::export::{export_tree, ExportError};
+    use wyrd_core::view::Head;
+    use wyrd_format::MemoryObjectStore;
+    use wyrd_fuse::ViewHead;
+
+    let (mut daemon, dir, _identity, _heads) = policy_node();
+    {
+        let (engine, view) = daemon.parts_mut();
+        pin_subtree(engine, view, "docs").unwrap();
+    }
+    let out = dir.join("export-pinned");
+    let report = export_tree(daemon.view(), &out).unwrap();
+    assert_eq!(report.files, 2, "pinned-local content exports");
+    // Evict the promise (bytes stay): export still succeeds, because
+    // eviction releases intent, never deletes.
+    {
+        let (engine, view) = daemon.parts_mut();
+        unpin_subtree(engine, view, "docs").unwrap();
+    }
+    {
+        let (engine, view) = daemon.parts_mut();
+        evict_subtree(engine, view, "docs").unwrap();
+    }
+    let out = dir.join("export-evicted");
+    let report = export_tree(daemon.view(), &out).unwrap();
+    assert_eq!(report.files, 2, "evicted-but-present content exports");
+    // A view over trees without chunks: namespace resolves, bytes
+    // do not. Policy still pins (intent is intact), but export
+    // fails closed naming the unheld file.
+    let full = daemon.view().store_read().unwrap();
+    let mut partial = MemoryObjectStore::default();
+    for head in daemon.engine().live_heads().unwrap() {
+        copy_tree(&*full, &mut partial, head.snapshot().tree);
+    }
+    drop(full);
+    let runtime = daemon.engine().runtime_state().unwrap();
+    let heads: Vec<ViewHead> = daemon
+        .engine()
+        .live_heads()
+        .unwrap()
+        .into_iter()
+        .map(|authorized| ViewHead::new(Head::new(authorized)))
+        .collect();
+    let bare = DriveView::new(partial, RuntimeMaterialization { runtime }, heads);
+    let out = dir.join("export-unfetched");
+    let error = export_tree(&bare, &out).unwrap_err();
+    let ExportError::View { path, .. } = error else {
+        panic!("unfetched bytes must fail closed, got {error:?}");
+    };
+    assert!(
+        path.contains(".txt"),
+        "the failure names the unheld file, got {path:?}"
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Copy one tree and its descendant trees between stores, skipping
+/// every chunk: the shape that proves "known structure, absent
+/// bytes" without a network.
+fn copy_tree<S: ObjectStore, D: ObjectStore>(from: &S, to: &mut D, id: wyrd_format::ContentId)
+where
+    S::Error: std::fmt::Debug,
+    D::Error: std::fmt::Debug,
+{
+    let bytes = from
+        .get(&id)
+        .unwrap()
+        .expect("tree resolves in the full store");
+    let landed = to.insert(ObjectKind::Tree, &bytes).unwrap();
+    assert_eq!(landed, id, "content addressing round-trips the tree");
+    let tree = Tree::decode(&bytes).unwrap();
+    for entry in tree.entries() {
+        if let EntryContent::Dir { subtree } = &entry.content {
+            copy_tree(from, to, *subtree);
+        }
+    }
 }

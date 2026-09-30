@@ -1523,10 +1523,13 @@ fn commit_rejects_overlarge_batches_before_writing() {
         })
         .collect();
     assert_eq!(facts.len(), MAX_RECORDS_PER_COMMIT + 1);
-    assert!(matches!(
-        store.commit(&facts),
-        Err(DurableError::TooManyRecords { .. })
-    ));
+    let error = store.commit(&facts).unwrap_err();
+    // The operator-facing string carries the ceiling and the remedy;
+    // pinning it here keeps either from silently regressing.
+    assert_eq!(
+        error.to_string(),
+        "commit batch of 65537 records exceeds the per-commit ceiling of 65536 records; split the batch and retry"
+    );
     assert_eq!(store.current(), 0, "the rejected batch advances nothing");
     // The refusal's whole justification is the read side: reopen and
     // prove the drive loads instead of wedging on CorruptCommit.
@@ -1550,12 +1553,18 @@ fn commit_fit_boundaries_match_the_load_ceilings() {
     use super::store::check_commit_fits;
     assert!(check_commit_fits(0, 0).is_ok());
     assert!(check_commit_fits(MAX_RECORDS_PER_COMMIT, MAX_COMMIT_BYTES as usize).is_ok());
-    assert!(matches!(
-        check_commit_fits(MAX_RECORDS_PER_COMMIT + 1, 0),
-        Err(DurableError::TooManyRecords { .. })
-    ));
-    assert!(matches!(
-        check_commit_fits(1, MAX_COMMIT_BYTES as usize + 1),
-        Err(DurableError::CommitTooLarge { .. })
-    ));
+    let Err(DurableError::TooManyRecords { count, max }) =
+        check_commit_fits(MAX_RECORDS_PER_COMMIT + 1, 0)
+    else {
+        panic!("one record over the ceiling refuses");
+    };
+    assert_eq!(count, MAX_RECORDS_PER_COMMIT + 1);
+    assert_eq!(max, MAX_RECORDS_PER_COMMIT);
+    let Err(DurableError::CommitTooLarge { bytes, max }) =
+        check_commit_fits(1, MAX_COMMIT_BYTES as usize + 1)
+    else {
+        panic!("one byte over the ceiling refuses");
+    };
+    assert_eq!(bytes, MAX_COMMIT_BYTES as usize as u64 + 1);
+    assert_eq!(max, MAX_COMMIT_BYTES);
 }

@@ -31,6 +31,15 @@ ROOT="$(git rev-parse --show-toplevel)"
 INSTANCE="wyrd-alpha"
 SHARE=/tmp/lima
 mkdir -p "$SHARE"
+# The guest copies each run's logs to $SHARE/logs/<timestamp>; keep
+# the last five so per-run forensics stay available without the
+# shared host dir growing without bound.
+if [[ -d "$SHARE/logs" ]]; then
+  # shellcheck disable=SC2012
+  ls -dt "$SHARE/logs/"*/ 2>/dev/null | tail -n +6 | while IFS= read -r old; do
+    rm -rf "$old"
+  done || true
+fi
 
 # The guest image follows the host architecture (the yaml carries both),
 # so the binary must match it: arm64 hosts take the aarch64-linux

@@ -45,12 +45,18 @@ HOST_LOGS="${HOST_LOGS:-}"
 
 collect_logs() {
   [[ -n "$HOST_LOGS" ]] || return 0
-  # Unmasked failures here would flip a passing run to failed: this
-  # runs in EXIT traps under `set -e`, on shares the guest may not
-  # be able to write.
+  # Every step here is masked: this runs in EXIT traps under `set
+  # -e`, on shares the guest may not be able to write, and a
+  # teardown failure must never flip the run's verdict. The copy
+  # itself is time-boxed — an unwritable 9p share must not turn the
+  # bounded exit this trap exists for into a new hang. Report which
+  # outcome happened; never claim a copy that failed.
   mkdir -p "$HOST_LOGS" 2>/dev/null || true
-  cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null || true
-  echo "logs collected under $HOST_LOGS"
+  if timeout 60 cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null; then
+    echo "logs collected under $HOST_LOGS"
+  else
+    echo "log copy failed (share unavailable), logs stay in $LOGDIR" >&2
+  fi
 }
 
 # A failed step must never strand a mount: unmount everything and kill

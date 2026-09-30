@@ -53,7 +53,11 @@ collect_logs() {
 # A failed step must never strand a mount: unmount everything and kill
 # leftover mount processes, so the next run starts clean. The unmount is
 # attempted unconditionally — gating on `mountpoint -q` or `-e` can skip a
-# live mount whose FUSE fs misbehaves under stat.
+# live mount whose FUSE fs misbehaves under stat. Caller contract: stop
+# the relay BEFORE this runs — the bare `wait` below reaps every
+# background job of the shell, and a still-live relay blocks it forever
+# (the Lima step-failure hang). Mounts are SIGKILLed above, so the wait
+# itself is bounded.
 cleanup_mounts() {
   local m pidf
   for m in "$MNTS"/*; do

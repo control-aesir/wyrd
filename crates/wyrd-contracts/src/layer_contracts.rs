@@ -887,10 +887,10 @@ mod policy_tests {
         );
     }
 
-    /// Permission-stripping tests no-op (pass silently) for elevated
-    /// runners: root reads through `0o000`, so the guard restores the
-    /// tree and returns instead of asserting a failure that cannot
-    /// happen there.
+    /// Permission-stripping proves the nested-dir branch on ordinary
+    /// runners; on elevated runners (root reads through `0o000`) the
+    /// same test asserts the complementary truth instead — a fully
+    /// readable fixture passes clean — so it is an assertion everywhere.
     #[cfg(unix)]
     #[test]
     fn nostr_scope_surfaces_an_unreadable_nested_dir() {
@@ -902,14 +902,21 @@ mod policy_tests {
         let opaque = root.join("src").join("opaque");
         fs::create_dir_all(&opaque).expect("scratch opaque dir");
         fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).expect("strip permissions");
+        // No root-proof way to fail `read_dir` from the filesystem
+        // exists, so an elevated runner reads through `0o000`. Rather
+        // than print-and-return (nextest hides passing-test output, so
+        // a note proves nothing), assert the complementary truth on
+        // that path: everything is readable, so the fixture tree must
+        // yield a clean scope verdict. That keeps the test an assertion
+        // on every runner and doubles as happy-path coverage of the
+        // fixture itself.
         if fs::read_dir(&opaque).is_ok() {
-            eprintln!(
-                "SKIP: elevated runner reads through 0o000, so this run proves nothing \
-                 about the nested-dir branch; the unreadable-file proof in \
-                 nostr_scope_surfaces_an_unreadable_file is runner-independent"
-            );
-            fs::set_permissions(&opaque, fs::Permissions::from_mode(0o755)).expect("restore");
+            let violations = check_core_nostr_scope(&root);
             fs::remove_dir_all(&root).expect("scratch cleanup");
+            assert!(
+                violations.is_empty(),
+                "fully readable fixture must pass clean: {violations:?}"
+            );
             return;
         }
         let violations = check_core_nostr_scope(&root);

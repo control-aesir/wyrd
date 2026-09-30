@@ -329,7 +329,7 @@ fn a_quota_refused_commit_commits_nothing_at_all() {
 /// directory layout states directly.
 ///
 /// Decision: the `return 0` on an unreadable `commits/` is fail-closed,
-/// not fail-open, because of how the sole caller consumes it. The
+/// not fail-open, because of how the sole calling test consumes it. The
 /// before-read asserts `facts_before > 0`, so an unreadable tree fails
 /// there; the after-read asserts equality against that bound positive
 /// count, so an unreadable tree fails there too. There is no path on

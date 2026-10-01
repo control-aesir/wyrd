@@ -4,19 +4,22 @@ use super::tests_harness::{wait_for_subscription, DELIVERY_TIMEOUT};
 use super::*;
 use std::time::{Duration, Instant};
 
-/// Terminal-poison flood stays memory-only at scale: 100k unique
+/// Terminal-poison flood stays memory-only at scale: 8k unique
 /// engine-discarded wraps settle `Poison`, so the durable log takes no
 /// write, the session cache stays capped, and the settlement watermark
-/// still accounts every handover. Coverage keys on rumor content
+/// still accounts every handover. 8k is ~64x the test poison bound
+/// (128): enough distinct ids to force eviction and prove the cap and
+/// the watermark without paying 100k seals — the bound, not the exact
+/// count, is what this pins. Coverage keys on rumor content
 /// indices like `drain_to`: redeliveries (replays of evicted poison
 /// ids) settle again harmlessly, so the loop converges on distinct
 /// coverage, never on settle counts. Chunked inject-and-drain keeps
 /// the relay backlog small, so convergence needs no replay timing.
 #[test]
 fn poison_flood_stays_memory_only_at_scale() {
-    const FLOOD: usize = 100_000;
+    const FLOOD: usize = 8_000;
     const CHUNK: usize = 2_000;
-    // Wall-clock generous on purpose: the workload is 100k NIP-59 seals
+    // Wall-clock generous on purpose: the workload is 8k NIP-59 seals
     // plus draining, and a 2x-slower runner must still pass — a tight
     // deadline here would assert machine speed, not the bound. The test
     // only takes as long as it takes, and it is excluded from the
@@ -230,16 +233,17 @@ fn poison_and_ack_share_the_settlement_watermark() {
     assert_eq!(lines, 2, "only the two acks recorded durably");
 }
 
-/// A retry-only flood holds at most one window: 100k unique retryable
-/// deliveries never grow the held set past the unacked bound, write
+/// A retry-only flood holds at most one window: 8k unique retryable
+/// deliveries (8x the 1024 unacked window, so the backlog outlives the
+/// window) never grow the held set past the unacked bound, write
 /// nothing durable, and move no watermark. Pure retry cannot converge
 /// by design (held mail only leaves on terminal settlement), so this
 /// pins the bound over settle cycles, not convergence: the relay
 /// retains the backlog, exactly as the contract requires.
 #[test]
 fn retry_flood_holds_at_most_one_window() {
-    const FLOOD: usize = 100_000;
-    const ROUNDS: usize = 150_000;
+    const FLOOD: usize = 8_000;
+    const ROUNDS: usize = 12_000;
     const DEADLINE: Duration = Duration::from_secs(900);
     let relay = MiniRelay::spawn();
     let url = relay.url().to_string();

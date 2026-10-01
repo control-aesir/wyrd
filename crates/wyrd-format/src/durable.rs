@@ -24,10 +24,11 @@
 //!   restart-recovery boundary: the obligation cannot live only in
 //!   volatile memory.
 //!
-//! A poisoned bookkeeping mutex fails every operation until the process
-//! restarts: poison means a previous holder panicked mid-update, so the
-//! sets may be inconsistent and no directory may be assumed durable or
-//! repaired. The instance is terminal but the process survives.
+//! A poisoned bookkeeping mutex fails every operation that needs it
+//! until the process restarts: poison means a previous holder panicked
+//! mid-update, so the sets may be inconsistent and no directory may be
+//! assumed durable or repaired. The instance is terminal but the
+//! process survives.
 //!
 //! Directory `fsync` and rename-atomicity assume Unix-like filesystem
 //! semantics; other platforms get best-effort durability.
@@ -55,9 +56,10 @@ pub enum PublishError {
     /// [`Durability::reconcile`].
     ///
     /// The same variant reports a poisoned bookkeeping lock: the
-    /// `fsync` then succeeded but the `verified`/`pending` update could
-    /// not be recorded, so the directory is *not* remembered and the
-    /// caller must treat durability as unknown rather than repairable.
+    /// `verified` update (or, on the failure branch, the `pending`
+    /// record of a failed `fsync`) could not be written, so the
+    /// directory is *not* remembered and the caller must treat
+    /// durability as unknown rather than repairable.
     #[error("directory fsync failed after rename: {0}")]
     DirectorySync(io::Error),
 }
@@ -506,6 +508,11 @@ mod tests {
         poison_sets(&durability, false, true);
         let temp = dir.join("newtop").join("leaf");
         assert!(durability.write_temp(&temp, b"data").is_err());
+        assert_eq!(
+            sync_calls(),
+            1,
+            "the fsync ran; only the bookkeeping write failed"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

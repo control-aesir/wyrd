@@ -54,6 +54,13 @@ pub(crate) struct SealedContent {
     pub objects: Vec<(StorageId, Vec<u8>)>,
     pub content_ids: Vec<ContentId>,
     pub manifest_id: ContentId,
+    /// The sealed tree's storage address: `objects[0]` by the
+    /// construction order below (tree first, then chunks), recorded
+    /// here so stagers address the tree by identity, not position.
+    pub tree_storage: StorageId,
+    /// The tree's content id, for status assertions against the
+    /// runtime's per-object fetch state.
+    pub tree_id: ContentId,
 }
 
 pub(crate) fn seal_flat_drive(
@@ -98,6 +105,8 @@ pub(crate) fn seal_flat_drive(
             content_id: manifest_id,
             sealed: manifest_obj.encode(),
         },
+        tree_storage: objects[0].0,
+        tree_id,
         objects,
         content_ids,
         manifest_id,
@@ -196,6 +205,32 @@ impl Loaded {
             },
             node_addr,
         )
+    }
+
+    /// Publish the root manifest and every sealed object except the
+    /// root tree: for tests that stage a pass where the head is
+    /// classified but its tree has not arrived yet.
+    pub(crate) fn publish_all_but_tree(&mut self) {
+        let snapshot_id = self.snapshot.snapshot_id();
+        self.bulk
+            .publish_root(snapshot_id, self.content.root.clone());
+        for (storage, sealed) in &self.content.objects {
+            if *storage != self.content.tree_storage {
+                self.bulk.publish_sealed(*storage, sealed.clone());
+            }
+        }
+    }
+
+    /// Publish the withheld root tree: the pass that heals a staged gap.
+    pub(crate) fn publish_tree(&mut self) {
+        let tree = &self.content.tree_storage;
+        let (_, sealed) = self
+            .content
+            .objects
+            .iter()
+            .find(|(storage, _)| storage == tree)
+            .expect("the sealed set carries its tree");
+        self.bulk.publish_sealed(*tree, sealed.clone());
     }
 
     /// Drain the control plane: the capability and the announcement

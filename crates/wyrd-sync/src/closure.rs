@@ -996,4 +996,111 @@ mod tests {
             );
         }
     }
+
+    /// A wide flat closure verifies under `Limits::V0`: thousands of
+    /// files, every chunk mapped, the root tree self-mapped. At 4096
+    /// files this is a sample, not a ceiling measurement — about 0.7%
+    /// of `Limits::V0.max_manifest_entries` and 0.4% of
+    /// `max_tree_entries` (sample run 2026-10-01, Apple Silicon:
+    /// ~30 ms); the ceiling edge itself is pinned by
+    /// `pinned_limits_reject_an_overwide_manifest` instead. The
+    /// elapsed time is recorded, not asserted — wall clocks are not
+    /// contracts — so the fetch hot path has a number to revisit.
+    /// Peak memory was not measured.
+    #[test]
+    fn wide_flat_closure_verifies_and_reports_cost() {
+        const FILES: usize = 4096;
+        let mut store = MemoryObjectStore::default();
+        let mut tree_entries = Vec::with_capacity(FILES);
+        let mut manifest_entries = Vec::with_capacity(FILES + 1);
+        for i in 0..FILES {
+            // Fixed-width indexes keep every payload the same
+            // length, so the declared file size is constant.
+            let payload = format!("wide file {i:04}");
+            let (id, entry) = chunk(payload.as_bytes());
+            tree_entries.push(
+                Entry::file(
+                    format!("file-{i:05}.txt"),
+                    payload.len() as u64,
+                    false,
+                    vec![id],
+                )
+                .unwrap(),
+            );
+            manifest_entries.push(entry);
+        }
+        let tree = Tree::from_entries(tree_entries).unwrap();
+        let tree_bytes = tree.encode();
+        let tree_id = store_tree(&mut store, &tree);
+        manifest_entries.push(ManifestEntry {
+            content_id: tree_id,
+            kind: ObjectKind::Tree,
+            version: 0,
+            storage_id: StorageId::from_bytes([0xC0; 32]),
+            encryption_epoch: 1,
+            size: tree_bytes.len() as u64,
+            transport: BaoRoot::from_bytes([0xD0; 32]),
+        });
+        let snapshot = snapshot(tree_id);
+        let root = manifest(&snapshot, manifest_entries);
+        let root_id = manifest_id(&root);
+
+        let start = std::time::Instant::now();
+        verify_snapshot_manifest(
+            &snapshot,
+            &store,
+            &root_id,
+            &root,
+            &BTreeMap::<ContentId, Manifest>::new(),
+            &Limits::V0,
+        )
+        .unwrap();
+        eprintln!(
+            "wide flat closure: {FILES} files ({} manifest entries) verified in {:?}",
+            root.entries().len(),
+            start.elapsed()
+        );
+    }
+
+    /// The count ceilings bind just over the edge: a pinned table
+    /// with room for two manifest entries rejects a three-entry
+    /// closure, proving the near-limit behavior without
+    /// million-entry fixtures.
+    #[test]
+    fn pinned_limits_reject_an_overwide_manifest() {
+        let (store, snapshot, _tree_id, root) = flat();
+        let (_, extra) = chunk(b"extra");
+        let mut entries = root.entries().to_vec();
+        entries.push(extra);
+        let root = Manifest::new(snapshot.snapshot_id(), entries, Vec::new()).unwrap();
+        assert_eq!(
+            root.entries().len(),
+            3,
+            "the fixture exceeds the pin by one"
+        );
+        let limits = Limits {
+            max_manifest_entries: 2,
+            ..Limits::V0
+        };
+        let err = verify_snapshot_manifest(
+            &snapshot,
+            &store,
+            &manifest_id(&root),
+            &root,
+            &BTreeMap::<ContentId, Manifest>::new(),
+            &limits,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClosureError::Ingest(IngestError::TooMany {
+                    what: "manifest entries",
+                    count: 3,
+                    max: 2,
+                })
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
 }

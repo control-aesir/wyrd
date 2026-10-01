@@ -7,9 +7,9 @@ use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{
     membership::{set_root, Admission, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT},
     snapshot::RECOVERY_FLAG,
-    BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, Manifest, ManifestEntry,
-    MembershipTransition, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot, SnapshotId,
-    StorageId, Tree,
+    BaoRoot, Change, ContentId, Entry, EntryContent, FetchStatus, FsObjectStore, Manifest,
+    ManifestEntry, MembershipTransition, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot,
+    SnapshotId, StorageId, Tree,
 };
 use wyrd_fuse::{DriveView, ViewError};
 use wyrd_sync::authorization::{Classification, Rejection, SnapshotDag};
@@ -2037,6 +2037,93 @@ fn a_mismatched_snapshot_manifest_never_mounts() {
     );
     drop(daemon);
     rig.teardown();
+}
+
+/// The head gate is fail-closed across passes and restarts: a head
+/// whose final tree object has not arrived yet is classified but
+/// installs nothing, the pass that fetches the tree mounts it, and a
+/// restart re-verifies the durable closure instead of losing the
+/// head. Composed end to end over the public APIs: the bulk peer
+/// stages the arrival gap, the daemon runs both passes over a
+/// durable store, and the engine reopens over the same directory.
+#[test]
+fn a_gated_head_mounts_only_after_its_tree_lands_and_survives_restart() {
+    let mut loaded = Loaded::new("gated.txt", b"gated payload");
+    loaded.publish_body_and_announcement(None);
+    // The tree has not arrived yet: manifest and chunk land first.
+    loaded.publish_all_but_tree();
+
+    let store_dir = scratch_dir("gated-head-objects");
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> = WyrdNode::new(
+        loaded.rig.take_engine(),
+        FsObjectStore::open(store_dir.clone()).unwrap(),
+    )
+    .unwrap();
+    loaded.want_all(daemon.parts_mut().0);
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    assert_eq!(
+        daemon.engine().live_heads().unwrap().len(),
+        1,
+        "the announced snapshot classifies even while its tree is missing"
+    );
+    assert!(
+        matches!(daemon.view().lookup("gated.txt"), Err(ViewError::NotFound)),
+        "a head whose tree has not arrived installs nothing"
+    );
+    // The pending arm under test is the missing tree specifically:
+    // the chunk is already Available while the tree is still
+    // Fetching, so a wider gap (manifest missing too) would fail here.
+    let runtime = daemon.engine().runtime_state().unwrap();
+    assert_eq!(
+        runtime.status(&loaded.content.tree_id),
+        FetchStatus::Fetching,
+        "the unfetched tree is the pending item"
+    );
+    for id in &loaded.content.content_ids {
+        if *id != loaded.content.tree_id {
+            assert_eq!(
+                runtime.status(id),
+                FetchStatus::Available,
+                "the chunk arrived on the first pass"
+            );
+        }
+    }
+
+    // The tree lands: the next pass fetches it and the head mounts.
+    loaded.publish_tree();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+    assert!(
+        daemon.view().lookup("gated.txt").is_ok(),
+        "the head mounts once its closure is complete"
+    );
+
+    // Restart: a fresh engine over the same directory re-verifies the
+    // durable closure — no new fetch — and the head stays mounted.
+    let dir = loaded.rig.dir.clone();
+    let recipient = loaded.rig.recipient.id;
+    let identity = loaded.rig.recipient.identity.clone();
+    let encryption = loaded.rig.recipient.encryption.clone();
+    drop(daemon);
+    let engine = Engine::open(dir, drive(), recipient, "contracts", identity, encryption)
+        .expect("the committed state reopens");
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(store_dir.clone()).unwrap()).unwrap();
+    assert_eq!(
+        daemon.engine().live_heads().unwrap().len(),
+        1,
+        "the reopened engine still classifies the fetched head"
+    );
+    daemon.refresh_live_heads().unwrap();
+    assert!(
+        daemon.view().lookup("gated.txt").is_ok(),
+        "the gated head stays mounted across a restart"
+    );
+    drop(daemon);
+    loaded.rig.teardown();
+    std::fs::remove_dir_all(store_dir).unwrap();
 }
 
 /// Recovery grafts content only, and a voided transition never

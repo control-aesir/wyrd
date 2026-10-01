@@ -317,7 +317,7 @@ without a held epoch key.
 |---|---|---|
 | `Capability` | 0x00 | device, epoch, wrapped capability bytes |
 | `MembershipTransition` | 0x01 | opaque canonical transition bytes (the membership machine verifies) |
-| `KeyRotation` | 0x02 | the epoch's transition id — new epoch material exists, capability follows |
+| `KeyRotation` | 0x02 | the epoch's transition id — new epoch material exists, capability follows as a separate message; hint only (below), addressed to epoch-key holders, confers no authority |
 | `SnapshotAnnouncement` | 0x03 | snapshot id, author, epoch, membership transition id — enough to fetch and classify |
 
 `KeyRotation` is envelope-defined but unhandled in v0: the runtime has
@@ -327,6 +327,17 @@ never deferred (deferral would park poison for retry). When rotation
 handling lands, that arm becomes a commit or a deferral; until then no
 durable record distinguishes a consumed rotation message from one never
 recorded, so a future handler must treat every rotation message as new.
+
+Notification semantics (the forward contract the envelope reserves):
+the notice is sealed under the epoch's control key, so its audience
+is exactly the holders of that epoch's key — current members, never
+the rotated device (which learns its keys through rotation delivery,
+outside this envelope). It promises nothing: the capability it points
+at travels as its own message and may arrive before, after, or never;
+a receiver that holds only the notice holds no new epoch material.
+Epoch state derives from transitions plus capabilities, which stay
+authoritative whether or not any notice was sent or received — the
+notice only tells a member that fetching the capability is worthwhile.
 
 Sealed envelope (changing any byte changes every seal — a format
 constant): `version (1) ‖ DriveId (32) ‖ kind (1) ‖ epoch u64 LE ‖ nonce

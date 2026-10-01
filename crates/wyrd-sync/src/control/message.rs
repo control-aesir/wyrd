@@ -94,8 +94,18 @@ pub struct TransitionPayload {
     pub transition: Vec<u8>,
 }
 
-/// A rotation notice: new epoch material exists under this transition:
+/// A rotation notice: new epoch material exists under this transition;
 /// the capability follows as its own message.
+///
+/// The notice is a hint, never authority. It is sealed under the
+/// epoch's control key, so only holders of that epoch's key (current
+/// members) can read it, and receipt obligates nothing: "the
+/// capability follows" is a sender-side pairing expectation, not a
+/// delivery guarantee — the notice may arrive before, after, or
+/// without the capability, and the epoch is learned from the
+/// transition plus the capability itself. Convergence never depends
+/// on the notice: transitions plus capabilities are authoritative
+/// for epoch state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRotation {
     pub transition: TransitionId,

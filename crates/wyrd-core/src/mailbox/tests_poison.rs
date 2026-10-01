@@ -238,19 +238,22 @@ fn poison_and_ack_share_the_settlement_watermark() {
 /// window) never grow the held set past the unacked bound, write
 /// nothing durable, and move no watermark. Pure retry cannot converge
 /// by design (held mail only leaves on terminal settlement), so this
-/// pins the bound over settle cycles, not convergence: the relay
-/// retains the backlog, exactly as the contract requires.
+/// converges on the bound itself: `recv` admits new mail only while
+/// the window is unfull and `Retry` keeps deliveries held, so the
+/// held count rises monotonically to exactly the window. The loop
+/// exits the moment the bound engages: retry keeping a held delivery
+/// (stable id, later mail unstarved) is pinned by
+/// `retry_requeues_behind_other_mail`, exact saturation with overflow
+/// retention by the sibling backpressure test — neither is
+/// re-observed here. The relay retains the backlog, exactly as the
+/// contract requires.
 #[test]
 fn retry_flood_holds_at_most_one_window() {
     const FLOOD: usize = 8_000;
-    // Settle cycles deliberately outscale the flood: iterations spin
-    // in under a millisecond once mail is held (recv round-robins
-    // instead of sleeping), so the count is a time margin over relay
-    // delivery lag, not lockstep with flood size. 150k cycles buy
-    // roughly a minute for 1025 distinct wraps to arrive and fill the
-    // window; cutting this to the flood's scale starves the exact-
-    // saturation assert below on a slow host.
-    const ROUNDS: usize = 150_000;
+    // Generous on purpose: the loop exits on its own predicate
+    // (seconds in practice), so the deadline only fires on a genuine
+    // hang — a tight one here would assert machine speed, not the
+    // bound. Generosity is free on a passing run.
     const DEADLINE: Duration = Duration::from_secs(900);
     let relay = MiniRelay::spawn();
     let url = relay.url().to_string();
@@ -295,8 +298,8 @@ fn retry_flood_holds_at_most_one_window() {
         relay.inject(event);
     }
     let start = Instant::now();
-    for _ in 0..ROUNDS {
-        assert!(start.elapsed() < DEADLINE, "retry rounds complete");
+    while mailbox.unacked.len() < MAX_UNACKED_DELIVERIES {
+        assert!(start.elapsed() < DEADLINE, "retry flood fills the window");
         if let Some(delivery) = mailbox.recv().unwrap() {
             mailbox.settle(delivery.id(), Disposition::Retry).unwrap();
             assert!(

@@ -133,6 +133,11 @@ Hard-won operational rules:
 - Supervised tasks restart with capped exponential backoff.
 - Every event subscription has a drainer; an undrained subscription wedges
   the sync actor.
+- The mailbox drainer listens to both SDK notification arms because
+  first-seen events surface through `Event` while resubscribe replay of
+  already-seen history arrives only as `Message`-arm `RelayMessage::Event`
+  frames; the classification is pinned by `mailbox::tests_classification`
+  and re-run first on any nostr-sdk bump.
 - Filesystem watchers declare a lag contract: on `Lagged`, backfill/reconcile
   from state, never from the missed events.
 - Self-writes are echo-suppressed (path + hash + TTL) so the watcher never

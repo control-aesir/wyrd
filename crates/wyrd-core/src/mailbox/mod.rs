@@ -196,6 +196,8 @@ pub(crate) mod mini_relay;
 #[cfg(test)]
 mod tests_backpressure;
 #[cfg(test)]
+mod tests_classification;
+#[cfg(test)]
 mod tests_dedupe;
 #[cfg(test)]
 mod tests_delivery;
@@ -1042,6 +1044,11 @@ async fn drain_notifications(
         // same client. The mailbox needs the replay (abandoned-channel and
         // never-pulled mail converge through it), so it listens to both;
         // double forwarding collapses downstream in held/seen dedupe.
+        // Pinned by `tests_classification`: a nostr-sdk bump re-runs that
+        // contract first (see the workspace `Cargo.toml` pin comment). The
+        // pin is a bump tripwire, not a delivery dependency — both arms
+        // are forwarded identically, so a moved seam re-reviews the pin
+        // instead of breaking the mailbox.
         let event = match notification {
             ClientNotification::Event { event, .. } => Some(event),
             ClientNotification::Message { message, .. } => match *message {

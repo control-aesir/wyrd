@@ -168,8 +168,13 @@ pub(super) fn open_keystore(
     // and reintroduces no race — only the *read* must sit under the
     // lock, not this existence check. Errors (including NotFound)
     // surface exactly as the pre-lock read produced them.
-    if let Err(error) = std::fs::metadata(dir.join(KEYSTORE_FILE)) {
-        return Err(EngineError::Io(error));
+    match std::fs::metadata(dir.join(KEYSTORE_FILE)) {
+        Ok(meta) if meta.is_file() => {}
+        // A directory (or other non-file) named `keystore` is not a
+        // record either: refuse before the store open mints state, the
+        // same write-nothing guarantee the missing case has.
+        Ok(_) => return Err(EngineError::MalformedKeystore),
+        Err(error) => return Err(EngineError::Io(error)),
     }
     // Acquire the store lock BEFORE reading custody. Creation holds
     // this lock across the custody write, so no cooperating writer can

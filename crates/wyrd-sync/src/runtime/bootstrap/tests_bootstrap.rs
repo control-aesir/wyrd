@@ -953,3 +953,25 @@ fn open_on_a_drive_only_directory_writes_nothing() {
         );
     }
 }
+
+#[test]
+fn open_with_a_directory_named_keystore_writes_nothing() {
+    // `metadata` succeeds on a directory, so the probe must also
+    // require a file: a hand-crafted directory named `keystore` is
+    // refused before the store open, minting nothing.
+    let dir = TestDir::new("custody-keystore-dir");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    std::fs::write(dir.path.join("DRIVE"), drive_id().as_bytes()).unwrap();
+    std::fs::create_dir(dir.path.join(KEYSTORE_FILE)).unwrap();
+    assert!(
+        matches!(
+            open_keystore(dir.path.clone(), "test-pass", identity),
+            Err(EngineError::MalformedKeystore)
+        ),
+        "a directory named keystore is not a custody record"
+    );
+    assert!(
+        !dir.path.join("store-key.wrap").exists(),
+        "the refused open mints no store key"
+    );
+}

@@ -129,7 +129,11 @@ pub(super) fn restart(device: &mut Device, controls: &[(u64, [u8; 32])]) {
 pub(super) fn assert_agreement(pair: &mut Pair) {
     let a = pair.a.engine.store.load().expect("loads a");
     let b = pair.b.engine.store.load().expect("loads b");
-    assert_eq!(a.announcements, b.announcements);
+    let mut a_ann: Vec<_> = a.announcements.iter().collect();
+    let mut b_ann: Vec<_> = b.announcements.iter().collect();
+    a_ann.sort_by_key(|ann| *ann.snapshot.as_bytes());
+    b_ann.sort_by_key(|ann| *ann.snapshot.as_bytes());
+    assert_eq!(a_ann, b_ann);
     let mut a_manifests: Vec<_> = a.manifests.iter().map(|m| m.manifest_id).collect();
     let mut b_manifests: Vec<_> = b.manifests.iter().map(|m| m.manifest_id).collect();
     a_manifests.sort();

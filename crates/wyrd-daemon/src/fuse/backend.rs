@@ -1760,14 +1760,15 @@ where
     /// nothing: this absorbs the kernel's `O_TRUNC` split (`open`
     /// commits the truncation itself; the followup `setattr` finds
     /// the size already there) and makes repeated truncates cheap.
-    /// Open clean handles on the path re-pin onto the committed size
-    /// (see below); dirty ones keep the stale rule.
+    /// A path that no longer stats fails here with the lookup
+    /// error: submitting for it would only die in the mutation
+    /// loop, burning a queue round trip to report what the stat
+    /// already knew. Open clean handles on the path re-pin onto
+    /// the committed size (see below); dirty ones keep the stale
+    /// rule.
     pub fn set_size_at(&self, ino: u64, size: u64) -> Result<(), fuser::Errno> {
         let path = self.inode_path(ino)?;
-        let current = self
-            .attr_at(&path)
-            .map(|attr| attr.size)
-            .unwrap_or(u64::MAX);
+        let current = self.attr_at(&path)?.size;
         if current == size {
             return Ok(());
         }

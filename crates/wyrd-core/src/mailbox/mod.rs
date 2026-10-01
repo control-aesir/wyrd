@@ -202,6 +202,8 @@ mod tests_dedupe;
 #[cfg(test)]
 mod tests_delivery;
 #[cfg(test)]
+mod tests_drainer;
+#[cfg(test)]
 mod tests_harness;
 #[cfg(test)]
 mod tests_interop;
@@ -749,11 +751,9 @@ where
         // relay history racing the subscription is lost to the void.
         let intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>> =
             Arc::new(std::sync::Mutex::new(None));
-        let incoming = Arc::new(std::sync::Mutex::new(runtime.block_on(establish_drainer(
-            &client,
-            &intake_waker,
-            &health,
-        ))));
+        let incoming = Arc::new(std::sync::Mutex::new(
+            runtime.block_on(establish_drainer(&client, &intake_waker, &health))?,
+        ));
         // Registration is local (no I/O per relay); `connect` dials every
         // registered relay concurrently, and nostr-sdk re-establishes
         // subscriptions on reconnects. With no relays there is nothing to
@@ -1105,18 +1105,31 @@ async fn drain_notifications(
     health.stream_alive.store(false, Ordering::Relaxed);
 }
 
+/// Await the drainer's readiness signal. A dropped sender means the
+/// task died before subscribing: report it so the supervisor can
+/// rebuild instead of crashing the process. The expect this replaces
+/// could not fire while the runtime was alive — the task sends
+/// readiness before its first fallible operation — but a later edit
+/// inside the spawned task breaks that silently, so the check is a
+/// reported error, not a crash.
+async fn await_drainer_ready(
+    ready: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), MailboxError> {
+    ready
+        .await
+        .map_err(|_| MailboxError::Transport("drainer task died before signaling readiness".into()))
+}
+
 /// Spawn a notification drainer over a fresh channel and wait until it is
 /// listening. `notifications()` only delivers events broadcast after it is
 /// called, so "spawned" is not a sufficient precondition for subscribing —
 /// the spawn has to be polled past the subscription, and this handshake
-/// makes that ordering airtight instead of timing-dependent. The expect
-/// cannot fire while the runtime is alive: the task sends readiness before
-/// its first fallible operation.
+/// makes that ordering airtight instead of timing-dependent.
 async fn establish_drainer(
     client: &Arc<Client>,
     intake_waker: &Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: &Arc<SupervisorState>,
-) -> tokio_mpsc::Receiver<Event> {
+) -> Result<tokio_mpsc::Receiver<Event>, MailboxError> {
     let (sender, receiver) = tokio_mpsc::channel(INCOMING_CAPACITY);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(drain_notifications(
@@ -1126,8 +1139,8 @@ async fn establish_drainer(
         Arc::clone(health),
         ready_tx,
     ));
-    ready_rx.await.expect("drainer task outlived its spawn");
-    receiver
+    await_drainer_ready(ready_rx).await?;
+    Ok(receiver)
 }
 
 /// Count currently connected relays. The client notification stream never
@@ -1394,7 +1407,11 @@ impl Drop for ClearOnDrop<'_> {
 /// relay history into the broadcast void between REQ and listen.
 ///
 /// A poisoned channel lock fails instead of panicking: the stream stays
-/// flagged down and the supervisor retries on the next tick.
+/// flagged down and the supervisor retries on the next tick. A drainer
+/// that never establishes fails the same way — before any subscribe,
+/// so the channel swap and the liveness flag below never run.
+/// Recovery attempts count every episode including these, so a
+/// never-establishing drainer reads as climbing attempts, not silence.
 async fn recover_stream(
     client: &Arc<Client>,
     filter: &Filter,
@@ -1404,7 +1421,20 @@ async fn recover_stream(
     subscription_id: &SubscriptionId,
     resubscribe_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), MailboxError> {
-    let receiver = establish_drainer(client, intake_waker, health).await;
+    let receiver = match establish_drainer(client, intake_waker, health).await {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            // The loop below counts every pass, but this return sits
+            // before it: count the attempt here too, or a
+            // never-establishing drainer respawns forever with the
+            // counter pinned at zero — indistinguishable from "never
+            // tried" via health.
+            health
+                .stream_recovery_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+    };
     let mut attempt: u32 = 0;
     loop {
         // Progress stays observable while the episode spins: each loop

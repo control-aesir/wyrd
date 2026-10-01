@@ -1,3 +1,11 @@
+//! Fixed-scenario runtime properties: arrival-order equivalence,
+//! re-drive idempotence, and scale bounds over the shared two-device
+//! scenario harness. Stated honestly, these are examples, not
+//! generators — the generative form lives in
+//! [`crate::authorization::properties`]; what this module pins is the
+//! full drain+execute path and the history sizes the issue named,
+//! with exact reports instead of wall-clock asserts.
+
 use super::tests_harness::{drain_side, execute_side, scenario, Device, Pair};
 use super::*;
 
@@ -126,14 +134,18 @@ fn reversed_arrival_converges_to_the_same_outcome() {
     assert_eq!(report.unfulfilled, 0, "b converged");
 }
 
-// --- drain/execute re-drive idempotence -------------------------
+// --- execute re-drive idempotence --------------------------------
 //
 // The restart tests pin idempotence across reopen; this pins the
-// re-drive itself: with no new traffic, a second drain and a second
-// execute report zero progress and commit nothing.
+// re-drive itself: with no new work, a second execute reports zero
+// progress and commits nothing. (A second drain over the acked queue
+// would prove only that acked envelopes are gone, not any dedupe
+// behavior — redelivery-stays-duplicate is pinned by
+// `redelivered_announcement_envelope_is_a_noop` instead — so the
+// drain half is a single pass here.)
 
 #[test]
-fn redrive_without_new_traffic_commits_nothing() {
+fn re_execute_without_new_work_commits_nothing() {
     let (mut pair, _, (snap_a, snap_b)) = scenario();
     for content in [snap_a.content, snap_b.content] {
         pair.a
@@ -144,17 +156,6 @@ fn redrive_without_new_traffic_commits_nothing() {
 
     let first = drain_side(&mut pair.relay, &mut pair.a);
     assert!(first.accepted > 0, "first drain takes the scenario traffic");
-    assert_eq!(
-        drain_side(&mut pair.relay, &mut pair.a),
-        DrainReport {
-            accepted: 0,
-            duplicates: 0,
-            deferred: 0,
-            skipped: 0,
-            discarded: 0,
-        },
-        "second drain with no new traffic is a no-op"
-    );
 
     let before = pair.a.engine.current();
     let plan = execute_side(&mut pair.bulk, &mut pair.a);
@@ -190,13 +191,20 @@ fn redrive_without_new_traffic_commits_nothing() {
 // --- large runtime histories -------------------------------------
 //
 // Scale before optimizing: a 128-announcement history must converge
-// with exact bounded reports (16x the generated scope, past the
-// per-pass intake budget so multi-pass draining is exercised too).
-// Empty roots keep the bulk peer cheap (manifests and bodies only,
-// no objects); the bound is completion with exact counts, never a
-// wall-clock assert. Larger histories stay fsync-bound per commit,
-// so 128 is the default-profile size — the shape, not the ceiling,
-// is what this pins.
+// with exact bounded reports (16x the generated scope). Empty roots
+// keep the bulk peer cheap (manifests and bodies only, no objects);
+// the bound is completion with exact counts, never a wall-clock
+// assert. Larger histories stay fsync-bound per commit, so 128 is
+// the default-profile size — the shape, not the ceiling, is what
+// this pins.
+//
+// Budget honesty: the intake budgets are 1024 facts per pass and
+// 256 per sender per pass, at two facts per accepted announcement,
+// so all 127 single-sender announcements land in one pass —
+// multi-pass shedding is NOT exercised here. That boundary is
+// pinned by the slow-profile
+// `sustained_spam_commits_bounded_facts_per_pass_and_converges`
+// instead.
 
 const SCALE_ANNOUNCEMENTS: usize = 128;
 
@@ -261,10 +269,13 @@ fn large_announcement_history_converges_with_exact_reports() {
         mail.push(deliver(&fixture, admission.epoch, &bound));
     }
     queue(&mut fixture, mail);
-    // The intake budget bounds one pass (128 here), so drain to
-    // quiescence and require the passes to sum to the whole queued
-    // history — no announcement shed, duplicated, or suppressed.
+    // Drain to quiescence and require the passes to sum to the whole
+    // queued history — no announcement shed, duplicated, or
+    // suppressed. The loop must observe a zero report: a history
+    // stuck deferring forever would otherwise pass on the count
+    // alone.
     let mut accepted = 0;
+    let mut quiesced = false;
     for _ in 0..16 {
         let report = drain(&mut fixture);
         accepted += report.accepted;
@@ -277,9 +288,11 @@ fn large_announcement_history_converges_with_exact_reports() {
                 discarded: 0,
             })
         {
+            quiesced = true;
             break;
         }
     }
+    assert!(quiesced, "the history drains to quiescence");
     assert_eq!(
         accepted,
         SCALE_ANNOUNCEMENTS - 1,

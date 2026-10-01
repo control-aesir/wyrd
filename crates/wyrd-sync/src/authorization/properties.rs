@@ -269,15 +269,20 @@ const SHARD_CASES: u32 = 64;
 /// terminate on long sequences, not just the 8-op generated ones —
 /// completion with exact verdicts is the bound (no wall-clock
 /// asserts). Trees stay constant: parentage alone distinguishes the
-/// snapshots.
+/// snapshots. The log rotates every 64 snapshots, so the chain also
+/// crosses epoch boundaries instead of pinning only the same-epoch
+/// arm.
 #[test]
 fn long_chain_classifies_tip_eligible_and_ancestors_history() {
     const DEPTH: usize = 256;
-    let f = Fixture::new(9);
+    let mut f = Fixture::new(9);
     let mut dag = SnapshotDag::new(f.drive);
     let mut parent = Vec::new();
     let mut tip = None;
-    for _ in 0..=DEPTH {
+    for n in 0..=DEPTH {
+        if n > 0 && n % 64 == 0 {
+            f.membership(vec![Change::Rotate]);
+        }
         let s = f.owner_snapshot(std::mem::take(&mut parent), tree_id(7));
         parent = vec![s.snapshot_id()];
         tip = Some(s.snapshot_id());
@@ -297,6 +302,7 @@ fn long_chain_classifies_tip_eligible_and_ancestors_history() {
         }
     }
 }
+
 macro_rules! sharded_property {
     (
         body $body:block

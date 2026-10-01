@@ -279,7 +279,9 @@ impl FsObjectStore {
     ///
     /// A directory-`fsync` failure after the rename is surfaced, and the
     /// directory is remembered by [`Durability`]; a later `insert`
-    /// reconciles it before reporting success.
+    /// reconciles it before reporting success. A poisoned bookkeeping
+    /// lock is the exception: nothing is recorded, so durability stays
+    /// unknown rather than repairable.
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> Result<(), FsStoreError> {
         loop {
             let tmp = Self::temp_path(path);
@@ -303,7 +305,9 @@ impl FsObjectStore {
                 // fsync failed: the write is not durable, and retrying
                 // the rename would not repair it, so surface the error.
                 // `Durability` remembers the directory for the next
-                // insert to reconcile.
+                // insert to reconcile — unless the failure is a
+                // poisoned bookkeeping lock, in which case nothing was
+                // recorded and durability stays unknown, not repairable.
                 Err(error) => return Err(FsStoreError::io(error.into_io())),
             }
         }

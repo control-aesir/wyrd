@@ -24,6 +24,12 @@
 //!   restart-recovery boundary: the obligation cannot live only in
 //!   volatile memory.
 //!
+//! A poisoned bookkeeping mutex fails every operation that needs it
+//! until the process restarts: poison means a previous holder panicked
+//! mid-update, so the sets may be inconsistent and no directory may be
+//! assumed durable or repaired. The instance is terminal but the
+//! process survives.
+//!
 //! Directory `fsync` and rename-atomicity assume Unix-like filesystem
 //! semantics; other platforms get best-effort durability.
 
@@ -48,6 +54,12 @@ pub enum PublishError {
     /// `fsync` failed. The file is visible, but its directory entry is
     /// not known durable; the directory is remembered for
     /// [`Durability::reconcile`].
+    ///
+    /// The same variant reports a poisoned bookkeeping lock: the
+    /// `verified` update (or, on the failure branch, the `pending`
+    /// record of a failed `fsync`) could not be written, so the
+    /// directory is *not* remembered and the caller must treat
+    /// durability as unknown rather than repairable.
     #[error("directory fsync failed after rename: {0}")]
     DirectorySync(io::Error),
 }
@@ -106,10 +118,11 @@ impl Durability {
     /// Retry every directory whose last sync failed. Idempotent: a
     /// directory is moved to `verified` once its sync succeeds, and
     /// retained in `pending` otherwise. Returns the first remaining
-    /// error, if any.
+    /// error, if any. A poisoned bookkeeping lock fails the whole call:
+    /// see the module header.
     pub fn reconcile(&self) -> io::Result<()> {
-        let mut pending = self.pending.lock().expect("durability pending lock");
-        let mut verified = self.verified.lock().expect("durability verified lock");
+        let mut pending = lock_set(&self.pending)?;
+        let mut verified = lock_set(&self.verified)?;
         let mut failure = None;
         pending.retain(|dir| match (self.sync_dir)(dir) {
             Ok(()) => {
@@ -130,14 +143,13 @@ impl Durability {
     /// Confirm that `dir` is durable before an existing entry inside it
     /// is accepted. A directory already verified in this process is a set
     /// lookup; otherwise its `fsync` runs now. This is the recovery point
-    /// after a restart, when the in-process `pending` set is gone.
+    /// after a restart, when the in-process `pending` set is gone. A
+    /// poisoned bookkeeping lock fails the call: see the module header.
     pub fn verify_dir(&self, dir: &Path) -> io::Result<()> {
-        if self
-            .verified
-            .lock()
-            .expect("durability verified lock")
-            .contains(dir)
-        {
+        // The guard drops at the end of the condition: `sync_and_verify`
+        // re-locks this mutex, and holding it across the call would
+        // deadlock (the mutex is not reentrant).
+        if lock_set(&self.verified)?.contains(dir) {
             return Ok(());
         }
         self.sync_and_verify(dir)
@@ -222,17 +234,11 @@ impl Durability {
     fn sync_and_verify(&self, dir: &Path) -> io::Result<()> {
         match (self.sync_dir)(dir) {
             Ok(()) => {
-                self.verified
-                    .lock()
-                    .expect("durability verified lock")
-                    .insert(dir.to_path_buf());
+                lock_set(&self.verified)?.insert(dir.to_path_buf());
                 Ok(())
             }
             Err(error) => {
-                self.pending
-                    .lock()
-                    .expect("durability pending lock")
-                    .insert(dir.to_path_buf());
+                lock_set(&self.pending)?.insert(dir.to_path_buf());
                 Err(error)
             }
         }
@@ -240,12 +246,9 @@ impl Durability {
 
     /// Re-sync `dir` only if a previous sync left it pending.
     fn reconcile_dir(&self, dir: &Path) -> io::Result<()> {
-        if !self
-            .pending
-            .lock()
-            .expect("durability pending lock")
-            .contains(dir)
-        {
+        // As above: the guard must drop before `sync_and_verify`
+        // re-locks this mutex.
+        if !lock_set(&self.pending)?.contains(dir) {
             return Ok(());
         }
         self.sync_and_verify(dir)
@@ -256,6 +259,17 @@ impl Durability {
 /// durable.
 pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// Lock the durability bookkeeping. A poisoned mutex fails the
+/// operation, never the process: poison means a previous holder
+/// panicked mid-update, so the sets may be inconsistent and no
+/// directory may be assumed durable or repaired on this call.
+fn lock_set(
+    set: &Mutex<HashSet<PathBuf>>,
+) -> io::Result<std::sync::MutexGuard<'_, HashSet<PathBuf>>> {
+    set.lock()
+        .map_err(|_| io::Error::other("durability bookkeeping lock poisoned"))
 }
 
 #[cfg(test)]
@@ -427,6 +441,116 @@ mod tests {
         durability.verify_dir(&dir).unwrap();
         durability.verify_dir(&dir).unwrap();
         assert_eq!(sync_calls(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Poison one or both bookkeeping sets by panicking while holding
+    /// each lock. The child panic is captured by `join`, so it
+    /// poisons without propagating through the scope.
+    fn poison_sets(durability: &Durability, pending: bool, verified: bool) {
+        for set in [
+            pending.then_some(&durability.pending),
+            verified.then_some(&durability.verified),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            std::thread::scope(|scope| {
+                let held = scope.spawn(|| {
+                    let _guard = set.lock().unwrap();
+                    panic!("injected panic while holding the bookkeeping lock");
+                });
+                assert!(held.join().is_err(), "the holder must panic");
+            });
+        }
+    }
+
+    #[test]
+    fn poisoned_pending_fails_reconcile_at_the_first_acquire() {
+        let durability = Durability::with_sync(count_sync);
+        poison_sets(&durability, true, false);
+        assert!(durability.reconcile().is_err());
+    }
+
+    #[test]
+    fn poisoned_verified_fails_reconcile_at_the_second_acquire() {
+        // `pending` still locks, so `reconcile` passes its first
+        // acquire and fails on `verified`: both lock sites are pinned,
+        // not just the first one reached.
+        let durability = Durability::with_sync(count_sync);
+        poison_sets(&durability, false, true);
+        assert!(durability.reconcile().is_err());
+    }
+
+    #[test]
+    fn poisoned_verified_fails_verify_dir_before_any_sync() {
+        let dir = scratch_dir();
+        reset_sync_calls();
+        let durability = Durability::with_sync(count_sync);
+        poison_sets(&durability, false, true);
+        assert!(durability.verify_dir(&dir).is_err());
+        assert_eq!(
+            sync_calls(),
+            0,
+            "no directory may be synced on inconsistent bookkeeping"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_verified_fails_the_success_bookkeeping_write() {
+        // A missing parent drives `ensure_dir` into `sync_and_verify`
+        // past a successful `fsync`, so the failure is the `verified`
+        // insert, not the sync itself.
+        let dir = scratch_dir();
+        reset_sync_calls();
+        let durability = Durability::with_sync(count_sync);
+        poison_sets(&durability, false, true);
+        let temp = dir.join("newtop").join("leaf");
+        assert!(durability.write_temp(&temp, b"data").is_err());
+        assert_eq!(
+            sync_calls(),
+            1,
+            "the fsync ran; only the bookkeeping write failed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_pending_fails_the_failure_bookkeeping_write() {
+        // `publish_temp` calls `sync_and_verify` directly, so the
+        // injected sync failure drives the `pending` insert past the
+        // lookup the other entry points fail at first.
+        let dir = scratch_dir();
+        reset_sync_calls();
+        let durability = Durability::with_sync(fail_first_sync);
+        poison_sets(&durability, true, false);
+        let temp = dir.join(".tmp-live");
+        fs::write(&temp, b"data").unwrap();
+        let path = dir.join("live");
+        let error = durability.publish_temp(&temp, &path).unwrap_err();
+        assert!(
+            matches!(error, PublishError::DirectorySync(_)),
+            "unexpected stage: {error:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_pending_fails_the_pending_lookup() {
+        // An existing directory drives `reconcile_dir` into the
+        // `pending` membership check before any sync runs.
+        let dir = scratch_dir();
+        reset_sync_calls();
+        let durability = Durability::with_sync(count_sync);
+        poison_sets(&durability, true, false);
+        let temp = dir.join("leaf");
+        assert!(durability.write_temp(&temp, b"data").is_err());
+        assert_eq!(
+            sync_calls(),
+            0,
+            "no directory may be repaired on inconsistent bookkeeping"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

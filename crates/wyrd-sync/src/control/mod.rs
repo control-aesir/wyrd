@@ -27,6 +27,25 @@
 //! Knowledge and key material stay distinct: a message for an unknown
 //! epoch is an error, never a guess.
 //!
+//! Two dedupe layers, keyed on different things. The envelope layer keys
+//! on the message id: byte-identical redeliveries share the id and ack
+//! as duplicates. The converse holds too — a freshly resealed
+//! equivalent payload carries a fresh nonce, so it mints a fresh id
+//! and the envelope layer treats it as new. Whether it then commits is
+//! per-kind content dedupe: transitions by transition id (the id covers
+//! every byte), announcements by the `Same` update check, capabilities
+//! by nothing yet — a resealed identical capability recommits, and
+//! semantic capability dedupe is a later issue. Senders therefore
+//! resend byte-identical envelopes on retry (first seal wins), never
+//! fresh seals: a regenerated seal defeats envelope dedupe, and under
+//! queue pressure each retry consumes a distinct pending slot.
+//! Overflow sheds relay-held — the relay re-offers the identical bytes,
+//! the inbox forgot the id, so the redelivery ingests fresh with no
+//! false duplicate — and never suppresses: suppression is only for
+//! terminal-invalid messages, and a shed envelope needs no sender
+//! regeneration beyond the relay's re-offer (or the durable outbox's
+//! byte-identical resend).
+//!
 //! The seal proves epoch-key possession (confidentiality from
 //! non-holders), not authorship: any holder of the epoch secret can forge
 //! any kind. Authorship comes from inner signatures (membership
@@ -104,7 +123,10 @@ pub struct SealedControl {
 }
 
 /// A control message id: BLAKE3 over the sealed bytes. Identical
-/// deliveries share the id, so replay is a set-membership check.
+/// deliveries share the id, so replay is a set-membership check. The
+/// converse holds too: a fresh seal (fresh nonce) mints a fresh id over
+/// equivalent payload, so envelope dedupe never fires across reseals —
+/// content-level dedupe (or its absence) decides those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ControlMessageId([u8; 32]);
 

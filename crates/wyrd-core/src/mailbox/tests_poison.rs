@@ -243,7 +243,14 @@ fn poison_and_ack_share_the_settlement_watermark() {
 #[test]
 fn retry_flood_holds_at_most_one_window() {
     const FLOOD: usize = 8_000;
-    const ROUNDS: usize = 12_000;
+    // Settle cycles deliberately outscale the flood: iterations spin
+    // in under a millisecond once mail is held (recv round-robins
+    // instead of sleeping), so the count is a time margin over relay
+    // delivery lag, not lockstep with flood size. 150k cycles buy
+    // roughly a minute for 1025 distinct wraps to arrive and fill the
+    // window; cutting this to the flood's scale starves the exact-
+    // saturation assert below on a slow host.
+    const ROUNDS: usize = 150_000;
     const DEADLINE: Duration = Duration::from_secs(900);
     let relay = MiniRelay::spawn();
     let url = relay.url().to_string();

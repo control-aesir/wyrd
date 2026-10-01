@@ -108,8 +108,8 @@ impl Durability {
     /// retained in `pending` otherwise. Returns the first remaining
     /// error, if any.
     pub fn reconcile(&self) -> io::Result<()> {
-        let mut pending = self.pending.lock().expect("durability pending lock");
-        let mut verified = self.verified.lock().expect("durability verified lock");
+        let mut pending = lock_set(&self.pending)?;
+        let mut verified = lock_set(&self.verified)?;
         let mut failure = None;
         pending.retain(|dir| match (self.sync_dir)(dir) {
             Ok(()) => {
@@ -132,12 +132,7 @@ impl Durability {
     /// lookup; otherwise its `fsync` runs now. This is the recovery point
     /// after a restart, when the in-process `pending` set is gone.
     pub fn verify_dir(&self, dir: &Path) -> io::Result<()> {
-        if self
-            .verified
-            .lock()
-            .expect("durability verified lock")
-            .contains(dir)
-        {
+        if lock_set(&self.verified)?.contains(dir) {
             return Ok(());
         }
         self.sync_and_verify(dir)
@@ -222,17 +217,11 @@ impl Durability {
     fn sync_and_verify(&self, dir: &Path) -> io::Result<()> {
         match (self.sync_dir)(dir) {
             Ok(()) => {
-                self.verified
-                    .lock()
-                    .expect("durability verified lock")
-                    .insert(dir.to_path_buf());
+                lock_set(&self.verified)?.insert(dir.to_path_buf());
                 Ok(())
             }
             Err(error) => {
-                self.pending
-                    .lock()
-                    .expect("durability pending lock")
-                    .insert(dir.to_path_buf());
+                lock_set(&self.pending)?.insert(dir.to_path_buf());
                 Err(error)
             }
         }
@@ -240,12 +229,7 @@ impl Durability {
 
     /// Re-sync `dir` only if a previous sync left it pending.
     fn reconcile_dir(&self, dir: &Path) -> io::Result<()> {
-        if !self
-            .pending
-            .lock()
-            .expect("durability pending lock")
-            .contains(dir)
-        {
+        if !lock_set(&self.pending)?.contains(dir) {
             return Ok(());
         }
         self.sync_and_verify(dir)
@@ -256,6 +240,17 @@ impl Durability {
 /// durable.
 pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// Lock the durability bookkeeping. A poisoned mutex fails the
+/// operation, never the process: poison means a previous holder
+/// panicked mid-update, so the sets may be inconsistent and no
+/// directory may be assumed durable or repaired on this call.
+fn lock_set(
+    set: &Mutex<HashSet<PathBuf>>,
+) -> io::Result<std::sync::MutexGuard<'_, HashSet<PathBuf>>> {
+    set.lock()
+        .map_err(|_| io::Error::other("durability bookkeeping lock poisoned"))
 }
 
 #[cfg(test)]
@@ -427,6 +422,33 @@ mod tests {
         durability.verify_dir(&dir).unwrap();
         durability.verify_dir(&dir).unwrap();
         assert_eq!(sync_calls(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_bookkeeping_fails_instead_of_panicking() {
+        // Panic while holding each bookkeeping lock, then prove every
+        // entry point that touches the sets reports an error instead of
+        // panicking on the poison: no directory may be assumed durable
+        // or repaired on state a panicked holder may have left
+        // inconsistent.
+        fn poison(set: &Mutex<HashSet<PathBuf>>) {
+            std::thread::scope(|scope| {
+                let held = scope.spawn(|| {
+                    let _guard = set.lock().unwrap();
+                    panic!("injected panic while holding the bookkeeping lock");
+                });
+                assert!(held.join().is_err(), "the holder must panic");
+            });
+        }
+
+        let dir = scratch_dir();
+        reset_sync_calls();
+        let durability = Durability::with_sync(count_sync);
+        poison(&durability.pending);
+        poison(&durability.verified);
+        assert!(durability.reconcile().is_err());
+        assert!(durability.verify_dir(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

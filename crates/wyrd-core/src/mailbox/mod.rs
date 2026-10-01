@@ -1407,7 +1407,11 @@ impl Drop for ClearOnDrop<'_> {
 /// relay history into the broadcast void between REQ and listen.
 ///
 /// A poisoned channel lock fails instead of panicking: the stream stays
-/// flagged down and the supervisor retries on the next tick.
+/// flagged down and the supervisor retries on the next tick. A drainer
+/// that never establishes fails the same way — before any subscribe,
+/// so the channel swap and the liveness flag below never run.
+/// Recovery attempts count every episode including these, so a
+/// never-establishing drainer reads as climbing attempts, not silence.
 async fn recover_stream(
     client: &Arc<Client>,
     filter: &Filter,
@@ -1417,7 +1421,20 @@ async fn recover_stream(
     subscription_id: &SubscriptionId,
     resubscribe_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), MailboxError> {
-    let receiver = establish_drainer(client, intake_waker, health).await?;
+    let receiver = match establish_drainer(client, intake_waker, health).await {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            // The loop below counts every pass, but this return sits
+            // before it: count the attempt here too, or a
+            // never-establishing drainer respawns forever with the
+            // counter pinned at zero — indistinguishable from "never
+            // tried" via health.
+            health
+                .stream_recovery_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+    };
     let mut attempt: u32 = 0;
     loop {
         // Progress stays observable while the episode spins: each loop

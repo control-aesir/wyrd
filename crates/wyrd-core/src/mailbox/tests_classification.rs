@@ -9,7 +9,10 @@
 //! that classification silently breaks abandoned-backlog recovery, so
 //! this test pins both arms against MiniRelay over a real client: any
 //! SDK reshape that moves the seam fails here first — to compile, or
-//! loudly.
+//! loudly. The absence assertions are a bump tripwire, not a mailbox
+//! dependency: the drainer forwards both arms identically and dedupe
+//! absorbs either classification, so a moved seam re-reviews the pin
+//! instead of breaking delivery.
 
 use super::mini_relay::MiniRelay;
 use super::tests_harness::{keys, wait_for_subscription, DELIVERY_TIMEOUT, QUIET_TIMEOUT};
@@ -18,24 +21,32 @@ use nostr::event::FinalizeEvent;
 
 use std::time::{Duration, Instant};
 
-/// Sightings of the pinned event by notification arm.
+/// Sightings of the pinned event by notification arm. `classify`
+/// reports whether the notification carried the event, so only event
+/// sightings arm the collector's quiet timer — EOSE and shutdown prove
+/// liveness but must not cut the arrival budget short.
 #[derive(Default)]
 struct Sightings {
     event_arm: Vec<EventId>,
     message_arm: Vec<EventId>,
 }
 
-fn classify(sightings: &mut Sightings, notification: ClientNotification) {
+fn classify(sightings: &mut Sightings, notification: ClientNotification) -> bool {
     match notification {
-        ClientNotification::Event { event, .. } => sightings.event_arm.push(event.id),
+        ClientNotification::Event { event, .. } => {
+            sightings.event_arm.push(event.id);
+            true
+        }
         ClientNotification::Message { message, .. } => {
             if let RelayMessage::Event { event, .. } = message.as_ref() {
                 sightings.message_arm.push(event.id);
+                return true;
             }
+            false
         }
         // Shutdown ends the stream (the next poll returns `None`); it
         // carries no event, so it classifies nowhere.
-        ClientNotification::Shutdown => {}
+        ClientNotification::Shutdown => false,
     }
 }
 
@@ -55,8 +66,9 @@ async fn collect_sightings(
         if elapsed >= window {
             break;
         }
-        // Once frames arrived, a quiet gap ends collection early; before
-        // the first frame the whole window is arrival budget.
+        // Once an event sighting arrived, a quiet gap ends collection
+        // early; before the first sighting the whole window is arrival
+        // budget.
         let budget = match last_seen {
             Some(seen) => QUIET_TIMEOUT
                 .saturating_sub(seen.elapsed())
@@ -68,8 +80,9 @@ async fn collect_sightings(
         }
         match tokio::time::timeout(budget, notifications.next()).await {
             Ok(Some(notification)) => {
-                classify(&mut sightings, notification);
-                last_seen = Some(Instant::now());
+                if classify(&mut sightings, notification) {
+                    last_seen = Some(Instant::now());
+                }
             }
             // Stream end or budget elapsed with no frame: collection is
             // over either way.
@@ -82,13 +95,16 @@ async fn collect_sightings(
 /// First-seen events surface once through the `Event` arm; already-seen
 /// replay after a CLOSE+REQ resubscribe under the same subscription ID
 /// (mirroring the mailbox's `resubscribe`) surfaces only through the
-/// `Message` arm as `RelayMessage::Event`. Either arm moving is a
-/// nostr-sdk behavior change the drainer's fork depends on.
+/// `Message` arm as `RelayMessage::Event`. Both relays hold the event,
+/// so the replay half also pins that the suppression is pool-wide, not
+/// per-relay. Either arm moving is a nostr-sdk behavior change worth a
+/// re-review of the drainer's fork — the absence assertions trip the
+/// bump, they are not a delivery dependency the mailbox breaks on.
 #[test]
 fn first_seen_event_uses_the_event_arm_and_resubscribe_replay_uses_the_message_arm() {
     const RESUBSCRIBE_WINDOW: Duration = Duration::from_secs(15);
-    let relay = MiniRelay::spawn();
-    let url = relay.url().to_string();
+    let relay_a = MiniRelay::spawn();
+    let relay_b = MiniRelay::spawn();
     let author = keys();
     let filter = Filter::new().kind(Kind::Custom(RUMOR_KIND));
     let event = EventBuilder::new(Kind::Custom(RUMOR_KIND), "classification pin")
@@ -106,7 +122,14 @@ fn first_seen_event_uses_the_event_arm_and_resubscribe_replay_uses_the_message_a
         // broadcasts after the subscription exists, so creating the
         // stream first is the same handshake `establish_drainer` makes.
         let mut notifications = client.notifications();
-        client.add_relay(&url).await.expect("relay registers");
+        // Both relays store the event before any subscription exists,
+        // so both replays carry already-seen history from the pool's
+        // point of view no matter which arrives first.
+        relay_a.inject(event.clone());
+        relay_b.inject(event);
+        for url in [relay_a.url(), relay_b.url()] {
+            client.add_relay(url).await.expect("relay registers");
+        }
         client.connect().await;
         let subscription_id = SubscriptionId::generate();
         client
@@ -114,8 +137,8 @@ fn first_seen_event_uses_the_event_arm_and_resubscribe_replay_uses_the_message_a
             .with_id(subscription_id.clone())
             .await
             .expect("subscribe registers");
-        wait_for_subscription(&relay, DELIVERY_TIMEOUT);
-        relay.inject(event);
+        wait_for_subscription(&relay_a, DELIVERY_TIMEOUT);
+        wait_for_subscription(&relay_b, DELIVERY_TIMEOUT);
 
         let first = collect_sightings(&mut notifications, DELIVERY_TIMEOUT).await;
         assert_eq!(
@@ -125,12 +148,14 @@ fn first_seen_event_uses_the_event_arm_and_resubscribe_replay_uses_the_message_a
         );
         assert_eq!(
             first.message_arm,
-            vec![wanted],
-            "first-seen event also surfaces once through the Message arm: \
-             Message fires for every EVENT frame, and held/seen dedupe \
-             absorbs the double forwarding"
+            vec![wanted, wanted],
+            "first-seen event surfaces through the Message arm once per \
+             relay EVENT frame: Message fires for every frame, and \
+             held/seen dedupe absorbs the forwarding"
         );
 
+        // CLOSE may race a dead relay; `resubscribe` treats the discard
+        // the same way — the REQ below is the recovery, not this call.
         let _ = client.unsubscribe(&subscription_id).await;
         client
             .subscribe(filter.clone())

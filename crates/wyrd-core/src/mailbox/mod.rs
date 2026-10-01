@@ -1045,7 +1045,10 @@ async fn drain_notifications(
         // never-pulled mail converge through it), so it listens to both;
         // double forwarding collapses downstream in held/seen dedupe.
         // Pinned by `tests_classification`: a nostr-sdk bump re-runs that
-        // contract first (see the workspace `Cargo.toml` pin comment).
+        // contract first (see the workspace `Cargo.toml` pin comment). The
+        // pin is a bump tripwire, not a delivery dependency — both arms
+        // are forwarded identically, so a moved seam re-reviews the pin
+        // instead of breaking the mailbox.
         let event = match notification {
             ClientNotification::Event { event, .. } => Some(event),
             ClientNotification::Message { message, .. } => match *message {

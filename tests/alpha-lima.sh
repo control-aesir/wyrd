@@ -513,13 +513,18 @@ main() {
   # first — rm cannot remove a live mountpoint.
   mkdir -p "$MNTS" "$LOGDIR"
   cleanup_mounts
-  # Any exit — a failed check included — unmounts, reaps, and stops the
-  # relay: a surviving background process inherits this script's
-  # stdout, so the host's `limactl shell` would wait for a pipe that
-  # never closes and the run would hang instead of failing.
+  # Any exit — a failed check included — stops the relay first,
+  # then unmounts, reaps, and collects the logs. Order is the fix:
+  # the relay is a background job of this shell, so
+  # cleanup_mounts' bare `wait` would block on it forever if it
+  # were still alive, and the host's `limactl shell` would wait on
+  # a pipe that never closes. Mounts and the relay are the two job
+  # classes the suite starts: a new background job must join this
+  # reap order, or it re-creates the hang.
   reap_background() {
-    cleanup_mounts
     stop_relay
+    cleanup_mounts
+    collect_logs
   }
   trap reap_background EXIT
   # A run killed while step 6 throttled loopback leaves the qdisc

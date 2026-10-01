@@ -31,6 +31,24 @@ ROOT="$(git rev-parse --show-toplevel)"
 INSTANCE="wyrd-alpha"
 SHARE=/tmp/lima
 mkdir -p "$SHARE"
+# The guest copies each run's logs to $SHARE/logs/<timestamp>; prune
+# to the five newest before this run adds its own, so per-run
+# forensics stay available without the shared host dir growing
+# without bound. Names sort by intent already (%Y%m%d-%H%M%S), so
+# order by name, not mtime.
+if [[ -d "$SHARE/logs" ]]; then
+  # Only directories rank: a stray file must neither consume a keep
+  # slot nor be deleted.
+  rank=0
+  while IFS= read -r old; do
+    rank=$((rank + 1))
+    [[ $rank -gt 5 ]] || continue
+    rm -rf "$SHARE/logs/$old"
+  done < <(for f in "$SHARE/logs/"*/; do
+    [[ -d "$f" ]] || continue
+    basename "$f"
+  done 2>/dev/null | sort -r) || true
+fi
 
 # The guest image follows the host architecture (the yaml carries both),
 # so the binary must match it: arm64 hosts take the aarch64-linux

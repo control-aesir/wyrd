@@ -45,15 +45,34 @@ HOST_LOGS="${HOST_LOGS:-}"
 
 collect_logs() {
   [[ -n "$HOST_LOGS" ]] || return 0
-  mkdir -p "$HOST_LOGS"
-  cp -r "$LOGDIR/." "$HOST_LOGS/" 2>/dev/null || true
-  echo "logs collected under $HOST_LOGS"
+  # Every step here is masked: this runs in EXIT traps under `set
+  # -e`, on shares the guest may not be able to write, and a
+  # teardown failure must never flip the run's verdict. The copy
+  # itself is time-boxed — an unwritable 9p share must not turn the
+  # bounded exit this trap exists for into a new hang. Report the
+  # real outcome: a timeout (124) means slow, any other status
+  # means failed, and the copy's own stderr carries the reason.
+  mkdir -p "$HOST_LOGS" 2>/dev/null || true
+  if timeout 60 cp -r "$LOGDIR/." "$HOST_LOGS/"; then
+    echo "logs collected under $HOST_LOGS"
+  else
+    local rc=$?
+    if [[ $rc -eq 124 ]]; then
+      echo "log copy exceeded 60s, logs stay in $LOGDIR" >&2
+    else
+      echo "log copy failed (exit $rc), logs stay in $LOGDIR" >&2
+    fi
+  fi
 }
 
 # A failed step must never strand a mount: unmount everything and kill
 # leftover mount processes, so the next run starts clean. The unmount is
 # attempted unconditionally — gating on `mountpoint -q` or `-e` can skip a
-# live mount whose FUSE fs misbehaves under stat.
+# live mount whose FUSE fs misbehaves under stat. Caller contract: stop
+# the relay BEFORE this runs — the bare `wait` below reaps every
+# background job of the shell, and a still-live relay blocks it forever
+# (the Lima step-failure hang). Mounts are SIGKILLed above, so the wait
+# itself is bounded.
 cleanup_mounts() {
   local m pidf
   for m in "$MNTS"/*; do

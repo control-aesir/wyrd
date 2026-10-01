@@ -1815,9 +1815,12 @@ where
 
     /// Submit a path-addressed (`base: None`) `SetAttrs` for a path
     /// that still stats. Every path-addressed immediate chmod/setattr
-    /// mutation goes through here — the `O_TRUNC` open's identity-bound
-    /// submit keeps its own lookup and `base` guard — so a vanished
-    /// path fails at the lookup instead of dying in the mutation loop.
+    /// mutation goes through here, with two deliberate exceptions: the
+    /// `O_TRUNC` open's identity-bound submit keeps its own lookup and
+    /// `base` guard, and `set_size_at` keeps its own `attr_at` because
+    /// it needs the stat's size for the same-size no-op and the
+    /// clean-handle repin. A vanished path fails at the lookup instead
+    /// of dying in the mutation loop.
     /// The converted arms are tested through this seam (vanished-path
     /// coverage on `set_exec_at` and the fh-less arm), not per arm:
     /// the arms differ only in how they obtain `path`.

@@ -204,6 +204,14 @@ actually rejecting warns at the default log level. Pinned by
 `serving_reopen_rebuilds_the_mirror_from_the_vault`, and
 `reimport_reconciles_a_vault_file_the_mirror_never_saw`.
 
+A poisoned durability-bookkeeping lock fails the operation, never the
+process: no directory is assumed durable or repaired on state a
+panicked holder may have left inconsistent, so the instance stays
+failed until restart. Pinned by
+`poisoned_pending_fails_reconcile_at_the_first_acquire` and
+`poisoned_verified_fails_verify_dir_before_any_sync`
+(`wyrd-format/src/durable.rs`).
+
 ## Mailbox ack and intake
 
 Commit precedes settle per envelope: accepted/duplicates ack,

@@ -303,7 +303,9 @@ impl FsObjectStore {
                 // fsync failed: the write is not durable, and retrying
                 // the rename would not repair it, so surface the error.
                 // `Durability` remembers the directory for the next
-                // insert to reconcile.
+                // insert to reconcile — unless the failure is a
+                // poisoned bookkeeping lock, in which case nothing was
+                // recorded and durability stays unknown, not repairable.
                 Err(error) => return Err(FsStoreError::io(error.into_io())),
             }
         }

@@ -11,8 +11,8 @@ use crate::keys::{DeviceEncryptionSecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::membership::MembershipLog;
 use crate::runtime::test_util::{
-    capability_message, control_key, deliver, drain, encryption_key, fixture, identity, owner,
-    queue, transition_message,
+    admit_engine, capability_message, control_key, deliver, drain, encryption_key, fixture,
+    identity, owner, queue, transition_message,
 };
 
 #[test]
@@ -630,4 +630,49 @@ fn unauthorized_capability_suppresses_without_pending() {
     assert_eq!(fixture.engine.pending_count(), 0);
     let facts = fixture.engine.store.load().expect("loads");
     assert!(facts.capabilities.is_empty());
+}
+
+/// A freshly resealed identical capability is a new envelope, not a
+/// duplicate: the message id covers the sealed bytes (fresh nonce),
+/// and capabilities carry no content-level dedupe — unlike
+/// transitions (transition id covers every byte) and announcements
+/// (the `Same` update check) — so the reseal commits a second fact.
+/// Semantic capability dedupe is a separate issue; this test pins
+/// today's boundary so that change updates it deliberately.
+#[test]
+fn resealed_identical_capability_recommits() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let cap = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+        ],
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &cap),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 3);
+    // Same capability value, freshly sealed: a new nonce means a new
+    // message id, so envelope dedupe does not fire — and no
+    // content-level check exists for capabilities.
+    let mail = vec![deliver(&fixture, 2, &cap)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "the reseal commits again");
+    assert_eq!(report.duplicates, 0, "the reseal is not a duplicate");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(
+        facts.capabilities.len(),
+        2,
+        "no semantic dedupe absorbs the reseal"
+    );
 }

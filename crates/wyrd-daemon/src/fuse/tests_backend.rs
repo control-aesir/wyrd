@@ -609,13 +609,14 @@ fn o_trunc_open_refuses_a_replacement_published_after_the_commit() {
 }
 
 /// `set_size_at` on a path that resolved and then disappeared
-/// returns the lookup error and submits nothing. With no loop
-/// draining the queue, a submission would block the call
-/// forever, so the worker finishing at all proves the syscall
-/// never reached the mutation path: before the fix the
-/// `u64::MAX` sentinel sailed past the no-op check and the call
-/// hung in `submit`, surfacing `ENOENT` from the background
-/// loop instead of the lookup.
+/// returns the lookup error and submits nothing — including for
+/// `u64::MAX`, the old sentinel, which must not read as "already
+/// this size" on a dead path. With no loop draining the queue, a
+/// submission would block the call forever, so the worker
+/// finishing at all proves the syscall never reached the mutation
+/// path: before the fix the `u64::MAX` sentinel sailed past the
+/// no-op check and the call hung in `submit`, surfacing `ENOENT`
+/// from the background loop instead of the lookup.
 #[test]
 fn set_size_at_on_a_disappeared_path_submits_nothing() {
     let (mut backend, _, gone, _) = kind_changing_backend();
@@ -637,9 +638,13 @@ fn set_size_at_on_a_disappeared_path_submits_nothing() {
     // next resolution retires it by path.
     publish(&backend, gone);
     assert_eq!(backend.inode_path(ino).as_deref(), Ok("f.txt"));
-
     let worker_backend = Arc::clone(&backend);
-    let worker = std::thread::spawn(move || worker_backend.set_size_at(ino, live_size + 1));
+    let worker = std::thread::spawn(move || {
+        (
+            worker_backend.set_size_at(ino, u64::MAX),
+            worker_backend.set_size_at(ino, live_size + 1),
+        )
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !worker.is_finished() {
         assert!(
@@ -648,8 +653,14 @@ fn set_size_at_on_a_disappeared_path_submits_nothing() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+    let (sentinel, sized) = worker.join().unwrap();
     assert_eq!(
-        worker.join().unwrap(),
+        sentinel,
+        Err(fuser::Errno::ENOENT),
+        "u64::MAX is a real size, not a silent no-op, on a dead path"
+    );
+    assert_eq!(
+        sized,
         Err(fuser::Errno::ENOENT),
         "the lookup error surfaces from the syscall, not the mutation loop"
     );

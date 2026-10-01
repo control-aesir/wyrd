@@ -1761,13 +1761,17 @@ where
     /// commits the truncation itself; the followup `setattr` finds
     /// the size already there) and makes repeated truncates cheap.
     /// A path that no longer stats fails here with the lookup
-    /// error: submitting for it would only die in the mutation
-    /// loop, burning a queue round trip to report what the stat
-    /// already knew. Open clean handles on the path re-pin onto
-    /// the committed size (see below); dirty ones keep the stale
-    /// rule.
+    /// error — whatever its class, not only `ENOENT`: submitting
+    /// for it would only die in the mutation loop, burning a queue
+    /// round trip to report what the stat already knew. Open clean
+    /// handles on the path re-pin onto the committed size (see
+    /// below); dirty ones keep the stale rule.
     pub fn set_size_at(&self, ino: u64, size: u64) -> Result<(), fuser::Errno> {
         let path = self.inode_path(ino)?;
+        // Deliberately no EROFS pre-check: the lookup runs first
+        // so a vanished path reports ENOENT on every mount, and a
+        // live path on a read-only mount still reaches `submit`
+        // and is refused there.
         let current = self.attr_at(&path)?.size;
         if current == size {
             return Ok(());

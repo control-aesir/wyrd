@@ -671,6 +671,83 @@ fn set_size_at_on_a_disappeared_path_submits_nothing() {
     );
 }
 
+/// `set_exec_at` on a path that resolved and then disappeared
+/// returns the lookup error and submits nothing: the chmod is
+/// path-addressed, so whatever the path names now is not what
+/// the caller addressed. With no loop draining the queue, a
+/// submission would block the call forever, so the worker
+/// finishing at all proves the syscall never reached the mutation
+/// path.
+#[test]
+fn set_exec_at_on_a_disappeared_path_submits_nothing() {
+    let (mut backend, _, gone, _) = kind_changing_backend();
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let (ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+
+    // The file leaves; the ino->path mapping lingers until the
+    // next resolution retires it by path.
+    publish(&backend, gone);
+    assert_eq!(backend.inode_path(ino).as_deref(), Ok("f.txt"));
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || worker_backend.set_exec_at(ino, true));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !worker.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "set_exec_at never returned: it submitted a mutation for a path it could not stat"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        Err(fuser::Errno::ENOENT),
+        "the lookup error surfaces from the syscall, not the mutation loop"
+    );
+    assert_eq!(
+        queue.outstanding(),
+        0,
+        "no SetAttrs may be queued for an unreadable path"
+    );
+}
+
+/// The fh-less `setattr_attrs` mode arm on a disappeared path
+/// behaves the same way: the submission is path-addressed, so a
+/// dead path fails at the lookup with nothing queued.
+#[test]
+fn setattr_attrs_mode_on_a_disappeared_path_submits_nothing() {
+    let (mut backend, _, gone, _) = kind_changing_backend();
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let (ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+
+    publish(&backend, gone);
+    assert_eq!(backend.inode_path(ino).as_deref(), Ok("f.txt"));
+    let worker_backend = Arc::clone(&backend);
+    let worker =
+        std::thread::spawn(move || worker_backend.setattr_attrs(ino, None, None, Some(0o755)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !worker.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "setattr_attrs never returned: it submitted a mutation for a path it could not stat"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        Err(fuser::Errno::ENOENT),
+        "the lookup error surfaces from the syscall, not the mutation loop"
+    );
+    assert_eq!(
+        queue.outstanding(),
+        0,
+        "no SetAttrs may be queued for an unreadable path"
+    );
+}
+
 /// Directory handles pin their enumeration generation: a listing
 /// opened before a publication keeps serving its own snapshot
 /// while a fresh open picks up the new generation. The two never

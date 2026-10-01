@@ -1800,13 +1800,34 @@ where
     }
 
     /// Toggle the exec bit of the file at `ino` (path-addressed
-    /// `setattr(mode)`).
+    /// `setattr(mode)`). A path that no longer stats fails here with
+    /// the lookup error — whatever its class, not only `ENOENT`:
+    /// submitting for it would only die in the mutation loop, burning
+    /// a queue round trip to report what the stat already knew.
+    /// Deliberately no EROFS pre-check, for the same reason as
+    /// `set_size_at`: a live path on a read-only mount still reaches
+    /// `submit` and is refused there.
     pub fn set_exec_at(&self, ino: u64, executable: bool) -> Result<(), fuser::Errno> {
         let path = self.inode_path(ino)?;
+        self.submit_attrs(&path, None, Some(executable))?;
+        Ok(())
+    }
+
+    /// Submit a path-addressed `SetAttrs` for a path that still
+    /// stats. Every immediate (non-handle-buffered) chmod/setattr
+    /// mutation goes through here so a vanished path fails at the
+    /// lookup instead of dying in the mutation loop.
+    fn submit_attrs(
+        &self,
+        path: &str,
+        size: Option<u64>,
+        executable: Option<bool>,
+    ) -> Result<(), fuser::Errno> {
+        self.attr_at(path)?;
         self.submit(MutationKind::SetAttrs {
-            path,
-            size: None,
-            executable: Some(executable),
+            path: path.to_owned(),
+            size,
+            executable,
             base: None,
         })?;
         Ok(())
@@ -1823,7 +1844,9 @@ where
     /// `O_APPEND` is the default for `>>`, so that arm is not exotic.
     /// Combining size and mode through a writable handle is refused
     /// (`EOPNOTSUPP`): the buffered image and a path-addressed exec
-    /// change cannot be one snapshot.
+    /// change cannot be one snapshot. Every path-addressed submission
+    /// below first stats the path (`submit_attrs`), so a vanished path
+    /// fails with the lookup error and queues nothing.
     pub fn setattr_attrs(
         &self,
         ino: u64,
@@ -1847,12 +1870,7 @@ where
                         return Err(fuser::Errno::EOPNOTSUPP);
                     }
                     if let Some(executable) = executable {
-                        self.submit(MutationKind::SetAttrs {
-                            path,
-                            size: None,
-                            executable: Some(executable),
-                            base: None,
-                        })?;
+                        self.submit_attrs(&path, None, Some(executable))?;
                     }
                     return Ok(());
                 }
@@ -1872,12 +1890,7 @@ where
                     return Err(fuser::Errno::EBADF);
                 }
                 match executable {
-                    Some(executable) => self.submit(MutationKind::SetAttrs {
-                        path,
-                        size: None,
-                        executable: Some(executable),
-                        base: None,
-                    })?,
+                    Some(executable) => self.submit_attrs(&path, None, Some(executable))?,
                     None => return Ok(()),
                 };
                 Ok(())
@@ -1892,12 +1905,7 @@ where
                 match (size, executable) {
                     (Some(size), None) => self.set_size_at(ino, size),
                     _ => {
-                        self.submit(MutationKind::SetAttrs {
-                            path,
-                            size,
-                            executable,
-                            base: None,
-                        })?;
+                        self.submit_attrs(&path, size, executable)?;
                         Ok(())
                     }
                 }

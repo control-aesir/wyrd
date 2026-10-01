@@ -379,6 +379,16 @@ impl MemoryRelay {
             .expect("delivery id space exhausted");
         self.queue.push_back(Slot { id, envelope });
     }
+
+    /// Reverse the pending queue: arrival-order properties drain one
+    /// device in scenario order, then hand the other device the same
+    /// traffic in the opposite order. Delivery ids ride along untouched
+    /// (identity, not order), so settlement still addresses the same
+    /// envelopes.
+    pub(crate) fn reverse_queue(&mut self) {
+        let reversed: VecDeque<Slot> = self.queue.drain(..).rev().collect();
+        self.queue = reversed;
+    }
 }
 
 #[cfg(test)]

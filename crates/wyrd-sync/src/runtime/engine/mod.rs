@@ -1662,7 +1662,7 @@ impl Engine {
 // Engine behavior tests live beside the engine, one file per theme:
 // the shared two-device scenario harness plus convergence,
 // authoring, drain/resume, serving, lifecycle, materialization,
-// and outbox delivery.
+// arrival-order/scale properties, and outbox delivery.
 #[cfg(test)]
 mod tests_authoring;
 #[cfg(test)]
@@ -1677,5 +1677,7 @@ mod tests_harness;
 mod tests_lifecycle;
 #[cfg(test)]
 mod tests_materialization;
+#[cfg(test)]
+mod tests_properties;
 #[cfg(test)]
 mod tests_serving;

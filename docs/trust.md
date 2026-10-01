@@ -552,7 +552,10 @@ AEAD(
 )
 ```
 
-Storage ID = domain-separated hash over `nonce || ciphertext || aad`.
+Storage ID = domain-separated BLAKE3 key derivation over the sealed
+bytes (`version ‖ kind ‖ nonce ‖ ciphertext`); the AAD (`version ‖
+kind ‖ ContentId`) authenticates the object but is never serialized
+into the addressed representation.
 
 Invariant: **successful decryption alone is never sufficient.** A device
 accepts an object only when (a) the AEAD tag verifies over the bound AAD,
@@ -832,7 +835,7 @@ holds the nsec describe NIP-46 mode only.
 
 | Party | Can know | Cannot know |
 |---|---|---|
-| vault | Storage IDs, ciphertext sizes, counts, timing, traffic patterns | plaintext, paths, structure, **cryptographic equality of plaintexts** (fresh nonces make ciphertext equality meaningless) |
+| vault | Storage IDs, object kinds, ciphertext sizes, counts, timing, traffic patterns — stated precisely in the subsection below | plaintext, paths, structure, **cryptographic equality of plaintexts** (fresh nonces make ciphertext equality meaningless) |
 | public relay | pubkeys that choose to be publicly visible; opaque encrypted control messages | membership graphs, invitation flow, any Wyrd payload |
 | drive member | full plaintext world of its epochs, all Content IDs, cross-device equality via manifests | other epochs' material it never held |
 | removed device | plaintext it cached, plus old-epoch objects it already stored | anything from later epochs |
@@ -847,6 +850,94 @@ Authorization = membership, object admission = content verification;
 there are no per-object ACLs in v0. This is an availability and
 enumeration property, not a confidentiality break: a member already
 holds the epoch material that makes the ciphertext meaningful.
+
+### Vault-side metadata confidentiality (stated precisely)
+
+The relay side settles for best-effort metadata confidentiality "exactly
+as for vaults" (Identity, above) — this section is the vault side of
+that sentence. "A vault" here is the target third-party replica: a
+peer that holds ciphertext and answers hash-addressed lookups over
+iroh (`iroh_blobs::ALPN`) with transport identity only — no keys, no
+Wyrd authorization, no control plane. What ships today is
+member-hosted: the serving endpoint opens from a member process
+holding the identity, epoch keys, and the live mailbox
+(`WyrdNode::open_serving`), so for that surface read the "drive
+member" row instead — the keyless replica is the posture new serving
+surfaces must preserve, not a description of the current composer.
+What the endpoint withholds is discovery, not hashes: it answers no
+listing and no enumeration (an unheld hash is a protocol error), while
+every request on the wire names its hash — the (address, hash) pairs
+that make a lookup possible travel inside sealed announcements to
+members and readers alone (T17).
+
+Observable — what a vault sees in v0:
+
+- **Opaque blob identifiers** it stores and serves (transport hashes;
+  member-held `StorageId` mappings resolve to them locally).
+- **Object kinds.** The sealed header carries a cleartext `kind` byte,
+  so a vault classifies every blob it holds; contents stay sealed.
+- **Ciphertext sizes.** There is no padding in v0, so approximate
+  plaintext sizes leak.
+- **Counts**: blobs held, total bytes.
+- **Timing**: when blobs are imported (publish/replication activity)
+  and when they are fetched (access activity).
+- **Request patterns** — a network-layer observation by the vault
+  operator, not endpoint telemetry (the endpoint takes no telemetry
+  sink and sees no requester identity): which transport peer (iroh
+  endpoint id) requested which hash when. Repeat requests for one hash
+  are linkable; Bao range requests are byte ranges within a blob
+  (Wyrd's own fetch asks whole blobs after a size probe).
+- **Transport identity** of connected peers — iroh node ids (and IP
+  addresses at the network layer), distinct from device identity. The
+  transport↔device binding lives only in the sealed announcements
+  members hold, so a vault cannot map a connection to a member.
+- **Correlation heuristics only**: co-fetching, matching sizes across
+  epochs. No cryptographic linkability exists between two blobs, or
+  between a blob and a drive.
+
+Hidden — what a vault cannot learn, even holding every blob of a drive
+and observing all request traffic:
+
+- **Plaintext, paths, tree structure**, manifest and snapshot contents
+  and authorship. Manifests are sealed to the drive; vaults store them
+  opaquely.
+- **ContentIds.** The ContentId never reaches the stored
+  representation: the StorageId hashes the sealed bytes only
+  (`version ‖ kind ‖ nonce ‖ ciphertext`), and the ContentId binds
+  solely as AEAD AAD. Concealment is absence, not one-wayness — and
+  fresh nonces make every re-sealing a new unlinkable StorageId: no
+  plaintext-equality oracle. That is the mirror image of the members'
+  ContentId oracle in the table above, and the reason the
+  member/vault boundary is a security boundary.
+- **Drive identity.** The `DriveId` never travels the bulk wire:
+  addressing is hash-only and the drive enters locally, as key
+  derivation input. Drives are unlinkable to a vault except via access
+  patterns.
+- **Membership.** Who the members and readers are, and where epoch
+  boundaries fall: new blobs reveal activity, never its meaning —
+  history is never re-encrypted, so a rotation shows only as new
+  blobs under new keys, indistinguishable from ordinary writes.
+- **Control traffic.** The Nostr side never reaches a keyless replica:
+  no mailbox, no gift wraps, no announcements. (A member-hosted
+  serving surface shares its host's mailbox; that mailbox belongs to
+  the member party, above.)
+
+The statement, in one line: **a vault learns nothing about contents,
+structure, membership, drive identity, or blob relationships beyond
+traffic-analysis heuristics — and traffic analysis is explicitly not
+resisted.** Sizes, counts, timing, and request patterns are accepted
+exposure, exactly as relay-visible routing metadata is on the control
+plane.
+
+v0 boundary with a future cost attached: **escrow records are the one
+framing whose vault exposure is already decided against.** The pinned
+record envelope carries cleartext `DriveId` and epoch (`version ‖
+DriveId ‖ epoch ‖ nonce ‖ ciphertext`), so replicating records to
+vaults — deferred to later transport work — would make a drive's
+records linkable and expose the `DriveId`. v0 never sends them there:
+records live as local keystore sidecars. The transport that eventually
+moves them must either accept that exposure or re-frame the record;
+until then no vault-visible bytes carry drive identity.
 
 ## Decision record
 

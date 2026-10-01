@@ -51,8 +51,8 @@ fn classify(sightings: &mut Sightings, notification: ClientNotification) -> bool
 }
 
 /// Drain the notification stream until `window` elapses, ending early on
-/// a quiet gap once anything arrived: the contract pins both presence
-/// (replay arrives) and absence (no second `Event`-arm firing), and
+/// a quiet gap once an event sighting arrived: the contract pins both
+/// presence (replay arrives) and absence (no second `Event`-arm firing), and
 /// absence needs a bounded quiet wait, not a single poll.
 async fn collect_sightings(
     notifications: &mut (impl futures_util::Stream<Item = ClientNotification> + Unpin),
@@ -92,14 +92,15 @@ async fn collect_sightings(
     sightings
 }
 
-/// First-seen events surface once through the `Event` arm; already-seen
-/// replay after a CLOSE+REQ resubscribe under the same subscription ID
-/// (mirroring the mailbox's `resubscribe`) surfaces only through the
-/// `Message` arm as `RelayMessage::Event`. Both relays hold the event,
-/// so the replay half also pins that the suppression is pool-wide, not
-/// per-relay. Either arm moving is a nostr-sdk behavior change worth a
-/// re-review of the drainer's fork — the absence assertions trip the
-/// bump, they are not a delivery dependency the mailbox breaks on.
+/// First-seen events surface once through the `Event` arm — both relays
+/// hold the event, so the single firing pins that first-seen is
+/// pool-wide, not per-relay; already-seen replay after a CLOSE+REQ
+/// resubscribe under the same subscription ID (mirroring the mailbox's
+/// `resubscribe`) surfaces only through the `Message` arm as
+/// `RelayMessage::Event`. Either arm moving is a nostr-sdk behavior
+/// change worth a re-review of the drainer's fork — the absence
+/// assertions trip the bump, they are not a delivery dependency the
+/// mailbox breaks on.
 #[test]
 fn first_seen_event_uses_the_event_arm_and_resubscribe_replay_uses_the_message_arm() {
     const RESUBSCRIBE_WINDOW: Duration = Duration::from_secs(15);
@@ -122,9 +123,10 @@ fn first_seen_event_uses_the_event_arm_and_resubscribe_replay_uses_the_message_a
         // broadcasts after the subscription exists, so creating the
         // stream first is the same handshake `establish_drainer` makes.
         let mut notifications = client.notifications();
-        // Both relays store the event before any subscription exists,
-        // so both replays carry already-seen history from the pool's
-        // point of view no matter which arrives first.
+        // Both relays stored the event before subscribing, so both REQs
+        // replay it; the pool records the first replay as first-seen and
+        // the second as already-seen no matter which relay wins the race,
+        // which is what makes the single `Event`-arm firing pool-wide.
         relay_a.inject(event.clone());
         relay_b.inject(event);
         for url in [relay_a.url(), relay_b.url()] {

@@ -198,6 +198,27 @@ impl Loaded {
         )
     }
 
+    /// Publish the root manifest and every sealed object except the
+    /// root tree: for tests that stage a pass where the head is
+    /// classified but its tree has not arrived yet. `objects[0]` is
+    /// the tree by `seal_flat_drive` construction (tree first, then
+    /// chunks).
+    pub(crate) fn publish_all_but_tree(&mut self) {
+        let snapshot_id = self.snapshot.snapshot_id();
+        self.bulk
+            .publish_root(snapshot_id, self.content.root.clone());
+        for (storage, sealed) in self.content.objects.iter().skip(1) {
+            self.bulk.publish_sealed(*storage, sealed.clone());
+        }
+    }
+
+    /// Publish the withheld root tree (`objects[0]`, see
+    /// `publish_all_but_tree`): the pass that heals a staged gap.
+    pub(crate) fn publish_tree(&mut self) {
+        let (storage, sealed) = &self.content.objects[0];
+        self.bulk.publish_sealed(*storage, sealed.clone());
+    }
+
     /// Drain the control plane: the capability and the announcement
     /// commit.
     pub(crate) fn drain(&mut self) -> DrainReport {

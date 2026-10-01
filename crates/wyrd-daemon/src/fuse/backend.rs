@@ -1813,16 +1813,24 @@ where
         Ok(())
     }
 
-    /// Submit a path-addressed `SetAttrs` for a path that still
-    /// stats. Every immediate (non-handle-buffered) chmod/setattr
-    /// mutation goes through here so a vanished path fails at the
-    /// lookup instead of dying in the mutation loop.
+    /// Submit a path-addressed (`base: None`) `SetAttrs` for a path
+    /// that still stats. Every path-addressed immediate chmod/setattr
+    /// mutation goes through here — the `O_TRUNC` open's identity-bound
+    /// submit keeps its own lookup and `base` guard — so a vanished
+    /// path fails at the lookup instead of dying in the mutation loop.
+    /// The converted arms are tested through this seam (vanished-path
+    /// coverage on `set_exec_at` and the fh-less arm), not per arm:
+    /// the arms differ only in how they obtain `path`.
     fn submit_attrs(
         &self,
         path: &str,
         size: Option<u64>,
         executable: Option<bool>,
     ) -> Result<(), fuser::Errno> {
+        debug_assert!(
+            size.is_some() || executable.is_some(),
+            "a SetAttrs with neither size nor exec change is a wasted round trip"
+        );
         self.attr_at(path)?;
         self.submit(MutationKind::SetAttrs {
             path: path.to_owned(),
@@ -1846,7 +1854,10 @@ where
     /// (`EOPNOTSUPP`): the buffered image and a path-addressed exec
     /// change cannot be one snapshot. Every path-addressed submission
     /// below first stats the path (`submit_attrs`), so a vanished path
-    /// fails with the lookup error and queues nothing.
+    /// fails with the lookup error and queues nothing. The chmod arms
+    /// deliberately follow `getattr_at` rather than the demand path:
+    /// an unmaterialized subtree fails fast with `EIO` instead of
+    /// fetching and retrying the way `open`/`read` do.
     pub fn setattr_attrs(
         &self,
         ino: u64,

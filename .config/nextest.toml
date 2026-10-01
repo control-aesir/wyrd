@@ -22,6 +22,24 @@ contracts-serial = { max-threads = 1 }
 # eight without a name-by-name list at each call site.
 [profile.default]
 default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window))"
+# Nextest's LEAK verdict fires when a test's stdout/stderr pipes stay
+# open past its exit: a live child process inheriting them, or an event
+# loop too loaded to observe the EOF within the window. Nextest runs
+# each test in its own process (verified: test binaries execute with
+# `--exact <single-test>`), so threads can never cross tests — the old
+# thread-misattribution theory recorded here and in the Sep-18
+# contracts-serial change is wrong; serializing only helped by
+# lightening the load. All pinned verdicts hit fast sync-only tests
+# that spawn nothing (their processes cannot hold their own pipes) in
+# the first second of a workspace run, when all seven test binaries
+# spawn at once and the observer starves past the sub-second default.
+# (Mount helpers do fork — vendored fuser shells umount — but those
+# live in mount-test processes, never in the blamed ones.) 5s keeps
+# the tripwire for a genuine leak while surviving the startup storm;
+# it costs nothing on clean runs since the wait only bites when the
+# pipes are still open. See the leaky-verdict issue for the pin
+# evidence (four blamed innocents across wyrd-cli and wyrd-core).
+leak-timeout = "5s"
 
 [profile.slow]
 default-filter = "test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window)"

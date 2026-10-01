@@ -997,11 +997,12 @@ mod tests {
         }
     }
 
-    /// A wide flat closure verifies at production limits: thousands of
+    /// A wide flat closure verifies under `Limits::V0`: thousands of
     /// files, every chunk mapped, the root tree self-mapped. At 4096
     /// files this is a sample, not a ceiling measurement — about 0.7%
     /// of `Limits::V0.max_manifest_entries` and 0.4% of
-    /// `max_tree_entries`; the ceiling edge itself is pinned by
+    /// `max_tree_entries` (sample run 2026-10-01, Apple Silicon:
+    /// ~30 ms); the ceiling edge itself is pinned by
     /// `pinned_limits_reject_an_overwide_manifest` instead. The
     /// elapsed time is recorded, not asserted — wall clocks are not
     /// contracts — so the fetch hot path has a number to revisit.

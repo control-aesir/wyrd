@@ -2072,6 +2072,24 @@ fn a_gated_head_mounts_only_after_its_tree_lands_and_survives_restart() {
         matches!(daemon.view().lookup("gated.txt"), Err(ViewError::NotFound)),
         "a head whose tree has not arrived installs nothing"
     );
+    // The pending arm under test is the missing tree specifically:
+    // the chunk is already Available while the tree is still
+    // Fetching, so a wider gap (manifest missing too) would fail here.
+    let runtime = daemon.engine().runtime_state().unwrap();
+    assert_eq!(
+        runtime.status(&loaded.content.tree_id),
+        FetchStatus::Fetching,
+        "the unfetched tree is the pending item"
+    );
+    for id in &loaded.content.content_ids {
+        if *id != loaded.content.tree_id {
+            assert_eq!(
+                runtime.status(id),
+                FetchStatus::Available,
+                "the chunk arrived on the first pass"
+            );
+        }
+    }
 
     // The tree lands: the next pass fetches it and the head mounts.
     loaded.publish_tree();

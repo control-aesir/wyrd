@@ -58,6 +58,9 @@ pub(crate) struct SealedContent {
     /// construction order below (tree first, then chunks), recorded
     /// here so stagers address the tree by identity, not position.
     pub tree_storage: StorageId,
+    /// The tree's content id, for status assertions against the
+    /// runtime's per-object fetch state.
+    pub tree_id: ContentId,
 }
 
 pub(crate) fn seal_flat_drive(
@@ -103,6 +106,7 @@ pub(crate) fn seal_flat_drive(
             sealed: manifest_obj.encode(),
         },
         tree_storage: objects[0].0,
+        tree_id,
         objects,
         content_ids,
         manifest_id,

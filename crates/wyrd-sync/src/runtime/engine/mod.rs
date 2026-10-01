@@ -646,8 +646,10 @@ impl Engine {
     }
 
     /// Assemble an engine over an already-open durable store. The caller
-    /// holds the store lock (bootstrap acquires it before writing any
-    /// drive or custody state, so creation is serialized).
+    /// holds the store lock: bootstrap acquires it before writing any
+    /// drive or custody state (so creation is serialized) and before
+    /// reading the custody record on open (so the read is serialized
+    /// against writers).
     pub(super) fn open_with_store(
         store: DurableStore,
         drive: DriveId,

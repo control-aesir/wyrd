@@ -133,9 +133,11 @@ fn opening_a_created_drive_with_the_wrong_passphrase_fails_closed() {
     let dir = TestDir::new("bootstrap-wrong-pass");
     let identity = DeviceIdentitySecret::generate().unwrap();
     drop(Engine::create(dir.path.clone(), "test-pass", identity.clone()).unwrap());
+    // The store key unwraps under the lock before custody is read, so
+    // a wrong passphrase surfaces at the store layer now; still closed.
     assert!(matches!(
         Engine::open_keystore(dir.path.clone(), "wrong-pass", identity),
-        Err(EngineError::Keystore(_))
+        Err(EngineError::Durable(DurableError::StoreKey(_)))
     ));
 }
 

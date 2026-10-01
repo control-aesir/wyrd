@@ -79,6 +79,10 @@ fn member_custody_reopens_without_root_or_escrow() {
         engine.log.known_state().is_none(),
         "no membership observed yet"
     );
+    // Release the lock before probing mismatches: the open acquires
+    // the store lock before reading custody, so a held lock reports
+    // contention before identity is even compared.
+    drop(engine);
     // A wrong identity names no record here, and a wrong
     // passphrase fails the wrap open: both fail closed.
     let other = DeviceIdentitySecret::generate().unwrap();
@@ -86,9 +90,11 @@ fn member_custody_reopens_without_root_or_escrow() {
         open_keystore(dir.path.clone(), "test-pass", other),
         Err(EngineError::DeviceMismatch)
     ));
+    // Same lock-first precedence as the owner path: the store key
+    // unwrap runs before the custody unwrap.
     assert!(matches!(
         open_keystore(dir.path.clone(), "wrong-pass", identity),
-        Err(EngineError::Keystore(_))
+        Err(EngineError::Durable(DurableError::StoreKey(_)))
     ));
 }
 
@@ -865,5 +871,40 @@ fn resync_refuses_bootstrap_that_disagrees_with_the_keyring() {
         engine.epoch_keys.get(&1),
         Some(&held_before),
         "a conflicting blob installs nothing"
+    );
+}
+
+#[test]
+fn swapped_custody_record_fails_closed_on_open() {
+    let victim = TestDir::new("custody-swap-victim");
+    let owner = DeviceIdentitySecret::generate().unwrap();
+    drop(create(victim.path.clone(), "test-pass", owner.clone()).unwrap());
+
+    // An attacker record that unwraps under the same passphrase but
+    // names a different owner: a well-formed owner custody from a
+    // second drive. Copying it over the victim models the racer
+    // winning the window between the custody read and the store lock.
+    let attacker_dir = TestDir::new("custody-swap-attacker");
+    let attacker = DeviceIdentitySecret::generate().unwrap();
+    drop(create(attacker_dir.path.clone(), "test-pass", attacker.clone()).unwrap());
+    let attacker_record =
+        std::fs::read(attacker_dir.path.join(KEYSTORE_FILE)).expect("attacker has custody");
+    std::fs::write(victim.path.join(KEYSTORE_FILE), &attacker_record).unwrap();
+
+    // The open must proceed on the bytes on disk at open time — the
+    // swapped record — and fail closed on them, never on stale bytes.
+    // The victim identity no longer names the recorded owner, and the
+    // attacker identity's escrow is bound to the attacker's drive, so
+    // both fail; neither opens the victim's drive.
+    assert!(
+        matches!(
+            open_keystore(victim.path.clone(), "test-pass", owner),
+            Err(EngineError::OwnerMismatch)
+        ),
+        "a swapped record must not open under the victim identity"
+    );
+    assert!(
+        open_keystore(victim.path.clone(), "test-pass", attacker).is_err(),
+        "a swapped record must not open under the attacker identity either"
     );
 }

@@ -882,8 +882,11 @@ fn swapped_custody_record_fails_closed_on_open() {
 
     // An attacker record that unwraps under the same passphrase but
     // names a different owner: a well-formed owner custody from a
-    // second drive. Copying it over the victim models the racer
-    // winning the window between the custody read and the store lock.
+    // second drive. Copying it over the victim pins custody
+    // interpretation (the open proceeds on the bytes on disk and fails
+    // closed on them); the lock ordering itself is pinned by the
+    // lock-first error precedence elsewhere, since a sequential test
+    // cannot land inside the old read-then-lock window.
     let attacker_dir = TestDir::new("custody-swap-attacker");
     let attacker = DeviceIdentitySecret::generate().unwrap();
     drop(create(attacker_dir.path.clone(), "test-pass", attacker.clone()).unwrap());
@@ -904,7 +907,49 @@ fn swapped_custody_record_fails_closed_on_open() {
         "a swapped record must not open under the victim identity"
     );
     assert!(
-        open_keystore(victim.path.clone(), "test-pass", attacker).is_err(),
+        matches!(
+            open_keystore(victim.path.clone(), "test-pass", attacker),
+            Err(EngineError::Crypto(_))
+        ),
         "a swapped record must not open under the attacker identity either"
     );
+}
+
+#[test]
+fn open_keystore_against_a_held_lock_reports_contention() {
+    let dir = TestDir::new("custody-lock-held");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let engine = create(dir.path.clone(), "test-pass", identity.clone()).unwrap();
+    // Another holder owns the directory: the open must report
+    // contention before it interprets any custody.
+    let drive = engine.drive;
+    drop(engine);
+    let _holder = DurableStore::open(dir.path.clone(), drive, "test-pass").expect("holder opens");
+    assert!(
+        matches!(
+            open_keystore(dir.path.clone(), "test-pass", identity),
+            Err(EngineError::Durable(DurableError::StoreLocked))
+        ),
+        "a lock-held open reports contention, not custody"
+    );
+}
+
+#[test]
+fn open_on_a_drive_only_directory_writes_nothing() {
+    // The crash window inside the store open between the DRIVE write
+    // and the store-key write: DRIVE exists, nothing else does. The
+    // open must refuse without minting state of its own.
+    let dir = TestDir::new("custody-drive-only");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    std::fs::write(dir.path.join("DRIVE"), drive_id().as_bytes()).unwrap();
+    assert!(
+        open_keystore(dir.path.clone(), "test-pass", identity).is_err(),
+        "a DRIVE-only directory refuses the open"
+    );
+    for residue in ["store-key.wrap", "LOCK", "commits", KEYSTORE_FILE] {
+        assert!(
+            !dir.path.join(residue).exists(),
+            "the refused open leaves no {residue} behind"
+        );
+    }
 }

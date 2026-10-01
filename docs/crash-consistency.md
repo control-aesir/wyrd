@@ -157,7 +157,11 @@ window resumes on open: the genesis is deterministic and
 owner-verified, the member secret is reused idempotently. Pinned by
 `an_interrupted_bootstrap_resumes_on_open`, `join_round_trip_reopens_as_member`,
 and the lifecycle create/open roundtrips (`runtime/bootstrap.rs`,
-`engine/tests_lifecycle.rs`).
+`engine/tests_lifecycle.rs`). The open itself takes the store lock
+before reading the custody record, so the read is serialized against
+cooperating writers; a missing record is refused before the store
+opens, so a refused open writes nothing (`open_on_a_drive_only_directory_writes_nothing`,
+`open_keystore_against_a_held_lock_reports_contention`).
 
 ## Escrow sidecars
 

@@ -160,6 +160,17 @@ pub(super) fn open_keystore(
     // open below re-verifies it under the lock (`DriveMismatch` on
     // divergence).
     let drive = read_drive(&dir)?;
+    // Refuse a missing custody record BEFORE opening the store: the
+    // store open would mint `store-key.wrap` (plus `commits/` and
+    // `LOCK`) in a directory this call is about to refuse, stranding a
+    // crash-window directory no later open can use. A missing record
+    // cannot become this caller's record, so the probe costs nothing
+    // and reintroduces no race — only the *read* must sit under the
+    // lock, not this existence check. Errors (including NotFound)
+    // surface exactly as the pre-lock read produced them.
+    if let Err(error) = std::fs::metadata(dir.join(KEYSTORE_FILE)) {
+        return Err(EngineError::Io(error));
+    }
     // Acquire the store lock BEFORE reading custody. Creation holds
     // this lock across the custody write, so no cooperating writer can
     // replace the record between this read and the engine open below:

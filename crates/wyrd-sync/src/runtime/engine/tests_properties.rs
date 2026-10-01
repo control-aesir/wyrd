@@ -6,7 +6,7 @@
 //! full drain+execute path and the history sizes the issue named,
 //! with exact reports instead of wall-clock asserts.
 
-use super::tests_harness::{drain_side, execute_side, scenario, Device, Pair};
+use super::tests_harness::{assert_agreement, drain_side, execute_side, scenario, Device, Pair};
 use super::*;
 
 use wyrd_format::{ContentId, MemoryObjectStore};
@@ -124,14 +124,11 @@ fn reversed_arrival_converges_to_the_same_outcome() {
         "nothing left pending on either order"
     );
     assert_same_outcome(&pair);
-    // Not assert_agreement: its announcement comparison is
-    // commit-order sensitive (its "order-insensitive" comment covers
-    // manifests and objects only), and commit order legitimately
-    // differs by arrival order. Re-check convergence directly.
-    let report = execute_side(&mut pair.bulk, &mut pair.a);
-    assert_eq!(report.unfulfilled, 0, "a converged");
-    let report = execute_side(&mut pair.bulk, &mut pair.b);
-    assert_eq!(report.unfulfilled, 0, "b converged");
+    // assert_agreement re-checks convergence on both devices (its
+    // announcement comparison sorts, so commit order from the two
+    // arrival orders is fine); the bodies comparison above stays
+    // because the helper omits it.
+    assert_agreement(&mut pair);
 }
 
 // --- execute re-drive idempotence --------------------------------
@@ -202,9 +199,10 @@ fn re_execute_without_new_work_commits_nothing() {
 // 256 per sender per pass, at two facts per accepted announcement,
 // so all 127 single-sender announcements land in one pass —
 // multi-pass shedding is NOT exercised here. That boundary is
-// pinned by the slow-profile
-// `sustained_spam_commits_bounded_facts_per_pass_and_converges`
-// instead.
+// pinned by the per-sender quota test
+// (`per_sender_quota_keeps_one_spammer_from_starving_others`: 200
+// single-sender announcements, 128 accepted at exactly 256 facts,
+// the rest shed and converging next pass) instead.
 
 const SCALE_ANNOUNCEMENTS: usize = 128;
 

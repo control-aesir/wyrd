@@ -79,6 +79,10 @@ fn member_custody_reopens_without_root_or_escrow() {
         engine.log.known_state().is_none(),
         "no membership observed yet"
     );
+    // Release the lock before probing mismatches: the open acquires
+    // the store lock before reading custody, so a held lock reports
+    // contention before identity is even compared.
+    drop(engine);
     // A wrong identity names no record here, and a wrong
     // passphrase fails the wrap open: both fail closed.
     let other = DeviceIdentitySecret::generate().unwrap();
@@ -86,9 +90,11 @@ fn member_custody_reopens_without_root_or_escrow() {
         open_keystore(dir.path.clone(), "test-pass", other),
         Err(EngineError::DeviceMismatch)
     ));
+    // Same lock-first precedence as the owner path: the store key
+    // unwrap runs before the custody unwrap.
     assert!(matches!(
         open_keystore(dir.path.clone(), "wrong-pass", identity),
-        Err(EngineError::Keystore(_))
+        Err(EngineError::Durable(DurableError::StoreKey(_)))
     ));
 }
 
@@ -865,5 +871,107 @@ fn resync_refuses_bootstrap_that_disagrees_with_the_keyring() {
         engine.epoch_keys.get(&1),
         Some(&held_before),
         "a conflicting blob installs nothing"
+    );
+}
+
+#[test]
+fn swapped_custody_record_fails_closed_on_open() {
+    let victim = TestDir::new("custody-swap-victim");
+    let owner = DeviceIdentitySecret::generate().unwrap();
+    drop(create(victim.path.clone(), "test-pass", owner.clone()).unwrap());
+
+    // An attacker record that unwraps under the same passphrase but
+    // names a different owner: a well-formed owner custody from a
+    // second drive. Copying it over the victim pins custody
+    // interpretation (the open proceeds on the bytes on disk and fails
+    // closed on them); the lock ordering itself is pinned by the
+    // lock-first error precedence elsewhere, since a sequential test
+    // cannot land inside the old read-then-lock window.
+    let attacker_dir = TestDir::new("custody-swap-attacker");
+    let attacker = DeviceIdentitySecret::generate().unwrap();
+    drop(create(attacker_dir.path.clone(), "test-pass", attacker.clone()).unwrap());
+    let attacker_record =
+        std::fs::read(attacker_dir.path.join(KEYSTORE_FILE)).expect("attacker has custody");
+    std::fs::write(victim.path.join(KEYSTORE_FILE), &attacker_record).unwrap();
+
+    // The open must proceed on the bytes on disk at open time — the
+    // swapped record — and fail closed on them, never on stale bytes.
+    // The victim identity no longer names the recorded owner, and the
+    // attacker identity's escrow is bound to the attacker's drive, so
+    // both fail; neither opens the victim's drive.
+    assert!(
+        matches!(
+            open_keystore(victim.path.clone(), "test-pass", owner),
+            Err(EngineError::OwnerMismatch)
+        ),
+        "a swapped record must not open under the victim identity"
+    );
+    assert!(
+        matches!(
+            open_keystore(victim.path.clone(), "test-pass", attacker),
+            Err(EngineError::Crypto(_))
+        ),
+        "a swapped record must not open under the attacker identity either"
+    );
+}
+
+#[test]
+fn open_keystore_against_a_held_lock_reports_contention() {
+    let dir = TestDir::new("custody-lock-held");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let engine = create(dir.path.clone(), "test-pass", identity.clone()).unwrap();
+    // Another holder owns the directory: the open must report
+    // contention before it interprets any custody.
+    let drive = engine.drive;
+    drop(engine);
+    let _holder = DurableStore::open(dir.path.clone(), drive, "test-pass").expect("holder opens");
+    assert!(
+        matches!(
+            open_keystore(dir.path.clone(), "test-pass", identity),
+            Err(EngineError::Durable(DurableError::StoreLocked))
+        ),
+        "a lock-held open reports contention, not custody"
+    );
+}
+
+#[test]
+fn open_on_a_drive_only_directory_writes_nothing() {
+    // The crash window inside the store open between the DRIVE write
+    // and the store-key write: DRIVE exists, nothing else does. The
+    // open must refuse without minting state of its own.
+    let dir = TestDir::new("custody-drive-only");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    std::fs::write(dir.path.join("DRIVE"), drive_id().as_bytes()).unwrap();
+    assert!(
+        open_keystore(dir.path.clone(), "test-pass", identity).is_err(),
+        "a DRIVE-only directory refuses the open"
+    );
+    for residue in ["store-key.wrap", "LOCK", "commits", KEYSTORE_FILE] {
+        assert!(
+            !dir.path.join(residue).exists(),
+            "the refused open leaves no {residue} behind"
+        );
+    }
+}
+
+#[test]
+fn open_with_a_directory_named_keystore_writes_nothing() {
+    // `metadata` succeeds on a directory, so the probe must also
+    // require a file: a hand-crafted directory named `keystore` is
+    // refused before the store open, minting nothing.
+    let dir = TestDir::new("custody-keystore-dir");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    std::fs::write(dir.path.join("DRIVE"), drive_id().as_bytes()).unwrap();
+    std::fs::create_dir(dir.path.join(KEYSTORE_FILE)).unwrap();
+    assert!(
+        matches!(
+            open_keystore(dir.path.clone(), "test-pass", identity),
+            Err(EngineError::MalformedKeystore)
+        ),
+        "a directory named keystore is not a custody record"
+    );
+    assert!(
+        !dir.path.join("store-key.wrap").exists(),
+        "the refused open mints no store key"
     );
 }

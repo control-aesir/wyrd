@@ -23,6 +23,12 @@
 //! Creation acquires the durable store lock before it writes the drive
 //! marker or any custody state, so two concurrent creators cannot
 //! clobber each other: exactly one wins, the other sees `StoreLocked`.
+//! Opening acquires the same lock before it reads the custody record,
+//! so a cooperating writer cannot swap the record between the read and
+//! the open. The lock serializes cooperating local callers only: the
+//! local store is cooperative, and custody interpretation still fails
+//! closed (identity, passphrase, and drive binding are all verified)
+//! against a non-cooperating filesystem writer.
 //! A single-device drive only; admitting more devices (bootstrap
 //! invitations, capabilities) and root recovery are later slices. The
 //! drive starts headless; the first snapshot comes from
@@ -149,15 +155,44 @@ pub(super) fn open_keystore(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<Engine, EngineError> {
+    // DRIVE is written once under the store lock and never changes
+    // drives, so reading it pre-lock is a fast path only: the store
+    // open below re-verifies it under the lock (`DriveMismatch` on
+    // divergence).
     let drive = read_drive(&dir)?;
+    // Refuse a missing custody record BEFORE opening the store: the
+    // store open would mint `store-key.wrap` (plus `commits/` and
+    // `LOCK`) in a directory this call is about to refuse, stranding a
+    // crash-window directory no later open can use. A missing record
+    // cannot become this caller's record, so the probe costs nothing
+    // and reintroduces no race — only the *read* must sit under the
+    // lock, not this existence check. Errors (including NotFound)
+    // surface exactly as the pre-lock read produced them.
+    match std::fs::metadata(dir.join(KEYSTORE_FILE)) {
+        Ok(meta) if meta.is_file() => {}
+        // A directory (or other non-file) named `keystore` is not a
+        // record either: refuse before the store open mints state, the
+        // same write-nothing guarantee the missing case has.
+        Ok(_) => return Err(EngineError::MalformedKeystore),
+        Err(error) => return Err(EngineError::Io(error)),
+    }
+    // Acquire the store lock BEFORE reading custody. Creation holds
+    // this lock across the custody write, so no cooperating writer can
+    // replace the record between this read and the engine open below:
+    // the bytes decoded here are serialized against writers. The lock
+    // guards cooperating callers only (see the module docs for the
+    // threat model); a non-cooperating swap still fails closed, every
+    // custody field being verified against the identity, the
+    // passphrase, and the drive before the engine opens.
+    let store = DurableStore::open(dir.clone(), drive, passphrase)?;
     match read_custody(&dir)? {
         Custody::Owner {
             owner,
             root: root_wrapped,
             device: device_wrapped,
             escrow: escrow_record,
-        } => open_owner_keystore(
-            dir,
+        } => open_owner_keystore_with_store(
+            store,
             drive,
             passphrase,
             identity,
@@ -178,7 +213,7 @@ pub(super) fn open_keystore(
                 &device_secret,
                 passphrase,
             )?)?;
-            let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
+            let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
             engine.resync()?;
             Ok(engine)
         }
@@ -187,10 +222,12 @@ pub(super) fn open_keystore(
 
 /// The owner half of [`open_keystore`]: root and epoch-1 escrow unwrap,
 /// the deterministic genesis completes an interrupted bootstrap, and
-/// the self capability installs exactly the escrowed epoch.
+/// the self capability installs exactly the escrowed epoch. Takes the
+/// already-open store: the caller holds the lock across the custody
+/// read, so this never re-opens (and never re-locks) the directory.
 #[allow(clippy::too_many_arguments)]
-fn open_owner_keystore(
-    dir: PathBuf,
+fn open_owner_keystore_with_store(
+    store: DurableStore,
     drive: DriveId,
     passphrase: &str,
     identity: DeviceIdentitySecret,
@@ -212,7 +249,7 @@ fn open_owner_keystore(
     // encryption) triple, used to complete an interrupted bootstrap below.
     let genesis = genesis_transition(drive, &identity, &encryption)?;
 
-    let mut engine = Engine::open(dir, drive, device, passphrase, identity, encryption)?;
+    let mut engine = Engine::open_with_store(store, drive, device, identity, encryption)?;
     // Owner custody retained for mint-time escrow, like at create.
     engine.root = Some(root);
     engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));

@@ -135,8 +135,10 @@ by POSIX boundaries on the authoring device:
 - Each namespace operation addressed by **path** (`create`, `unlink`,
   `mkdir`, `rmdir`, `rename`, `chmod`, `truncate`) submits a mutation
   and commits one snapshot per *effective* operation — a truncate to
-  the current size, or a chmod to the mode already recorded, submits
-  nothing.
+  the current size submits nothing, while a chmod to the mode already
+  recorded commits no snapshot (the request still passes through the
+  mutation loop, which evaluates it and returns `Done` without
+  publishing).
 - The same operations addressed through a **file handle** (`ftruncate`,
   `fchmod`) are not always immediate: on a writable, non-append handle
   they arrive as the same `setattr` carrying a `FileHandle`, resize or

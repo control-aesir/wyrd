@@ -506,7 +506,7 @@ valid filesystem.
 | `rmdir` | Removes an empty directory only (`ENOTEMPTY` otherwise); `ENOTDIR` on a file. |
 | `rename` | File→file replaces; file→dir `EISDIR`; dir→empty-dir replaces; dir→nonempty-dir `ENOTEMPTY`; dir→file `ENOTDIR`; a directory into its own descendant `EINVAL`; same path is a no-op. A trailing slash on the source requires a directory. |
 | `truncate` | The conceptual operation behind `setattr(size)`: construct the new file representation at the target size. Growing preserves the existing bytes and zero-fills; shrinking preserves the prefix and discards the tail. Obeys the stale-handle rule. A truncate of a path that no longer stats fails with the lookup error and submits nothing. |
-| `set-exec` | The conceptual operation behind `setattr(mode)`: toggles the exec bit, the only mode state represented. |
+| `set-exec` | The conceptual operation behind `setattr(mode)`: toggles the exec bit, the only mode state represented. A path-addressed `set-exec` (or a combined size+mode `setattr`) on a path that no longer stats fails with the lookup error and submits nothing, like `truncate`. |
 
 `truncate` is a **representation construction**, not a mandate to read a
 file: the implementation materializes only the ranges needed to build the

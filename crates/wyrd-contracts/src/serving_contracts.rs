@@ -8,7 +8,7 @@
 
 use wyrd_format::ObjectStore;
 use wyrd_sync::bulk::IrohBulkSource;
-use wyrd_sync::runtime::RoutePublishing;
+use wyrd_sync::runtime::{MaterializationState, RoutePublishing};
 use wyrd_sync::serving::{ServingEndpoint, Vault};
 
 use crate::support::{scratch_dir, Loaded};
@@ -134,8 +134,12 @@ fn loopback_bulk_source() -> IrohBulkSource {
 /// order explicitly.
 ///
 /// Slow-gated (nextest `slow` profile): dead loopback dials stall to
-/// the full dial timeout rather than refusing, so the failure phase
-/// alone costs minutes. The sliced unit test in
+/// the full dial timeout rather than refusing, so each striking run
+/// pays a ~30 s dial. The dead phase drives a single representation
+/// (the tree) to keep that cost to one dial per run; the
+/// strike-to-cooldown shape is per-representation and unchanged, and
+/// the chunk joins after the restart so the revival still lands the
+/// full set. The sliced unit test in
 /// `runtime::plan::tests_execution` covers the same shape in seconds;
 /// this one proves it over real transport.
 #[test]
@@ -175,13 +179,18 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
     bulk.publish_routes(&engine.runtime_state().unwrap())
         .unwrap();
 
-    // Serving dies with the objects still unfetched. Object attempts
-    // now fail in transport until the strike threshold cools them;
-    // the cooldown is the state the restart must revive past.
+    // Serving dies with the tree still unfetched. Tree attempts
+    // now fail in transport until the strike threshold cools the
+    // representation; the cooldown is the state the restart must
+    // revive past. Only the tree is wanted here (the chunk joins
+    // after the restart), so each striking run pays one dead dial
+    // instead of two.
     serving
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
-    loaded.want_all(&mut engine);
+    engine
+        .set_materialization(loaded.content.tree_id, MaterializationState::Cached)
+        .unwrap();
     let mut saw_transport_errors = false;
     let mut cooled = false;
     for _ in 0..8 {
@@ -189,7 +198,7 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
         assert_eq!(report.objects, 0, "nothing fulfills over the dead route");
         if report.transport_errors > 0 {
             saw_transport_errors = true;
-        } else if saw_transport_errors && report.unfulfilled == 2 {
+        } else if saw_transport_errors && report.unfulfilled == 1 {
             cooled = true;
             break;
         }
@@ -200,7 +209,7 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
     );
     assert!(
         cooled,
-        "the dead representations cooled: no attempts, still pending"
+        "the dead representation cooled: no attempts, still pending"
     );
 
     // Serving restarts on a fresh endpoint with the same vault; the
@@ -213,11 +222,21 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
     bulk.publish_routes(&engine.runtime_state().unwrap())
         .unwrap();
     // Past the cooldown the attempts resume, this time over the live
-    // route: both objects land with no fetching-side restart.
+    // route: the chunk joins the tree here, and both objects land with
+    // no fetching-side restart. The two land on different runs — the
+    // chunk was never struck so it lands immediately, the tree past
+    // its cooldown — so the loop watches the store, not a single
+    // report (same pattern as the sliced boundary test below).
+    loaded.want_all(&mut engine);
     let mut landed = false;
     for _ in 0..10 {
-        let report = engine.execute_plan(&mut bulk, &mut objects).unwrap();
-        if report.objects == 2 {
+        engine.execute_plan(&mut bulk, &mut objects).unwrap();
+        if loaded
+            .content
+            .content_ids
+            .iter()
+            .all(|id| objects.get(id).unwrap().is_some())
+        {
             landed = true;
             break;
         }

@@ -303,10 +303,12 @@ fn live_close_returns_past_a_zero_deadline() {
     );
     // Establish the connection so the close runs against a live
     // peer. The shutdown must return past a zero deadline instead
-    // of blocking: which outcome it reports is host timing (a fast
-    // host resolves the graceful close on the first poll and
-    // `timeout` reports clean), so the TimedOut variant is pinned
-    // by the never-ready unit test in `close.rs`, not here.
+    // of blocking: `Timeout` polls the stop before arming the
+    // timer, so the outcome is decided on the first poll —
+    // `TimedOut` unless the close is already complete — and this
+    // test only pins that the deadline holds. The `TimedOut` leg
+    // stays pinned by the never-ready unit test in `close.rs`,
+    // not here.
     assert_eq!(
         source.fetch_sealed(&storage, usize::MAX).unwrap(),
         Some(b"live connection".to_vec())

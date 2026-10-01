@@ -2093,6 +2093,11 @@ fn a_gated_head_mounts_only_after_its_tree_lands_and_survives_restart() {
         .expect("the committed state reopens");
     let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
         WyrdNode::new(engine, FsObjectStore::open(store_dir.clone()).unwrap()).unwrap();
+    assert_eq!(
+        daemon.engine().live_heads().unwrap().len(),
+        1,
+        "the reopened engine still classifies the fetched head"
+    );
     daemon.refresh_live_heads().unwrap();
     assert!(
         daemon.view().lookup("gated.txt").is_ok(),

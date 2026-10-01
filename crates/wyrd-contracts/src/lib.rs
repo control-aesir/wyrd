@@ -70,7 +70,11 @@
 //!     fetchable, and the daemon verifies each head's tree/manifest
 //!     closure before installing it: a validly signed body whose manifest
 //!     describes different content never becomes a mounted head
-//!     (`object-model.md`, decision 27).
+//!     (`object-model.md`, decision 27). The arrival-order half is
+//!     pinned by
+//!     `a_gated_head_mounts_only_after_its_tree_lands_and_survives_restart`:
+//!     a classified-but-unfetched head installs nothing, mounts the
+//!     pass its tree lands, and stays mounted across a restart.
 //! 16. `daemon_write_publication_and_retry_converges_across_members` —
 //!     the local write publication path end to end: one member authors
 //!     through `put_file` and announces through the control-plane

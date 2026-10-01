@@ -998,9 +998,14 @@ mod tests {
     }
 
     /// A wide flat closure verifies at production limits: thousands of
-    /// files, every chunk mapped, the root tree self-mapped. The
+    /// files, every chunk mapped, the root tree self-mapped. At 4096
+    /// files this is a sample, not a ceiling measurement — about 0.7%
+    /// of `Limits::V0.max_manifest_entries` and 0.4% of
+    /// `max_tree_entries`; the ceiling edge itself is pinned by
+    /// `pinned_limits_reject_an_overwide_manifest` instead. The
     /// elapsed time is recorded, not asserted — wall clocks are not
     /// contracts — so the fetch hot path has a number to revisit.
+    /// Peak memory was not measured.
     #[test]
     fn wide_flat_closure_verifies_and_reports_cost() {
         const FILES: usize = 4096;
@@ -1086,7 +1091,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ClosureError::Ingest(IngestError::TooMany { .. })),
+            matches!(
+                err,
+                ClosureError::Ingest(IngestError::TooMany {
+                    what: "manifest entries",
+                    count: 3,
+                    max: 2,
+                })
+            ),
             "unexpected error: {err:?}"
         );
     }

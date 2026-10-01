@@ -25,7 +25,9 @@ Apply exactly one label from each category:
 
 - Type: `bug`, `enhancement`, or `chore`.
 - Priority: `P0` through `P4`.
-- Milestone: one `release:*` label.
+- Milestone: one `release:*` label. Match it against the milestone
+  thesis in `ROADMAP.md` (including the v0.2 entry test) — never
+  guess from recency or from the current release line.
 
 ```bash
 ngit issue label <issue> --label enhancement --json

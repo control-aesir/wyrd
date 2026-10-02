@@ -298,7 +298,7 @@ fn refused_publish_logs_the_relay_message() {
         "send path emits the outcome line:\n{logged}"
     );
     assert!(
-        logged.contains("not_accepted"),
+        logged.contains("not_accepted_relays=["),
         "refusal lands in the not-accepted bucket:\n{logged}"
     );
     assert!(

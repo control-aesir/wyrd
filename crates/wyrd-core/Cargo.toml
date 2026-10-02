@@ -27,6 +27,9 @@ serde_json = "1"
 # Log capture for the send-path outcome test (test-only: asserts the
 # relay's answer reaches the debug line; never a runtime dependency).
 tracing-subscriber = "0.3"
+# Live iroh endpoint for the catch-up fetch leg (test-only: the loopback
+# bulk fetch runs over real transport; never a runtime dependency).
+iroh.workspace = true
 
 [lints]
 workspace = true

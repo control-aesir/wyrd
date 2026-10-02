@@ -196,6 +196,8 @@ pub(crate) mod mini_relay;
 #[cfg(test)]
 mod tests_backpressure;
 #[cfg(test)]
+mod tests_catchup;
+#[cfg(test)]
 mod tests_classification;
 #[cfg(test)]
 mod tests_dedupe;

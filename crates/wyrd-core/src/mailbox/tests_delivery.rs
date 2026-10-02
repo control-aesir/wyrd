@@ -1,6 +1,7 @@
 use super::tests_harness::{
-    assert_quiet, device_id, envelope, keys, live_mailbox, seal_rumor, sender_keys, temp_path,
-    wait_for_delivery, wait_for_health, DELIVERY_TIMEOUT, OUTAGE_TIMEOUT, RECOVERY_TIMEOUT,
+    assert_quiet, device_id, drain_until, envelope, keys, keys_for, live_mailbox, seal_rumor,
+    sender_keys, temp_path, wait_for_delivery, wait_for_health, DELIVERY_TIMEOUT, OUTAGE_TIMEOUT,
+    RECOVERY_TIMEOUT,
 };
 use super::*;
 use nostr::event::FinalizeEvent;
@@ -10,7 +11,7 @@ use wyrd_format::{
 };
 use wyrd_sync::control::{seal, Message, SnapshotAnnouncement};
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
-use wyrd_sync::runtime::{DrainReport, Engine};
+use wyrd_sync::runtime::Engine;
 use wyrd_sync::transport::mailbox::{check_outbound_size, MAX_MAILBOX_OPEN_BYTES};
 
 use std::time::{Duration, Instant};
@@ -18,10 +19,6 @@ use std::time::{Duration, Instant};
 // --- integration tests over an in-process relay ---
 
 use super::mini_relay::MiniRelay;
-
-fn keys_for(identity: &DeviceIdentitySecret) -> Keys {
-    identity.signer_keys()
-}
 
 fn maximum_node_addr(drive: &DriveId, epoch: u64) -> Vec<u8> {
     let fits = |len: usize| {
@@ -54,31 +51,6 @@ fn maximum_node_addr(drive: &DriveId, epoch: u64) -> Vec<u8> {
         assert!(!fits(low + 1));
     }
     vec![0xA5; low]
-}
-
-fn drain_until(
-    engine: &mut Engine,
-    mailbox: &mut LiveMailbox<Keys>,
-    expected: usize,
-) -> DrainReport {
-    let start = Instant::now();
-    let mut total = DrainReport::default();
-    loop {
-        let report = engine.drain(mailbox).unwrap();
-        total.accepted += report.accepted;
-        total.duplicates += report.duplicates;
-        total.deferred += report.deferred;
-        total.skipped += report.skipped;
-        total.discarded += report.discarded;
-        if total.accepted >= expected {
-            return total;
-        }
-        assert!(
-            start.elapsed() < DELIVERY_TIMEOUT,
-            "engine drains expected mail"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[test]

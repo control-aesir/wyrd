@@ -13,8 +13,8 @@ use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::membership::MembershipLog;
 use crate::runtime::test_util::{
-    control_key, deliver, drain, encryption_key, fixture, identity, queue, rotation_delivery,
-    rotation_delivery_from, transition_message,
+    capability_message, control_key, deliver, drain, encryption_key, fixture, identity, queue,
+    rotation_delivery, rotation_delivery_from, transition_message,
 };
 
 fn secrets(n: usize) -> Vec<EpochSecret> {
@@ -232,6 +232,54 @@ fn rotation_converges_without_the_epoch_key_in_one_drain() {
     let report = drain(&mut fixture);
     assert_eq!(report.accepted, 0);
     assert_eq!(report.duplicates, 1);
+}
+
+/// A rotation delivery records the projection it commits through: the
+/// rotation path never consults it (budget-gated only), but the same
+/// grant arriving later under the control framing acks as a
+/// duplicate instead of recommitting. Rotation still installs the
+/// keys for the unheld epoch in the same pass.
+#[test]
+fn control_reseal_of_a_rotation_delivered_capability_dedupes() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let c = chain(device);
+    let grant_secrets = secrets(3);
+    let (wrapped, proof) = grant(&chain3(&c), &c.admission, device, grant_secrets.clone());
+
+    // Epoch 3 arrives only as a rotation delivery — the device holds
+    // no epoch-3 key.
+    let rotation = rotation_delivery(&fixture, 3, &c.admission, wrapped, proof);
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&c.genesis)),
+        deliver(&fixture, 2, &transition_message(&c.admit_sender)),
+        rotation,
+    ];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 3);
+    assert!(
+        fixture.engine.epoch_keys.contains_key(&3),
+        "rotation installs the missing control key for epoch 3"
+    );
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 1);
+
+    // The same grant under the control framing: identical value, so
+    // the committed-capability projection absorbs it — no second
+    // fact, and the installed keys are untouched.
+    let reseal = capability_message(device, c.admission.transition_id(), 3, grant_secrets);
+    let mail = vec![deliver(&fixture, 3, &reseal)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 0, "the control reseal commits nothing");
+    assert_eq!(report.duplicates, 1, "the control reseal is a duplicate");
+    assert!(
+        fixture.engine.epoch_keys.contains_key(&3),
+        "duplicate verdict leaves the installed keys alone"
+    );
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 1);
 }
 
 #[test]

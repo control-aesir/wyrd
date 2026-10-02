@@ -69,6 +69,7 @@ use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
+use crate::keys::capability::Capability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey};
 use crate::membership::MembershipLog;
 use crate::membership::TransitionStatus;
@@ -592,6 +593,17 @@ pub struct Engine {
     /// forks never become facts — so replay never encounters a conflict
     /// intake could have detected.
     pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
+    /// The committed-capability projection intake validates against:
+    /// one hydrated capability per (device, authorizing transition),
+    /// kept in lockstep with the durable facts (updated only after a
+    /// commit succeeds, rebuilt from them on resync). A resealed
+    /// byte-identical capability mints a fresh message id (fresh seal
+    /// nonce), so envelope dedupe never fires — the value comparison
+    /// here is what turns the reseal into a `Duplicate` instead of a
+    /// second fact. A conflicting value under an already-recorded key
+    /// still commits: the projection suppresses exact replays, never
+    /// new information.
+    pub(super) committed_capabilities: BTreeMap<(DeviceId, TransitionId), Capability>,
     /// Held (deferred) control messages with their unblocking
     /// dependencies: arrival order plus a dependency index (see
     /// [`PendingQueue`]). A flush batch emits the woken entries in
@@ -673,6 +685,7 @@ impl Engine {
             epoch_keys: BTreeMap::new(),
             log: MembershipLog::new(drive),
             announcements: BTreeMap::new(),
+            committed_capabilities: BTreeMap::new(),
             pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
@@ -1055,6 +1068,15 @@ impl Engine {
             state.record_announcement(a)?;
         }
         self.announcements = state.announcements;
+        // The capability projection replays in commit order, last value
+        // wins: conflicting values under one key are all durable facts
+        // (intake never drops new information), and the projection
+        // holds the latest for the replay check.
+        let mut committed_capabilities = BTreeMap::new();
+        for c in facts.capabilities {
+            committed_capabilities.insert((c.device, c.transition), c);
+        }
+        self.committed_capabilities = committed_capabilities;
         // Pending-invitation material re-derives the invitation's
         // control keys on every resync: the joined device holds no
         // authorized capability yet, so without this a restart between

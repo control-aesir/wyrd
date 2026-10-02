@@ -468,6 +468,16 @@ fn note_committed_facts(engine: &mut Engine, facts: &[Fact]) {
             engine.inbox.remember(id);
         }
         if let Fact::Capability(authorized) = fact {
+            // The projection follows the durable state, never leads
+            // it: the committed value lands here only after the fact
+            // batch committed. Shared with the rotation path, which
+            // never consults the projection but still records what it
+            // committed, so a later control-path reseal of a
+            // rotation-delivered capability reads as a duplicate.
+            let committed = authorized.capability();
+            engine
+                .committed_capabilities
+                .insert((committed.device, committed.transition), committed.clone());
             let drive = engine.drive;
             for (index, secret) in authorized.capability().secrets.iter().enumerate() {
                 let epoch = index as u64 + 1;
@@ -672,6 +682,24 @@ fn capability_action(
     let transition_id = capability.transition;
     match AuthorizedCapability::authorize(capability, engine.drive(), &engine.log, &transition_id) {
         Ok(authorized) => {
+            // Already recorded: the seal nonce mints a fresh message
+            // id per wrap, so envelope dedupe never fires for a
+            // reseal — the committed-capability projection is the
+            // check that turns an identical regrant into a `Duplicate`
+            // with no facts, before the budget charge. A conflicting
+            // value under a recorded key is new information and still
+            // commits; the rotation path never consults this (a carried
+            // transition may be committed while its capability is
+            // still unrecorded, and dropping the delivery would stall
+            // the device on a missing epoch secret).
+            let committed = authorized.capability();
+            if engine
+                .committed_capabilities
+                .get(&(committed.device, committed.transition))
+                .is_some_and(|known| known == committed)
+            {
+                return Action::Duplicate;
+            }
             // Shed before committing: authorization is spent work, but
             // the facts are not yet recorded and no view mutated, so
             // the envelope can still shed cleanly.

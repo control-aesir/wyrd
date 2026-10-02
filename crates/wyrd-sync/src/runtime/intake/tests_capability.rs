@@ -632,15 +632,14 @@ fn unauthorized_capability_suppresses_without_pending() {
     assert!(facts.capabilities.is_empty());
 }
 
-/// A freshly resealed identical capability is a new envelope, not a
-/// duplicate: the message id covers the sealed bytes (fresh nonce),
-/// and capabilities carry no content-level dedupe — unlike
-/// transitions (transition id covers every byte) and announcements
-/// (the `Same` update check) — so the reseal commits a second fact.
-/// Semantic capability dedupe is a separate issue; this test pins
-/// today's boundary so that change updates it deliberately.
+/// A freshly resealed identical capability is a duplicate, not a new
+/// envelope: the message id covers the sealed bytes (fresh nonce per
+/// seal), so envelope dedupe never fires — but the
+/// committed-capability projection compares the unwrapped value, and
+/// an identical regrant acks free with no facts. This used to
+/// recommit a second fact per reseal; the projection now absorbs it.
 #[test]
-fn resealed_identical_capability_recommits() {
+fn resealed_identical_capability_dedupes() {
     let mut fixture = fixture();
     let device = fixture.recipient;
     let (mut builder, genesis) = Builder::genesis(10);
@@ -662,17 +661,77 @@ fn resealed_identical_capability_recommits() {
     queue(&mut fixture, mail);
     assert_eq!(drain(&mut fixture).accepted, 3);
     // Same capability value, freshly sealed: a new nonce means a new
-    // message id, so envelope dedupe does not fire — and no
-    // content-level check exists for capabilities.
+    // message id, so envelope dedupe does not fire — the
+    // value-level check in the capability arm does.
     let mail = vec![deliver(&fixture, 2, &cap)];
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
-    assert_eq!(report.accepted, 1, "the reseal commits again");
-    assert_eq!(report.duplicates, 0, "the reseal is not a duplicate");
+    assert_eq!(report.accepted, 0, "the reseal commits nothing");
+    assert_eq!(report.duplicates, 1, "the reseal is a duplicate");
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(
         facts.capabilities.len(),
-        2,
-        "no semantic dedupe absorbs the reseal"
+        1,
+        "the projection absorbs the reseal"
     );
+}
+
+/// The projection rebuilds from durable facts on resync: a reseal
+/// arriving after a restart acks as a duplicate, not a second fact.
+/// Restart-safe like every other `Duplicate` verdict — redelivery
+/// re-derives it from durable state, never from memory the crash
+/// took.
+#[test]
+fn reseal_after_restart_dedupes_from_durable_facts() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let cap = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+        ],
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &cap),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 3);
+    // Restart: a fresh engine over the same store. The old engine
+    // releases the store lock first; the epoch keys are device
+    // knowledge, re-added like the fixture does — the projection
+    // itself must come back from the committed facts.
+    fixture.engine.release_store_lock();
+    let (identity_sk, _) = identity(0x02);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    fixture.engine = Engine::open(
+        fixture.dir.path.clone(),
+        member_drive(),
+        device,
+        "test-pass",
+        identity_sk,
+        encryption_sk,
+    )
+    .unwrap();
+    for epoch in [1, 2] {
+        fixture
+            .engine
+            .add_epoch_key(epoch, Zeroizing::new(control_key(epoch)));
+    }
+    let mail = vec![deliver(&fixture, 2, &cap)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(
+        report.accepted, 0,
+        "the post-restart reseal commits nothing"
+    );
+    assert_eq!(report.duplicates, 1, "the resync rebuilt the projection");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 1);
 }

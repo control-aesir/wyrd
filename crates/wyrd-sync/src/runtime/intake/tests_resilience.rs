@@ -399,18 +399,65 @@ fn semantic_duplicates_commit_no_facts() {
     // Reseals of already-recorded payloads: fresh nonces make new
     // message ids over byte-identical content. Each must ack as a
     // duplicate without appending another durable fact.
-    let mut mail = Vec::with_capacity(12);
+    let mut mail = Vec::with_capacity(14);
     for _ in 0..10 {
         mail.push(deliver(&fixture, 2, &bound));
     }
     for _ in 0..2 {
         mail.push(deliver(&fixture, 1, &transition_message(&genesis)));
     }
+    for _ in 0..2 {
+        mail.push(deliver(&fixture, 2, &cap));
+    }
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
     assert_eq!(report.accepted, 0);
-    assert_eq!(report.duplicates, 12);
+    assert_eq!(report.duplicates, 14);
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.transitions.len(), 2);
     assert_eq!(facts.announcements.len(), 1);
+    assert_eq!(facts.capabilities.len(), 1);
+}
+
+/// A sustained capability reseal storm: hundreds of fresh seals over
+/// one recorded grant, past the per-sender quota — every one acks as
+/// a duplicate with no fact, because duplicates never charge the
+/// budget. (Named off the "flood" substring so the live-mailbox
+/// serial group in .config/nextest.toml does not sweep up this
+/// MemoryMailbox-only test.)
+#[test]
+fn sustained_capability_reseal_commits_no_new_facts() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let cap = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+        ],
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &cap),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 3);
+    // Three hundred reseals from one sender: past the 256-fact
+    // per-sender quota, which binds nothing because no reseal
+    // commits.
+    let mut mail = Vec::with_capacity(300);
+    for _ in 0..300 {
+        mail.push(deliver(&fixture, 2, &cap));
+    }
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.duplicates, 300);
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 1);
 }

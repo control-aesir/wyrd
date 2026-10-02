@@ -1358,7 +1358,21 @@ where
             return Ok(());
         }
         let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
-        let content = write.image.take().unwrap_or_default();
+        // A dirty handle always carries its buffered image: every
+        // `dirty = true` assignment pairs with `image = Some(..)`. If
+        // the image is ever absent here, fail the commit closed
+        // rather than authoring an empty prefix as a successful
+        // write. Terminal like any other refused commit, and the
+        // budget release is idempotent.
+        let content = match write.image.take() {
+            Some(image) => image,
+            None => {
+                write.failed = true;
+                write.dirty = false;
+                self.budget.release(write.id);
+                return Err(fuser::Errno::EIO);
+            }
+        };
         let path = write.path.clone();
         let outcome = if write.append {
             // Append: the sequence commits onto the current head's end;

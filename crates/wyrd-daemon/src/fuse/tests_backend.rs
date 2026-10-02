@@ -931,10 +931,16 @@ fn destroy_commits_dirty_write_handles_while_queue_live() {
     done.store(true, Ordering::Relaxed);
     drainer.join().expect("drainer exits after destroy");
     match &seen.lock().unwrap()[..] {
-        [MutationKind::CommitFile { path, .. }] => assert_eq!(
-            path, "f.txt",
-            "destroy submits the dirty handle's image, not a synthetic op"
-        ),
+        [MutationKind::CommitFile { path, content, .. }] => {
+            assert_eq!(
+                path, "f.txt",
+                "destroy submits the dirty handle's image, not a synthetic op"
+            );
+            assert_eq!(
+                content, b"dirty",
+                "destroy submits the full buffered image, never a prefix"
+            );
+        }
         other => panic!("destroy must commit exactly the dirty handle, saw {other:?}"),
     }
     assert_eq!(
@@ -946,6 +952,49 @@ fn destroy_commits_dirty_write_handles_while_queue_live() {
         backend.budget.total(),
         0,
         "a committed handle releases its buffered bytes"
+    );
+}
+
+/// A dirty handle with no buffered image fails its commit closed
+/// instead of authoring an empty prefix as a successful write: the
+/// image boundary is structural, not incidental. Unreachable through
+/// the write surface (every `dirty = true` pairs with an image), so
+/// the latent state is forced directly. No mutation is submitted,
+/// the handle goes terminal, and its budget is released.
+#[test]
+fn commit_without_image_fails_closed_instead_of_authoring_empty() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    {
+        let files = backend.files.lock().unwrap();
+        let handle = match files.by_handle.get(&fh.0) {
+            Some(Handle::Write(handle)) => Arc::clone(handle),
+            _ => panic!("a fresh open is a writable handle"),
+        };
+        let mut write = handle.lock().unwrap();
+        assert!(write.image.is_none(), "a fresh handle has no image");
+        write.dirty = true;
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    assert_eq!(
+        backend.commit_handle(fh),
+        Err(fuser::Errno::EIO),
+        "a dirty handle with no image fails closed"
+    );
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no mutation is submitted for the imageless commit"
+    );
+    assert_eq!(
+        backend.commit_handle(fh),
+        Err(fuser::Errno::EIO),
+        "a failed commit stays terminal instead of retrying"
     );
 }
 

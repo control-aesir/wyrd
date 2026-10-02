@@ -450,6 +450,15 @@ pub struct MailboxHealth {
     /// `recover_relays` loop iterations, lifetime total: relay-recovery
     /// progress while the episode is in flight.
     pub relay_recovery_attempts: u64,
+    /// Relay-sent subscription closures observed by the drainer, lifetime
+    /// total. A CLOSED arrives with the TCP attachment intact, so without
+    /// this count a relay that closes our subscription (auth-required,
+    /// rate-limited, unsupported filter) reads as an idle mailbox:
+    /// connected stays 1/1 while no delivery can ever arrive. Policy
+    /// closes never heal without operator action (a re-REQ just earns
+    /// another CLOSED, so nothing auto-resubscribes), but they are now
+    /// always visible here and in the warn log instead of silent.
+    pub closed_subscriptions: u64,
 }
 
 impl MailboxHealth {
@@ -481,6 +490,14 @@ struct SupervisorState {
     stream_recovery_attempts: AtomicU64,
     /// Relay-recovery loop iterations, lifetime total.
     relay_recovery_attempts: AtomicU64,
+    /// Relay-sent subscription closures observed by the drainer,
+    /// lifetime total (see [`MailboxHealth::closed_subscriptions`]).
+    /// Written by the drainer task, read by the tick loop never — the
+    /// count is purely observational: nothing auto-resubscribes a
+    /// closed subscription, because re-REQing a policy close
+    /// (auth-required) loops CLOSED forever while looking like
+    /// recovery.
+    closed_subscriptions: AtomicU64,
     /// A stream-recovery episode is in flight. Claimed by the tick loop
     /// before spawning the episode task, released when the task ends:
     /// at most one episode per kind runs at a time, and a trigger
@@ -745,6 +762,7 @@ where
             ticks: AtomicU64::new(0),
             stream_recovery_attempts: AtomicU64::new(0),
             relay_recovery_attempts: AtomicU64::new(0),
+            closed_subscriptions: AtomicU64::new(0),
             stream_episode: AtomicBool::new(false),
             relay_episode: AtomicBool::new(false),
             saturation_episode: AtomicBool::new(false),
@@ -846,6 +864,7 @@ where
             supervisor_ticks: self.health.ticks.load(Ordering::Relaxed),
             stream_recovery_attempts: self.health.stream_recovery_attempts.load(Ordering::Relaxed),
             relay_recovery_attempts: self.health.relay_recovery_attempts.load(Ordering::Relaxed),
+            closed_subscriptions: self.health.closed_subscriptions.load(Ordering::Relaxed),
         }
     }
 
@@ -1056,21 +1075,52 @@ async fn drain_notifications(
         // instead of breaking the mailbox.
         let event = match notification {
             ClientNotification::Event { event, .. } => Some(event),
-            ClientNotification::Message { message, .. } => match *message {
+            ClientNotification::Message { relay_url, message } => match *message {
                 RelayMessage::Event { event, .. } => Some(Box::new(event.into_owned())),
-                // Interop record (external-relay issue): every other relay
-                // message — CLOSED, AUTH, NOTICE, OK — is dropped here. A
-                // relay that closes our subscription (auth-required,
-                // rate-limited, unsupported filter) therefore reads as an
-                // idle mailbox, not an error: health still reports the TCP
-                // attachment as connected while no delivery can ever arrive.
-                // NIP-42 in particular must stay unimplemented until a trust
-                // decision allows it: answering an AUTH challenge signs with
-                // the device key, teaching the relay the device pubkey and
-                // breaking the attribution-freedom property above (relays
-                // cannot attribute sends to the device). Until then, relays
-                // that demand auth are simply incompatible, and the opt-in
-                // interop tests prove the open-relay path instead.
+                // A relay-sent CLOSED kills the subscription while the TCP
+                // attachment stays up, so without the count below it reads
+                // as an idle mailbox: connected 1/1 with no delivery ever
+                // arriving (observed against relay.damus.io, which demands
+                // NIP-42 auth for gift-wrap reads). Counted into health and
+                // warned here, never auto-retried: re-REQing a policy close
+                // loops CLOSED forever while looking like recovery.
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } => {
+                    health.closed_subscriptions.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        relay = ?relay_url,
+                        subscription = ?subscription_id,
+                        reason = %message,
+                        "mailbox subscription closed by relay"
+                    );
+                    None
+                }
+                // NIP-42 stays unimplemented by trust decision (answering
+                // signs with the device key and teaches the relay the
+                // device pubkey), so an AUTH challenge is a relay we can
+                // never satisfy: warn loudly, since a CLOSED on policy
+                // grounds normally follows and intake goes blind.
+                RelayMessage::Auth { challenge } => {
+                    tracing::warn!(
+                        relay = ?relay_url,
+                        challenge = %challenge,
+                        "relay demands authentication the mailbox will never answer"
+                    );
+                    None
+                }
+                // Notices carry the relay's own account of policy
+                // (rate-limited, shutting down): debug-level, since they
+                // need no action unless paired with a CLOSED above.
+                RelayMessage::Notice(message) => {
+                    tracing::debug!(
+                        relay = ?relay_url,
+                        notice = %message,
+                        "mailbox relay notice"
+                    );
+                    None
+                }
                 _ => None,
             },
             ClientNotification::Shutdown => None,

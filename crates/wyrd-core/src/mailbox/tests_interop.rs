@@ -10,11 +10,19 @@ use std::time::Duration;
 // relay-specific replay behavior. This group runs the same
 // send/receive/recovery suite against a real public relay:
 //
-// `WYRD_TEST_RELAY_URL=wss://nos.lol cargo test -p wyrd-daemon
+// `WYRD_TEST_RELAY_URL=wss://relay.primal.net cargo test -p wyrd-core
 //  external_relay -- --ignored`
 //
-// Proven against nos.lol; relay.damus.io never completed the attach
-// from here, so prefer a relay that answers.
+// Proven against relay.primal.net, which serves gift-wrap REQs without
+// auth. Relay policy evidence (probed 2026-10-02, raw SDK wire):
+// - relay.damus.io attaches and ACKs EVENT writes, but answers every
+//   gift-wrap REQ with AUTH plus
+//   `CLOSED: auth-required: requested filter requires authentication`
+//   (plain kind-1 REQs stream fine) — incompatible by trust decision,
+//   since NIP-42 would sign with the device key.
+// - wss://nos.lol, the previous default, answers no TCP at all from
+//   here (ports 80/443 blackholed) although monitors report it up
+//   elsewhere — dead from this vantage, not a mailbox regression.
 //
 // `#[ignore]` keeps the group out of the default `cargo nextest run`
 // gate, so third-party availability can never flake CI. Selecting the
@@ -30,7 +38,11 @@ use std::time::Duration;
 fn external_relay_url() -> String {
     let url = std::env::var("WYRD_TEST_RELAY_URL").unwrap_or_default();
     let url = url.trim();
-    let url = if url.is_empty() { "wss://nos.lol" } else { url };
+    let url = if url.is_empty() {
+        "wss://relay.primal.net"
+    } else {
+        url
+    };
     assert!(
         url.starts_with("wss://"),
         "interop covers the TLS path; use a wss:// relay URL, got {url}"

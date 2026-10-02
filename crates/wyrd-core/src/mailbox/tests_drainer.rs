@@ -20,6 +20,7 @@ fn drainer_establishes_over_a_relay_less_client() {
         ticks: AtomicU64::new(0),
         stream_recovery_attempts: AtomicU64::new(0),
         relay_recovery_attempts: AtomicU64::new(0),
+        closed_subscriptions: AtomicU64::new(0),
         stream_episode: AtomicBool::new(false),
         relay_episode: AtomicBool::new(false),
         saturation_episode: AtomicBool::new(false),

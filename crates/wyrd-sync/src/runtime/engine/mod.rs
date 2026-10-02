@@ -1193,6 +1193,12 @@ impl Engine {
     /// canonical owner may recover; anyone else fails closed with
     /// [`EngineError::RecoveryNotOwner`]. Fails closed like
     /// [`Engine::author_snapshot`] otherwise.
+    ///
+    /// Milestone note: the content-recovery creation workflow is
+    /// deferred to v0.3 (see `ROADMAP.md`), so v0.2 ships no operator
+    /// surface for this method — no CLI command or daemon entry point
+    /// calls it. It stays public because `wyrd-contracts` pins the
+    /// normative grafting rule end to end from outside this crate.
     pub fn author_recovery_snapshot<S: ObjectStore>(
         &mut self,
         objects: &S,

@@ -190,7 +190,9 @@ policy, reliable FUSE read/write operation, E2E convergence tests,
 adversarial and runtime property tests, operationally meaningful limits
 and failure behavior.
 
-Explicitly do not ship: recovery grafting, mobile, File Provider,
+Explicitly do not ship: the recovery grafting workflow (no operator
+surface: no CLI command, no daemon entry point, no owner creation
+workflow — that workflow is v0.3), mobile, File Provider,
 sophisticated conflict UI, production telemetry platform, marketplace,
 release distribution, major performance architecture.
 
@@ -205,6 +207,18 @@ Known v0.2 limitations (documented, not deferred silently): stranded local
 content has no sanctioned path back until the v0.3 content-recovery
 workflow; the local store is cooperative, so concurrent non-cooperating
 writers are outside the supported concurrency model.
+
+Milestone decision (content recovery in v0.2): the grafting
+primitives exist at the library layer only.
+`Engine::author_recovery_snapshot` stays public because
+`wyrd-contracts` pins the normative grafting rule (`docs/epochs.md`)
+end to end from outside the crate; that pinning is contract
+enforcement, not a shipped workflow. Nothing in the operator surface
+(CLI, daemon, embeddable node) calls it, and the owner creation
+workflow that would make grafting operable ships in v0.3. Recovery
+terminology in this file, used precisely: crash recovery already
+shipped; content recovery is the v0.3 workflow above; root recovery
+(all capable devices lost, guardians reconstruct) is v0.7.
 
 ## v0.3 — Durable operation and content recovery
 

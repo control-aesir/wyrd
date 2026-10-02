@@ -109,6 +109,32 @@ pub(super) fn wait_for_health(
     }
 }
 
+/// Poll `health` until exactly `expected` relays report connected (or
+/// time out): `wait_for_health` returns on the first live sample,
+/// which can mean a lone survivor, so legs that need the whole pool
+/// await the count itself. The failure names the bound enforced.
+pub(super) fn wait_for_connected(
+    mailbox: &LiveMailbox<Keys>,
+    expected: usize,
+    timeout: Duration,
+    label: &str,
+) -> MailboxHealth {
+    let start = Instant::now();
+    loop {
+        let health = mailbox.health();
+        if health.connected_relays == expected {
+            return health;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "{label}: still at {}/{} connected",
+            health.connected_relays,
+            health.total_relays,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub(super) fn live_mailbox(device: &Keys, relays: &[String], seen: PathBuf) -> LiveMailbox<Keys> {
     let mut mailbox = LiveMailbox::connect(
         device.clone(),

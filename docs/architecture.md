@@ -199,7 +199,7 @@ serving (contract 13). Still open: the NIP-46 signer-session client
 wiring. Multi-relay pool coverage is checked in
 (`mailbox::tests_multirelay`: publication, replay/dedupe, outage with
 survivor intake, recovery); cross-implementation relay interop stays
-opt-in (`mailbox::tests_interop`, live public relay), and real-world
+opt-in (`mailbox::tests_interop`, live public relay). Real-world
 delivery through those relays is itself an open defect
 (`nostr:nevent1qqspuphchj0ldulcpmzgcrj6pzr4v7v47mg5le4kr6wdglykpf6wc4cpz9mhxue69uhkwunpwdczuap49eehg46en03`).
 The durable announcement outbox itself has landed (queued/delivered

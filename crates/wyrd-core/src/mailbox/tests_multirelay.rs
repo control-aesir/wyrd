@@ -1,12 +1,10 @@
 use super::mini_relay::MiniRelay;
 use super::tests_harness::{
     assert_quiet, device_id, envelope, keys, live_mailbox, sender_keys, temp_path,
-    wait_for_delivery, wait_for_health, wait_for_subscription, DELIVERY_TIMEOUT, OUTAGE_TIMEOUT,
-    RECOVERY_TIMEOUT,
+    wait_for_connected, wait_for_delivery, wait_for_health, wait_for_subscription,
+    DELIVERY_TIMEOUT, OUTAGE_TIMEOUT, RECOVERY_TIMEOUT,
 };
 use super::*;
-
-use std::time::{Duration, Instant};
 
 /// Simultaneous two-relay operation in one episode: addressed
 /// publication through both relays, replay plus dedupe across both,
@@ -101,25 +99,19 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     // sent CLOSE, so its dead connection's entry lingers and the
     // reopen's fresh REQ reads two, not one — a fake-side artifact,
     // not a second live subscription. The attach count is the tripwire
-    // instead, polled like the outage and recovery legs: `wait_for_health`
-    // returns on the first live sample (one relay connected), so a bare
-    // assert would sample the `2` once rather than await it — and if a
+    // instead: `wait_for_health` returns on the first live sample (one
+    // relay connected), so the count itself is awaited — and if a
     // relay's attach plus replay slipped past the quiet window, its
     // frames would surface as a payload mismatch in a later leg rather
     // than a dedupe failure here.
     let mut mailbox = live_mailbox(&receiver, &relays, seen);
     wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
-    let start = Instant::now();
-    loop {
-        if mailbox.health().connected_relays == 2 {
-            break;
-        }
-        assert!(
-            start.elapsed() < OUTAGE_TIMEOUT,
-            "reopened mailbox reattaches to both relays before the quiet window"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_connected(
+        &mailbox,
+        2,
+        OUTAGE_TIMEOUT,
+        "reopened mailbox reattaches to both relays",
+    );
     assert_quiet(&mut mailbox);
 
     // Outage with continued intake: killing one relay degrades the
@@ -129,15 +121,7 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     // stays diagnostic-only (and separately unit-tested), so nothing
     // here observes which bucket the dead relay lands in.
     relay_a.shutdown();
-    let start = Instant::now();
-    loop {
-        let health = mailbox.health();
-        if health.connected_relays == 1 && health.total_relays == 2 {
-            break;
-        }
-        assert!(start.elapsed() < OUTAGE_TIMEOUT, "survivor reported");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_connected(&mailbox, 1, OUTAGE_TIMEOUT, "survivor reported");
     assert!(mailbox.health().is_live(), "one survivor is live");
     {
         let mut outbox = live_mailbox(
@@ -168,17 +152,7 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     // resubscribe; retained history collapses to silence on the acked
     // log before new mail addressed through both relays arrives once.
     relay_a.restart();
-    let start = Instant::now();
-    loop {
-        if mailbox.health().connected_relays == 2 {
-            break;
-        }
-        assert!(
-            start.elapsed() < RECOVERY_TIMEOUT,
-            "recovered relay rejoins"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_connected(&mailbox, 2, RECOVERY_TIMEOUT, "recovered relay rejoins");
     wait_for_subscription(&relay_a, RECOVERY_TIMEOUT);
     assert_quiet(&mut mailbox);
     {

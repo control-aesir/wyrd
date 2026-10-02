@@ -470,3 +470,36 @@ fn foreign_envelope_sender_rejected() {
 // proven relay below — real assertions either way, never a silent
 // pass. Each run publishes a few gift wraps to fresh random
 // recipients — negligible traffic addressed to keys nobody holds.
+
+/// The send-path debug line's accounting: accepted relays land in
+/// `accepted`, every other relay lands in `not_accepted` carrying the
+/// relay's answer — so a relay that answers `OK false` reads
+/// differently from one that accepted, instead of both resolving `Ok`
+/// in silence.
+#[test]
+fn send_outcome_classifies_acceptance_and_non_acceptance() {
+    use nostr::types::RelayUrl;
+    use nostr_sdk::relay::EventSendStatus;
+
+    let id = EventBuilder::new(Kind::GiftWrap, "probe")
+        .finalize(&keys())
+        .unwrap()
+        .id;
+    let ok_relay = RelayUrl::parse("ws://127.0.0.1:9/").expect("test relay url");
+    let refused_relay = RelayUrl::parse("ws://127.0.0.1:10/").expect("test relay url");
+    let mut output = SendEventOutput::new(id);
+    output
+        .success
+        .insert(ok_relay.clone(), EventSendStatus::Sent);
+    output.failed.insert(
+        refused_relay.clone(),
+        "blocked: kind 1059 needs payment".to_string(),
+    );
+
+    let outcome = classify_send_outcome(&output);
+    assert_eq!(outcome.accepted, vec![ok_relay.to_string()]);
+    assert_eq!(
+        outcome.not_accepted,
+        vec![format!("{refused_relay}: blocked: kind 1059 needs payment")]
+    );
+}

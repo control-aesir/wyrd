@@ -49,11 +49,12 @@ const EXTERNAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// observed through health, not assumed from construction.
 ///
 /// Publish success is proven by delivery, not by `send` returning Ok:
-/// `send` awaits the relay OKs under the SDK's default ack policy but
-/// discards the per-relay output, so a rejection surfaces only as
-/// missing mail. A relay that refuses gift-wrap writes (fee, PoW,
-/// allowlist) fails this test at the delivery wait — a relay-policy
-/// signal, not mailbox logic; pick an open relay.
+/// `send` awaits the relay OKs under the SDK's default ack policy and
+/// logs the per-relay outcome (`mailbox send relay outcome`), but a
+/// refusal still resolves `Ok` — so a rejection surfaces in the logs
+/// and then as missing mail. A relay that refuses gift-wrap writes
+/// (fee, PoW, allowlist) fails this test at the delivery wait — a
+/// relay-policy signal, not mailbox logic; pick an open relay.
 #[test]
 #[ignore = "opt-in: runs live assertions against a public relay"]
 fn external_relay_gift_wrap_round_trip_over_tls() {

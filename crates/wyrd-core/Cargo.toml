@@ -24,6 +24,9 @@ wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
 # a minimal NIP-01 server; never a runtime dependency).
 tokio-tungstenite = "0.28"
 serde_json = "1"
+# Log capture for the send-path outcome test (test-only: asserts the
+# relay's answer reaches the debug line; never a runtime dependency).
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

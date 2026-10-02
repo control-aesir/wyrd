@@ -228,6 +228,7 @@ use nostr::prelude::{AsyncGetPublicKey, AsyncNip44};
 use nostr::prelude::{
     Event, EventBuilder, EventId, Keys, Kind, PublicKey, SubscriptionId, Tag, UnsignedEvent,
 };
+use nostr_sdk::client::SendEventOutput;
 use nostr_sdk::prelude::{Client, ClientNotification, Filter, RelayLimits};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -1495,6 +1496,41 @@ async fn recover_relays(
     }
 }
 
+/// One publish's per-relay outcome, as reported on the send-path debug
+/// line: relays that accepted the wrap (`OK true`, with the relay's
+/// message when it sent one) versus relays that did not accept it (an
+/// explicit `OK false`, an unreachable relay, a timeout — the SDK
+/// reports all of these in one map, so the bucket is named for what it
+/// guarantees, not for policy refusal). Pure classification over the
+/// SDK output so the acceptance accounting is unit-testable without a
+/// relay; entries sort by relay URL so log lines are stable.
+struct SendOutcome {
+    accepted: Vec<String>,
+    not_accepted: Vec<String>,
+}
+
+fn classify_send_outcome(output: &SendEventOutput) -> SendOutcome {
+    let mut accepted: Vec<String> = output
+        .success
+        .iter()
+        .map(|(url, status)| match status.message() {
+            Some(message) => format!("{url} ({message})"),
+            None => format!("{url}"),
+        })
+        .collect();
+    accepted.sort();
+    let mut not_accepted: Vec<String> = output
+        .failed
+        .iter()
+        .map(|(url, error)| format!("{url}: {error}"))
+        .collect();
+    not_accepted.sort();
+    SendOutcome {
+        accepted,
+        not_accepted,
+    }
+}
+
 impl<S> Mailbox for LiveMailbox<S>
 where
     S: AsyncGetPublicKey + AsyncSignEvent + AsyncNip44 + Send + Sync + 'static,
@@ -1521,10 +1557,29 @@ where
             .rt()
             .block_on(GiftWrapBuilder::new(recipient, rumor).finalize_async(&*self.signer))
             .map_err(|_| MailboxError::Signer)?;
-        self.rt()
+        let output = self
+            .rt()
             .block_on(async { self.client.send_event(&wrap).await })
-            .map(|_| ())
-            .map_err(|error| MailboxError::Transport(error.to_string()))
+            .map_err(|error| MailboxError::Transport(error.to_string()))?;
+        // Per-relay send forensics at the same level as the outbox send
+        // line: `send_event` resolves `Ok` even when every relay refused
+        // the write (an `OK false` lands in `failed`, not in `Err`), so
+        // without this line a relay-side rejection is indistinguishable
+        // from success — the recipient just never receives. The outcome
+        // stays diagnostic only: whether an explicit refusal should fail
+        // the send (and hold the outbox obligation pending instead of
+        // retiring it) is a protocol decision for a separate change.
+        let outcome = classify_send_outcome(&output);
+        tracing::debug!(
+            event_id = %output.id().to_hex(),
+            recipient = %recipient,
+            accepted = outcome.accepted.len(),
+            not_accepted = outcome.not_accepted.len(),
+            accepted_relays = ?outcome.accepted,
+            not_accepted_relays = ?outcome.not_accepted,
+            "mailbox send relay outcome"
+        );
+        Ok(())
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

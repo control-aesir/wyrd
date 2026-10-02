@@ -196,7 +196,10 @@ router: a serving endpoint over the vault answers peer fetches by
 transport root, announcement `node_addr` routes publish into the fetch
 plane on every sync pass, and a serving restart's route update rewires
 serving (contract 13). Still open: the NIP-46 signer-session client
-wiring, multi-relay mailbox supervision and relay interop coverage.
+wiring. Multi-relay pool coverage is checked in
+(`mailbox::tests_multirelay`: publication, replay/dedupe, outage with
+survivor intake, recovery); cross-implementation relay interop stays
+opt-in (`mailbox::tests_interop`, live public relay).
 The durable announcement outbox itself has landed (queued/delivered
 facts with byte-identical sealed retries, contract-tested); what was
 open was its live-loop wiring, which has now landed too — see below.

@@ -66,39 +66,58 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     assert_quiet(&mut mailbox);
     drop(mailbox);
 
-    // Replay plus dedupe: a fresh log redelivers both wraps — each
-    // relay replays its own store, so four frames collapse to two
-    // deliveries — proving real retained history on *both* relays.
-    let mut replayed = live_mailbox(&receiver, &relays, temp_path("seen-multirelay-fresh"));
-    wait_for_health(&replayed, true, OUTAGE_TIMEOUT);
-    let mut replayed_payloads = Vec::new();
-    for _ in 0..2 {
-        let delivery =
-            wait_for_delivery(&mut replayed, DELIVERY_TIMEOUT).expect("both relays replay");
-        replayed_payloads.push(delivery.envelope().ciphertext.clone());
-        replayed
-            .settle(delivery.id(), Disposition::Ack)
-            .expect("acks");
+    // Replay plus dedupe, per relay: a fresh log subscribed to each
+    // relay *alone* must redeliver both wraps. Relay replay is the
+    // only source a fresh log can draw on, so this proves both relays
+    // retained the history independently. A single two-relay
+    // subscriber would see the same two deliveries whether one or
+    // both relays replayed, so it could not observe fan-out — a
+    // regression to single-relay publishing would pass it.
+    for index in 0..relays.len() {
+        let mut replayed = live_mailbox(
+            &receiver,
+            &relays[index..index + 1],
+            temp_path(&format!("seen-multirelay-fresh-{index}")),
+        );
+        wait_for_health(&replayed, true, OUTAGE_TIMEOUT);
+        let mut replayed_payloads = Vec::new();
+        for _ in 0..2 {
+            let delivery = wait_for_delivery(&mut replayed, DELIVERY_TIMEOUT)
+                .expect("each relay replays both wraps");
+            replayed_payloads.push(delivery.envelope().ciphertext.clone());
+            replayed
+                .settle(delivery.id(), Disposition::Ack)
+                .expect("acks");
+        }
+        replayed_payloads.sort();
+        assert_eq!(replayed_payloads, ["multi-first", "multi-second"]);
     }
-    replayed_payloads.sort();
-    assert_eq!(replayed_payloads, ["multi-first", "multi-second"]);
-    drop(replayed);
 
-    // The proven replay collapses on the original log: the durable
-    // seen log absorbs the full double replay into silence. No
-    // subscription-count wait here: dropping the first mailbox never
+    // The proven replay collapses on the original log: the persisted
+    // seen log absorbs the full double replay into silence (records
+    // are written and reloaded, not fsynced — the harness runs
+    // ephemeral — so this pins convergence, not the crash guarantee).
+    // No subscription-count wait here: dropping the first mailbox never
     // sent CLOSE, so its dead connection's entry lingers and the
     // reopen's fresh REQ reads two, not one — a fake-side artifact,
-    // not a second live subscription. The fresh mailbox always sends
-    // a setup REQ at connect, so the replay this quiet absorbs is
-    // real, not a missing resubscribe.
+    // not a second live subscription. The attach count is the tripwire
+    // instead: if a relay's attach plus replay slipped past the quiet
+    // window, its frames would surface as a payload mismatch in a
+    // later leg rather than a dedupe failure here.
     let mut mailbox = live_mailbox(&receiver, &relays, seen);
-    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+    assert_eq!(
+        wait_for_health(&mailbox, true, OUTAGE_TIMEOUT).connected_relays,
+        2,
+        "reopened mailbox reattaches to both relays before the quiet window"
+    );
     assert_quiet(&mut mailbox);
 
     // Outage with continued intake: killing one relay degrades the
-    // mailbox to the survivor without dropping liveness, and mail
-    // addressed through the survivor still arrives.
+    // mailbox to the survivor without dropping liveness — and a send
+    // through the full pool still resolves and still reaches the
+    // survivor, pinning the partial-failure surface: the dead relay
+    // lands in the send-path outcome's not-accepted bucket while the
+    // wrap is delivered, not wedged behind the outage.
     relay_a.shutdown();
     let start = Instant::now();
     loop {
@@ -113,8 +132,8 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     {
         let mut outbox = live_mailbox(
             &sender,
-            &relays[1..],
-            temp_path("seen-multirelay-survivor-sender"),
+            &relays,
+            temp_path("seen-multirelay-degraded-sender"),
         );
         outbox
             .send(envelope(
@@ -122,7 +141,7 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
                 device_id(&receiver),
                 "via-survivor",
             ))
-            .expect("send via survivor");
+            .expect("pool send resolves despite the dead relay");
     }
     let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("survivor delivers");
     assert_eq!(delivery.envelope().ciphertext, "via-survivor");

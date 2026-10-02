@@ -210,6 +210,8 @@ mod tests_interop;
 #[cfg(test)]
 mod tests_mailbox;
 #[cfg(test)]
+mod tests_multirelay;
+#[cfg(test)]
 mod tests_poison;
 #[cfg(test)]
 mod tests_signer_boundary;

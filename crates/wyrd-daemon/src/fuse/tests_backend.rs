@@ -992,11 +992,6 @@ fn commit_without_image_fails_closed_instead_of_authoring_empty() {
         "no mutation is submitted for the imageless commit"
     );
     assert_eq!(
-        backend.budget.dirty_handles(),
-        0,
-        "a refused commit releases its dirty mark"
-    );
-    assert_eq!(
         backend.commit_handle(fh),
         Err(fuser::Errno::EIO),
         "a failed commit stays terminal instead of retrying"

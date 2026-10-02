@@ -74,6 +74,12 @@ pub(crate) struct MiniRelay {
     listener: Arc<TcpListener>,
     store: Store,
     subs: Subs,
+    /// When `Some`, EVENT publishes are answered `OK false` with the
+    /// message and never stored or broadcast: the fake relay refuses the
+    /// write, like a real relay's fee/PoW/allowlist policy on kind 1059.
+    /// `None` is the normal accept path. Shared across serving episodes
+    /// so a test can flip policy without restarting the relay.
+    reject: Arc<Mutex<Option<String>>>,
     serving: Mutex<Option<Serving>>,
     /// Declared last so the runtime (and with it any serving tasks)
     /// drops last.
@@ -108,12 +114,14 @@ impl MiniRelay {
 
         let store: Store = Arc::new(Mutex::new(Vec::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
+        let reject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let relay = Self {
             url,
             listener: Arc::new(listener),
             store,
             subs,
+            reject,
             serving: Mutex::new(None),
             runtime,
         };
@@ -150,6 +158,7 @@ impl MiniRelay {
             core,
             Arc::clone(&self.store),
             Arc::clone(&self.subs),
+            Arc::clone(&self.reject),
         ));
         *self.serving.lock().expect("relay lock") = Some(Serving {
             commands,
@@ -169,6 +178,20 @@ impl MiniRelay {
     /// one matching subscription no matter how many recoveries fire).
     pub(crate) fn subscription_count(&self) -> usize {
         self.subs.lock().expect("subs lock").len()
+    }
+
+    /// Refuse subsequent EVENT publishes with `OK false` carrying
+    /// `message`: the wrap is neither stored nor broadcast, so the
+    /// publisher's send resolves with the relay in `failed` while the
+    /// recipient observes silence — the exact signal the send-path debug
+    /// line must make diagnosable.
+    pub(crate) fn reject_writes(&self, message: &str) {
+        *self.reject.lock().expect("reject lock") = Some(message.to_owned());
+    }
+
+    /// Resume the normal accept path for EVENT publishes.
+    pub(crate) fn accept_writes(&self) {
+        *self.reject.lock().expect("reject lock") = None;
     }
 
     /// Store and broadcast an event without a publishing client; no
@@ -299,14 +322,27 @@ fn handle_message(
     true
 }
 
-async fn core_loop(mut core: mpsc::UnboundedReceiver<Command>, store: Store, subs: Subs) {
+async fn core_loop(
+    mut core: mpsc::UnboundedReceiver<Command>,
+    store: Store,
+    subs: Subs,
+    reject: Arc<Mutex<Option<String>>>,
+) {
     while let Some(command) = core.recv().await {
         match command {
             Command::Publish { event, reply } => {
                 let id = event.id.to_hex();
-                store.lock().expect("store lock").push(event.clone());
-                let _ = reply.send(Message::text(json!(["OK", id, true, ""]).to_string()));
-                broadcast(&subs, &event);
+                if let Some(message) = reject.lock().expect("reject lock").clone() {
+                    // Refused write: answer `OK false` like a real relay's
+                    // write policy, and store nothing — the recipient must
+                    // observe silence, not a delayed delivery.
+                    let _ =
+                        reply.send(Message::text(json!(["OK", id, false, message]).to_string()));
+                } else {
+                    store.lock().expect("store lock").push(event.clone());
+                    let _ = reply.send(Message::text(json!(["OK", id, true, ""]).to_string()));
+                    broadcast(&subs, &event);
+                }
             }
             Command::Inject(event) => {
                 store.lock().expect("store lock").push(event.clone());

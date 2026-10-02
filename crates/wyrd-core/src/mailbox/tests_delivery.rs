@@ -184,6 +184,57 @@ fn deliveries_round_trip_and_replay_converges_after_restart() {
     assert_quiet(&mut reopened);
 }
 
+/// A relay-side write refusal (fee, PoW, allowlist on kind 1059) is
+/// diagnosable, not silent: the refused send still resolves `Ok` —
+/// failing the send (and holding the outbox obligation pending instead
+/// of retiring it) is a separate protocol decision — while the
+/// recipient observes silence. The relay's answer lands on the
+/// `mailbox send relay outcome` debug line (accounting pinned by
+/// `send_outcome_classifies_acceptance_and_refusal`); this test pins
+/// the refusal itself reaching the SDK as `failed` rather than
+/// delivery, over a proven-live attachment so the silence cannot read
+/// as "never connected".
+#[test]
+fn relay_write_refusal_resolves_ok_and_delivers_nothing() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let relays = vec![url];
+
+    let mut inbox = live_mailbox(&receiver, &relays, temp_path("seen-refusal"));
+    let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-refusal-sender"));
+
+    // Accept mode first: the path is proven live before any refusal.
+    outbox
+        .send(envelope(device_id(&sender), device_id(&receiver), "before"))
+        .expect("publish reaches the relay client");
+    let proven = wait_for_delivery(&mut inbox, DELIVERY_TIMEOUT).expect("path is live");
+    assert_eq!(proven.envelope().ciphertext, "before");
+    inbox.settle(proven.id(), Disposition::Ack).expect("acks");
+
+    // Refuse mode: the send resolves `Ok`, the recipient hears nothing.
+    relay.reject_writes("blocked: kind 1059 needs payment");
+    outbox
+        .send(envelope(
+            device_id(&sender),
+            device_id(&receiver),
+            "refused-mail",
+        ))
+        .expect("refusal still resolves Ok: failing the send is a separate protocol decision");
+    assert_quiet(&mut inbox);
+
+    // Accept mode again: the refusal was policy, not a broken mailbox.
+    relay.accept_writes();
+    outbox
+        .send(envelope(device_id(&sender), device_id(&receiver), "after"))
+        .expect("publish reaches the relay client");
+    let delivery = wait_for_delivery(&mut inbox, DELIVERY_TIMEOUT).expect("accepted mail arrives");
+    assert_eq!(delivery.envelope().ciphertext, "after");
+    inbox.settle(delivery.id(), Disposition::Ack).expect("acks");
+    assert_quiet(&mut inbox);
+}
+
 #[test]
 fn retry_requeues_behind_other_mail() {
     let relay = MiniRelay::spawn();

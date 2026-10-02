@@ -3,6 +3,8 @@ use super::*;
 use nostr::event::FinalizeEvent;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use wyrd_sync::keys::DeviceIdentitySecret;
+use wyrd_sync::runtime::{DrainReport, Engine};
 
 pub(super) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const QUIET_TIMEOUT: Duration = Duration::from_secs(2);
@@ -14,6 +16,41 @@ pub(super) const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn keys() -> Keys {
     Keys::generate()
+}
+
+/// The nostr signing keys for an engine identity: shared by the
+/// real-relay scenario tests so engine authorship and mailbox
+/// delivery use one identity.
+pub(super) fn keys_for(identity: &DeviceIdentitySecret) -> Keys {
+    identity.signer_keys()
+}
+
+/// Drain until `expected` envelopes are accepted (or the deadline
+/// bites): relay delivery onto a subscribe or resubscribe is
+/// asynchronous, so reconnect legs observe rather than assume.
+pub(super) fn drain_until(
+    engine: &mut Engine,
+    mailbox: &mut LiveMailbox<Keys>,
+    expected: usize,
+) -> DrainReport {
+    let start = Instant::now();
+    let mut total = DrainReport::default();
+    loop {
+        let report = engine.drain(mailbox).unwrap();
+        total.accepted += report.accepted;
+        total.duplicates += report.duplicates;
+        total.deferred += report.deferred;
+        total.skipped += report.skipped;
+        total.discarded += report.discarded;
+        if total.accepted >= expected {
+            return total;
+        }
+        assert!(
+            start.elapsed() < DELIVERY_TIMEOUT,
+            "engine drains expected mail"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub(super) fn device_id(keys: &Keys) -> DeviceId {

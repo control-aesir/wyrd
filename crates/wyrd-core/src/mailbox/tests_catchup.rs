@@ -1,5 +1,8 @@
 use super::mini_relay::MiniRelay;
-use super::tests_harness::{keys, live_mailbox, temp_path, DELIVERY_TIMEOUT};
+use super::tests_harness::{
+    drain_until, keys, keys_for, live_mailbox, temp_path, wait_for_health, DELIVERY_TIMEOUT,
+    OUTAGE_TIMEOUT, RECOVERY_TIMEOUT,
+};
 use super::*;
 use nostr::event::FinalizeEvent;
 use wyrd_format::{ContentId, Entry, MemoryObjectStore, ObjectKind, ObjectStore, SnapshotId, Tree};
@@ -9,38 +12,6 @@ use wyrd_sync::runtime::{DrainReport, Engine, MaterializationState, RoutePublish
 use wyrd_sync::serving::ServingEndpoint;
 
 use std::time::{Duration, Instant};
-
-fn keys_for(identity: &DeviceIdentitySecret) -> Keys {
-    identity.signer_keys()
-}
-
-/// Drain until `expected` envelopes are accepted (or the deadline
-/// bites): relay delivery onto the resubscribe is asynchronous, so the
-/// reconnect legs observe rather than assume.
-fn drain_until(
-    engine: &mut Engine,
-    mailbox: &mut LiveMailbox<Keys>,
-    expected: usize,
-) -> DrainReport {
-    let start = Instant::now();
-    let mut total = DrainReport::default();
-    loop {
-        let report = engine.drain(mailbox).unwrap();
-        total.accepted += report.accepted;
-        total.duplicates += report.duplicates;
-        total.deferred += report.deferred;
-        total.skipped += report.skipped;
-        total.discarded += report.discarded;
-        if total.accepted >= expected {
-            return total;
-        }
-        assert!(
-            start.elapsed() < DELIVERY_TIMEOUT,
-            "engine drains expected mail"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
 
 /// History catch-up over a real relay: an admitted peer disconnects,
 /// misses several ordinary snapshots plus an admission it never saw,
@@ -54,6 +25,11 @@ fn drain_until(
 /// heads match the owner's (state convergence). A garbage wrap
 /// injected mid-gap must never become a delivery, and a restart after
 /// convergence must stay quiet with heads intact.
+///
+/// Retention bound: the absent peer is rescued only within relay
+/// retention. The owner retires every obligation on relay acceptance,
+/// so this scenario proves acquisition from a retaining relay, not
+/// repair past eviction.
 #[test]
 fn disconnected_peer_acquires_missed_history_over_real_relay() {
     let relay = MiniRelay::spawn();
@@ -191,9 +167,13 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
     // retained state rather than assuming arrival order — the
     // post-admission announcement must still be skipped (its epoch key
     // arrives only with the heal) while the three ordinary ones are
-    // recorded. Skipped mail settles `Retry`, so the relay retains it;
-    // the loop breaks on the first pass showing the full picture, since
-    // further passes would re-offer the retained envelope.
+    // recorded. Skipped mail settles `Retry`: the handover stays in
+    // the mailbox's bounded in-memory `unacked` queue and is re-offered
+    // round-robin, so the heal needs no second replay — with the
+    // consequence that a peer crash before the heal leans on relay
+    // retention for the wrap again. The loop breaks on the first pass
+    // showing the full picture, since further passes would re-offer
+    // the retained envelope.
     let mut recipient_mailbox = live_mailbox(
         &recipient_keys,
         &[url],
@@ -229,9 +209,16 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
     assert_eq!(acquired.deferred, 0);
     // The setup admission pair replays onto the fresh seen log and
     // collapses by message id: redelivery of committed mail is a
-    // duplicate, never a second commit.
+    // duplicate, never a second commit. The counts above depend on
+    // relay store order (the keyless announcement replays last), so a
+    // reordered gap changes them.
     assert_eq!(acquired.duplicates, 2, "setup admission redelivered once");
     assert_eq!(acquired.discarded, 0, "garbage never reached intake");
+    assert_eq!(
+        recipient_mailbox.poison_len(),
+        1,
+        "the mid-gap garbage wrap is recorded as poison, not silently absent"
+    );
 
     // History closure, asserted before any convergence: the missed
     // ordinary snapshots are recorded, the keyless one is retained but
@@ -250,7 +237,7 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
     assert_eq!(
         recipient.pending_count(),
         0,
-        "skipped mail is relay-held, not engine-held"
+        "skipped mail is mailbox-held for re-offer, not engine-held"
     );
     let known = recipient.membership_log().known_state().unwrap();
     assert_eq!(known.epoch, 2, "membership still pre-gap");
@@ -308,6 +295,21 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
         quiet.duplicates, 1,
         "rotation-committed transition collapses"
     );
+    // Admitting C queued the pre-admission snapshots as newcomer
+    // catch-up for the late member: the durable outbox republishes
+    // them without re-authoring, and only then is nothing pending for
+    // anyone — the no-re-push property made visible.
+    assert_eq!(
+        owner
+            .announce_pending(&mut owner_mailbox, Some(&route))
+            .unwrap(),
+        3,
+        "pre-admission snapshots republish to the late member"
+    );
+    assert!(
+        !owner.has_pending_outbound().unwrap(),
+        "owner discharged every obligation, including the withheld admission"
+    );
 
     // The missed bodies, manifests, and demanded content arrive over
     // live iroh: every missed snapshot fetches body plus root
@@ -334,7 +336,10 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
     let mut bulk = IrohBulkSource::with_runtime(client, std::sync::Arc::new(runtime));
     let state = recipient.runtime_state().unwrap();
     let routes = bulk.publish_routes(&state).unwrap().published;
-    assert!(routes >= 4, "every missed snapshot publishes routes");
+    // Four routes per announced snapshot — root-manifest transport,
+    // body, eager root, eager body — so the fan-out pins a route
+    // regression that still leaves the count above four.
+    assert_eq!(routes, 16, "every missed snapshot publishes its routes");
     let mut objects = MemoryObjectStore::default();
     let first = recipient.execute_plan(&mut bulk, &mut objects).unwrap();
     assert_eq!(
@@ -423,6 +428,128 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
     serving
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
+    std::fs::remove_dir_all(owner_dir).unwrap();
+    std::fs::remove_dir_all(recipient_dir).unwrap();
+}
+
+/// Acquisition across a relay restart on the production reconnect
+/// shape: the peer keeps its mailbox and durable seen log while the
+/// relay drops and reboots, so the supervisor's own resubscribe —
+/// not a fresh mailbox — replays the missed snapshots onto the same
+/// subscription state. Already-acked mail must collapse in the seen
+/// log (no intake duplicates); missed mail commits exactly once.
+///
+/// Recovery pacing belongs to the SDK's auto-reconnect, so the
+/// restart legs wait generously.
+#[test]
+fn same_mailbox_acquires_missed_snapshots_across_relay_restart() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let owner_dir = temp_path("catchup-restart-owner");
+    let recipient_dir = temp_path("catchup-restart-recipient");
+    let drive_pass = "test-pass";
+    let owner_identity = DeviceIdentitySecret::generate().unwrap();
+    let recipient_identity = DeviceIdentitySecret::generate().unwrap();
+    let recipient_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let owner_keys = keys_for(&owner_identity);
+    let recipient_keys = keys_for(&recipient_identity);
+
+    let mut owner = Engine::create(owner_dir.clone(), drive_pass, owner_identity.clone()).unwrap();
+    let invitation = owner
+        .admit_device(
+            recipient_identity.device_id(),
+            recipient_encryption.encryption_key(),
+        )
+        .unwrap()
+        .invitation;
+    let mut recipient = Engine::accept_invitation(
+        recipient_dir.clone(),
+        drive_pass,
+        recipient_identity.clone(),
+        recipient_encryption,
+        &invitation,
+    )
+    .unwrap();
+
+    let mut owner_mailbox = live_mailbox(
+        &owner_keys,
+        std::slice::from_ref(&url),
+        temp_path("catchup-restart-owner-seen"),
+    );
+    let mut recipient_mailbox = live_mailbox(
+        &recipient_keys,
+        std::slice::from_ref(&url),
+        temp_path("catchup-restart-recipient-seen"),
+    );
+
+    assert_eq!(owner.deliver_pending(&mut owner_mailbox).unwrap(), 2);
+    let setup = drain_until(&mut recipient, &mut recipient_mailbox, 2);
+    assert_eq!(setup.accepted, 2);
+    let seen_before = recipient_mailbox.seen_len();
+
+    // Two snapshots published, then the relay episode: the restart
+    // keeps history but clears subscriptions, so the same client must
+    // re-REQ and the replay carries both the acked setup pair and the
+    // missed snapshots.
+    let mut author_objects = MemoryObjectStore::default();
+    let mut missed = Vec::new();
+    for index in 0..2 {
+        let payload = format!("restart-missed-{index}").into_bytes();
+        let chunk = author_objects.insert(ObjectKind::Chunk, &payload).unwrap();
+        let tree = Tree::from_entries(vec![Entry::file(
+            "payload",
+            payload.len() as u64,
+            false,
+            vec![chunk],
+        )
+        .unwrap()])
+        .unwrap()
+        .insert_into(&mut author_objects)
+        .unwrap();
+        let authored = owner.author_snapshot(&author_objects, tree).unwrap();
+        let snapshot = authored.snapshot().snapshot_id();
+        assert_eq!(
+            owner
+                .announce_snapshot(&authored, &mut owner_mailbox, None)
+                .unwrap(),
+            1
+        );
+        missed.push(snapshot);
+    }
+
+    relay.shutdown();
+    wait_for_health(&recipient_mailbox, false, OUTAGE_TIMEOUT);
+    relay.restart();
+    wait_for_health(&recipient_mailbox, true, RECOVERY_TIMEOUT);
+
+    let report = drain_until(&mut recipient, &mut recipient_mailbox, 2);
+    assert_eq!(report.accepted, 2, "missed snapshots commit once");
+    // The acked setup pair replays onto the same seen log and
+    // collapses there, never reaching intake — the production
+    // resubscribe shape the fresh-mailbox test does not exercise.
+    assert_eq!(report.duplicates, 0, "seen log suppresses the acked prefix");
+    assert_eq!(report.skipped, 0);
+    assert_eq!(
+        recipient_mailbox.seen_len(),
+        seen_before + 2,
+        "only the two new deliveries join the seen log"
+    );
+    let state = recipient.runtime_state().unwrap();
+    for snapshot in &missed {
+        assert!(
+            state.announcement(snapshot).is_some(),
+            "missed snapshot recorded"
+        );
+    }
+    assert_eq!(recipient.pending_count(), 0, "nothing held");
+    let quiet = recipient.drain(&mut recipient_mailbox).unwrap();
+    assert_eq!(quiet.accepted, 0);
+    assert_eq!(quiet.duplicates, 0);
+
+    drop(recipient_mailbox);
+    drop(owner_mailbox);
+    drop(recipient);
+    drop(owner);
     std::fs::remove_dir_all(owner_dir).unwrap();
     std::fs::remove_dir_all(recipient_dir).unwrap();
 }

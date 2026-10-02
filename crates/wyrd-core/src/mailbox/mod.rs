@@ -464,8 +464,12 @@ pub struct MailboxHealth {
 }
 
 impl MailboxHealth {
-    /// True when deliveries can flow: the drainer is alive and, if relays
-    /// are configured, at least one is connected.
+    /// True when the transport can carry deliveries: the drainer is
+    /// alive and, if relays are configured, at least one is connected.
+    /// Transport liveness only — a relay-closed subscription kills
+    /// intake while the socket stays up, so read
+    /// [`closed_subscriptions`](Self::closed_subscriptions) alongside:
+    /// live with a non-zero close count is attached but blind.
     pub fn is_live(&self) -> bool {
         self.stream_alive && (self.total_relays == 0 || self.connected_relays > 0)
     }
@@ -854,7 +858,10 @@ where
     }
 
     /// Current relay attachment health for the daemon composer: a dead
-    /// mailbox reads `is_live() == false` instead of idling silently.
+    /// transport reads `is_live() == false` instead of idling silently.
+    /// Transport death is not the only blindness — a relay-closed
+    /// subscription keeps every transport flag green while killing
+    /// intake, so composers also read `closed_subscriptions`.
     /// Lock-free; the supervisor refreshes it every tick, so it is
     /// eventually consistent — right after construction or an outage it
     /// can read stale for up to a tick, never a construction guarantee.
@@ -1095,14 +1102,25 @@ async fn drain_notifications(
                     // Only the mailbox's own stable subscription counts:
                     // the client holds no other subscription, and a relay
                     // answering our own CLOSE with CLOSED is a teardown
-                    // echo, not a policy refusal of intake.
-                    if closed_id.as_ref() == &subscription_id {
+                    // echo, not a policy refusal of intake. A non-matching
+                    // id is debug-logged, never counted: the relay dropped
+                    // a subscription we cannot attribute, which is worth
+                    // a trace but not a policy signal.
+                    let closed = closed_id.into_owned();
+                    if closed == subscription_id {
                         health.closed_subscriptions.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             relay = ?relay_url,
-                            subscription = ?closed_id,
+                            subscription = ?subscription_id,
                             reason = %message,
                             "mailbox subscription closed by relay"
+                        );
+                    } else {
+                        tracing::debug!(
+                            relay = ?relay_url,
+                            subscription = ?closed,
+                            reason = %message,
+                            "relay closed an unknown subscription"
                         );
                     }
                     None

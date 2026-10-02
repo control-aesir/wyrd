@@ -90,10 +90,11 @@ pub(crate) struct MiniRelay {
     /// there is no reset, so one refusal policy per relay in tests.
     close_subs: Arc<Mutex<Option<String>>>,
     /// When `Some`, every REQ is additionally answered with an NIP-42
-    /// `AUTH` challenge carrying the string — then served normally, so
-    /// the challenge alone closes nothing. Models a relay that demands
-    /// authentication the mailbox will never provide (the trust decision
-    /// forbids answering: it would sign with the device key).
+    /// `AUTH` challenge carrying the string, sent after the replay and
+    /// before EOSE — then served normally, so the challenge alone
+    /// closes nothing. Models a relay that demands authentication the
+    /// mailbox will never provide (the trust decision forbids
+    /// answering: it would sign with the device key).
     auth_challenge: Arc<Mutex<Option<String>>>,
     /// Leading frame tags observed from clients (`EVENT`, `REQ`,
     /// `CLOSE`, `AUTH`, ...), in arrival order: test observability for
@@ -434,9 +435,10 @@ async fn core_loop(
                 for event_json in matching_events(&store, &filter) {
                     let _ = tx.send(event_frame(&sub_id, &event_json));
                 }
-                // A challenge alone closes nothing: answer AUTH, then
-                // serve the subscription normally. The client must never
-                // answer back (see `observed_frames`).
+                // A challenge alone closes nothing: answer AUTH after the
+                // replay and before EOSE, then serve the subscription
+                // normally. The client must never answer back
+                // (see `observed_frames`).
                 if let Some(challenge) = auth_challenge.lock().expect("auth lock").clone() {
                     let _ = tx.send(Message::text(json!(["AUTH", challenge]).to_string()));
                 }

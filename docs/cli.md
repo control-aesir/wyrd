@@ -268,7 +268,10 @@ sync now
     = bounded synchronization run
     = connects
     = may mutate durable state
-    = reports network liveness
+    = reports network liveness plus mailbox intake posture (a
+      relay-closed subscription degrades the verdict even when every
+      relay is connected; exit status still reflects the local run
+      only, not the closure count)
     = either converges or explicitly reports incomplete
 ```
 

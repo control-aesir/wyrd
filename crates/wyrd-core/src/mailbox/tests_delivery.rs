@@ -1278,3 +1278,53 @@ fn relay_closed_subscription_is_counted_not_silent() {
         "one REQ earns exactly one CLOSED, no resubscribe loop"
     );
 }
+
+/// A relay-sent AUTH challenge is never answered: NIP-42 stays
+/// unimplemented by trust decision (answering signs with the device
+/// key), so the client must emit no AUTH frame no matter how often the
+/// relay challenges. The challenge alone closes nothing — delivery
+/// still flows past it, which also bounds the wait: by the time mail
+/// arrives, any AUTH answer would already be on the wire.
+#[test]
+fn relay_auth_challenge_is_never_answered() {
+    let relay = MiniRelay::spawn();
+    relay.challenge_auth("prove-you-are-a-device");
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let mut mailbox = live_mailbox(
+        &receiver,
+        std::slice::from_ref(&url),
+        temp_path("seen-auth-challenge"),
+    );
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+    {
+        let mut outbox = live_mailbox(
+            &sender,
+            std::slice::from_ref(&url),
+            temp_path("seen-auth-challenge-sender"),
+        );
+        outbox
+            .send(envelope(
+                device_id(&sender),
+                device_id(&receiver),
+                "past-the-challenge",
+            ))
+            .expect("publish reaches the relay");
+    }
+    let delivery =
+        wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("delivery flows past AUTH");
+    assert_eq!(delivery.envelope().ciphertext, "past-the-challenge");
+    mailbox
+        .settle(delivery.id(), Disposition::Ack)
+        .expect("acks");
+    let frames = relay.observed_frames();
+    assert!(
+        frames.iter().any(|frame| frame == "REQ"),
+        "relay observed the subscription: {frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|frame| frame == "AUTH"),
+        "client never answers the challenge: {frames:?}"
+    );
+}

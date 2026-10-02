@@ -989,4 +989,8 @@ until then no vault-visible bytes carry drive identity.
    (T16); the daemon's `LiveMailbox` implements it with a supervisor that
    polls relay connection status into `MailboxHealth` and rebuilds a dead
    notification stream (reconnect plus resubscribe with capped backoff).
+   Relays that demand NIP-42 authentication for gift-wrap reads are
+   incompatible by decision, never answered: AUTH would sign with the
+   device key and teach the relay the device pubkey. Their CLOSEDs are
+   counted in health, not retried.
    Still open: the `nostr-connect` session client composition.

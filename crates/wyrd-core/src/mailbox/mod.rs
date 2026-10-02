@@ -457,7 +457,9 @@ pub struct MailboxHealth {
     /// connected stays 1/1 while no delivery can ever arrive. Policy
     /// closes never heal without operator action (a re-REQ just earns
     /// another CLOSED, so nothing auto-resubscribes), but they are now
-    /// always visible here and in the warn log instead of silent.
+    /// always visible here and in the warn log instead of silent. The
+    /// count is pool-global while the symptom is per-relay: which relay
+    /// refused lives in the warn fields, not here.
     pub closed_subscriptions: u64,
 }
 
@@ -768,25 +770,26 @@ where
             saturation_episode: AtomicBool::new(false),
             saturation_replay_at: std::sync::Mutex::new(None),
         });
+        // One stable subscription ID for the mailbox lifetime: every
+        // (re)subscribe sends CLOSE before REQ under this ID (see
+        // `resubscribe`), so recovery replays never accumulate relay-side
+        // subscriptions. Generated before the drainer so it can count
+        // only closures of this subscription.
+        let subscription_id = SubscriptionId::generate();
         // Listen before subscribing: the drainer must be polled past its
         // broadcast subscription before the REQ whose replay it has to
         // catch is sent (establish awaits the drainer's readiness), or
         // relay history racing the subscription is lost to the void.
         let intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>> =
             Arc::new(std::sync::Mutex::new(None));
-        let incoming = Arc::new(std::sync::Mutex::new(
-            runtime.block_on(establish_drainer(&client, &intake_waker, &health))?,
-        ));
+        let incoming = Arc::new(std::sync::Mutex::new(runtime.block_on(
+            establish_drainer(&client, &intake_waker, &health, &subscription_id),
+        )?));
         // Registration is local (no I/O per relay); `connect` dials every
         // registered relay concurrently, and nostr-sdk re-establishes
         // subscriptions on reconnects. With no relays there is nothing to
         // dial (nostr-sdk refuses an empty `connect`), and the mailbox
         // stays constructible for offline boundary use.
-        // One stable subscription ID for the mailbox lifetime: every
-        // (re)subscribe sends CLOSE before REQ under this ID (see
-        // `resubscribe`), so recovery replays never accumulate relay-side
-        // subscriptions.
-        let subscription_id = SubscriptionId::generate();
         let setup_subscription_id = subscription_id.clone();
         let setup_filter = filter.clone();
         let resubscribe_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -1055,6 +1058,7 @@ async fn drain_notifications(
     sender: tokio_mpsc::Sender<Event>,
     intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: Arc<SupervisorState>,
+    subscription_id: SubscriptionId,
     ready: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut notifications = client.notifications();
@@ -1085,16 +1089,22 @@ async fn drain_notifications(
                 // warned here, never auto-retried: re-REQing a policy close
                 // loops CLOSED forever while looking like recovery.
                 RelayMessage::Closed {
-                    subscription_id,
+                    subscription_id: closed_id,
                     message,
                 } => {
-                    health.closed_subscriptions.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        relay = ?relay_url,
-                        subscription = ?subscription_id,
-                        reason = %message,
-                        "mailbox subscription closed by relay"
-                    );
+                    // Only the mailbox's own stable subscription counts:
+                    // the client holds no other subscription, and a relay
+                    // answering our own CLOSE with CLOSED is a teardown
+                    // echo, not a policy refusal of intake.
+                    if closed_id.as_ref() == &subscription_id {
+                        health.closed_subscriptions.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            relay = ?relay_url,
+                            subscription = ?closed_id,
+                            reason = %message,
+                            "mailbox subscription closed by relay"
+                        );
+                    }
                     None
                 }
                 // NIP-42 stays unimplemented by trust decision (answering
@@ -1184,6 +1194,7 @@ async fn establish_drainer(
     client: &Arc<Client>,
     intake_waker: &Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>>,
     health: &Arc<SupervisorState>,
+    subscription_id: &SubscriptionId,
 ) -> Result<tokio_mpsc::Receiver<Event>, MailboxError> {
     let (sender, receiver) = tokio_mpsc::channel(INCOMING_CAPACITY);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1192,6 +1203,7 @@ async fn establish_drainer(
         sender,
         Arc::clone(intake_waker),
         Arc::clone(health),
+        subscription_id.clone(),
         ready_tx,
     ));
     await_drainer_ready(ready_rx).await?;
@@ -1476,7 +1488,7 @@ async fn recover_stream(
     subscription_id: &SubscriptionId,
     resubscribe_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), MailboxError> {
-    let receiver = match establish_drainer(client, intake_waker, health).await {
+    let receiver = match establish_drainer(client, intake_waker, health, subscription_id).await {
         Ok(receiver) => receiver,
         Err(error) => {
             // The loop below counts every pass, but this return sits

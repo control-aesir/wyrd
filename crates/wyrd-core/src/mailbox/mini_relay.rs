@@ -332,7 +332,10 @@ async fn core_loop(
         match command {
             Command::Publish { event, reply } => {
                 let id = event.id.to_hex();
-                if let Some(message) = reject.lock().expect("reject lock").clone() {
+                // Clone under the lock, then reply without holding it:
+                // the guard must not span the reply send.
+                let rejection = reject.lock().expect("reject lock").clone();
+                if let Some(message) = rejection {
                     // Refused write: answer `OK false` like a real relay's
                     // write policy, and store nothing — the recipient must
                     // observe silence, not a delayed delivery.

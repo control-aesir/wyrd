@@ -1498,13 +1498,15 @@ async fn recover_relays(
 
 /// One publish's per-relay outcome, as reported on the send-path debug
 /// line: relays that accepted the wrap (`OK true`, with the relay's
-/// message when it sent one) versus relays that refused or failed it
-/// (`OK false` message or transport error). Pure classification over
-/// the SDK output so the acceptance/refusal accounting is unit-testable
-/// without a relay; entries sort by relay URL so log lines are stable.
+/// message when it sent one) versus relays that did not accept it (an
+/// explicit `OK false`, an unreachable relay, a timeout — the SDK
+/// reports all of these in one map, so the bucket is named for what it
+/// guarantees, not for policy refusal). Pure classification over the
+/// SDK output so the acceptance accounting is unit-testable without a
+/// relay; entries sort by relay URL so log lines are stable.
 struct SendOutcome {
     accepted: Vec<String>,
-    refused: Vec<String>,
+    not_accepted: Vec<String>,
 }
 
 fn classify_send_outcome(output: &SendEventOutput) -> SendOutcome {
@@ -1517,13 +1519,16 @@ fn classify_send_outcome(output: &SendEventOutput) -> SendOutcome {
         })
         .collect();
     accepted.sort();
-    let mut refused: Vec<String> = output
+    let mut not_accepted: Vec<String> = output
         .failed
         .iter()
         .map(|(url, error)| format!("{url}: {error}"))
         .collect();
-    refused.sort();
-    SendOutcome { accepted, refused }
+    not_accepted.sort();
+    SendOutcome {
+        accepted,
+        not_accepted,
+    }
 }
 
 impl<S> Mailbox for LiveMailbox<S>
@@ -1569,9 +1574,9 @@ where
             event_id = %output.id().to_hex(),
             recipient = %recipient,
             accepted = outcome.accepted.len(),
-            refused = outcome.refused.len(),
+            not_accepted = outcome.not_accepted.len(),
             accepted_relays = ?outcome.accepted,
-            refused_relays = ?outcome.refused,
+            not_accepted_relays = ?outcome.not_accepted,
             "mailbox send relay outcome"
         );
         Ok(())

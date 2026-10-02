@@ -190,7 +190,7 @@ fn deliveries_round_trip_and_replay_converges_after_restart() {
 /// of retiring it) is a separate protocol decision — while the
 /// recipient observes silence. The relay's answer lands on the
 /// `mailbox send relay outcome` debug line (accounting pinned by
-/// `send_outcome_classifies_acceptance_and_refusal`); this test pins
+/// `send_outcome_classifies_acceptance_and_non_acceptance`); this test pins
 /// the refusal itself reaching the SDK as `failed` rather than
 /// delivery, over a proven-live attachment so the silence cannot read
 /// as "never connected".
@@ -233,6 +233,78 @@ fn relay_write_refusal_resolves_ok_and_delivers_nothing() {
     assert_eq!(delivery.envelope().ciphertext, "after");
     inbox.settle(delivery.id(), Disposition::Ack).expect("acks");
     assert_quiet(&mut inbox);
+}
+
+/// In-memory tracing writer: captures the send-path debug line so the
+/// refusal test below can assert on the emitted line, not just on the
+/// classifier input.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The relay's refusal message reaches the send-path debug line end to
+/// end: a captured subscriber around a refused publish over a real
+/// relay frame must show the `mailbox send relay outcome` line with the
+/// relay in `not_accepted` and its message verbatim. The send itself
+/// runs on the calling thread, so a thread-local subscriber observes
+/// the line the classifier feeds it.
+#[test]
+fn refused_publish_logs_the_relay_message() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let relays = vec![url];
+    let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-log-capture"));
+
+    relay.reject_writes("blocked: kind 1059 needs payment");
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        outbox
+            .send(envelope(
+                device_id(&sender),
+                device_id(&receiver),
+                "logged-refusal",
+            ))
+            .expect("refusal still resolves Ok");
+    });
+    let logged =
+        String::from_utf8(capture.0.lock().expect("log lock").clone()).expect("log is UTF-8");
+    assert!(
+        logged.contains("mailbox send relay outcome"),
+        "send path emits the outcome line:\n{logged}"
+    );
+    assert!(
+        logged.contains("not_accepted"),
+        "refusal lands in the not-accepted bucket:\n{logged}"
+    );
+    assert!(
+        logged.contains("blocked: kind 1059 needs payment"),
+        "relay message reaches the line verbatim:\n{logged}"
+    );
 }
 
 #[test]

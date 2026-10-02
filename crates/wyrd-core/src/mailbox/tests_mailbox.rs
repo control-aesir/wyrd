@@ -472,12 +472,12 @@ fn foreign_envelope_sender_rejected() {
 // recipients — negligible traffic addressed to keys nobody holds.
 
 /// The send-path debug line's accounting: accepted relays land in
-/// `accepted`, refused or failed relays land in `refused` carrying the
+/// `accepted`, every other relay lands in `not_accepted` carrying the
 /// relay's answer — so a relay that answers `OK false` reads
 /// differently from one that accepted, instead of both resolving `Ok`
 /// in silence.
 #[test]
-fn send_outcome_classifies_acceptance_and_refusal() {
+fn send_outcome_classifies_acceptance_and_non_acceptance() {
     use nostr::types::RelayUrl;
     use nostr_sdk::relay::EventSendStatus;
 
@@ -499,7 +499,7 @@ fn send_outcome_classifies_acceptance_and_refusal() {
     let outcome = classify_send_outcome(&output);
     assert_eq!(outcome.accepted, vec![ok_relay.to_string()]);
     assert_eq!(
-        outcome.refused,
+        outcome.not_accepted,
         vec![format!("{refused_relay}: blocked: kind 1059 needs payment")]
     );
 }

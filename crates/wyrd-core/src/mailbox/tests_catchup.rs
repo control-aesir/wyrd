@@ -521,6 +521,18 @@ fn same_mailbox_acquires_missed_snapshots_across_relay_restart() {
     wait_for_health(&recipient_mailbox, false, OUTAGE_TIMEOUT);
     relay.restart();
     wait_for_health(&recipient_mailbox, true, RECOVERY_TIMEOUT);
+    // Both mailboxes must hold exactly one subscription each after
+    // the resubscribe: a leaked second one would double-deliver every
+    // replayed wrap, and the seen log would silently swallow the copy
+    // this test counts on. Two clients, so two — not one.
+    let start = Instant::now();
+    while relay.subscription_count() != 2 {
+        assert!(
+            start.elapsed() < DELIVERY_TIMEOUT,
+            "resubscribe holds exactly one subscription per mailbox"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let report = drain_until(&mut recipient, &mut recipient_mailbox, 2);
     assert_eq!(report.accepted, 2, "missed snapshots commit once");

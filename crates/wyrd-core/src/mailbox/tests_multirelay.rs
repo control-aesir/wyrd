@@ -101,23 +101,33 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     // sent CLOSE, so its dead connection's entry lingers and the
     // reopen's fresh REQ reads two, not one — a fake-side artifact,
     // not a second live subscription. The attach count is the tripwire
-    // instead: if a relay's attach plus replay slipped past the quiet
-    // window, its frames would surface as a payload mismatch in a
-    // later leg rather than a dedupe failure here.
+    // instead, polled like the outage and recovery legs: `wait_for_health`
+    // returns on the first live sample (one relay connected), so a bare
+    // assert would sample the `2` once rather than await it — and if a
+    // relay's attach plus replay slipped past the quiet window, its
+    // frames would surface as a payload mismatch in a later leg rather
+    // than a dedupe failure here.
     let mut mailbox = live_mailbox(&receiver, &relays, seen);
-    assert_eq!(
-        wait_for_health(&mailbox, true, OUTAGE_TIMEOUT).connected_relays,
-        2,
-        "reopened mailbox reattaches to both relays before the quiet window"
-    );
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+    let start = Instant::now();
+    loop {
+        if mailbox.health().connected_relays == 2 {
+            break;
+        }
+        assert!(
+            start.elapsed() < OUTAGE_TIMEOUT,
+            "reopened mailbox reattaches to both relays before the quiet window"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_quiet(&mut mailbox);
 
     // Outage with continued intake: killing one relay degrades the
     // mailbox to the survivor without dropping liveness — and a send
-    // through the full pool still resolves and still reaches the
-    // survivor, pinning the partial-failure surface: the dead relay
-    // lands in the send-path outcome's not-accepted bucket while the
-    // wrap is delivered, not wedged behind the outage.
+    // through the full pool still resolves `Ok` and still reaches the
+    // survivor. That is all this leg pins: per-relay send accounting
+    // stays diagnostic-only (and separately unit-tested), so nothing
+    // here observes which bucket the dead relay lands in.
     relay_a.shutdown();
     let start = Instant::now();
     loop {

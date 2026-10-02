@@ -931,10 +931,16 @@ fn destroy_commits_dirty_write_handles_while_queue_live() {
     done.store(true, Ordering::Relaxed);
     drainer.join().expect("drainer exits after destroy");
     match &seen.lock().unwrap()[..] {
-        [MutationKind::CommitFile { path, .. }] => assert_eq!(
-            path, "f.txt",
-            "destroy submits the dirty handle's image, not a synthetic op"
-        ),
+        [MutationKind::CommitFile { path, content, .. }] => {
+            assert_eq!(
+                path, "f.txt",
+                "destroy submits the dirty handle's image, not a synthetic op"
+            );
+            assert_eq!(
+                content, b"dirty",
+                "destroy submits the full buffered image, never a prefix"
+            );
+        }
         other => panic!("destroy must commit exactly the dirty handle, saw {other:?}"),
     }
     assert_eq!(

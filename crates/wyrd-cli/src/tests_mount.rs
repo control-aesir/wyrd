@@ -4,6 +4,19 @@ use super::*;
 
 use wyrd_fuse::DriveView;
 
+/// The shutdown latch is process-global, so the two live mounts
+/// below cannot run in parallel: whichever finishes first trips the
+/// latch and tears down the other's mount mid-test. The lock
+/// serializes them; poisoning is tolerated because a failed holder
+/// still releases the mount on unwind.
+static LIVE_MOUNT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn live_mount_serial() -> std::sync::MutexGuard<'static, ()> {
+    LIVE_MOUNT_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Mount diagnostics initialize a per-mount log file. A second init
 /// in the same process truncates its own path but reuses the
 /// installed subscriber — the first install wins by design — and
@@ -235,6 +248,7 @@ fn mount_preamble_projects_authorized_heads_without_fuse() {
 #[test]
 #[ignore = "needs kernel FUSE and local networking"]
 fn live_mount_serves_read_write_until_shutdown() {
+    let _serial = live_mount_serial();
     // The shutdown latch is process-global: start unset so a
     // previous run in this process cannot cut this mount short.
     SHUTDOWN.store(false, Ordering::Relaxed);
@@ -328,6 +342,7 @@ fn live_mount_serves_read_write_until_shutdown() {
 #[test]
 #[ignore = "needs kernel FUSE and local networking"]
 fn live_mount_preserves_dirty_handle_across_shutdown() {
+    let _serial = live_mount_serial();
     use std::io::Write as _;
 
     // The shutdown latch is process-global: start unset so a
@@ -385,7 +400,11 @@ fn live_mount_preserves_dirty_handle_across_shutdown() {
         .truncate(true)
         .open(temp.0.join("mnt").join("dirty.txt"))
         .unwrap();
-    (&dirty).write_all(b"unflushed through the mount").unwrap();
+    // The payload length drives the read window below: `read` takes
+    // an explicit byte count, so a stale literal here silently
+    // asserts a truncated prefix instead of the whole image.
+    let payload = b"unflushed through the mount";
+    (&dirty).write_all(payload).unwrap();
     // Trip first, close second: the release races the loop's return
     // and commits mid-teardown. Closing before the trip would commit
     // on a live loop; closing after the rejoin starts would wedge the
@@ -405,9 +424,15 @@ fn live_mount_preserves_dirty_handle_across_shutdown() {
     daemon.refresh_live_heads().unwrap();
     let node = daemon.view().lookup("dirty.txt").unwrap();
     let file = daemon.view().open(&node).unwrap();
+    // The declared size must match the whole payload first: a commit
+    // that persisted a prefix would declare the short size here, and
+    // the windowed read below would then serve the prefix. Both pin
+    // the all-or-nothing image boundary — no prefix is ever committed
+    // as a successful write.
+    assert_eq!(file.size(), payload.len() as u64);
     assert_eq!(
-        daemon.view().read(&file, 0, 25).unwrap(),
-        b"unflushed through the mount"
+        daemon.view().read(&file, 0, payload.len()).unwrap(),
+        payload
     );
 }
 /// Owns a spawned mount thread: signals shutdown and rejoins on

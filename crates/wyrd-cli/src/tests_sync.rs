@@ -706,3 +706,23 @@ fn sync_now_without_relay_or_offline_is_a_usage_error() {
         "refusal names both the missing flag and the opt-out: {message}"
     );
 }
+
+/// `--offline` means "run without relays", so combining it with a
+/// relay is contradictory: the combination is refused rather than
+/// silently ignoring the flag while connecting.
+#[test]
+fn sync_now_with_relay_and_offline_is_a_usage_error() {
+    let fixture = Fixture::new();
+    // --relay belongs to `sync`, --offline to `now`: flags straddle
+    // the action.
+    let mut args = fixture.sync_args(vec!["--relay".into(), "ws://one.example".into()], "now");
+    args.push("--offline".into());
+    let error = command(args).unwrap_err();
+    let CliError::Usage(message) = error else {
+        panic!("expected a usage refusal, got: {error:?}");
+    };
+    assert!(
+        message.contains("--offline") && message.contains("--relay"),
+        "refusal names the contradictory combination: {message}"
+    );
+}

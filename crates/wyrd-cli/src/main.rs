@@ -1698,6 +1698,16 @@ fn sync(
             Ok(())
         }
         SyncAction::Now { offline } => {
+            // --offline means "run without relays": combining it with
+            // --relay is contradictory, and silently ignoring the flag
+            // would lie about the run. (clap conflicts_with cannot
+            // express this: --relay lives on the parent command via
+            // flatten, not on the `now` subcommand.)
+            if offline && !relays.is_empty() {
+                return Err(CliError::Usage(
+                    "--offline cannot be combined with --relay".into(),
+                ));
+            }
             // A relay-less run exits 0 with an idle intake, which a
             // cron or systemd unit keying on exit status cannot
             // distinguish from a converged sync. Refuse it before

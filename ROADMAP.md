@@ -380,9 +380,9 @@ Kept separate from v0.4 on purpose: v0.4 is usable synchronization with
 conflict safety, v0.5 is usable history semantics with human resolution.
 
 Time travel is the v0.5 deliverable today's docs must not claim early:
-browsing arbitrary historical snapshots and restoring previous versions
-through ordinary file tools, built on the retained history the v0 substrate
-already keeps but renders only as live heads.
+browsing arbitrary historical snapshots and restoring previous versions,
+built on the retained history the v0 substrate already keeps but renders
+only as live heads.
 
 ## v0.6 — Mobile synchronization
 

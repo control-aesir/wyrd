@@ -37,6 +37,12 @@
       ],
       "mustContain": ["Trustworthy live synchronization", "Full Wyrd drive"],
       "forbids": []
+    },
+    {
+      "slot": "demo/snaps",
+      "backs": [],
+      "mustContain": ["not built yet"],
+      "forbids": ["stepped back in time", "any snapshot materializes"]
     }
   ]
 }

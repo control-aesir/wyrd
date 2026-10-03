@@ -49,7 +49,7 @@ Object contents are encrypted client-side before they ever leave the device. Vau
 When concurrent modifications occur across peers, Wyrd keeps both heads reachable and retains both versions as separate immutable objects. Conflicts are surfaced in the filesystem/UI for user resolution rather than automatically merged or overwritten.
 
 ### 7. No Data Lock-In
-The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing a chosen snapshot into a standard directory tree on a conventional filesystem (`wyrd export`; see `docs/cli.md`).
+The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing the live view into a standard directory tree on a conventional filesystem (`wyrd export`; see `docs/cli.md`).
 
 ---
 
@@ -68,7 +68,7 @@ When GC arrives, it will be the only way data is removed, and it will require:
 Wyrd mounts via **FUSE** to present standard filesystem interfaces (pre-alpha today: a read-write FUSE mount via the daemon):
 
 * **Live View:** Operates as a standard read-write local folder; writes commit as snapshots.
-* **Conflict Versioning:** When concurrent publishes produce multiple heads, both versions stay reachable: the mounted view and export address them as `name@N` siblings, numbered in SnapshotId byte order. Browsing arbitrary historical snapshots and restoring previous versions is not available in v0.2; it is v0.5 work (see `ROADMAP.md`).
+* **Conflict Versioning:** When concurrent publishes produce multiple heads, both versions stay reachable: the mounted view addresses them by lookup (never listed by `readdir`); export writes them as `name@N` siblings, numbered in SnapshotId byte order. Browsing arbitrary historical snapshots and restoring previous versions is not available in v0.2; it is v0.5 work (see `ROADMAP.md`).
 
 ---
 

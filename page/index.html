@@ -715,6 +715,7 @@ wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./pa
 
 <script>
 (function(){
+  <!-- slot:demo/snaps -->
   var snaps = [
     {
       id: "snapshot 0a13…e02",
@@ -745,7 +746,7 @@ wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./pa
     },
     {
       id: "v0.5: restore 0a13…e02",
-      moment: "stepping back in time (roadmap)",
+      moment: "stepping back in time — not built yet (v0.5)",
       store: "store holds 5 objects",
       view: '<div><span class="ok">field-notes.txt</span> <span class="absent">(as first written)</span></div>' +
             '<div class="absent">9be2…11  77ac…f0  c301…9d</div>' +
@@ -754,6 +755,7 @@ wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./pa
     }
   ];
   var i = 0;
+  <!-- /slot:demo/snaps -->
   var id = document.getElementById("drive-id");
   var moment = document.getElementById("drive-moment");
   var store = document.getElementById("drive-store");

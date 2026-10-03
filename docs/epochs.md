@@ -533,8 +533,10 @@ single sanctioned remedy.
 - **Heads** = snapshots not referenced as a parent by any known snapshot.
 - The live view renders **eligible heads only**. One eligible head = live
   state; multiple = conflicted (existing rule). Superseded, stranded, and
-  voided snapshots are retained but rendered by no v0 surface: never in the
-  live view, and arbitrary historical browsing is v0.5 work.
+  voided snapshots stay visible through the head listing
+  (`wyrd snapshot heads`) with their classification and reason; their
+  contents are never projected and never served to a live view, and
+  arbitrary historical browsing is v0.5 work.
 - **Recovery snapshots** are owner-authored snapshots with the **recovery
   flag** set (a distinct, authenticated snapshot type — v0 format `flags`
   bit 0, so implementations can audit recovery and never confuse it with

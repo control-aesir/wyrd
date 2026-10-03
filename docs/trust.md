@@ -733,15 +733,22 @@ cannot compile quietly — it arrives as a visible, greppable trust decision.
   monotonic:** installing a capability may only add secrets for epochs not
   yet held; it must never decrease the device's known membership state or
   remove newer secrets — a replayed older capability is a no-op, not a
-  rollback. Conflicting vectors are first-wins in commit order: the
-  earliest-committed vector anchors every epoch it covers, a later
-  conflicting vector contributes only its vacant tail, and the conflict
-  stays in the log as evidence. That ordering is what keeps a reopen
-  convergent with the live engine, and it is also what makes the
-  first-committed vector the minting base for later capabilities —
+  rollback. Conflicting vectors resolve first-wins over local durable
+  commit order: the earliest-committed vector anchors the epochs it
+  covers, and later vectors fill only epochs not already occupied.
+  Deterministic per replica, not across replicas — two nodes committing
+  the same conflicting vectors in different arrival orders anchor
+  different histories. Honest operation never produces conflicts (one
+  mint per binding), so divergence requires a faulty or adversarial
+  minter. Acceptance is not authority: the winning vector is operative
+  (installed, minted from) without being legitimate (proof-bound), and
+  the conflict stays in the log as evidence. That ordering is what
+  keeps a reopen convergent with the live engine, and it is also what
+  makes the first-committed vector the minting base for later
+  capabilities —
   including propagation: the next rotation re-mints whatever the
   keyring holds under a valid owner proof, so a first-committed
-  forgery travels to every member. First-wins keeps the node working;
+  conflicting vector travels to every member. First-wins keeps the node working;
   quarantining the forgery needs the escrow-preferring mint, which is
   future work.
   Knowledge and key material are distinct: learning epoch N+1's

@@ -906,6 +906,72 @@ fn longer_conflicting_vector_grants_its_vacant_tail_on_reopen() {
     );
 }
 
+/// Commit order is local durable commit order: two engines committing
+/// the same conflicting vectors in opposite arrival orders anchor
+/// different key histories. Deterministic per replica, not across
+/// replicas — honest operation never produces conflicts (one mint per
+/// binding), so this divergence requires a faulty or adversarial
+/// minter.
+#[test]
+fn conflicting_commit_order_decides_per_replica_key_history() {
+    let mut first = fixture();
+    let mut second = fixture();
+    let device = first.recipient;
+    assert_eq!(second.recipient, device);
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let honest = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+        ],
+    );
+    let rival = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x0A; 32]),
+            EpochSecret::from_bytes([0x0B; 32]),
+        ],
+    );
+    for fx in [&mut first, &mut second] {
+        let mail = vec![
+            deliver(fx, 1, &transition_message(&genesis)),
+            deliver(fx, 1, &transition_message(&admission)),
+        ];
+        queue(fx, mail);
+        assert_eq!(drain(fx).accepted, 2);
+    }
+    // Opposite arrival orders for the same two vectors.
+    let first_mail = vec![deliver(&first, 2, &honest), deliver(&first, 2, &rival)];
+    let second_mail = vec![deliver(&second, 2, &rival), deliver(&second, 2, &honest)];
+    queue(&mut first, first_mail);
+    queue(&mut second, second_mail);
+    assert_eq!(drain(&mut first).accepted, 2);
+    assert_eq!(drain(&mut second).accepted, 2);
+    // The live engines both hold the fixture pre-seed keys
+    // (fill-vacant installs nothing over held keys), so the anchor
+    // reads from the rebuilt keyring — what a reopen would install
+    // and what authoring would mint from.
+    for (fx, name, secret) in [
+        (&first, "first", [0x08; 32]),
+        (&second, "second", [0x0A; 32]),
+    ] {
+        let rebuilt = fx.engine.store.rebuild(device).expect("rebuilds");
+        assert_eq!(
+            rebuilt.keyring.secret(1).cloned(),
+            Some(EpochSecret::from_bytes(secret)),
+            "{name} committer anchors its first vector"
+        );
+        let facts = fx.engine.store.load().expect("loads");
+        assert_eq!(facts.capabilities.len(), 2, "both facts stay durable");
+    }
+}
+
 /// A freshly resealed identical capability is a duplicate, not a new
 /// envelope: the message id covers the sealed bytes (fresh nonce per
 /// seal), so envelope dedupe never fires — but the

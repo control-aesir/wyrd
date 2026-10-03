@@ -323,14 +323,20 @@ A **capability** delivered to a member of epoch N:
 add secrets for epochs the device does not yet hold. It must never decrease
 the device's known membership state, remove newer secrets, or roll back —
 a replayed older capability is a harmless no-op, not a downgrade.
-Conflicting vectors resolve first-wins in commit order, at install time
-and on every replay: the earliest-committed vector anchors the epochs it
-covers, later vectors contribute only vacant epochs, and every vector
-stays committed as evidence. Future capabilities therefore mint from
+Conflicting vectors resolve first-wins over local durable commit
+order, at install time and on every replay: the earliest-committed
+vector anchors the epochs it covers, later vectors fill only epochs
+not already occupied, and every vector stays committed as evidence.
+Deterministic per replica, not across replicas — honest operation
+never produces conflicts (one mint per binding), so divergent anchors
+require a faulty or adversarial minter. Operative is not legitimate:
+the winning vector is installed and minted from whether or not it
+was proof-bound. Future capabilities therefore mint from
 first-committed secrets, which is why owner-minted material (proof-bound
 at delivery) is the only trustworthy source for a device's key history.
-Accepted consequence, stated plainly: a forged vector committed before
-the honest one becomes the minting base, and the next rotation re-mints
+Accepted consequence, stated plainly: a conflicting vector committed
+before the honest one becomes the minting base for as long as v0.2
+first-wins semantics hold, and the next rotation re-mints
 it under a valid owner proof to every member — first-wins keeps one node
 working, it does not quarantine the forgery. Preferring the root escrow
 sidecar over the keyring when minting past epochs would stop that

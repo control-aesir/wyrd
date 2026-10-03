@@ -101,6 +101,12 @@
 //!     an owner-signed but invalid sibling is suppressed while the
 //!     genuine admission converges around it; the pusher is transport,
 //!     never authority.
+//! 44. `body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent` —
+//!     an announcement with no servable body stays recorded but
+//!     unadopted (out of the live heads, its paths `ENOENT`), a
+//!     served child on top classifies `Undecided(UnknownParent)`, and
+//!     the stall heals cleanly once the bytes arrive
+//!     (`docs/fetch-on-open.md`, body-or-manifest unavailable).
 //! 38. `concurrent_opens_reads_and_publications_never_deadlock_or_tear` —
 //!     opens, reads, and head publications interleave across threads:
 //!     every read is one whole published version (daemon FUSE backend).

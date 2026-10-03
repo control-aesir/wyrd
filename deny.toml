@@ -12,13 +12,19 @@
 #   file-level copyleft with no repo-wide effect; allowed deliberately.
 
 [advisories]
-# Vulnerabilities always fail and cannot be downgraded. Yanked crates only
-# warn. Unmaintained crates fail only when they are direct workspace
-# dependencies: the three unmaintained advisories in the graph today
+# Vulnerabilities always fail and cannot be downgraded. Soundness
+# advisories fail too: this workspace holds drive keys, so an `unsound`
+# crate anywhere in the graph blocks rather than warns. (Precedent:
+# RUSTSEC-2026-0306 in faster-hex <= 0.10.0, via pinned nostr 0.45;
+# resolved by the 0.10.1 bump — no exception needed. Reachability
+# finding lives on the `nostr` dependency comment in Cargo.toml.)
+# Yanked crates only warn. Unmaintained crates fail only when they are
+# direct workspace dependencies: the three unmaintained advisories in the graph today
 # (atomic-polyfill, paste, proc-macro-error) are transitive-only, so they are
 # reported but do not block. Promote to `all` once those are eliminated.
 yanked = "warn"
 unmaintained = "workspace"
+unsound = "all"
 
 [licenses]
 allow = [

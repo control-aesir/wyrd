@@ -98,6 +98,12 @@ n0-future = "=0.3.2"
 # (mailbox::tests_classification in wyrd-core): stream-recovery replay
 # depends on first-seen/Event-arm vs replay/Message-arm classification, and
 # a silent change there breaks abandoned-backlog recovery invisibly.
+# Dependency audit: nostr reaches faster-hex (key/id/signature display,
+# NIP-49/59 hex payloads) only through the length-validated `hex_decode`
+# and the encode path — never the raw `hex_decode_unchecked` behind
+# RUSTSEC-2026-0306 — and the lock carries the patched faster-hex 0.10.1,
+# which nostr's `faster-hex = "0.10"` requirement admits. `deny.toml`
+# fails `unsound` outright, so the next advisory here blocks.
 nostr = { version = "0.45.5", default-features = false, features = ["std", "nip44", "nip59", "os-rng"] }
 nostr-connect = "0.45"
 nostr-sdk = { version = "0.45.2", default-features = false, features = ["rustls-tls-webpki-roots"] }

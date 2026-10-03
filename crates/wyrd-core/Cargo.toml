@@ -23,6 +23,10 @@ wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
 # In-process websocket relay for mailbox integration tests (test-only:
 # a minimal NIP-01 server; never a runtime dependency).
 tokio-tungstenite = "0.28"
+# Second relay implementation for the cross-implementation episode
+# (test-only: rust-nostr's real relay — signature verification, real OKs,
+# real history — beside the fake above; never a runtime dependency).
+nostr-sdk = { workspace = true, features = ["local-relay"] }
 serde_json = "1"
 # Log capture for the send-path outcome test (test-only: asserts the
 # relay's answer reaches the debug line; never a runtime dependency).

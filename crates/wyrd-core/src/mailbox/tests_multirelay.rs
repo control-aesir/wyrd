@@ -14,10 +14,11 @@ use super::*;
 /// The two relays are independent MiniRelay *instances* — separate
 /// sockets, stores, and histories, so one can die while the other
 /// serves — but a single *implementation*. A localhost fake can never
-/// prove cross-implementation behavior, so the second implementation
-/// (real relay software over TLS) stays covered by the opt-in external
-/// group in `tests_interop.rs`; this test proves the pool logic that
-/// must hold no matter which implementations back it.
+/// prove cross-implementation behavior, so the heterogeneous episode
+/// (fake plus rust-nostr's real relay) lives in `tests_crossimpl.rs`
+/// and the live public-relay evidence stays opt-in in
+/// `tests_interop.rs`; this test proves the pool logic that must hold
+/// no matter which implementations back it.
 #[test]
 fn two_relays_cover_publication_replay_outage_and_recovery() {
     let relay_a = MiniRelay::spawn();

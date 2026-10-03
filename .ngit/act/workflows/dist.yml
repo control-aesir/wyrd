@@ -15,8 +15,9 @@ name: dist
 # (ROADMAP.md: "Explicitly do not ship ... release distribution").
 # The `if: false` on the job below disables the only publishing leg,
 # so neither a tag push nor a manual trigger can upload anything.
-# Do not delete it (or cut a release) until the v0.3 dogfood track
-# re-enables distribution; re-enabling is deleting those three lines.
+# Do not delete the gate (or cut a release) until the v0.3 dogfood
+# track re-enables distribution; re-enabling is deleting the `if:`
+# line and this comment block.
 #
 # The human release flow then is: fetch the tarball by its printed
 # sha256 from any listed mirror into dist/, run
@@ -30,10 +31,14 @@ on:
 
 jobs:
   dist-x86_64:
+    # The name says why a tag-triggered run skips this job without
+    # opening the file.
+    name: dist-x86_64 (disabled for v0.2)
     # v0.2 SCOPE: distribution disabled (see header). `false` is the
     # whole gate: the tag trigger still fires the workflow, but the
     # only job that builds or uploads anything always skips — including
-    # on a manual `ci trigger`. Delete these three lines to re-enable.
+    # on a manual `ci trigger`. Re-enabling is deleting the `if:` line
+    # and this comment block.
     if: false
     runs-on: ubuntu-latest
     timeout-minutes: 90

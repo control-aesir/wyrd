@@ -266,7 +266,8 @@ sync status
 
 sync now
     = bounded synchronization run
-    = connects
+    = connects when given a relay (a relay-less run is refused
+      without --offline)
     = may mutate durable state
     = reports network liveness plus mailbox intake posture (a
       relay-closed subscription degrades the verdict even when every

@@ -44,15 +44,39 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   exposure as any two-party encrypted messaging, already accepted as
   best-effort.
 - **`Mailbox` trait**: the send/receive boundary a relay client implements.
-  Synchronous by design, since no concrete relay pool lives in `wyrd-sync`
-  yet — every test runs against an in-memory fake, never a live network.
+  Synchronous by design. The concrete relay pool lives one layer up,
+  in `wyrd-core/src/mailbox/` — not in `wyrd-sync`, which owns only
+  the transport-agnostic message set and this trait boundary. The
+  pool is `LiveMailbox`: NIP-59 kind-1059 gift wraps over a durable
+  seen-event-id dedupe log, one stable filter and subscription for
+  the mailbox lifetime, CLOSE+REQ resubscribe transactions,
+  capped-backoff drainer recovery with relay-health polling, and the
+  event kind/tag conventions (rumor kind 9501, recipient `#p` tag,
+  gift-wrap framing). It lives in `wyrd-core` because it composes
+  node concerns — identity secrets, the signer boundary, relay
+  supervision — while `wyrd-sync` stays composable protocol:
+  anything implementing `Mailbox` (a test fake, a relay pool, a
+  future mixnet drop) drives the same engine.
+- **Test evidence, three-way**: hermetic in-process NIP-01 relay
+  (`MiniRelay`, real `EVENT`/`REQ`/`EOSE`/`CLOSE` over websockets,
+  no live network); the real-iroh but relay-disabled serving path
+  for the bulk plane; and two opt-in tests against actual public
+  relays (`mailbox::tests_interop`). Those two are `#[ignore]`d and
+  excluded from every CI profile by rule (`.config/nextest.toml`:
+  the ignore attribute is reserved for tests needing external
+  resources, which must never run in CI) — the honest framing of
+  current evidence is proven-against-public-relays by hand, not by
+  gate.
 - **`SignerSession` trait**: the NIP-46 `sign_message` boundary
   (`trust.md` "NIP-46 remote signing"); a `nostr-connect`-style client
   implements it, tested here only against an in-memory fake key.
-- **Deferred**: the concrete relay pool (subscription management, retry
-  backoff, event kind/tag conventions) and the `nostr-connect` session
-  negotiation are wiring for whatever composes this crate — the traits above
-  are the pinned boundary.
+- **Deferred**: the `nostr-connect` session negotiation is wiring for
+  whatever composes this crate — the traits above are the pinned
+  boundary. (`wyrd-sync/src/control/nip46.rs` is wire codecs only;
+  no session-negotiation implementation exists yet.) The live
+  mailbox side is described from the composer perspective in
+  `architecture.md`; this section describes the boundary it
+  implements, so the two stop contradicting each other.
 
 ## What is exchanged
 

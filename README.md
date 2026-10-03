@@ -210,8 +210,12 @@ To try the alpha without installing Rust:
 nix run .#wyrd -- --help
 ```
 
-Prebuilt `wyrd-{version}-{platform}.tar.gz` archives ship with each ngit
-release (built reproducibly per platform via `nix build .#wyrd-dist`). Alpha caveat: the on-disk format, the trust protocol, and the CLI
+Release archives (`wyrd-{version}-{platform}.tar.gz`, built reproducibly
+per platform via `nix build .#wyrd-dist`) ship with ngit releases —
+but v0.2 publishes none: distribution is explicitly out of scope for
+this milestone (see ROADMAP.md), so there is nothing to download yet.
+Run v0.2 from source (`cargo run -p wyrd-cli -- ...`) or without
+installing Rust via `nix run .#wyrd` above. Alpha caveat: the on-disk format, the trust protocol, and the CLI
 can all change between alphas — `CHANGELOG.md` leads with the format
 version so you can tell whether two builds interoperate.
 

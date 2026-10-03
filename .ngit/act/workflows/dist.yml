@@ -11,6 +11,13 @@ name: dist
 # A `push.tags` stanza is declared as well so hosted forges that honor
 # tag pushes run it automatically; the manual trigger works regardless.
 #
+# v0.2 SCOPE: distribution is out of scope for this milestone
+# (ROADMAP.md: "Explicitly do not ship ... release distribution").
+# The `if: false` on the job below disables the only publishing leg,
+# so neither a tag push nor a manual trigger can upload anything.
+# Do not delete it (or cut a release) until the v0.3 dogfood track
+# re-enables distribution; re-enabling is deleting those three lines.
+#
 # The human release flow then is: fetch the tarball by its printed
 # sha256 from any listed mirror into dist/, run
 # `build <version> --strict` locally for the other three legs plus the
@@ -23,6 +30,11 @@ on:
 
 jobs:
   dist-x86_64:
+    # v0.2 SCOPE: distribution disabled (see header). `false` is the
+    # whole gate: the tag trigger still fires the workflow, but the
+    # only job that builds or uploads anything always skips — including
+    # on a manual `ci trigger`. Delete these three lines to re-enable.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

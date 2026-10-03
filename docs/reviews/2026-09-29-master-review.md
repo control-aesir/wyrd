@@ -314,7 +314,7 @@ What is genuinely good: the line citations are near-perfect. Every one checked
 landed on the code it described, which is rare and is what made the rest of
 this validation possible. The area selection is coherent, the crypto
 foundations verdict is correct, and several findings are real and worth
-filing (M1, M3, M4, L1, L4, L6, L12, L16, L20).
+filing (M1, M3, M4, L1, L4, L6, L12, L20).
 
 What caps it: the only High finding and two of the seven Mediums are wrong at
 the root. M2 asserts a `Result`-returning signature for a function that
@@ -335,11 +335,11 @@ H1's fix would silently truncate large files. None of these are close calls.
 | M5 | Wrong, and the fix violates a normative spec decision. Reject. |
 | M6 | Correct. Info-level; the claimed cost is one directory per failed run. |
 | M7 | Half right. The proposed fix is what the code already does. Info-level. |
-| L1, L4, L6, L12, L16, L20 | Correct and useful. File as-is. |
+| L1, L4, L6, L12, L20 | Correct and useful. |
 | L2, L3, L5, L7 | Right shape, wrong description of the cost (detail below). |
 | L8, L9, L10, L11, L13, L14, L19, L22 | Correct reading of the code, but each restates a deliberate documented decision rather than a defect. |
 | L15 | Wrong. Contradicted by the code it cites. |
-| L17, L18 | Unreachable. The invariant the code relies on makes them impossible. |
+| L16, L17, L18 | Unreachable. The invariants the code relies on make them impossible. |
 
 ## H1 - the one High finding does not survive
 
@@ -404,14 +404,23 @@ input"). File it once.
   `membership/validate.rs:27`). The review flagged the test fixture and none
   of them, then praised the pattern in its own Verdict.
 
-## L17, L18 - unreachable on 32-bit
+## L16, L17, L18 - unreachable on 32-bit
 
+L17 and L18 are unreachable because of the write-budget invariant.
 `budget.reserve` caps the handle image at `MAX_WRITE_BUFFER_BYTES` *before*
 the slice is taken (`backend.rs:1275,1293`), so `offset` and `end` can never
 exceed 64 MiB and `offset as usize` cannot truncate on a 32-bit target. In
 `read_append`, `start` and `stop` are derived from `end - base_size` against a
 buffer bounded by the same cap (`backend.rs:877,889-891`), so the range is
 always in bounds. The slices cannot panic and the casts cannot wrap.
+
+L16 is unreachable for a different reason, and this is a correction to my own
+first pass. In `readdir` the `offset` is the cookie the backend itself handed
+out on the previous reply, `(index + 1) as u64` (`backend.rs:2124,2127`), so
+it is bounded by the length of the union listing, which the tree entry
+ceilings bound far below `usize::MAX` on any target. A hostile client cannot
+widen it; it can only ever pass back a cookie it was given. Filing a 32-bit
+issue for it would be filing a non-bug.
 
 L15 is wrong for a different reason: the join it says is missing is two lines
 below its own citation. `shutdown` awaits `router.shutdown()`, drops the
@@ -501,14 +510,37 @@ were filed against:
 
 ## Recommended disposition
 
-File: M1 (once, covering the mailbox recipient as the same gap), M3, M4, L1,
-L4, L6, L12, L16, L20, and a re-scoped H1 about appending past the write
-budget.
+Six issues filed on 2026-09-29 as Rowan, each created bare and triaged after
+with one `issue label` call per category (type, priority, release):
 
-Drop: M2 and M5 as written. Reconsider before acting: L2/L3/L5/L7 against the
-perf issues already tracking that code, and L8/L9/L10/L11/L13/L14 as
-decision points rather than defects.
+| Finding | Issue | Labels |
+|---|---|---|
+| M1 + M2 | `harden(sync): validate device IDs as curve points where they are parsed` (`nostr:nevent1qqs857qucehn206t5lc2ksyg3var5cr047lg2sp977gpudclta3dn4gpz9mhxue69uhkwunpwdczuap49eehge5xkfs`) | enhancement, P4, v0.2.0-alpha |
+| M3 | `harden(core): return an error when the mailbox drainer fails to start` (`nostr:nevent1qqsz9ldrldemkdgra60kr6d7lpvnvalzvmpnfk8ydwrkphp67ys8qaspz9mhxue69uhkwunpwdczuap49eehgh3lrn3`) | chore, P4, v0.2.0-alpha |
+| M4 | `bug(daemon): set_size_at submits a mutation for a path it could not stat` (`nostr:nevent1qqsvlwqw72d7kwyqnt5xlvulvjn9ts2cyhsrnajc7x7d7rulasa7smqpz9mhxue69uhkwunpwdczuap49eehg4vtvqh`) | bug, P4, v0.2.0-alpha |
+| H1, re-scoped | `enhance(core): support O_APPEND to a file larger than the per-handle write budget` (`nostr:nevent1qqsxv4sc8h4rwp2lrgl34c2d93xmdc2jh02rqq5y8dv5rhygafn9nagpz9mhxue69uhkwunpwdczuap49eehgcx89tc`) | enhancement, P4, v0.2.0-alpha |
+| L12 | `perf(format): avoid the whole-object revalidation read on a no-op insert` (`nostr:nevent1qqsrvaekqjr6tpp3426lsm2mjc0ehrnx8z3gcmls7wccqg24rd5kz7gpz9mhxue69uhkwunpwdczuap49eehgd9hdgt`) | enhancement, P4, v0.2.0-alpha |
+| L20 | `bug(contracts): the layer 34 nostr-scope check passes when the source tree is missing` (`nostr:nevent1qqsp00l807c86ccuf8gq6snzl4am45ns2hzaffu2nrqughnmjfevy9cpz9mhxue69uhkwunpwdczuap49eehgqg7pe8`) | bug, P3, v0.2.0-alpha |
 
-L10, L11, and L15 are recorded here as not findings. If a later reader finds
-them filed as issues, this section is the correction.
+Each body carries the corrected analysis, so the review's original severity
+does not travel with the issue. The append issue states explicitly that the
+existing bound is load-bearing and must not be deleted.
+
+Deliberately not filed:
+
+- **L1** is already tracked by `perf(format): avoid allocation in
+  ManifestEntry::sort_key`.
+- **L4 and L6** fall under `perf(membership): batch the log analysis behind
+  authoritative lookups if capability volume grows`, which already owns the
+  cost of `chain::analyse` and the chain walks. Filing them separately would
+  fragment one trigger condition across three issues. L4's specific
+  inheritance-walk shape is worth adding to that issue as a comment when
+  someone next touches it.
+- **L16** is unreachable, per the correction above.
+- **M2 and M5** as written, per the sections above.
+- **L2, L3, L5, L7** are already covered by the `perf(format)` traversal and
+  `perf(daemon)` live-head issues they were mapped to.
+- **L8, L9, L10, L11, L13, L14, L19, L22** restate deliberate decisions. L10,
+  L11, and L15 are recorded here as not findings. If a later reader finds any
+  of them filed as an issue, this section is the correction.
 

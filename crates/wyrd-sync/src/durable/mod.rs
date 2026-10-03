@@ -82,9 +82,9 @@
 //! bytes, not of the token. Whether a snapshot may head a view is
 //! decided where heads are composed (`WyrdNode::refresh_live_heads`
 //! over the engine's `Eligible` classification), so a view built from
-//! otherwise-obtained tokens can project `CanonicalHistory`,
-//! `Superseded`, or `Voided` snapshots: valid history the local view
-//! never installed.
+//! otherwise-obtained tokens can project retained history: the
+//! engine's term for everything else in the DAG, which never advances
+//! the live view.
 //!
 //! Children: [`store`] owns lifecycle and the crash-safe commit
 //! protocol; [`codec`] owns the commit envelope and fact records;

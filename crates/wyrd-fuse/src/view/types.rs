@@ -1,4 +1,4 @@
-//! Namespace value types live in `wyrd-core` (the provider-neutral
+//! Namespace value types live in `wyrd-namespace` (the provider-neutral
 //! namespace model) and are re-exported here so existing view and
 //! backend code keeps its paths. The symlink confinement policy lives
 //! there too — it is namespace policy shared by every backend that
@@ -6,7 +6,7 @@
 //! nothing today: the kernel refusal mapping (EOPNOTSUPP) lives at the
 //! backend's `readlink` boundary in `wyrd-daemon`.
 
-pub use wyrd_core::view::{
+pub use wyrd_namespace::view::{
     confine_symlink_target, Attr, ConfinementError, ConflictVersion, DirEntry, Kind,
     MaterializationPolicy as Materialization, Node, OpenFile, ViewError,
 };

@@ -65,6 +65,7 @@ use super::{MaterializationState, RuntimeError, RuntimeState};
 
 use crate::bulk::BulkSource;
 use crate::control::{ControlInbox, ControlMessageId, Message, SnapshotAnnouncement};
+use crate::durable::AuthorizeSnapshot;
 use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;

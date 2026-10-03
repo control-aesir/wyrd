@@ -5,6 +5,7 @@
 use wyrd_daemon::fuse::FuseBackend;
 use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, TransitionId, Tree};
 use wyrd_fuse::{DriveView, Kind, Node, ViewError};
+use wyrd_sync::durable::AuthorizeSnapshot;
 
 use crate::support::{
     device, drive, fixture_heads, mount_heads, signed_head, signed_snapshot, Loaded,

@@ -215,27 +215,37 @@ impl AuthorizedCapability {
     }
 }
 
-/// A snapshot body that passed signature verification and may be durably
-/// recorded. Constructible only through [`AuthorizedSnapshot::authorize`],
-/// so the commit path cannot persist a body that was never checked. Full
-/// classification (eligibility, lineage) re-runs at projection against
-/// the whole DAG; the signature is the commit-time integrity gate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedSnapshot {
-    snapshot: Snapshot,
-}
+/// The verification-proof token, defined provider-neutral in
+/// `wyrd-namespace` so the namespace layer can name verified state without
+/// linking the transport. Re-exported here so existing paths keep
+/// working; values cross into the token only through
+/// [`AuthorizeSnapshot`].
+pub use wyrd_namespace::view::AuthorizedSnapshot;
 
-impl AuthorizedSnapshot {
+/// The verification authority for snapshot bodies: checking the
+/// BIP-340 signature is sync's job, and this trait is the only
+/// production path from a bare [`Snapshot`] to an
+/// [`AuthorizedSnapshot`]. Call sites keep the
+/// `AuthorizedSnapshot::authorize` spelling through this trait —
+/// the import is the audit marker that verification happened here.
+pub trait AuthorizeSnapshot {
     /// Verify the body's BIP-340 signature (drive-bound, exact bytes)
     /// and wrap it for durability.
-    pub fn authorize(snapshot: Snapshot, drive: &DriveId) -> Result<Self, Rejection> {
-        verify_snapshot(drive, &snapshot)?;
-        Ok(AuthorizedSnapshot { snapshot })
-    }
+    fn authorize(snapshot: Snapshot, drive: &DriveId) -> Result<AuthorizedSnapshot, Rejection>;
+}
 
-    /// The verified snapshot body.
-    pub fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+impl AuthorizeSnapshot for AuthorizedSnapshot {
+    fn authorize(snapshot: Snapshot, drive: &DriveId) -> Result<AuthorizedSnapshot, Rejection> {
+        verify_snapshot(drive, &snapshot)?;
+        // SAFETY: the signature verified just above, drive-bound over
+        // the exact bytes — this is the verification authority's one
+        // crossing into the proof token. The `allow` is the audit
+        // marker: keep this the only production call site of
+        // `from_verified_unchecked`.
+        #[allow(unsafe_code)]
+        unsafe {
+            Ok(AuthorizedSnapshot::from_verified_unchecked(snapshot))
+        }
     }
 }
 /// The durable identity of one `CapabilitySealed` fact: a

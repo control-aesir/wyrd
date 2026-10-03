@@ -3,6 +3,7 @@
 //! view without the daemon's engine projection.
 
 use wyrd_format::{ContentId, FetchStatus, Snapshot};
+use wyrd_sync::durable::AuthorizeSnapshot;
 
 /// A test materialization that reports everything remote-only: the
 /// view consults it only for bytes the object store lacks, and the

@@ -6,7 +6,7 @@ use wyrd_format::{
 };
 
 use crate::authorization::SnapshotDag;
-use crate::durable::{AuthorizedSnapshot, Fact, Rebuilt};
+use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact, Rebuilt};
 use crate::ingest::{check_manifest, check_tree, Limits};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::ManifestRecord;

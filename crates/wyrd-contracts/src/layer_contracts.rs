@@ -26,6 +26,27 @@
 //! cooked, byte, and raw strings, char literals) — enough grammar for
 //! a convention check, with the residual edge cases named at
 //! `code_text`.
+//!
+//! A second rule needs the transitive closure, not the direct edges,
+//! and lives here as well: `wyrd-fuse`'s production-edge closure must
+//! reach neither `wyrd-sync` nor any `iroh*` package. Only the view
+//! crate is walked — `wyrd-daemon` and `wyrd-cli` must link the
+//! transport, so the gap is load-bearing only here (mobile surfaces
+//! mount no FUSE; they build on the same provider-neutral view). The
+//! direct check above cannot see reachability — `wyrd-fuse → wyrd-core
+//! → wyrd-sync` is three allowed edges that link iroh into the view
+//! crate. Manifests see member-declared edges only: a third-party
+//! crate's own transitive dependencies are invisible here, so this
+//! pins the exact property that no member-declared path leads to the
+//! transport, not a full link-graph audit (that remains `cargo tree`
+//! territory). The closure treats an unresolvable edge as a leaf, and
+//! may: the direct check already fails closed on any edge outside the
+//! exact allow-lists, so leniency here cannot hide a new edge.
+//!
+//! A third rule pins the verification-proof crossing count (`check_proof_mint`):
+//! the unsafe token constructor appears in code exactly twice — its
+//! definition and the verification authority's single call — so the
+//! audit marker stays honest without review vigilance.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -55,7 +76,7 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
         // forensics facade (per-pass sync counts, intake verdicts,
         // outbox sends) — events only, no subscriber, no I/O.
         "wyrd-sync" => Some(MemberPolicy {
-            workspace_allow: &["wyrd-format"],
+            workspace_allow: &["wyrd-format", "wyrd-namespace"],
             external_allow: &[
                 "iroh",
                 "iroh-blobs",
@@ -77,16 +98,14 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "zeroize",
             ],
         }),
-        // The embeddable node: sync and format below; the mailbox
+        // The embeddable node: view, sync, and format below; the mailbox
         // subsystem's async and control-plane crates; never presentation
         // (fuser), argument parsing (clap), POSIX errno mapping (libc),
-        // or process-signal handling. The `wyrd-core` edge on `wyrd-fuse`
-        // is allowed now so Phase 2 can point the adapter at the
-        // provider-neutral API without a policy edit. `tracing` is the
+        // or process-signal handling. `tracing` is the
         // structured forensics facade (per-pass sync counts) — events
         // only, no subscriber, no I/O.
         "wyrd-core" => Some(MemberPolicy {
-            workspace_allow: &["wyrd-format", "wyrd-sync"],
+            workspace_allow: &["wyrd-format", "wyrd-namespace", "wyrd-sync"],
             external_allow: &[
                 "futures-util",
                 "getrandom",
@@ -97,8 +116,19 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "tracing",
             ],
         }),
+        // The mount-free view: format and the provider-neutral model
+        // below, nothing else. No edge on `wyrd-core` by design — the
+        // view links no transport, not even transitively (checked by
+        // `fuse_link_graph_excludes_sync_and_iroh` below).
         "wyrd-fuse" => Some(MemberPolicy {
-            workspace_allow: &["wyrd-format", "wyrd-core"],
+            workspace_allow: &["wyrd-format", "wyrd-namespace"],
+            external_allow: &["thiserror"],
+        }),
+        // The provider-neutral namespace model: format below, error
+        // reporting only. No sync edge by design — naming verified
+        // state must never link the verifier.
+        "wyrd-namespace" => Some(MemberPolicy {
+            workspace_allow: &["wyrd-format"],
             external_allow: &["thiserror"],
         }),
         // The composer and process host: everything below, never the CLI
@@ -245,6 +275,45 @@ fn production_deps(manifest: &toml::Table) -> DepSet {
     }
     walk(manifest, &mut deps);
     deps
+}
+
+/// Collect `[dev-dependencies]` entries from a member manifest. Any
+/// table named exactly `dev-dependencies` counts (covers future
+/// `[target.*.dev-dependencies]`); production deps never do.
+fn dev_deps(manifest: &toml::Table) -> DepSet {
+    let mut deps = DepSet::new();
+    fn walk(table: &toml::Table, deps: &mut DepSet) {
+        for (key, value) in table {
+            if key == "dev-dependencies" {
+                if let Some(table) = value.as_table() {
+                    deps.extend(table.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+            } else if let Some(inner) = value.as_table() {
+                walk(inner, deps);
+            }
+        }
+    }
+    walk(manifest, &mut deps);
+    deps
+}
+
+/// `wyrd-fuse`'s test-only edge set, pinned exactly: the view tests
+/// build export fixtures against `wyrd-core` and nothing else. The
+/// direct check exempts dev-dependencies by design, so this pin is
+/// what makes a widening deliberate instead of silent. Pure over the
+/// edge set so the negative test proves it bites.
+fn check_fuse_dev_deps(deps: &DepSet, workspace_deps: &toml::Table) -> Vec<String> {
+    let names: BTreeSet<String> = deps
+        .iter()
+        .map(|(key, value)| effective_name(key, value, workspace_deps))
+        .collect();
+    if names != BTreeSet::from(["wyrd-core".to_owned()]) {
+        return vec![format!(
+            "`wyrd-fuse` dev-dependencies drifted to `{names:?}` (want exactly \
+             `wyrd-core` for export fixtures): widen deliberately here, never silently"
+        )];
+    }
+    Vec::new()
 }
 
 fn workspace_root() -> PathBuf {
@@ -414,25 +483,15 @@ fn nostr_holding_subsystems(files: &[(&str, &str)]) -> BTreeSet<String> {
         .collect()
 }
 
-/// `nostr*` use inside `wyrd-core` must stay within a single top-level
-/// `src/` subsystem directory (the mailbox decision: control-plane
-/// framing lives with sync control, never ambient across the node).
-/// The walk fails closed: unreadable directories and files are
-/// violations naming the path (never silent skips), and a walk that
-/// examines no `.rs` files at all fails too — an empty file set
-/// proves nothing, so "no `nostr*` references" and "nothing examined"
-/// are different verdicts.
-fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
+/// Collect every `.rs` file under `dir`, as paths relative to
+/// `root`. Build output (`target/`) is never descended into. Fails
+/// closed: unreadable entries are errors, never silent skips. An
+/// empty collection is returned, not failed, here — an empty walk
+/// proves nothing, so each rule names its own non-vacuity verdict.
+fn collect_rs_files(dir: &Path, root: &Path) -> (Vec<(String, String)>, Vec<String>) {
     let mut files: Vec<(String, String)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    let mut examined = 0usize;
-    fn walk(
-        dir: &Path,
-        src: &Path,
-        files: &mut Vec<(String, String)>,
-        errors: &mut Vec<String>,
-        examined: &mut usize,
-    ) {
+    fn walk(dir: &Path, root: &Path, files: &mut Vec<(String, String)>, errors: &mut Vec<String>) {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(err) => {
@@ -450,20 +509,19 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
             };
             let path = entry.path();
             if path.is_dir() {
-                walk(&path, src, files, errors, examined);
+                // Never descend into build output.
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&path, root, files, errors);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let rel = path
-                    .strip_prefix(src)
+                    .strip_prefix(root)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                // Prefix with `src/` so the subsystem is always at
-                // component index 1, matching the test convention.
                 match fs::read_to_string(&path) {
-                    Ok(text) => {
-                        *examined += 1;
-                        files.push((format!("src/{rel}"), text));
-                    }
+                    Ok(text) => files.push((rel, text)),
                     Err(err) => {
                         errors.push(format!("cannot read file `{}`: {err}", path.display()));
                     }
@@ -471,12 +529,28 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
             }
         }
     }
+    walk(dir, root, &mut files, &mut errors);
+    files.sort();
+    (files, errors)
+}
+
+/// `nostr*` use inside `wyrd-core` must stay within a single top-level
+/// `src/` subsystem directory (the mailbox decision: control-plane
+/// framing lives with sync control, never ambient across the node).
+/// The walk fails closed: unreadable directories and files are
+/// violations naming the path (never silent skips), and a walk that
+/// examines no `.rs` files at all fails too — an empty file set
+/// proves nothing, so "no `nostr*` references" and "nothing examined"
+/// are different verdicts.
+fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
     let src = core_dir.join("src");
-    walk(&src, &src, &mut files, &mut errors, &mut examined);
+    // Paths stay relative to the crate dir, so the subsystem is
+    // always at component index 1, matching the test convention.
+    let (files, errors) = collect_rs_files(&src, core_dir);
     if !errors.is_empty() {
         return errors;
     }
-    if examined == 0 {
+    if files.is_empty() {
         return vec![format!(
             "`nostr*` scope check examined no `.rs` files under `{}`: \
              an empty walk proves nothing, failing closed",
@@ -496,6 +570,113 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// The token definition site: the one file allowed to hold the
+/// unsafe constructor in code. Every other code occurrence is a mint
+/// and fails below.
+const PROOF_DEFINITION: &str = "crates/wyrd-namespace/src/view.rs";
+
+/// The verification authority: the one file allowed to call the
+/// unsafe constructor in code (after the BIP-340 check).
+const PROOF_AUTHORITY: &str = "crates/wyrd-sync/src/durable/mod.rs";
+
+/// Files holding code (not comment/string) occurrences of the proof
+/// token's unsafe constructor, from an explicit file list: path to
+/// occurrence count. Counts, not presence flags, so a second mint in
+/// the same file is visible. Pure so tests can pin the rule without
+/// touching the filesystem.
+fn mint_holding_files(files: &[(&str, &str)]) -> Vec<(String, usize)> {
+    let mut holders: Vec<(String, usize)> = files
+        .iter()
+        .map(|(path, text)| {
+            (
+                path.to_string(),
+                code_text(text).matches("from_verified_unchecked").count(),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    holders.sort();
+    holders
+}
+
+/// The `AuthorizedSnapshot` crossing count: the unsafe constructor
+/// must appear in code exactly twice workspace-wide — its definition
+/// and the verification authority's single call — so the `#[allow]`
+/// audit marker stays honest without review vigilance. Any new mint
+/// (production or test) fails here. Pure over the holder list so the
+/// negative tests prove it bites.
+fn check_proof_mint(holders: &[(String, usize)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let definitions: usize = holders
+        .iter()
+        .filter(|(holder, _)| holder.as_str() == PROOF_DEFINITION)
+        .map(|(_, count)| count)
+        .sum();
+    if definitions != 1 {
+        violations.push(format!(
+            "the proof token definition `{PROOF_DEFINITION}` holds {definitions} code \
+             occurrences of the unsafe constructor (want exactly the definition): \
+             the mint moved or duplicated"
+        ));
+    }
+    let mut unexpected: Vec<(&String, usize)> = holders
+        .iter()
+        .filter(|(holder, _)| {
+            holder.as_str() != PROOF_DEFINITION && holder.as_str() != PROOF_AUTHORITY
+        })
+        .map(|(holder, count)| (holder, *count))
+        .collect();
+    unexpected.sort();
+    for (holder, count) in unexpected {
+        violations.push(format!(
+            "`{holder}` mints the verification-proof token {count} time(s) outside the \
+             verification authority: route through `AuthorizeSnapshot::authorize` or amend \
+             this rule deliberately"
+        ));
+    }
+    let authority: usize = holders
+        .iter()
+        .filter(|(holder, _)| holder.as_str() == PROOF_AUTHORITY)
+        .map(|(_, count)| count)
+        .sum();
+    if authority != 1 {
+        violations.push(format!(
+            "the verification authority `{PROOF_AUTHORITY}` holds {authority} code \
+             occurrences of the unsafe constructor (want exactly the single crossing): \
+             the authority stopped minting or mints twice"
+        ));
+    }
+    violations
+}
+
+/// Contract 34, mint-count half: the verification-proof token's
+/// unsafe constructor appears in code exactly twice — the definition
+/// in `wyrd-namespace` and sync's single authorization crossing — so
+/// "verified state" cannot be minted anywhere else without the suite
+/// failing.
+#[test]
+fn verification_proof_has_one_mint() {
+    let root = workspace_root();
+    let (files, errors) = collect_rs_files(&root.join("crates"), &root);
+    assert!(
+        errors.is_empty(),
+        "source walk errors:\n- {}",
+        errors.join("\n- ")
+    );
+    // Never pass vacuously: an empty file set would check nothing.
+    assert!(!files.is_empty(), "workspace holds no `.rs` files");
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let violations = check_proof_mint(&mint_holding_files(&refs));
+    assert!(
+        violations.is_empty(),
+        "proof-mint violations:\n- {}",
+        violations.join("\n- ")
+    );
 }
 
 /// Contract 34 (packaging half): the distribution build compiles the
@@ -548,6 +729,7 @@ fn workspace_members_are_exact() {
     let mut expected = [
         "crates/wyrd-format",
         "crates/wyrd-sync",
+        "crates/wyrd-namespace",
         "crates/wyrd-fuse",
         "crates/wyrd-core",
         "crates/wyrd-daemon",
@@ -596,6 +778,171 @@ fn crate_dependencies_follow_the_layered_dag() {
     assert!(
         violations.is_empty(),
         "dependency-DAG violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+/// A member's production edges resolved to effective package names:
+/// the `wyrd-*` members it names, and the third-party packages it
+/// declares. Built with the same alias/workspace resolution as the
+/// direct check, so the closure sees exactly what the checker sees.
+#[derive(Debug)]
+struct MemberEdges {
+    workspace: BTreeSet<String>,
+    external: BTreeSet<String>,
+}
+
+fn member_edges(deps: &DepSet, workspace_deps: &toml::Table) -> MemberEdges {
+    let mut edges = MemberEdges {
+        workspace: BTreeSet::new(),
+        external: BTreeSet::new(),
+    };
+    for (key, value) in deps {
+        let name = effective_name(key, value, workspace_deps);
+        if name.starts_with("wyrd-") {
+            edges.workspace.insert(name);
+        } else {
+            edges.external.insert(name);
+        }
+    }
+    edges
+}
+
+/// One witness path from `member` to `target` through workspace edges,
+/// for diagnostics. Breadth-first over the sorted edge sets, so the
+/// reported path is deterministic.
+fn witness_path(member: &str, target: &str, graph: &BTreeMap<String, MemberEdges>) -> Vec<String> {
+    let mut parent: BTreeMap<String, String> = BTreeMap::new();
+    let mut queue = std::collections::VecDeque::from([member.to_owned()]);
+    parent.insert(member.to_owned(), String::new());
+    while let Some(current) = queue.pop_front() {
+        if current == target {
+            let mut path = vec![current];
+            loop {
+                let previous = parent[path.last().expect("nonempty path")].clone();
+                if previous.is_empty() {
+                    break;
+                }
+                path.push(previous);
+            }
+            path.reverse();
+            return path;
+        }
+        if let Some(edges) = graph.get(&current) {
+            for next in &edges.workspace {
+                if !parent.contains_key(next) {
+                    parent.insert(next.clone(), current.clone());
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Check one member's transitive production closure: every workspace
+/// member reachable through production edges, plus every external
+/// package any reached member declares. Flags `wyrd-sync`
+/// reachability and any `iroh*` package in the reached externals as
+/// separate violations. Pure over the edge sets so the negative tests
+/// below can prove the checker bites without touching the filesystem.
+fn check_link_graph(member: &str, graph: &BTreeMap<String, MemberEdges>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![member.to_owned()];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        if let Some(edges) = graph.get(&current) {
+            stack.extend(edges.workspace.iter().cloned());
+        }
+    }
+    let mut violations = Vec::new();
+    if seen.contains("wyrd-sync") {
+        violations.push(format!(
+            "`{member}` reaches `wyrd-sync` through production edges ({}): the view \
+             crate's link graph must exclude the transport — move the needed surface \
+             into a narrower crate or amend the policy deliberately",
+            witness_path(member, "wyrd-sync", graph).join(" → ")
+        ));
+    }
+    let mut iroh_hits: BTreeSet<(String, String)> = BTreeSet::new();
+    for reached in &seen {
+        if let Some(edges) = graph.get(reached) {
+            iroh_hits.extend(
+                edges
+                    .external
+                    .iter()
+                    .filter(|name| name.starts_with("iroh"))
+                    .map(|name| (reached.clone(), name.clone())),
+            );
+        }
+    }
+    if !iroh_hits.is_empty() {
+        let via = iroh_hits
+            .iter()
+            .map(|(reached, name)| format!("`{name}` via `{reached}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "`{member}`'s link graph includes iroh-family packages ({via}): the view \
+             crate must never link the transport, even transitively"
+        ));
+    }
+    violations
+}
+
+/// Contract 34, transitive half: `wyrd-fuse` is the crate the mobile
+/// story depends on staying transport-neutral, so its
+/// production-edge closure must reach neither `wyrd-sync` nor any
+/// `iroh*` package. Resolves every member's normal edges from the
+/// manifests (dev-dependencies excluded, as in the direct check) and
+/// walks the closure from the view crate.
+#[test]
+fn fuse_link_graph_excludes_sync_and_iroh() {
+    let root = workspace_root();
+    let root_manifest = read_manifest(&root);
+    let members: Vec<String> = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("workspace members list")
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect();
+    // Never pass vacuously: an empty member list would check nothing.
+    assert!(!members.is_empty(), "workspace declares no members");
+    let workspace_deps = workspace_dep_table(&root_manifest);
+
+    let mut graph = BTreeMap::new();
+    for member in &members {
+        let name = member.rsplit('/').next().unwrap_or(member);
+        let deps = production_deps(&read_manifest(&root.join(member)));
+        graph.insert(name.to_owned(), member_edges(&deps, &workspace_deps));
+    }
+    let violations = check_link_graph("wyrd-fuse", &graph);
+    assert!(
+        violations.is_empty(),
+        "link-graph violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+/// Contract 34, dev-dep pin: `wyrd-fuse`'s test-only edges stay
+/// exactly `wyrd-core` (export fixtures). The direct check exempts
+/// dev-dependencies, and the transitive check ignores them, so
+/// without this pin a transport edge could hide in the test profile
+/// while every suite stays green.
+#[test]
+fn fuse_dev_deps_stay_pinned() {
+    let root = workspace_root();
+    let root_manifest = read_manifest(&root);
+    let workspace_deps = workspace_dep_table(&root_manifest);
+    let fuse = read_manifest(&root.join("crates/wyrd-fuse"));
+    let violations = check_fuse_dev_deps(&dev_deps(&fuse), &workspace_deps);
+    assert!(
+        violations.is_empty(),
+        "dev-dep violations:\n- {}",
         violations.join("\n- ")
     );
 }
@@ -952,6 +1299,198 @@ mod policy_tests {
         assert!(
             violations[0].contains("mod.rs"),
             "unreadable file must surface: {violations:?}"
+        );
+    }
+
+    /// A scratch workspace-edge graph: `(member, workspace edges,
+    /// external packages)`. Edges name members directly (no manifest
+    /// parsing) so the closure tests prove the checker bites on shape
+    /// alone.
+    fn link_graph(members: &[(&str, &[&str], &[&str])]) -> BTreeMap<String, MemberEdges> {
+        members
+            .iter()
+            .map(|(member, workspace, external)| {
+                (
+                    member.to_string(),
+                    MemberEdges {
+                        workspace: workspace.iter().map(|s| s.to_string()).collect(),
+                        external: external.iter().map(|s| s.to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transitive_sync_reachability_is_rejected_with_witness() {
+        let graph = link_graph(&[
+            ("wyrd-fuse", &["wyrd-core"], &["thiserror"]),
+            (
+                "wyrd-core",
+                &["wyrd-format", "wyrd-sync"],
+                &["thiserror", "tokio"],
+            ),
+            ("wyrd-sync", &["wyrd-format"], &["iroh", "thiserror"]),
+            ("wyrd-format", &[], &["blake3", "thiserror"]),
+        ]);
+        let violations = check_link_graph("wyrd-fuse", &graph);
+        assert_eq!(violations.len(), 2, "sync and iroh: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-sync"),
+            "sync reachability names the target: {violations:?}"
+        );
+        assert!(
+            violations[0].contains("wyrd-fuse → wyrd-core → wyrd-sync"),
+            "the witness path names every hop: {violations:?}"
+        );
+        assert!(
+            violations[1].contains("`iroh` via `wyrd-sync`"),
+            "the iroh hit names the declaring member: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn iroh_without_sync_is_still_rejected() {
+        // The two assertions are independent: a reached member
+        // declaring an iroh-family package fails even with no
+        // `wyrd-sync` in the closure.
+        let graph = link_graph(&[
+            ("wyrd-fuse", &["wyrd-core"], &["thiserror"]),
+            ("wyrd-core", &["wyrd-format"], &["iroh-blobs", "thiserror"]),
+            ("wyrd-format", &[], &["blake3", "thiserror"]),
+        ]);
+        let violations = check_link_graph("wyrd-fuse", &graph);
+        assert_eq!(violations.len(), 1, "iroh only: {violations:?}");
+        assert!(
+            violations[0].contains("`iroh-blobs` via `wyrd-core`"),
+            "names the package and the member: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn clean_closure_passes() {
+        let graph = link_graph(&[
+            ("wyrd-fuse", &["wyrd-namespace"], &["thiserror"]),
+            ("wyrd-namespace", &["wyrd-format"], &["thiserror"]),
+            ("wyrd-format", &[], &["blake3", "hex", "thiserror"]),
+        ]);
+        assert!(
+            check_link_graph("wyrd-fuse", &graph).is_empty(),
+            "a transport-free closure must pass"
+        );
+    }
+
+    #[test]
+    fn closure_ignores_unknown_members() {
+        // Edges at non-members (a removed crate, a typo) are the
+        // direct check's fail-closed territory; the closure walk must
+        // not panic on them, just treat them as leaves.
+        let graph = link_graph(&[("wyrd-fuse", &["wyrd-gone"], &["thiserror"])]);
+        assert!(
+            check_link_graph("wyrd-fuse", &graph).is_empty(),
+            "unknown members are leaves to the closure: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_passes_the_clean_pair() {
+        let holders = [
+            ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1),
+            ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
+        ];
+        assert!(
+            check_proof_mint(&holders).is_empty(),
+            "definition plus authority must pass"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_second_mint() {
+        let holders = [
+            ("crates/wyrd-fuse/src/view/tests.rs".to_owned(), 1),
+            ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
+            ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1),
+        ];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "one rogue mint: {violations:?}");
+        assert!(
+            violations[0].contains("crates/wyrd-fuse/src/view/tests.rs"),
+            "names the rogue file: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_second_mint_in_the_authority_file() {
+        // The likeliest real drift: another call inside the authority
+        // file. File-granularity would miss it; counts do not.
+        let holders = [
+            ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
+            ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 2),
+        ];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "double mint: {violations:?}");
+        assert!(
+            violations[0].contains("mints twice"),
+            "names the failure mode: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_missing_definition() {
+        let holders = [("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1)];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "missing definition: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-namespace"),
+            "names the definition site: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_missing_authority() {
+        let holders = [("crates/wyrd-namespace/src/view.rs".to_owned(), 1)];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "missing authority: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-sync"),
+            "names the authority site: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_scanner_ignores_comments_and_strings() {
+        let files = [
+            (
+                "crates/wyrd-fuse/src/view/head.rs",
+                "// mint via from_verified_unchecked is forbidden",
+            ),
+            (
+                "crates/wyrd-sync/src/durable/mod.rs",
+                "let name = \"from_verified_unchecked\";",
+            ),
+        ];
+        assert!(
+            mint_holding_files(&files).is_empty(),
+            "comments and strings are not mints"
+        );
+    }
+
+    #[test]
+    fn fuse_dev_dep_widening_is_rejected() {
+        let violations = check_fuse_dev_deps(&deps(&["wyrd-core", "tokio"]), &empty_ws());
+        assert_eq!(violations.len(), 1, "widened dev-deps: {violations:?}");
+        assert!(
+            violations[0].contains("tokio"),
+            "names the added edge: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn fuse_dev_dep_pin_passes_exact() {
+        let violations = check_fuse_dev_deps(&deps(&["wyrd-core"]), &empty_ws());
+        assert!(
+            violations.is_empty(),
+            "exactly wyrd-core must pass: {violations:?}"
         );
     }
 }

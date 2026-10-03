@@ -1,0 +1,13 @@
+[package]
+name = "wyrd-namespace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wyrd's provider-neutral namespace model: the value types, verified-head handle, and read surface every presentation backend serves. Depends on wyrd-format only — no sync, no iroh, no async — so the view links no transport."
+
+[dependencies]
+wyrd-format.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

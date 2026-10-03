@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/wyrd-format",
     "crates/wyrd-sync",
+    "crates/wyrd-namespace",
     "crates/wyrd-fuse",
     "crates/wyrd-core",
     "crates/wyrd-daemon",
@@ -37,6 +38,7 @@ fuser = { path = "vendor/fuser" }
 # wyrd crates
 wyrd-format = { path = "crates/wyrd-format" }
 wyrd-sync = { path = "crates/wyrd-sync" }
+wyrd-namespace = { path = "crates/wyrd-namespace" }
 wyrd-fuse = { path = "crates/wyrd-fuse" }
 wyrd-core = { path = "crates/wyrd-core" }
 wyrd-daemon = { path = "crates/wyrd-daemon" }

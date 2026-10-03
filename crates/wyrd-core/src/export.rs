@@ -51,10 +51,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wyrd_format::MAX_PATH_DEPTH;
 
-use crate::view::{
-    confine_symlink_target_with_budget, ConfinementError, NamespaceView, Node, OpenFile,
-    SymlinkResolutionBudget, ViewError,
-};
+use crate::view::{ConfinementError, NamespaceView, Node, OpenFile, ViewError};
+use wyrd_namespace::view::{confine_symlink_target_with_budget, SymlinkResolutionBudget};
 
 /// What one export produced, for logs and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

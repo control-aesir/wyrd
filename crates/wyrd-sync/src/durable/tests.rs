@@ -1,7 +1,7 @@
 use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{
-    AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact,
+    AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact,
     SealedCapabilityFactId,
 };
 use crate::authorization::test_util::sign_snapshot;

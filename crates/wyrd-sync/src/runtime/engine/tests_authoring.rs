@@ -7,6 +7,7 @@ use crate::keys::capability::Capability;
 use crate::seal::{EncryptedObject, SEAL_VERSION};
 use wyrd_format::{ContentId, Entry, MemoryObjectStore, ObjectKind, Snapshot, TransitionId, Tree};
 
+use crate::durable::AuthorizeSnapshot;
 use crate::durable::AuthorizedSnapshot;
 use crate::durable::Fact;
 use crate::keys::EpochSecret;

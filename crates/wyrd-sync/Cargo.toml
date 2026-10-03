@@ -7,6 +7,7 @@ description = "Wyrd's peer-to-peer replication layer: iroh transport, peer roles
 
 [dependencies]
 wyrd-format.workspace = true
+wyrd-namespace.workspace = true
 
 iroh.workspace = true
 iroh-blobs.workspace = true

@@ -9,8 +9,9 @@ to. The README carries the vision; `docs/` carries the current design contract.
 
 - `crates/wyrd-format` — CAS, typed identities, chunking, Merkle snapshot DAG. The format contract.
 - `crates/wyrd-sync` — iroh transport, encrypted manifests, roles × materialization, two-phase content.
+- `crates/wyrd-namespace` — Provider-neutral namespace model: value types, verified-head handle, read surface. Depends on `wyrd-format` and `thiserror` only; performs no cryptography, links no transport.
 - `crates/wyrd-fuse` — Mount-free drive view (the filesystem-shaped read surface; never mounts).
-- `crates/wyrd-core` — Embeddable local node (namespace, mutations, materialization, sync control). Depends on `wyrd-format`/`wyrd-sync` only; the daemon is one host for it.
+- `crates/wyrd-core` — Embeddable local node (namespace, mutations, materialization, sync control). Depends on `wyrd-format`/`wyrd-namespace`/`wyrd-sync` only; the daemon is one host for it.
 - `crates/wyrd-daemon` — Composition library: engine + view + presentation backends (FUSE adapter today; mobile file surfaces later). The composer per T16.
 - `crates/wyrd-cli` — The `wyrd` process host (binary-only): argument parsing, credential files, mount orchestration, diagnostics, exit codes over the daemon's public surface.
 - `crates/wyrd-contracts` — Cross-crate architectural contract suite: one named test per review contract, composed end to end over the public APIs. Workspace leaf over the library crates (it cannot depend on the binary-only `wyrd-cli`; the CLI's edges are pinned by contract 34's member-wide check instead), nothing depends on it.
@@ -47,6 +48,7 @@ to. The README carries the vision; `docs/` carries the current design contract.
   AEAD, CSPRNG). Use audited crates from the nostr/secp256k1 ecosystem; see
   the Cryptographic substrate section of `docs/trust.md` (decision T11).
 - iroh dependency versions change as a set.
+- `AuthorizedSnapshot` is minted only by `wyrd-sync` authorization (contract 34's crossing-count check enforces the single call site); nothing else constructs the verification-proof token.
 - Format decisions live in the decision record at the bottom of
   `docs/object-model.md`. Remaining open questions there are decisions to be
   made, not assumptions to be coded around. Do not code past them silently.

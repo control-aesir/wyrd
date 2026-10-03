@@ -2,7 +2,7 @@ use super::deliver::{
     control_key_for, open_reused_sealed, seal_fresh_for, send_sealed_to, verify_reused_sealed,
 };
 use crate::control::{seal as seal_control, Message, SnapshotAnnouncement};
-use crate::durable::{AuthorizedSnapshot, Fact, Rebuilt};
+use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact, Rebuilt};
 use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::mailbox::Mailbox;

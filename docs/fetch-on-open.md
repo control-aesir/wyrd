@@ -311,7 +311,8 @@ what retries:
   never a new caller.
 - **Snapshot body or manifest unavailable.** An announcement whose
   body never arrives leaves the snapshot unadopted: a snapshot with
-  unrecorded parents classifies `Undecided(UnknownParent)` and never
+  unrecorded parents classifies
+  `Classification::Pending(Pendency::UnknownParent)` and never
   becomes a live head (`authorization/classify.rs`), so the
   projected namespace never contains paths from it — `ENOENT`, not a
   hang. The announcement itself stays recorded and stays advertised
@@ -319,7 +320,8 @@ what retries:
   chain. Pinned end to end by
   `body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent`
   in `crates/wyrd-contracts/src/sync_contracts.rs` (recorded but not
-  live, paths `ENOENT`, child classifies `Undecided(UnknownParent)`,
+  live, paths `ENOENT`, child classifies
+  `Classification::Pending(Pendency::UnknownParent)`,
   and the stall heals cleanly once the bytes arrive).
 - **File content unavailable.** Chunks whose representations name no
   reachable provider are absence at the object level: the fetch walk

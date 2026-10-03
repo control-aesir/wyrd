@@ -1583,12 +1583,11 @@ fn absent_representations_do_not_strike() {
 
 /// The manifest-chain walk over two hostile representations of one
 /// tree: corrupt bytes served under the first address, absence under
-/// the second. Both candidates are attempted, the corrupt one strikes
-/// while the absent one never does, and nothing commits — the engine
-/// holds no tree the open path could project. Trees are structural
-/// metadata (always wanted, never policy-gated), so no pin is
-/// needed: this is the plan-level half of the manifest-chain open
-/// leg (`docs/fetch-on-open.md`), staged here because the installed
+/// the second. The corrupt bytes strike, the absent address never
+/// does, and nothing commits — the engine holds no tree the open
+/// path could project. Trees are structural metadata (always wanted,
+/// never policy-gated), so no pin is needed: this is the plan-level
+/// half of the manifest-chain open leg (`docs/fetch-on-open.md`), staged here because the installed
 /// plus unblocked half lives at the daemon boundary, where the same
 /// walk cannot be re-driven once the durable facts call the tree
 /// local.
@@ -1714,23 +1713,39 @@ fn corrupt_and_absent_tree_representations_commit_nothing() {
     let mut objects = MemoryObjectStore::default();
 
     // Both candidates are attempted and neither commits: the corrupt
-    // bytes strike, the absence is reported without striking, and the
-    // tree stays out of the store a projection would read.
+    // bytes strike, the absent address is walked without striking,
+    // and the tree stays out of the store a projection would read.
+    // Attribution runs through the strike ledger, not the report's
+    // `missing` count — the tree item aggregates to `Invalid`
+    // (invalid outranks missing), so the pass's `missing` belongs to
+    // the bodiless sibling announcement, not the absent
+    // representation.
     let report = fixture
         .engine
         .execute_plan(&mut bulk, &mut objects)
         .unwrap();
     assert_eq!(report.snapshot_bodies, 1, "the served body adopts");
     assert_eq!(report.manifests, 2, "both roots converge");
-    assert!(
-        report.invalid >= 1,
-        "the corrupt representation is tried and strikes"
-    );
-    assert!(
-        report.missing >= 1,
-        "the absent representation is tried and reported"
-    );
+    assert_eq!(report.invalid, 1, "the corrupt representation strikes");
     assert_eq!(report.objects, 0, "no representation commits");
+    assert!(
+        fixture
+            .engine
+            .fetch_strikes
+            .contains_key(&crate::runtime::engine::FetchKey::Storage(
+                sealed_a.storage_id()
+            )),
+        "the served corrupt bytes strike their address"
+    );
+    assert!(
+        !fixture
+            .engine
+            .fetch_strikes
+            .contains_key(&crate::runtime::engine::FetchKey::Storage(
+                sealed_b.storage_id()
+            )),
+        "the never-asked address strikes nothing"
+    );
     // A second run strikes the corrupt representation again — still
     // short of the cooldown threshold — while the absent one stays
     // strikeless and nothing commits.
@@ -1738,8 +1753,8 @@ fn corrupt_and_absent_tree_representations_commit_nothing() {
         .engine
         .execute_plan(&mut bulk, &mut objects)
         .unwrap();
-    assert!(
-        report.invalid >= 1,
+    assert_eq!(
+        report.invalid, 1,
         "the corrupt representation strikes again"
     );
     assert_eq!(report.objects, 0, "no representation commits");

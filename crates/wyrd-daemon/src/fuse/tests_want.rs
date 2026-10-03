@@ -177,25 +177,39 @@ fn manifest_chain_open_fails_bounded_eio_while_tree_unmaterialized() {
     let open_timeout = Duration::from_millis(300);
     // The tree is built but never inserted: the view resolves through
     // the installed head while the store holds nothing.
-    let mut scratch = MemoryObjectStore::default();
-    let chunk = scratch.insert(ObjectKind::Chunk, b"streamed").unwrap();
+    let chunk = ContentId::derive(ObjectKind::Chunk, b"streamed");
     let tree =
         Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()]).unwrap();
     let tree_id = ContentId::derive(ObjectKind::Tree, &tree.encode());
     let store = Arc::new(RwLock::new(MemoryObjectStore::default()));
-    let view = DriveView::new(
-        SharedStore::from(Arc::clone(&store)),
-        NoMaterialization,
-        heads(vec![snapshot_of(tree_id)]),
-    );
+    let projection = Arc::new(RwLock::new(Arc::new(Projection::initial(
+        DriveView::new(
+            SharedStore::from(Arc::clone(&store)),
+            NoMaterialization,
+            heads(vec![snapshot_of(tree_id)]),
+        ),
+        0,
+    ))));
     let registry = Arc::new(WantRegistry::default());
-    let backend = Arc::new(FuseBackend::shared_with_wants(
-        Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
+    let budgets = ResourceBudgets::default();
+    let backend = FuseBackend::shared_with_wants(
+        Arc::clone(&projection),
         Arc::clone(&registry),
         Arc::new(MutationQueue::default()),
         open_timeout,
-        &ResourceBudgets::default(),
-    ));
+        &budgets,
+    );
+    // The second observation runs under a generous deadline of its
+    // own: sharing the 300 ms opener would let a scheduler stall eat
+    // the whole re-registration window and misreport a correct
+    // backend as broken.
+    let patient = FuseBackend::shared_with_wants(
+        Arc::clone(&projection),
+        Arc::clone(&registry),
+        Arc::new(MutationQueue::default()),
+        Duration::from_secs(5),
+        &budgets,
+    );
 
     // The open blocks for the deadline — it never fails fast and
     // never hangs past its bound.
@@ -213,13 +227,14 @@ fn manifest_chain_open_fails_bounded_eio_while_tree_unmaterialized() {
         registry.peek_pending().is_empty(),
         "expiry retired the manifest-chain demand"
     );
+    assert!(
+        !registry.is_admitted(&tree_id),
+        "no in-flight fetch outlives the retired demand"
+    );
 
     // A second open re-registers its own want: observe the pending
     // tree identity mid-flight, then the same bounded EIO.
-    let second = {
-        let backend = Arc::clone(&backend);
-        std::thread::spawn(move || backend.open_at("f.txt"))
-    };
+    let second = std::thread::spawn(move || patient.open_at("f.txt"));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let pending = registry.peek_pending();
@@ -240,5 +255,26 @@ fn manifest_chain_open_fails_bounded_eio_while_tree_unmaterialized() {
     assert!(
         registry.peek_pending().is_empty(),
         "the second expiry retired its demand as well"
+    );
+    assert!(
+        !registry.is_admitted(&tree_id),
+        "no in-flight fetch outlives the second demand either"
+    );
+
+    // Property 6, positive half: a timeout cancels the wait, not the
+    // arrival. Landing the tree after both expiries makes the next
+    // open serve immediately with no new demand registered.
+    store
+        .write()
+        .unwrap()
+        .insert(ObjectKind::Tree, &tree.encode())
+        .unwrap();
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "the arrived tree serves without another wait"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "the served open registers no demand"
     );
 }

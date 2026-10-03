@@ -12,6 +12,7 @@ use super::fetch::FetchOutcome;
 use super::{PendingObjectFetch, RuntimeState};
 use crate::bulk::BulkSource;
 use crate::control::SnapshotAnnouncement;
+use crate::durable::AuthorizeSnapshot;
 
 /// Look up the announcement a planned body derives from. The plan's
 /// pending bodies come from the same projection, so a miss is a

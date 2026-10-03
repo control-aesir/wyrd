@@ -9,7 +9,7 @@ use super::author_with_parents;
 use super::merge::MergeSelection;
 use super::tests_harness::{craft_rival, frozen_engine, owner_engine};
 use crate::authorization::test_util::sign_snapshot;
-use crate::durable::{AuthorizedSnapshot, Fact};
+use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact};
 use crate::membership::test_util::{drive as member_drive, key};
 use crate::runtime::engine::{Engine, EngineError};
 use wyrd_format::{

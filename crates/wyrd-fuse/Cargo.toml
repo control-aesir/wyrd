@@ -7,8 +7,14 @@ description = "Wyrd's FUSE presentation layer: live view and time travel"
 
 [dependencies]
 wyrd-format.workspace = true
-wyrd-core.workspace = true
+wyrd-namespace.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Static-export fixtures in the view tests (test-only: `export_tree`
+# stays a node-layer API; never a production dependency, so the
+# link-graph contract keeps ignoring it).
+wyrd-core.workspace = true
 
 [lints]
 workspace = true

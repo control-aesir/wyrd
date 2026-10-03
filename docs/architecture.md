@@ -42,16 +42,20 @@ arbitrary subsets of that drive locally.
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror only |
-| `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
-| `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format`, `wyrd-core` (namespace value model) |
-| `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control; no presentation, no process supervision | `wyrd-format`, `wyrd-sync` |
+| `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, `wyrd-namespace` (verification-proof token), iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
+| `wyrd-namespace` | Provider-neutral namespace model: value types, verified-head handle, read surface every presentation backend serves | `wyrd-format`, thiserror only — never sync, never iroh |
+| `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format`, `wyrd-namespace` (namespace value model) |
+| `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control; no presentation, no process supervision | `wyrd-format`, `wyrd-namespace`, `wyrd-sync` |
 | `wyrd-daemon` | Composition library: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-core`, `wyrd-sync`, `wyrd-fuse`, `fuser` |
 | `wyrd-cli` | The `wyrd` process host: argument parsing, credential files, mount orchestration, diagnostics, exit codes | `wyrd-daemon` (+ `wyrd-core`/`wyrd-sync`/`wyrd-format` surfaces), `clap`, `fuser`, `libc` |
 | `wyrd-contracts` | Test suite: one named test per architectural contract, composed end to end | all of the above |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
-async, or FUSE dependency. `wyrd-fuse` must never know that iroh exists — the
-daemon composes sync and fuse. `wyrd-daemon` is that composer: the node in
+async, or FUSE dependency. `wyrd-fuse` must never link iroh — not even
+transitively through another member: the transitive half of contract 34
+pins its production-edge closure to `wyrd-format` and `wyrd-namespace`,
+so a future `wyrd-core` API can never hand a backend a transport type
+without the suite failing. `wyrd-daemon` is that composer: the node in
 `wyrd-core` is presentation-agnostic (mobile platforms cannot use FUSE, so the
 platform surface is a pluggable backend over the same view); the FUSE adapter
 is the first backend, not a property of the node.
@@ -69,7 +73,8 @@ parsing, credential files, mount orchestration, diagnostics, exit
 codes over the daemon's public surface). `wyrd-daemon` depends on
 `wyrd-core`, never the reverse; CLI and providers consume public
 surfaces only. The DAG is machine-enforced by contract 34
-(`layer_contracts.rs`) for every member — each extraction phase landed
+(`layer_contracts.rs`) for every member — direct edges and, for the
+view crate, the transitive closure — so each extraction phase landed
 against an invariant rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
 to the mailbox subsystem by the same contract: control-plane framing
 lives with sync control, never ambient across the node.

@@ -10,7 +10,7 @@ use super::grammar;
 use super::head::ViewHead;
 use super::merge::merge;
 use super::types::{Attr, DirEntry, Kind, Materialization, Node, OpenFile, ViewError};
-use wyrd_core::view::{Head, LookupResult, NamespaceView, ViewLockError};
+use wyrd_namespace::{Head, LookupResult, NamespaceView, ViewLockError};
 
 /// A mounted drive's read-only view: the head set plus the stores that
 /// serve it. Heads are whole snapshots; the walked root is always the

@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::control::bootstrap::open_bootstrap;
 use crate::control::{seal, Message};
-use crate::durable::{AuthorizedSnapshot, Fact};
+use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact};
 use crate::keys::capability::WrappedCapability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, sign, Builder};

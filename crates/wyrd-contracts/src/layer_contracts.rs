@@ -26,6 +26,18 @@
 //! cooked, byte, and raw strings, char literals) — enough grammar for
 //! a convention check, with the residual edge cases named at
 //! `code_text`.
+//!
+//! A second rule needs the transitive closure, not the direct edges,
+//! and lives here as well: `wyrd-fuse`'s production-edge closure must
+//! reach neither `wyrd-sync` nor any `iroh*` package. The direct check
+//! above cannot see reachability — `wyrd-fuse → wyrd-core → wyrd-sync`
+//! is three allowed edges that link iroh into the view crate — and
+//! the view crate is where the gap is load-bearing (mobile surfaces
+//! mount no FUSE; they build on the same provider-neutral view).
+//! Manifests see member-declared edges only: a third-party crate's own
+//! transitive dependencies are invisible here, so this pins the exact
+//! property that no member-declared path leads to the transport, not
+//! a full link-graph audit (that remains `cargo tree` territory).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -55,7 +67,7 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
         // forensics facade (per-pass sync counts, intake verdicts,
         // outbox sends) — events only, no subscriber, no I/O.
         "wyrd-sync" => Some(MemberPolicy {
-            workspace_allow: &["wyrd-format"],
+            workspace_allow: &["wyrd-format", "wyrd-namespace"],
             external_allow: &[
                 "iroh",
                 "iroh-blobs",
@@ -77,16 +89,14 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "zeroize",
             ],
         }),
-        // The embeddable node: sync and format below; the mailbox
+        // The embeddable node: view, sync, and format below; the mailbox
         // subsystem's async and control-plane crates; never presentation
         // (fuser), argument parsing (clap), POSIX errno mapping (libc),
-        // or process-signal handling. The `wyrd-core` edge on `wyrd-fuse`
-        // is allowed now so Phase 2 can point the adapter at the
-        // provider-neutral API without a policy edit. `tracing` is the
+        // or process-signal handling. `tracing` is the
         // structured forensics facade (per-pass sync counts) — events
         // only, no subscriber, no I/O.
         "wyrd-core" => Some(MemberPolicy {
-            workspace_allow: &["wyrd-format", "wyrd-sync"],
+            workspace_allow: &["wyrd-format", "wyrd-namespace", "wyrd-sync"],
             external_allow: &[
                 "futures-util",
                 "getrandom",
@@ -97,8 +107,19 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "tracing",
             ],
         }),
+        // The mount-free view: format and the provider-neutral model
+        // below, nothing else. No edge on `wyrd-core` by design — the
+        // view links no transport, not even transitively (checked by
+        // `fuse_link_graph_excludes_sync_and_iroh` below).
         "wyrd-fuse" => Some(MemberPolicy {
-            workspace_allow: &["wyrd-format", "wyrd-core"],
+            workspace_allow: &["wyrd-format", "wyrd-namespace"],
+            external_allow: &["thiserror"],
+        }),
+        // The provider-neutral namespace model: format below, error
+        // reporting only. No sync edge by design — naming verified
+        // state must never link the verifier.
+        "wyrd-namespace" => Some(MemberPolicy {
+            workspace_allow: &["wyrd-format"],
             external_allow: &["thiserror"],
         }),
         // The composer and process host: everything below, never the CLI
@@ -548,6 +569,7 @@ fn workspace_members_are_exact() {
     let mut expected = [
         "crates/wyrd-format",
         "crates/wyrd-sync",
+        "crates/wyrd-namespace",
         "crates/wyrd-fuse",
         "crates/wyrd-core",
         "crates/wyrd-daemon",
@@ -596,6 +618,152 @@ fn crate_dependencies_follow_the_layered_dag() {
     assert!(
         violations.is_empty(),
         "dependency-DAG violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+/// A member's production edges resolved to effective package names:
+/// the `wyrd-*` members it names, and the third-party packages it
+/// declares. Built with the same alias/workspace resolution as the
+/// direct check, so the closure sees exactly what the checker sees.
+#[derive(Debug)]
+struct MemberEdges {
+    workspace: BTreeSet<String>,
+    external: BTreeSet<String>,
+}
+
+fn member_edges(deps: &DepSet, workspace_deps: &toml::Table) -> MemberEdges {
+    let mut edges = MemberEdges {
+        workspace: BTreeSet::new(),
+        external: BTreeSet::new(),
+    };
+    for (key, value) in deps {
+        let name = effective_name(key, value, workspace_deps);
+        if name.starts_with("wyrd-") {
+            edges.workspace.insert(name);
+        } else {
+            edges.external.insert(name);
+        }
+    }
+    edges
+}
+
+/// One witness path from `member` to `target` through workspace edges,
+/// for diagnostics. Breadth-first over the sorted edge sets, so the
+/// reported path is deterministic.
+fn witness_path(member: &str, target: &str, graph: &BTreeMap<String, MemberEdges>) -> Vec<String> {
+    let mut parent: BTreeMap<String, String> = BTreeMap::new();
+    let mut queue = std::collections::VecDeque::from([member.to_owned()]);
+    parent.insert(member.to_owned(), String::new());
+    while let Some(current) = queue.pop_front() {
+        if current == target {
+            let mut path = vec![current];
+            loop {
+                let previous = parent[path.last().expect("nonempty path")].clone();
+                if previous.is_empty() {
+                    break;
+                }
+                path.push(previous);
+            }
+            path.reverse();
+            return path;
+        }
+        if let Some(edges) = graph.get(&current) {
+            for next in &edges.workspace {
+                if !parent.contains_key(next) {
+                    parent.insert(next.clone(), current.clone());
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Check one member's transitive production closure: every workspace
+/// member reachable through production edges, plus every external
+/// package any reached member declares. Flags `wyrd-sync`
+/// reachability and any `iroh*` package in the reached externals as
+/// separate violations. Pure over the edge sets so the negative tests
+/// below can prove the checker bites without touching the filesystem.
+fn check_link_graph(member: &str, graph: &BTreeMap<String, MemberEdges>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![member.to_owned()];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        if let Some(edges) = graph.get(&current) {
+            stack.extend(edges.workspace.iter().cloned());
+        }
+    }
+    let mut violations = Vec::new();
+    if seen.contains("wyrd-sync") {
+        violations.push(format!(
+            "`{member}` reaches `wyrd-sync` through production edges ({}): the view \
+             crate's link graph must exclude the transport — move the needed surface \
+             into a narrower crate or amend the policy deliberately",
+            witness_path(member, "wyrd-sync", graph).join(" → ")
+        ));
+    }
+    let mut iroh_hits: BTreeSet<(String, String)> = BTreeSet::new();
+    for reached in &seen {
+        if let Some(edges) = graph.get(reached) {
+            iroh_hits.extend(
+                edges
+                    .external
+                    .iter()
+                    .filter(|name| name.starts_with("iroh"))
+                    .map(|name| (reached.clone(), name.clone())),
+            );
+        }
+    }
+    if !iroh_hits.is_empty() {
+        let via = iroh_hits
+            .iter()
+            .map(|(reached, name)| format!("`{name}` via `{reached}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "`{member}`'s link graph includes iroh-family packages ({via}): the view \
+             crate must never link the transport, even transitively"
+        ));
+    }
+    violations
+}
+
+/// Contract 34, transitive half: `wyrd-fuse` is the crate the mobile
+/// story depends on staying transport-neutral, so its
+/// production-edge closure must reach neither `wyrd-sync` nor any
+/// `iroh*` package. Resolves every member's normal edges from the
+/// manifests (dev-dependencies excluded, as in the direct check) and
+/// walks the closure from the view crate.
+#[test]
+fn fuse_link_graph_excludes_sync_and_iroh() {
+    let root = workspace_root();
+    let root_manifest = read_manifest(&root);
+    let members: Vec<String> = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("workspace members list")
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect();
+    // Never pass vacuously: an empty member list would check nothing.
+    assert!(!members.is_empty(), "workspace declares no members");
+    let workspace_deps = workspace_dep_table(&root_manifest);
+
+    let mut graph = BTreeMap::new();
+    for member in &members {
+        let name = member.rsplit('/').next().unwrap_or(member);
+        let deps = production_deps(&read_manifest(&root.join(member)));
+        graph.insert(name.to_owned(), member_edges(&deps, &workspace_deps));
+    }
+    let violations = check_link_graph("wyrd-fuse", &graph);
+    assert!(
+        violations.is_empty(),
+        "link-graph violations:\n- {}",
         violations.join("\n- ")
     );
 }
@@ -952,6 +1120,96 @@ mod policy_tests {
         assert!(
             violations[0].contains("mod.rs"),
             "unreadable file must surface: {violations:?}"
+        );
+    }
+
+    /// A scratch workspace-edge graph: `(member, workspace edges,
+    /// external packages)`. Edges name members directly (no manifest
+    /// parsing) so the closure tests prove the checker bites on shape
+    /// alone.
+    fn link_graph(members: &[(&str, &[&str], &[&str])]) -> BTreeMap<String, MemberEdges> {
+        members
+            .iter()
+            .map(|(member, workspace, external)| {
+                (
+                    member.to_string(),
+                    MemberEdges {
+                        workspace: workspace.iter().map(|s| s.to_string()).collect(),
+                        external: external.iter().map(|s| s.to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transitive_sync_reachability_is_rejected_with_witness() {
+        let graph = link_graph(&[
+            ("wyrd-fuse", &["wyrd-core"], &["thiserror"]),
+            (
+                "wyrd-core",
+                &["wyrd-format", "wyrd-sync"],
+                &["thiserror", "tokio"],
+            ),
+            ("wyrd-sync", &["wyrd-format"], &["iroh", "thiserror"]),
+            ("wyrd-format", &[], &["blake3", "thiserror"]),
+        ]);
+        let violations = check_link_graph("wyrd-fuse", &graph);
+        assert_eq!(violations.len(), 2, "sync and iroh: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-sync"),
+            "sync reachability names the target: {violations:?}"
+        );
+        assert!(
+            violations[0].contains("wyrd-fuse → wyrd-core → wyrd-sync"),
+            "the witness path names every hop: {violations:?}"
+        );
+        assert!(
+            violations[1].contains("`iroh` via `wyrd-sync`"),
+            "the iroh hit names the declaring member: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn iroh_without_sync_is_still_rejected() {
+        // The two assertions are independent: a reached member
+        // declaring an iroh-family package fails even with no
+        // `wyrd-sync` in the closure.
+        let graph = link_graph(&[
+            ("wyrd-fuse", &["wyrd-core"], &["thiserror"]),
+            ("wyrd-core", &["wyrd-format"], &["iroh-blobs", "thiserror"]),
+            ("wyrd-format", &[], &["blake3", "thiserror"]),
+        ]);
+        let violations = check_link_graph("wyrd-fuse", &graph);
+        assert_eq!(violations.len(), 1, "iroh only: {violations:?}");
+        assert!(
+            violations[0].contains("`iroh-blobs` via `wyrd-core`"),
+            "names the package and the member: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn clean_closure_passes() {
+        let graph = link_graph(&[
+            ("wyrd-fuse", &["wyrd-namespace"], &["thiserror"]),
+            ("wyrd-namespace", &["wyrd-format"], &["thiserror"]),
+            ("wyrd-format", &[], &["blake3", "hex", "thiserror"]),
+        ]);
+        assert!(
+            check_link_graph("wyrd-fuse", &graph).is_empty(),
+            "a transport-free closure must pass"
+        );
+    }
+
+    #[test]
+    fn closure_ignores_unknown_members() {
+        // Edges at non-members (a removed crate, a typo) are the
+        // direct check's fail-closed territory; the closure walk must
+        // not panic on them, just treat them as leaves.
+        let graph = link_graph(&[("wyrd-fuse", &["wyrd-gone"], &["thiserror"])]);
+        assert!(
+            check_link_graph("wyrd-fuse", &graph).is_empty(),
+            "unknown members are leaves to the closure: {graph:?}"
         );
     }
 }

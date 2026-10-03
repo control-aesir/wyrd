@@ -9,6 +9,7 @@ use wyrd_format::{
     StorageId, Tree,
 };
 use wyrd_sync::bulk::{MemoryBulkSource, SealedManifest};
+use wyrd_sync::durable::AuthorizeSnapshot;
 use wyrd_sync::keys::EpochSecret;
 use wyrd_sync::runtime::{DrainReport, Engine, MaterializationState};
 use wyrd_sync::seal::{self, SEAL_VERSION};

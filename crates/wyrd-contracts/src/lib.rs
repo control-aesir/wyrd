@@ -124,6 +124,9 @@
 //!     `wyrd-format → wyrd-sync → wyrd-core → presentation`, and the
 //!     policy fails closed on unknown crates or edges
 //!     (`docs/architecture.md`, crate map).
+//!     `fuse_link_graph_excludes_sync_and_iroh` is the transitive half:
+//!     the view crate's production-edge closure reaches neither
+//!     `wyrd-sync` nor any `iroh*` package.
 //!
 //! The node contracts (provider-neutral boundary):
 //!

@@ -8,7 +8,7 @@
 use super::tests_harness::{device_of, owner_engine};
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Pendency, Rejection, SnapshotDag};
-use crate::durable::{AuthorizedSnapshot, Fact};
+use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::test_util::{drive as member_drive, key};
 use crate::runtime::engine::{Engine, EngineError};

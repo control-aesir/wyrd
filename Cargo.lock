@@ -5251,6 +5251,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wyrd-format",
+ "wyrd-namespace",
  "wyrd-sync",
 ]
 
@@ -5285,6 +5286,15 @@ dependencies = [
  "thiserror 2.0.20",
  "wyrd-core",
  "wyrd-format",
+ "wyrd-namespace",
+]
+
+[[package]]
+name = "wyrd-namespace"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "thiserror 2.0.20",
+ "wyrd-format",
 ]
 
 [[package]]
@@ -5310,6 +5320,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wyrd-format",
+ "wyrd-namespace",
  "zeroize",
 ]
 

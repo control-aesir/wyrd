@@ -1736,13 +1736,31 @@ fn sync_now(
     let mut bulk = Some(bind_bulk_source()?);
     let report = drive_quiet(&mut live, &mut mailbox, &mut bulk, settle);
     // Liveness as observed, not inferred: the run connected, so it
-    // reports what the relay attachment actually did.
+    // reports what the relay attachment actually did. A relay-closed
+    // subscription keeps the TCP count up while killing intake, so the
+    // closure count degrades the verdict even when every relay is
+    // connected — this summary is the only human surface on the
+    // headless path, and sync_now installs no tracing subscriber for
+    // the drainer's warn to reach.
     let health = mailbox.health();
+    let closed = health.closed_subscriptions;
     println!(
-        "mailbox: {} ({} of {} relays connected)",
-        if health.is_live() { "live" } else { "degraded" },
+        "mailbox: {} ({} of {} relays connected{})",
+        if health.is_live() && closed == 0 {
+            "live"
+        } else {
+            "degraded"
+        },
         health.connected_relays,
         health.total_relays,
+        if closed == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {closed} subscription{} closed by relay",
+                if closed == 1 { "" } else { "s" }
+            )
+        },
     );
     // Teardown mirrors mount's transport shutdown in miniature: stop
     // the mailbox tasks under a bounded deadline, then close bulk.

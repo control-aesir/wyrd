@@ -80,6 +80,27 @@ pub(crate) struct MiniRelay {
     /// `None` is the normal accept path. Shared across serving episodes
     /// so a test can flip policy without restarting the relay.
     reject: Arc<Mutex<Option<String>>>,
+    /// When `Some`, REQ subscriptions are answered `CLOSED` with the
+    /// message and never registered or replayed: the fake relay refuses
+    /// the read, like a real relay's auth/rate-limit/filter policy. The
+    /// TCP attachment stays up, so the client observes silence on a
+    /// healthy-looking connection — the exact signal the drainer's
+    /// closed-subscription count must make diagnosable. `None` is the
+    /// normal subscribe path. Set before the subscription under test;
+    /// there is no reset, so one refusal policy per relay in tests.
+    close_subs: Arc<Mutex<Option<String>>>,
+    /// When `Some`, every REQ is additionally answered with an NIP-42
+    /// `AUTH` challenge carrying the string, sent after the replay and
+    /// before EOSE — then served normally, so the challenge alone
+    /// closes nothing. Models a relay that demands authentication the
+    /// mailbox will never provide (the trust decision forbids
+    /// answering: it would sign with the device key).
+    auth_challenge: Arc<Mutex<Option<String>>>,
+    /// Leading frame tags observed from clients (`EVENT`, `REQ`,
+    /// `CLOSE`, `AUTH`, ...), in arrival order: test observability for
+    /// proving what the client sent back — in particular, that it never
+    /// answers an AUTH challenge.
+    observed: Arc<Mutex<Vec<String>>>,
     serving: Mutex<Option<Serving>>,
     /// Declared last so the runtime (and with it any serving tasks)
     /// drops last.
@@ -115,6 +136,9 @@ impl MiniRelay {
         let store: Store = Arc::new(Mutex::new(Vec::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
         let reject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let close_subs: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let auth_challenge: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let relay = Self {
             url,
@@ -122,6 +146,9 @@ impl MiniRelay {
             store,
             subs,
             reject,
+            close_subs,
+            auth_challenge,
+            observed,
             serving: Mutex::new(None),
             runtime,
         };
@@ -153,12 +180,15 @@ impl MiniRelay {
             Arc::clone(&self.listener),
             commands.clone(),
             Arc::clone(&connections),
+            Arc::clone(&self.observed),
         ));
         let core = self.runtime.spawn(core_loop(
             core,
             Arc::clone(&self.store),
             Arc::clone(&self.subs),
             Arc::clone(&self.reject),
+            Arc::clone(&self.close_subs),
+            Arc::clone(&self.auth_challenge),
         ));
         *self.serving.lock().expect("relay lock") = Some(Serving {
             commands,
@@ -194,6 +224,27 @@ impl MiniRelay {
         *self.reject.lock().expect("reject lock") = None;
     }
 
+    /// Answer subsequent REQs with `CLOSED` carrying `message`: the
+    /// subscription is never registered or replayed, so the client
+    /// observes silence on a healthy-looking connection — the policy
+    /// refusal a real relay sends for auth-required or rate-limited
+    /// reads.
+    pub(crate) fn close_subscriptions(&self, message: &str) {
+        *self.close_subs.lock().expect("close lock") = Some(message.to_owned());
+    }
+
+    /// Answer every REQ with an NIP-42 `AUTH` challenge carrying
+    /// `challenge`, then serve it normally: the challenge alone must
+    /// never earn an `AUTH` answer frame from the client.
+    pub(crate) fn challenge_auth(&self, challenge: &str) {
+        *self.auth_challenge.lock().expect("auth lock") = Some(challenge.to_owned());
+    }
+
+    /// Leading client frame tags observed so far, in arrival order.
+    pub(crate) fn observed_frames(&self) -> Vec<String> {
+        self.observed.lock().expect("observed lock").clone()
+    }
+
     /// Store and broadcast an event without a publishing client; no
     /// signature checks, so tests can inject garbage frames. Panics while
     /// the relay is shut down — tests only ever inject into a serving relay.
@@ -213,6 +264,7 @@ async fn accept_loop(
     listener: std::sync::Arc<TcpListener>,
     commands: mpsc::UnboundedSender<Command>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    observed: Arc<Mutex<Vec<String>>>,
 ) {
     let mut next_conn: u64 = 0;
     loop {
@@ -222,7 +274,8 @@ async fn accept_loop(
         next_conn += 1;
         let conn = next_conn;
         let commands = commands.clone();
-        let handle = tokio::spawn(handle_connection(stream, commands, conn));
+        let observed = Arc::clone(&observed);
+        let handle = tokio::spawn(handle_connection(stream, commands, conn, observed));
         if let Ok(mut connections) = connections.lock() {
             connections.retain(|handle| !handle.is_finished());
             connections.push(handle);
@@ -230,7 +283,12 @@ async fn accept_loop(
     }
 }
 
-async fn handle_connection(stream: TcpStream, commands: mpsc::UnboundedSender<Command>, conn: u64) {
+async fn handle_connection(
+    stream: TcpStream,
+    commands: mpsc::UnboundedSender<Command>,
+    conn: u64,
+    observed: Arc<Mutex<Vec<String>>>,
+) {
     eprintln!("[mini-relay] conn {conn} open");
     let Ok(websocket) = tokio_tungstenite::accept_async(stream).await else {
         return;
@@ -252,7 +310,7 @@ async fn handle_connection(stream: TcpStream, commands: mpsc::UnboundedSender<Co
                 }
             }
             message = source.next() => {
-                if !handle_message(message, &commands, &tx, conn) {
+                if !handle_message(message, &commands, &tx, conn, &observed) {
                     return;
                 }
             }
@@ -267,6 +325,7 @@ fn handle_message(
     commands: &mpsc::UnboundedSender<Command>,
     tx: &mpsc::UnboundedSender<Message>,
     conn: u64,
+    observed: &Arc<Mutex<Vec<String>>>,
 ) -> bool {
     let Some(Ok(message)) = message else {
         return false;
@@ -284,6 +343,9 @@ fn handle_message(
     let Some(frame) = value.as_array() else {
         return true;
     };
+    if let Some(tag) = frame.first().and_then(|tag| tag.as_str()) {
+        observed.lock().expect("observed lock").push(tag.to_owned());
+    }
     match frame.first().and_then(|tag| tag.as_str()) {
         Some("EVENT") if frame.len() == 2 => {
             let Ok(event) = serde_json::from_value::<Event>(frame[1].clone()) else {
@@ -327,6 +389,8 @@ async fn core_loop(
     store: Store,
     subs: Subs,
     reject: Arc<Mutex<Option<String>>>,
+    close_subs: Arc<Mutex<Option<String>>>,
+    auth_challenge: Arc<Mutex<Option<String>>>,
 ) {
     while let Some(command) = core.recv().await {
         match command {
@@ -357,8 +421,26 @@ async fn core_loop(
                 filter,
                 tx,
             } => {
+                // Clone under the lock, then answer without holding it.
+                let refusal = close_subs.lock().expect("close lock").clone();
+                if let Some(message) = refusal {
+                    // Refused read: answer `CLOSED` like a real relay's
+                    // read policy, and register nothing — the subscriber
+                    // must observe silence, not a delayed replay.
+                    let _ = tx.send(Message::text(
+                        json!(["CLOSED", sub_id, message]).to_string(),
+                    ));
+                    continue;
+                }
                 for event_json in matching_events(&store, &filter) {
                     let _ = tx.send(event_frame(&sub_id, &event_json));
+                }
+                // A challenge alone closes nothing: answer AUTH after the
+                // replay and before EOSE, then serve the subscription
+                // normally. The client must never answer back
+                // (see `observed_frames`).
+                if let Some(challenge) = auth_challenge.lock().expect("auth lock").clone() {
+                    let _ = tx.send(Message::text(json!(["AUTH", challenge]).to_string()));
                 }
                 let _ = tx.send(Message::text(json!(["EOSE", sub_id]).to_string()));
                 subs.lock()

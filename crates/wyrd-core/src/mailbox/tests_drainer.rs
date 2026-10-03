@@ -20,6 +20,7 @@ fn drainer_establishes_over_a_relay_less_client() {
         ticks: AtomicU64::new(0),
         stream_recovery_attempts: AtomicU64::new(0),
         relay_recovery_attempts: AtomicU64::new(0),
+        closed_subscriptions: AtomicU64::new(0),
         stream_episode: AtomicBool::new(false),
         relay_episode: AtomicBool::new(false),
         saturation_episode: AtomicBool::new(false),
@@ -28,7 +29,12 @@ fn drainer_establishes_over_a_relay_less_client() {
     let intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let mut receiver = runtime
-        .block_on(establish_drainer(&client, &intake_waker, &health))
+        .block_on(establish_drainer(
+            &client,
+            &intake_waker,
+            &health,
+            &SubscriptionId::generate(),
+        ))
         .expect("drainer establishes");
     // Empty, not disconnected: the spawned task is alive and holding
     // the sender, so the handshake ordered listen-before-subscribe.

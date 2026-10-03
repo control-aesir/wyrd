@@ -1225,3 +1225,106 @@ fn soak_restart_delivers_once_across_reopens() {
         "log stays bounded across restarts, got {lines} lines"
     );
 }
+
+/// A relay that answers REQ with CLOSED leaves the TCP attachment up
+/// while killing intake: the mailbox must count the closure instead of
+/// reading as idle. Pins the external-relay issue's symptom — attached
+/// but silent — made diagnosable: connected stays 1/1 (the socket is
+/// fine), `closed_subscriptions` reads 1, and published mail never
+/// arrives because no subscription holds it.
+#[test]
+fn relay_closed_subscription_is_counted_not_silent() {
+    let relay = MiniRelay::spawn();
+    relay.close_subscriptions("auth-required: gift-wrap reads need authentication");
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let mut mailbox = live_mailbox(
+        &receiver,
+        std::slice::from_ref(&url),
+        temp_path("seen-closed-sub"),
+    );
+    // TCP attach succeeds: the relay answers the socket, only the
+    // subscription is refused — liveness still reports the transport.
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+    // The CLOSED lands through the drainer asynchronously: poll the
+    // counter rather than assuming it.
+    let start = Instant::now();
+    loop {
+        if mailbox.health().closed_subscriptions == 1 {
+            break;
+        }
+        assert!(
+            start.elapsed() < OUTAGE_TIMEOUT,
+            "relay-sent closure is counted"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        mailbox.health().connected_relays,
+        1,
+        "TCP attachment intact while the subscription is dead"
+    );
+    // No subscription holds anything: published mail never arrives.
+    relay.inject(seal_rumor(
+        &sender,
+        receiver.public_key(),
+        "closed-never-arrives".to_string(),
+    ));
+    assert_quiet(&mut mailbox);
+    assert_eq!(
+        mailbox.health().closed_subscriptions,
+        1,
+        "one REQ earns exactly one CLOSED, no resubscribe loop"
+    );
+}
+
+/// A relay-sent AUTH challenge is never answered: NIP-42 stays
+/// unimplemented by trust decision (answering signs with the device
+/// key), so the client must emit no AUTH frame no matter how often the
+/// relay challenges. The challenge alone closes nothing — delivery
+/// still flows past it, which also bounds the wait: by the time mail
+/// arrives, any AUTH answer would already be on the wire.
+#[test]
+fn relay_auth_challenge_is_never_answered() {
+    let relay = MiniRelay::spawn();
+    relay.challenge_auth("prove-you-are-a-device");
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let mut mailbox = live_mailbox(
+        &receiver,
+        std::slice::from_ref(&url),
+        temp_path("seen-auth-challenge"),
+    );
+    wait_for_health(&mailbox, true, OUTAGE_TIMEOUT);
+    {
+        let mut outbox = live_mailbox(
+            &sender,
+            std::slice::from_ref(&url),
+            temp_path("seen-auth-challenge-sender"),
+        );
+        outbox
+            .send(envelope(
+                device_id(&sender),
+                device_id(&receiver),
+                "past-the-challenge",
+            ))
+            .expect("publish reaches the relay");
+    }
+    let delivery =
+        wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("delivery flows past AUTH");
+    assert_eq!(delivery.envelope().ciphertext, "past-the-challenge");
+    mailbox
+        .settle(delivery.id(), Disposition::Ack)
+        .expect("acks");
+    let frames = relay.observed_frames();
+    assert!(
+        frames.iter().any(|frame| frame == "REQ"),
+        "relay observed the subscription: {frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|frame| frame == "AUTH"),
+        "client never answers the challenge: {frames:?}"
+    );
+}

@@ -199,9 +199,15 @@ serving (contract 13). Still open: the NIP-46 signer-session client
 wiring. Multi-relay pool coverage is checked in
 (`mailbox::tests_multirelay`: publication, replay/dedupe, outage with
 survivor intake, recovery); cross-implementation relay interop stays
-opt-in (`mailbox::tests_interop`, live public relay). Real-world
-delivery through those relays is itself an open defect
-(`nostr:nevent1qqspuphchj0ldulcpmzgcrj6pzr4v7v47mg5le4kr6wdglykpf6wc4cpz9mhxue69uhkwunpwdczuap49eehg46en03`).
+opt-in (`mailbox::tests_interop`, live public relay, proven against
+relay.primal.net). Real-world delivery failed on policy, not on wire
+logic: relay.damus.io ACKs gift-wrap writes but CLOSEDs every
+gift-wrap REQ as auth-required (NIP-42, which the trust decision
+forbids), and nos.lol answers no TCP from here. A relay-sent CLOSED
+used to read as an idle mailbox — connected 1/1 with no delivery ever
+arriving — so closures are now counted in health
+(`closed_subscriptions`) and warned on, with no auto-resubscribe
+(re-REQing a policy close loops forever).
 The durable announcement outbox itself has landed (queued/delivered
 facts with byte-identical sealed retries, contract-tested); what was
 open was its live-loop wiring, which has now landed too — see below.

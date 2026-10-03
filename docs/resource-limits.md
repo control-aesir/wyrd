@@ -153,6 +153,11 @@ surfaces:
   objects, `unfulfilled`, `local_failures`, `transport_errors`.
 - `MailboxHealth::saturation_recoveries`: saturation replays issued
   (a rising count means the relay stream is chronically choked).
+- `MailboxHealth::closed_subscriptions`: relay-sent subscription
+  closures observed (a rising count means intake is blind on a relay
+  whose TCP attachment still reads connected — auth-required,
+  rate-limited, or unsupported filter; policy closes never heal
+  without operator action).
 - POSIX errnos at the mount (`ENOSPC`, `EACCES`, `EMFILE`,
   `EAGAIN`): the refusal itself is the signal, logged per request
   by the backend's request probe. One exception is mount-wide, not

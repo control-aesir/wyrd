@@ -217,7 +217,22 @@ invalid bytes never committed or served. Local bitrot is detected on
 read but never re-fetched — an object recorded as local stays local —
 so a bitrotted object is a permanent read error in v0.2. The repair
 loop and scrub are booked in v0.3 core below; the design, with its
-protocol invariants, is recorded in `docs/peer-repair.md`.
+protocol invariants, is recorded in `docs/peer-repair.md`. Admitting
+a device walks the live epoch chain's ancestry and commits one
+announcement obligation per closure member in the single admission
+batch — O(recorded history) allocation and commit in one call, with
+no incremental checkpointing. Past the 65,536-record per-commit
+ceiling the admission is refused whole (never truncated, never
+partial); the walk covers the live epoch's chain only, so a
+newcomer admitted epochs later does not re-walk superseded chains
+(open question whether that horizon is intended: see
+nostr:nevent1qqsdypczmlxwznanysne4qlk640fv6akxdskpmzpn9atjr9yvu6a6dgpz9mhxue69uhkwunpwdczuap49eehgcjgtm3).
+Not a v0.2 blocker: it needs a long single-epoch history plus an
+admission, violates no operational bound, and incremental
+checkpointing under the resource budget is the booked fix. The
+ceiling behavior and the cost shape are pinned by
+`admission_closure_cost_scales_with_history` and documented in
+`docs/resource-limits.md`.
 
 Milestone decision (content recovery in v0.2): the grafting
 primitives exist at the library layer only.

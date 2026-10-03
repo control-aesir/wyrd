@@ -1096,6 +1096,83 @@ fn admission_queues_the_lineage_closure_for_the_newcomer() {
     );
 }
 
+/// The admission-time lineage walk costs O(recorded history) in
+/// one commit: every servable closure member queues exactly one
+/// obligation and the closure is never truncated to fit. The walk
+/// seeds from the live (current-epoch eligible) heads, so one long
+/// epoch's whole chain queues in one admission — and a superseded
+/// epoch's chain is not re-walked for later joiners. This pins the
+/// cost shape the eventual incremental checkpointing must
+/// preserve-or-replace deliberately. Atomicity the other way (a
+/// failed admit commits nothing) is pinned by
+/// `failed_admit_leaves_no_phantom_tip`.
+#[test]
+fn admission_closure_cost_scales_with_history() {
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+
+    let (_dir, mut engine, _genesis) = owner_engine("admission-closure-cost");
+    let mut objects = MemoryObjectStore::default();
+    for n in 0..6u8 {
+        let chunk = objects.insert(ObjectKind::Chunk, &[0xA0 + n]).unwrap();
+        let tree =
+            Tree::from_entries(vec![Entry::file("cost.txt", 1, false, vec![chunk]).unwrap()])
+                .unwrap()
+                .insert_into(&mut objects)
+                .unwrap();
+        engine.author_snapshot(&objects, tree).unwrap();
+    }
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    let queued = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .count();
+    assert_eq!(
+        queued, 6,
+        "first admission queues one obligation per closure member, no truncation"
+    );
+
+    // A post-admission write starts a fresh root: below-epoch
+    // snapshots classify Superseded, so no eligible heads exist to
+    // parent onto. The next admission therefore walks only the new
+    // epoch's chain — the superseded chain is not re-walked for the
+    // late joiner, who holds the old epoch keys from its contiguous
+    // invitation without learning the old snapshot ids.
+    let chunk = objects.insert(ObjectKind::Chunk, &[0xB0]).unwrap();
+    let tree = Tree::from_entries(vec![Entry::file("cost.txt", 1, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let seventh = engine.author_snapshot(&objects, tree).unwrap();
+    assert!(
+        seventh.snapshot().parents.is_empty(),
+        "new epoch, no eligible heads: the chain restarts as a fresh root"
+    );
+    let late = DeviceIdentitySecret::generate().unwrap();
+    let late_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let late_id = device_of(&late);
+    engine
+        .admit_device(late_id, encryption_key(&late_encryption))
+        .unwrap();
+    let queued = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == late_id)
+        .count();
+    assert_eq!(
+        queued, 1,
+        "second admission walks only the live epoch's chain, never the superseded one"
+    );
+}
+
 /// Admission onto a frozen log fails closed instead of becoming a
 /// third contender: the staged transition would leave the conflict
 /// frozen, which intake would never elect.

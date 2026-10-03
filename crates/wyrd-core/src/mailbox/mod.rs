@@ -200,6 +200,8 @@ mod tests_catchup;
 #[cfg(test)]
 mod tests_classification;
 #[cfg(test)]
+mod tests_crossimpl;
+#[cfg(test)]
 mod tests_dedupe;
 #[cfg(test)]
 mod tests_delivery;

@@ -46,8 +46,12 @@ use std::time::Duration;
 // that the mailbox broke: on the write side `send` logs each relay's
 // answer while still resolving `Ok`, so a refusal surfaces in the
 // logs and then as missing mail. These two tests are the only
-// real-relay evidence in the tree and run in no CI job — they prove a
-// moment, not a standing guarantee.
+// real-relay-over-the-internet evidence in the tree and run in no CI
+// job — they prove a moment, not a standing guarantee. The
+// deterministic cross-implementation episode (fake plus a
+// locally-spawned real relay, full outage/recovery) lives in
+// `tests_crossimpl.rs` and runs in the default gate; this group
+// adds live public-relay policy on top of that behavior.
 
 /// Public relay URL for the opt-in interop group: `WYRD_TEST_RELAY_URL`
 /// when set and non-empty, otherwise the default public relay below.

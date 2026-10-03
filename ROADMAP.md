@@ -183,7 +183,7 @@ state transitions, and fuzzing for the envelope and decoder surfaces.
 Thesis: Wyrd can synchronize real drives reliably over the live network.
 
 Ship: multi-relay mailbox operation, relay interoperability, fetch-walk
-alternate-provider fallback and history catch-up, correct closure and
+alternate-representation fallback and history catch-up, correct closure and
 head gating, demand-driven content acquisition, bounded intake and
 resource consumption, correct shutdown and restart behavior, headless
 sync, sync status, materialization policy, reliable FUSE read/write
@@ -208,11 +208,16 @@ Known v0.2 limitations (documented, not deferred silently): stranded local
 content has no sanctioned path back until the v0.3 content-recovery
 workflow; the local store is cooperative, so concurrent non-cooperating
 writers are outside the supported concurrency model; there is no
-dedicated peer-repair loop or scrub — corrupt or unreachable candidates
-fall back to the next recorded provider inside the fetch walk, each
-snapshot names a single route (v0 has no replication serving), and when
-no candidate serves the waiter fails bounded (EIO) with invalid bytes
-never committed or served.
+dedicated peer-repair loop or background scrub — corrupt or unreachable
+representations fall back to the next recorded representation inside
+the fetch walk, route publication records one serving peer per
+snapshot, so the alternates are representations, not providers, and
+when no representation serves the waiter fails bounded (EIO) with
+invalid bytes never committed or served. Local bitrot is detected on
+read but never re-fetched — an object recorded as local stays local —
+so a bitrotted object is a permanent read error in v0.2. The repair
+loop and scrub are booked in v0.3 core below; the design, with its
+protocol invariants, is recorded in `docs/peer-repair.md`.
 
 Milestone decision (content recovery in v0.2): the grafting
 primitives exist at the library layer only.
@@ -236,7 +241,11 @@ operator can safely run on one machine. Three parts, in dependency order.
 Device-local durability levels, mutation accumulation versus snapshot
 commitment, explicit transaction and commit windows, crash semantics,
 content-recovery snapshots and sanctioned grafting, durable outbox
-semantics, restart-equivalence testing. This comes before editors and
+semantics, restart-equivalence testing. A dedicated peer-repair loop
+and local scrub land here too: generation-scoped terminal fetch
+state with waiter completion, local quarantine with re-want, and
+fetch-failure diagnostics (design and protocol invariants in
+`docs/peer-repair.md`). This comes before editors and
 mobile behavior are built on Wyrd.
 
 Real observability, not telemetry for its own sake: sync, peer, relay,

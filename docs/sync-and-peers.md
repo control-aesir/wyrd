@@ -245,10 +245,15 @@ In v0.2 only the first three project live (`status()` never returns
 the repair work, not observed states. The translation to POSIX errors
 happens only at the boundary: opening a non-local path blocks on
 fetch with visible progress, serves the read once verified and
-cached, and fails with `EIO` when no candidate serves and the object
-is not cached. Corrupt or unreachable candidates fall back to the
-next recorded provider or representation inside the fetch walk —
-hash/AEAD-verified, never committed on mismatch — but there is no
-scrub pass and no repair loop, so persistent failure surfaces as a
-bounded `EIO`, never as unverified bytes. Eviction never affects the
+cached, and fails with `EIO` when no representation serves and the object
+is not cached. Corrupt or unreachable representations fall back to the
+next recorded representation inside the fetch walk — and, within one
+representation, its transport root before its storage address —
+hash/AEAD-verified, never committed on mismatch. There is no scrub
+pass and no repair loop: the store verifies on read and fails closed,
+but a bitrotted object stays recorded as local and is never
+re-fetched, so persistent failure surfaces as a bounded `EIO`, never
+as unverified bytes. The repair design — generation-scoped terminal
+state, route-set policy, measurement before replication — is recorded
+in `docs/peer-repair.md`. Eviction never affects the
 drive — only what this device holds.

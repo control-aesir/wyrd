@@ -156,7 +156,9 @@ enum Command {
     },
     /// Headless sync: report sync state or run a bounded sync without
     /// mounting. Status never connects and never mutates durable
-    /// state; `now` connects, may mutate it, and reports liveness.
+    /// state; `now` connects when given a relay (and refuses a
+    /// relay-less run without `--offline`), may mutate durable
+    /// state, and reports liveness.
     Sync {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,

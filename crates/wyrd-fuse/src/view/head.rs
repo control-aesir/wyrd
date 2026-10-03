@@ -21,9 +21,11 @@ use wyrd_format::Snapshot;
 /// `AuthorizedSnapshot` sync's BIP-340 verification alone may mint;
 /// every other in-tree impl is a deliberately forged test fixture
 /// documented as asserting nothing real. The token proves a
-/// drive-bound signature only — head eligibility is decided at
+/// drive-bound signature only: head eligibility is decided at
 /// composition (`WyrdNode::refresh_live_heads`), so a view built
-/// from otherwise-obtained tokens can project retained history.
+/// from otherwise-obtained tokens can project `CanonicalHistory`,
+/// `Superseded`, or `Voided` snapshots: valid history the local
+/// view never installed.
 ///
 /// A downstream wrapper around a raw snapshot cannot implement the
 /// capability in safe code — the audit marker is the only way across:

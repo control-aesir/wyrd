@@ -78,10 +78,13 @@
 //! content id already binds the bytes to the announcement), replayed
 //! verbatim (validity is bytes-bound, unlike capabilities, so no
 //! re-check is needed). The token proves a drive-bound signature and
-//! nothing else: whether a snapshot may head a view is decided where
-//! heads are composed (`WyrdNode::refresh_live_heads` over the
-//! engine's `Eligible` classification), so a view built from
-//! otherwise-obtained tokens can project retained history.
+//! nothing beyond it: the content-id binding is a property of the
+//! bytes, not of the token. Whether a snapshot may head a view is
+//! decided where heads are composed (`WyrdNode::refresh_live_heads`
+//! over the engine's `Eligible` classification), so a view built from
+//! otherwise-obtained tokens can project `CanonicalHistory`,
+//! `Superseded`, or `Voided` snapshots: valid history the local view
+//! never installed.
 //!
 //! Children: [`store`] owns lifecycle and the crash-safe commit
 //! protocol; [`codec`] owns the commit envelope and fact records;

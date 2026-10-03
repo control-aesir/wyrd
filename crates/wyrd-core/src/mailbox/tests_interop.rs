@@ -30,6 +30,18 @@ use std::time::Duration;
 // proven relay below — real assertions either way, never a silent
 // pass. Each run publishes a few gift wraps to fresh random
 // recipients — negligible traffic addressed to keys nobody holds.
+//
+// How to read a failure: a delivery-wait timeout against a public
+// relay is ambiguous by construction — relay write/serve policy vs a
+// Wyrd defect. Check the warn logs first: relay-sent AUTH, CLOSED, or
+// NOTICE lines (CLOSEDs are counted in
+// `MailboxHealth.closed_subscriptions`) mean the relay refused the
+// subscription, not that the mailbox broke; on the write side `send`
+// logs each relay's answer (`mailbox send relay outcome`) while still
+// resolving `Ok`, so a refusal surfaces in the logs and then as
+// missing mail. These two tests are the only real-relay evidence in
+// the tree and run in no CI job — they prove a moment, not a standing
+// guarantee.
 
 /// Public relay URL for the opt-in interop group: `WYRD_TEST_RELAY_URL`
 /// when set and non-empty, otherwise the default public relay below.

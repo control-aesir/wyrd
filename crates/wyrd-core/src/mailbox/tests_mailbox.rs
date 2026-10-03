@@ -451,26 +451,6 @@ fn foreign_envelope_sender_rejected() {
     ));
 }
 
-// --- external-relay interop: opt-in, never in the default gate ---
-//
-// MiniRelay proves the mailbox against exactly the protocol slice it
-// uses, without signature verification, TLS, relay auth, or
-// relay-specific replay behavior. This group runs the same
-// send/receive/recovery suite against a real public relay:
-//
-// `WYRD_TEST_RELAY_URL=wss://nos.lol cargo test -p wyrd-daemon
-//  external_relay -- --ignored`
-//
-// Proven against nos.lol; relay.damus.io never completed the attach
-// from here, so prefer a relay that answers.
-//
-// `#[ignore]` keeps the group out of the default `cargo nextest run`
-// gate, so third-party availability can never flake CI. Selecting the
-// group runs it against `WYRD_TEST_RELAY_URL`, defaulting to the
-// proven relay below — real assertions either way, never a silent
-// pass. Each run publishes a few gift wraps to fresh random
-// recipients — negligible traffic addressed to keys nobody holds.
-
 /// The send-path debug line's accounting: accepted relays land in
 /// `accepted`, every other relay lands in `not_accepted` carrying the
 /// relay's answer — so a relay that answers `OK false` reads

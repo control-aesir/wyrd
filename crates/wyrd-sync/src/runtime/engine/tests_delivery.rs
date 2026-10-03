@@ -16,7 +16,7 @@ use crate::runtime::test_util::{
 };
 use crate::transport::mailbox::{
     open_from_sender, seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox,
-    MailboxEnvelope, MailboxError, MemoryMailbox,
+    MailboxEnvelope, MailboxError, MemoryMailbox, SendReport,
 };
 
 /// A planted stale obligation: given a fixture, an admission
@@ -102,6 +102,87 @@ fn delivery_refuses_transition_sealed_bytes_for_another_id() {
         loaded.transition_queued,
         vec![(genesis_id, recipient)],
         "the obligation stays pending"
+    );
+}
+
+/// A mailbox that drops every send while reporting zero relay
+/// acceptance: the all-relays-refused arm of the delivery contract.
+/// Wraps a real mailbox so the test can unwrap to the accepting arm
+/// for the retry half.
+struct RefusingMailbox<M> {
+    inner: M,
+}
+
+impl<M: Mailbox> Mailbox for RefusingMailbox<M> {
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        Ok(SendReport { accepted: 0 })
+    }
+
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+        self.inner.recv()
+    }
+
+    fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError> {
+        self.inner.settle(id, disposition)
+    }
+}
+
+/// A send no relay accepts must not discharge the obligation: the
+/// Delivered fact means relay-accepted, so zero acceptance leaves
+/// the pair pending for a later pass instead of committing a fact
+/// no acceptance supports. The retry half proves the obligation
+/// survived: an accepting relay discharges it on the next pass.
+#[test]
+fn delivery_retains_obligation_when_no_relay_accepts() {
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let sealed = seal(
+        &control_key(2),
+        &member_drive(),
+        2,
+        &transition_message(&child),
+    )
+    .unwrap()
+    .encode();
+    let recipient = identity(0x03).1;
+    fx.engine
+        .commit_facts(&[
+            Fact::TransitionSealed(child_id, sealed),
+            Fact::TransitionQueued(child_id, recipient),
+        ])
+        .unwrap();
+    let mut refusing = RefusingMailbox {
+        inner: MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: fx.recipient,
+        },
+    };
+    assert_eq!(
+        fx.engine.deliver_pending(&mut refusing).unwrap(),
+        0,
+        "a refused send counts nothing"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.transition_delivered.is_empty(),
+        "refusal must not commit a Delivered fact"
+    );
+    assert_eq!(
+        loaded.transition_queued,
+        vec![(child_id, recipient)],
+        "the obligation stays pending"
+    );
+    let mut mailbox = refusing.inner;
+    assert_eq!(
+        fx.engine.deliver_pending(&mut mailbox).unwrap(),
+        1,
+        "acceptance discharges the retained obligation"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.transition_delivered,
+        vec![(child_id, recipient)],
+        "the Delivered fact lands only on acceptance"
     );
 }
 
@@ -261,7 +342,7 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
     /// does not — the next pass must resend the identical bytes.
     struct FailSend;
     impl Mailbox for FailSend {
-        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
             Err(MailboxError::Transport("injected send failure".into()))
         }
         fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
@@ -449,7 +530,7 @@ fn announce_skips_snapshot_without_a_sealing_key_and_sends_the_rest() {
 /// does not — the next pass must resend the identical bytes.
 struct FailSend;
 impl Mailbox for FailSend {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         Err(MailboxError::Transport("injected send failure".into()))
     }
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

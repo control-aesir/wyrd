@@ -9,6 +9,7 @@ use wyrd_sync::control::{self, Message};
 use wyrd_sync::keys::{DeviceIdentitySecret, EpochSecret};
 use wyrd_sync::transport::mailbox::{
     seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    SendReport,
 };
 
 /// A fake relay: envelopes stay until Acked; every pass offers each
@@ -41,9 +42,9 @@ impl Mailbox for Relay {
     fn send(
         &mut self,
         envelope: MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+    ) -> Result<SendReport, wyrd_sync::transport::mailbox::MailboxError> {
         self.queue(std::iter::once(envelope));
-        Ok(())
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

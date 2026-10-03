@@ -569,13 +569,15 @@ fn oversize_envelope_discarded_without_commit() {
 /// as a durable ack.
 #[test]
 fn discarded_envelope_settles_poison_not_ack() {
-    use crate::transport::mailbox::{Delivery, DeliveryId, Mailbox, MailboxEnvelope, MailboxError};
+    use crate::transport::mailbox::{
+        Delivery, DeliveryId, Mailbox, MailboxEnvelope, MailboxError, SendReport,
+    };
     struct RecordingMailbox<'a> {
         inner: MemoryMailbox<'a>,
         settled: Vec<(DeliveryId, Disposition)>,
     }
     impl Mailbox for RecordingMailbox<'_> {
-        fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
             self.inner.send(envelope)
         }
         fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

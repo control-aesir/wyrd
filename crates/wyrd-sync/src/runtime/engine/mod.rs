@@ -939,7 +939,7 @@ impl Engine {
     }
 
     /// Send every undischarged transition- and capability-delivery
-    /// obligation, returning the number of envelopes sent this call.
+    /// obligation, returning the number of relay-accepted sends this call.
     /// Transitions go before capabilities; a mid-loop transport
     /// failure leaves the rest pending for the next call. See
     /// [`super::author::deliver_pending`].
@@ -1391,12 +1391,12 @@ impl Engine {
     }
 
     /// Announce an authored snapshot over the control plane to every
-    /// other member, returning the number of envelopes sent this call.
+    /// other member, returning the number of relay-accepted sends this call.
     /// The epoch's control key must be held; the author is not sent to
     /// itself. Durable and retryable: the obligation was queued at
     /// authoring, the sealed bytes persist on first send (retries are
     /// byte-identical), and one delivered marker commits per successful
-    /// send — a mid-loop failure leaves the rest pending for
+    /// relay-accepted send — a mid-loop failure leaves the rest pending for
     /// [`Engine::announce_pending`].
     pub fn announce_snapshot(
         &mut self,
@@ -1408,7 +1408,7 @@ impl Engine {
     }
 
     /// Resume every undischarged announcement obligation across
-    /// snapshots, returning the number of envelopes sent this call.
+    /// snapshots, returning the number of relay-accepted sends this call.
     /// The restart path: discovers the durable outbox and sends it
     /// without re-authoring anything.
     pub fn announce_pending(

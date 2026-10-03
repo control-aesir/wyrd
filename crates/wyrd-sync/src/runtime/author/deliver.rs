@@ -15,13 +15,13 @@ use crate::transport::signer::{SignerError, SignerSession};
 use zeroize::Zeroizing;
 
 /// Send every undischarged transition- and capability-delivery
-/// obligation, returning the number of envelopes sent this call.
-/// Transitions go before capabilities (the ordering optimization:
+/// obligation, returning the number of relay-accepted sends this
+/// call. Transitions go before capabilities (the ordering optimization:
 /// intake holds membership-unseen capabilities pending, so either
 /// order converges, but tip-first minimizes deferrals). Durable and
 /// retryable like the announcement outbox: sealed bytes persist on
 /// first send so retries are byte-identical, one delivered marker
-/// commits per successful send, and a mid-loop failure leaves the rest
+/// commits per relay-accepted send, and a mid-loop failure leaves the rest
 /// pending for the next call. Entries that cannot resolve now —
 /// orphaned transitions, epochs without a canonical transition or
 /// held secret, recipients no longer members — are skipped and stay
@@ -152,8 +152,11 @@ pub(super) fn seal_fresh_for(
 
 /// Send verified sealed bytes to each recipient under the mailbox's
 /// outer recipient seal, committing one delivered marker per
-/// successful send. A send failure returns immediately with the rest
-/// still pending.
+/// relay-accepted send. A send no relay accepts commits nothing —
+/// the Delivered fact means relay-accepted, so zero acceptance
+/// leaves the obligation pending for a later pass instead of
+/// recording a fact no acceptance supports. A send failure returns
+/// immediately with the rest still pending.
 pub(super) fn send_sealed_to(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
@@ -165,7 +168,15 @@ pub(super) fn send_sealed_to(
     let mut sent = 0usize;
     for recipient in recipients {
         let envelope = seal_for_recipient(&engine.identity_secret, recipient, sealed_bytes)?;
-        mailbox.send(envelope)?;
+        let report = mailbox.send(envelope)?;
+        if report.accepted == 0 {
+            // The bytes reached no relay: retiring the obligation
+            // here would lose the sender's recovery path while the
+            // recipient never saw the event. Stay pending; the next
+            // pass retries the identical bytes.
+            tracing::debug!(kind, recipient = ?recipient, "outbox send refused; obligation stays pending");
+            continue;
+        }
         // Per-send forensics, mirroring the intake verdict lines: with
         // relay ids on one side and control kinds on the other, a
         // stuck peer's whole outbox can be reconstructed envelope by
@@ -179,7 +190,8 @@ pub(super) fn send_sealed_to(
 
 /// Send all pending transition obligations. One sealed envelope per
 /// transition (recipient binding is the outer mailbox seal, so the
-/// bytes are shared), one delivered marker per recipient send.
+/// bytes are shared), one delivered marker per relay-accepted
+/// recipient send.
 fn deliver_transitions(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,

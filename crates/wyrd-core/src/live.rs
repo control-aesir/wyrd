@@ -837,7 +837,7 @@ where
     /// Send every undischarged outbound obligation: transitions and
     /// capabilities first (tip-first minimizes intake deferrals on the
     /// receiving side), then announcements. Durable and retryable —
-    /// each send commits its own delivered marker, so a failure leaves
+    /// each relay-accepted send commits its own delivered marker, so a failure leaves
     /// the rest pending for the next pass and a crash resumes from the
     /// outbox, never by re-authoring.
     ///

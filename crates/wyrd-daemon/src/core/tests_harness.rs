@@ -19,8 +19,11 @@ impl Mailbox for NoopMailbox {
     fn send(
         &mut self,
         _envelope: MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
-        Ok(())
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
+        Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
@@ -160,7 +163,10 @@ impl Mailbox for SendFailingMailbox {
     fn send(
         &mut self,
         _envelope: MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
         Err(wyrd_sync::transport::mailbox::MailboxError::Transport(
             "relay unreachable".into(),
         ))
@@ -188,8 +194,11 @@ impl Mailbox for PanicMailbox {
     fn send(
         &mut self,
         _envelope: MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
-        Ok(())
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
+        Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
@@ -214,8 +223,11 @@ impl Mailbox for SettlementFailingMailbox {
     fn send(
         &mut self,
         _envelope: MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
-        Ok(())
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
+        Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {
@@ -267,9 +279,12 @@ impl Mailbox for QueueMailbox {
     fn send(
         &mut self,
         envelope: MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
         self.push(envelope);
-        Ok(())
+        Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, wyrd_sync::transport::mailbox::MailboxError> {

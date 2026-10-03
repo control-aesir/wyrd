@@ -793,7 +793,7 @@ fn rotate_delivers_the_new_epoch_secret_to_a_current_member() {
 #[test]
 fn pending_announcement_resends_with_the_live_route() {
     use crate::transport::mailbox::{
-        Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+        Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
     };
     use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 
@@ -802,7 +802,7 @@ fn pending_announcement_resends_with_the_live_route() {
     // their relay mount later replayed with dead routes.
     struct UnreachableMailbox;
     impl Mailbox for UnreachableMailbox {
-        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
             Err(MailboxError::Transport("no relay".into()))
         }
 

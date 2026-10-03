@@ -4,7 +4,7 @@ use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use wyrd_sync::transport::mailbox::{
-    Delivery, DeliveryId, Disposition, MailboxEnvelope, MailboxError,
+    Delivery, DeliveryId, Disposition, MailboxEnvelope, MailboxError, SendReport,
 };
 
 /// A single drive plus owner credentials, initialized through the
@@ -75,9 +75,9 @@ impl RecordingMailbox {
 }
 
 impl Mailbox for RecordingMailbox {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         self.sent.push(envelope);
-        Ok(())
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
@@ -94,8 +94,8 @@ impl Mailbox for RecordingMailbox {
 struct NoopMailbox;
 
 impl Mailbox for NoopMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-        Ok(())
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
@@ -137,8 +137,8 @@ impl DelayedMailbox {
 }
 
 impl Mailbox for DelayedMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-        Ok(())
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
@@ -176,7 +176,7 @@ impl Mailbox for DelayedMailbox {
     }
 }
 impl Mailbox for SendFailingMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         Err(MailboxError::Transport("test send failure".into()))
     }
 

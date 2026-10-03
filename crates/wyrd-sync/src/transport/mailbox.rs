@@ -223,9 +223,27 @@ pub fn open_from_sender(
 /// a client that consumes on `recv`: the engine's crash recovery
 /// ("a crash can only lose envelopes the relay still holds for
 /// redelivery") depends on unacked mail surviving.
+/// What one `send` established: how many relays accepted the
+/// envelope (`OK true`). Zero means no relay holds the bytes — the
+/// outbox obligation stays pending and a later pass retries — while
+/// `Err` stays reserved for a broken mailbox, never for refusal.
+/// Relay-accepted is the strongest claim a send makes: acceptance
+/// never reaches the recipient, and recipient receipt is never
+/// reported here. Plain data, no behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendReport {
+    /// Relays that accepted the envelope. Zero: refused or
+    /// unreachable everywhere — keep the obligation pending.
+    pub accepted: usize,
+}
+
 pub trait Mailbox {
-    /// Publish one sealed envelope.
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError>;
+    /// Publish one sealed envelope, reporting relay acceptance.
+    /// `Ok` means the transport ran; `report.accepted` counts the
+    /// relays that accepted the write. Zero accepted is not an
+    /// error — the bytes reached no relay, so the caller keeps the
+    /// outbox obligation pending for a later pass.
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError>;
 
     /// Hand over the next envelope addressed to this mailbox's owner,
     /// if any. The handover does NOT consume the envelope: it stays
@@ -399,9 +417,11 @@ pub(crate) struct MemoryMailbox<'a> {
 
 #[cfg(test)]
 impl Mailbox for MemoryMailbox<'_> {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         self.relay.push(envelope);
-        Ok(())
+        // The shared queue never refuses: the in-memory relay holds
+        // every envelope until Ack, so every send is accepted.
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

@@ -31,7 +31,7 @@ use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::Engine;
 use wyrd_sync::transport::mailbox::{
-    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
 };
 
 /// A control plane that never speaks: no announcements, no sends, so
@@ -39,8 +39,8 @@ use wyrd_sync::transport::mailbox::{
 struct SilentMailbox;
 
 impl Mailbox for SilentMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-        Ok(())
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

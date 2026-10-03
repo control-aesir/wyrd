@@ -380,7 +380,7 @@ writes, stale-temp sweep on open, verify-on-read scrub.
 2. Manifest partition encoding details (sharding, chunked transfer of large
    manifests).
 3. Live-view conflict naming (e.g. by author id / snapshot timestamp).
-4. Gossip (iroh-gossip) framing for snapshot announcements (announcement encoding pinned in `wyrd-sync/src/control/`).
+4. Gossip framing for snapshot announcements (candidate: iroh-gossip — the dependency stays out until this lands; announcement encoding pinned in `wyrd-sync/src/control/`).
 5. Chunk-size parameters (benchmark before the v1 freeze).
 
 ## Decision record

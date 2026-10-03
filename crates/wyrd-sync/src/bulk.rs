@@ -1,6 +1,6 @@
 //! Bulk object transport: the sync fetch boundary for sealed bytes.
 //!
-//! The control plane (mailbox) carries small gossip; everything bulky —
+//! The control plane (mailbox) carries small control messages; everything bulky —
 //! sealed manifests and sealed objects — moves through [`BulkSource`],
 //! synchronously by design like the rest of `wyrd-sync`: the in-memory
 //! fake serves tests, and [`IrohBulkSource`] provides the network backend.

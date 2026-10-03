@@ -80,7 +80,6 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
             external_allow: &[
                 "iroh",
                 "iroh-blobs",
-                "iroh-gossip",
                 "bao-tree",
                 "bytes",
                 "n0-future",

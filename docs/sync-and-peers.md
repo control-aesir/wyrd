@@ -9,10 +9,10 @@ ID / Storage ID). This doc describes how peers exchange them.
 
 ## Transport
 
-- iroh endpoint with relay/DNS discovery, NAT traversal, and gossip
+- iroh endpoint with relay/DNS discovery and NAT traversal
 - Pairing via tickets (one peer generates, the other imports)
-- The iroh version set (iroh 1.1.0 / iroh-blobs 0.103.0 fs-store /
-  iroh-gossip 0.101.0) is validated as a set and changes as a set
+- The iroh version set (iroh 1.1.0 / iroh-blobs 0.103.0 fs-store)
+  is validated as a set and changes as a set
 
 ## Runtime sync boundary
 
@@ -109,7 +109,7 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
 
 ## What is exchanged
 
-- **Snapshot announcements** (small, gossip-propagated): "my head set now
+- **Snapshot announcements** (small, fanned out to every admitted device): "my head set now
   includes snapshot S, and here is my current `node_addr` for retrieval" —
   signed, verified against known member identity keys (`trust.md`). The
   address is authenticated routing metadata inside the same sealed

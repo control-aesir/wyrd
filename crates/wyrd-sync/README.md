@@ -5,7 +5,7 @@ encrypted manifests, roles × materialization.
 
 ## What belongs here
 
-- iroh endpoint, gossip, and blob-transfer wiring (transport only):
+- iroh endpoint and blob-transfer wiring (transport only):
   `IrohBulkSource` is the network bulk backend; the `BulkSource` trait and
   its memory fake serve the fetch contracts
 - Author-signed snapshot announcements: Bao transport roots as the
@@ -50,5 +50,5 @@ remote signing, and scrub/repair wiring.
 
 ## Version policy
 
-The iroh version set is validated as a set — change all three together and
+The iroh version set is validated as a set — change both together and
 run the full test suite.

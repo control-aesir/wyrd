@@ -322,7 +322,8 @@ sync now
   is passed — a relay-less run exits 0 with an idle intake, which
   automation keying on exit status cannot distinguish from a
   converged sync. With `--offline`, intake stays idle: `now`
-  discharges local obligations and fetches nothing new.
+  discharges local obligations and fetches nothing new. `--offline`
+  cannot be combined with `--relay`.
 
 Route-less authoring is intentional, not an omission: `now` binds
 no serving endpoint, so its announcements carry no retrieval

@@ -387,7 +387,8 @@ enum SyncAction {
     /// refuses unless `--offline` explicitly opts into the local run.
     Now {
         /// Run without relays: intake stays idle, only local
-        /// obligations discharge, nothing new is fetched.
+        /// obligations discharge, nothing new is fetched. Cannot be
+        /// combined with --relay.
         #[arg(long)]
         offline: bool,
     },

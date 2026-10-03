@@ -455,24 +455,17 @@ impl DriveKeyring {
     /// Conflicts are detected before any mutation, so a failed install
     /// leaves the held set untouched. Capabilities for another drive or
     /// device are rejected before anything else.
+    ///
+    /// This is the strict reference predicate: no live path calls it
+    /// (replay installs through [`DriveKeyring::install_vacant`]).
+    /// Its callers are the unit, property, and codec suites that pin
+    /// the authorization boundary itself.
     pub fn install(
         &mut self,
         capability: &Capability,
         log: &crate::membership::MembershipLog,
     ) -> Result<InstallReport, InstallError> {
-        if capability.drive != self.drive {
-            return Err(InstallError::WrongDrive(
-                capability.drive.to_string(),
-                self.drive.to_string(),
-            ));
-        }
-        if capability.device != self.device {
-            return Err(InstallError::WrongDevice(
-                capability.device.to_string(),
-                self.device.to_string(),
-            ));
-        }
-        capability.authorize_against(self.drive, log, &capability.transition)?;
+        self.preflight(capability, log)?;
         for (i, secret) in capability.secrets.iter().enumerate() {
             let epoch = i as u64 + 1;
             if let Some(held) = self.secrets.get(&epoch) {
@@ -499,11 +492,73 @@ impl DriveKeyring {
         }
     }
 
+    /// Install only the epochs the keyring does not already hold,
+    /// keeping every held secret: the replay path's conflict policy.
+    /// The full [`Capability::authorize_against`] predicate still runs
+    /// first, so an unauthorized vector installs nothing; a held epoch
+    /// disagreeing with the vector is skipped (returned) rather than
+    /// failing the whole install. Commit order makes this first-wins:
+    /// the earliest-committed vector anchors every epoch it covers,
+    /// and a later conflicting vector contributes only its vacant
+    /// tail. That matches the live intake, which installs fill-vacant
+    /// and never swaps a held secret behind traffic sealed under it —
+    /// so a reopen derives exactly the keys the live engine held.
+    /// Unlike [`DriveKeyring::install`], partial application is the
+    /// point: replay must converge on the durable facts, never fail
+    /// closed over them.
+    pub(crate) fn install_vacant(
+        &mut self,
+        capability: &Capability,
+        log: &crate::membership::MembershipLog,
+    ) -> Result<Vec<u64>, InstallError> {
+        self.preflight(capability, log)?;
+        let mut skipped = Vec::new();
+        for (i, secret) in capability.secrets.iter().enumerate() {
+            let epoch = i as u64 + 1;
+            match self.secrets.entry(epoch) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(secret.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(held) => {
+                    if held.get() != secret {
+                        skipped.push(epoch);
+                    }
+                }
+            }
+        }
+        Ok(skipped)
+    }
+
     /// The held secret for an epoch, if any.
     pub fn secret(&self, epoch: u64) -> Option<&EpochSecret> {
         self.secrets.get(&epoch)
     }
 
+    /// The shared authorization preflight for every install path:
+    /// drive and device routing, then the full predicate with the
+    /// state the capability's own transition produces. Factored so a
+    /// future edit cannot silently drift one install path off the
+    /// check the others enforce.
+    fn preflight(
+        &self,
+        capability: &Capability,
+        log: &crate::membership::MembershipLog,
+    ) -> Result<(), InstallError> {
+        if capability.drive != self.drive {
+            return Err(InstallError::WrongDrive(
+                capability.drive.to_string(),
+                self.drive.to_string(),
+            ));
+        }
+        if capability.device != self.device {
+            return Err(InstallError::WrongDevice(
+                capability.device.to_string(),
+                self.device.to_string(),
+            ));
+        }
+        capability.authorize_against(self.drive, log, &capability.transition)?;
+        Ok(())
+    }
     /// The highest held epoch.
     pub fn up_to(&self) -> u64 {
         self.secrets.keys().next_back().copied().unwrap_or(0)

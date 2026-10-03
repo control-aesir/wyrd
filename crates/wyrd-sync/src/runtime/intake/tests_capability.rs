@@ -680,6 +680,298 @@ fn conflicting_capability_value_under_a_recorded_key_commits() {
     assert_eq!(facts.capabilities.len(), 2);
 }
 
+/// Conflicting capability facts must not brick the next open: the
+/// store holds two vectors for one device disagreeing on held epochs,
+/// and `Engine::open` replays them first-wins (commit order) instead
+/// of failing `EpochConflict` — the reopen keeps the first-committed
+/// secrets, matching the live fill-vacant install, and the engine is
+/// fully operational afterwards.
+#[test]
+fn conflicting_capability_facts_do_not_brick_reopen() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let first = vec![
+        EpochSecret::from_bytes([0x08; 32]),
+        EpochSecret::from_bytes([0x09; 32]),
+    ];
+    let cap = capability_message(device, admission.transition_id(), 2, first.clone());
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &cap),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 3);
+    let rival = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x0A; 32]),
+            EpochSecret::from_bytes([0x0B; 32]),
+        ],
+    );
+    let mail = vec![deliver(&fixture, 2, &rival)];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 1);
+    // Restart over the conflicting facts: the open must succeed.
+    fixture.engine.release_store_lock();
+    let (identity_sk, _) = identity(0x02);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    fixture.engine = Engine::open(
+        fixture.dir.path.clone(),
+        member_drive(),
+        device,
+        "test-pass",
+        identity_sk,
+        encryption_sk,
+    )
+    .expect("conflicting facts open first-wins");
+    // First-committed vector holds epochs 1..=2: the reopened
+    // keyring — and the re-derived control keys — agree with it,
+    // never with the later rival.
+    for (epoch, secret) in first.iter().enumerate() {
+        let epoch = epoch as u64 + 1;
+        let expected = secret.control_key(&member_drive(), epoch);
+        assert_eq!(
+            fixture.engine.epoch_keys.get(&epoch).map(|k| k.to_vec()),
+            Some(expected.to_vec()),
+            "epoch {epoch} keeps the first-committed secret"
+        );
+    }
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 2, "both facts stay durable");
+    // The reopened engine is operational: re-add the device-held
+    // envelope keys (device knowledge, like the fixture setup) and a
+    // reseal of the latest value dedupes. This pins the
+    // last-wins projection rebuild, not the keyring fix — the
+    // keyring evidence is the epoch-key assertions above.
+    for epoch in [1, 2] {
+        fixture
+            .engine
+            .add_epoch_key(epoch, Zeroizing::new(control_key(epoch)));
+    }
+    let mail = vec![deliver(&fixture, 2, &rival)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.duplicates, 1);
+}
+
+/// A longer conflicting vector still grants its vacant tail on
+/// reopen: the device honestly holds 1..=N, and the rival bound to a
+/// later epoch covers 1..=M. Whole-vector skip would freeze epoch
+/// creation — the authoring path reads every past secret from the
+/// durable keyring, so a missing tail fails the next mint with
+/// `MissingEpochSecret`. Fill-vacant keeps the held prefix and
+/// installs the tail, so the reopened engine opens later-epoch
+/// traffic and still has every past secret its next mint needs.
+#[test]
+fn longer_conflicting_vector_grants_its_vacant_tail_on_reopen() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let rotation = builder.child(vec![Change::Rotate]);
+    let honest = vec![
+        EpochSecret::from_bytes([0x08; 32]),
+        EpochSecret::from_bytes([0x09; 32]),
+    ];
+    let cap = capability_message(device, admission.transition_id(), 2, honest.clone());
+    // The epoch-3 envelope key is device knowledge the fixture
+    // pre-seeds, like epochs 1 and 2.
+    fixture
+        .engine
+        .add_epoch_key(3, Zeroizing::new(control_key(3)));
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &transition_message(&rotation)),
+        deliver(&fixture, 2, &cap),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 4);
+    // Rival bound to the epoch-3 transition: forged history over the
+    // held prefix, new material for the vacant tail.
+    let tail = EpochSecret::from_bytes([0x0C; 32]);
+    let rival = capability_message(
+        device,
+        rotation.transition_id(),
+        3,
+        vec![
+            EpochSecret::from_bytes([0x0A; 32]),
+            EpochSecret::from_bytes([0x0B; 32]),
+            tail.clone(),
+        ],
+    );
+    let mail = vec![deliver(&fixture, 3, &rival)];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 1);
+    // A mid-life resync over the conflicting facts succeeds — the
+    // other `build_keyring` caller, and the one an in-flight pass
+    // uses.
+    fixture
+        .engine
+        .resync()
+        .expect("resync tolerates the conflict");
+    // Restart: the held prefix keeps the first-committed secrets and
+    // the vacant tail installs, so epochs 1..=3 all resolve.
+    fixture.engine.release_store_lock();
+    let (identity_sk, _) = identity(0x02);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    fixture.engine = Engine::open(
+        fixture.dir.path.clone(),
+        member_drive(),
+        device,
+        "test-pass",
+        identity_sk,
+        encryption_sk,
+    )
+    .expect("conflicting facts open fill-vacant");
+    let mut expected = honest.clone();
+    expected.push(tail.clone());
+    for (epoch, secret) in expected.iter().enumerate() {
+        let epoch = epoch as u64 + 1;
+        let key = secret.control_key(&member_drive(), epoch);
+        assert_eq!(
+            fixture.engine.epoch_keys.get(&epoch).map(|k| k.to_vec()),
+            Some(key.to_vec()),
+            "epoch {epoch} resolves after reopen"
+        );
+    }
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 2, "both facts stay durable");
+    // The authoring precondition directly, not via the epoch_keys
+    // proxy above: `commit_new_epoch` reads
+    // `store.rebuild(..).keyring`, so the tail secret must be there —
+    // this is what unblocks the next mint.
+    let rebuilt = fixture.engine.store.rebuild(device).expect("rebuilds");
+    assert_eq!(
+        rebuilt.keyring.secret(3).cloned(),
+        Some(tail.clone()),
+        "the vacant tail installs for authoring to read"
+    );
+    // An honest regrant of the true vector still commits — new
+    // information is never suppressed — but it cannot dislodge the
+    // first-committed tail from the keyring. That residual is the
+    // pre-existing gap (no owner proof on the control framing), now
+    // visible instead of brick-shaped: the fact log records it.
+    // Re-add the envelope keys first: the reopen derived them from
+    // the committed facts, while test mail seals under the fixture
+    // keys.
+    for epoch in [1, 2, 3] {
+        fixture
+            .engine
+            .add_epoch_key(epoch, Zeroizing::new(control_key(epoch)));
+    }
+    let regrant = capability_message(
+        device,
+        rotation.transition_id(),
+        3,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+            EpochSecret::from_bytes([0x0D; 32]),
+        ],
+    );
+    let mail = vec![deliver(&fixture, 3, &regrant)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "the regrant commits");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 3);
+    // A third open over all three facts: the honest regrant changed
+    // the log but not the keyring — epoch 3 still resolves to the
+    // rival tail. This pins the residual the comment above
+    // describes, and fails if fill-vacant ever becomes last-wins.
+    fixture.engine.release_store_lock();
+    let (identity_sk, _) = identity(0x02);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    fixture.engine = Engine::open(
+        fixture.dir.path.clone(),
+        member_drive(),
+        device,
+        "test-pass",
+        identity_sk,
+        encryption_sk,
+    )
+    .expect("three conflicting facts still open");
+    let key = tail.control_key(&member_drive(), 3);
+    assert_eq!(
+        fixture.engine.epoch_keys.get(&3).map(|k| k.to_vec()),
+        Some(key.to_vec()),
+        "the first-committed tail survives the honest regrant"
+    );
+}
+
+/// Commit order is local durable commit order: two engines committing
+/// the same conflicting vectors in opposite arrival orders anchor
+/// different key histories. Deterministic per replica, not across
+/// replicas — honest operation never produces conflicts (one mint per
+/// binding), so this divergence requires a faulty or adversarial
+/// minter.
+#[test]
+fn conflicting_commit_order_decides_per_replica_key_history() {
+    let mut first = fixture();
+    let mut second = fixture();
+    let device = first.recipient;
+    assert_eq!(second.recipient, device);
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let honest = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+        ],
+    );
+    let rival = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x0A; 32]),
+            EpochSecret::from_bytes([0x0B; 32]),
+        ],
+    );
+    for fx in [&mut first, &mut second] {
+        let mail = vec![
+            deliver(fx, 1, &transition_message(&genesis)),
+            deliver(fx, 1, &transition_message(&admission)),
+        ];
+        queue(fx, mail);
+        assert_eq!(drain(fx).accepted, 2);
+    }
+    // Opposite arrival orders for the same two vectors.
+    let first_mail = vec![deliver(&first, 2, &honest), deliver(&first, 2, &rival)];
+    let second_mail = vec![deliver(&second, 2, &rival), deliver(&second, 2, &honest)];
+    queue(&mut first, first_mail);
+    queue(&mut second, second_mail);
+    assert_eq!(drain(&mut first).accepted, 2);
+    assert_eq!(drain(&mut second).accepted, 2);
+    // The live engines both hold the fixture pre-seed keys
+    // (fill-vacant installs nothing over held keys), so the anchor
+    // reads from the rebuilt keyring — what a reopen would install
+    // and what authoring would mint from.
+    for (fx, name, secret) in [
+        (&first, "first", [0x08; 32]),
+        (&second, "second", [0x0A; 32]),
+    ] {
+        let rebuilt = fx.engine.store.rebuild(device).expect("rebuilds");
+        assert_eq!(
+            rebuilt.keyring.secret(1).cloned(),
+            Some(EpochSecret::from_bytes(secret)),
+            "{name} committer anchors its first vector"
+        );
+        let facts = fx.engine.store.load().expect("loads");
+        assert_eq!(facts.capabilities.len(), 2, "both facts stay durable");
+    }
+}
+
 /// A freshly resealed identical capability is a duplicate, not a new
 /// envelope: the message id covers the sealed bytes (fresh nonce per
 /// seal), so envelope dedupe never fires — but the

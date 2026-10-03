@@ -162,7 +162,7 @@ ngit pr close <ID|nevent> --reason "blocked by upstream" --json
 ngit pr reopen <ID|nevent> --reason "fix was incomplete" --json
 ngit pr ready <ID|nevent> --reason "addressed review feedback" --json
 ngit pr draft <ID|nevent> --reason "needs more work" --json
-ngit pr label <ID|nevent> --label bug --label enhancement --json
+ngit pr label <ID|nevent> --label bug --json
 ngit pr set-subject <ID|nevent> --subject "New title" --json
 ngit pr set-cover-note <ID|nevent> --body "Updated description. See nostr:nevent1abc…" --json
 ```

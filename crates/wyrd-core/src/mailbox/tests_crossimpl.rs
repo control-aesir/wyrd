@@ -52,7 +52,12 @@ impl RealRelay {
     /// and the database outlive the serving loop, so a restart replays
     /// retained wraps like a relay reboot. The old listener drops
     /// asynchronously under shutdown, so the re-bind retries until it
-    /// lands instead of racing the teardown.
+    /// lands instead of racing the teardown. One limit the public API
+    /// imposes: `run()` also reports `Ok` when the relay is already
+    /// running, indistinguishably from a fresh bind — so the retry
+    /// covers the rebind race, not a missed restart. Recovery legs
+    /// therefore observe the rejoin (`wait_for_connected`) and the
+    /// replay (fresh-log redelivery), never this return value.
     fn restart(&self) {
         let start = Instant::now();
         loop {
@@ -93,8 +98,11 @@ fn heterogeneous_relays_cover_publication_replay_outage_and_recovery() {
     // otherwise a send could land on only one store and the replay
     // legs would prove nothing about the other relay. Only the fake
     // exposes its subscription count; the real relay's registration is
-    // proven by the delivery and replay legs below, which fail closed
-    // if its REQ never landed.
+    // not awaited here, so the first leg does not distinguish a live
+    // push from a replay served at subscribe time on the real relay —
+    // either way both wraps arrive. Replay against the real relay is
+    // proven separately, per relay, below; those legs fail closed if
+    // its history never landed.
     let mut mailbox = live_mailbox(&receiver, &relays, seen.clone());
     assert_eq!(
         wait_for_health(&mailbox, true, OUTAGE_TIMEOUT).connected_relays,
@@ -169,9 +177,11 @@ fn heterogeneous_relays_cover_publication_replay_outage_and_recovery() {
 
     // Outage with continued intake, killing the *real* relay: the pool
     // degrades to the fake survivor without dropping liveness, and a
-    // send through the full pool still resolves `Ok` and still reaches
-    // the survivor. This pins the SDK's reconnect path against a real
-    // implementation's TCP close, not just the fake's abort.
+    // send through the full pool still resolves `Ok` — the degraded-write
+    // path, which reports per-relay outcomes diagnostically and never
+    // fails the send for one dead relay. The survivor still delivers,
+    // which is all this leg pins; the reconnect itself is observed at
+    // recovery, not here.
     real.shutdown();
     wait_for_connected(&mailbox, 1, OUTAGE_TIMEOUT, "survivor reported");
     assert!(mailbox.health().is_live(), "one survivor is live");
@@ -196,12 +206,36 @@ fn heterogeneous_relays_cover_publication_replay_outage_and_recovery() {
         .expect("acks");
     assert_quiet(&mut mailbox);
 
-    // Recovery: the rebooted real relay rejoins the pool and its fresh
-    // subscription replays retained history, which collapses to silence
-    // on the acked log before new mail addressed through the pool
-    // arrives once.
+    // Recovery: the rebooted real relay rejoins the pool. Its
+    // replay is observed directly first: a fresh log subscribed to
+    // the rebooted relay alone must redeliver the two pre-outage
+    // wraps — proving the real relay's database survived the reboot
+    // and its fresh subscription replays retained history, not merely
+    // that the pool is quiet. (`via-survivor` is absent by construction:
+    // it published while the real relay was down.) Only then does the
+    // original log assert convergence to silence, before new mail
+    // addressed through the pool arrives once.
     real.restart();
     wait_for_connected(&mailbox, 2, RECOVERY_TIMEOUT, "recovered relay rejoins");
+    {
+        let mut replayed = live_mailbox(
+            &receiver,
+            &relays[1..2],
+            temp_path("seen-crossimpl-rebooted-fresh"),
+        );
+        wait_for_health(&replayed, true, RECOVERY_TIMEOUT);
+        let mut replayed_payloads = Vec::new();
+        for _ in 0..2 {
+            let delivery = wait_for_delivery(&mut replayed, DELIVERY_TIMEOUT)
+                .expect("rebooted relay replays retained history");
+            replayed_payloads.push(delivery.envelope().ciphertext.clone());
+            replayed
+                .settle(delivery.id(), Disposition::Ack)
+                .expect("acks");
+        }
+        replayed_payloads.sort();
+        assert_eq!(replayed_payloads, ["cross-first", "cross-second"]);
+    }
     assert_quiet(&mut mailbox);
     {
         let mut outbox = live_mailbox(

@@ -77,12 +77,13 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
 - **`SignerSession` trait**: the NIP-46 `sign_message` boundary
   (`trust.md` "NIP-46 remote signing"); a `nostr-connect`-style client
   implements it, tested here only against an in-memory fake key.
-- **Deferred**: the `nostr-connect` session negotiation is wiring for
+- **Deferred**: the `nostr-connect` session   negotiation is wiring for
   whatever composes this crate — the traits above are the pinned
   boundary. (`wyrd-sync/src/control/nip46.rs` is wire codecs only;
   no session-negotiation implementation exists yet.) The live
   mailbox side is described from the composer perspective in
-  `architecture.md`; this section describes the boundary it
+  `docs/architecture.md:176-178` (the `LiveMailbox` composition);
+  this section describes the boundary it
   implements, so the two stop contradicting each other.
 
 ## What is exchanged

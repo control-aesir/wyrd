@@ -279,12 +279,22 @@ what retries:
   undecodable `node_addr` publishes nothing; the plan reports
   absence (`Ok(None)` is genuine absence — nothing to ask,
   `missing_bytes_are_absence_not_error` in
-  `crates/wyrd-sync/src/bulk/tests_bulk.rs`). Visible: the snapshot
-  id, its epoch, and its membership binding — it classifies and
-  projects as history. Unusable: structure and bytes; manifests are
-  never synthesized. Fails: `open()` blocks to the want deadline,
-  then `EIO` (`wait_returns_on_success_and_on_deadline` in
-  `crates/wyrd-core/src/want.rs`). Retry: the next open re-registers
+  `crates/wyrd-sync/src/bulk/tests_bulk.rs`, and the undecodable
+  skip is counted by
+  `undecodable_route_publishes_nothing_and_counts_the_skip` in
+  `crates/wyrd-sync/src/transport/routes.rs`). Visible: the
+  recorded announcement — snapshot id, epoch, membership binding.
+  Routes never enter classification, so a snapshot whose body this
+  engine holds still classifies and projects; the failure comes
+  later. Fails: `open()` blocks to the want deadline, then `EIO`.
+  The deadline-to-`EIO` half is pinned at the registry
+  (`wait_returns_on_success_and_on_deadline` in
+  `crates/wyrd-core/src/want.rs`) and at the FUSE boundary for
+  chunk reads under a materialized tree
+  (`read_deadline_is_eio_and_releases_the_want` in
+  `crates/wyrd-daemon/src/fuse/tests_want.rs`); a manifest-chain
+  `open()` blocking all the way to `EIO` has no dedicated test and
+  is unverified until one lands. Retry: the next open re-registers
   the want; a re-announced route is fetched once its cooldown
   lapses (property 8 above), so recovery needs a new announcement,
   never a new caller.

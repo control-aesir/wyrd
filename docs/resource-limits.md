@@ -87,13 +87,22 @@ committed atomically with the admission itself (pinned by
 `admission_closure_cost_scales_with_history` in
 `crates/wyrd-sync/src/runtime/author/tests_admission.rs`). The
 ceiling answers the same way — an admission whose batch exceeds
-65,536 records is refused whole with `DurableError::TooManyRecords`
-out of `admit_device`: the newcomer is not admitted and nothing
-commits, so the drive never holds a partial lineage and a failure
-cannot leave a phantom tip (`failed_admit_leaves_no_phantom_tip`).
+65,536 records is refused whole: `check_commit_fits` rejects the
+batch before the encode loop (`DurableError::TooManyRecords`,
+surfaced as `EngineError::Durable` through the single `?` on
+`commit_facts`), so `admit_device` returns `Err`, the newcomer is
+not admitted, and nothing commits — the drive never holds a
+partial lineage. The atomic-failure half (a torn commit leaves no
+phantom tip) is pinned by `failed_admit_leaves_no_phantom_tip`;
+the ceiling boundary itself by `commit_fit_boundaries_match_the_load_ceilings`
+in `crates/wyrd-sync/src/durable/tests.rs`.
 The walk seeds from the live (current-epoch eligible) heads only;
 a superseded epoch's chain is not re-walked for later joiners,
-which bounds each admission by its own epoch's chain. Not a v0.2
+which bounds each admission by its own epoch's chain — at the cost
+of the late-joiner horizon (a newcomer admitted epochs later holds
+the old epoch keys without learning the old snapshot ids; see the
+Known v0.2 limitations in `ROADMAP.md` and
+`docs/fetch-on-open.md`). Not a v0.2
 blocker: it needs a long single-epoch history plus an admission,
 violates no bound in this document, and incremental checkpointing
 under the resource budget is the booked fix.

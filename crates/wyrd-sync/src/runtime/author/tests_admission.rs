@@ -1112,7 +1112,8 @@ fn admission_closure_cost_scales_with_history() {
 
     let (_dir, mut engine, _genesis) = owner_engine("admission-closure-cost");
     let mut objects = MemoryObjectStore::default();
-    for n in 0..6u8 {
+    const CHAIN_LEN: u8 = 6;
+    for n in 0..CHAIN_LEN {
         let chunk = objects.insert(ObjectKind::Chunk, &[0xA0 + n]).unwrap();
         let tree =
             Tree::from_entries(vec![Entry::file("cost.txt", 1, false, vec![chunk]).unwrap()])
@@ -1135,7 +1136,8 @@ fn admission_closure_cost_scales_with_history() {
         .filter(|(_, device)| *device == newcomer_id)
         .count();
     assert_eq!(
-        queued, 6,
+        queued,
+        usize::from(CHAIN_LEN),
         "first admission queues one obligation per closure member, no truncation"
     );
 

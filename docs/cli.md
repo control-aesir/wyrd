@@ -318,8 +318,11 @@ sync now
   burning the cap. Zero-progress passes park the settle window too,
   so dead churn waits on the relay instead of spinning.
 - `--relay <url>` (repeatable, shared parsing with `mount`): with
-  none given, intake stays idle and `now` discharges local
-  obligations and fetches nothing new.
+  none given, `now` refuses with a usage error unless `--offline`
+  is passed — a relay-less run exits 0 with an idle intake, which
+  automation keying on exit status cannot distinguish from a
+  converged sync. With `--offline`, intake stays idle: `now`
+  discharges local obligations and fetches nothing new.
 
 Route-less authoring is intentional, not an omission: `now` binds
 no serving endpoint, so its announcements carry no retrieval

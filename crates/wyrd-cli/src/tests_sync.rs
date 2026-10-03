@@ -675,14 +675,34 @@ fn headless_loop_settles_for_late_arriving_mail() {
     );
 }
 
-/// Headless `sync now` with no relays runs the real composition
+/// Headless `sync now --offline` runs the real composition
 /// (keystore, store, live node, offline mailbox, bulk endpoint) and
 /// converges a quiet drive immediately.
 #[test]
 fn sync_now_on_quiet_drive_completes() {
     let fixture = Fixture::new();
-    command(fixture.sync_args(vec![], "now")).unwrap();
+    // --offline belongs to the `now` subcommand, after the action.
+    let mut args = fixture.sync_args(vec![], "now");
+    args.push("--offline".into());
+    command(args).unwrap();
     let engine = fixture.open();
     let rendered = sync_status_render(&observe(&engine, 0).unwrap());
     assert!(rendered.contains("live heads: none"), "{rendered}");
+}
+
+/// A bare `sync now` with no relays is a usage error, not a quiet
+/// success: the relay-less run exits 0 with an idle intake, which
+/// automation keying on exit status cannot distinguish from a
+/// converged sync. The refusal happens before the keystore opens.
+#[test]
+fn sync_now_without_relay_or_offline_is_a_usage_error() {
+    let fixture = Fixture::new();
+    let error = command(fixture.sync_args(vec![], "now")).unwrap_err();
+    let CliError::Usage(message) = error else {
+        panic!("expected a usage refusal, got: {error:?}");
+    };
+    assert!(
+        message.contains("--relay") && message.contains("--offline"),
+        "refusal names both the missing flag and the opt-out: {message}"
+    );
 }

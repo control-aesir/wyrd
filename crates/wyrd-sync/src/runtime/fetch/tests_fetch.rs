@@ -15,8 +15,9 @@ use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::engine::{FETCH_COOLDOWN_PASSES, FETCH_MAX_STRIKES};
 use crate::runtime::test_util::{
     admit_engine, announcement_msg_with, body_root, capability_message, deliver, drain, fixture,
-    identity_secret, intake_body, intake_published, intake_snapshot, publish_into, queue, reopen,
-    transition_message, AnnouncedRoots, Fixture, TransportFault, TransportOnly, WithoutObjects,
+    identity_secret, intake_body, intake_body_with_tree, intake_published, intake_snapshot,
+    publish_into, queue, reopen, transition_message, AnnouncedRoots, Fixture, TransportFault,
+    TransportOnly, WithoutObjects,
 };
 
 /// A hostile peer on the storage route only: the transport map stays
@@ -1578,6 +1579,174 @@ fn absent_representations_do_not_strike() {
         .unwrap();
     assert_eq!(report.invalid, 0, "corrupt representation cooled");
     assert_eq!(report.missing, 1, "absent representation still attempted");
+}
+
+/// The manifest-chain walk over two hostile representations of one
+/// tree: corrupt bytes served under the first address, absence under
+/// the second. Both candidates are attempted, the corrupt one strikes
+/// while the absent one never does, and nothing commits — the engine
+/// holds no tree the open path could project. Trees are structural
+/// metadata (always wanted, never policy-gated), so no pin is
+/// needed: this is the plan-level half of the manifest-chain open
+/// leg (`docs/fetch-on-open.md`), staged here because the installed
+/// plus unblocked half lives at the daemon boundary, where the same
+/// walk cannot be re-driven once the durable facts call the tree
+/// local.
+#[test]
+fn corrupt_and_absent_tree_representations_commit_nothing() {
+    use wyrd_format::{Entry, Tree};
+
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let drive = member_drive();
+
+    // The tree both manifests name: real bytes, sealed twice under
+    // fresh nonces so the two representations address apart.
+    let payload = b"manifest-chain probe";
+    let chunk = ContentId::derive(ObjectKind::Chunk, payload);
+    let tree = Tree::from_entries(vec![Entry::file(
+        "probe.txt",
+        payload.len() as u64,
+        false,
+        vec![chunk],
+    )
+    .unwrap()])
+    .unwrap();
+    let tree_bytes = tree.encode();
+    let tree_id = ContentId::derive(ObjectKind::Tree, &tree_bytes);
+    // The announced body carries the same tree, so body, manifest,
+    // and tree agree exactly as a production announcement would.
+    let body_a = intake_body_with_tree(&builder, &admission, tree_id);
+    let snapshot_a = body_a.snapshot_id();
+    bulk.publish_snapshot(snapshot_a, body_a.encode());
+    bulk.publish_transport(body_a.encode());
+    let tree_key = epoch_secret.object_key(&drive, 2, &tree_id, ObjectKind::Tree, SEAL_VERSION);
+    let sealed_a = crate::seal::seal(&tree_key, ObjectKind::Tree, &tree_id, &tree_bytes).unwrap();
+    let sealed_b = crate::seal::seal(&tree_key, ObjectKind::Tree, &tree_id, &tree_bytes).unwrap();
+    assert_ne!(
+        sealed_a.storage_id(),
+        sealed_b.storage_id(),
+        "fresh nonces address the two representations apart"
+    );
+    let entry_a = entry_for(ObjectKind::Tree, 2, &sealed_a, &tree_id, &tree_bytes).unwrap();
+    let entry_b = entry_for(ObjectKind::Tree, 2, &sealed_b, &tree_id, &tree_bytes).unwrap();
+
+    // The corrupt carrier: announced with a served body, its manifest
+    // published with transport metadata like any honest root.
+    let manifest_a = Manifest::new(snapshot_a, vec![entry_a], Vec::new()).unwrap();
+    let (manifest_id_a, sealed_manifest_a) = seal_manifest(
+        &epoch_secret.manifest_key(&drive, 2, &snapshot_a),
+        &manifest_a,
+    )
+    .unwrap();
+    bulk.publish_root(
+        snapshot_a,
+        SealedManifest {
+            content_id: manifest_id_a,
+            sealed: sealed_manifest_a.encode(),
+        },
+    );
+    bulk.publish_transport(sealed_manifest_a.encode());
+    // Manual control plane: the announcement must name this body's
+    // roots, which `intake_published` cannot do for a caller-built
+    // manifest — it announces only its own body.
+    let cap = capability_message(
+        fixture.recipient,
+        admission.transition_id(),
+        admission.epoch,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+    );
+    let bound_a = announcement_msg_with(
+        &identity_secret(&builder.sk),
+        snapshot_a,
+        admission.epoch,
+        admission.transition_id(),
+        body_root(&body_a),
+        manifest_id_a,
+        crate::seal::transport_root(&sealed_manifest_a),
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, admission.epoch, &cap),
+        deliver(&fixture, admission.epoch, &bound_a),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 4);
+
+    // The absent carrier: announced but bodiless, its manifest
+    // published without transport metadata — nothing is served under
+    // either of its routes.
+    let snapshot_b = SnapshotId::from_bytes([0xB2; 32]);
+    let manifest_b = Manifest::new(snapshot_b, vec![entry_b], Vec::new()).unwrap();
+    let (manifest_id_b, sealed_manifest_b) = seal_manifest(
+        &epoch_secret.manifest_key(&drive, 2, &snapshot_b),
+        &manifest_b,
+    )
+    .unwrap();
+    bulk.publish_root(
+        snapshot_b,
+        SealedManifest {
+            content_id: manifest_id_b,
+            sealed: sealed_manifest_b.encode(),
+        },
+    );
+    let bound = announcement_msg_with(
+        &identity_secret(&builder.sk),
+        snapshot_b,
+        2,
+        admission.transition_id(),
+        BaoRoot::from_bytes([0x44; 32]),
+        manifest_id_b,
+        crate::seal::transport_root(&sealed_manifest_b),
+    );
+    let envelope = deliver(&fixture, 2, &bound);
+    queue(&mut fixture, vec![envelope]);
+    assert_eq!(drain(&mut fixture).accepted, 1);
+
+    // The first representation serves AEAD-failing bytes; the second
+    // is never published, from any route.
+    bulk.publish_sealed(sealed_a.storage_id(), vec![0xFF; 64]);
+    let mut objects = MemoryObjectStore::default();
+
+    // Both candidates are attempted and neither commits: the corrupt
+    // bytes strike, the absence is reported without striking, and the
+    // tree stays out of the store a projection would read.
+    let report = fixture
+        .engine
+        .execute_plan(&mut bulk, &mut objects)
+        .unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the served body adopts");
+    assert_eq!(report.manifests, 2, "both roots converge");
+    assert!(
+        report.invalid >= 1,
+        "the corrupt representation is tried and strikes"
+    );
+    assert!(
+        report.missing >= 1,
+        "the absent representation is tried and reported"
+    );
+    assert_eq!(report.objects, 0, "no representation commits");
+    // A second run strikes the corrupt representation again — still
+    // short of the cooldown threshold — while the absent one stays
+    // strikeless and nothing commits.
+    let report = fixture
+        .engine
+        .execute_plan(&mut bulk, &mut objects)
+        .unwrap();
+    assert!(
+        report.invalid >= 1,
+        "the corrupt representation strikes again"
+    );
+    assert_eq!(report.objects, 0, "no representation commits");
+    assert!(
+        !objects.has(&tree_id).unwrap(),
+        "the hostile tree never lands in the store"
+    );
 }
 
 #[test]

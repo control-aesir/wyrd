@@ -69,6 +69,7 @@ use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;
 use crate::durable::{DurableError, DurableStore, Fact};
+use crate::keys::capability::Capability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey};
 use crate::membership::MembershipLog;
 use crate::membership::TransitionStatus;
@@ -592,6 +593,18 @@ pub struct Engine {
     /// forks never become facts — so replay never encounters a conflict
     /// intake could have detected.
     pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
+    /// The committed-capability projection intake validates against:
+    /// one hydrated capability per (device, authorizing transition),
+    /// recorded by [`Engine::commit_facts`] itself so every writer of
+    /// `Fact::Capability` lands here, and rebuilt from the durable
+    /// facts on resync. A resealed
+    /// byte-identical capability mints a fresh message id (fresh seal
+    /// nonce), so envelope dedupe never fires — the value comparison
+    /// here is what turns the reseal into a `Duplicate` instead of a
+    /// second fact. A conflicting value under an already-recorded key
+    /// still commits: the projection suppresses exact replays, never
+    /// new information.
+    pub(super) committed_capabilities: BTreeMap<(DeviceId, TransitionId), Capability>,
     /// Held (deferred) control messages with their unblocking
     /// dependencies: arrival order plus a dependency index (see
     /// [`PendingQueue`]). A flush batch emits the woken entries in
@@ -673,6 +686,7 @@ impl Engine {
             epoch_keys: BTreeMap::new(),
             log: MembershipLog::new(drive),
             announcements: BTreeMap::new(),
+            committed_capabilities: BTreeMap::new(),
             pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
@@ -947,7 +961,27 @@ impl Engine {
         if let Some(stage) = self.crash_stage.take() {
             return self.store.commit_until(facts, stage);
         }
-        self.store.commit(facts)
+        let seq = self.store.commit(facts)?;
+        // The committed-capability projection is a property of the
+        // commit, not of any one intake caller: every writer of
+        // `Fact::Capability` (control and rotation intake, authoring,
+        // bootstrap) records what it committed here, so the live
+        // projection and the resync rebuild cannot disagree within
+        // one lifetime. Updated only after the durable write
+        // succeeds — the projection follows the store, never leads
+        // it (the rotation path's pre-flush stage at `intake/mod.rs`
+        // is the one documented exception) — and skipped on the
+        // torn-commit path above, where recovery reopens (except
+        // after `CURRENT` is renamed, where the batch is durable and
+        // only the in-memory view lags until the reopen rebuilds it).
+        for fact in facts {
+            if let Fact::Capability(authorized) = fact {
+                let committed = authorized.capability();
+                self.committed_capabilities
+                    .insert((committed.device, committed.transition), committed.clone());
+            }
+        }
+        Ok(seq)
     }
 
     /// Test-only: release the store's advisory lock without dropping the
@@ -1055,6 +1089,15 @@ impl Engine {
             state.record_announcement(a)?;
         }
         self.announcements = state.announcements;
+        // The capability projection replays in commit order, last value
+        // wins: conflicting values under one key are all durable facts
+        // (intake never drops new information), and the projection
+        // holds the latest for the replay check.
+        let mut committed_capabilities = BTreeMap::new();
+        for c in facts.capabilities {
+            committed_capabilities.insert((c.device, c.transition), c);
+        }
+        self.committed_capabilities = committed_capabilities;
         // Pending-invitation material re-derives the invitation's
         // control keys on every resync: the joined device holds no
         // authorized capability yet, so without this a restart between

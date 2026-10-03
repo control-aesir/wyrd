@@ -218,7 +218,10 @@ Commit precedes settle per envelope: accepted/duplicates ack,
 discards settle Poison, deferred/held/skipped retry. A commit
 failure resyncs and never settles that envelope, so it redelivers.
 Suppression verdicts and pending queues are memory-only and
-revalidate after restart; poison settlements are memory-only too,
+revalidate after restart; the announcement and committed-capability
+projections are rebuilt from durable facts on every resync, so
+post-restart duplicate verdicts re-derive from the store rather than
+from memory the crash took; poison settlements are memory-only too,
 so redelivery re-poisons; the durable seen set survives for
 consumption. Pinned by the intake restart suite
 (`intake/tests_pipeline.rs`: crash-before-commit redelivery,

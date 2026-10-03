@@ -467,6 +467,10 @@ fn note_committed_facts(engine: &mut Engine, facts: &[Fact]) {
         if let Fact::ControlMessage(id) = fact {
             engine.inbox.remember(id);
         }
+        // The committed-capability projection needs no mirror here:
+        // `commit_facts` records every committed capability itself,
+        // so rotation deliveries (which never consult the projection)
+        // still land in it for a later control-path reseal to read.
         if let Fact::Capability(authorized) = fact {
             let drive = engine.drive;
             for (index, secret) in authorized.capability().secrets.iter().enumerate() {
@@ -672,6 +676,24 @@ fn capability_action(
     let transition_id = capability.transition;
     match AuthorizedCapability::authorize(capability, engine.drive(), &engine.log, &transition_id) {
         Ok(authorized) => {
+            // Already recorded: the seal nonce mints a fresh message
+            // id per wrap, so envelope dedupe never fires for a
+            // reseal — the committed-capability projection is the
+            // check that turns an identical regrant into a `Duplicate`
+            // with no facts, before the budget charge. A conflicting
+            // value under a recorded key is new information and still
+            // commits; the rotation path never consults this (a carried
+            // transition may be committed while its capability is
+            // still unrecorded, and dropping the delivery would stall
+            // the device on a missing epoch secret).
+            let committed = authorized.capability();
+            if engine
+                .committed_capabilities
+                .get(&(committed.device, committed.transition))
+                .is_some_and(|known| known == committed)
+            {
+                return Action::Duplicate;
+            }
             // Shed before committing: authorization is spent work, but
             // the facts are not yet recorded and no view mutated, so
             // the envelope can still shed cleanly.
@@ -923,6 +945,19 @@ fn rotation_commit(
     }
     engine.log.observe(transition.clone());
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
+    // The flush below re-drives held entries through the capability
+    // arm, so the committing value must already be visible to the
+    // projection — the announcement analog of the `staged` map above.
+    // A held identical regrant then consumes as a duplicate instead of
+    // recommitting. If the batch below fails to commit, the error
+    // path resyncs (rebuilding the projection without this value),
+    // and the consumed entry's envelope was never settled, so relay
+    // redelivery revalidates it later against durable truth.
+    let committing = authorized.capability();
+    engine.committed_capabilities.insert(
+        (committing.device, committing.transition),
+        committing.clone(),
+    );
     let mut facts = vec![
         Fact::Transition(transition),
         Fact::Capability(authorized),

@@ -34,8 +34,9 @@
 //! and the envelope layer treats it as new. Whether it then commits is
 //! per-kind content dedupe: transitions by transition id (the id covers
 //! every byte), announcements by the `Same` update check, capabilities
-//! by nothing yet — a resealed identical capability recommits, and
-//! semantic capability dedupe is a later issue. Senders therefore
+//! by the committed-capability projection (the unwrapped value, keyed
+//! per device and authorizing transition — a resealed identical
+//! capability acks as a duplicate with no facts). Senders therefore
 //! resend byte-identical envelopes on retry (first seal wins), never
 //! fresh seals: a regenerated seal defeats envelope dedupe, and under
 //! queue pressure each retry consumes a distinct pending slot.

@@ -297,10 +297,13 @@ within the retained inbox state: receivers dedupe by message id (BLAKE3
 over the sealed bytes) and the machines are set-based. Processed
 messages dedupe from durable `Fact::ControlMessage` records, so
 redelivery after a restart is a no-op — with one more source beside
-them: a byte-identical announcement replay, or a resealed
-already-observed transition, acks as a semantic duplicate with no new
-fact written, and the verdict re-derives from the durable membership
-log and announcement projection rebuilt on resync. Terminal invalid messages —
+them: a byte-identical announcement replay, a resealed
+already-observed transition, or a resealed already-recorded
+capability, acks as a semantic duplicate with no new
+fact written, and the verdict re-derives from durable state rebuilt
+on resync — the membership log backs the transition verdict, the
+announcement projection the announcement verdict, and the
+committed-capability projection the capability verdict. Terminal invalid messages —
 framing-valid but semantically unprocessable — take a different path:
 suppression verdicts are deterministic but memory-only and
 FIFO-bounded (4096 ids), committing no durable fact, so unique invalid

@@ -19,6 +19,7 @@ use super::DurableError;
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::capability::DriveKeyring;
+use crate::keys::capability::InstallError;
 use crate::membership::MembershipLog;
 use crate::runtime::{ManifestRecord, MaterializationState, RuntimeState};
 
@@ -253,7 +254,27 @@ pub(crate) fn build_keyring(
         // produces are inseparable — so a record that passed the
         // store-key envelope can never install a capability whose
         // drive, binding, or secret count is stale.
-        keyring.install(cap, &log)?;
+        //
+        // A conflicting vector under an already-installed key does
+        // not fail the rebuild: commit order is first-wins (the live
+        // intake installs fill-vacant and never swaps a held secret
+        // behind traffic sealed under it), the conflicting fact stays
+        // durable as tamper evidence, and failing the open over it
+        // would let one proof-less control-framed grant permanently
+        // brick the node. The skip is loud, so a conflict never
+        // passes silently.
+        match keyring.install(cap, &log) {
+            Ok(_) => {}
+            Err(InstallError::EpochConflict(epoch)) => {
+                tracing::warn!(
+                    device = %device,
+                    epoch,
+                    transition = %cap.transition,
+                    "conflicting capability fact skipped: first-committed secret holds"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(keyring)
 }

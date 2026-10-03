@@ -969,8 +969,11 @@ impl Engine {
         // projection and the resync rebuild cannot disagree within
         // one lifetime. Updated only after the durable write
         // succeeds — the projection follows the store, never leads
-        // it — and skipped on the torn-commit path above, where
-        // nothing durable exists to follow and recovery reopens.
+        // it (the rotation path's pre-flush stage at `intake/mod.rs`
+        // is the one documented exception) — and skipped on the
+        // torn-commit path above, where recovery reopens (except
+        // after `CURRENT` is renamed, where the batch is durable and
+        // only the in-memory view lags until the reopen rebuilds it).
         for fact in facts {
             if let Fact::Capability(authorized) = fact {
                 let committed = authorized.capability();

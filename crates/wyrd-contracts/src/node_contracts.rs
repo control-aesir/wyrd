@@ -40,6 +40,8 @@ struct SilentMailbox;
 
 impl Mailbox for SilentMailbox {
     fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        // Deliberately claims acceptance the fake never observed: the
+        // contracts here need obligations to drain, not a refusal path.
         Ok(SendReport { accepted: 1 })
     }
 

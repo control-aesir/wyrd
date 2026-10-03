@@ -84,7 +84,11 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   relay accepts leaves the obligation pending for a later pass —
   retiring it there would lose the sender's recovery path while the
   recipient never saw the event — pinned by
-  `delivery_retains_obligation_when_no_relay_accepts`. The states:
+  `delivery_retains_obligation_when_no_relay_accepts`. A refused
+  obligation retries every pass indefinitely: v0.2 has no ceiling,
+  backoff, or attempt counter, so a permanently refusing relay
+  means a permanently pending obligation, visible through the
+  pending projection. The states:
   | Local send attempted | Not delivered — the bytes may have reached nobody |
   | At least one relay accepted | Relay-accepted: the fact's whole meaning |
   | Recipient received | Not guaranteed unless separately acknowledged |

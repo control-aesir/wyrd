@@ -347,6 +347,9 @@ pub(super) struct BrokenMailbox;
 
 impl Mailbox for BrokenMailbox {
     fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        // Deliberately claims acceptance the fake never observed: this
+        // mailbox is broken on `recv`, and its tests never read the
+        // send report.
         Ok(SendReport { accepted: 1 })
     }
 

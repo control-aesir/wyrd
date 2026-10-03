@@ -12,7 +12,7 @@
 //! durable fact store, and the drive-local serving vault. The iroh
 //! endpoint wiring in the daemon and the mirror/vault peer roles are
 //! the remaining slices. The iroh version set is validated as a set;
-//! change all three together and run the full test suite.
+//! change both together and run the full test suite.
 
 pub mod authorization;
 pub mod bulk;

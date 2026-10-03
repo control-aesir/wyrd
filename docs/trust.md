@@ -989,7 +989,7 @@ until then no vault-visible bytes carry drive identity.
    the pre-transition owner set, conflict resolution by extension).
 2. Manifest partition encoding details (sharding, chunked transfer).
 3. Live-view conflict naming (e.g. by author id / snapshot timestamp).
-4. Gossip (iroh-gossip) framing for snapshot announcements (announcement encoding pinned in `wyrd-sync/src/control/`).
+4. Gossip framing for snapshot announcements (candidate: iroh-gossip — the dependency stays out until this lands; announcement encoding pinned in `wyrd-sync/src/control/`).
 5. Chunk-size parameters (benchmark before the v1 freeze).
 6. ~~Keystore KDF~~ — v0 choice recorded: **Argon2id**, 64 MiB memory,
    t=3, p=1, 16-byte random salt, 32-byte output, selected for

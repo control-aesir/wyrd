@@ -130,9 +130,16 @@ pub(super) fn wait_for_distinct_deliveries(
             ids.len(),
             wanted,
         );
-        match mailbox.recv().unwrap() {
-            Some(delivery) if seen.insert(delivery.id()) => ids.push(delivery.id()),
-            _ => std::thread::sleep(Duration::from_millis(50)),
+        let mut progressed = false;
+        if let Some(delivery) = mailbox.recv().unwrap() {
+            let id = delivery.id();
+            if seen.insert(id) {
+                ids.push(id);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
     ids

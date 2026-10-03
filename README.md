@@ -210,15 +210,21 @@ To try the alpha without installing Rust:
 nix run .#wyrd -- --help
 ```
 
-Prebuilt `wyrd-{version}-{platform}.tar.gz` archives ship with each ngit
-release (built reproducibly per platform via `nix build .#wyrd-dist`). Alpha caveat: the on-disk format, the trust protocol, and the CLI
-can all change between alphas — `CHANGELOG.md` leads with the format
-version so you can tell whether two builds interoperate.
+Release archives (`wyrd-{version}-{platform}.tar.gz`, built reproducibly
+per platform via `nix build .#wyrd-dist`) ship with ngit releases —
+but v0.2 publishes none: distribution is explicitly out of scope for
+this milestone (see ROADMAP.md), so there is nothing to download yet.
+Run v0.2 from source (`cargo run -p wyrd-cli -- ...`) or without
+installing Rust via `nix run .#wyrd` above. Alpha caveat: the
+on-disk format, the trust protocol, and the CLI can all change
+between alphas — `CHANGELOG.md` leads with the format version so
+you can tell whether two builds interoperate.
 
-### Running the alpha release
+### Running the alpha from source
 
-Each archive holds one binary, `bin/wyrd`. It does two things: create a
-drive, and mount one.
+A release archive holds one binary, `bin/wyrd` (v0.2 publishes no
+archives yet, so build it yourself or run it via the commands
+above). It does two things: create a drive, and mount one.
 
 ```bash
 # 1. Credentials: an identity secret (32 raw bytes or 64 hex chars) and a

@@ -182,13 +182,13 @@ state transitions, and fuzzing for the envelope and decoder surfaces.
 
 Thesis: Wyrd can synchronize real drives reliably over the live network.
 
-Ship: multi-relay mailbox operation, relay interoperability, peer repair
-and history catch-up, correct closure and head gating, demand-driven
-content acquisition, bounded intake and resource consumption, correct
-shutdown and restart behavior, headless sync, sync status, materialization
-policy, reliable FUSE read/write operation, E2E convergence tests,
-adversarial and runtime property tests, operationally meaningful limits
-and failure behavior.
+Ship: multi-relay mailbox operation, relay interoperability, fetch-walk
+alternate-provider fallback and history catch-up, correct closure and
+head gating, demand-driven content acquisition, bounded intake and
+resource consumption, correct shutdown and restart behavior, headless
+sync, sync status, materialization policy, reliable FUSE read/write
+operation, E2E convergence tests, adversarial and runtime property
+tests, operationally meaningful limits and failure behavior.
 
 Explicitly do not ship: the recovery grafting workflow (no operator
 surface: no CLI command, no daemon entry point, no owner
@@ -207,7 +207,12 @@ convergence are separate failure domains; the definition covers both.
 Known v0.2 limitations (documented, not deferred silently): stranded local
 content has no sanctioned path back until the v0.3 content-recovery
 workflow; the local store is cooperative, so concurrent non-cooperating
-writers are outside the supported concurrency model.
+writers are outside the supported concurrency model; there is no
+dedicated peer-repair loop or scrub — corrupt or unreachable candidates
+fall back to the next recorded provider inside the fetch walk, each
+snapshot names a single route (v0 has no replication serving), and when
+no candidate serves the waiter fails bounded (EIO) with invalid bytes
+never committed or served.
 
 Milestone decision (content recovery in v0.2): the grafting
 primitives exist at the library layer only.

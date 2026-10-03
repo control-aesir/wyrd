@@ -6,7 +6,7 @@
     {
       "slot": "rules/s4-body",
       "backs": [
-        { "file": "README.md", "heading": "### 4. Continuous Self-Healing Integrity" },
+        { "file": "README.md", "heading": "### 4. Content-Verified Integrity" },
         { "file": "docs/architecture.md", "heading": "## Current status" }
       ],
       "mustContain": ["fully automatic repair is still being built"],

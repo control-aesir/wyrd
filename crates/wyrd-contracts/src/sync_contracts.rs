@@ -28,7 +28,7 @@ use wyrd_sync::runtime::{
 use wyrd_sync::seal::{self, SEAL_VERSION};
 use wyrd_sync::serving::VaultSource;
 use wyrd_sync::transport::mailbox::{
-    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
 };
 
 use crate::support::{
@@ -195,7 +195,7 @@ impl<'a, M: Mailbox> FailFirstSettle<'a, M> {
 }
 
 impl<M: Mailbox> Mailbox for FailFirstSettle<'_, M> {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         self.inner.send(envelope)
     }
 
@@ -796,7 +796,9 @@ fn a_damaged_head_beside_an_installed_one_fails_the_pass_closed() {
 /// takes — and indefinitely, if the fetch never completes.
 #[test]
 fn a_pending_only_pass_still_delivers_the_durable_outbox() {
-    use wyrd_sync::transport::mailbox::{Disposition, Mailbox, MailboxEnvelope, MailboxError};
+    use wyrd_sync::transport::mailbox::{
+        Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
+    };
 
     let mut loaded = Loaded::new("keeper.txt", b"keeper");
     let mut engine = loaded.rig.take_engine();
@@ -814,11 +816,13 @@ fn a_pending_only_pass_still_delivers_the_durable_outbox() {
     let local = engine.author_snapshot(&scratch, tree).unwrap();
 
     // A refused announcement leaves its obligation durable: the
-    // outbox the pending-only pass must still drain.
+    // outbox the pending-only pass must still drain. Refusal is not
+    // a failure — zero acceptance returns `Ok`, so the pass counts
+    // nothing and keeps the obligation pending for a later pass.
     struct OfflineMailbox;
     impl Mailbox for OfflineMailbox {
-        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-            Err(MailboxError::Transport("offline".into()))
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+            Ok(SendReport { accepted: 0 })
         }
         fn recv(
             &mut self,
@@ -833,11 +837,12 @@ fn a_pending_only_pass_still_delivers_the_durable_outbox() {
             Ok(())
         }
     }
-    assert!(
+    assert_eq!(
         engine
             .announce_snapshot(&local, &mut OfflineMailbox, None)
-            .is_err(),
-        "the refused announcement reports the failure"
+            .unwrap(),
+        0,
+        "the refused announcement counts nothing, not a failure"
     );
     assert!(
         engine.has_pending_outbound().unwrap(),
@@ -981,7 +986,7 @@ impl<'a, M: Mailbox> FailFirstSend<'a, M> {
 }
 
 impl<M: Mailbox> Mailbox for FailFirstSend<'_, M> {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         if self.armed {
             self.armed = false;
             return Err(MailboxError::Transport("lost announcement".into()));
@@ -1760,8 +1765,8 @@ fn conflicted_drive_rejects_mounted_writes() {
 
     struct NoopMailbox;
     impl Mailbox for NoopMailbox {
-        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-            Ok(())
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+            Ok(SendReport { accepted: 1 })
         }
         fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
             Ok(None)

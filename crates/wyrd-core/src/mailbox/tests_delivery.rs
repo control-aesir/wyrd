@@ -157,9 +157,9 @@ fn deliveries_round_trip_and_replay_converges_after_restart() {
 }
 
 /// A relay-side write refusal (fee, PoW, allowlist on kind 1059) is
-/// diagnosable, not silent: the refused send still resolves `Ok` —
-/// failing the send (and holding the outbox obligation pending instead
-/// of retiring it) is a separate protocol decision — while the
+/// diagnosable, not silent: the refused send still resolves `Ok`,
+/// but the report carries `accepted: 0` — the engine outbox holds
+/// the obligation pending instead of retiring it — while the
 /// recipient observes silence. The relay's answer lands on the
 /// `mailbox send relay outcome` debug line (accounting pinned by
 /// `send_outcome_classifies_acceptance_and_non_acceptance`); this test pins
@@ -185,15 +185,20 @@ fn relay_write_refusal_resolves_ok_and_delivers_nothing() {
     assert_eq!(proven.envelope().ciphertext, "before");
     inbox.settle(proven.id(), Disposition::Ack).expect("acks");
 
-    // Refuse mode: the send resolves `Ok`, the recipient hears nothing.
+    // Refuse mode: the send resolves `Ok` with zero acceptance,
+    // and the recipient hears nothing.
     relay.reject_writes("blocked: kind 1059 needs payment");
-    outbox
+    let report = outbox
         .send(envelope(
             device_id(&sender),
             device_id(&receiver),
             "refused-mail",
         ))
-        .expect("refusal still resolves Ok: failing the send is a separate protocol decision");
+        .expect("refusal still resolves Ok");
+    assert_eq!(
+        report.accepted, 0,
+        "a refused write is accepted by no relay"
+    );
     assert_quiet(&mut inbox);
 
     // Accept mode again: the refusal was policy, not a broken mailbox.
@@ -205,6 +210,61 @@ fn relay_write_refusal_resolves_ok_and_delivers_nothing() {
     assert_eq!(delivery.envelope().ciphertext, "after");
     inbox.settle(delivery.id(), Disposition::Ack).expect("acks");
     assert_quiet(&mut inbox);
+}
+
+/// Refusal through the whole stack: an engine outbox sending over a
+/// refusing `LiveMailbox` keeps its obligations pending — no
+/// Delivered fact, `deliver_pending` counts nothing — and the same
+/// outbox discharges once the relay accepts. This pins the consumer
+/// gate (`send_sealed_to`) against a real relay refusal instead of
+/// an injected report.
+#[test]
+fn engine_outbox_retains_obligations_through_live_relay_refusal() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let owner_identity = DeviceIdentitySecret::generate().unwrap();
+    let recipient_identity = DeviceIdentitySecret::generate().unwrap();
+    let recipient_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let owner_keys = keys_for(&owner_identity);
+
+    let mut owner = Engine::create(
+        temp_path("refusal-owner"),
+        "test-pass",
+        owner_identity.clone(),
+    )
+    .unwrap();
+    let _ = owner
+        .admit_device(
+            recipient_identity.device_id(),
+            recipient_encryption.encryption_key(),
+        )
+        .unwrap();
+    let mut owner_mailbox = live_mailbox(
+        &owner_keys,
+        std::slice::from_ref(&url),
+        temp_path("refusal-owner-seen"),
+    );
+
+    relay.reject_writes("blocked: kind 1059 needs payment");
+    assert_eq!(
+        owner.deliver_pending(&mut owner_mailbox).unwrap(),
+        0,
+        "refused sends count nothing"
+    );
+    assert!(
+        owner.has_pending_outbound().unwrap(),
+        "refusal keeps the obligations pending"
+    );
+
+    relay.accept_writes();
+    assert!(
+        owner.deliver_pending(&mut owner_mailbox).unwrap() > 0,
+        "acceptance discharges the retained obligations"
+    );
+    assert!(
+        !owner.has_pending_outbound().unwrap(),
+        "nothing stays pending after acceptance"
+    );
 }
 
 /// In-memory tracing writer: captures the send-path debug line so the

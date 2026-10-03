@@ -300,8 +300,11 @@ impl wyrd_sync::transport::mailbox::Mailbox for NoopMailbox {
     fn send(
         &mut self,
         _envelope: wyrd_sync::transport::mailbox::MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
-        Ok(())
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
+        Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
     }
 
     fn recv(
@@ -1471,9 +1474,12 @@ impl wyrd_sync::transport::mailbox::Mailbox for ReplayMailbox {
     fn send(
         &mut self,
         envelope: wyrd_sync::transport::mailbox::MailboxEnvelope,
-    ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+    ) -> Result<
+        wyrd_sync::transport::mailbox::SendReport,
+        wyrd_sync::transport::mailbox::MailboxError,
+    > {
         self.push(envelope);
-        Ok(())
+        Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
     }
 
     fn recv(
@@ -1563,9 +1569,12 @@ fn headless_loop_converges_a_new_device_to_current_heads() {
             fn send(
                 &mut self,
                 envelope: MailboxEnvelope,
-            ) -> Result<(), wyrd_sync::transport::mailbox::MailboxError> {
+            ) -> Result<
+                wyrd_sync::transport::mailbox::SendReport,
+                wyrd_sync::transport::mailbox::MailboxError,
+            > {
                 self.sent.push(envelope);
-                Ok(())
+                Ok(wyrd_sync::transport::mailbox::SendReport { accepted: 1 })
             }
             fn recv(
                 &mut self,

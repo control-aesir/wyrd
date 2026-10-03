@@ -241,7 +241,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use wyrd_format::DeviceId;
 use wyrd_sync::transport::mailbox::MAX_MAILBOX_CIPHERTEXT_LEN;
 use wyrd_sync::transport::{
-    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
+    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
 };
 
 use crate::wake::WakeSignal;
@@ -1621,7 +1621,7 @@ impl<S> Mailbox for LiveMailbox<S>
 where
     S: AsyncGetPublicKey + AsyncSignEvent + AsyncNip44 + Send + Sync + 'static,
 {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         // Identity binding on the envelope too: the caller's `sender` is
         // metadata this adapter will not let lie — mail leaves under this
         // device's identity or not at all.
@@ -1650,11 +1650,12 @@ where
         // Per-relay send forensics at the same level as the outbox send
         // line: `send_event` resolves `Ok` even when every relay refused
         // the write (an `OK false` lands in `failed`, not in `Err`), so
-        // without this line a relay-side rejection is indistinguishable
-        // from success — the recipient just never receives. The outcome
-        // stays diagnostic only: whether an explicit refusal should fail
-        // the send (and hold the outbox obligation pending instead of
-        // retiring it) is a protocol decision for a separate change.
+        // without this report a relay-side rejection is indistinguishable
+        // from success — the recipient just never receives. The report
+        // carries the acceptance count to the outbox: zero accepted
+        // keeps the obligation pending for a later pass instead of
+        // retiring it, so a Delivered fact always has at least one
+        // relay acceptance behind it.
         let outcome = classify_send_outcome(&output);
         tracing::debug!(
             event_id = %output.id().to_hex(),
@@ -1665,7 +1666,9 @@ where
             not_accepted_relays = ?outcome.not_accepted,
             "mailbox send relay outcome"
         );
-        Ok(())
+        Ok(SendReport {
+            accepted: outcome.accepted.len(),
+        })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

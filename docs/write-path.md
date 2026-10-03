@@ -358,7 +358,9 @@ A commit proceeds in this order, and the order is the contract:
 6. **Announcement discharge.** The recorded obligation is sent
    with retry through the durable outbox (`Engine::announce_snapshot`
    for one snapshot, `Engine::announce_pending` for the resume path:
-   per-recipient delivered markers, byte-identical sealed retries per
+   per-recipient delivered markers — one per relay-accepted send, so
+   a send no relay accepts leaves the obligation pending for a later
+   pass — byte-identical sealed retries per
    route — the canonical seal when its route is live, else the
    persisted route-specific reseal).
 

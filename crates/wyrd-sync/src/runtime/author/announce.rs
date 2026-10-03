@@ -9,7 +9,7 @@ use crate::transport::mailbox::Mailbox;
 
 /// Announce an authored snapshot to every other admitted device of the
 /// snapshot's bound transition — members and readers alike — over the
-/// control plane, returning the number of envelopes sent this call (the
+/// control plane, returning the number of relay-accepted sends this call (the
 /// author is skipped: it already holds the body). The epoch must be one
 /// this engine holds a control key for, and the snapshot's root manifest
 /// must be recorded — the announcement carries the transport identities the
@@ -24,7 +24,7 @@ use crate::transport::mailbox::Mailbox;
 /// pre-outbox snapshots (idempotent), seals the announcement once (the
 /// sealed bytes persist, so every retry resends byte-identical bytes
 /// and the receiver's message-id dedupe collapses the retry to a
-/// no-op), and records one delivered marker per successful send. A
+/// no-op), and records one delivered marker per relay-accepted send. A
 /// mid-loop send failure returns the error with the remaining
 /// recipients still pending — resume with [`announce_pending`], which
 /// resends only the undischarged obligations. The first seal wins, so
@@ -136,7 +136,7 @@ pub(crate) fn announce(
 }
 
 /// Resume every undischarged announcement obligation across snapshots,
-/// returning the number of envelopes sent this call. This is the
+/// returning the number of relay-accepted sends this call. This is the
 /// restart path: after a crash or a partial send, the durable outbox
 /// still holds the queued-minus-delivered pairs, and this sends them
 /// without re-authoring anything. Snapshots with no persisted sealed
@@ -224,7 +224,7 @@ pub(crate) fn announce_pending(
 
 /// Send one snapshot's pending announcement obligations, reusing the
 /// persisted seal when its route is live and reusing or persisting a
-/// route-specific reseal otherwise. Returns the envelopes sent, or
+/// route-specific reseal otherwise. Returns the relay-accepted sends, or
 /// `None` when the sealing key is not held (the obligation stays
 /// pending for a later pass).
 ///
@@ -453,7 +453,7 @@ fn reannounce_one(
 }
 
 /// Send the sealed bytes to every still-pending recipient of one
-/// snapshot, recording one delivered marker per successful send. A
+/// snapshot, recording one delivered marker per relay-accepted send. A
 /// send failure returns immediately with the rest still pending.
 fn send_pending_for(
     engine: &mut Engine,

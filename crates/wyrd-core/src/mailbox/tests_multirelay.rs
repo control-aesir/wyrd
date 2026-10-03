@@ -119,8 +119,9 @@ fn two_relays_cover_publication_replay_outage_and_recovery() {
     // mailbox to the survivor without dropping liveness — and a send
     // through the full pool still resolves `Ok` and still reaches the
     // survivor. That is all this leg pins: per-relay send accounting
-    // stays diagnostic-only (and separately unit-tested), so nothing
-    // here observes which bucket the dead relay lands in.
+    // is load-bearing (zero acceptance would hold the outbox
+    // obligation pending), but the survivor accepts here, so the
+    // refusal path is not what this leg observes.
     relay_a.shutdown();
     wait_for_connected(&mailbox, 1, OUTAGE_TIMEOUT, "survivor reported");
     assert!(mailbox.health().is_live(), "one survivor is live");

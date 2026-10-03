@@ -7,7 +7,9 @@ use wyrd_format::{
 };
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
-use wyrd_sync::transport::mailbox::{Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope};
+use wyrd_sync::transport::mailbox::{
+    Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, SendReport,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,9 +51,9 @@ impl ThreadRecordingMailbox {
 }
 
 impl Mailbox for ThreadRecordingMailbox {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         self.sent.lock().unwrap().push(envelope);
-        Ok(())
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

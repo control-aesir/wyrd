@@ -14,7 +14,7 @@ use crate::runtime::test_util::{
 };
 use crate::transport::mailbox::{
     seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
-    MemoryMailbox, MemoryRelay,
+    MemoryMailbox, MemoryRelay, SendReport,
 };
 
 /// One scenario epoch secret (capability-delivered knowledge).
@@ -324,12 +324,12 @@ pub(super) struct FailingMailbox {
 }
 
 impl Mailbox for FailingMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         if self.sent >= self.fail_after {
             return Err(MailboxError::Crypto);
         }
         self.sent += 1;
-        Ok(())
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
@@ -346,8 +346,11 @@ impl Mailbox for FailingMailbox {
 pub(super) struct BrokenMailbox;
 
 impl Mailbox for BrokenMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<(), MailboxError> {
-        Ok(())
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        // Deliberately claims acceptance the fake never observed: this
+        // mailbox is broken on `recv`, and its tests never read the
+        // send report.
+        Ok(SendReport { accepted: 1 })
     }
 
     fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {

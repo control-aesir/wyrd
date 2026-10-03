@@ -301,7 +301,10 @@ sync now
   (which a mount absorbs by running forever) trips the cap, which
   reports `stopped: pass limit (32) reached; sync may be
   incomplete` and exits non-zero — a capped run is never reported
-  as converged. A run that stops with known-but-unfetchable heads
+  as converged. Refusal burns the cap the same way: a relay
+  configuration that accepts nothing keeps the outbox pending
+  forever, so the run never reaches quiet — the pending count names
+  the stuck obligations. A run that stops with known-but-unfetchable heads
   exits zero: the outbox is empty and there is nothing local left
   to do, so a non-zero exit would only invite pointless retries —
   automate on the `unfetchable heads` count, not the exit status,

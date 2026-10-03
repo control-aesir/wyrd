@@ -77,6 +77,24 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   resources, which must never run in CI) — the honest framing of
   current evidence is proven-against-public-relays by hand, not by
   gate.
+- **Delivery contract — relay-accepted is the maximum v0.2
+  guarantee**: `Mailbox::send` reports per-relay acceptance
+  (`SendReport.accepted`), and the outbox commits a `Delivered`
+  fact only when at least one relay accepted the write. A send no
+  relay accepts leaves the obligation pending for a later pass —
+  retiring it there would lose the sender's recovery path while the
+  recipient never saw the event — pinned by
+  `delivery_retains_obligation_when_no_relay_accepts`. A refused
+  obligation retries every pass indefinitely: v0.2 has no ceiling,
+  backoff, or attempt counter, so a permanently refusing relay
+  means a permanently pending obligation, visible through the
+  pending projection. The states:
+  | Local send attempted | Not delivered — the bytes may have reached nobody |
+  | At least one relay accepted | Relay-accepted: the fact's whole meaning |
+  | Recipient received | Not guaranteed unless separately acknowledged |
+  | Retention expired before recipient retrieval | Potential loss — no re-push or pull path for control messages past relay retention |
+  Recipient receipt is never reported by the send path; anything
+  needing it must build an acknowledgement above this boundary.
 - **`SignerSession` trait**: the NIP-46 `sign_message` boundary
   (`trust.md` "NIP-46 remote signing"); a `nostr-connect`-style client
   implements it, tested here only against an in-memory fake key.

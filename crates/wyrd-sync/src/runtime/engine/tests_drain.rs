@@ -11,6 +11,7 @@ use crate::durable::{Fact, TAG_ANNOUNCEMENT_SEALED};
 use crate::membership::test_util::drive as member_drive;
 use crate::transport::mailbox::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, MemoryMailbox,
+    SendReport,
 };
 
 #[test]
@@ -55,7 +56,7 @@ struct RecordingMailbox<'a> {
 }
 
 impl Mailbox for RecordingMailbox<'_> {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         self.recorded.push(envelope.clone());
         self.inner.send(envelope)
     }
@@ -77,7 +78,7 @@ struct RecordingFailingMailbox {
 }
 
 impl Mailbox for RecordingFailingMailbox {
-    fn send(&mut self, envelope: MailboxEnvelope) -> Result<(), MailboxError> {
+    fn send(&mut self, envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
         self.recorded.push(envelope);
         Err(MailboxError::Crypto)
     }

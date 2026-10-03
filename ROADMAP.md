@@ -251,12 +251,13 @@ announcement, since v0.2 provides neither content recovery nor a
 root-recovery workflow (both book to v0.3).
 The case split is normative in `docs/fetch-on-open.md`. Control-plane
 delivery is relay-accepted, not recipient-received: the outbox
-obligation retires when the bytes leave this device — `mailbox.send`
-resolving `Ok` means the relay client accepted the write, and a
-relay-side refusal still resolves `Ok` (diagnostic-only outcome),
-so the committed `Delivered` fact cannot distinguish refusal from
-success. A peer absent past relay retention leaves a silent hole:
-no re-push, no pull path for control messages never received
+commits a `Delivered` fact only when at least one relay accepted the
+write (`SendReport`, normative in `docs/sync-and-peers.md`), and a
+send no relay accepts leaves the obligation pending for a later pass
+instead of retiring it. The remaining hole is relay retention: a
+peer absent past retention finds no event to fetch, and v0.2
+provides no re-push or pull path for control messages never
+received
 (triage: nostr:nevent1qqs26a0kqnfm72p8l5c3sw2hr4mxf97r4nszm0zm7ekh7facn3h0j7gpz9mhxue69uhkwunpwdczuap49eehgrh0ugr).
 Admitting
 a device walks the live epoch chain's ancestry and commits one

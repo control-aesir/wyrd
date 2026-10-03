@@ -244,7 +244,8 @@ without a reachable provider stays visible but unfetchable, and the
 two cases fail differently: a known snapshot whose manifest chain
 cannot be materialized within the deadline fails `open()`
 bounded (`EIO`); an announcement whose body never arrives leaves the
-snapshot unadopted (`UnknownParent`), so its paths never enter the
+snapshot unadopted — a later snapshot built on it classifies
+`UnknownParent`, so its paths never enter the
 projected namespace (`ENOENT`, never a hang). Recovery needs a new
 announcement, since v0.2 provides neither content recovery nor a
 root-recovery workflow (both book to v0.3).

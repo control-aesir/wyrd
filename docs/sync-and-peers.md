@@ -64,13 +64,14 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   supervision — while `wyrd-sync` stays composable protocol:
   anything implementing `Mailbox` (a test fake, a relay pool, a
   future mixnet drop) drives the same engine.
-- **Test evidence, three-way**: hermetic in-process NIP-01 relay
+- **Test evidence, four legs**: a hermetic in-process NIP-01 relay
   (`MiniRelay`, real `EVENT`/`REQ`/`EOSE`/`CLOSE` over websockets,
-  no live network) plus the heterogeneous cross-implementation
-  episode beside it (`tests_crossimpl`: the fake plus rust-nostr's
-  real in-process relay, in the default gate); the real-iroh but
+  no live network); the heterogeneous cross-implementation episode
+  beside it (`tests_crossimpl`: the fake plus rust-nostr's real
+  in-process relay, in the default gate); the real-iroh but
   relay-disabled serving path for the bulk plane; and two opt-in
-  tests against actual public relays (`mailbox::tests_interop`). Those two are `#[ignore]`d and
+  tests against actual public relays (`mailbox::tests_interop`).
+  Those two are `#[ignore]`d and
   excluded from every CI profile by rule (`.config/nextest.toml`:
   the ignore attribute is reserved for tests needing external
   resources, which must never run in CI) — the honest framing of
@@ -79,7 +80,7 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
 - **`SignerSession` trait**: the NIP-46 `sign_message` boundary
   (`trust.md` "NIP-46 remote signing"); a `nostr-connect`-style client
   implements it, tested here only against an in-memory fake key.
-- **Deferred**: the `nostr-connect` session   negotiation is wiring for
+- **Deferred**: the `nostr-connect` session negotiation is wiring for
   whatever composes this crate — the traits above are the pinned
   boundary. (`wyrd-sync/src/control/nip46.rs` is wire codecs only;
   no session-negotiation implementation exists yet.) The live

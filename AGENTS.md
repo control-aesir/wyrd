@@ -9,7 +9,7 @@ to. The README carries the vision; `docs/` carries the current design contract.
 
 - `crates/wyrd-format` — CAS, typed identities, chunking, Merkle snapshot DAG. The format contract.
 - `crates/wyrd-sync` — iroh transport, encrypted manifests, roles × materialization, two-phase content.
-- `crates/wyrd-namespace` — Provider-neutral namespace model: value types, verified-head handle, read surface. Depends on `wyrd-format` only; performs no cryptography, links no transport.
+- `crates/wyrd-namespace` — Provider-neutral namespace model: value types, verified-head handle, read surface. Depends on `wyrd-format` and `thiserror` only; performs no cryptography, links no transport.
 - `crates/wyrd-fuse` — Mount-free drive view (the filesystem-shaped read surface; never mounts).
 - `crates/wyrd-core` — Embeddable local node (namespace, mutations, materialization, sync control). Depends on `wyrd-format`/`wyrd-namespace`/`wyrd-sync` only; the daemon is one host for it.
 - `crates/wyrd-daemon` — Composition library: engine + view + presentation backends (FUSE adapter today; mobile file surfaces later). The composer per T16.

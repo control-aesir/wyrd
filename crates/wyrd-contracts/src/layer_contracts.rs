@@ -483,163 +483,12 @@ fn nostr_holding_subsystems(files: &[(&str, &str)]) -> BTreeSet<String> {
         .collect()
 }
 
-/// `nostr*` use inside `wyrd-core` must stay within a single top-level
-/// `src/` subsystem directory (the mailbox decision: control-plane
-/// framing lives with sync control, never ambient across the node).
-/// The walk fails closed: unreadable directories and files are
-/// violations naming the path (never silent skips), and a walk that
-/// examines no `.rs` files at all fails too — an empty file set
-/// proves nothing, so "no `nostr*` references" and "nothing examined"
-/// are different verdicts.
-fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
-    let mut files: Vec<(String, String)> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut examined = 0usize;
-    fn walk(
-        dir: &Path,
-        src: &Path,
-        files: &mut Vec<(String, String)>,
-        errors: &mut Vec<String>,
-        examined: &mut usize,
-    ) {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                errors.push(format!("cannot read directory `{}`: {err}", dir.display()));
-                return;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    errors.push(format!("cannot list entry in `{}`: {err}", dir.display()));
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, src, files, errors, examined);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let rel = path
-                    .strip_prefix(src)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                // Prefix with `src/` so the subsystem is always at
-                // component index 1, matching the test convention.
-                match fs::read_to_string(&path) {
-                    Ok(text) => {
-                        *examined += 1;
-                        files.push((format!("src/{rel}"), text));
-                    }
-                    Err(err) => {
-                        errors.push(format!("cannot read file `{}`: {err}", path.display()));
-                    }
-                }
-            }
-        }
-    }
-    let src = core_dir.join("src");
-    walk(&src, &src, &mut files, &mut errors, &mut examined);
-    if !errors.is_empty() {
-        return errors;
-    }
-    if examined == 0 {
-        return vec![format!(
-            "`nostr*` scope check examined no `.rs` files under `{}`: \
-             an empty walk proves nothing, failing closed",
-            src.display()
-        )];
-    }
-    let refs: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(p, t)| (p.as_str(), t.as_str()))
-        .collect();
-    let subsystems = nostr_holding_subsystems(&refs);
-    if subsystems.len() > 1 {
-        vec![format!(
-            "`nostr*` use in `wyrd-core` spans subsystems {subsystems:?}: \
-             keep it inside the mailbox subsystem"
-        )]
-    } else {
-        Vec::new()
-    }
-}
-
-/// The token definition site: the one file allowed to hold the
-/// unsafe constructor in code. Every other code occurrence is a mint
-/// and fails below.
-const PROOF_DEFINITION: &str = "crates/wyrd-namespace/src/view.rs";
-
-/// The verification authority: the one file allowed to call the
-/// unsafe constructor in code (after the BIP-340 check).
-const PROOF_AUTHORITY: &str = "crates/wyrd-sync/src/durable/mod.rs";
-
-/// Files holding a code (not comment/string) occurrence of the proof
-/// token's unsafe constructor, from an explicit file list. Pure so
-/// tests can pin the rule without touching the filesystem.
-fn mint_holding_files(files: &[(&str, &str)]) -> Vec<String> {
-    let mut holders: Vec<String> = files
-        .iter()
-        .filter(|(_, text)| code_text(text).contains("from_verified_unchecked"))
-        .map(|(path, _)| path.to_string())
-        .collect();
-    holders.sort();
-    holders.dedup();
-    holders
-}
-
-/// The `AuthorizedSnapshot` crossing count: the unsafe constructor
-/// must appear in code exactly twice workspace-wide — its definition
-/// and the verification authority's single call — so the `#[allow]`
-/// audit marker stays honest without review vigilance. Any new mint
-/// (production or test) fails here. Pure over the holder list so the
-/// negative tests prove it bites.
-fn check_proof_mint(holders: &[String]) -> Vec<String> {
-    let mut violations = Vec::new();
-    let definitions = holders
-        .iter()
-        .filter(|h| h.as_str() == PROOF_DEFINITION)
-        .count();
-    if definitions != 1 {
-        violations.push(format!(
-            "the proof token definition `{PROOF_DEFINITION}` holds {definitions} code \
-             occurrences of the unsafe constructor (want exactly the definition): \
-             the mint moved or duplicated"
-        ));
-    }
-    let mut unexpected: Vec<&String> = holders
-        .iter()
-        .filter(|h| h.as_str() != PROOF_DEFINITION && h.as_str() != PROOF_AUTHORITY)
-        .collect();
-    unexpected.sort();
-    for holder in unexpected {
-        violations.push(format!(
-            "`{holder}` mints the verification-proof token outside the verification \
-             authority: route through `AuthorizeSnapshot::authorize` or amend this \
-             rule deliberately"
-        ));
-    }
-    let authority = holders
-        .iter()
-        .filter(|h| h.as_str() == PROOF_AUTHORITY)
-        .count();
-    if authority != 1 {
-        violations.push(format!(
-            "the verification authority `{PROOF_AUTHORITY}` holds {authority} code \
-             occurrences of the unsafe constructor (want exactly the single crossing): \
-             the authority stopped minting or mints twice"
-        ));
-    }
-    violations
-}
-
-/// Collect every `.rs` file under each member directory, as paths
-/// relative to the workspace root. Fails closed like the subsystem
-/// walk: unreadable entries are errors (never silent skips), and an
-/// empty collection proves nothing.
-fn collect_member_sources(root: &Path) -> (Vec<(String, String)>, Vec<String>) {
+/// Collect every `.rs` file under `dir`, as paths relative to
+/// `root`. Build output (`target/`) is never descended into. Fails
+/// closed: unreadable entries are errors, never silent skips. An
+/// empty collection is returned, not failed, here — an empty walk
+/// proves nothing, so each rule names its own non-vacuity verdict.
+fn collect_rs_files(dir: &Path, root: &Path) -> (Vec<(String, String)>, Vec<String>) {
     let mut files: Vec<(String, String)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     fn walk(dir: &Path, root: &Path, files: &mut Vec<(String, String)>, errors: &mut Vec<String>) {
@@ -680,10 +529,126 @@ fn collect_member_sources(root: &Path) -> (Vec<(String, String)>, Vec<String>) {
             }
         }
     }
-    let crates = root.join("crates");
-    walk(&crates, root, &mut files, &mut errors);
+    walk(dir, root, &mut files, &mut errors);
     files.sort();
     (files, errors)
+}
+
+/// `nostr*` use inside `wyrd-core` must stay within a single top-level
+/// `src/` subsystem directory (the mailbox decision: control-plane
+/// framing lives with sync control, never ambient across the node).
+/// The walk fails closed: unreadable directories and files are
+/// violations naming the path (never silent skips), and a walk that
+/// examines no `.rs` files at all fails too — an empty file set
+/// proves nothing, so "no `nostr*` references" and "nothing examined"
+/// are different verdicts.
+fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
+    let src = core_dir.join("src");
+    // Paths stay relative to the crate dir, so the subsystem is
+    // always at component index 1, matching the test convention.
+    let (files, errors) = collect_rs_files(&src, core_dir);
+    if !errors.is_empty() {
+        return errors;
+    }
+    if files.is_empty() {
+        return vec![format!(
+            "`nostr*` scope check examined no `.rs` files under `{}`: \
+             an empty walk proves nothing, failing closed",
+            src.display()
+        )];
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let subsystems = nostr_holding_subsystems(&refs);
+    if subsystems.len() > 1 {
+        vec![format!(
+            "`nostr*` use in `wyrd-core` spans subsystems {subsystems:?}: \
+             keep it inside the mailbox subsystem"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The token definition site: the one file allowed to hold the
+/// unsafe constructor in code. Every other code occurrence is a mint
+/// and fails below.
+const PROOF_DEFINITION: &str = "crates/wyrd-namespace/src/view.rs";
+
+/// The verification authority: the one file allowed to call the
+/// unsafe constructor in code (after the BIP-340 check).
+const PROOF_AUTHORITY: &str = "crates/wyrd-sync/src/durable/mod.rs";
+
+/// Files holding code (not comment/string) occurrences of the proof
+/// token's unsafe constructor, from an explicit file list: path to
+/// occurrence count. Counts, not presence flags, so a second mint in
+/// the same file is visible. Pure so tests can pin the rule without
+/// touching the filesystem.
+fn mint_holding_files(files: &[(&str, &str)]) -> Vec<(String, usize)> {
+    let mut holders: Vec<(String, usize)> = files
+        .iter()
+        .map(|(path, text)| {
+            (
+                path.to_string(),
+                code_text(text).matches("from_verified_unchecked").count(),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    holders.sort();
+    holders
+}
+
+/// The `AuthorizedSnapshot` crossing count: the unsafe constructor
+/// must appear in code exactly twice workspace-wide — its definition
+/// and the verification authority's single call — so the `#[allow]`
+/// audit marker stays honest without review vigilance. Any new mint
+/// (production or test) fails here. Pure over the holder list so the
+/// negative tests prove it bites.
+fn check_proof_mint(holders: &[(String, usize)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let definitions: usize = holders
+        .iter()
+        .filter(|(holder, _)| holder.as_str() == PROOF_DEFINITION)
+        .map(|(_, count)| count)
+        .sum();
+    if definitions != 1 {
+        violations.push(format!(
+            "the proof token definition `{PROOF_DEFINITION}` holds {definitions} code \
+             occurrences of the unsafe constructor (want exactly the definition): \
+             the mint moved or duplicated"
+        ));
+    }
+    let mut unexpected: Vec<(&String, usize)> = holders
+        .iter()
+        .filter(|(holder, _)| {
+            holder.as_str() != PROOF_DEFINITION && holder.as_str() != PROOF_AUTHORITY
+        })
+        .map(|(holder, count)| (holder, *count))
+        .collect();
+    unexpected.sort();
+    for (holder, count) in unexpected {
+        violations.push(format!(
+            "`{holder}` mints the verification-proof token {count} time(s) outside the \
+             verification authority: route through `AuthorizeSnapshot::authorize` or amend \
+             this rule deliberately"
+        ));
+    }
+    let authority: usize = holders
+        .iter()
+        .filter(|(holder, _)| holder.as_str() == PROOF_AUTHORITY)
+        .map(|(_, count)| count)
+        .sum();
+    if authority != 1 {
+        violations.push(format!(
+            "the verification authority `{PROOF_AUTHORITY}` holds {authority} code \
+             occurrences of the unsafe constructor (want exactly the single crossing): \
+             the authority stopped minting or mints twice"
+        ));
+    }
+    violations
 }
 
 /// Contract 34, mint-count half: the verification-proof token's
@@ -694,7 +659,7 @@ fn collect_member_sources(root: &Path) -> (Vec<(String, String)>, Vec<String>) {
 #[test]
 fn verification_proof_has_one_mint() {
     let root = workspace_root();
-    let (files, errors) = collect_member_sources(&root);
+    let (files, errors) = collect_rs_files(&root.join("crates"), &root);
     assert!(
         errors.is_empty(),
         "source walk errors:\n- {}",
@@ -1430,8 +1395,8 @@ mod policy_tests {
     #[test]
     fn mint_count_passes_the_clean_pair() {
         let holders = [
-            "crates/wyrd-sync/src/durable/mod.rs".to_owned(),
-            "crates/wyrd-namespace/src/view.rs".to_owned(),
+            ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1),
+            ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
         ];
         assert!(
             check_proof_mint(&holders).is_empty(),
@@ -1442,9 +1407,9 @@ mod policy_tests {
     #[test]
     fn mint_count_rejects_a_second_mint() {
         let holders = [
-            "crates/wyrd-fuse/src/view/tests.rs".to_owned(),
-            "crates/wyrd-namespace/src/view.rs".to_owned(),
-            "crates/wyrd-sync/src/durable/mod.rs".to_owned(),
+            ("crates/wyrd-fuse/src/view/tests.rs".to_owned(), 1),
+            ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
+            ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1),
         ];
         let violations = check_proof_mint(&holders);
         assert_eq!(violations.len(), 1, "one rogue mint: {violations:?}");
@@ -1455,8 +1420,24 @@ mod policy_tests {
     }
 
     #[test]
+    fn mint_count_rejects_a_second_mint_in_the_authority_file() {
+        // The likeliest real drift: another call inside the authority
+        // file. File-granularity would miss it; counts do not.
+        let holders = [
+            ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
+            ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 2),
+        ];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "double mint: {violations:?}");
+        assert!(
+            violations[0].contains("mints twice"),
+            "names the failure mode: {violations:?}"
+        );
+    }
+
+    #[test]
     fn mint_count_rejects_a_missing_definition() {
-        let holders = ["crates/wyrd-sync/src/durable/mod.rs".to_owned()];
+        let holders = [("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1)];
         let violations = check_proof_mint(&holders);
         assert_eq!(violations.len(), 1, "missing definition: {violations:?}");
         assert!(
@@ -1467,7 +1448,7 @@ mod policy_tests {
 
     #[test]
     fn mint_count_rejects_a_missing_authority() {
-        let holders = ["crates/wyrd-namespace/src/view.rs".to_owned()];
+        let holders = [("crates/wyrd-namespace/src/view.rs".to_owned(), 1)];
         let violations = check_proof_mint(&holders);
         assert_eq!(violations.len(), 1, "missing authority: {violations:?}");
         assert!(

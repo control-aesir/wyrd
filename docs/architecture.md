@@ -202,7 +202,8 @@ survivor intake, recovery); cross-implementation relay interop runs in
 the default gate (`mailbox::tests_crossimpl`: the same episode against
 a fake plus a locally-spawned real relay, with live public-relay
 policy staying opt-in (`mailbox::tests_interop`, live public relay,
-proven against relay.primal.net)). Real-world delivery failed on policy, not on wire
+proven against relay.primal.net)). Real-world delivery failed on
+policy, not on wire
 logic: relay.damus.io ACKs gift-wrap writes but CLOSEDs every
 gift-wrap REQ as auth-required (NIP-42, which the trust decision
 forbids), and nos.lol answers no TCP from here. A relay-sent CLOSED

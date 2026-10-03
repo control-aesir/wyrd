@@ -8,6 +8,29 @@ use super::*;
 
 use std::time::{Duration, Instant};
 
+/// Redeliver both pre-outage wraps from one relay alone onto a fresh
+/// log, then prove nothing else follows: relay replay is the only
+/// source a fresh log can draw on, so redelivery proves the relay
+/// retained and re-served the wraps through its own store, and the
+/// trailing quiet pins that the relay holds exactly those two — no
+/// third wrap queued while it was down, no duplicate replay.
+fn expect_replay_from(receiver: &Keys, relay_url: &str, label: &str) {
+    let mut replayed = live_mailbox(receiver, &[relay_url.to_owned()], temp_path(label));
+    wait_for_health(&replayed, true, OUTAGE_TIMEOUT);
+    let mut replayed_payloads = Vec::new();
+    for _ in 0..2 {
+        let delivery =
+            wait_for_delivery(&mut replayed, DELIVERY_TIMEOUT).expect("relay replays both wraps");
+        replayed_payloads.push(delivery.envelope().ciphertext.clone());
+        replayed
+            .settle(delivery.id(), Disposition::Ack)
+            .expect("acks");
+    }
+    replayed_payloads.sort();
+    assert_eq!(replayed_payloads, ["cross-first", "cross-second"]);
+    assert_quiet(&mut replayed);
+}
+
 /// A real relay beside the fake: rust-nostr's in-process `LocalRelay`
 /// (real NIP-01 handling — event-id verification, real `OK` frames,
 /// in-memory history with real query/replay) on its own runtime, which
@@ -143,24 +166,8 @@ fn heterogeneous_relays_cover_publication_replay_outage_and_recovery() {
     // source a fresh log can draw on, so redelivery there means the
     // real implementation verified, stored, and re-served the wraps
     // through its own query path.
-    for index in 0..relays.len() {
-        let mut replayed = live_mailbox(
-            &receiver,
-            &relays[index..index + 1],
-            temp_path(&format!("seen-crossimpl-fresh-{index}")),
-        );
-        wait_for_health(&replayed, true, OUTAGE_TIMEOUT);
-        let mut replayed_payloads = Vec::new();
-        for _ in 0..2 {
-            let delivery = wait_for_delivery(&mut replayed, DELIVERY_TIMEOUT)
-                .expect("each implementation replays both wraps");
-            replayed_payloads.push(delivery.envelope().ciphertext.clone());
-            replayed
-                .settle(delivery.id(), Disposition::Ack)
-                .expect("acks");
-        }
-        replayed_payloads.sort();
-        assert_eq!(replayed_payloads, ["cross-first", "cross-second"]);
+    for (index, relay) in relays.iter().enumerate() {
+        expect_replay_from(&receiver, relay, &format!("seen-crossimpl-fresh-{index}"));
     }
 
     // The proven replay collapses on the original log: the persisted
@@ -217,25 +224,9 @@ fn heterogeneous_relays_cover_publication_replay_outage_and_recovery() {
     // addressed through the pool arrives once.
     real.restart();
     wait_for_connected(&mailbox, 2, RECOVERY_TIMEOUT, "recovered relay rejoins");
-    {
-        let mut replayed = live_mailbox(
-            &receiver,
-            &relays[1..2],
-            temp_path("seen-crossimpl-rebooted-fresh"),
-        );
-        wait_for_health(&replayed, true, RECOVERY_TIMEOUT);
-        let mut replayed_payloads = Vec::new();
-        for _ in 0..2 {
-            let delivery = wait_for_delivery(&mut replayed, DELIVERY_TIMEOUT)
-                .expect("rebooted relay replays retained history");
-            replayed_payloads.push(delivery.envelope().ciphertext.clone());
-            replayed
-                .settle(delivery.id(), Disposition::Ack)
-                .expect("acks");
-        }
-        replayed_payloads.sort();
-        assert_eq!(replayed_payloads, ["cross-first", "cross-second"]);
-    }
+    // Named, not positional: this leg must subscribe to the rebooted
+    // real relay whatever order `relays` lists the pair in.
+    expect_replay_from(&receiver, real.url(), "seen-crossimpl-rebooted-fresh");
     assert_quiet(&mut mailbox);
     {
         let mut outbox = live_mailbox(

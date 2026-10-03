@@ -25,7 +25,7 @@ contracts-serial = { max-threads = 1 }
 # profile. Both its relays are localhost (MiniRelay plus an in-process
 # real relay), so it needs no external resource, and it is the only
 # default-gate coverage of the cross-implementation path — the slow
-# profile covers the fake-only sibling instead. About 22s of wall time
+# profile covers the fake-only sibling instead. About 30s of wall time
 # buys that standing evidence on every local and PR run.
 [profile.default]
 default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover))"

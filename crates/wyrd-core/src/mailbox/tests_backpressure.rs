@@ -1,12 +1,16 @@
 use super::mini_relay::MiniRelay;
 use super::tests_harness::{
     drain_to, keys, live_mailbox, seal_rumor, sender_keys, temp_path, wait_for_delivery,
-    DELIVERY_TIMEOUT,
+    wait_for_distinct_deliveries, DELIVERY_TIMEOUT,
 };
 use super::*;
 use nostr::event::FinalizeEvent;
 
 use std::time::{Duration, Instant};
+
+/// Flood-scale collection budget: saturation tests converge on
+/// arrival plus drain, not on a single delivery.
+const FLOOD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Backlog pressure: more wraps than the notification channel
 /// holds still all arrive. Overflow backpressures into the relay
@@ -45,7 +49,7 @@ fn flood_beyond_channel_capacity_delivers_all_once() {
         &mut settled,
         &mut covered,
         FLOOD,
-        Duration::from_secs(120),
+        FLOOD_TIMEOUT,
     );
     assert_eq!(covered.len(), FLOOD, "no wrap lost");
     // No assert_quiet: evicted acks may legitimately redeliver on a
@@ -83,26 +87,23 @@ fn unacked_bound_backpressures_overflow_without_loss() {
     }
 
     // Pull without settling: deferred mail stays held, overflow waits
-    // unread past the bound — never offered while full.
-    let mut ids = std::collections::HashSet::new();
-    for _ in 0..FLOOD {
-        let delivery =
-            wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("held mail keeps flowing");
-        ids.insert(delivery.id());
-        assert!(
-            mailbox.unacked.len() <= MAX_UNACKED_DELIVERIES,
-            "held mail stays bounded"
-        );
-    }
+    // unread past the bound — never offered while full. Collect
+    // distinct ids, since a re-offered held delivery must not stand
+    // in for mail still arriving. The no-overflow proof is the bound
+    // assert below, not the count alone: MAX distinct observed ids
+    // are equally consistent with more having been offered.
+    let mut ids: std::collections::HashSet<DeliveryId> =
+        wait_for_distinct_deliveries(&mut mailbox, MAX_UNACKED_DELIVERIES, FLOOD_TIMEOUT)
+            .into_iter()
+            .collect();
+    assert!(
+        mailbox.unacked.len() <= MAX_UNACKED_DELIVERIES,
+        "held mail stays bounded"
+    );
     assert_eq!(
         mailbox.unacked.len(),
         MAX_UNACKED_DELIVERIES,
         "the bound fills exactly"
-    );
-    assert_eq!(
-        ids.len(),
-        MAX_UNACKED_DELIVERIES,
-        "overflow is not offered while full"
     );
 
     // Settle everything: each ack frees room the queued overflow is

@@ -1,7 +1,7 @@
 use super::mini_relay::MiniRelay;
 use super::tests_harness::{
     assert_quiet, drain_to, keys, live_mailbox, seal_rumor, sender_keys, temp_path,
-    wait_for_delivery, DELIVERY_TIMEOUT,
+    DELIVERY_TIMEOUT,
 };
 use super::*;
 use nostr::event::FinalizeEvent;
@@ -149,9 +149,23 @@ fn settled_ids_collapse_to_watermark() {
         relay.inject(seal_rumor(&sender, receiver_key, format!("wm-{index}")));
     }
     let mut ids = Vec::new();
-    for _ in 0..3 {
-        let delivery = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("mail delivers");
-        ids.push(delivery.id());
+    // Collect three *distinct* deliveries: recv re-offers held mail
+    // under its stable id when nothing new has arrived yet, and a
+    // bare wait would mistake that re-offer for new mail — settling
+    // the same id twice advances the watermark early and flakes the
+    // assertions below. First-seen order is arrival order (fresh
+    // wraps mint increasing ids), so the settle choreography is
+    // unchanged.
+    let start = Instant::now();
+    while ids.len() < 3 {
+        assert!(start.elapsed() < DELIVERY_TIMEOUT, "mail delivers");
+        if let Some(delivery) = mailbox.recv().unwrap() {
+            if !ids.contains(&delivery.id()) {
+                ids.push(delivery.id());
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     // Settle newest first: nothing is contiguous yet.
     mailbox.settle(ids[2], Disposition::Ack).unwrap();

@@ -217,7 +217,14 @@ invalid bytes never committed or served. Local bitrot is detected on
 read but never re-fetched — an object recorded as local stays local —
 so a bitrotted object is a permanent read error in v0.2. The repair
 loop and scrub are booked in v0.3 core below; the design, with its
-protocol invariants, is recorded in `docs/peer-repair.md`. Admitting
+protocol invariants, is recorded in `docs/peer-repair.md`. Known history
+without a reachable provider stays visible but unfetchable: an
+announcement with no decodable route, or whose body never arrives,
+leaves the snapshot classified as history and the paths out of the
+projected namespace — `open()` fails bounded (`EIO`), never hangs,
+and recovery needs a new announcement, since v0.2 provides neither
+content recovery nor a root-recovery workflow (both book to v0.3).
+The case split is normative in `docs/fetch-on-open.md`. Admitting
 a device walks the live epoch chain's ancestry and commits one
 announcement obligation per closure member in the single admission
 batch — O(recorded history) allocation and commit in one call, with

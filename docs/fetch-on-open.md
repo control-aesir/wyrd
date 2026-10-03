@@ -264,6 +264,59 @@ not demand: a path no installed head contains is `ENOENT` immediately —
 open blocks for content *after* announce, never for announcements
 themselves.
 
+## No provider reaches the known snapshot
+
+History-visible and provider-reachable are separate facts. An
+announcement recorded at intake makes a snapshot *known*; only a
+decodable `node_addr` from a reachable peer makes it *fetchable* —
+and v0 serves content only from the announcing peer (no replication
+serving: one address per snapshot, `transport::routes::publish_recorded_routes`).
+When nothing serves, every layer below reports absence upward and the
+waiter fails bounded. What each case leaves visible, what fails, and
+what retries:
+
+- **Known snapshot, no route.** An announcement with an absent or
+  undecodable `node_addr` publishes nothing; the plan reports
+  absence (`Ok(None)` is genuine absence — nothing to ask,
+  `missing_bytes_are_absence_not_error` in
+  `crates/wyrd-sync/src/bulk/tests_bulk.rs`). Visible: the snapshot
+  id, its epoch, and its membership binding — it classifies and
+  projects as history. Unusable: structure and bytes; manifests are
+  never synthesized. Fails: `open()` blocks to the want deadline,
+  then `EIO` (`wait_returns_on_success_and_on_deadline` in
+  `crates/wyrd-core/src/want.rs`). Retry: the next open re-registers
+  the want; a re-announced route is fetched once its cooldown
+  lapses (property 8 above), so recovery needs a new announcement,
+  never a new caller.
+- **Snapshot body or manifest unavailable.** An announcement whose
+  body never arrives leaves the snapshot unadopted: a snapshot with
+  unrecorded parents classifies `Undecided(UnknownParent)` and never
+  becomes a live head (`authorization/classify.rs`), so the
+  projected namespace never contains paths from it — `ENOENT`, not a
+  hang. The announcement itself stays recorded and stays advertised
+  as known; intake neither commits unverified bytes nor poisons the
+  chain. (No dedicated test pins the body-never-arrives adoption
+  stall end to end; the classification half is pinned by the
+  authorization conformance suite. Treat the end-to-end stall as
+  unverified until such a test lands.)
+- **File content unavailable.** Chunks whose representations name no
+  reachable provider are absence at the object level: the fetch walk
+  tries every candidate the walk reaches (property 8), genuine
+  absence returns `Ok(None)`, and the waiter still fails bounded
+  with `EIO` — absence is not an error in the transport, but it is a
+  failed open at the boundary. Corrupt or unreachable
+  representations fall back to the next recorded representation
+  inside the walk; hash/AEAD mismatch is never committed.
+
+In all three cases the timeout cancels the wait, not the fetch
+(property 6): a concurrent success still publishes and caches.
+And in all three cases v0.2 provides no way back: stranded local
+content has no sanctioned recovery path and there is no
+root-recovery workflow — both book to v0.3 (`ROADMAP.md`, known
+limitations). A peer that holds the epoch material but never learns
+a snapshot id (the late-joiner horizon) is the same shape of absence
+from the other side: keys without knowledge fetch nothing.
+
 ## Locking discipline
 
 Established by the store-lock work and extended here — normative:

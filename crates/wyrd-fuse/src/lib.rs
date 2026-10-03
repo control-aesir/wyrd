@@ -1,4 +1,4 @@
-//! Wyrd's FUSE presentation layer: the live view and time travel.
+//! Wyrd's FUSE presentation layer: the live view and conflict-version lookup.
 //!
 //! The read-only drive view ([`view::DriveView`]) works mount-free
 //! against the format layer, `wyrd-namespace`'s namespace value model, and

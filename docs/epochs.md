@@ -440,7 +440,7 @@ Classification:
 | valid history but referenced transition voided | **VOIDED** | retained; its authorization branch never became canonical; content only via recovery |
 | `in_live_lineage`, `epoch == K`, DAG head | **ELIGIBLE** | may advance the live view |
 | `in_live_lineage`, not an eligible head | **canonical snapshot history** | the accepted past |
-| valid+authorized history, `epoch < K`, not live-lineage | **SUPERSEDED** | stale fork; browsable via time travel, never live |
+| valid+authorized history, `epoch < K`, not live-lineage | **SUPERSEDED** | stale fork; retained, never live; no v0 surface reads it back |
 | valid+authorized history, `epoch == K`, not live-lineage | **STRANDED** | legitimate work on a doomed fork; owner recovery is the remedy |
 
 Terminology note: **superseded ≠ revoked-author.** A snapshot becomes
@@ -533,7 +533,10 @@ single sanctioned remedy.
 - **Heads** = snapshots not referenced as a parent by any known snapshot.
 - The live view renders **eligible heads only**. One eligible head = live
   state; multiple = conflicted (existing rule). Superseded, stranded, and
-  voided snapshots are visible through time travel, never in the live view.
+  voided snapshots stay visible through the head listing
+  (`wyrd snapshot heads`) with their classification and reason; their
+  contents are never projected and never served to a live view, and
+  arbitrary historical browsing is v0.5 work.
 - **Recovery snapshots** are owner-authored snapshots with the **recovery
   flag** set (a distinct, authenticated snapshot type — v0 format `flags`
   bit 0, so implementations can audit recovery and never confuse it with

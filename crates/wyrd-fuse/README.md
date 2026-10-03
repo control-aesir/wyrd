@@ -7,8 +7,9 @@ the daemon over `fuser`.
 
 - The **live view** (`src/view.rs`): the drive's current state as an
   ordinary read-only folder — lookup, readdir, open, read, stat
-- **Time travel**: browsing previous snapshot heads with ordinary file
-  tools (restoration workflows live in `wyrd-sync` recovery)
+- **Conflict versions**: looking up the versions of a multi-head conflict
+  as `name@N` siblings with ordinary file tools (arbitrary historical
+  browsing and restore are v0.5 work)
 - **Materialization**: remote-only paths are visible and open on demand.
   Absent bytes map to `FetchStatus` at the view boundary; the daemon's
   want registry blocks open/read with a bounded deadline (`EIO` on

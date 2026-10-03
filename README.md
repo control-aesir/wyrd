@@ -49,7 +49,7 @@ Object contents are encrypted client-side before they ever leave the device. Vau
 When concurrent modifications occur across peers, Wyrd keeps both heads reachable and retains both versions as separate immutable objects. Conflicts are surfaced in the filesystem/UI for user resolution rather than automatically merged or overwritten.
 
 ### 7. No Data Lock-In
-The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing a chosen snapshot into a standard directory tree on a conventional filesystem (`wyrd export`; see `docs/cli.md`).
+The local object store is a documented CAS of immutable Wyrd objects; the logical object format is specified independently of any encrypted storage or transport representation. Exporting your data is as simple as materializing the live view into a standard directory tree on a conventional filesystem (`wyrd export`; see `docs/cli.md`).
 
 ---
 
@@ -68,7 +68,7 @@ When GC arrives, it will be the only way data is removed, and it will require:
 Wyrd mounts via **FUSE** to present standard filesystem interfaces (pre-alpha today: a read-write FUSE mount via the daemon):
 
 * **Live View:** Operates as a standard read-write local folder; writes commit as snapshots.
-* **Time Travel:** Historical snapshots and previous roots can be browsed using ordinary file manipulation tools.
+* **Conflict Versioning:** When concurrent publishes produce multiple heads, both versions stay reachable: the mounted view addresses them by lookup (never listed by `readdir`); export writes them as `name@N` siblings, numbered in SnapshotId byte order. Browsing arbitrary historical snapshots and restoring previous versions is not available in v0.2; it is v0.5 work (see `ROADMAP.md`).
 
 ---
 
@@ -130,7 +130,7 @@ Wyrd's bet is that these are one system: git's object model, Syncthing's replica
 |---|---|
 | `crates/wyrd-format` | The format contract: two identities (content/storage), canonical encoding, chunking, Merkle file trees, snapshot DAG |
 | `crates/wyrd-sync` | Peer replication on iroh: snapshot announcements, encrypted manifests, roles × materialization, two-phase content, zero-trust encryption |
-| `crates/wyrd-fuse` | The drive as a filesystem: live view, time travel, visible conflicts |
+| `crates/wyrd-fuse` | The drive as a filesystem: live view, conflict-version lookup, visible conflicts |
 | `crates/wyrd-daemon` | Composition library: engine + view + presentation backends (read-write FUSE today) |
 | `crates/wyrd-cli` | The `wyrd` process host: `init`, `mount`, `export`, diagnostics, exit codes over the daemon's surface |
 | `crates/wyrd-contracts` | Cross-crate architectural contract suite: one named test per review contract, composed end to end |

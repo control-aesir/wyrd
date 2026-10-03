@@ -3,7 +3,7 @@ name = "wyrd-fuse"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Wyrd's FUSE presentation layer: live view and time travel"
+description = "Wyrd's FUSE presentation layer: live view and conflict-version lookup"
 
 [dependencies]
 wyrd-format.workspace = true

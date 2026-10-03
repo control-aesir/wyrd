@@ -522,7 +522,7 @@
               <button class="drive-dot" type="button" data-snap="0" aria-label="Snapshot 1, first write"></button>
               <button class="drive-dot" type="button" data-snap="1" aria-label="Snapshot 2, edited"></button>
               <button class="drive-dot" type="button" data-snap="2" aria-label="Snapshot 3, deleted"></button>
-              <button class="drive-dot" type="button" data-snap="3" aria-label="Snapshot 4, restored"></button>
+              <button class="drive-dot" type="button" data-snap="3" aria-label="Snapshot 4, v0.5 restore"></button>
             </div>
             <button class="drive-btn" id="drive-next" type="button">Later</button>
           </div>
@@ -584,7 +584,7 @@
           <div class="article">
             <span class="article-no">§7</span>
             <h3>The door stays open</h3>
-            <p>The local store is ordinary files on disk, and any snapshot materializes into a plain directory. No export format stands between you and your data.</p>
+            <p>The local store is ordinary files on disk, and the live view materializes into a plain directory. No export format stands between you and your data.</p>
           </div>
         </div>
       </div>
@@ -610,7 +610,7 @@
           </div>
           <div class="neighbour">
             <h3>Time Machine</h3>
-            <p>The manners Wyrd wants: step back through time. Bound to one machine and one company's filesystem.</p>
+            <p>The manners Wyrd is building toward: step back through time. Bound to one machine and one company's filesystem.</p>
           </div>
           <div class="neighbour">
             <h3>Object storage</h3>
@@ -715,6 +715,7 @@ wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./pa
 
 <script>
 (function(){
+  <!-- slot:demo/snaps -->
   var snaps = [
     {
       id: "snapshot 0a13…e02",
@@ -744,16 +745,17 @@ wyrd mount ./mydrive ./mnt --identity-file ./identity.bin --passphrase-file ./pa
       note: "Deletion is a state change: the snapshot stops referencing the file."
     },
     {
-      id: "materialize 0a13…e02",
-      moment: "stepped back in time",
+      id: "v0.5: restore 0a13…e02",
+      moment: "stepping back in time — not built yet (v0.5)",
       store: "store holds 5 objects",
       view: '<div><span class="ok">field-notes.txt</span> <span class="absent">(as first written)</span></div>' +
             '<div class="absent">9be2…11  77ac…f0  c301…9d</div>' +
-            '<div class="holders"><b>phone</b> materializes the original on demand; nothing was re-uploaded</div>',
-      note: "Any snapshot materializes into a plain directory. The past is intact."
+            '<div class="holders">the retained pieces are what make restore possible; no v0 surface reads them back yet</div>',
+      note: "Browsing arbitrary historical snapshots and restoring previous versions is v0.5 work. The past is intact; the browsing is not yet built."
     }
   ];
   var i = 0;
+  <!-- /slot:demo/snaps -->
   var id = document.getElementById("drive-id");
   var moment = document.getElementById("drive-moment");
   var store = document.getElementById("drive-store");

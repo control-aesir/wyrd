@@ -1,7 +1,7 @@
 use super::*;
 
 use wyrd_core::export::{export_tree, ExportError};
-use wyrd_namespace::{NamespaceView, MAX_SYMLINK_COMPONENTS, MAX_SYMLINK_HOPS};
+use wyrd_namespace::view::{NamespaceView, MAX_SYMLINK_COMPONENTS, MAX_SYMLINK_HOPS};
 
 use std::collections::HashMap;
 use wyrd_format::store::MemoryStoreError;

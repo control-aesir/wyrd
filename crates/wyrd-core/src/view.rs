@@ -12,11 +12,10 @@
 
 use wyrd_format::{ContentId, FetchStatus};
 
-pub use wyrd_namespace::{
-    confine_symlink_target, confine_symlink_target_with_budget, Attr, ConfinementError,
-    ConflictVersion, DirEntry, Head, Kind, LookupResult, MaterializationPolicy, NamespaceView,
-    Node, OpenFile, SymlinkResolutionBudget, ViewError, ViewLockError, MAX_SYMLINK_COMPONENTS,
-    MAX_SYMLINK_HOPS, MAX_SYMLINK_WORK,
+pub use wyrd_namespace::view::{
+    confine_symlink_target, Attr, ConfinementError, ConflictVersion, DirEntry, Head, Kind,
+    LookupResult, MaterializationPolicy, NamespaceView, Node, OpenFile, ViewError, ViewLockError,
+    MAX_SYMLINK_COMPONENTS, MAX_SYMLINK_HOPS, MAX_SYMLINK_WORK,
 };
 
 /// How the node reports fetch status for content the local store

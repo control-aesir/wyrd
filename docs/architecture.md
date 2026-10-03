@@ -55,7 +55,10 @@ async, or FUSE dependency. `wyrd-fuse` must never link iroh — not even
 transitively through another member: the transitive half of contract 34
 pins its production-edge closure to `wyrd-format` and `wyrd-namespace`,
 so a future `wyrd-core` API can never hand a backend a transport type
-without the suite failing. `wyrd-daemon` is that composer: the node in
+without the suite failing. The verification-proof token is minted only
+by `wyrd-sync`'s authorization — the namespace crate performs no
+cryptography — and contract 34's crossing-count check pins the single
+call site. `wyrd-daemon` is that composer: the node in
 `wyrd-core` is presentation-agnostic (mobile platforms cannot use FUSE, so the
 platform surface is a pluggable backend over the same view); the FUSE adapter
 is the first backend, not a property of the node.

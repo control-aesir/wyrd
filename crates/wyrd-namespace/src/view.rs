@@ -18,8 +18,8 @@
 //! unsafe constructor. [`MaterializationPolicy`] is the residency
 //! query the view consults for absent content; the engine-coupled
 //! implementation stays in `wyrd-core`, which reads sync runtime
-//! state. [`NamespaceView`] (below, next commit) is the read surface
-//! the node loop programs against.
+//! state. [`NamespaceView`] (below) is the read surface the node loop
+//! programs against.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -81,14 +81,15 @@ impl AuthorizedSnapshot {
 
 /// One installed head: a snapshot that crossed from sync to the
 /// namespace layer only through verification. The body is unreachable
-/// except through these accessors, so a head cannot be unwrapped and
-/// re-wrapped around different bytes.
+/// except through these accessors, and safe code cannot re-wrap a
+/// different body: `into_snapshot` yields the bare body, but `new`
+/// takes the verification token, which safe code cannot mint.
 pub struct Head(AuthorizedSnapshot);
 
 impl Head {
     /// Install a verified snapshot as a head. `AuthorizedSnapshot` is
-    /// constructible only by sync's verification, so this constructor
-    /// is the proof — no unsafe capability needed.
+    /// minted only by sync's verification, so this constructor is the
+    /// proof — no unsafe capability needed.
     pub fn new(verified: AuthorizedSnapshot) -> Self {
         Head(verified)
     }

@@ -220,7 +220,7 @@ impl AuthorizedCapability {
 /// linking the transport. Re-exported here so existing paths keep
 /// working; values cross into the token only through
 /// [`AuthorizeSnapshot`].
-pub use wyrd_namespace::AuthorizedSnapshot;
+pub use wyrd_namespace::view::AuthorizedSnapshot;
 
 /// The verification authority for snapshot bodies: checking the
 /// BIP-340 signature is sync's job, and this trait is the only

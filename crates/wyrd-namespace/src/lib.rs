@@ -11,8 +11,7 @@
 //! and the single production call site is sync's own authorization.
 //! The DAG is machine-enforced by contract 34
 //! (`wyrd-contracts`' `layer_contracts.rs`), direct and transitive
-//! halves.
+//! halves. Items live under [`view`]; there is no root re-export, so
+//! every path names the module it comes from.
 
 pub mod view;
-
-pub use view::*;

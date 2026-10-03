@@ -10,16 +10,17 @@ use wyrd_format::Snapshot;
 /// explicit `unsafe impl`. The orphan rule prevents implementing the
 /// capability directly for a foreign `Snapshot`; the unsafe contract
 /// makes wrapper-based bypasses an explicit, auditable trust assertion.
-/// Rust offers no stronger cross-crate seal for a layering reason: the
-/// view cannot name `wyrd-sync`'s `AuthorizedSnapshot` (no dependency
-/// edge may run from the view to sync), and a constructor with a
-/// private body cannot be shared between crates at all. Every
-/// `unsafe impl` is a visible, greppable claim that the implementing
-/// type's construction is owned by the verification authority. In-tree
-/// the production impl is exactly one: `wyrd_namespace::Head`, whose
-/// inner `AuthorizedSnapshot` can only be produced by sync's BIP-340
-/// verification; every other in-tree impl is a deliberately forged
-/// test fixture documented as asserting nothing real.
+/// The seal is `unsafe`-audited at two points by design, and both are
+/// greppable: minting the proof token is sync's one audited crossing
+/// (`wyrd_sync::durable::AuthorizeSnapshot::authorize`, pinned by
+/// contract 34's crossing-count check), while installing a head is
+/// this trait's audited `unsafe impl`. Every `unsafe impl` is a
+/// visible claim that the implementing type's construction is owned
+/// by the verification authority. In-tree the production impl is
+/// exactly one: `wyrd_namespace::view::Head`, whose inner
+/// `AuthorizedSnapshot` sync's BIP-340 verification alone may mint;
+/// every other in-tree impl is a deliberately forged test fixture
+/// documented as asserting nothing real.
 ///
 /// A downstream wrapper around a raw snapshot cannot implement the
 /// capability in safe code — the audit marker is the only way across:
@@ -75,14 +76,15 @@ impl ViewHead {
     }
 }
 
-// SAFETY: `wyrd_namespace::Head` is constructible only from sync's
-// `AuthorizedSnapshot`, which only BIP-340 verification produces —
-// the same trust claim as the daemon's former `LiveHead`, carried by
-// the type instead of a second wrapper. This is the one production
-// crossing from verified sync state into view heads.
+// SAFETY: `wyrd_namespace::view::Head` wraps the proof token sync's
+// BIP-340 verification alone may mint (single audited crossing, see
+// the trait docs) — the same trust claim as the daemon's former
+// `LiveHead`, carried by the type instead of a second wrapper. This
+// is the one production crossing from verified sync state into view
+// heads.
 #[allow(unsafe_code)]
-unsafe impl VerifiedSnapshot for wyrd_namespace::Head {
+unsafe impl VerifiedSnapshot for wyrd_namespace::view::Head {
     fn into_snapshot(self) -> Snapshot {
-        wyrd_namespace::Head::into_snapshot(self)
+        wyrd_namespace::view::Head::into_snapshot(self)
     }
 }

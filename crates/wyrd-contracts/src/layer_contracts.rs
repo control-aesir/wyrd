@@ -29,15 +29,24 @@
 //!
 //! A second rule needs the transitive closure, not the direct edges,
 //! and lives here as well: `wyrd-fuse`'s production-edge closure must
-//! reach neither `wyrd-sync` nor any `iroh*` package. The direct check
-//! above cannot see reachability — `wyrd-fuse → wyrd-core → wyrd-sync`
-//! is three allowed edges that link iroh into the view crate — and
-//! the view crate is where the gap is load-bearing (mobile surfaces
-//! mount no FUSE; they build on the same provider-neutral view).
-//! Manifests see member-declared edges only: a third-party crate's own
-//! transitive dependencies are invisible here, so this pins the exact
-//! property that no member-declared path leads to the transport, not
-//! a full link-graph audit (that remains `cargo tree` territory).
+//! reach neither `wyrd-sync` nor any `iroh*` package. Only the view
+//! crate is walked — `wyrd-daemon` and `wyrd-cli` must link the
+//! transport, so the gap is load-bearing only here (mobile surfaces
+//! mount no FUSE; they build on the same provider-neutral view). The
+//! direct check above cannot see reachability — `wyrd-fuse → wyrd-core
+//! → wyrd-sync` is three allowed edges that link iroh into the view
+//! crate. Manifests see member-declared edges only: a third-party
+//! crate's own transitive dependencies are invisible here, so this
+//! pins the exact property that no member-declared path leads to the
+//! transport, not a full link-graph audit (that remains `cargo tree`
+//! territory). The closure treats an unresolvable edge as a leaf, and
+//! may: the direct check already fails closed on any edge outside the
+//! exact allow-lists, so leniency here cannot hide a new edge.
+//!
+//! A third rule pins the verification-proof crossing count (`check_proof_mint`):
+//! the unsafe token constructor appears in code exactly twice — its
+//! definition and the verification authority's single call — so the
+//! audit marker stays honest without review vigilance.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -266,6 +275,45 @@ fn production_deps(manifest: &toml::Table) -> DepSet {
     }
     walk(manifest, &mut deps);
     deps
+}
+
+/// Collect `[dev-dependencies]` entries from a member manifest. Any
+/// table named exactly `dev-dependencies` counts (covers future
+/// `[target.*.dev-dependencies]`); production deps never do.
+fn dev_deps(manifest: &toml::Table) -> DepSet {
+    let mut deps = DepSet::new();
+    fn walk(table: &toml::Table, deps: &mut DepSet) {
+        for (key, value) in table {
+            if key == "dev-dependencies" {
+                if let Some(table) = value.as_table() {
+                    deps.extend(table.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+            } else if let Some(inner) = value.as_table() {
+                walk(inner, deps);
+            }
+        }
+    }
+    walk(manifest, &mut deps);
+    deps
+}
+
+/// `wyrd-fuse`'s test-only edge set, pinned exactly: the view tests
+/// build export fixtures against `wyrd-core` and nothing else. The
+/// direct check exempts dev-dependencies by design, so this pin is
+/// what makes a widening deliberate instead of silent. Pure over the
+/// edge set so the negative test proves it bites.
+fn check_fuse_dev_deps(deps: &DepSet, workspace_deps: &toml::Table) -> Vec<String> {
+    let names: BTreeSet<String> = deps
+        .iter()
+        .map(|(key, value)| effective_name(key, value, workspace_deps))
+        .collect();
+    if names != BTreeSet::from(["wyrd-core".to_owned()]) {
+        return vec![format!(
+            "`wyrd-fuse` dev-dependencies drifted to `{names:?}` (want exactly \
+             `wyrd-core` for export fixtures): widen deliberately here, never silently"
+        )];
+    }
+    Vec::new()
 }
 
 fn workspace_root() -> PathBuf {
@@ -519,6 +567,153 @@ fn check_core_nostr_scope(core_dir: &Path) -> Vec<String> {
     }
 }
 
+/// The token definition site: the one file allowed to hold the
+/// unsafe constructor in code. Every other code occurrence is a mint
+/// and fails below.
+const PROOF_DEFINITION: &str = "crates/wyrd-namespace/src/view.rs";
+
+/// The verification authority: the one file allowed to call the
+/// unsafe constructor in code (after the BIP-340 check).
+const PROOF_AUTHORITY: &str = "crates/wyrd-sync/src/durable/mod.rs";
+
+/// Files holding a code (not comment/string) occurrence of the proof
+/// token's unsafe constructor, from an explicit file list. Pure so
+/// tests can pin the rule without touching the filesystem.
+fn mint_holding_files(files: &[(&str, &str)]) -> Vec<String> {
+    let mut holders: Vec<String> = files
+        .iter()
+        .filter(|(_, text)| code_text(text).contains("from_verified_unchecked"))
+        .map(|(path, _)| path.to_string())
+        .collect();
+    holders.sort();
+    holders.dedup();
+    holders
+}
+
+/// The `AuthorizedSnapshot` crossing count: the unsafe constructor
+/// must appear in code exactly twice workspace-wide — its definition
+/// and the verification authority's single call — so the `#[allow]`
+/// audit marker stays honest without review vigilance. Any new mint
+/// (production or test) fails here. Pure over the holder list so the
+/// negative tests prove it bites.
+fn check_proof_mint(holders: &[String]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let definitions = holders
+        .iter()
+        .filter(|h| h.as_str() == PROOF_DEFINITION)
+        .count();
+    if definitions != 1 {
+        violations.push(format!(
+            "the proof token definition `{PROOF_DEFINITION}` holds {definitions} code \
+             occurrences of the unsafe constructor (want exactly the definition): \
+             the mint moved or duplicated"
+        ));
+    }
+    let mut unexpected: Vec<&String> = holders
+        .iter()
+        .filter(|h| h.as_str() != PROOF_DEFINITION && h.as_str() != PROOF_AUTHORITY)
+        .collect();
+    unexpected.sort();
+    for holder in unexpected {
+        violations.push(format!(
+            "`{holder}` mints the verification-proof token outside the verification \
+             authority: route through `AuthorizeSnapshot::authorize` or amend this \
+             rule deliberately"
+        ));
+    }
+    let authority = holders
+        .iter()
+        .filter(|h| h.as_str() == PROOF_AUTHORITY)
+        .count();
+    if authority != 1 {
+        violations.push(format!(
+            "the verification authority `{PROOF_AUTHORITY}` holds {authority} code \
+             occurrences of the unsafe constructor (want exactly the single crossing): \
+             the authority stopped minting or mints twice"
+        ));
+    }
+    violations
+}
+
+/// Collect every `.rs` file under each member directory, as paths
+/// relative to the workspace root. Fails closed like the subsystem
+/// walk: unreadable entries are errors (never silent skips), and an
+/// empty collection proves nothing.
+fn collect_member_sources(root: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    fn walk(dir: &Path, root: &Path, files: &mut Vec<(String, String)>, errors: &mut Vec<String>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                errors.push(format!("cannot read directory `{}`: {err}", dir.display()));
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    errors.push(format!("cannot list entry in `{}`: {err}", dir.display()));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                // Never descend into build output.
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&path, root, files, errors);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                match fs::read_to_string(&path) {
+                    Ok(text) => files.push((rel, text)),
+                    Err(err) => {
+                        errors.push(format!("cannot read file `{}`: {err}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    let crates = root.join("crates");
+    walk(&crates, root, &mut files, &mut errors);
+    files.sort();
+    (files, errors)
+}
+
+/// Contract 34, mint-count half: the verification-proof token's
+/// unsafe constructor appears in code exactly twice — the definition
+/// in `wyrd-namespace` and sync's single authorization crossing — so
+/// "verified state" cannot be minted anywhere else without the suite
+/// failing.
+#[test]
+fn verification_proof_has_one_mint() {
+    let root = workspace_root();
+    let (files, errors) = collect_member_sources(&root);
+    assert!(
+        errors.is_empty(),
+        "source walk errors:\n- {}",
+        errors.join("\n- ")
+    );
+    // Never pass vacuously: an empty file set would check nothing.
+    assert!(!files.is_empty(), "workspace holds no `.rs` files");
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let violations = check_proof_mint(&mint_holding_files(&refs));
+    assert!(
+        violations.is_empty(),
+        "proof-mint violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
 /// Contract 34 (packaging half): the distribution build compiles the
 /// user-facing binary from `wyrd-cli`. The Phase 4 move broke this
 /// once (the flake built `-p wyrd-daemon`, which installs no binary,
@@ -764,6 +959,25 @@ fn fuse_link_graph_excludes_sync_and_iroh() {
     assert!(
         violations.is_empty(),
         "link-graph violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+/// Contract 34, dev-dep pin: `wyrd-fuse`'s test-only edges stay
+/// exactly `wyrd-core` (export fixtures). The direct check exempts
+/// dev-dependencies, and the transitive check ignores them, so
+/// without this pin a transport edge could hide in the test profile
+/// while every suite stays green.
+#[test]
+fn fuse_dev_deps_stay_pinned() {
+    let root = workspace_root();
+    let root_manifest = read_manifest(&root);
+    let workspace_deps = workspace_dep_table(&root_manifest);
+    let fuse = read_manifest(&root.join("crates/wyrd-fuse"));
+    let violations = check_fuse_dev_deps(&dev_deps(&fuse), &workspace_deps);
+    assert!(
+        violations.is_empty(),
+        "dev-dep violations:\n- {}",
         violations.join("\n- ")
     );
 }
@@ -1210,6 +1424,92 @@ mod policy_tests {
         assert!(
             check_link_graph("wyrd-fuse", &graph).is_empty(),
             "unknown members are leaves to the closure: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_passes_the_clean_pair() {
+        let holders = [
+            "crates/wyrd-sync/src/durable/mod.rs".to_owned(),
+            "crates/wyrd-namespace/src/view.rs".to_owned(),
+        ];
+        assert!(
+            check_proof_mint(&holders).is_empty(),
+            "definition plus authority must pass"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_second_mint() {
+        let holders = [
+            "crates/wyrd-fuse/src/view/tests.rs".to_owned(),
+            "crates/wyrd-namespace/src/view.rs".to_owned(),
+            "crates/wyrd-sync/src/durable/mod.rs".to_owned(),
+        ];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "one rogue mint: {violations:?}");
+        assert!(
+            violations[0].contains("crates/wyrd-fuse/src/view/tests.rs"),
+            "names the rogue file: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_missing_definition() {
+        let holders = ["crates/wyrd-sync/src/durable/mod.rs".to_owned()];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "missing definition: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-namespace"),
+            "names the definition site: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_count_rejects_a_missing_authority() {
+        let holders = ["crates/wyrd-namespace/src/view.rs".to_owned()];
+        let violations = check_proof_mint(&holders);
+        assert_eq!(violations.len(), 1, "missing authority: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-sync"),
+            "names the authority site: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn mint_scanner_ignores_comments_and_strings() {
+        let files = [
+            (
+                "crates/wyrd-fuse/src/view/head.rs",
+                "// mint via from_verified_unchecked is forbidden",
+            ),
+            (
+                "crates/wyrd-sync/src/durable/mod.rs",
+                "let name = \"from_verified_unchecked\";",
+            ),
+        ];
+        assert!(
+            mint_holding_files(&files).is_empty(),
+            "comments and strings are not mints"
+        );
+    }
+
+    #[test]
+    fn fuse_dev_dep_widening_is_rejected() {
+        let violations = check_fuse_dev_deps(&deps(&["wyrd-core", "tokio"]), &empty_ws());
+        assert_eq!(violations.len(), 1, "widened dev-deps: {violations:?}");
+        assert!(
+            violations[0].contains("tokio"),
+            "names the added edge: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn fuse_dev_dep_pin_passes_exact() {
+        let violations = check_fuse_dev_deps(&deps(&["wyrd-core"]), &empty_ws());
+        assert!(
+            violations.is_empty(),
+            "exactly wyrd-core must pass: {violations:?}"
         );
     }
 }

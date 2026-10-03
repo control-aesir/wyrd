@@ -6,7 +6,7 @@
 //! nothing today: the kernel refusal mapping (EOPNOTSUPP) lives at the
 //! backend's `readlink` boundary in `wyrd-daemon`.
 
-pub use wyrd_namespace::{
+pub use wyrd_namespace::view::{
     confine_symlink_target, Attr, ConfinementError, ConflictVersion, DirEntry, Kind,
     MaterializationPolicy as Materialization, Node, OpenFile, ViewError,
 };

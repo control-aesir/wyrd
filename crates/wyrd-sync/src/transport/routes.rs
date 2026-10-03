@@ -187,4 +187,44 @@ mod tests {
         }
         bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
     }
+
+    /// An announcement with an undecodable route publishes nothing and
+    /// counts the skip: routing metadata is untrusted, so a refusal
+    /// must not fail the pass — the plan reports absence instead.
+    #[test]
+    fn undecodable_route_publishes_nothing_and_counts_the_skip() {
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let snapshot = SnapshotId::from_bytes([0x12; 32]);
+        let mut state = RuntimeState::new(drive);
+        state
+            .record_announcement(SnapshotAnnouncement {
+                snapshot,
+                author: DeviceId::from_bytes([0x33; 32]),
+                epoch: 1,
+                membership: TransitionId::from_bytes([0x44; 32]),
+                body_root: BaoRoot::from_bytes([0x55; 32]),
+                root_manifest: wyrd_format::ContentId::from_bytes([0x77; 32]),
+                root_manifest_transport: BaoRoot::from_bytes([0x66; 32]),
+                node_addr: Some(vec![0xFF; 8]),
+                signature: [0; 64],
+            })
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        let mut bulk = IrohBulkSource::with_runtime(endpoint, Arc::new(runtime));
+        let report = publish_recorded_routes(&state, &mut bulk);
+        assert_eq!(report.published, 0, "no route, no publications");
+        assert_eq!(report.undecodable, 1, "the skip is counted, not silent");
+        bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    }
 }

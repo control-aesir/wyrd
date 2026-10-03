@@ -106,10 +106,32 @@ Landed:
   routing columns, announcement fork gating at intake with route updates
 - bulk object transport type (`IrohBulkSource`) and the fetch plan that
   consumes the announced identities
+- the serving router peers dial into: a serving endpoint over the
+  durable vault answers peer fetches by transport root, wired in the
+  `wyrd` binary (`WyrdNode::open_serving`) and proven on the
+  real-iroh loopback (contract 13 in `wyrd-contracts`)
+- relay interoperability across implementations: the heterogeneous
+  episode (MiniRelay fake plus rust-nostr's real in-process
+  `LocalRelay` — publication fan-out, per-relay replay with dedupe,
+  outage with survivor intake, recovery with replay convergence)
+  runs in the default gate (`mailbox::tests_crossimpl`); live
+  public-relay runs stay opt-in hand evidence by rule (never in CI)
 
-Remaining in this phase: the serving router peers dial into (real-iroh
-loopback in the `wyrd` binary), NIP-46 remote signing, and bulk
-backpressure under live network conditions.
+Open from this phase (status + v0.2 blocker call each — reconciled
+against `docs/architecture.md`, `README.md`, and
+`docs/sync-and-peers.md`):
+
+- NIP-46 remote signing: absent. The `SignerSession` trait boundary
+  and the `control/nip46.rs` wire codecs exist and are fake-tested;
+  no session-negotiation implementation exists. Not a v0.2 blocker:
+  v0 operates with the local signer, and neither the v0.2 Ship list
+  nor the definition of done below names remote signing.
+- Bulk backpressure under live network conditions: mechanism landed
+  (pass-budget fair-share across providers, `docs/fetch-on-open.md`
+  property 8) and loopback-tested; measured pressure on a live
+  network is open. Not a v0.2 blocker: no operational bound is
+  violated on current evidence, so the v0.2 performance entry test
+  does not trigger; live measurement books to later hardening.
 
 ## Phase 2: Minimal Filesystem Slice — shipped
 
@@ -217,7 +239,41 @@ invalid bytes never committed or served. Local bitrot is detected on
 read but never re-fetched — an object recorded as local stays local —
 so a bitrotted object is a permanent read error in v0.2. The repair
 loop and scrub are booked in v0.3 core below; the design, with its
-protocol invariants, is recorded in `docs/peer-repair.md`.
+protocol invariants, is recorded in `docs/peer-repair.md`. Known history
+without a reachable provider stays visible but unfetchable, and the
+two cases fail differently: a known snapshot whose manifest chain
+cannot be materialized within the deadline fails `open()`
+bounded (`EIO`); an announcement whose body never arrives leaves the
+snapshot unadopted — a later snapshot built on it classifies
+`UnknownParent`, so its paths never enter the
+projected namespace (`ENOENT`, never a hang). Recovery needs a new
+announcement, since v0.2 provides neither content recovery nor a
+root-recovery workflow (both book to v0.3).
+The case split is normative in `docs/fetch-on-open.md`. Control-plane
+delivery is relay-accepted, not recipient-received: the outbox
+obligation retires when the bytes leave this device — `mailbox.send`
+resolving `Ok` means the relay client accepted the write, and a
+relay-side refusal still resolves `Ok` (diagnostic-only outcome),
+so the committed `Delivered` fact cannot distinguish refusal from
+success. A peer absent past relay retention leaves a silent hole:
+no re-push, no pull path for control messages never received
+(triage: nostr:nevent1qqs26a0kqnfm72p8l5c3sw2hr4mxf97r4nszm0zm7ekh7facn3h0j7gpz9mhxue69uhkwunpwdczuap49eehgrh0ugr).
+Admitting
+a device walks the live epoch chain's ancestry and commits one
+announcement obligation per closure member in the single admission
+batch — O(recorded history) allocation and commit in one call, with
+no incremental checkpointing. Past the 65,536-record per-commit
+ceiling the admission is refused whole (never truncated, never
+partial); the walk covers the live epoch's chain only, so a
+newcomer admitted epochs later does not re-walk superseded chains
+(open question whether that horizon is intended: see
+nostr:nevent1qqsdypczmlxwznanysne4qlk640fv6akxdskpmzpn9atjr9yvu6a6dgpz9mhxue69uhkwunpwdczuap49eehgcjgtm3).
+Not a v0.2 blocker: it needs a long single-epoch history plus an
+admission, violates no operational bound, and incremental
+checkpointing under the resource budget is the booked fix. The
+ceiling behavior and the cost shape are pinned by
+`admission_closure_cost_scales_with_history` and documented in
+`docs/resource-limits.md`.
 
 Milestone decision (content recovery in v0.2): the grafting
 primitives exist at the library layer only.

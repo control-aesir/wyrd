@@ -16,14 +16,21 @@ ID / Storage ID). This doc describes how peers exchange them.
 
 ## Runtime sync boundary
 
-The remaining runtime work sits between the protocol primitives and the
-filesystem surface:
+The runtime work between the protocol primitives and the
+filesystem surface — status each, since this list used to read as
+all-remaining:
 
 - persistent local state for membership, snapshots, manifests, materialization,
-  capabilities, and pending work
-- bulk object transport and backpressure
-- crash recovery and restart reconciliation
-- read-only then read/write FUSE integration
+  capabilities, and pending work — landed (durable fact log, replay,
+  restart reconciliation under test; `ROADMAP.md` Phase 1)
+- bulk object transport and backpressure — mechanism landed
+  (pass-budget fair-share, `fetch-on-open.md` property 8) and
+  loopback-tested; measured pressure on a live network stays open
+  (`ROADMAP.md` Phase 1, not a v0.2 blocker)
+- crash recovery and restart reconciliation — landed, including
+  torn-commit recovery (`ROADMAP.md`: crash recovery is shipped)
+- read-only then read/write FUSE integration — landed; the mount
+  serves read-write by default (`ROADMAP.md` Phase 2)
 
 The control plane is wired both ways: intake drains the relay mailbox
 into the engine every pass, and the same pass publishes undischarged

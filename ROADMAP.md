@@ -106,10 +106,34 @@ Landed:
   routing columns, announcement fork gating at intake with route updates
 - bulk object transport type (`IrohBulkSource`) and the fetch plan that
   consumes the announced identities
+- the serving router peers dial into: a serving endpoint over the
+  durable vault answers peer fetches by transport root, wired in the
+  `wyrd` binary (`WyrdNode::open_serving`) and proven on the
+  real-iroh loopback (contract 13 in `wyrd-contracts`)
 
-Remaining in this phase: the serving router peers dial into (real-iroh
-loopback in the `wyrd` binary), NIP-46 remote signing, and bulk
-backpressure under live network conditions.
+Open from this phase (status + v0.2 blocker call each — reconciled
+against `docs/architecture.md`, `README.md`, and
+`docs/sync-and-peers.md`):
+
+- NIP-46 remote signing: absent. The `SignerSession` trait boundary
+  and the `control/nip46.rs` wire codecs exist and are fake-tested;
+  no session-negotiation implementation exists. Not a v0.2 blocker:
+  v0 operates with the local signer, and neither the v0.2 Ship list
+  nor the definition of done below names remote signing.
+- Bulk backpressure under live network conditions: mechanism landed
+  (pass-budget fair-share across providers, `docs/fetch-on-open.md`
+  property 8) and loopback-tested; measured pressure on a live
+  network is open. Not a v0.2 blocker: no operational bound is
+  violated on current evidence, so the v0.2 performance entry test
+  does not trigger; live measurement books to later hardening.
+- Relay interoperability: multi-relay operation is landed
+  (`LiveMailbox` supervision with relay-health polling and
+  capped-backoff recovery, `mailbox::tests_multirelay` covering
+  publication, replay/dedupe, and outage with survivor intake);
+  verification against independent relay implementations is in
+  progress under `test(mailbox): verify cross-implementation relay
+  interop` (v0.2 scope), with the opt-in public-relay tests as
+  hand-run evidence (proven by hand, never in CI).
 
 ## Phase 2: Minimal Filesystem Slice — shipped
 

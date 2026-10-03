@@ -738,7 +738,12 @@ cannot compile quietly — it arrives as a visible, greppable trust decision.
   conflicting vector contributes only its vacant tail, and the conflict
   stays in the log as evidence. That ordering is what keeps a reopen
   convergent with the live engine, and it is also what makes the
-  first-committed vector the minting base for later capabilities.
+  first-committed vector the minting base for later capabilities —
+  including propagation: the next rotation re-mints whatever the
+  keyring holds under a valid owner proof, so a first-committed
+  forgery travels to every member. First-wins keeps the node working;
+  quarantining the forgery needs the escrow-preferring mint, which is
+  future work.
   Knowledge and key material are distinct: learning epoch N+1's
   transition does not mean holding epoch N+1 secrets until the capability
   arrives.

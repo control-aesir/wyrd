@@ -329,6 +329,13 @@ covers, later vectors contribute only vacant epochs, and every vector
 stays committed as evidence. Future capabilities therefore mint from
 first-committed secrets, which is why owner-minted material (proof-bound
 at delivery) is the only trustworthy source for a device's key history.
+Accepted consequence, stated plainly: a forged vector committed before
+the honest one becomes the minting base, and the next rotation re-mints
+it under a valid owner proof to every member — first-wins keeps one node
+working, it does not quarantine the forgery. Preferring the root escrow
+sidecar over the keyring when minting past epochs would stop that
+propagation without reintroducing the open brick; that narrowing is
+future protocol work.
 
 Security properties, stated as invariants:
 

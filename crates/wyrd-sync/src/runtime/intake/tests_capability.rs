@@ -831,7 +831,7 @@ fn longer_conflicting_vector_grants_its_vacant_tail_on_reopen() {
     )
     .expect("conflicting facts open fill-vacant");
     let mut expected = honest.clone();
-    expected.push(tail);
+    expected.push(tail.clone());
     for (epoch, secret) in expected.iter().enumerate() {
         let epoch = epoch as u64 + 1;
         let key = secret.control_key(&member_drive(), epoch);
@@ -843,6 +843,16 @@ fn longer_conflicting_vector_grants_its_vacant_tail_on_reopen() {
     }
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.capabilities.len(), 2, "both facts stay durable");
+    // The authoring precondition directly, not via the epoch_keys
+    // proxy above: `commit_new_epoch` reads
+    // `store.rebuild(..).keyring`, so the tail secret must be there —
+    // this is what unblocks the next mint.
+    let rebuilt = fixture.engine.store.rebuild(device).expect("rebuilds");
+    assert_eq!(
+        rebuilt.keyring.secret(3).cloned(),
+        Some(tail.clone()),
+        "the vacant tail installs for authoring to read"
+    );
     // An honest regrant of the true vector still commits — new
     // information is never suppressed — but it cannot dislodge the
     // first-committed tail from the keyring. That residual is the
@@ -872,6 +882,28 @@ fn longer_conflicting_vector_grants_its_vacant_tail_on_reopen() {
     assert_eq!(report.accepted, 1, "the regrant commits");
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.capabilities.len(), 3);
+    // A third open over all three facts: the honest regrant changed
+    // the log but not the keyring — epoch 3 still resolves to the
+    // rival tail. This pins the residual the comment above
+    // describes, and fails if fill-vacant ever becomes last-wins.
+    fixture.engine.release_store_lock();
+    let (identity_sk, _) = identity(0x02);
+    let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();
+    fixture.engine = Engine::open(
+        fixture.dir.path.clone(),
+        member_drive(),
+        device,
+        "test-pass",
+        identity_sk,
+        encryption_sk,
+    )
+    .expect("three conflicting facts still open");
+    let key = tail.control_key(&member_drive(), 3);
+    assert_eq!(
+        fixture.engine.epoch_keys.get(&3).map(|k| k.to_vec()),
+        Some(key.to_vec()),
+        "the first-committed tail survives the honest regrant"
+    );
 }
 
 /// A freshly resealed identical capability is a duplicate, not a new

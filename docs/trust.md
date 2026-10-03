@@ -733,7 +733,13 @@ cannot compile quietly — it arrives as a visible, greppable trust decision.
   monotonic:** installing a capability may only add secrets for epochs not
   yet held; it must never decrease the device's known membership state or
   remove newer secrets — a replayed older capability is a no-op, not a
-  rollback. Knowledge and key material are distinct: learning epoch N+1's
+  rollback. Conflicting vectors are first-wins in commit order: the
+  earliest-committed vector anchors every epoch it covers, a later
+  conflicting vector contributes only its vacant tail, and the conflict
+  stays in the log as evidence. That ordering is what keeps a reopen
+  convergent with the live engine, and it is also what makes the
+  first-committed vector the minting base for later capabilities.
+  Knowledge and key material are distinct: learning epoch N+1's
   transition does not mean holding epoch N+1 secrets until the capability
   arrives.
 - **Pinned wrap parameters** (decision T12): the ECDH input is the

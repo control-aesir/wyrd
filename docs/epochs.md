@@ -323,6 +323,12 @@ A **capability** delivered to a member of epoch N:
 add secrets for epochs the device does not yet hold. It must never decrease
 the device's known membership state, remove newer secrets, or roll back —
 a replayed older capability is a harmless no-op, not a downgrade.
+Conflicting vectors resolve first-wins in commit order, at install time
+and on every replay: the earliest-committed vector anchors the epochs it
+covers, later vectors contribute only vacant epochs, and every vector
+stays committed as evidence. Future capabilities therefore mint from
+first-committed secrets, which is why owner-minted material (proof-bound
+at delivery) is the only trustworthy source for a device's key history.
 
 Security properties, stated as invariants:
 

@@ -19,7 +19,6 @@ use super::DurableError;
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::capability::DriveKeyring;
-use crate::keys::capability::InstallError;
 use crate::membership::MembershipLog;
 use crate::runtime::{ManifestRecord, MaterializationState, RuntimeState};
 
@@ -226,13 +225,13 @@ pub struct Rebuilt {
     pub runtime: RuntimeState,
 }
 
-/// Rebuild the live state: replay transitions into a fresh log,
-/// re-validate capabilities against their transition's derived state,
-/// install the local device's capabilities, and replay the runtime
 /// The authorized key view over already-loaded facts: the single-device
 /// keyring as [`rebuild_facts`] builds it, without the runtime
-/// projection. Resync consults this (not a second store load) to gate
-/// provisional bootstrap installs against authorized epoch secrets.
+/// projection. Transitions replay into a fresh log, capabilities
+/// re-validate against their transition's derived state, and the local
+/// device's capabilities install fill-vacant (first-committed wins).
+/// Resync consults this (not a second store load) to gate provisional
+/// bootstrap installs against authorized epoch secrets.
 pub(crate) fn build_keyring(
     drive: &DriveId,
     facts: &LoadedFacts,
@@ -253,25 +252,25 @@ pub(crate) fn build_keyring(
         // authoritative lookup — the transition and the state it
         // produces are inseparable — so a record that passed the
         // store-key envelope can never install a capability whose
-        // drive, binding, or secret count is stale.
-        //
-        // A conflicting vector under an already-installed key does
-        // not fail the rebuild: commit order is first-wins (the live
-        // intake installs fill-vacant and never swaps a held secret
-        // behind traffic sealed under it), the conflicting fact stays
-        // durable as tamper evidence, and failing the open over it
-        // would let one proof-less control-framed grant permanently
-        // brick the node. The skip is loud, so a conflict never
-        // passes silently.
-        match keyring.install(cap, &log) {
-            Ok(_) => {}
-            Err(InstallError::EpochConflict(epoch)) => {
-                tracing::warn!(
-                    device = %device,
-                    epoch,
-                    transition = %cap.transition,
-                    "conflicting capability fact skipped: first-committed secret holds"
-                );
+        // drive, binding, or secret count is stale. Conflicting
+        // vectors install fill-vacant — the same outcome as the live
+        // intake's `note_committed_facts`, which never swaps a held
+        // secret behind traffic sealed under it — so a reopen derives
+        // exactly the keys the live engine held: held epochs keep
+        // their first-committed secret, the vacant tail still lands
+        // so later epochs stay openable and authorable, and the skip
+        // warns loudly below — a conflict never passes silently and
+        // never fails the rebuild.
+        match keyring.install_vacant(cap, &log) {
+            Ok(skipped) => {
+                if !skipped.is_empty() {
+                    tracing::warn!(
+                        device = %device,
+                        transition = %cap.transition,
+                        skipped_epochs = ?skipped,
+                        "conflicting capability fact skipped: first-committed secrets hold"
+                    );
+                }
             }
             Err(error) => return Err(error.into()),
         }

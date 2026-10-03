@@ -1,7 +1,7 @@
 use super::mini_relay::MiniRelay;
 use super::tests_harness::{
     assert_quiet, drain_to, keys, live_mailbox, seal_rumor, sender_keys, temp_path,
-    DELIVERY_TIMEOUT,
+    wait_for_distinct_deliveries, DELIVERY_TIMEOUT,
 };
 use super::*;
 use nostr::event::FinalizeEvent;
@@ -145,28 +145,16 @@ fn settled_ids_collapse_to_watermark() {
     let seen_path = temp_path("seen-watermark");
 
     let mut mailbox = live_mailbox(&receiver, &relays, seen_path.clone());
-    for index in 0..3 {
+    const COUNT: usize = 3;
+    for index in 0..COUNT {
         relay.inject(seal_rumor(&sender, receiver_key, format!("wm-{index}")));
     }
-    let mut ids = Vec::new();
-    // Collect three *distinct* deliveries: recv re-offers held mail
-    // under its stable id when nothing new has arrived yet, and a
-    // bare wait would mistake that re-offer for new mail — settling
-    // the same id twice advances the watermark early and flakes the
-    // assertions below. First-seen order is arrival order (fresh
-    // wraps mint increasing ids), so the settle choreography is
-    // unchanged.
-    let start = Instant::now();
-    while ids.len() < 3 {
-        assert!(start.elapsed() < DELIVERY_TIMEOUT, "mail delivers");
-        if let Some(delivery) = mailbox.recv().unwrap() {
-            if !ids.contains(&delivery.id()) {
-                ids.push(delivery.id());
-            }
-        } else {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+    // Collect distinct deliveries: a re-offered held delivery must
+    // not stand in for mail still arriving — settling one id twice
+    // advances the watermark early and flakes the assertions below.
+    // First-seen order is arrival order, so the settle choreography
+    // is unchanged. Budget keeps the old per-take allowance.
+    let ids = wait_for_distinct_deliveries(&mut mailbox, COUNT, DELIVERY_TIMEOUT * 3);
     // Settle newest first: nothing is contiguous yet.
     mailbox.settle(ids[2], Disposition::Ack).unwrap();
     assert_eq!(mailbox.settled_below(), 0, "gap blocks the watermark");

@@ -106,6 +106,38 @@ pub(super) fn assert_quiet(mailbox: &mut LiveMailbox<Keys>) {
     assert!(wait_for_delivery(mailbox, QUIET_TIMEOUT).is_none());
 }
 
+/// Collect `wanted` *distinct* deliveries within `timeout`: recv
+/// re-offers held mail under its stable id when nothing new has
+/// arrived yet, so blind takes mistake re-offers for new mail and
+/// settle (or count) one id twice. Sleeps on any iteration that
+/// adds nothing new — a dry or duplicate-only pipeline backs off
+/// instead of spinning. First-seen order is arrival order (fresh
+/// wraps mint increasing ids). Additive alongside
+/// `wait_for_delivery`, which stays re-offer-transparent for the
+/// tests that pin re-offer behavior itself.
+pub(super) fn wait_for_distinct_deliveries(
+    mailbox: &mut LiveMailbox<Keys>,
+    wanted: usize,
+    timeout: Duration,
+) -> Vec<DeliveryId> {
+    let start = Instant::now();
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    while ids.len() < wanted {
+        assert!(
+            start.elapsed() < timeout,
+            "only {}/{} distinct deliveries arrived",
+            ids.len(),
+            wanted,
+        );
+        match mailbox.recv().unwrap() {
+            Some(delivery) if seen.insert(delivery.id()) => ids.push(delivery.id()),
+            _ => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    ids
+}
+
 /// Wait until the relay holds the mailbox's subscription (or time
 /// out): the initial REQ races the relay core loop, so floods inject
 /// after registration instead of assuming it.

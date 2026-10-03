@@ -266,7 +266,8 @@ sync status
 
 sync now
     = bounded synchronization run
-    = connects
+    = connects when given a relay (a relay-less run is refused
+      without --offline)
     = may mutate durable state
     = reports network liveness plus mailbox intake posture (a
       relay-closed subscription degrades the verdict even when every
@@ -318,8 +319,12 @@ sync now
   burning the cap. Zero-progress passes park the settle window too,
   so dead churn waits on the relay instead of spinning.
 - `--relay <url>` (repeatable, shared parsing with `mount`): with
-  none given, intake stays idle and `now` discharges local
-  obligations and fetches nothing new.
+  none given, `now` refuses with a usage error unless `--offline`
+  is passed — a relay-less run exits 0 with an idle intake, which
+  automation keying on exit status cannot distinguish from a
+  converged sync. With `--offline`, intake stays idle: `now`
+  discharges local obligations and fetches nothing new. `--offline`
+  cannot be combined with `--relay`.
 
 Route-less authoring is intentional, not an omission: `now` binds
 no serving endpoint, so its announcements carry no retrieval

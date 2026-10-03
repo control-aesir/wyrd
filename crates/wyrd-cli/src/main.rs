@@ -70,7 +70,8 @@ struct Credentials {
 #[derive(Debug, Args)]
 struct RelayArgs {
     /// Control-plane relay; repeatable. With none given, intake
-    /// stays idle and the command runs offline.
+    /// stays idle and the command runs offline (`sync now`
+    /// additionally requires `--offline` to say so explicitly).
     #[arg(long, value_name = "URL")]
     relay: Vec<String>,
 }
@@ -155,7 +156,9 @@ enum Command {
     },
     /// Headless sync: report sync state or run a bounded sync without
     /// mounting. Status never connects and never mutates durable
-    /// state; `now` connects, may mutate it, and reports liveness.
+    /// state; `now` connects when given a relay (and refuses a
+    /// relay-less run without `--offline`), may mutate durable
+    /// state, and reports liveness.
     Sync {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -380,8 +383,17 @@ enum SyncAction {
     Status,
     /// Run bounded sync passes headless: drain, deliver, announce,
     /// fetch — no FUSE session, same live budgets as mount. Stops on
-    /// the first quiet pass; the pass limit reports incomplete.
-    Now,
+    /// the first quiet pass; the pass limit reports incomplete. A
+    /// relay-less run exits 0 having contacted nothing, which reads
+    /// as converged to automation — so without `--relay` the command
+    /// refuses unless `--offline` explicitly opts into the local run.
+    Now {
+        /// Run without relays: intake stays idle, only local
+        /// obligations discharge, nothing new is fetched. Cannot be
+        /// combined with --relay.
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 /// One cache reporting action. Both read durable state only: never
@@ -1688,7 +1700,29 @@ fn sync(
             print!("{}", sync_status_render(&status));
             Ok(())
         }
-        SyncAction::Now => sync_now(drive_dir, relays, passphrase, identity),
+        SyncAction::Now { offline } => {
+            // --offline means "run without relays": combining it with
+            // --relay is contradictory, and silently ignoring the flag
+            // would lie about the run. (clap conflicts_with cannot
+            // express this: --relay lives on the parent command via
+            // flatten, not on the `now` subcommand.)
+            if offline && !relays.is_empty() {
+                return Err(CliError::Usage(
+                    "--offline cannot be combined with --relay".into(),
+                ));
+            }
+            // A relay-less run exits 0 with an idle intake, which a
+            // cron or systemd unit keying on exit status cannot
+            // distinguish from a converged sync. Refuse it before
+            // touching the keystore unless --offline opts in.
+            if relays.is_empty() && !offline {
+                return Err(CliError::Usage(
+                    "sync now needs at least one --relay, or --offline for a relay-less local run"
+                        .into(),
+                ));
+            }
+            sync_now(drive_dir, relays, passphrase, identity)
+        }
     }
 }
 
@@ -1728,6 +1762,9 @@ fn sync_now(
     // burns its full window even as mail lands.
     mailbox.attach_waker(Arc::clone(live.waker()));
     let settle = if relays.is_empty() {
+        // Only reachable with --offline (the dispatch above refuses
+        // a bare relay-less run): intake stays idle by explicit
+        // request, so there is no arrival to wait for.
         eprintln!("warning: no --relay given; control-plane intake stays idle");
         None
     } else {

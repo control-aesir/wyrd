@@ -96,9 +96,10 @@ over the durable vault answers peer fetches by transport root), and a
 read-write FUSE mount via the daemon (`wyrd mount`, writes committing as
 snapshots) are in place and under test. The relay pool is supervised
 (`LiveMailbox` with relay-health polling and capped-backoff recovery,
-multi-relay operation under test); what stays open on the relay side
-is verification against independent relay implementations, in
-progress for v0.2. Still pending: signer-client wiring (NIP-46),
+multi-relay operation under test) and proven across implementations
+in the default gate (fake plus real in-process relay); live
+public-relay runs stay opt-in hand evidence. Still pending:
+signer-client wiring (NIP-46),
 automatic peer repair, and garbage
 collection (post-v1 by contract).
 
@@ -266,8 +267,7 @@ bounded, then surfaces `EIO` on expiry) and a serving endpoint other
 peers can fetch from.
 
 What it is not: peer sync is not hardened (signer-session wiring is
-still open and relay verification against independent implementations
-is in progress), there is no garbage collection
+still open and live-internet relay evidence stays opt-in), there is no garbage collection
 (the store grows forever), `O_APPEND` and `O_TRUNC` are supported but
 `O_APPEND|O_TRUNC` together is refused (`EOPNOTSUPP`), there is no
 auto-update, and drives created by one alpha may not open under the

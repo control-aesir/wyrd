@@ -110,6 +110,12 @@ Landed:
   durable vault answers peer fetches by transport root, wired in the
   `wyrd` binary (`WyrdNode::open_serving`) and proven on the
   real-iroh loopback (contract 13 in `wyrd-contracts`)
+- relay interoperability across implementations: the heterogeneous
+  episode (MiniRelay fake plus rust-nostr's real in-process
+  `LocalRelay` — publication fan-out, per-relay replay with dedupe,
+  outage with survivor intake, recovery with replay convergence)
+  runs in the default gate (`mailbox::tests_crossimpl`); live
+  public-relay runs stay opt-in hand evidence by rule (never in CI)
 
 Open from this phase (status + v0.2 blocker call each — reconciled
 against `docs/architecture.md`, `README.md`, and
@@ -126,14 +132,6 @@ against `docs/architecture.md`, `README.md`, and
   network is open. Not a v0.2 blocker: no operational bound is
   violated on current evidence, so the v0.2 performance entry test
   does not trigger; live measurement books to later hardening.
-- Relay interoperability: multi-relay operation is landed
-  (`LiveMailbox` supervision with relay-health polling and
-  capped-backoff recovery, `mailbox::tests_multirelay` covering
-  publication, replay/dedupe, and outage with survivor intake);
-  verification against independent relay implementations is in
-  progress under `test(mailbox): verify cross-implementation relay
-  interop` (v0.2 scope), with the opt-in public-relay tests as
-  hand-run evidence (proven by hand, never in CI).
 
 ## Phase 2: Minimal Filesystem Slice — shipped
 

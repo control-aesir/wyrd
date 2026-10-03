@@ -66,9 +66,11 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   future mixnet drop) drives the same engine.
 - **Test evidence, three-way**: hermetic in-process NIP-01 relay
   (`MiniRelay`, real `EVENT`/`REQ`/`EOSE`/`CLOSE` over websockets,
-  no live network); the real-iroh but relay-disabled serving path
-  for the bulk plane; and two opt-in tests against actual public
-  relays (`mailbox::tests_interop`). Those two are `#[ignore]`d and
+  no live network) plus the heterogeneous cross-implementation
+  episode beside it (`tests_crossimpl`: the fake plus rust-nostr's
+  real in-process relay, in the default gate); the real-iroh but
+  relay-disabled serving path for the bulk plane; and two opt-in
+  tests against actual public relays (`mailbox::tests_interop`). Those two are `#[ignore]`d and
   excluded from every CI profile by rule (`.config/nextest.toml`:
   the ignore attribute is reserved for tests needing external
   resources, which must never run in CI) — the honest framing of

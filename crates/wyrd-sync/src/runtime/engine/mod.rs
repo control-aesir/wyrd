@@ -595,8 +595,9 @@ pub struct Engine {
     pub(super) announcements: BTreeMap<SnapshotId, SnapshotAnnouncement>,
     /// The committed-capability projection intake validates against:
     /// one hydrated capability per (device, authorizing transition),
-    /// kept in lockstep with the durable facts (updated only after a
-    /// commit succeeds, rebuilt from them on resync). A resealed
+    /// recorded by [`Engine::commit_facts`] itself so every writer of
+    /// `Fact::Capability` lands here, and rebuilt from the durable
+    /// facts on resync. A resealed
     /// byte-identical capability mints a fresh message id (fresh seal
     /// nonce), so envelope dedupe never fires — the value comparison
     /// here is what turns the reseal into a `Duplicate` instead of a
@@ -960,7 +961,24 @@ impl Engine {
         if let Some(stage) = self.crash_stage.take() {
             return self.store.commit_until(facts, stage);
         }
-        self.store.commit(facts)
+        let seq = self.store.commit(facts)?;
+        // The committed-capability projection is a property of the
+        // commit, not of any one intake caller: every writer of
+        // `Fact::Capability` (control and rotation intake, authoring,
+        // bootstrap) records what it committed here, so the live
+        // projection and the resync rebuild cannot disagree within
+        // one lifetime. Updated only after the durable write
+        // succeeds — the projection follows the store, never leads
+        // it — and skipped on the torn-commit path above, where
+        // nothing durable exists to follow and recovery reopens.
+        for fact in facts {
+            if let Fact::Capability(authorized) = fact {
+                let committed = authorized.capability();
+                self.committed_capabilities
+                    .insert((committed.device, committed.transition), committed.clone());
+            }
+        }
+        Ok(seq)
     }
 
     /// Test-only: release the store's advisory lock without dropping the

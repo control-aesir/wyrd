@@ -234,6 +234,78 @@ fn rotation_converges_without_the_epoch_key_in_one_drain() {
     assert_eq!(report.duplicates, 1);
 }
 
+/// A capability held on an unseen transition re-drives to `Duplicate`
+/// when its fact lands first through the rotation framing: the control
+/// envelope defers on the unobserved transition, the rotation delivery
+/// commits the same value (observing the transition and recording the
+/// projection), and the pending flush consumes the held entry with no
+/// facts instead of recommitting.
+#[test]
+fn deferred_capability_redriven_to_duplicate_by_rotation_commit() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    // Epoch-2 admission of the fixture sender and the engine device:
+    // the sender stays a member of the granted epoch, so its delivery
+    // passes the sender check.
+    let (_, sender) = identity(0x01);
+    let sender_key =
+        DeviceEncryptionSecret::from_bytes([0xE2; 32]).expect("fixture scalar is valid");
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = builder.child(vec![
+        Change::Admit(Admission {
+            device: sender,
+            encryption_key: encryption_key(&sender_key),
+        }),
+        Change::Admit(Admission {
+            device,
+            encryption_key: encryption_key(
+                &DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap(),
+            ),
+        }),
+    ]);
+    let grant_secrets = secrets(2);
+    let (wrapped, proof) = grant(
+        &[genesis.clone(), admission.clone()],
+        &admission,
+        device,
+        grant_secrets.clone(),
+    );
+    let control = capability_message(device, admission.transition_id(), 2, grant_secrets);
+    // Control first: the epoch key is held so the envelope opens, but
+    // the transition is unobserved, so it holds. Rotation second:
+    // commits the transition and the same value, and the flush meets
+    // the held entry with the projection already recorded.
+    let rotation = rotation_delivery(&fixture, 2, &admission, wrapped, proof);
+    let held = deliver(&fixture, 2, &control);
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        held,
+        rotation,
+    ];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 2, "genesis and the rotation commit");
+    assert_eq!(report.deferred, 1, "the control envelope holds");
+    assert_eq!(
+        fixture.engine.pending_count(),
+        0,
+        "the flush consumes the held entry as a duplicate"
+    );
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.transitions.len(), 2);
+    assert_eq!(facts.capabilities.len(), 1);
+    // And later deliveries of the same value stay duplicates: the
+    // reseal, plus the never-settled original envelope the relay
+    // retains and re-offers — both ack free with no facts.
+    let mail = vec![deliver(&fixture, 2, &control)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.duplicates, 2);
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 1);
+}
+
 /// A rotation delivery records the projection it commits through: the
 /// rotation path never consults it (budget-gated only), but the same
 /// grant arriving later under the control framing acks as a

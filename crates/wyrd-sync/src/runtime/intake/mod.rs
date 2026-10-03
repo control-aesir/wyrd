@@ -467,17 +467,11 @@ fn note_committed_facts(engine: &mut Engine, facts: &[Fact]) {
         if let Fact::ControlMessage(id) = fact {
             engine.inbox.remember(id);
         }
+        // The committed-capability projection needs no mirror here:
+        // `commit_facts` records every committed capability itself,
+        // so rotation deliveries (which never consult the projection)
+        // still land in it for a later control-path reseal to read.
         if let Fact::Capability(authorized) = fact {
-            // The projection follows the durable state, never leads
-            // it: the committed value lands here only after the fact
-            // batch committed. Shared with the rotation path, which
-            // never consults the projection but still records what it
-            // committed, so a later control-path reseal of a
-            // rotation-delivered capability reads as a duplicate.
-            let committed = authorized.capability();
-            engine
-                .committed_capabilities
-                .insert((committed.device, committed.transition), committed.clone());
             let drive = engine.drive;
             for (index, secret) in authorized.capability().secrets.iter().enumerate() {
                 let epoch = index as u64 + 1;
@@ -951,6 +945,19 @@ fn rotation_commit(
     }
     engine.log.observe(transition.clone());
     let mut staged: BTreeMap<SnapshotId, SnapshotAnnouncement> = BTreeMap::new();
+    // The flush below re-drives held entries through the capability
+    // arm, so the committing value must already be visible to the
+    // projection — the announcement analog of the `staged` map above.
+    // A held identical regrant then consumes as a duplicate instead of
+    // recommitting. If the batch below fails to commit, the error
+    // path resyncs (rebuilding the projection without this value),
+    // and the consumed entry's envelope was never settled, so relay
+    // redelivery revalidates it later against durable truth.
+    let committing = authorized.capability();
+    engine.committed_capabilities.insert(
+        (committing.device, committing.transition),
+        committing.clone(),
+    );
     let mut facts = vec![
         Fact::Transition(transition),
         Fact::Capability(authorized),

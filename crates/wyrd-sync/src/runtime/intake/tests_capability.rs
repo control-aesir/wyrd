@@ -632,6 +632,54 @@ fn unauthorized_capability_suppresses_without_pending() {
     assert!(facts.capabilities.is_empty());
 }
 
+/// A conflicting value under a recorded key still commits: the
+/// projection suppresses exact replays, never new information. Same
+/// device and authorizing transition, different secret vector — the
+/// second delivery is a new grant, not a duplicate, and the fact log
+/// records it.
+#[test]
+fn conflicting_capability_value_under_a_recorded_key_commits() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let cap = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x08; 32]),
+            EpochSecret::from_bytes([0x09; 32]),
+        ],
+    );
+    let mail = vec![
+        deliver(&fixture, 1, &transition_message(&genesis)),
+        deliver(&fixture, 1, &transition_message(&admission)),
+        deliver(&fixture, 2, &cap),
+    ];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 3);
+    // Same key, different secret vector: authorization agrees (same
+    // binding, same epoch coverage) but the value differs, so the
+    // projection does not absorb it.
+    let rival = capability_message(
+        device,
+        admission.transition_id(),
+        2,
+        vec![
+            EpochSecret::from_bytes([0x0A; 32]),
+            EpochSecret::from_bytes([0x0B; 32]),
+        ],
+    );
+    let mail = vec![deliver(&fixture, 2, &rival)];
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 1, "the new grant commits");
+    assert_eq!(report.duplicates, 0, "a different value is no duplicate");
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.capabilities.len(), 2);
+}
+
 /// A freshly resealed identical capability is a duplicate, not a new
 /// envelope: the message id covers the sealed bytes (fresh nonce per
 /// seal), so envelope dedupe never fires — but the

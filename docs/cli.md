@@ -275,8 +275,13 @@ sync now
     = may mutate durable state
     = reports network liveness plus mailbox intake posture (a
       relay-closed subscription degrades the verdict even when every
-      relay is connected; exit status still reflects the local run
-      only, not the closure count)
+      relay is connected; a degraded mailbox fails the run as
+      unverified, whatever the local state — quiet observed through
+      a blind intake is never reported as converged, including a
+      blind stretch that healed mid-run: the lifetime
+      recovery-attempt counters prove an episode ran, so the quiet
+      verdict may predate the healing. Episodes only fire after
+      first attachment, so a slow cold start never counts.)
     = either converges or explicitly reports incomplete
 ```
 
@@ -305,15 +310,21 @@ sync now
   At most 32 passes: a peer that keeps intake non-idle forever
   (which a mount absorbs by running forever) trips the cap, which
   reports `stopped: pass limit (32) reached; sync may be
-  incomplete` and exits non-zero — a capped run is never reported
-  as converged. Refusal burns the cap the same way: a relay
-  configuration that accepts nothing keeps the outbox pending
-  forever, so the run never reaches quiet — the pending count names
-  the stuck obligations. A run that stops with known-but-unfetchable heads
-  exits zero: the outbox is empty and there is nothing local left
-  to do, so a non-zero exit would only invite pointless retries —
-  automate on the `unfetchable heads` count, not the exit status,
-  when that distinction matters.
+   incomplete` and exits non-zero — a capped run is never reported
+   as converged. Refusal burns the cap the same way: a relay
+   configuration that accepts nothing keeps the outbox pending
+   forever, so the run never reaches quiet — the pending count names
+   the stuck obligations. A run that stops with known-but-unfetchable heads
+   exits zero with a healthy mailbox: the outbox is empty and there is
+   nothing local left to do, so a non-zero exit would only invite
+   pointless retries — automate on the `unfetchable heads` count, not
+   the exit status, when that distinction matters. With a degraded
+   mailbox the same stop exits non-zero as unverified instead: the
+   empty outbox was observed through a blind intake, so "nothing
+   left to do" is unproven — including an intake that went blind
+   and recovered, which reads degraded with its attempt count, not
+   live. Stalled is a verdict about observed emptiness, not about
+   reachability — an unreachable relay never earns the quiet exit.
   Quiet is never trusted on first sight: relay delivery races the
   first drain, so a quiet verdict parks a short settle window
   (arrival short-circuits it) and confirms with a second pass.
@@ -323,12 +334,16 @@ sync now
   burning the cap. Zero-progress passes park the settle window too,
   so dead churn waits on the relay instead of spinning.
 - `--relay <url>` (repeatable, shared parsing with `mount`): with
-  none given, `now` refuses with a usage error unless `--offline`
-  is passed — a relay-less run exits 0 with an idle intake, which
-  automation keying on exit status cannot distinguish from a
-  converged sync. With `--offline`, intake stays idle: `now`
-  discharges local obligations and fetches nothing new. `--offline`
-  cannot be combined with `--relay`.
+   none given, `now` refuses with a usage error unless `--offline`
+   is passed — a relay-less run exits 0 with an idle intake, which
+   automation keying on exit status cannot distinguish from a
+   converged sync. With `--offline`, intake stays idle: `now`
+   discharges local obligations and fetches nothing new. The mailbox
+   line reads `idle (no --relay given)` there — an explicitly offline
+   run claims neither liveness nor degradation — and the completion
+   line reads `completed: quiet (offline run: local obligations
+   only)`, so the last line states the scope it converged. `--offline`
+   cannot be combined with `--relay`.
 
 Route-less authoring is intentional, not an omission: `now` binds
 no serving endpoint, so its announcements carry no retrieval

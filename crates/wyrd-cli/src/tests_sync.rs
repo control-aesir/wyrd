@@ -320,7 +320,10 @@ fn headless_loop_converges_a_real_outbox_in_staged_passes() {
         .unwrap();
     drop(parts);
     let mut bulk = Some(MemoryBulkSource::default());
-    let report = drive_quiet(&mut live, &mut NoopMailbox, &mut bulk, None).unwrap();
+    let mut report = drive_quiet(&mut live, &mut NoopMailbox, &mut bulk, None).unwrap();
+    // The loop test proves convergence, not the exit path: state the
+    // mailbox premise the render assertion rests on.
+    report.mailbox = Some(fixture_mailbox());
     assert_eq!(report.outcome, RunOutcome::Quiet);
     assert_eq!(report.passes, 4, "publish, republication, quiet, confirm");
     assert_eq!(report.pending, 0);
@@ -357,7 +360,10 @@ fn headless_loop_reports_unfetchable_instead_of_spinning() {
         .unwrap();
     drop(parts);
     let mut bulk = Some(MemoryBulkSource::default());
-    let report = drive_quiet(&mut live, &mut NoopMailbox, &mut bulk, None).unwrap();
+    let mut report = drive_quiet(&mut live, &mut NoopMailbox, &mut bulk, None).unwrap();
+    // The loop test proves the stall stop, not the exit path: state
+    // the mailbox premise the render assertion rests on.
+    report.mailbox = Some(fixture_mailbox());
     assert_eq!(report.outcome, RunOutcome::RemoteStalled);
     assert_eq!(report.passes, 2, "one grace pass, then stop");
     assert_eq!(report.pending, 0);
@@ -439,13 +445,251 @@ fn headless_loop_trips_the_cap_on_permanent_send_failure() {
         .unwrap();
     drop(parts);
     let mut bulk = Some(MemoryBulkSource::default());
-    let report = drive_quiet(&mut live, &mut SendFailingMailbox, &mut bulk, None).unwrap();
+    let mut report = drive_quiet(&mut live, &mut SendFailingMailbox, &mut bulk, None).unwrap();
+    // The loop test proves the cap trip, not the exit path: state
+    // the mailbox premise the render assertion rests on.
+    report.mailbox = Some(fixture_mailbox());
     assert_eq!(report.outcome, RunOutcome::PassLimit);
     assert_eq!(report.passes, MAX_SYNC_NOW_PASSES);
     assert!(report.pending > 0);
     let rendered = sync_now_render(&report);
     assert!(rendered.contains("pass limit"), "{rendered}");
     assert!(rendered.contains("may be incomplete"), "{rendered}");
+}
+
+/// Test-fixture mailbox posture: no mailbox ran, so there is no
+/// intake to distrust. Healthy by construction. A test-only stand-in
+/// for an observed snapshot — production never fabricates one
+/// (`drive_quiet` leaves `None`, `sync_now` stores `Some`).
+fn fixture_mailbox() -> MailboxHealth {
+    MailboxHealth {
+        stream_alive: true,
+        connected_relays: 0,
+        total_relays: 0,
+        saturation_recoveries: 0,
+        supervisor_ticks: 0,
+        stream_recovery_attempts: 0,
+        relay_recovery_attempts: 0,
+        closed_subscriptions: 0,
+    }
+}
+
+/// A mailbox snapshot no stopping verdict can rest on: the relay
+/// is unreachable, so intake may have missed mail the whole run.
+/// Closed count stays zero here; the disconnect alone is enough.
+fn blind_mailbox() -> MailboxHealth {
+    MailboxHealth {
+        stream_alive: true,
+        connected_relays: 0,
+        total_relays: 1,
+        saturation_recoveries: 0,
+        supervisor_ticks: 0,
+        stream_recovery_attempts: 0,
+        relay_recovery_attempts: 0,
+        closed_subscriptions: 0,
+    }
+}
+
+/// One report builder so the outcome-mapping tests differ only in
+/// what they vary: the stopping outcome and the mailbox posture.
+fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunReport {
+    SyncRunReport {
+        passes: 3,
+        accepted: 0,
+        duplicates: 0,
+        deferred: 0,
+        skipped: 0,
+        discarded: 0,
+        manifests: 0,
+        snapshot_bodies: 0,
+        objects: 0,
+        unfulfilled: 0,
+        outcome,
+        pending: 0,
+        unfetchable_heads: 0,
+        mailbox,
+    }
+}
+
+/// A degraded mailbox fails the run even when the local state
+/// converged: quiet was observed through a blind intake, so the
+/// verdict is unverified, never success. The blind mailbox outranks
+/// the cap too: rerunning without operator action cannot converge,
+/// so the error names the mailbox, not the pass count. An unobserved
+/// mailbox fails as unobserved on every outcome: no snapshot means
+/// no verdict to rest on.
+#[test]
+fn degraded_mailbox_fails_every_outcome_as_unverified() {
+    for outcome in [
+        RunOutcome::Quiet,
+        RunOutcome::RemoteStalled,
+        RunOutcome::PassLimit,
+    ] {
+        let report = report_with(outcome, Some(blind_mailbox()));
+        let error = run_outcome_error(&report).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CliError::Unverified {
+                    connected: 0,
+                    total: 1,
+                    closed: 0,
+                    attempts: 0
+                }
+            ),
+            "a blind mailbox fails {outcome:?} as unverified, got: {error}"
+        );
+        let rendered = sync_now_render(&report);
+        assert!(
+            !rendered.contains("completed:"),
+            "an unverified run never claims completion: {rendered}"
+        );
+        assert!(
+            rendered.contains("unverified"),
+            "the report says what the verdict lacks: {rendered}"
+        );
+        let unobserved = report_with(outcome, None);
+        let error = run_outcome_error(&unobserved).unwrap_err();
+        assert!(
+            matches!(error, CliError::Unobserved),
+            "an unobserved mailbox fails {outcome:?} as unobserved, got: {error}"
+        );
+        let rendered = sync_now_render(&unobserved);
+        assert!(
+            rendered.contains("mailbox unobserved") && rendered.contains("unverified"),
+            "the report admits the missing snapshot: {rendered}"
+        );
+    }
+    // A relay-closed subscription degrades at full connection: the
+    // socket is up while intake is dead, so the verdict is blind.
+    let mut closed = blind_mailbox();
+    closed.connected_relays = 1;
+    closed.closed_subscriptions = 1;
+    let error = run_outcome_error(&report_with(RunOutcome::Quiet, Some(closed))).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CliError::Unverified {
+                connected: 1,
+                total: 1,
+                closed: 1,
+                attempts: 0
+            }
+        ),
+        "a closed subscription fails quiet as unverified, got: {error}"
+    );
+    // A healed outage still fails: the counters prove a supervisor
+    // episode ran mid-run, so the quiet verdict may have been
+    // reached through the blind window. The error names the
+    // episodes, since the line above it reads live.
+    let mut healed = blind_mailbox();
+    healed.connected_relays = 1;
+    healed.relay_recovery_attempts = 2;
+    let error = run_outcome_error(&report_with(RunOutcome::Quiet, Some(healed))).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CliError::Unverified {
+                connected: 1,
+                total: 1,
+                closed: 0,
+                attempts: 2
+            }
+        ),
+        "a mid-run outage fails quiet as unverified, got: {error}"
+    );
+    let rendered = sync_now_render(&report_with(RunOutcome::Quiet, Some(healed)));
+    assert!(
+        rendered.contains("recovered mid-run (2 recovery attempts)"),
+        "the report names the history the live line cannot: {rendered}"
+    );
+}
+
+/// The mailbox line reads posture, never connection alone: an
+/// explicitly offline run is idle (neither live nor degraded), a
+/// connected run with no closures is live, and anything else names
+/// the symptom.
+#[test]
+fn mailbox_line_reads_posture_not_connection() {
+    assert_eq!(
+        mailbox_line(&fixture_mailbox()),
+        "mailbox: idle (no --relay given)\n"
+    );
+    let mut live = blind_mailbox();
+    live.connected_relays = 1;
+    assert_eq!(
+        mailbox_line(&live),
+        "mailbox: live (1 of 1 relays connected)\n"
+    );
+    assert_eq!(
+        mailbox_line(&blind_mailbox()),
+        "mailbox: degraded (0 of 1 relays connected)\n"
+    );
+    let mut closed = blind_mailbox();
+    closed.connected_relays = 1;
+    closed.closed_subscriptions = 2;
+    assert_eq!(
+        mailbox_line(&closed),
+        "mailbox: degraded (1 of 1 relays connected, 2 subscriptions closed by relay)\n"
+    );
+    // A recovered run reads degraded for its run-level verdict,
+    // with the history attached: the 1-of-1 count explains the
+    // attachment, the suffix explains the verdict.
+    let mut healed = blind_mailbox();
+    healed.connected_relays = 1;
+    healed.stream_recovery_attempts = 1;
+    healed.relay_recovery_attempts = 1;
+    assert_eq!(
+        mailbox_line(&healed),
+        "mailbox: degraded (1 of 1 relays connected, 2 recovery attempts during the run)\n"
+    );
+}
+
+/// The line and the exit agree on every posture: the word the
+/// operator reads and the code automation keys on never contradict
+/// each other — degraded word with a non-zero exit, live or idle
+/// word with zero. The healed case is pinned explicitly: attached
+/// now but blind mid-run still reads degraded, with the episodes
+/// named.
+#[test]
+fn mailbox_line_and_exit_agree_on_every_posture() {
+    // Offline: the line reads idle, the exit succeeds.
+    let offline = fixture_mailbox();
+    assert!(mailbox_line(&offline).contains("idle"));
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(offline))).is_ok());
+    // Healthy and attached: live line, clean exit.
+    let mut live = blind_mailbox();
+    live.connected_relays = 1;
+    assert!(mailbox_line(&live).starts_with("mailbox: live"));
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(live))).is_ok());
+    // Down or blind now: degraded line, failed exit.
+    assert!(mailbox_line(&blind_mailbox()).starts_with("mailbox: degraded"));
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(blind_mailbox()))).is_err());
+    let mut closed = blind_mailbox();
+    closed.connected_relays = 1;
+    closed.closed_subscriptions = 1;
+    assert!(mailbox_line(&closed).starts_with("mailbox: degraded"));
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(closed))).is_err());
+    // Healed: degraded word with the history named, failed exit.
+    let mut healed = blind_mailbox();
+    healed.connected_relays = 1;
+    healed.relay_recovery_attempts = 1;
+    assert!(mailbox_line(&healed).starts_with("mailbox: degraded"));
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(healed))).is_err());
+}
+
+/// An offline completion names its limits: it discharged local
+/// obligations and fetched nothing, so the last line says so
+/// instead of reading as a full convergence.
+#[test]
+fn offline_completion_names_its_limits() {
+    let report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    assert!(run_outcome_error(&report).is_ok());
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("completed: quiet (offline run: local obligations only)"),
+        "an offline success qualifies its scope: {rendered}"
+    );
 }
 
 /// The outcome maps to the process result: quiet succeeds, a capped
@@ -466,6 +710,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         outcome: RunOutcome::Quiet,
         pending: 0,
         unfetchable_heads: 0,
+        mailbox: Some(fixture_mailbox()),
     };
     assert!(run_outcome_error(&quiet).is_ok());
     let stalled = SyncRunReport {
@@ -482,6 +727,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         outcome: RunOutcome::RemoteStalled,
         pending: 0,
         unfetchable_heads: 1,
+        mailbox: Some(fixture_mailbox()),
     };
     assert!(run_outcome_error(&stalled).is_ok());
     let capped = SyncRunReport {
@@ -498,6 +744,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         outcome: RunOutcome::PassLimit,
         pending: 4,
         unfetchable_heads: 0,
+        mailbox: Some(fixture_mailbox()),
     };
     let error = run_outcome_error(&capped).unwrap_err();
     assert!(

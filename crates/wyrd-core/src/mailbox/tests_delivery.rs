@@ -663,6 +663,54 @@ fn relay_outage_marks_down_and_recovery_redelivers() {
     assert_quiet(&mut mailbox);
 }
 
+/// Pre-attachment ticks never arm the outage grace: a relay that is
+/// down from the start (a slow cold start) must not count recovery
+/// attempts, or a converged run would fail its exit verdict on
+/// history that predates any attachment. The later attachment still
+/// recovers fully through the normal path — gating the grace costs
+/// no dead-from-start recovery.
+#[test]
+fn pre_attachment_ticks_never_arm_the_outage_grace() {
+    let relay = MiniRelay::spawn();
+    relay.shutdown();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let relays = vec![url];
+    let mut mailbox = live_mailbox(&receiver, &relays, temp_path("seen-pre-attachment"));
+    // Many grace windows over with no attachment ever: the test tick
+    // is 50ms, so the third zero-connected tick passed long ago —
+    // any attempt counted here is the bug.
+    std::thread::sleep(Duration::from_secs(1));
+    let health = mailbox.health();
+    assert_eq!(health.connected_relays, 0, "relay still down");
+    assert_eq!(
+        health.relay_recovery_attempts, 0,
+        "pre-attachment ticks arm no relay episode"
+    );
+    assert_eq!(
+        health.stream_recovery_attempts, 0,
+        "pre-attachment ticks arm no stream episode"
+    );
+    // Serve now: attachment lands through the normal path with no
+    // episode spent, and intake flows.
+    relay.restart();
+    wait_for_health(&mailbox, true, RECOVERY_TIMEOUT);
+    assert_eq!(
+        mailbox.health().relay_recovery_attempts,
+        0,
+        "first attachment needs no recovery"
+    );
+    let mut outbox = live_mailbox(&sender, &relays, temp_path("seen-pre-attachment-sender"));
+    outbox
+        .send(envelope(device_id(&sender), device_id(&receiver), "late"))
+        .expect("send after attach");
+    let arrived = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("delivery flows");
+    assert_eq!(arrived.envelope().ciphertext, "late");
+    mailbox.settle(arrived.id(), Disposition::Ack).expect("ack");
+    assert_quiet(&mut mailbox);
+}
+
 /// Stream-death recovery without losing unacked or in-flight mail.
 /// The drainer is killed for real (its channel abandoned, so its next
 /// forward fails and it exits through the production death path) and

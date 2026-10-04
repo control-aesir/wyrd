@@ -106,8 +106,8 @@ announceable?                  (only ever yes past serving residency)
 | Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
 | `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
-| Refused `create` (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; A untouched |
-| Refused `create` (precondition fails during application) | Failed member; never forces and never displaces earlier members | Failed forcer aborts the fold with nothing committed (rule 6) | 0 | Unchanged; A untouched |
+| Refused `create` (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; no other handle is displaced |
+| Refused `create` (precondition fails during application) | Failed member; never forces | Failed forcer aborts the fold with nothing committed; never displaces earlier members (rule 6) | 0 | Unchanged; no other handle is displaced |
 | Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
@@ -214,9 +214,7 @@ Rules:
    store, authoring, or fact-commit failure; the pre-commit
    retained-bytes quota, which under folding covers the aggregate of
    the whole pending set before the commit's first write; and a
-   failed forcing member (the fold aborts with nothing committed —
-   a failed syscall never makes another member's pending bytes
-   durable).
+   failed forcing member.
    Post-durable stage failures (publication, serving residency) are
    likewise not member-attributable: the commit already succeeded, so
    monotonicity fixes the outcome and the caller learns nothing.
@@ -923,15 +921,15 @@ Each row locks a decided invariant.
   succeeds and binds the just-committed identity, A's handle is
   terminal `EIO`. If the fold cannot be authored the open fails
   (`EIO`/`ESTALE`) with nothing committed.
-- **Fold refused create (same path)**: A holds a dirty buffer on `P`;
-  `create(P, O_CREAT|O_EXCL)` → `EEXIST`. The refusal is a failed
-  member that never forces and never displaces A: nothing commits, A
-  still buffers and commits later.
-- **Fold refused create (different path)**: A holds a dirty buffer on
-  `P`; `create(Q, O_CREAT|O_EXCL)` → `EEXIST` on another path. The
-  forcer fails while A's member survives, so A's pending bytes commit
-  into the one snapshot — extra durability from a failed syscall,
-  covered by rule 6's failed-member path.
+- **Fold refused create**: A holds a dirty buffer on `P`;
+  `create(P, O_CREAT|O_EXCL)` → `EEXIST`, on any path, same path or
+  not. The refusal is a failed member that never forces and never
+  displaces A: nothing commits, A still buffers and commits later.
+- **Fold failed forcer**: A holds a dirty buffer on `P`; the forcing
+  member fails (refused `create`, fold-fatal quota, conflicted
+  heads). No snapshot is authored, no announcement obligation is
+  created, and A's handle is not terminal — A still buffers and
+  commits later.
 - **Pre-submit refusal**: submits nothing and forces nothing, on any
   path, whether or not other handles hold pending data.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both

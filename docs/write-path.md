@@ -107,7 +107,7 @@ announceable?                  (only ever yes past serving residency)
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
 | `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | Refused `create` (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; no other handle is displaced |
-| Refused `create` (precondition fails during application) | Failed member; never forces | Failed forcer aborts the fold with nothing committed; never displaces earlier members (rule 6) | 0 | Unchanged; no other handle is displaced |
+| Refused `create` (precondition fails during application) | Failed member | Never forces and never displaces earlier members; failed forcer aborts the fold with nothing committed (rule 6) | 0 | Unchanged; no other handle is displaced |
 | Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
@@ -192,9 +192,10 @@ Rules:
 6. **Fold failures are per member, except the fold-fatal classes.**
    When the forcing member survives, surviving members still commit
    into the one snapshot; each failed member reports its own errno
-   to its own waiter and its handle goes terminal. The forcing caller receives the errno of its own member
-   — an `O_SYNC` write is never failed by an unrelated member's
-   staleness, and a namespace op reports only its own outcome. At
+   to its own waiter and its handle goes terminal. The forcing
+   caller receives the errno of its own member — an `O_SYNC` write
+   is never failed by an unrelated member's staleness, and a
+   namespace op reports only its own outcome. At
    shutdown/`destroy` the same rule holds best-effort per path:
    committed members stay committed, and per-path losses are logged
    rather than reported. A failed member never forces: pre-submit
@@ -202,8 +203,9 @@ Rules:
    `EMFILE` at open, `ESTALE` from the parent claim or capture)
    submit nothing and force nothing, and a member whose namespace
    precondition fails during fold application (`EEXIST`,
-   `ENOENT`/`ESTALE` parent races — decided inside application at
-   `live.rs:1437`/`:1441-1442`/`:1444-1446`, never at admission)
+   `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided inside
+   application at `live.rs:1437`/`:1439`/`:1441-1442`/`:1444-1446`,
+   never at admission)
    reports its own errno without forcing. If the forcing member
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
@@ -922,14 +924,16 @@ Each row locks a decided invariant.
   terminal `EIO`. If the fold cannot be authored the open fails
   (`EIO`/`ESTALE`) with nothing committed.
 - **Fold refused create**: A holds a dirty buffer on `P`;
-  `create(P, O_CREAT|O_EXCL)` → `EEXIST`, on any path, same path or
-  not. The refusal is a failed member that never forces and never
-  displaces A: nothing commits, A still buffers and commits later.
+  `create(P, O_CREAT|O_EXCL)` → `EEXIST` — or `create(Q, …)` while A
+  holds `P`, same outcome on any path. The refusal is a failed
+  member that never forces and never displaces A: nothing commits, A
+  still buffers and commits later.
 - **Fold failed forcer**: A holds a dirty buffer on `P`; the forcing
   member fails (refused `create`, fold-fatal quota, conflicted
   heads). No snapshot is authored, no announcement obligation is
-  created, and A's handle is not terminal — A still buffers and
-  commits later.
+  created, and A's handle is not terminal — A still buffers, and
+  commits later once a persistent condition (conflict resolved,
+  quota relieved) no longer aborts the fold.
 - **Pre-submit refusal**: submits nothing and forces nothing, on any
   path, whether or not other handles hold pending data.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both

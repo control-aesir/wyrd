@@ -156,10 +156,9 @@
 //! 25. `upgrade_old_objects_stay_readable` — a reopened object store
 //!     serves what it served before, with nothing rewritten
 //!     (invariant 3, same-version form).
-//! 26. `upgrade_previous_release_store_replays` — genuine
-//!     `v0.1.0-alpha.1` bytes open and replay under the current
-//!     build, with an oldness gate on the record tags (invariant 3,
-//!     cross-release form).
+//! 26. `upgrade_previous_release_store_replays` — the checked-in
+//!     release fixture opens and replays under the current build
+//!     (invariant 3, cross-release form).
 //! 27. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
 //!     recovers committed coverage by replay, stably across restarts
 //!     (invariant 4).

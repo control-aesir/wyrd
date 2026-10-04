@@ -157,8 +157,10 @@
 //!     serves what it served before, with nothing rewritten
 //!     (invariant 3, same-version form).
 //! 26. `upgrade_previous_release_store_replays` — the checked-in
-//!     release fixture opens and replays under the current build
-//!     (invariant 3, cross-release form).
+//!     release fixture opens and replays under the current build:
+//!     a same-build baseline today, genuine cross-release evidence
+//!     once the next cut replays the v0.2.0-alpha bytes under a newer
+//!     build (invariant 3, cross-release form).
 //! 27. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
 //!     recovers committed coverage by replay, stably across restarts
 //!     (invariant 4).

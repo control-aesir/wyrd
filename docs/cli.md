@@ -322,7 +322,7 @@ sync now
    mailbox the same stop exits non-zero as unverified instead: the
    empty outbox was observed through a blind intake, so "nothing
    left to do" is unproven — including an intake that went blind
-   and recovered, which reads degraded with its episode count, not
+   and recovered, which reads degraded with its attempt count, not
    live. Stalled is a verdict about observed emptiness, not about
    reachability — an unreachable relay never earns the quiet exit.
   Quiet is never trusted on first sight: relay delivery races the

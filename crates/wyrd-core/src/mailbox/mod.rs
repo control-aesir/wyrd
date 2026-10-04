@@ -447,10 +447,12 @@ pub struct MailboxHealth {
     /// fields alone read stale-zero through an outage.
     pub supervisor_ticks: u64,
     /// `recover_stream` loop iterations, lifetime total: stream-recovery
-    /// progress while the episode is in flight.
+    /// progress while the episode is in flight. Episodes only spawn
+    /// after first attachment, so a slow cold start never counts.
     pub stream_recovery_attempts: u64,
     /// `recover_relays` loop iterations, lifetime total: relay-recovery
-    /// progress while the episode is in flight.
+    /// progress while the episode is in flight. Episodes only spawn
+    /// after first attachment, so a slow cold start never counts.
     pub relay_recovery_attempts: u64,
     /// Relay-sent subscription closures observed by the drainer, lifetime
     /// total. A CLOSED arrives with the TCP attachment intact, so without
@@ -1242,10 +1244,10 @@ async fn connected_count(client: &Client) -> usize {
 }
 
 /// Consecutive zero-connected ticks before the supervisor treats it as an
-/// outage and starts a recovery episode. A normal handshake completes in
-/// milliseconds, so this grace period keeps startup (and single-tick
-/// flaps) out of recovery without delaying real-outage response
-/// meaningfully.
+/// outage and starts a recovery episode. Single-tick flaps never
+/// reach it; startup never reaches it either — pre-attachment ticks
+/// do not count (see `ever_connected`), since a slow handshake is
+/// not an outage.
 const OUTAGE_GRACE_TICKS: u32 = 3;
 
 /// Replace the mailbox subscription under its stable ID: CLOSE the
@@ -1564,9 +1566,10 @@ async fn recover_stream(
 }
 
 /// Relay-level recovery: no relay has been connected for a sustained
-/// stretch after first attachment, so ensure a connection task exists (`connect` is a no-op for
-/// relays whose task is already driving or retrying — the supervisor never
-/// disconnects, see above) and wait briefly for progress, backing off with
+/// stretch after first attachment, so ensure a connection task
+/// exists (`connect` is a no-op for relays whose task is already
+/// driving or retrying — the supervisor never disconnects, see
+/// above) and wait briefly for progress, backing off with
 /// a capped delay between attempts. On success, replace the subscription
 /// under the stable ID to refresh relay-side state; relay replay plus the
 /// durable dedupe log converge the replacement. Runs as a spawned

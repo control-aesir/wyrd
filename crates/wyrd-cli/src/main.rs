@@ -1491,7 +1491,7 @@ struct SyncRunReport {
 /// converged, but the quiet verdict may have been reached through
 /// the blind window; failing it as unverified is the conservative
 /// direction for a convergence-verdict command, and the error names
-/// the episodes so the operator knows a rerun settles it.
+/// the attempt count so the operator knows a rerun settles it.
 /// Saturation replays deliberately do not count: a replay
 /// re-requests and redelivers through dedupe, so post-replay
 /// intake is whole again.

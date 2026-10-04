@@ -216,7 +216,9 @@ Explicitly do not ship: the recovery grafting workflow (no operator
 surface: no CLI command, no daemon entry point, no owner
 recovery-snapshot creation workflow — that workflow is v0.3),
 mobile, File Provider, sophisticated conflict UI, production
-telemetry platform, marketplace, release distribution, major
+telemetry platform, marketplace, release distribution (the v0.2.0-alpha
+archives ship through the manual flow to validate release mechanics;
+automated distribution is v0.3+), major
 performance architecture.
 
 Definition of done: given two or more legitimate Wyrd peers connected

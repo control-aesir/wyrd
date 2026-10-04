@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha"
 edition = "2021"
 # Matches the project LICENSE (MIT). Crates inherit via `license.workspace`.
 license = "MIT"

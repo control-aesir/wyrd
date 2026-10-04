@@ -13,9 +13,9 @@
 //! directory tree is data, not a second test target. The first
 //! checked-in fixture is `dev/`: a harness smoke fixture produced by
 //! the ignored `regenerate_dev_fixture` below, never cross-version
-//! evidence. Per-release fixtures land under their tag starting with
-//! the next release — the generator is what had the deadline, and it
-//! is this module.
+//! evidence. Per-release fixtures land under their tag; the
+//! `v0.2.0-alpha` release cut the first one, and the generator for
+//! the next is `regenerate_release_fixture` below.
 //!
 //! Reachability note (contract-issue point 4): `COMMIT_VERSION` is
 //! `pub(super)` inside wyrd-sync's private codec, so the suite does
@@ -59,6 +59,12 @@ fn dev_fixture_dir() -> PathBuf {
     fixture_release("dev")
 }
 
+/// Tag directory of the checked-in release fixture: the store bytes
+/// `upgrade_previous_release_store_replays` replays above. Frozen at
+/// release-cut time; the next release adds its own tag directory and
+/// repoints this constant, keeping exactly one live baseline.
+const RELEASE_FIXTURE: &str = "v0.2.0-alpha";
+
 #[test]
 fn regenerate_targets_dev_never_the_root() {
     let dst = dev_fixture_dir();
@@ -83,6 +89,43 @@ fn fixture_root_holds_only_release_dirs() {
             "stray file at the fixture root: {:?}",
             entry.file_name()
         );
+    }
+}
+
+/// Pin the frozen bytes: blake3 over sorted (path, len, bytes) of
+/// every fixture file except the prose README. Regenerating the
+/// fixture by hand — or a format drift in the committed records —
+/// changes the digest and fails loudly here instead of silently
+/// re-baselining the replay evidence the release cut.
+fn fixture_digest(dir: &Path) -> String {
+    let mut rels: Vec<PathBuf> = vec![];
+    collect_files(dir, dir, &mut rels);
+    rels.sort();
+    let mut hasher = blake3::Hasher::new();
+    for rel in rels {
+        if rel.file_name().and_then(|n| n.to_str()) == Some("README.md") {
+            continue;
+        }
+        let bytes = std::fs::read(dir.join(&rel)).unwrap();
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == "LOCK" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, out);
+        } else {
+            out.push(path.strip_prefix(root).unwrap().to_path_buf());
+        }
     }
 }
 
@@ -191,6 +234,49 @@ fn regenerate_dev_fixture() {
     .unwrap();
 }
 
+/// Cut the release fixture: the same store bytes as `dev`, frozen
+/// under the release tag for `upgrade_previous_release_store_replays`
+/// to replay. Run explicitly at release-cut time; CI uses the
+/// checked-in bytes so the replay test pins stored history, not fresh
+/// output. The next release re-runs this under its own tag and
+/// repoints `RELEASE_FIXTURE`, keeping exactly one live baseline.
+///
+/// `cargo test -p wyrd-contracts regenerate_release_fixture -- --ignored`
+#[test]
+#[ignore = "cuts the checked-in release fixture; run explicitly, see above"]
+fn regenerate_release_fixture() {
+    let dir = regenerate_fixture_store();
+    let dst = fixture_release(RELEASE_FIXTURE);
+    assert_eq!(
+        dst.parent(),
+        Some(fixture_root().as_path()),
+        "the release fixture lives beside dev/, never inside it"
+    );
+    assert_ne!(
+        dst,
+        dev_fixture_dir(),
+        "repointing the release tag at dev/ would wipe the smoke fixture"
+    );
+    if dst.exists() {
+        std::fs::remove_dir_all(&dst).unwrap();
+    }
+    std::fs::create_dir_all(&dst).unwrap();
+    copy_dir(&dir, &dst);
+    std::fs::write(
+        dst.join("README.md"),
+        format!(
+            "# {RELEASE_FIXTURE} fixture\n\nRelease baseline for the upgrade contracts, produced by\n\
+             `regenerate_release_fixture` (ignored, run explicitly) through the public\n\
+             delivery path: genesis and admission transitions plus an epoch-1..2\n\
+             capability for the deterministic `device(0x20)` recipient, store\n\
+             passphrase `contracts`. Frozen store bytes: `upgrade_previous_release_store_replays`\n\
+             replays exactly these files, so regenerating them by hand breaks\n\
+             the pin — re-run the generator instead.\n",
+        ),
+    )
+    .unwrap();
+}
+
 /// Invariant 1: a new encoding is a new representation. This is the
 /// single-version form the current tree can prove: identical content
 /// re-stores under the same ContentId (CAS idempotence), and later
@@ -246,19 +332,49 @@ fn upgrade_replays_previous_fact_payload_versions() {
     todo!("replay v0 fact payloads into current records once payloads are versioned");
 }
 
-/// Invariant 3 (cross-release form, blocked): the previous release's
+/// Invariant 3 (cross-release form): the previous release's
 /// store replays under the current build. No released store predates
 /// the reader-set format — alpha.1's fixture went out with the
 /// pre-v1 breakage the upgrade contract announces (every alpha may
 /// break compatibility before the format freezes), and carrying a
 /// legacy transition decoder for unshipped software would be the
-/// wrong trade. The next release cuts a fresh fixture under its tag
-/// and re-enables this test; until then the dev fixture plus the
-/// same-version reopen tests below carry the replay evidence.
+/// wrong trade. The v0.2.0-alpha fixture below is the baseline the
+/// next release replays against; until a second fixture exists, the
+/// dev fixture plus the same-version reopen tests carry the rest of
+/// the replay evidence.
 #[test]
-#[ignore = "blocked on the next release fixture; see above"]
 fn upgrade_previous_release_store_replays() {
-    todo!("check in tests/fixtures/stores/<release>/ and replay it here");
+    let dir = copy_store(
+        &fixture_release(RELEASE_FIXTURE),
+        "upgrade-previous-release",
+    );
+    let recipient = device(0x20);
+    let state = Engine::open(
+        dir.clone(),
+        drive(),
+        recipient.id,
+        "contracts",
+        recipient.identity.clone(),
+        recipient.encryption.clone(),
+    )
+    .unwrap()
+    .runtime_state()
+    .unwrap();
+    assert!(
+        state.pending_transitions().is_empty() && state.pending_capabilities().is_empty(),
+        "the release fixture replays with nothing left pending"
+    );
+    let facts = DurableStore::open(dir.clone(), drive(), "contracts")
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(facts.transitions.len(), 2, "genesis and admission replay");
+    assert_eq!(facts.capabilities.len(), 1, "the epoch-1..2 grant replays");
+    assert_eq!(
+        fixture_digest(&dir),
+        "2abd4973a20cbed7bc9cba9a021daa3bfdf6cdd434d84fc61309d11cd9ad1d67",
+        "release fixture bytes are frozen: regenerate via regenerate_release_fixture, never by hand"
+    );
 }
 
 /// Invariant 3 (same-version form): a reopened object store serves

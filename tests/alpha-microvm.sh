@@ -245,7 +245,7 @@ rm -f "$RUN"/conflict-rename-member-ready "$RUN"/conflict-rename-owner-done \
   "$RUN"/conflict-rename-member-done "$RUN"/conflict-partitioned \
   "$RUN"/conflict-owner-written "$RUN"/conflict-member-written \
   "$RUN"/conflict-healed "$RUN"/conflict-owner-done "$RUN"/conflict-member-done \
-   "$RUN"/rename-stale.err "$RUN/logs"/conflict-eio-write-owner.stderr \
+  "$RUN"/rename-stale.err "$RUN/logs"/conflict-eio-write-owner.stderr \
   "$RUN/logs"/conflict-eio-write-member.stderr \
   "$RUN/logs"/conflict-reread-owner-1.stderr \
   "$RUN/logs"/conflict-reread-owner-2.stderr \

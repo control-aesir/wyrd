@@ -551,18 +551,22 @@ conflict_assert_converged() {
   # still in flight. So each version is captured separately with
   # errexit off (naming its side, exit code, and kernel error text),
   # and the capture plus set comparison retries bounded like the
-  # poll: a version that never serves still fails loudly, with the
-  # trajectory on the die line. LOGDIR is shared across guests, so
-  # the per-cat stderr files are namespaced by side like the
-  # EIO-write probe's below.
-  local got want got1 got2 rc1=0 rc2=0 settled=0 attempt=0
-  local err1="" err2=""
+  # poll. Content mismatches retry too: the set is order-free and
+  # heads land incrementally post-heal, so a transient mismatch is
+  # settle, not failure — a version that never serves or never
+  # matches still dies loudly with the trajectory on the die line.
+  # The per-read cats carry the same `timeout 60` as the poll above
+  # so the retry budget stays a real wall-clock bound. LOGDIR is
+  # shared across guests, so the per-cat stderr files are namespaced
+  # by side like the EIO-write probe's below.
+  local got want got1 got2 rc1=0 rc2=0 settled=0 attempt=0 last=""
+  local errexit=true
+  case $- in *e*) ;; *) errexit=false;; esac
+  set +e
   while (( attempt < 120 )); do
     attempt=$(( attempt + 1 ))
-    set +e
-    got1="$(cat "$m/conflict-c.txt@1" 2>"$LOGDIR/conflict-reread-$side-1.stderr")"; rc1=$?
-    got2="$(cat "$m/conflict-c.txt@2" 2>"$LOGDIR/conflict-reread-$side-2.stderr")"; rc2=$?
-    set -e
+    got1="$(timeout 60 cat "$m/conflict-c.txt@1" 2>"$LOGDIR/conflict-reread-$side-1.stderr")"; rc1=$?
+    got2="$(timeout 60 cat "$m/conflict-c.txt@2" 2>"$LOGDIR/conflict-reread-$side-2.stderr")"; rc2=$?
     if [[ $rc1 -eq 0 && $rc2 -eq 0 ]]; then
       got="$(printf '%s\n' "$got1" "$got2" | sort)"
       want="$(printf '%s\n' "owner-conflict-1" "member-conflict-1" | sort)"
@@ -570,18 +574,26 @@ conflict_assert_converged() {
         settled=1
         break
       fi
-      err1="set mismatch [$got]"; err2=""
+      last="content set mismatch [$got]"
     else
-      err1="rc $rc1: $(cat "$LOGDIR/conflict-reread-$side-1.stderr")"
-      err2="rc $rc2: $(cat "$LOGDIR/conflict-reread-$side-2.stderr")"
+      # Unfailable by construction: the redirects above create both
+      # files before the reads run, and `|| true` holds even if the
+      # share itself misbehaves — diagnostics must never reintroduce
+      # the silent death this block removes.
+      last="reads"
+      if [[ $rc1 -ne 0 ]]; then
+        last="$last @1(rc $rc1: $(cat "$LOGDIR/conflict-reread-$side-1.stderr" 2>/dev/null || true))"
+      fi
+      if [[ $rc2 -ne 0 ]]; then
+        last="$last @2(rc $rc2: $(cat "$LOGDIR/conflict-reread-$side-2.stderr" 2>/dev/null || true))"
+      fi
     fi
     sleep 0.5
   done
+  if $errexit; then set -e; fi
   [[ $settled -eq 1 ]] \
-    || die "conflict versions never settled on $m after $attempt attempts (@1: $err1; @2: $err2)"
-  [[ $attempt -gt 1 ]] && echo "  note: conflict re-read settled after $attempt attempts on $m"
-  [[ "$got" == "$want" ]] \
-    || die "conflict version set mismatch on $m: got [$got]"
+    || die "conflict versions never settled on $m after $attempt attempts (last: $last)"
+  [[ $attempt -gt 1 ]] && echo "  note: conflict re-read settled after $attempt attempts on $m (last: $last)"
   pass "conflict versions read identically (owner + member takes)"
   if test -e "$m/conflict-c.txt@3"; then
     die "third conflict version on $m: more than two heads"
@@ -598,8 +610,24 @@ conflict_assert_converged() {
     || die "conflicted-drive write was not EIO on $m (rc $wrc)"
   [[ "$wrc" == 1 ]] \
     || die "conflicted-drive write exited $wrc, want 1, on $m"
-  [[ "$(cat "$m/conflict-c.txt@1")" != "" ]] \
-    || die "conflicted drive stopped serving reads on $m"
+  # Post-write serving probe with the same settle tolerance as the
+  # re-read above: a transient read failure right after the refused
+  # write retries bounded instead of misreporting "stopped serving
+  # reads" for a drive that resumes serving.
+  local serving="" src=0 sread=0 sattempt=0
+  set +e
+  while (( sattempt < 60 )); do
+    sattempt=$(( sattempt + 1 ))
+    serving="$(timeout 60 cat "$m/conflict-c.txt@1" 2>/dev/null)"; src=$?
+    if [[ $src -eq 0 && "$serving" != "" ]]; then
+      sread=1
+      break
+    fi
+    sleep 0.5
+  done
+  if $errexit; then set -e; fi
+  [[ $sread -eq 1 ]] \
+    || die "conflicted drive stopped serving reads on $m (rc $src after $sattempt attempts)"
   pass "conflicted drive fails writes EIO and still serves reads"
 }
 

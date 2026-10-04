@@ -106,8 +106,8 @@ announceable?                  (only ever yes past serving residency)
 | Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
 | `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
-| Refused `create` (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; no other handle is displaced |
-| Refused `create` (precondition fails during application) | Failed member | Never forces and never displaces earlier members; failed forcer aborts the fold with nothing committed (rule 6) | 0 | Unchanged; no other handle is displaced |
+| Refused namespace forcer (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; no other handle is displaced |
+| Refused namespace forcer (precondition fails during application — refused `create`, `mkdir` on an existing name, `unlink` of an absent path or of a directory, no-replace `rename`) | Failed member | Never forces and never displaces earlier members; failed forcer aborts the fold with nothing committed (rule 6) | 0 | Unchanged; no other handle is displaced |
 | Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
@@ -211,11 +211,14 @@ Rules:
    reports its own errno without forcing. If the forcing member
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
-   bytes durable. A fold-fatal refusal leaves members retryable and
-   non-terminal; only an attempted commit that fails is terminal
-   (the stale/`EIO` rule below). A fold with no surviving member
-   authors nothing: no empty snapshot, no dangling announcement
-   obligation.
+   bytes durable. A fold-fatal refusal raised before the commit
+   begins — the pre-commit quota (`live.rs:1406`) and
+   `ConflictedHeads` (`live.rs:1431-1434`) — leaves members
+   retryable and non-terminal, as does a failed forcing member; a
+   `StaleHandle` or a store, authoring, or fact-commit failure
+   occurs at or after the commit and is terminal (the stale/`EIO`
+   rule below). A fold with no surviving member authors nothing:
+   no empty snapshot, no dangling announcement obligation.
    Fold-fatal (whole-fold, unattributable to one member):
    `ConflictedHeads` (refuses the entire fold, nothing commits);
    store, authoring, or fact-commit failure; the pre-commit

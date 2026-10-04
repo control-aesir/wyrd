@@ -96,8 +96,10 @@ announceable?                  (only ever yes past serving residency)
 | Event | Pending empty | Pending non-empty | Snapshots | Yield |
 |---|---|---|---|---|
 | Buffered `write` / handle `truncate` / handle `set-exec` (non-`O_SYNC`) | Accumulate | Accumulate; never forces | 0 | Working |
-| `flush` / `fsync` / `fdatasync` on a handle whose path has pending data anywhere | n/a (this handle's buffer may itself be a pending member) | Fold all pending into one snapshot | 0–1 | Committed → Published via the pipeline; 0 only when no member survives (rule 6) |
-| `flush` / `fsync` on a handle whose path has no pending data anywhere | No-op; commits nothing | No-op | 0 | Unchanged |
+| `fsync` / `fdatasync` on a handle whose path has pending data anywhere | n/a (this handle's buffer may itself be a pending member) | Fold all pending into one snapshot | 0–1 | Committed → Published via the pipeline; 0 only when no member survives (rule 6) |
+| `fsync` / `fdatasync` on a handle whose path has no pending data anywhere | No-op; commits nothing | No-op | 0 | Unchanged |
+| `flush` on a **dirty** handle (this handle holds its own buffer) | n/a | Fold all pending into one snapshot | 0–1 | Committed → Published via the pipeline; 0 only when no member survives (rule 6) |
+| `flush` on a clean or read handle (including the kernel-injected close-time flush) | No-op; never forces on another handle's behalf | No-op | 0 | Unchanged |
 | `release` / `close` of a **dirty** handle (this handle holds its own buffer) | n/a | Fold all pending into one snapshot, best-effort | 0–1 | Committed → Published; errors often discarded by callers; 0 only when no member survives (rule 6) |
 | `release` / `close` of a clean or read handle | No-op; never forces on another handle's behalf | No-op | 0 | Unchanged |
 | `O_SYNC` / `O_DSYNC` `write` | Its own durable snapshot, shared with any pending set | Fold pending + this write into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
@@ -113,37 +115,49 @@ Rules:
 1. **Fold, don't sequence.** A forcing event commits the whole pending
    set plus itself as a single snapshot, not pending-as-one plus
    self-as-another. `fsync` on one handle therefore makes other
-   handles' pending data durable too — extra durability, never less —
-   and the folded data is durable at the boundary, so serving and
-   announcing it with the snapshot is safe.
+   handles' pending data durable too — extra durability, never less,
+   except through rule 2's tie-break: a losing member's buffer is
+   discarded rather than committed, and the loser can be destroyed by
+   an unrelated third party's fold (an `O_SYNC` write, `release`, or
+   shutdown on another path) when the forcer has no member on the
+   tied path. Apart from the tie-break, the folded data is durable
+   at the boundary, so serving and announcing it with the snapshot is
+   safe.
 2. **Stale and conflict checks are per member, at commit.** Members
    are ordered first-in-first-buffered (FIFO by buffering time), which
    is deterministic. Same-path concurrent edits fail closed for the
    conflicting member (its handle goes terminal `EIO`); different-path
    edits rebase onto the current head and still fold into the one
-   snapshot. On a same-path tie the forcing member wins: an explicit
-   durability call (`fsync`, `O_SYNC` write, effective namespace op)
-   never loses its own bytes to an earlier-buffered member — the
-   earlier member goes terminal instead. When the forcer has no member
-   on the tied path, the earliest-buffered member wins. Either way the
-   inverted case is explicit: the losing member's handle is terminal
-   `EIO` at the fold, before it ever makes its own forcing call.
-   More than one eligible live head refuses the whole fold
-   (`ConflictedHeads`); nothing commits.
-3. **`flush` ≡ `fsync` stays the reportable persistence point** and
-   `O_SYNC` stays commit-per-write; coalescing applies only to demand
-   that does not explicitly require synchronous durability. For
-   `flush`/`fsync`/`fdatasync`, "clean" is a per-path property: a
-   committing boundary on a handle whose path has no pending data
-   anywhere commits nothing and forces nothing, which keeps idle
-   flushes on untouched paths free while preserving the per-inode
-   `fsync` contract — an `fsync` on any descriptor of a path with
-   pending data makes that path's data durable. For
-   `release`/`close`, "clean" is a per-handle property: only a handle
-   holding its own buffer forces, and a clean or read close never
-   forces on another handle's behalf (`close` is not a durability
-   point). The `flush` ≡ `fsync` equivalence must not pull the close
-   path in with it.
+   snapshot. On a same-path tie the forcing member wins whenever the
+   forcing event carries privilege — `fsync`/`fdatasync`, `flush` on
+   a dirty handle, `O_SYNC` write, effective namespace op,
+   dirty-handle `release`, and the explicit checkpoint all carry it —
+   so an explicit durability call never loses its own bytes to an
+   earlier-buffered member; the earlier member goes terminal instead.
+   Shutdown/`destroy` carries no privilege (no caller to honor;
+   best-effort, errors logged), so a shutdown fold breaks ties
+   earliest-buffered. When the forcer has no member on the tied path,
+   the earliest-buffered member wins. Either way the inverted case is
+   explicit: the losing member's handle is terminal `EIO` at the
+   fold, before it ever makes its own forcing call. More than one
+   eligible live head refuses the whole fold (`ConflictedHeads`);
+   nothing commits.
+3. **`flush` ≡ `fsync` stays the reportable persistence point for the
+   calling handle's own data** and `O_SYNC` stays commit-per-write;
+   coalescing applies only to demand that does not explicitly require
+   synchronous durability. For `fsync`/`fdatasync`, "clean" is a
+   per-path property: a boundary on a handle whose path has no
+   pending data anywhere commits nothing and forces nothing, which
+   keeps idle syncs on untouched paths free while preserving the
+   per-inode `fsync` contract — an `fsync` on any descriptor of a
+   path with pending data makes that path's data durable. For
+   `flush` and `release`/`close`, "clean" is a per-handle property:
+   only a handle holding its own buffer forces, and a clean or read
+   close — including the kernel-injected close-time `flush`, which
+   `fuser` does not require to flush pending writes — never forces
+   on another handle's behalf. The `flush` ≡ `fsync` equivalence
+   covers the caller's own bytes and must not pull the close path in
+   with it.
 4. **No idle-window commit in v0.3.** A timer in the durability path
    would be a silent post-timeout commit, contradicting the queue's
    synchronous contract below (a caller stays blocked until the loop
@@ -174,6 +188,9 @@ Rules:
    store, authoring, or fact-commit failure; and the pre-commit
    retained-bytes quota, which under folding covers the aggregate of
    the whole pending set before the commit's first write.
+   Post-durable stage failures (publication, serving residency) are
+   likewise not member-attributable: the commit already succeeded, so
+   monotonicity fixes the outcome and the caller learns nothing.
 7. **Folded handles advance atomically with the snapshot.** Every
    member whose data committed has its base advanced to the committed
    identity and its dirty bit and budget cleared as part of the same
@@ -572,11 +589,12 @@ guarantee: there is no cached-but-not-durable commit state — the commit
 boundary *is* the durability boundary. They differ only in how
 applications observe the result: `flush` runs on every `close` and its
 error is frequently ignored, so `fsync` is the reportable persistence
-point. A `flush`/`fsync` on a handle whose path has no pending data
-anywhere performs no snapshot and forces nothing (DG-1 table); a
-`release`/`close` forces only when the closing handle itself is dirty.
-A forcing `flush`/`fsync` folds the whole pending set, not just the
-calling handle.
+point. An `fsync`/`fdatasync` on a handle whose path has no pending
+data anywhere performs no snapshot and forces nothing, while a
+`flush` or `release`/`close` forces only when the calling handle
+itself is dirty — a clean close-time `flush` never forces on another
+handle's behalf (DG-1 table). A forcing boundary folds the whole
+pending set, not just the calling handle.
 
 Because `release` is best-effort and drops the buffer, an application
 that never calls `flush`/`fsync` can lose acknowledged writes. This is
@@ -817,16 +835,21 @@ The write state machine lives in the daemon and sync crates; FUSE stays
 an adapter:
 
 ```text
-wyrd-fuse        POSIX translation only
-                     ↓
-wyrd-core        MutationQueue, fold orchestration, commit sequencing,
-                 stale checks, publication
-                     ↓ (per-handle buffers live with their owner:)
-daemon backend   WriteHandle buffers, base advance, budget release
+wyrd-fuse        POSIX translation only          daemon backend   WriteHandle
+     ↓↑ (handle-owner callback                    buffers, base advance,
+wyrd-core        MutationQueue, fold orchestration,  budget release
+                 commit sequencing, stale checks,
+                 publication
                      ↓
 wyrd-sync        immutable tree mutation, snapshot authoring,
                  durable commit, announcement obligation
 ```
+
+The daemon row sits beside the presentation layer, not below the
+node: `wyrd-daemon` depends on `wyrd-core`, never the reverse. The
+fold calls down into `wyrd-sync`; the per-handle post-commit
+transition is a callback the daemon supplies upward into the
+orchestrated commit (rule 7).
 
 Stale checks, snapshot creation, tree mutation, and commit sequencing
 must not be implemented inside FUSE callbacks.
@@ -860,6 +883,11 @@ Each row locks a decided invariant.
   forces (`fsync`) → B wins the tie, B's bytes are durable on return,
   A's handle is terminal `EIO` before A ever calls. The explicit
   durability caller never loses to an earlier-buffered member.
+- **Fold release tie-break**: A and B hold dirty buffers on one file;
+  B closes → B's dirty release carries privilege, B wins, A's handle
+  is terminal `EIO`. A close-time `flush` or `release` on a handle
+  that never wrote commits nothing, even when another handle holds
+  pending data on the same path; `fsync` on that path does commit it.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.

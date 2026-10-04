@@ -202,15 +202,20 @@ Rules:
    refusals (unsupported flags, read-only mount, `ENOTDIR`/`EIO`/
    `EMFILE` at open, `ESTALE` from the parent claim or capture)
    submit nothing and force nothing, and a member whose namespace
-   precondition fails during fold application (`EEXIST`,
-   `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided inside
-   application at `live.rs:1437`/`:1439`/`:1441-1442`/`:1444-1446`,
-   never at admission)
+   precondition fails during fold application (the `create` arm's
+   `EEXIST` and `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided
+   inside application at `live.rs:1437`/`:1439`/`:1441-1442`/
+   `:1444-1446`, never at admission; the clause is generic over
+   every namespace mutation — `mkdir`, `unlink`, `rename` preconditions
+   fail the same way)
    reports its own errno without forcing. If the forcing member
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
-   bytes durable. A fold with no surviving member authors nothing:
-   no empty snapshot, no dangling announcement obligation.
+   bytes durable. A fold-fatal refusal leaves members retryable and
+   non-terminal; only an attempted commit that fails is terminal
+   (the stale/`EIO` rule below). A fold with no surviving member
+   authors nothing: no empty snapshot, no dangling announcement
+   obligation.
    Fold-fatal (whole-fold, unattributable to one member):
    `ConflictedHeads` (refuses the entire fold, nothing commits);
    store, authoring, or fact-commit failure; the pre-commit
@@ -929,13 +934,19 @@ Each row locks a decided invariant.
   member that never forces and never displaces A: nothing commits, A
   still buffers and commits later.
 - **Fold failed forcer**: A holds a dirty buffer on `P`; the forcing
-  member fails (refused `create`, fold-fatal quota, conflicted
-  heads). No snapshot is authored, no announcement obligation is
-  created, and A's handle is not terminal — A still buffers, and
-  commits later once a persistent condition (conflict resolved,
-  quota relieved) no longer aborts the fold.
+  member fails (fold-fatal quota, conflicted heads — the refused
+  `create` case is pinned by the row above). No snapshot is
+  authored, no announcement obligation is created, and A's handle is
+  not terminal — A still buffers, and commits later once the
+  persistent condition (conflict resolved, quota relieved) no
+  longer aborts the fold.
 - **Pre-submit refusal**: submits nothing and forces nothing, on any
   path, whether or not other handles hold pending data.
+- **Fold refused namespace forcer**: any namespace forcer (`mkdir`
+  on an existing name, `unlink` of a directory, no-replace `rename`
+  onto an existing name) refused in application is a failed member
+  that never forces; if it is the forcing member the fold aborts
+  with nothing committed and other members stay retryable.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.

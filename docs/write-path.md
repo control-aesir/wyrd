@@ -131,17 +131,24 @@ Rules:
    snapshot. On a same-path tie the forcing member wins whenever the
    forcing event carries privilege — `fsync`/`fdatasync`, `flush` on
    a dirty handle, `O_SYNC` write, effective namespace op,
-   dirty-handle `release`, and the explicit checkpoint all carry it —
-   so an explicit durability call never loses its own bytes to an
-   earlier-buffered member; the earlier member goes terminal instead.
-   Shutdown/`destroy` carries no privilege (no caller to honor;
-   best-effort, errors logged), so a shutdown fold breaks ties
-   earliest-buffered. When the forcer has no member on the tied path,
-   the earliest-buffered member wins. Either way the inverted case is
-   explicit: the losing member's handle is terminal `EIO` at the
-   fold, before it ever makes its own forcing call. More than one
-   eligible live head refuses the whole fold (`ConflictedHeads`);
-   nothing commits.
+   dirty-handle `release`, `create`/`O_TRUNC`-open, and the explicit
+   checkpoint all carry it — so an explicit durability call never
+   loses its own bytes to an earlier-buffered member; the earlier
+   member goes terminal instead. A truncating `open` therefore keeps
+   today's outcome: the truncate wins its path tie and any dirty
+   handle on that path goes terminal `EIO`, rather than the open
+   failing because another handle held unflushed bytes. If the fold
+   itself cannot be authored (conflicted drive, store failure), the
+   open fails with the existing binding-rule errno (`EIO`/`ESTALE`)
+   and nothing commits — there is no half-truncated state for the
+   returned handle to bind. Shutdown/`destroy` carries no privilege
+   (no caller to honor; best-effort, errors logged), so a shutdown
+   fold breaks ties earliest-buffered. When the forcer has no member
+   on the tied path, the earliest-buffered member wins. Either way
+   the inverted case is explicit: the losing member's handle is
+   terminal `EIO` at the fold, before it ever makes its own forcing
+   call. More than one eligible live head refuses the whole fold
+   (`ConflictedHeads`); nothing commits.
 3. **`flush` ≡ `fsync` stays the reportable persistence point for the
    calling handle's own data** and `O_SYNC` stays commit-per-write;
    coalescing applies only to demand that does not explicitly require
@@ -584,12 +591,14 @@ after serving is retried the obligation is discharged.
 | `fsync` | Commits the handle. Success means the commit is device-local durable. |
 | `release` | Commits best-effort; the error is often discarded by applications; always drops the handle and buffer. |
 
-`flush` and `fsync` are **semantically equivalent** for Wyrd's durability
-guarantee: there is no cached-but-not-durable commit state — the commit
-boundary *is* the durability boundary. They differ only in how
-applications observe the result: `flush` runs on every `close` and its
-error is frequently ignored, so `fsync` is the reportable persistence
-point. An `fsync`/`fdatasync` on a handle whose path has no pending
+`flush` and `fsync` are **semantically equivalent** for the calling
+handle's own data: there is no cached-but-not-durable commit state —
+the commit boundary *is* the durability boundary. They differ in
+which events force — `fsync`/`fdatasync` fold on a per-path test
+while `flush` forces only on the calling handle's own buffer — and
+only in how applications observe the result: `flush` runs on every
+`close` and its error is frequently ignored, so `fsync` is the
+reportable persistence point. An `fsync`/`fdatasync` on a handle whose path has no pending
 data anywhere performs no snapshot and forces nothing, while a
 `flush` or `release`/`close` forces only when the calling handle
 itself is dirty — a clean close-time `flush` never forces on another
@@ -835,21 +844,21 @@ The write state machine lives in the daemon and sync crates; FUSE stays
 an adapter:
 
 ```text
-wyrd-fuse        POSIX translation only          daemon backend   WriteHandle
-     ↓↑ (handle-owner callback                    buffers, base advance,
-wyrd-core        MutationQueue, fold orchestration,  budget release
-                 commit sequencing, stale checks,
-                 publication
-                     ↓
-wyrd-sync        immutable tree mutation, snapshot authoring,
-                 durable commit, announcement obligation
+presentation     wyrd-fuse (POSIX translation only)
+                     ↓ reads the shared view; never authors
+node             wyrd-core (MutationQueue, fold orchestration,
+                 commit sequencing, stale checks, publication)
+                     ↓ authors into
+store            wyrd-sync (immutable tree mutation, snapshot
+                 authoring, durable commit, announcement obligation)
 ```
 
-The daemon row sits beside the presentation layer, not below the
-node: `wyrd-daemon` depends on `wyrd-core`, never the reverse. The
-fold calls down into `wyrd-sync`; the per-handle post-commit
-transition is a callback the daemon supplies upward into the
-orchestrated commit (rule 7).
+Separately, the daemon backend owns the per-handle `WriteHandle`
+state (buffers, base advance, budget release) and supplies the
+post-commit transition as a handle-owner callback upward into the
+orchestrated commit (rule 7). `wyrd-daemon` depends on `wyrd-core`,
+never the reverse; `wyrd-fuse` depends on `wyrd-format` and
+`wyrd-namespace` only and never calls into the node.
 
 Stale checks, snapshot creation, tree mutation, and commit sequencing
 must not be implemented inside FUSE callbacks.
@@ -885,9 +894,12 @@ Each row locks a decided invariant.
   durability caller never loses to an earlier-buffered member.
 - **Fold release tie-break**: A and B hold dirty buffers on one file;
   B closes → B's dirty release carries privilege, B wins, A's handle
-  is terminal `EIO`. A close-time `flush` or `release` on a handle
-  that never wrote commits nothing, even when another handle holds
-  pending data on the same path; `fsync` on that path does commit it.
+  is terminal `EIO`.
+- **Fold create tie-break**: A holds a dirty buffer on `P`;
+  `open(P, O_TRUNC)` → the truncate carries privilege, the open
+  succeeds and binds the just-committed identity, A's handle is
+  terminal `EIO`. If the fold cannot be authored the open fails
+  (`EIO`/`ESTALE`) with nothing committed.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.
@@ -927,6 +939,10 @@ Each row locks a decided invariant.
   read sees the overlay; the tree is unchanged until `flush`.
 - **Single commit per flush**: N writes + one `flush` → one snapshot; a
   clean second `flush` commits nothing.
+- **Close-time flush forces nothing for others**: a `flush` or
+  `release` on a handle that never wrote commits nothing, even when
+  another handle holds pending data on the same path; `fsync` on
+  that path does commit it.
 - **flush ≡ fsync durability**: a file survives a simulated restart
   after either; it may be lost after `write` without a commit boundary.
 - **`O_SYNC` per write**: each successful `write` is durable before

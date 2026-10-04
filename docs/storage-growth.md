@@ -127,11 +127,13 @@ No debounce or autosave timer exists in the code. Snapshots are created
 by POSIX boundaries on the authoring device:
 
 - `write` only buffers; a snapshot is created by the DG-1
-  commit-forcing events (`docs/write-path.md`, DG-1 table): `flush`,
-  `fsync`, or dirty-handle `release` fold the whole pending set into
-  one snapshot. A committing boundary on a path with no pending data
-  anywhere performs no snapshot, so idle flushes are free; a clean or
-  read `release` never forces on another handle's behalf.
+  commit-forcing events (`docs/write-path.md`, DG-1 table):
+  dirty-handle `flush` or `release`, `fsync` on a path with pending
+  data, and the other listed forcing events fold the whole pending
+  set into one snapshot. An `fsync` on a path with no pending data
+  anywhere performs no snapshot, and a clean, read, or
+  never-wrote `flush`/`release` never forces on another handle's
+  behalf, so idle closes are free for two independent reasons.
 - `O_SYNC` / `O_DSYNC` never wait for a later boundary: each successful
   `write` is durable before returning, in its own durable snapshot
   shared with any pending set (`docs/write-path.md`, DG-1 table). This

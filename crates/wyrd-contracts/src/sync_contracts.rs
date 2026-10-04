@@ -12,7 +12,7 @@ use wyrd_format::{
     SnapshotId, StorageId, Tree,
 };
 use wyrd_fuse::{DriveView, ViewError};
-use wyrd_sync::authorization::{Classification, Rejection, SnapshotDag};
+use wyrd_sync::authorization::{Classification, Pendency, Rejection, SnapshotDag};
 use wyrd_sync::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::closure::{verify_snapshot_manifest, ClosureError};
 use wyrd_sync::control::{CapabilityPayload, Message};
@@ -2129,6 +2129,191 @@ fn a_gated_head_mounts_only_after_its_tree_lands_and_survives_restart() {
     drop(daemon);
     loaded.rig.teardown();
     std::fs::remove_dir_all(store_dir).unwrap();
+}
+
+/// The body-never-arrives adoption stall, end to end: an announcement
+/// with no servable body leaves the snapshot recorded but unadopted —
+/// out of `live_heads()`, its paths `ENOENT` — while a child authored
+/// on top classifies `Undecided(UnknownParent)`; and the stall poisons
+/// nothing, so serving the bytes later adopts the head normally.
+/// (`docs/fetch-on-open.md`: "Snapshot body or manifest unavailable".)
+#[test]
+fn body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent() {
+    let mut loaded = Loaded::new("payload", b"stalled payload");
+    // Announce only: body, manifest, and objects are never published,
+    // so no route can serve them. The roots are real (they name what
+    // a peer would serve), only the bytes are missing.
+    let snapshot_id = loaded.snapshot.snapshot_id();
+    let body_bytes = loaded.snapshot.encode();
+    let envelope = loaded.rig.enqueue_announcement(
+        snapshot_id,
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body_bytes).as_bytes()),
+            root_manifest: loaded.content.manifest_id,
+            root_transport: BaoRoot::from_bytes(
+                *blake3::hash(&loaded.content.root.sealed).as_bytes(),
+            ),
+        },
+        None,
+    );
+
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(loaded.rig.take_engine(), loaded.objects.clone()).unwrap();
+    let drained = daemon.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(drained.accepted, 2, "capability and announcement commit");
+
+    // Nothing to fetch: no body, no manifest, no objects.
+    let report = daemon.execute_plan(&mut loaded.bulk).unwrap();
+    assert_eq!(report.snapshot_bodies, 0, "no body arrives, none commits");
+    assert_eq!(report.manifests, 0, "no manifest arrives, none commits");
+    assert_eq!(report.objects, 0, "no objects arrive, none commit");
+
+    // Recorded but unadopted: a bodyless announcement is not even
+    // listed among the heads, let alone live.
+    assert!(
+        daemon
+            .engine()
+            .snapshot_heads()
+            .unwrap()
+            .iter()
+            .all(|head| head.id != snapshot_id),
+        "a head without its body is dropped, never listed"
+    );
+    assert!(
+        daemon
+            .engine()
+            .live_heads()
+            .unwrap()
+            .iter()
+            .all(|head| head.snapshot().snapshot_id() != snapshot_id),
+        "the unadopted snapshot is not a live head"
+    );
+
+    // The projected namespace never contains its paths: ENOENT from a
+    // synchronous lookup — never a hang, never EIO.
+    daemon.refresh_live_heads().unwrap();
+    assert_eq!(
+        daemon.view().lookup("payload"),
+        Err(ViewError::NotFound),
+        "unadopted history projects no paths"
+    );
+
+    // A child authored on top is adopted bodily once served, but its
+    // missing parent keeps it out of the live set with the
+    // classification the conformance suite pins at the DAG level. The
+    // child reuses the parent's tree and re-stamps the parent's
+    // manifest entries under its own snapshot id: post-heal the child
+    // is the only head, so sharing the tree keeps the healed
+    // projection single-headed and its closure complete.
+    let child = signed_snapshot(
+        vec![snapshot_id],
+        loaded.content.tree_id,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        2_001,
+    );
+    let child_id = child.snapshot_id();
+    let child_bytes = child.encode();
+    let parent_manifest = seal::open_manifest(
+        &loaded.rig.epoch2.manifest_key(&drive(), 2, &snapshot_id),
+        &loaded.content.manifest_id,
+        &wyrd_sync::seal::EncryptedObject::decode(&loaded.content.root.sealed).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest::new(
+        child_id,
+        parent_manifest.entries().to_vec(),
+        parent_manifest.children().to_vec(),
+    )
+    .unwrap();
+    let manifest_key = loaded.rig.epoch2.manifest_key(&drive(), 2, &child_id);
+    let (manifest_id, manifest_obj) = seal::seal_manifest(&manifest_key, &manifest).unwrap();
+    let manifest_bytes = manifest_obj.encode();
+    loaded.bulk.publish_snapshot(child_id, child_bytes.clone());
+    loaded.bulk.publish_transport(child_bytes.clone());
+    loaded.bulk.publish_root(
+        child_id,
+        SealedManifest {
+            content_id: manifest_id,
+            sealed: manifest_bytes.clone(),
+        },
+    );
+    loaded.bulk.publish_transport(manifest_bytes.clone());
+    loaded.rig.enqueue_announcement(
+        child_id,
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&child_bytes).as_bytes()),
+            root_manifest: manifest_id,
+            root_transport: BaoRoot::from_bytes(*blake3::hash(&manifest_bytes).as_bytes()),
+        },
+        None,
+    );
+    let drained = daemon.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(drained.accepted, 1, "the child announcement commits");
+    let report = daemon.execute_plan(&mut loaded.bulk).unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the served child body commits");
+    let child_head = daemon
+        .engine()
+        .snapshot_heads()
+        .unwrap()
+        .into_iter()
+        .find(|head| head.id == child_id)
+        .expect("the adopted child is listed");
+    assert_eq!(
+        child_head.classification,
+        Classification::Pending(Pendency::UnknownParent),
+        "a child of unrecorded history waits on its parent"
+    );
+    assert!(
+        daemon
+            .engine()
+            .live_heads()
+            .unwrap()
+            .iter()
+            .all(|head| head.snapshot().snapshot_id() != child_id),
+        "the undecided child is not a live head"
+    );
+
+    // No poisoning: a further pass rejects nothing, the announcement
+    // is still durably recorded (its redelivery collapses to a
+    // duplicate), and serving the bytes later heals the chain: the
+    // parent adopts, which makes the waiting child the sole head, and
+    // the child — sharing the parent's tree — mounts and projects.
+    // A rejected snapshot could not heal like this.
+    let report = daemon.execute_plan(&mut loaded.bulk).unwrap();
+    assert_eq!(report.invalid, 0, "the stall poisons no fact");
+    loaded.rig.relay.queue([envelope]);
+    let redelivered = daemon.drain(&mut loaded.rig.relay).unwrap();
+    assert_eq!(redelivered.accepted, 0, "nothing new to commit");
+    assert_eq!(
+        redelivered.duplicates, 1,
+        "the announcement stayed recorded"
+    );
+    loaded.publish_all();
+    let report = daemon.execute_plan(&mut loaded.bulk).unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the late body still adopts");
+    daemon.refresh_live_heads().unwrap();
+    assert!(
+        daemon
+            .engine()
+            .live_heads()
+            .unwrap()
+            .iter()
+            .any(|head| head.snapshot().snapshot_id() == child_id),
+        "the healed chain makes the waiting child live, proving the parent adopted"
+    );
+    assert!(
+        daemon.view().lookup("payload").is_ok(),
+        "the healed head projects its paths"
+    );
+
+    drop(daemon);
+    loaded.rig.teardown();
 }
 
 /// Recovery grafts content only, and a voided transition never

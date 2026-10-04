@@ -292,23 +292,37 @@ what retries:
   `crates/wyrd-core/src/want.rs`) and at the FUSE boundary for
   chunk reads under a materialized tree
   (`read_deadline_is_eio_and_releases_the_want` in
-  `crates/wyrd-daemon/src/fuse/tests_want.rs`); a manifest-chain
-  `open()` blocking all the way to `EIO` has no dedicated test and
-  is unverified until one lands. Retry: the next open re-registers
+  `crates/wyrd-daemon/src/fuse/tests_want.rs`). The manifest-chain
+  case is pinned in two halves, split where the architecture forces
+  the split: the hostile-representation walk (corrupt served plus
+  absent, nothing committed) at the plan level
+  (`corrupt_and_absent_tree_representations_commit_nothing` in
+  `crates/wyrd-sync/src/runtime/fetch/tests_fetch.rs`), and the
+  blocking open itself — deadline elapsed, `EIO`, registry drained,
+  second open re-registers — at the FUSE boundary
+  (`manifest_chain_open_fails_bounded_eio_while_tree_unmaterialized`
+  in `crates/wyrd-daemon/src/fuse/tests_want.rs`). One test cannot
+  cover both: once the durable facts call the tree local the plan
+  correctly stops re-driving its walk, while the install gate needs
+  present trees — so the walk is staged pre-install and the boundary
+  against post-install loss. Retry: the next open re-registers
   the want; a re-announced route is fetched once its cooldown
   lapses (property 8 above), so recovery needs a new announcement,
   never a new caller.
 - **Snapshot body or manifest unavailable.** An announcement whose
   body never arrives leaves the snapshot unadopted: a snapshot with
-  unrecorded parents classifies `Undecided(UnknownParent)` and never
+  unrecorded parents classifies
+  `Classification::Pending(Pendency::UnknownParent)` and never
   becomes a live head (`authorization/classify.rs`), so the
   projected namespace never contains paths from it — `ENOENT`, not a
   hang. The announcement itself stays recorded and stays advertised
   as known; intake neither commits unverified bytes nor poisons the
-  chain. (No dedicated test pins the body-never-arrives adoption
-  stall end to end; the classification half is pinned by the
-  authorization conformance suite. Treat the end-to-end stall as
-  unverified until such a test lands.)
+  chain. Pinned end to end by
+  `body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent`
+  in `crates/wyrd-contracts/src/sync_contracts.rs` (recorded but not
+  live, paths `ENOENT`, child classifies
+  `Classification::Pending(Pendency::UnknownParent)`,
+  and the stall heals cleanly once the bytes arrive).
 - **File content unavailable.** Chunks whose representations name no
   reachable provider are absence at the object level: the fetch walk
   tries every candidate the walk reaches (property 8), genuine

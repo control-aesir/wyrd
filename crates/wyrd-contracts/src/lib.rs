@@ -201,6 +201,13 @@
 //! 43. `policy_commits_change_no_replicated_state` — pin, unpin, and
 //!     evict leave the head set byte-identical and the durable
 //!     outbox empty: policy facts never enter replicated state.
+//! 44. `body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent` —
+//!     an announcement with no servable body stays recorded but
+//!     unadopted (out of the live heads, its paths `ENOENT`), a
+//!     served child on top classifies
+//!     `Classification::Pending(Pendency::UnknownParent)`, and the
+//!     stall heals cleanly once the bytes arrive
+//!     (`docs/fetch-on-open.md`, body-or-manifest unavailable).
 
 #[cfg(test)]
 mod egress_contracts;

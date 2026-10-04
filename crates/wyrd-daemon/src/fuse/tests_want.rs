@@ -2,7 +2,7 @@ use super::tests_harness::{heads, snapshot_of, NoMaterialization};
 use super::*;
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wyrd_format::ObjectStore;
 use wyrd_fuse::DriveView;
@@ -150,4 +150,131 @@ fn concurrent_reads_coalesce_into_one_want() {
         .unwrap();
     assert_eq!(reader_a.join().unwrap(), b"streamed");
     assert_eq!(reader_b.join().unwrap(), b"streamed");
+}
+
+/// A manifest-chain open against an unmaterialized tree blocks for
+/// the whole open deadline and fails `EIO`: the tree the resolution
+/// path needs registers its identity as a want, no provider
+/// completes it, the demand entry is retired on expiry, and a second
+/// open re-registers rather than returning a cached error. The tree
+/// — not a chunk — is what makes this the manifest-chain leg
+/// (`docs/fetch-on-open.md`): `open()` must materialize the chain
+/// before an FD exists, while `read()` demand is covered by the
+/// tests above.
+///
+/// Staging honesty: the installed head with a missing tree models
+/// post-install loss (bytes gone out of band after the closure
+/// verified). In v0 that state is reachable only out of band — the
+/// install gate needs present trees, `status()` trusts the durable
+/// facts over the store, and no public API writes an `ObjectRemoved`
+/// fact — so the hostile-representation walk this blocks against is
+/// pinned at the plan level instead
+/// (`corrupt_and_absent_tree_representations_commit_nothing` in
+/// `wyrd-sync`), and this test pins the boundary half: blocking,
+/// bounded `EIO`, registry hygiene, re-registration.
+#[test]
+fn manifest_chain_open_fails_bounded_eio_while_tree_unmaterialized() {
+    let open_timeout = Duration::from_millis(300);
+    // The tree is built but never inserted: the view resolves through
+    // the installed head while the store holds nothing.
+    let chunk = ContentId::derive(ObjectKind::Chunk, b"streamed");
+    let tree =
+        Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()]).unwrap();
+    let tree_id = ContentId::derive(ObjectKind::Tree, &tree.encode());
+    let store = Arc::new(RwLock::new(MemoryObjectStore::default()));
+    let projection = Arc::new(RwLock::new(Arc::new(Projection::initial(
+        DriveView::new(
+            SharedStore::from(Arc::clone(&store)),
+            NoMaterialization,
+            heads(vec![snapshot_of(tree_id)]),
+        ),
+        0,
+    ))));
+    let registry = Arc::new(WantRegistry::default());
+    let budgets = ResourceBudgets::default();
+    let backend = FuseBackend::shared_with_wants(
+        Arc::clone(&projection),
+        Arc::clone(&registry),
+        Arc::new(MutationQueue::default()),
+        open_timeout,
+        &budgets,
+    );
+    // The second observation runs under a generous deadline of its
+    // own: sharing the 300 ms opener would let a scheduler stall eat
+    // the whole re-registration window and misreport a correct
+    // backend as broken.
+    let patient = FuseBackend::shared_with_wants(
+        Arc::clone(&projection),
+        Arc::clone(&registry),
+        Arc::new(MutationQueue::default()),
+        Duration::from_secs(5),
+        &budgets,
+    );
+
+    // The open blocks for the deadline — it never fails fast and
+    // never hangs past its bound.
+    let started = Instant::now();
+    assert_eq!(
+        backend.open_at("f.txt"),
+        Err(fuser::Errno::EIO),
+        "an unmaterializable manifest chain fails the open with EIO"
+    );
+    assert!(
+        started.elapsed() >= open_timeout,
+        "the open waits out the deadline instead of failing fast"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "expiry retired the manifest-chain demand"
+    );
+    assert!(
+        !registry.is_admitted(&tree_id),
+        "no in-flight fetch outlives the retired demand"
+    );
+
+    // A second open re-registers its own want: observe the pending
+    // tree identity mid-flight, then the same bounded EIO.
+    let second = std::thread::spawn(move || patient.open_at("f.txt"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = registry.peek_pending();
+        if pending == vec![tree_id] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second open never re-registered its want"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        second.join().unwrap(),
+        Err(fuser::Errno::EIO),
+        "the re-registered open fails bounded too, never cached"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "the second expiry retired its demand as well"
+    );
+    assert!(
+        !registry.is_admitted(&tree_id),
+        "no in-flight fetch outlives the second demand either"
+    );
+
+    // Property 6, positive half: a timeout cancels the wait, not the
+    // arrival. Landing the tree after both expiries makes the next
+    // open serve immediately with no new demand registered.
+    store
+        .write()
+        .unwrap()
+        .insert(ObjectKind::Tree, &tree.encode())
+        .unwrap();
+    assert!(
+        backend.open_at("f.txt").is_ok(),
+        "the arrived tree serves without another wait"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "the served open registers no demand"
+    );
 }

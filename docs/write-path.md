@@ -96,15 +96,15 @@ announceable?                  (only ever yes past serving residency)
 | Event | Pending empty | Pending non-empty | Snapshots | Yield |
 |---|---|---|---|---|
 | Buffered `write` / handle `truncate` / handle `set-exec` (non-`O_SYNC`) | Accumulate | Accumulate; never forces | 0 | Working |
-| `flush` / `fsync` / `fdatasync` on a handle whose path has pending data | n/a (this handle's buffer is a pending member) | Fold all pending into one snapshot | 1 | Committed → Published via the pipeline |
+| `flush` / `fsync` / `fdatasync` on a handle whose path has pending data anywhere | n/a (this handle's buffer may itself be a pending member) | Fold all pending into one snapshot | 0–1 | Committed → Published via the pipeline; 0 only when no member survives (rule 6) |
 | `flush` / `fsync` on a handle whose path has no pending data anywhere | No-op; commits nothing | No-op | 0 | Unchanged |
-| `release` / `close` of a handle whose path has pending data | n/a | Fold all pending into one snapshot, best-effort | 1 | Committed → Published; errors often discarded by callers |
-| `release` / `close` of a handle whose path has no pending data anywhere | No-op | No-op | 0 | Unchanged |
-| `O_SYNC` / `O_DSYNC` `write` | Its own durable snapshot, shared with any pending set | Fold pending + this write into one snapshot, synchronously before return | 1 | Committed → Published |
-| Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 1 | Committed → Published |
+| `release` / `close` of a **dirty** handle (this handle holds its own buffer) | n/a | Fold all pending into one snapshot, best-effort | 0–1 | Committed → Published; errors often discarded by callers; 0 only when no member survives (rule 6) |
+| `release` / `close` of a clean or read handle | No-op; never forces on another handle's behalf | No-op | 0 | Unchanged |
+| `O_SYNC` / `O_DSYNC` `write` | Its own durable snapshot, shared with any pending set | Fold pending + this write into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
-| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 1 | Committed → Published |
-| Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | Nothing to do | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
+| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
 
@@ -116,20 +116,34 @@ Rules:
    handles' pending data durable too — extra durability, never less —
    and the folded data is durable at the boundary, so serving and
    announcing it with the snapshot is safe.
-2. **Stale and conflict checks are per member, at commit, in
-   submission order.** Same-path concurrent edits fail closed for the
+2. **Stale and conflict checks are per member, at commit.** Members
+   are ordered first-in-first-buffered (FIFO by buffering time), which
+   is deterministic. Same-path concurrent edits fail closed for the
    conflicting member (its handle goes terminal `EIO`); different-path
    edits rebase onto the current head and still fold into the one
-   snapshot. More than one eligible live head refuses the whole fold
+   snapshot. On a same-path tie the forcing member wins: an explicit
+   durability call (`fsync`, `O_SYNC` write, effective namespace op)
+   never loses its own bytes to an earlier-buffered member — the
+   earlier member goes terminal instead. When the forcer has no member
+   on the tied path, the earliest-buffered member wins. Either way the
+   inverted case is explicit: the losing member's handle is terminal
+   `EIO` at the fold, before it ever makes its own forcing call.
+   More than one eligible live head refuses the whole fold
    (`ConflictedHeads`); nothing commits.
 3. **`flush` ≡ `fsync` stays the reportable persistence point** and
    `O_SYNC` stays commit-per-write; coalescing applies only to demand
-   that does not explicitly require synchronous durability. "Clean" is
-   a per-path property: a committing boundary on a handle whose path
-   has no pending data anywhere commits nothing and forces nothing.
-   This keeps idle flushes on untouched paths free while preserving
-   the per-inode `fsync` contract — an `fsync` on any descriptor of a
-   path with pending data makes that path's data durable.
+   that does not explicitly require synchronous durability. For
+   `flush`/`fsync`/`fdatasync`, "clean" is a per-path property: a
+   committing boundary on a handle whose path has no pending data
+   anywhere commits nothing and forces nothing, which keeps idle
+   flushes on untouched paths free while preserving the per-inode
+   `fsync` contract — an `fsync` on any descriptor of a path with
+   pending data makes that path's data durable. For
+   `release`/`close`, "clean" is a per-handle property: only a handle
+   holding its own buffer forces, and a clean or read close never
+   forces on another handle's behalf (`close` is not a durability
+   point). The `flush` ≡ `fsync` equivalence must not pull the close
+   path in with it.
 4. **No idle-window commit in v0.3.** A timer in the durability path
    would be a silent post-timeout commit, contradicting the queue's
    synchronous contract below (a caller stays blocked until the loop
@@ -145,14 +159,21 @@ Rules:
    exactly the pending set; that loss is the contract, not a
    violation. The `Working | Committed | Published` labels are
    descriptive here; DG-2 owns the level encoding and API contract.
-6. **Fold failures are per member.** Surviving members still commit
-   into the one snapshot; each failed member reports its own errno to
-   its own waiter and its handle goes terminal. The forcing caller
-   receives the errno of its own member — an `O_SYNC` write is never
-   failed by an unrelated member's staleness, and a namespace op
-   reports only its own outcome. At shutdown/`destroy` the same rule
-   holds best-effort per path: committed members stay committed, and
-   per-path losses are logged rather than reported.
+6. **Fold failures are per member, except the fold-fatal classes.**
+   Surviving members still commit into the one snapshot; each failed
+   member reports its own errno to its own waiter and its handle goes
+   terminal. The forcing caller receives the errno of its own member
+   — an `O_SYNC` write is never failed by an unrelated member's
+   staleness, and a namespace op reports only its own outcome. At
+   shutdown/`destroy` the same rule holds best-effort per path:
+   committed members stay committed, and per-path losses are logged
+   rather than reported. A fold with no surviving member authors
+   nothing: no empty snapshot, no dangling announcement obligation.
+   Fold-fatal (whole-fold, unattributable to one member):
+   `ConflictedHeads` (refuses the entire fold, nothing commits);
+   store, authoring, or fact-commit failure; and the pre-commit
+   retained-bytes quota, which under folding covers the aggregate of
+   the whole pending set before the commit's first write.
 7. **Folded handles advance atomically with the snapshot.** Every
    member whose data committed has its base advanced to the committed
    identity and its dirty bit and budget cleared as part of the same
@@ -551,9 +572,10 @@ guarantee: there is no cached-but-not-durable commit state — the commit
 boundary *is* the durability boundary. They differ only in how
 applications observe the result: `flush` runs on every `close` and its
 error is frequently ignored, so `fsync` is the reportable persistence
-point. A committing boundary on a handle whose path has no pending data
-anywhere performs no snapshot and forces nothing (DG-1 table). A
-forcing `flush`/`fsync` folds the whole pending set, not just the
+point. A `flush`/`fsync` on a handle whose path has no pending data
+anywhere performs no snapshot and forces nothing (DG-1 table); a
+`release`/`close` forces only when the closing handle itself is dirty.
+A forcing `flush`/`fsync` folds the whole pending set, not just the
 calling handle.
 
 Because `release` is best-effort and drops the buffer, an application
@@ -797,8 +819,10 @@ an adapter:
 ```text
 wyrd-fuse        POSIX translation only
                      ↓
-wyrd-core        WritableHandle, MutationQueue, commit orchestration,
+wyrd-core        MutationQueue, fold orchestration, commit sequencing,
                  stale checks, publication
+                     ↓ (per-handle buffers live with their owner:)
+daemon backend   WriteHandle buffers, base advance, budget release
                      ↓
 wyrd-sync        immutable tree mutation, snapshot authoring,
                  durable commit, announcement obligation
@@ -829,7 +853,13 @@ Each row locks a decided invariant.
 **Lost-update boundary**
 
 - **Stale writable handle**: A and B open one file; B commits; A commits
-  → A gets `EIO`, B's content remains, no third snapshot.
+  → A gets `EIO`, B's content remains, no third snapshot. (Pre-fold
+  mechanism: separate commits. Under DG-1, A goes terminal at B's
+  fold, so "A commits" never happens — same outcome, earlier loss.)
+- **Fold inverted case**: A and B hold dirty buffers on one file; B
+  forces (`fsync`) → B wins the tie, B's bytes are durable on return,
+  A's handle is terminal `EIO` before A ever calls. The explicit
+  durability caller never loses to an earlier-buffered member.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.

@@ -105,7 +105,7 @@ announceable?                  (only ever yes past serving residency)
 | `O_SYNC` / `O_DSYNC` `write` | Its own durable snapshot, shared with any pending set | Fold pending + this write into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
-| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6). A `create` refused at admission (`EEXIST`, `ESTALE`, `ENOENT`) submits nothing and forces nothing — the refusal is decided before any fold |
 | Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
@@ -135,9 +135,11 @@ Rules:
    checkpoint all carry it — so an explicit durability call never
    loses its own bytes to an earlier-buffered member; the earlier
    member goes terminal instead. A truncating `open` therefore keeps
-   today's outcome: the truncate wins its path tie and any dirty
-   handle on that path goes terminal `EIO`, rather than the open
-   failing because another handle held unflushed bytes. If the fold
+   today's commit outcome with earlier loss: the truncate wins its
+   path tie and any dirty handle on that path goes terminal `EIO`
+   at the fold — where today it would keep buffering and only go
+   stale at its own later commit — rather than the open failing
+   because another handle held unflushed bytes. If the fold
    itself cannot be authored (conflicted drive, store failure), the
    open fails with the existing binding-rule errno (`EIO`/`ESTALE`)
    and nothing commits — there is no half-truncated state for the

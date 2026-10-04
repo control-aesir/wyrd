@@ -280,7 +280,8 @@ sync now
       a blind intake is never reported as converged, including a
       blind stretch that healed mid-run: the lifetime
       recovery-attempt counters prove an episode ran, so the quiet
-      verdict may predate the healing)
+      verdict may predate the healing. Episodes only fire after
+      first attachment, so a slow cold start never counts.)
     = either converges or explicitly reports incomplete
 ```
 

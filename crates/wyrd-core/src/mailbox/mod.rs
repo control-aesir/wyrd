@@ -1329,6 +1329,14 @@ async fn supervise(ctx: SupervisorContext, total_relays: usize) {
     } = ctx;
     let mut tick = tokio::time::interval(SUPERVISOR_INTERVAL);
     let mut down_ticks: u32 = 0;
+    // Whether any tick has yet observed a connected relay. Recovery
+    // episodes prove a blind window only after attachment: before
+    // the first connect the handshake may simply be slow, so
+    // pre-attachment ticks must neither arm the outage grace nor
+    // launch a stream episode. Downstream verdicts read the
+    // recovery-attempt totals as run-level blindness — an episode
+    // fired on a slow cold start would fail a converged run.
+    let mut ever_connected = false;
     loop {
         tick.tick().await;
         // The tick count advances on every loop pass, including passes
@@ -1336,6 +1344,9 @@ async fn supervise(ctx: SupervisorContext, total_relays: usize) {
         // proof the supervisor keeps reporting while an episode spins.
         health.ticks.fetch_add(1, Ordering::Relaxed);
         refresh(&client, &health).await;
+        if health.connected_relays.load(Ordering::Relaxed) > 0 {
+            ever_connected = true;
+        }
         // Offline mailbox: nothing to re-drive; health is stream-alive
         // alone, and an empty client refuses connect/subscribe.
         if total_relays == 0 {
@@ -1394,6 +1405,7 @@ async fn supervise(ctx: SupervisorContext, total_relays: usize) {
             });
         }
         if !health.stream_alive.load(Ordering::Relaxed)
+            && ever_connected
             && !health.stream_episode.swap(true, Ordering::Relaxed)
         {
             // Spawned, never awaited: the tick loop keeps ticking while
@@ -1430,7 +1442,12 @@ async fn supervise(ctx: SupervisorContext, total_relays: usize) {
             down_ticks = 0;
         }
         if health.connected_relays.load(Ordering::Relaxed) == 0 {
-            down_ticks = down_ticks.saturating_add(1);
+            // Post-attachment only (see `ever_connected` above): a
+            // relay that never attached is down, not out — the end
+            // state already reports that, and no episode is owed.
+            if ever_connected {
+                down_ticks = down_ticks.saturating_add(1);
+            }
         } else {
             down_ticks = 0;
         }
@@ -1547,7 +1564,7 @@ async fn recover_stream(
 }
 
 /// Relay-level recovery: no relay has been connected for a sustained
-/// stretch, so ensure a connection task exists (`connect` is a no-op for
+/// stretch after first attachment, so ensure a connection task exists (`connect` is a no-op for
 /// relays whose task is already driving or retrying — the supervisor never
 /// disconnects, see above) and wait briefly for progress, backing off with
 /// a capped delay between attempts. On success, replace the subscription

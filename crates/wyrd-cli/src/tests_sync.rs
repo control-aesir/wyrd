@@ -534,7 +534,7 @@ fn degraded_mailbox_fails_every_outcome_as_unverified() {
                     connected: 0,
                     total: 1,
                     closed: 0,
-                    recoveries: 0
+                    attempts: 0
                 }
             ),
             "a blind mailbox fails {outcome:?} as unverified, got: {error}"
@@ -573,7 +573,7 @@ fn degraded_mailbox_fails_every_outcome_as_unverified() {
                 connected: 1,
                 total: 1,
                 closed: 1,
-                recoveries: 0
+                attempts: 0
             }
         ),
         "a closed subscription fails quiet as unverified, got: {error}"
@@ -593,7 +593,7 @@ fn degraded_mailbox_fails_every_outcome_as_unverified() {
                 connected: 1,
                 total: 1,
                 closed: 0,
-                recoveries: 2
+                attempts: 2
             }
         ),
         "a mid-run outage fails quiet as unverified, got: {error}"

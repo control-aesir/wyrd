@@ -474,20 +474,24 @@ pub(crate) enum CliError {
     #[error("sync incomplete: pass limit ({passes}) reached with {pending} obligations pending")]
     Incomplete { passes: u32, pending: usize },
     /// A run that stopped on a quiet local state while the mailbox
-    /// could not prove intake worked: no relay connected, or a relay
-    /// closed our subscription mid-run. Quiet observed through a
-    /// blind intake is unverified, never converged — automation must
-    /// not mistake it for success. Exits non-zero like any other
-    /// failure; the stdout lines still carry the pass and pending
-    /// counts for forensics.
+    /// could not prove intake worked: no relay connected, a relay
+    /// closed our subscription mid-run, or a blind stretch healed
+    /// mid-run (a non-zero recovery-attempt total proves a
+    /// supervisor episode ran — post-attachment only, so a slow cold
+    /// start never counts). Quiet observed through a blind intake is
+    /// unverified, never converged — automation must not mistake it
+    /// for success. Exits non-zero like any other failure; the stdout
+    /// lines still carry the pass and pending counts for forensics.
+    /// The counts use wyrd-core's unit (loop iterations, not
+    /// episodes): one slow episode converges over several attempts.
     #[error(
-        "sync unverified: mailbox degraded ({connected} of {total} relays connected, {closed} subscriptions closed by relay, {recoveries} recovery episodes during the run)"
+        "sync unverified: mailbox degraded ({connected} of {total} relays connected, {closed} subscriptions closed by relay, {attempts} recovery attempts during the run)"
     )]
     Unverified {
         connected: usize,
         total: usize,
         closed: u64,
-        recoveries: u64,
+        attempts: u64,
     },
     /// No mailbox snapshot was ever recorded on the report. Unreachable
     /// in production (`sync_now` always stores the observed snapshot),
@@ -1481,8 +1485,9 @@ struct SyncRunReport {
 /// resubscribe without operator action), or a blind stretch that
 /// did (a non-zero recovery-attempt total proves a supervisor
 /// episode ran during this run — the counters start at zero per
-/// mailbox and episodes only spawn after a sustained outage, so
-/// they cannot be stale). A recovered run may in fact have
+/// mailbox and episodes only spawn after first attachment and a
+/// sustained outage, so they cannot be stale and a slow cold start
+/// never counts). A recovered run may in fact have
 /// converged, but the quiet verdict may have been reached through
 /// the blind window; failing it as unverified is the conservative
 /// direction for a convergence-verdict command, and the error names
@@ -1500,10 +1505,11 @@ fn mailbox_degraded(health: &MailboxHealth) -> bool {
         || health.relay_recovery_attempts > 0
 }
 
-/// Recovery episodes over the run, both kinds: a stream death or a
+/// Recovery attempts over the run, both kinds: a stream death or a
 /// relay outage each leaves intake blind until its episode
-/// converges, so the run-level verdict counts either.
-fn recovery_episodes(health: &MailboxHealth) -> u64 {
+/// converges, so the run-level verdict counts either. Loop
+/// iterations, matching wyrd-core's unit — not episodes.
+fn recovery_attempts(health: &MailboxHealth) -> u64 {
     health
         .stream_recovery_attempts
         .saturating_add(health.relay_recovery_attempts)
@@ -1731,7 +1737,7 @@ fn mailbox_line(health: &MailboxHealth) -> String {
         return MAILBOX_IDLE_LINE.to_owned();
     }
     let closed = health.closed_subscriptions;
-    let episodes = recovery_episodes(health);
+    let attempts = recovery_attempts(health);
     format!(
         "mailbox: {} ({} of {} relays connected{}{})\n",
         if mailbox_degraded(health) {
@@ -1749,12 +1755,12 @@ fn mailbox_line(health: &MailboxHealth) -> String {
                 if closed == 1 { "" } else { "s" }
             )
         },
-        if episodes == 0 {
+        if attempts == 0 {
             String::new()
         } else {
             format!(
-                ", {episodes} recovery attempt{} during the run",
-                if episodes == 1 { "" } else { "s" }
+                ", {attempts} recovery attempt{} during the run",
+                if attempts == 1 { "" } else { "s" }
             )
         },
     )
@@ -1763,18 +1769,18 @@ fn mailbox_line(health: &MailboxHealth) -> String {
 /// Name the degraded cause for the report lines: the current
 /// posture when it is down or blind, the mid-run recovery when the
 /// mailbox is attached now but ran blind earlier, and the missing
-/// observation when there is none. The mid-run arm is why the
-/// report can say "recovered" while the mailbox line says "live":
-/// both describe the same snapshot from their own angle.
+/// observation when there is none. The mid-run arm names the
+/// history the mailbox line only counts: the line reads degraded
+/// with the attempt total, the report says what the total proves.
 fn degraded_reason(mailbox: Option<MailboxHealth>) -> String {
     match mailbox {
         None => "mailbox unobserved".to_owned(),
         Some(health) => {
-            let episodes = recovery_episodes(&health);
-            if health.closed_subscriptions > 0 || !health.is_live() || episodes == 0 {
+            let attempts = recovery_attempts(&health);
+            if health.closed_subscriptions > 0 || !health.is_live() || attempts == 0 {
                 "mailbox degraded".to_owned()
             } else {
-                format!("mailbox recovered mid-run ({episodes} recovery attempts)")
+                format!("mailbox recovered mid-run ({attempts} recovery attempts)")
             }
         }
     }
@@ -1874,7 +1880,7 @@ fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
             connected: mailbox.connected_relays,
             total: mailbox.total_relays,
             closed: mailbox.closed_subscriptions,
-            recoveries: recovery_episodes(&mailbox),
+            attempts: recovery_attempts(&mailbox),
         });
     }
     match report.outcome {

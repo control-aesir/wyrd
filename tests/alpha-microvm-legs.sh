@@ -542,25 +542,44 @@ conflict_assert_converged() {
   [[ "$listing" != *conflict-c.txt@* ]] \
     || die "readdir lists a version-qualified name on $m"
   pass "readdir omits version-qualified names"
-  # The re-read must be loud: a failing cat inside the bare command
-  # substitution below killed this leg silently under set -e twice on
-  # odin (leg 10, post-heal) with no die line, so a re-read failure
-  # was indistinguishable from a dead shell. Capture each version
-  # separately with errexit off so the failure names its side, its
-  # exit code, and the kernel's error text. LOGDIR is shared across
-  # guests, so the per-cat stderr files are namespaced by side like
-  # the EIO-write probe's below.
-  local got want got1 got2 rc1=0 rc2=0
-  set +e
-  got1="$(cat "$m/conflict-c.txt@1" 2>"$LOGDIR/conflict-reread-$side-1.stderr")"; rc1=$?
-  got2="$(cat "$m/conflict-c.txt@2" 2>"$LOGDIR/conflict-reread-$side-2.stderr")"; rc2=$?
-  set -e
-  [[ $rc1 -eq 0 ]] \
-    || die "conflict re-read @1 failed on $m (rc $rc1): $(cat "$LOGDIR/conflict-reread-$side-1.stderr")"
-  [[ $rc2 -eq 0 ]] \
-    || die "conflict re-read @2 failed on $m (rc $rc2): $(cat "$LOGDIR/conflict-reread-$side-2.stderr")"
-  got="$(printf '%s\n' "$got1" "$got2" | sort)"
-  want="$(printf '%s\n' "owner-conflict-1" "member-conflict-1" | sort)"
+  # The re-read must be loud and settle-tolerant. A failing cat
+  # inside a bare command substitution killed this leg silently under
+  # set -e twice on odin (leg 10, post-heal) with no die line; and a
+  # rerun at the same commit went green, with the red runs converging
+  # in ~6s post-heal against ~17s green — the single-shot re-read
+  # fires milliseconds after the poll while post-heal convergence is
+  # still in flight. So each version is captured separately with
+  # errexit off (naming its side, exit code, and kernel error text),
+  # and the capture plus set comparison retries bounded like the
+  # poll: a version that never serves still fails loudly, with the
+  # trajectory on the die line. LOGDIR is shared across guests, so
+  # the per-cat stderr files are namespaced by side like the
+  # EIO-write probe's below.
+  local got want got1 got2 rc1=0 rc2=0 settled=0 attempt=0
+  local err1="" err2=""
+  while (( attempt < 120 )); do
+    attempt=$(( attempt + 1 ))
+    set +e
+    got1="$(cat "$m/conflict-c.txt@1" 2>"$LOGDIR/conflict-reread-$side-1.stderr")"; rc1=$?
+    got2="$(cat "$m/conflict-c.txt@2" 2>"$LOGDIR/conflict-reread-$side-2.stderr")"; rc2=$?
+    set -e
+    if [[ $rc1 -eq 0 && $rc2 -eq 0 ]]; then
+      got="$(printf '%s\n' "$got1" "$got2" | sort)"
+      want="$(printf '%s\n' "owner-conflict-1" "member-conflict-1" | sort)"
+      if [[ "$got" == "$want" ]]; then
+        settled=1
+        break
+      fi
+      err1="set mismatch [$got]"; err2=""
+    else
+      err1="rc $rc1: $(cat "$LOGDIR/conflict-reread-$side-1.stderr")"
+      err2="rc $rc2: $(cat "$LOGDIR/conflict-reread-$side-2.stderr")"
+    fi
+    sleep 0.5
+  done
+  [[ $settled -eq 1 ]] \
+    || die "conflict versions never settled on $m after $attempt attempts (@1: $err1; @2: $err2)"
+  [[ $attempt -gt 1 ]] && echo "  note: conflict re-read settled after $attempt attempts on $m"
   [[ "$got" == "$want" ]] \
     || die "conflict version set mismatch on $m: got [$got]"
   pass "conflict versions read identically (owner + member takes)"

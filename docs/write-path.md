@@ -105,7 +105,8 @@ announceable?                  (only ever yes past serving residency)
 | `O_SYNC` / `O_DSYNC` `write` | Its own durable snapshot, shared with any pending set | Fold pending + this write into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
-| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6). A `create` refused at admission (`EEXIST`, `ESTALE`, `ENOENT`) submits nothing and forces nothing — the refusal is decided before any fold |
+| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| Refused `create` | A refusal decided before submit submits nothing and forces nothing | A precondition that fails during fold application is a failed member and never forces (rule 6) | 0 | Unchanged; a failed forcer aborts the fold with nothing committed |
 | Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
@@ -116,13 +117,14 @@ Rules:
    set plus itself as a single snapshot, not pending-as-one plus
    self-as-another. `fsync` on one handle therefore makes other
    handles' pending data durable too — extra durability, never less,
-   except through rule 2's tie-break: a losing member's buffer is
+   except through rule 2's tie-break (a losing member's buffer is
    discarded rather than committed, and the loser can be destroyed by
-   an unrelated third party's fold (an `O_SYNC` write, `release`, or
-   shutdown on another path) when the forcer has no member on the
-   tied path. Apart from the tie-break, the folded data is durable
-   at the boundary, so serving and announcing it with the snapshot is
-   safe.
+   an unrelated third party's fold when the forcer has no member on
+   the tied path) or rule 6's failed-member path (a failed member is
+   discarded, and a failed forcer aborts the fold with nothing
+   committed). Apart from those two paths, the folded data is
+   durable at the boundary, so serving and announcing it with the
+   snapshot is safe.
 2. **Stale and conflict checks are per member, at commit.** Members
    are ordered first-in-first-buffered (FIFO by buffering time), which
    is deterministic. Same-path concurrent edits fail closed for the
@@ -190,8 +192,18 @@ Rules:
    staleness, and a namespace op reports only its own outcome. At
    shutdown/`destroy` the same rule holds best-effort per path:
    committed members stay committed, and per-path losses are logged
-   rather than reported. A fold with no surviving member authors
-   nothing: no empty snapshot, no dangling announcement obligation.
+   rather than reported. A failed member never forces: pre-submit
+   refusals (unsupported flags, read-only mount, `ENOTDIR`/`EIO`/
+   `EMFILE` at open, `ESTALE` from the parent claim or capture)
+   submit nothing and force nothing, and a member whose namespace
+   precondition fails during fold application (`EEXIST`,
+   `ENOENT`/`ESTALE` parent races — decided inside application at
+   `live.rs:1437`/`:1441-1442`/`:1444-1446`, never at admission)
+   reports its own errno without forcing. If the forcing member
+   itself is the one that fails, the fold aborts with nothing
+   committed — a failed syscall never makes another member's pending
+   bytes durable. A fold with no surviving member authors nothing:
+   no empty snapshot, no dangling announcement obligation.
    Fold-fatal (whole-fold, unattributable to one member):
    `ConflictedHeads` (refuses the entire fold, nothing commits);
    store, authoring, or fact-commit failure; and the pre-commit
@@ -600,12 +612,13 @@ which events force — `fsync`/`fdatasync` fold on a per-path test
 while `flush` forces only on the calling handle's own buffer — and
 only in how applications observe the result: `flush` runs on every
 `close` and its error is frequently ignored, so `fsync` is the
-reportable persistence point. An `fsync`/`fdatasync` on a handle whose path has no pending
-data anywhere performs no snapshot and forces nothing, while a
-`flush` or `release`/`close` forces only when the calling handle
-itself is dirty — a clean close-time `flush` never forces on another
-handle's behalf (DG-1 table). A forcing boundary folds the whole
-pending set, not just the calling handle.
+reportable persistence point. An `fsync`/`fdatasync` on a handle
+whose path has no pending data anywhere performs no snapshot and
+forces nothing, while a `flush` or `release`/`close` forces only
+when the calling handle itself is dirty — a clean close-time
+`flush` never forces on another handle's behalf (DG-1 table). A
+forcing boundary folds the whole pending set, not just the calling
+handle.
 
 Because `release` is best-effort and drops the buffer, an application
 that never calls `flush`/`fsync` can lose acknowledged writes. This is
@@ -666,7 +679,7 @@ is a complete, valid filesystem.
 
 | Operation | Semantics (v0) |
 |---|---|
-| `create` | Commits an empty regular file, folding any pending set, **and** returns a handle based on the resulting snapshot, as one daemon operation (no window between them). The empty-file snapshot is a complete, independently valid state: a crash before the first content commit leaves it, and a peer may observe it. `O_EXCL` → `EEXIST`. |
+| `create` | Commits an empty regular file, folding any pending set, **and** returns a handle based on the resulting snapshot, as one daemon operation (no window between them). The empty-file snapshot is a complete, independently valid state: a crash before the first content commit leaves it, and a peer may observe it. `O_EXCL` → `EEXIST`. A refusal decided before submit submits and forces nothing; a precondition that fails during application is a failed member that never forces, and a failed forcer aborts the fold (DG-1 table). |
 | `write` | Buffer only; committed by `flush`/`fsync`/`release`. |
 | `mkdir` | Creates an empty directory. Does **not** create intermediates: `mkdir a/b/c` is `ENOENT` when `a/b` is absent. `EEXIST` when the name exists. (The mount does not inherit `WyrdNode::put_file`'s intermediate-creation convenience.) |
 | `unlink` | Removes a file or symlink entry; `EISDIR` on a directory; `ENOENT` when absent. |
@@ -902,6 +915,11 @@ Each row locks a decided invariant.
   succeeds and binds the just-committed identity, A's handle is
   terminal `EIO`. If the fold cannot be authored the open fails
   (`EIO`/`ESTALE`) with nothing committed.
+- **Fold refused create**: A holds a dirty buffer on `P`;
+  `create(P, O_CREAT|O_EXCL)` → `EEXIST`. The refusal is a failed
+  member that never forces: nothing commits, A still buffers and
+  commits later. A pre-submit refusal likewise submits and forces
+  nothing.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.

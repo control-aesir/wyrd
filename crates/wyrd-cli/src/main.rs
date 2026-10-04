@@ -481,13 +481,21 @@ pub(crate) enum CliError {
     /// failure; the stdout lines still carry the pass and pending
     /// counts for forensics.
     #[error(
-        "sync unverified: mailbox degraded ({connected} of {total} relays connected, {closed} subscriptions closed by relay)"
+        "sync unverified: mailbox degraded ({connected} of {total} relays connected, {closed} subscriptions closed by relay, {recoveries} recovery episodes during the run)"
     )]
     Unverified {
         connected: usize,
         total: usize,
         closed: u64,
+        recoveries: u64,
     },
+    /// No mailbox snapshot was ever recorded on the report. Unreachable
+    /// in production (`sync_now` always stores the observed snapshot),
+    /// and it exists so that any future path that renders or maps a
+    /// report without observing the mailbox fails closed instead of
+    /// inheriting a fabricated posture.
+    #[error("sync unverified: mailbox posture was never recorded")]
+    Unobserved,
     #[error("macOS FUSE preflight failed: {0}")]
     #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
@@ -1451,36 +1459,54 @@ struct SyncRunReport {
     unfetchable_heads: usize,
     /// Mailbox posture the stopping verdict rests on. `drive_quiet`
     /// is generic over the mailbox and cannot observe it, so it
-    /// leaves the fixture value below and `sync_now` overwrites it
-    /// with the observed snapshot before rendering or mapping the
-    /// outcome.
-    mailbox: MailboxHealth,
+    /// leaves `None` and `sync_now` stores the observed snapshot
+    /// before rendering or mapping the outcome. `None` means "not
+    /// observed", never "healthy": both consumers fail it closed,
+    /// so a future path that forgets the snapshot inherits an
+    /// unverified run, not a fabricated success.
+    mailbox: Option<MailboxHealth>,
 }
 
-/// Test-fixture mailbox posture: no mailbox ran, so there is no
-/// intake to distrust. Healthy by construction, so unit runs over
-/// fake mailboxes render the success they converged to; `sync_now`
-/// always overwrites this with the observed snapshot.
-fn fixture_mailbox() -> MailboxHealth {
-    MailboxHealth {
-        stream_alive: true,
-        connected_relays: 0,
-        total_relays: 0,
-        saturation_recoveries: 0,
-        supervisor_ticks: 0,
-        stream_recovery_attempts: 0,
-        relay_recovery_attempts: 0,
-        closed_subscriptions: 0,
-    }
-}
-
-/// True when no stopping verdict can rest on this snapshot: intake
-/// is down (no relay connected) or was blind part of the run (a
-/// relay closed our subscription, which never heals without
-/// operator action). Mirrors the drainer's own contract: live with
-/// a non-zero close count is attached but blind.
+/// True when no stopping verdict can rest on this snapshot. A
+/// relay-less (offline) snapshot is never degraded: idle intake is
+/// the explicit request there, so there is nothing to distrust —
+/// `mailbox_line` reports the same case as idle, and the agreement
+/// test pins the two together. This early return is explicit on
+/// purpose: it must not lean on `is_live`'s zero-relay special
+/// case, or tightening that predicate would turn `--offline` into
+/// a self-contradicting idle-line-plus-exit-2 report. Otherwise the
+/// verdict covers the whole run, not just the terminal sample: a
+/// down intake (no relay connected), a blind stretch that never
+/// healed (a relay closed our subscription, which takes no
+/// resubscribe without operator action), or a blind stretch that
+/// did (a non-zero recovery-attempt total proves a supervisor
+/// episode ran during this run — the counters start at zero per
+/// mailbox and episodes only spawn after a sustained outage, so
+/// they cannot be stale). A recovered run may in fact have
+/// converged, but the quiet verdict may have been reached through
+/// the blind window; failing it as unverified is the conservative
+/// direction for a convergence-verdict command, and the error names
+/// the episodes so the operator knows a rerun settles it.
+/// Saturation replays deliberately do not count: a replay
+/// re-requests and redelivers through dedupe, so post-replay
+/// intake is whole again.
 fn mailbox_degraded(health: &MailboxHealth) -> bool {
-    !health.is_live() || health.closed_subscriptions > 0
+    if health.total_relays == 0 {
+        return false;
+    }
+    !health.is_live()
+        || health.closed_subscriptions > 0
+        || health.stream_recovery_attempts > 0
+        || health.relay_recovery_attempts > 0
+}
+
+/// Recovery episodes over the run, both kinds: a stream death or a
+/// relay outage each leaves intake blind until its episode
+/// converges, so the run-level verdict counts either.
+fn recovery_episodes(health: &MailboxHealth) -> u64 {
+    health
+        .stream_recovery_attempts
+        .saturating_add(health.relay_recovery_attempts)
 }
 
 /// Drive bounded sync passes until the first settled-quiet pass,
@@ -1526,7 +1552,7 @@ where
         outcome: RunOutcome::Quiet,
         pending: 0,
         unfetchable_heads: 0,
-        mailbox: fixture_mailbox(),
+        mailbox: None,
     };
     // Consecutive zero-progress passes with pending heads and an
     // empty outbox: the first is grace, the second stops the run.
@@ -1678,7 +1704,7 @@ fn sync_status_render(status: &SyncStatus) -> String {
         classes.rejected,
     ));
     if status.mailbox.configured_relays == 0 {
-        out.push_str("mailbox: idle (no --relay given)\n");
+        out.push_str(MAILBOX_IDLE_LINE);
     } else {
         out.push_str(&format!(
             "mailbox: {} relays configured (liveness visible on sync now or mount)\n",
@@ -1688,18 +1714,26 @@ fn sync_status_render(status: &SyncStatus) -> String {
     out
 }
 
+/// The relay-less mailbox posture, shared by the status and now
+/// surfaces so the two cannot drift apart.
+const MAILBOX_IDLE_LINE: &str = "mailbox: idle (no --relay given)\n";
+
 /// Render the mailbox posture line. Built as a string so tests
 /// assert the rendering without capturing stdout. An explicitly
 /// relay-less run reads idle, never live: with no relays there is
 /// no attachment to be alive, and `is_live` over zero relays would
-/// claim otherwise.
+/// claim otherwise. The verdict word is the run-level one from
+/// `mailbox_degraded`, so it always agrees with the exit status; a
+/// run that recovered mid-run reads degraded with the episodes
+/// named, never a bare live that the exit contradicts.
 fn mailbox_line(health: &MailboxHealth) -> String {
     if health.total_relays == 0 {
-        return "mailbox: idle (no --relay given)\n".to_owned();
+        return MAILBOX_IDLE_LINE.to_owned();
     }
     let closed = health.closed_subscriptions;
+    let episodes = recovery_episodes(health);
     format!(
-        "mailbox: {} ({} of {} relays connected{})\n",
+        "mailbox: {} ({} of {} relays connected{}{})\n",
         if mailbox_degraded(health) {
             "degraded"
         } else {
@@ -1715,7 +1749,35 @@ fn mailbox_line(health: &MailboxHealth) -> String {
                 if closed == 1 { "" } else { "s" }
             )
         },
+        if episodes == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {episodes} recovery attempt{} during the run",
+                if episodes == 1 { "" } else { "s" }
+            )
+        },
     )
+}
+
+/// Name the degraded cause for the report lines: the current
+/// posture when it is down or blind, the mid-run recovery when the
+/// mailbox is attached now but ran blind earlier, and the missing
+/// observation when there is none. The mid-run arm is why the
+/// report can say "recovered" while the mailbox line says "live":
+/// both describe the same snapshot from their own angle.
+fn degraded_reason(mailbox: Option<MailboxHealth>) -> String {
+    match mailbox {
+        None => "mailbox unobserved".to_owned(),
+        Some(health) => {
+            let episodes = recovery_episodes(&health);
+            if health.closed_subscriptions > 0 || !health.is_live() || episodes == 0 {
+                "mailbox degraded".to_owned()
+            } else {
+                format!("mailbox recovered mid-run ({episodes} recovery attempts)")
+            }
+        }
+    }
 }
 
 /// Render a headless run report. Built as a string so tests assert
@@ -1737,22 +1799,43 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         report.unfetchable_heads,
     );
     match report.outcome {
-        // A degraded mailbox downgrades both quiet verdicts: the
-        // local state converged, but intake may have missed mail, so
-        // the run stopped instead of completing. The `stopped` prefix
-        // matches the pass-limit line — both exit non-zero.
-        RunOutcome::Quiet if mailbox_degraded(&report.mailbox) => {
-            out.push_str("stopped: quiet locally, mailbox degraded, convergence unverified\n")
-        }
-        RunOutcome::Quiet => out.push_str("completed: quiet\n"),
-        RunOutcome::RemoteStalled if mailbox_degraded(&report.mailbox) => out.push_str(&format!(
-            "stopped: quiet locally with {} unfetchable heads (known but not local), mailbox degraded, convergence unverified\n",
-            report.unfetchable_heads,
-        )),
-        RunOutcome::RemoteStalled => out.push_str(&format!(
-            "completed: quiet with {} unfetchable heads (known but not local)\n",
-            report.unfetchable_heads,
-        )),
+        // A degraded or unobserved mailbox downgrades both quiet
+        // verdicts: the local state converged, but intake may have
+        // missed mail, so the run stopped instead of completing.
+        // The `stopped` prefix matches the pass-limit line — all
+        // three exit non-zero. An offline completion keeps its
+        // success but names its limits: it fetched nothing, so an
+        // operator tailing only the last line sees the scope.
+        RunOutcome::Quiet => match report.mailbox {
+            Some(health) if !mailbox_degraded(&health) => {
+                out.push_str("completed: quiet");
+                if health.total_relays == 0 {
+                    out.push_str(" (offline run: local obligations only)");
+                }
+                out.push('\n');
+            }
+            _ => out.push_str(&format!(
+                "stopped: quiet locally, {}, convergence unverified\n",
+                degraded_reason(report.mailbox),
+            )),
+        },
+        RunOutcome::RemoteStalled => match report.mailbox {
+            Some(health) if !mailbox_degraded(&health) => {
+                out.push_str(&format!(
+                    "completed: quiet with {} unfetchable heads (known but not local)",
+                    report.unfetchable_heads,
+                ));
+                if health.total_relays == 0 {
+                    out.push_str(" (offline run: local obligations only)");
+                }
+                out.push('\n');
+            }
+            _ => out.push_str(&format!(
+                "stopped: quiet locally with {} unfetchable heads (known but not local), {}, convergence unverified\n",
+                report.unfetchable_heads,
+                degraded_reason(report.mailbox),
+            )),
+        },
         RunOutcome::PassLimit => {
             out.push_str(&format!(
                 "stopped: pass limit ({MAX_SYNC_NOW_PASSES}) reached; sync may be incomplete"
@@ -1761,8 +1844,8 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             // keeps obligations pending forever, so the run never
             // reaches quiet. Name it here, not just in the stderr
             // error, so the stdout forensics show the cause.
-            if mailbox_degraded(&report.mailbox) {
-                out.push_str("; mailbox degraded, convergence unverified");
+            if !matches!(report.mailbox, Some(health) if !mailbox_degraded(&health)) {
+                out.push_str(&format!("; {}, convergence unverified", degraded_reason(report.mailbox)));
             }
             out.push('\n');
         }
@@ -1773,19 +1856,25 @@ fn sync_now_render(report: &SyncRunReport) -> String {
 /// Map a headless run outcome to the process result: quiet and
 /// remote-stalled succeed (the latter has nothing local left to
 /// do), a capped run fails as incomplete with its pass and pending
-/// counts. A degraded mailbox fails first, whatever the outcome:
-/// `Quiet` and `RemoteStalled` both rest on intake having observed
-/// an empty world, which a blind mailbox cannot prove, and the cap
-/// trip may itself be the dead mailbox keeping obligations
-/// pending — rerunning without operator action cannot converge, so
-/// the error names the mailbox, not the pass count. Tested
-/// directly; `sync_now` channels through it.
+/// counts. An unobserved mailbox fails as unobserved, and a degraded
+/// one fails as unverified, whatever the outcome: `Quiet` and
+/// `RemoteStalled` both rest on intake having observed an empty
+/// world, which a blind mailbox cannot prove, and the cap trip may
+/// itself be the dead mailbox keeping obligations pending —
+/// rerunning without operator action cannot converge, so the error
+/// names the mailbox, not the pass count. Tested directly;
+/// `sync_now` channels through it.
 fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
-    if mailbox_degraded(&report.mailbox) {
+    let mailbox = match report.mailbox {
+        None => return Err(CliError::Unobserved),
+        Some(health) => health,
+    };
+    if mailbox_degraded(&mailbox) {
         return Err(CliError::Unverified {
-            connected: report.mailbox.connected_relays,
-            total: report.mailbox.total_relays,
-            closed: report.mailbox.closed_subscriptions,
+            connected: mailbox.connected_relays,
+            total: mailbox.total_relays,
+            closed: mailbox.closed_subscriptions,
+            recoveries: recovery_episodes(&mailbox),
         });
     }
     match report.outcome {
@@ -1910,7 +1999,7 @@ fn sync_now(
     drop(bulk);
     drop(live);
     let mut report = report?;
-    report.mailbox = health;
+    report.mailbox = Some(health);
     print!("{}", sync_now_render(&report));
     let outcome = run_outcome_error(&report);
     combine_status(TeardownStatus {

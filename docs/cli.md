@@ -277,7 +277,10 @@ sync now
       relay-closed subscription degrades the verdict even when every
       relay is connected; a degraded mailbox fails the run as
       unverified, whatever the local state — quiet observed through
-      a blind intake is never reported as converged)
+      a blind intake is never reported as converged, including a
+      blind stretch that healed mid-run: the lifetime
+      recovery-attempt counters prove an episode ran, so the quiet
+      verdict may predate the healing)
     = either converges or explicitly reports incomplete
 ```
 
@@ -317,9 +320,10 @@ sync now
    the exit status, when that distinction matters. With a degraded
    mailbox the same stop exits non-zero as unverified instead: the
    empty outbox was observed through a blind intake, so "nothing
-   left to do" is unproven. Stalled is a verdict about observed
-   emptiness, not about reachability — an unreachable relay never
-   earns the quiet exit.
+   left to do" is unproven — including an intake that went blind
+   and recovered, which reads degraded with its episode count, not
+   live. Stalled is a verdict about observed emptiness, not about
+   reachability — an unreachable relay never earns the quiet exit.
   Quiet is never trusted on first sight: relay delivery races the
   first drain, so a quiet verdict parks a short settle window
   (arrival short-circuits it) and confirms with a second pass.
@@ -335,7 +339,9 @@ sync now
    converged sync. With `--offline`, intake stays idle: `now`
    discharges local obligations and fetches nothing new. The mailbox
    line reads `idle (no --relay given)` there — an explicitly offline
-   run claims neither liveness nor degradation. `--offline`
+   run claims neither liveness nor degradation — and the completion
+   line reads `completed: quiet (offline run: local obligations
+   only)`, so the last line states the scope it converged. `--offline`
    cannot be combined with `--relay`.
 
 Route-less authoring is intentional, not an omission: `now` binds

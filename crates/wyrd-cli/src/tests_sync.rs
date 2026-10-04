@@ -448,6 +448,126 @@ fn headless_loop_trips_the_cap_on_permanent_send_failure() {
     assert!(rendered.contains("may be incomplete"), "{rendered}");
 }
 
+/// A mailbox snapshot no stopping verdict can rest on: the relay
+/// is unreachable, so intake may have missed mail the whole run.
+/// Closed count stays zero here; the disconnect alone is enough.
+fn blind_mailbox() -> MailboxHealth {
+    MailboxHealth {
+        stream_alive: true,
+        connected_relays: 0,
+        total_relays: 1,
+        saturation_recoveries: 0,
+        supervisor_ticks: 0,
+        stream_recovery_attempts: 0,
+        relay_recovery_attempts: 0,
+        closed_subscriptions: 0,
+    }
+}
+
+/// One report builder so the outcome-mapping tests differ only in
+/// what they vary: the stopping outcome and the mailbox posture.
+fn report_with(outcome: RunOutcome, mailbox: MailboxHealth) -> SyncRunReport {
+    SyncRunReport {
+        passes: 3,
+        accepted: 0,
+        duplicates: 0,
+        deferred: 0,
+        skipped: 0,
+        discarded: 0,
+        manifests: 0,
+        snapshot_bodies: 0,
+        objects: 0,
+        unfulfilled: 0,
+        outcome,
+        pending: 0,
+        unfetchable_heads: 0,
+        mailbox,
+    }
+}
+
+/// A degraded mailbox fails the run even when the local state
+/// converged: quiet was observed through a blind intake, so the
+/// verdict is unverified, never success. The blind mailbox outranks
+/// the cap too: rerunning without operator action cannot converge,
+/// so the error names the mailbox, not the pass count.
+#[test]
+fn degraded_mailbox_fails_every_outcome_as_unverified() {
+    for outcome in [
+        RunOutcome::Quiet,
+        RunOutcome::RemoteStalled,
+        RunOutcome::PassLimit,
+    ] {
+        let report = report_with(outcome, blind_mailbox());
+        let error = run_outcome_error(&report).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CliError::Unverified {
+                    connected: 0,
+                    total: 1,
+                    closed: 0
+                }
+            ),
+            "a blind mailbox fails {outcome:?} as unverified, got: {error}"
+        );
+        let rendered = sync_now_render(&report);
+        assert!(
+            !rendered.contains("completed:"),
+            "an unverified run never claims completion: {rendered}"
+        );
+        assert!(
+            rendered.contains("unverified"),
+            "the report says what the verdict lacks: {rendered}"
+        );
+    }
+    // A relay-closed subscription degrades at full connection: the
+    // socket is up while intake is dead, so the verdict is blind.
+    let mut closed = blind_mailbox();
+    closed.connected_relays = 1;
+    closed.closed_subscriptions = 1;
+    let error = run_outcome_error(&report_with(RunOutcome::Quiet, closed)).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CliError::Unverified {
+                connected: 1,
+                total: 1,
+                closed: 1
+            }
+        ),
+        "a closed subscription fails quiet as unverified, got: {error}"
+    );
+}
+
+/// The mailbox line reads posture, never connection alone: an
+/// explicitly offline run is idle (neither live nor degraded), a
+/// connected run with no closures is live, and anything else names
+/// the symptom.
+#[test]
+fn mailbox_line_reads_posture_not_connection() {
+    assert_eq!(
+        mailbox_line(&fixture_mailbox()),
+        "mailbox: idle (no --relay given)\n"
+    );
+    let mut live = blind_mailbox();
+    live.connected_relays = 1;
+    assert_eq!(
+        mailbox_line(&live),
+        "mailbox: live (1 of 1 relays connected)\n"
+    );
+    assert_eq!(
+        mailbox_line(&blind_mailbox()),
+        "mailbox: degraded (0 of 1 relays connected)\n"
+    );
+    let mut closed = blind_mailbox();
+    closed.connected_relays = 1;
+    closed.closed_subscriptions = 2;
+    assert_eq!(
+        mailbox_line(&closed),
+        "mailbox: degraded (1 of 1 relays connected, 2 subscriptions closed by relay)\n"
+    );
+}
+
 /// The outcome maps to the process result: quiet succeeds, a capped
 /// run fails as incomplete with its pass and pending counts.
 #[test]
@@ -466,6 +586,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         outcome: RunOutcome::Quiet,
         pending: 0,
         unfetchable_heads: 0,
+        mailbox: fixture_mailbox(),
     };
     assert!(run_outcome_error(&quiet).is_ok());
     let stalled = SyncRunReport {
@@ -482,6 +603,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         outcome: RunOutcome::RemoteStalled,
         pending: 0,
         unfetchable_heads: 1,
+        mailbox: fixture_mailbox(),
     };
     assert!(run_outcome_error(&stalled).is_ok());
     let capped = SyncRunReport {
@@ -498,6 +620,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         outcome: RunOutcome::PassLimit,
         pending: 4,
         unfetchable_heads: 0,
+        mailbox: fixture_mailbox(),
     };
     let error = run_outcome_error(&capped).unwrap_err();
     assert!(

@@ -15,7 +15,7 @@ use crate::probes::TeardownStatus;
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
-use wyrd_core::mailbox::LiveMailbox;
+use wyrd_core::mailbox::{LiveMailbox, MailboxHealth};
 use wyrd_core::policy::{
     evict_subtree, pin_subtree, residency_census, unpin_subtree, LocalPresence, ResidencyCensus,
     RetentionPolicy,
@@ -473,6 +473,21 @@ pub(crate) enum CliError {
     /// converged device. Exits non-zero like any other failure.
     #[error("sync incomplete: pass limit ({passes}) reached with {pending} obligations pending")]
     Incomplete { passes: u32, pending: usize },
+    /// A run that stopped on a quiet local state while the mailbox
+    /// could not prove intake worked: no relay connected, or a relay
+    /// closed our subscription mid-run. Quiet observed through a
+    /// blind intake is unverified, never converged — automation must
+    /// not mistake it for success. Exits non-zero like any other
+    /// failure; the stdout lines still carry the pass and pending
+    /// counts for forensics.
+    #[error(
+        "sync unverified: mailbox degraded ({connected} of {total} relays connected, {closed} subscriptions closed by relay)"
+    )]
+    Unverified {
+        connected: usize,
+        total: usize,
+        closed: u64,
+    },
     #[error("macOS FUSE preflight failed: {0}")]
     #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
@@ -1402,8 +1417,11 @@ enum RunOutcome {
     /// A pass left no actionable work.
     Quiet,
     /// The outbox is empty but known heads are not locally
-    /// closable. Exits 0: locally there is nothing more to do, so
-    /// a non-zero exit would only invite pointless retries.
+    /// closable. Exits 0 with a healthy mailbox: locally there is
+    /// nothing more to do, so a non-zero exit would only invite
+    /// pointless retries. A degraded mailbox fails as unverified
+    /// instead — the empty outbox was observed through a blind
+    /// intake, so "nothing left to do" is unproven.
     RemoteStalled,
     /// The pass cap tripped with obligations still pending.
     PassLimit,
@@ -1431,6 +1449,38 @@ struct SyncRunReport {
     /// remote condition (no route, no bytes, no capability yet),
     /// never local work. Reported, never spun on.
     unfetchable_heads: usize,
+    /// Mailbox posture the stopping verdict rests on. `drive_quiet`
+    /// is generic over the mailbox and cannot observe it, so it
+    /// leaves the fixture value below and `sync_now` overwrites it
+    /// with the observed snapshot before rendering or mapping the
+    /// outcome.
+    mailbox: MailboxHealth,
+}
+
+/// Test-fixture mailbox posture: no mailbox ran, so there is no
+/// intake to distrust. Healthy by construction, so unit runs over
+/// fake mailboxes render the success they converged to; `sync_now`
+/// always overwrites this with the observed snapshot.
+fn fixture_mailbox() -> MailboxHealth {
+    MailboxHealth {
+        stream_alive: true,
+        connected_relays: 0,
+        total_relays: 0,
+        saturation_recoveries: 0,
+        supervisor_ticks: 0,
+        stream_recovery_attempts: 0,
+        relay_recovery_attempts: 0,
+        closed_subscriptions: 0,
+    }
+}
+
+/// True when no stopping verdict can rest on this snapshot: intake
+/// is down (no relay connected) or was blind part of the run (a
+/// relay closed our subscription, which never heals without
+/// operator action). Mirrors the drainer's own contract: live with
+/// a non-zero close count is attached but blind.
+fn mailbox_degraded(health: &MailboxHealth) -> bool {
+    !health.is_live() || health.closed_subscriptions > 0
 }
 
 /// Drive bounded sync passes until the first settled-quiet pass,
@@ -1476,6 +1526,7 @@ where
         outcome: RunOutcome::Quiet,
         pending: 0,
         unfetchable_heads: 0,
+        mailbox: fixture_mailbox(),
     };
     // Consecutive zero-progress passes with pending heads and an
     // empty outbox: the first is grace, the second stops the run.
@@ -1637,6 +1688,36 @@ fn sync_status_render(status: &SyncStatus) -> String {
     out
 }
 
+/// Render the mailbox posture line. Built as a string so tests
+/// assert the rendering without capturing stdout. An explicitly
+/// relay-less run reads idle, never live: with no relays there is
+/// no attachment to be alive, and `is_live` over zero relays would
+/// claim otherwise.
+fn mailbox_line(health: &MailboxHealth) -> String {
+    if health.total_relays == 0 {
+        return "mailbox: idle (no --relay given)\n".to_owned();
+    }
+    let closed = health.closed_subscriptions;
+    format!(
+        "mailbox: {} ({} of {} relays connected{})\n",
+        if mailbox_degraded(health) {
+            "degraded"
+        } else {
+            "live"
+        },
+        health.connected_relays,
+        health.total_relays,
+        if closed == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {closed} subscription{} closed by relay",
+                if closed == 1 { "" } else { "s" }
+            )
+        },
+    )
+}
+
 /// Render a headless run report. Built as a string so tests assert
 /// the rendering without capturing stdout.
 fn sync_now_render(report: &SyncRunReport) -> String {
@@ -1656,14 +1737,35 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         report.unfetchable_heads,
     );
     match report.outcome {
+        // A degraded mailbox downgrades both quiet verdicts: the
+        // local state converged, but intake may have missed mail, so
+        // the run stopped instead of completing. The `stopped` prefix
+        // matches the pass-limit line — both exit non-zero.
+        RunOutcome::Quiet if mailbox_degraded(&report.mailbox) => {
+            out.push_str("stopped: quiet locally, mailbox degraded, convergence unverified\n")
+        }
         RunOutcome::Quiet => out.push_str("completed: quiet\n"),
+        RunOutcome::RemoteStalled if mailbox_degraded(&report.mailbox) => out.push_str(&format!(
+            "stopped: quiet locally with {} unfetchable heads (known but not local), mailbox degraded, convergence unverified\n",
+            report.unfetchable_heads,
+        )),
         RunOutcome::RemoteStalled => out.push_str(&format!(
             "completed: quiet with {} unfetchable heads (known but not local)\n",
             report.unfetchable_heads,
         )),
-        RunOutcome::PassLimit => out.push_str(&format!(
-            "stopped: pass limit ({MAX_SYNC_NOW_PASSES}) reached; sync may be incomplete\n"
-        )),
+        RunOutcome::PassLimit => {
+            out.push_str(&format!(
+                "stopped: pass limit ({MAX_SYNC_NOW_PASSES}) reached; sync may be incomplete"
+            ));
+            // A blind mailbox may be why the cap tripped: refusal
+            // keeps obligations pending forever, so the run never
+            // reaches quiet. Name it here, not just in the stderr
+            // error, so the stdout forensics show the cause.
+            if mailbox_degraded(&report.mailbox) {
+                out.push_str("; mailbox degraded, convergence unverified");
+            }
+            out.push('\n');
+        }
     }
     out
 }
@@ -1671,8 +1773,21 @@ fn sync_now_render(report: &SyncRunReport) -> String {
 /// Map a headless run outcome to the process result: quiet and
 /// remote-stalled succeed (the latter has nothing local left to
 /// do), a capped run fails as incomplete with its pass and pending
-/// counts. Tested directly; `sync_now` channels through it.
+/// counts. A degraded mailbox fails first, whatever the outcome:
+/// `Quiet` and `RemoteStalled` both rest on intake having observed
+/// an empty world, which a blind mailbox cannot prove, and the cap
+/// trip may itself be the dead mailbox keeping obligations
+/// pending — rerunning without operator action cannot converge, so
+/// the error names the mailbox, not the pass count. Tested
+/// directly; `sync_now` channels through it.
 fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
+    if mailbox_degraded(&report.mailbox) {
+        return Err(CliError::Unverified {
+            connected: report.mailbox.connected_relays,
+            total: report.mailbox.total_relays,
+            closed: report.mailbox.closed_subscriptions,
+        });
+    }
     match report.outcome {
         RunOutcome::Quiet | RunOutcome::RemoteStalled => Ok(()),
         RunOutcome::PassLimit => Err(CliError::Incomplete {
@@ -1778,27 +1893,11 @@ fn sync_now(
     // closure count degrades the verdict even when every relay is
     // connected — this summary is the only human surface on the
     // headless path, and sync_now installs no tracing subscriber for
-    // the drainer's warn to reach.
+    // the drainer's warn to reach. The snapshot also travels in the
+    // report, so the exit path judges the same posture the line
+    // shows — a blind mailbox never exits as converged.
     let health = mailbox.health();
-    let closed = health.closed_subscriptions;
-    println!(
-        "mailbox: {} ({} of {} relays connected{})",
-        if health.is_live() && closed == 0 {
-            "live"
-        } else {
-            "degraded"
-        },
-        health.connected_relays,
-        health.total_relays,
-        if closed == 0 {
-            String::new()
-        } else {
-            format!(
-                ", {closed} subscription{} closed by relay",
-                if closed == 1 { "" } else { "s" }
-            )
-        },
-    );
+    print!("{}", mailbox_line(&health));
     // Teardown mirrors mount's transport shutdown in miniature: stop
     // the mailbox tasks under a bounded deadline, then close bulk.
     // A sync failure still tears transport down before returning it.
@@ -1810,7 +1909,8 @@ fn sync_now(
         .map_err(CliError::Bulk);
     drop(bulk);
     drop(live);
-    let report = report?;
+    let mut report = report?;
+    report.mailbox = health;
     print!("{}", sync_now_render(&report));
     let outcome = run_outcome_error(&report);
     combine_status(TeardownStatus {

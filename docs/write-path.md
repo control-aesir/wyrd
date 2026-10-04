@@ -106,7 +106,8 @@ announceable?                  (only ever yes past serving residency)
 | Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
 | No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
 | `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
-| Refused `create` | A refusal decided before submit submits nothing and forces nothing | A precondition that fails during fold application is a failed member and never forces (rule 6) | 0 | Unchanged; a failed forcer aborts the fold with nothing committed |
+| Refused `create` (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; A untouched |
+| Refused `create` (precondition fails during application) | Failed member; never forces and never displaces earlier members | Failed forcer aborts the fold with nothing committed (rule 6) | 0 | Unchanged; A untouched |
 | Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
 | Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
 | Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
@@ -134,9 +135,13 @@ Rules:
    forcing event carries privilege — `fsync`/`fdatasync`, `flush` on
    a dirty handle, `O_SYNC` write, effective namespace op,
    dirty-handle `release`, `create`/`O_TRUNC`-open, and the explicit
-   checkpoint all carry it — so an explicit durability call never
-   loses its own bytes to an earlier-buffered member; the earlier
-   member goes terminal instead. A truncating `open` therefore keeps
+   checkpoint all carry it — but only a forcing member that survives
+   its own preconditions carries it: a member's own namespace
+   preconditions are evaluated before the tie-break, so a refused
+   `create` never displaces an earlier-buffered member and leaves it
+   untouched. An explicit durability call that survives never loses
+   its own bytes to an earlier-buffered member; the earlier member
+   goes terminal instead. A truncating `open` therefore keeps
    today's commit outcome with earlier loss: the truncate wins its
    path tie and any dirty handle on that path goes terminal `EIO`
    at the fold — where today it would keep buffering and only go
@@ -185,9 +190,9 @@ Rules:
    violation. The `Working | Committed | Published` labels are
    descriptive here; DG-2 owns the level encoding and API contract.
 6. **Fold failures are per member, except the fold-fatal classes.**
-   Surviving members still commit into the one snapshot; each failed
-   member reports its own errno to its own waiter and its handle goes
-   terminal. The forcing caller receives the errno of its own member
+   When the forcing member survives, surviving members still commit
+   into the one snapshot; each failed member reports its own errno
+   to its own waiter and its handle goes terminal. The forcing caller receives the errno of its own member
    — an `O_SYNC` write is never failed by an unrelated member's
    staleness, and a namespace op reports only its own outcome. At
    shutdown/`destroy` the same rule holds best-effort per path:
@@ -206,9 +211,12 @@ Rules:
    no empty snapshot, no dangling announcement obligation.
    Fold-fatal (whole-fold, unattributable to one member):
    `ConflictedHeads` (refuses the entire fold, nothing commits);
-   store, authoring, or fact-commit failure; and the pre-commit
+   store, authoring, or fact-commit failure; the pre-commit
    retained-bytes quota, which under folding covers the aggregate of
-   the whole pending set before the commit's first write.
+   the whole pending set before the commit's first write; and a
+   failed forcing member (the fold aborts with nothing committed —
+   a failed syscall never makes another member's pending bytes
+   durable).
    Post-durable stage failures (publication, serving residency) are
    likewise not member-attributable: the commit already succeeded, so
    monotonicity fixes the outcome and the caller learns nothing.
@@ -915,11 +923,17 @@ Each row locks a decided invariant.
   succeeds and binds the just-committed identity, A's handle is
   terminal `EIO`. If the fold cannot be authored the open fails
   (`EIO`/`ESTALE`) with nothing committed.
-- **Fold refused create**: A holds a dirty buffer on `P`;
+- **Fold refused create (same path)**: A holds a dirty buffer on `P`;
   `create(P, O_CREAT|O_EXCL)` → `EEXIST`. The refusal is a failed
-  member that never forces: nothing commits, A still buffers and
-  commits later. A pre-submit refusal likewise submits and forces
-  nothing.
+  member that never forces and never displaces A: nothing commits, A
+  still buffers and commits later.
+- **Fold refused create (different path)**: A holds a dirty buffer on
+  `P`; `create(Q, O_CREAT|O_EXCL)` → `EEXIST` on another path. The
+  forcer fails while A's member survives, so A's pending bytes commit
+  into the one snapshot — extra durability from a failed syscall,
+  covered by rule 6's failed-member path.
+- **Pre-submit refusal**: submits nothing and forces nothing, on any
+  path, whether or not other handles hold pending data.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.

@@ -254,12 +254,20 @@ delivery is relay-accepted, not recipient-received: the outbox
 commits a `Delivered` fact only when at least one relay accepted the
 write (`SendReport`, normative in `docs/sync-and-peers.md`), and a
 send no relay accepts leaves the obligation pending for a later pass
-instead of retiring it. The remaining hole is relay retention: a
+instead of retiring it. Relay acceptance is not evidence of relay
+storage: a relay that acknowledges a write and discards it is
+indistinguishable from delivery, on the sender and on the
+recipient. The remaining hole is relay retention: a
 peer absent past retention finds no event to fetch, and v0.2
 provides no re-push or pull path for control messages never
 received
 (triage: nostr:nevent1qqs26a0kqnfm72p8l5c3sw2hr4mxf97r4nszm0zm7ekh7facn3h0j7gpz9mhxue69uhkwunpwdczuap49eehgrh0ugr).
-Admitting
+Removal bounds acquisition, not knowledge: a removed device keeps
+its local plaintext, and can keep fetching any content whose
+transport root it learned before removal, from any serving member
+that still answers. It learns no new roots — announcements bound
+to epochs after its removal are sealed under keys it never
+receives. Admitting
 a device walks the live epoch chain's ancestry and commits one
 announcement obligation per closure member in the single admission
 batch — O(recorded history) allocation and commit in one call, with

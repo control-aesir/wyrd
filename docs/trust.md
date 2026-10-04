@@ -870,7 +870,12 @@ A serving consequence follows from T17: a member who can name a
 Authorization = membership, object admission = content verification;
 there are no per-object ACLs in v0. This is an availability and
 enumeration property, not a confidentiality break: a member already
-holds the epoch material that makes the ciphertext meaningful.
+holds the epoch material that makes the ciphertext meaningful. The
+same consequence extends to a removed device: revocation ends
+acquisition of new-epoch material, not knowledge of what it already
+holds — a removed device that retained a transport root can keep
+fetching that content from any serving member that still answers
+(see `docs/cli.md`'s `remove` section).
 
 ### Vault-side metadata confidentiality (stated precisely)
 

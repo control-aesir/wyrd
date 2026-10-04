@@ -129,6 +129,10 @@ characters (x-only pubkeys).
 - `remove <device>`: author a removal transition. The removed device —
   member or reader — receives no new-epoch material; its acquisition
   ends at the removal boundary while its history stays valid.
+  Removal bounds acquisition, not knowledge: a removed device keeps
+  its local plaintext, and can keep fetching any content whose
+  transport root it learned before removal, from any serving member
+  that still answers. It learns no new roots.
   Removing the sole owner is valid but terminal — it empties the owner
   set and no future transition can be authorized — so it requires
   `--yes`. Like `rotate` and `set-owner` below, `remove` fails on a

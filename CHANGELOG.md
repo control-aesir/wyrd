@@ -19,6 +19,16 @@ alpha can change the format, the trust protocol, and the CLI: drives created
 by one alpha may not open under the next, and the release notes for each
 version say exactly what changed.
 
+## [Unreleased]
+
+### Added
+
+- Normative DG-1 mutation/commit boundary table in `docs/write-path.md`:
+  one snapshot per commit-forcing event (folding all pending), dirty-handle
+  release as a forcing event, namespace operations as folding forcing events,
+  no idle-window commit in v0.3. Decision only; no behavior change and no
+  format impact. Implementation is gated on this artefact.
+
 ## [0.2.0-alpha]
 
 ### Added

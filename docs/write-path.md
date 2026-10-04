@@ -51,7 +51,7 @@ write(fd, off, data)   ┌──► WritableHandle
                        │    ├── base snapshot + file identity
                        │    ├── buffered overlay
                        │    └── dirty
-                       │         │ flush / fsync / release
+                       │         │ forcing event (DG-1 table below)
 create/mkdir/rename ───┘         ▼
 truncate/unlink ...      bounded MutationQueue (FIFO, total order)
                                  │
@@ -65,6 +65,78 @@ truncate/unlink ...      bounded MutationQueue (FIFO, total order)
                               5 flush serving residency
                               6 discharge the announcement obligation
 ```
+
+## Mutation/commit boundary table (DG-1, normative)
+
+Decision OD-1 (`planning/v0.3/04-open-discussions.md`): coalescing
+policy **A, independent of the POSIX mutation unit, with dirty-handle
+release as a forcing event**. Given an arbitrary sequence of POSIX
+mutations, the system commits exactly one snapshot per commit-forcing
+event — not one per mutation — and the pending state between commits
+is never durable, never servable, and never announceable.
+
+```text
+POSIX operation sequence
+        ↓
+pending mutation set          (Working: volatile, memory-only;
+                               never durable, never servable, never announceable)
+        ↓
+commit-forcing event?         (the table below)
+        ↓
+snapshot boundary              (one snapshot per forcing event, folding all pending)
+        ↓
+durability level               (Working | Committed | Published — local axis only;
+                               the level encoding is owned by DG-2 and referenced here)
+        ↓
+servable?                      (only ever yes past the snapshot boundary + serving residency)
+        ↓
+announceable?                  (only ever yes past serving residency)
+```
+
+| Event | Pending empty | Pending non-empty | Snapshots | Yield |
+|---|---|---|---|---|
+| Buffered `write` / handle `truncate` / handle `set-exec` (non-`O_SYNC`) | Accumulate | Accumulate; never forces | 0 | Working |
+| `flush` / `fsync` / `fdatasync` on a **dirty** handle | n/a (this handle is the pending) | Fold all pending into one snapshot | 1 | Committed → Published via the pipeline |
+| `flush` / `fsync` on a **clean** handle | No-op; commits nothing | No-op for other handles' pending | 0 | Unchanged |
+| `release` / `close` of a **dirty** handle | n/a | Fold all pending into one snapshot, best-effort | 1 | Committed → Published; errors often discarded by callers |
+| `release` / `close` of a **clean** handle | No-op | No-op for other handles' pending | 0 | Unchanged |
+| `O_SYNC` / `O_DSYNC` `write` | Its own snapshot | Fold pending + this write into one snapshot, synchronously before return | 1 | Committed → Published |
+| Namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 1 | Committed → Published |
+| `create` / `O_TRUNC`-open | Its own snapshot (empty file / truncation) | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 1 | Committed → Published |
+| Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | Nothing to do | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
+| Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
+| Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
+
+Rules:
+
+1. **Fold, don't sequence.** A forcing event commits the whole pending
+   set plus itself as a single snapshot, not pending-as-one plus
+   self-as-another. `fsync` on one handle therefore makes other
+   handles' pending data durable too — extra durability, never less —
+   and serving/announcement of that data earlier than its own `fsync`
+   is safe by monotonicity.
+2. **Stale and conflict checks are per member, at commit, in
+   submission order.** Same-path concurrent edits fail closed for the
+   conflicting member (its handle goes terminal `EIO`); different-path
+   edits rebase onto the current head and still fold into the one
+   snapshot. More than one eligible live head refuses the whole fold
+   (`ConflictedHeads`); nothing commits.
+3. **`flush` ≡ `fsync` stays the reportable persistence point** and
+   `O_SYNC` stays commit-per-write; coalescing applies only to demand
+   that does not explicitly require synchronous durability. A clean
+   committing boundary still commits nothing.
+4. **No idle-window commit in v0.3.** A timer in the durability path
+   would be a silent post-timeout commit, contradicting the queue's
+   synchronous contract below and the monotonic-state rule, and
+   `storage-growth.md:220-225` forbids delaying a reported-durable
+   commit. Revisit only with explicit durability semantics.
+5. **Pending is Working, never more.** The pending set is volatile
+   memory: it populates no cache keyed on durable revision, appears
+   in no manifest, satisfies no serving request, and creates no
+   announcement obligation. A crash loses exactly the pending set;
+   that loss is the contract, not a violation. The `Working |
+   Committed | Published` labels are descriptive here; DG-2 owns the
+   level encoding and API contract.
 
 ## Writable handles
 
@@ -445,7 +517,9 @@ guarantee: there is no cached-but-not-durable commit state — the commit
 boundary *is* the durability boundary. They differ only in how
 applications observe the result: `flush` runs on every `close` and its
 error is frequently ignored, so `fsync` is the reportable persistence
-point. A committing boundary on a **clean** handle performs no snapshot.
+point. A committing boundary on a **clean** handle performs no snapshot
+and forces nothing else (DG-1 table). A forcing `flush`/`fsync` folds
+the whole pending set, not just the calling handle.
 
 Because `release` is best-effort and drops the buffer, an application
 that never calls `flush`/`fsync` can lose acknowledged writes. This is
@@ -469,10 +543,11 @@ mount the kernel releases every open file before destroy runs, so
 writes; `destroy` is the net for handles whose release-time commit
 failed.
 
-`O_SYNC`/`O_DSYNC` deliberately sacrifice write coalescing: because the
-unit of commit is the snapshot, each successful `write` on such a handle
-is its **own durable snapshot** (a committing boundary per syscall). That
-is expensive and correct by construction.
+`O_SYNC`/`O_DSYNC` never wait for a later boundary: each successful
+`write` on such a handle is durable before returning. Under DG-1 the
+write folds any pending set plus itself into one snapshot (a
+committing boundary per syscall, shared when other handles have
+pending data). That is expensive and correct by construction.
 
 ### Error timing
 
@@ -495,9 +570,10 @@ Write-time and commit-time failures are distinct surfaces:
 
 ## Namespace operations
 
-Each operation is one snapshot unless stated otherwise. `sqlite`-style
-multi-step tooling is unaffected: each committed state is a complete,
-valid filesystem.
+Snapshot boundaries are governed by the DG-1 table above: namespace
+operations are forcing events that fold pending plus self into one
+snapshot. `sqlite`-style multi-step tooling is unaffected: each
+committed state is a complete, valid filesystem.
 
 | Operation | Semantics (v0) |
 |---|---|
@@ -699,7 +775,8 @@ must not be implemented inside FUSE callbacks.
   file locks, `mmap` writes, or `O_DIRECT`.
 - No byte-range merging between handles: same-file stale handles fail
   (the append exception aside), and there is no three-way content merge.
-- No write coalescing across handles.
+- Write coalescing across handles follows the DG-1 boundary table
+  above (one snapshot per forcing event, folding all pending).
 - No automatic peer repair and no GC: superseded objects, manifests, and
   heads are retained append-only.
 - No cross-device moves.

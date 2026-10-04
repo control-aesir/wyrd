@@ -1,12 +1,9 @@
-# v0.2 SCOPE: distribution is out of scope for this milestone
-# (ROADMAP.md: "Explicitly do not ship ... release distribution").
-# Do NOT cut a v0.2 release: no tag, no `build --strict` release run,
-# no `ngit release publish`. The runbook below resumes with the v0.3
-# dogfood distribution track. (The CI half is enforced by `if: false`
-# on the dist.yml publishing job; this banner gates the human half.)
-#
 # Release manifest for `ngit release publish`: with this committed, a release
-# needs nothing but a version. Cutting one (the v0.1.0-alpha.1 lessons are
+# needs nothing but a version. Release flow is manual through v0.x
+# (see dist.yml header): cut the tag, let CI build the x86_64 leg,
+# fetch it from a mirror, build the rest locally, publish by hand,
+# and record the findings on the release issue for the next
+# automation pass. Cutting one (the v0.1.0-alpha.1 lessons are
 # baked into the steps; CI discipline lives in
 # docs/collaboration-workflow.md):
 #

@@ -3,7 +3,8 @@
 # (see dist.yml header): cut the tag, let CI build the x86_64 leg,
 # fetch it from a mirror, build the rest locally, publish by hand,
 # and record the findings on the release issue for the next
-# automation pass. Cutting one (the v0.1.0-alpha.1 lessons are
+# automation pass. Full checklist with v0.2.0-alpha findings:
+# docs/release-process.md. Cutting one (the v0.1.0-alpha.1 lessons are
 # baked into the steps; CI discipline lives in
 # docs/collaboration-workflow.md):
 #

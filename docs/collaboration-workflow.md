@@ -176,3 +176,12 @@ ngit ci trigger "$COORD" <ref> --workflow <file> --json
 ngit pr list --json --offline | python3 -c "..." # stash the PR id, then
 ngit merge $(cat /tmp/prid.txt) --json
 ```
+
+## 8. Releases
+
+Cutting a release follows the checklist and runbook in
+`docs/release-process.md` (version bump, changelog, fixture, gates,
+tag, multi-platform build, publish), plus the ngit, suite, and docs
+lessons recorded there from the v0.2.0-alpha cut. The `release:*`
+milestone on the release issue is the tracking spine; the v0.3
+umbrella carries the next cut.

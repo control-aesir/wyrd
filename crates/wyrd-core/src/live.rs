@@ -2455,7 +2455,7 @@ where
                 chunk: *chunk,
                 base: Self::pin_head(heads),
             },
-            FetchStatus::Unavailable | FetchStatus::Available | FetchStatus::Corrupt => {
+            FetchStatus::Unavailable(_) | FetchStatus::Available | FetchStatus::Corrupt => {
                 MutationError::Store(StoreFailure::Transient)
             }
         }

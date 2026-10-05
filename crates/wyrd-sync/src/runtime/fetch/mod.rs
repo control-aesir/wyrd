@@ -525,15 +525,21 @@ impl<T> FetchOutcome<T> {
     /// No production caller yet: the daemon composing sync with the
     /// FUSE view settles attempts through here once in-flight fetch
     /// tracking lands. Unit tests pin the contract until then.
+    ///
+    /// The generation is threaded in by the caller: one attempt has
+    /// no generation scope of its own, so the per-attempt projection
+    /// borrows the identity's current attempt number. Identity-level
+    /// terminality (whether every representation is exhausted) is
+    /// decided by the engine's terminal evaluation, not here.
     #[allow(dead_code)]
-    pub(super) fn settled(&self) -> FetchStatus {
+    pub(super) fn settled(&self, generation: u64) -> FetchStatus {
         match self {
             FetchOutcome::Fulfilled(_) => FetchStatus::Available,
             FetchOutcome::Missing
             | FetchOutcome::UnavailableKey
             | FetchOutcome::Transport
             | FetchOutcome::Deadline { .. }
-            | FetchOutcome::Store(_) => FetchStatus::Unavailable,
+            | FetchOutcome::Store(_) => FetchStatus::Unavailable(generation),
             FetchOutcome::Invalid | FetchOutcome::Local => FetchStatus::Corrupt,
         }
     }

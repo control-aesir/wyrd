@@ -291,7 +291,7 @@ fn unavailable_content_fails_cleanly() {
     let view = DriveView::new(
         store,
         FakeMaterialization::with(vec![
-            (missing_chunk, FetchStatus::Unavailable),
+            (missing_chunk, FetchStatus::Unavailable(2)),
             (corrupt_chunk, FetchStatus::Corrupt),
         ]),
         heads(vec![snapshot(root)]),
@@ -316,7 +316,7 @@ fn missing_tree_maps_through_fetch_status() {
     let absent = ContentId::derive(ObjectKind::Tree, b"absent tree");
     let view = DriveView::new(
         store,
-        FakeMaterialization::with(vec![(absent, FetchStatus::Unavailable)]),
+        FakeMaterialization::with(vec![(absent, FetchStatus::Unavailable(1))]),
         heads(vec![snapshot(absent)]),
     );
     assert_eq!(view.lookup("anything"), Err(ViewError::Unavailable));
@@ -855,7 +855,7 @@ fn zero_length_reads_serve_nothing() {
     );
     let view = DriveView::new(
         store,
-        FakeMaterialization::with(vec![(missing, FetchStatus::Unavailable)]),
+        FakeMaterialization::with(vec![(missing, FetchStatus::Unavailable(3))]),
         heads(vec![snapshot(root)]),
     );
     let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();

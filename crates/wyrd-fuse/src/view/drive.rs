@@ -413,7 +413,7 @@ where
             FetchStatus::RemoteOnly | FetchStatus::Fetching => {
                 ViewError::NotMaterialized { content: *id }
             }
-            FetchStatus::Unavailable | FetchStatus::Available => ViewError::Unavailable,
+            FetchStatus::Unavailable(_) | FetchStatus::Available => ViewError::Unavailable,
             FetchStatus::Corrupt => ViewError::Corrupt,
         }
     }

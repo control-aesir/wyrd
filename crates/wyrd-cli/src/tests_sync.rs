@@ -433,9 +433,11 @@ fn sync_status_reports_peer_queue_convergence_materialization() {
 /// A): neither the admitted peer's id nor the owner's own id —
 /// author of the live head — appears anywhere in the render. Scoped
 /// to the exact adversarial hexes, not a bare hex-run detector:
-/// snapshot and transition ids still render on this surface by
-/// pre-existing design, and a generic detector cannot tell them
-/// apart from device ids.
+/// snapshot and transition ids render as documented item keys
+/// (docs/cli.md names them explicitly as merge identities), and a
+/// generic detector cannot tell them apart from device ids — so the
+/// negative pins DeviceId absence precisely where the docs draw the
+/// line.
 #[test]
 fn sync_status_output_contains_no_membership_data() {
     let fixture = Fixture::new();

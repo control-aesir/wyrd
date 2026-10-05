@@ -323,6 +323,46 @@ impl DurableStore {
         self.current
     }
 
+    /// Bytes of commit files on disk, counted without touching
+    /// anything. The observational half of retention reporting: the
+    /// fact log is resident but unenforced, so `cache policy` shows
+    /// this next to the quota-enforced object-store count rather than
+    /// folding it in. Read-only like
+    /// [`wyrd_format::FsObjectStore::retained_bytes`]: temp files
+    /// (`.tmp`, a crashed commit's debris) are excluded, and a missing
+    /// commits directory counts as zero.
+    pub fn committed_bytes(&self) -> Result<u64, DurableError> {
+        let mut total = 0u64;
+        let entries = match fs::read_dir(self.commits_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(DurableError::Io(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(DurableError::Io)?;
+            // One stat per entry: `metadata` answers both questions —
+            // kind and length. `DirEntry::metadata` does not traverse
+            // symlinks, so a symlink inside the commits directory is
+            // excluded from the observational count rather than
+            // followed out of the measured tree. A file that vanishes
+            // first was never ours to count; any other listing failure
+            // is operational.
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DurableError::Io(error)),
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
+            total += metadata.len();
+        }
+        Ok(total)
+    }
+
     /// Test-only: release the advisory lock without dropping the store,
     /// modeling an abrupt process death (a restart test's fresh engine
     /// opens the directory while the parked old engine is still in

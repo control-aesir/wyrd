@@ -25,7 +25,6 @@ use wyrd_format::{
 };
 
 const PASSPHRASE: &str = "durable test passphrase";
-
 /// Decode pinned hex for the known-answer vectors below. Local to
 /// this test module: a shared home waits for a third in-crate user.
 fn unhex<const N: usize>(hex: &str) -> [u8; N] {
@@ -668,6 +667,38 @@ fn replayed_empty_to_filled_merge_keeps_transport_represented() {
             .any(|root| *root == stored.transport),
         "the rebuilt record serves only advertised roots"
     );
+}
+
+/// One commit is one commit file: CURRENT advances by exactly one and
+/// the fact-log byte count grows by exactly the file the commit wrote.
+/// This pins the one-commit-one-file premise the unavailable-open
+/// measurement's fsync derivation rests on. It does not count fsyncs.
+#[test]
+fn one_commit_writes_one_commit_file() {
+    let dir = TestDir::new("commit-file-count");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let current_before = store.current();
+    let bytes_before = store.committed_bytes().unwrap();
+    let files_before = commit_files(&dir.path);
+    store
+        .commit(&[Fact::Materialization(
+            ContentId::from_bytes([7; 32]),
+            MaterializationState::Cached,
+        )])
+        .unwrap();
+    assert_eq!(store.current(), current_before + 1);
+    assert_eq!(commit_files(&dir.path), files_before + 1);
+    assert!(store.committed_bytes().unwrap() > bytes_before);
+}
+
+/// Published commit files in a store directory: `{seq}.commit`, never
+/// the `.tmp` debris a crashed commit leaves behind.
+fn commit_files(dir: &std::path::Path) -> usize {
+    fs::read_dir(dir.join("commits"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "commit"))
+        .count()
 }
 
 /// Facts rebuild the live machines bit-identically: same log

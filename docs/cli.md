@@ -395,7 +395,18 @@ retention promise and reports as `REMOTE_ONLY` policy.
   only — the object store as a whole is never scanned.
 - `cache policy`: device totals over reachable content plus the
   effective retention and fetch budgets. Facts are per identity,
-  not per path, so pinned paths are not listed.
+  not per path, so pinned paths are not listed. Below the budgets,
+  a `retention accounting (bytes):` block reports three resident
+  dimensions measured at report time (three walks, never cached):
+  `retained content` (the object store — the quota-enforced quantity),
+  `fact log` and `sync vault` (resident but unenforced — auxiliary
+  growth), each labelled, plus an observational total. With no quota
+  configured the block ends in an explicitly non-authoritative
+  advisory ceiling ("no lower than current retention"); a quota is
+  an operator-selected refusal boundary, never an implicit default. The
+  report names the local quota only: the refusal ceiling and the
+  receive-side ceiling required by `docs/retention-constraints.md:147-149`
+  have no value to report until the receive-path admission gate lands.
 
 Conflicted paths refuse every mutating policy command: resolve
 first, or address one version through the existing `path@N`

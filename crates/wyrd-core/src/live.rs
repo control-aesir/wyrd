@@ -7,8 +7,8 @@
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
-    chunk, ContentId, DeviceId, Entry, FetchStatus, ObjectStore, RetainedBytes, SharedStore,
-    SnapshotId, StoreError, StoreFailure, TransitionId, Tree,
+    chunk, ContentId, DeviceId, Entry, FetchStatus, FsObjectStore, ObjectStore, RetainedBytes,
+    SharedStore, SnapshotId, StoreError, StoreFailure, TransitionId, Tree,
 };
 use wyrd_sync::closure::ClosureError;
 use wyrd_sync::durable::{AuthorizedSnapshot, DurableError};
@@ -312,6 +312,90 @@ impl LiveConfig {
         config.retained_bytes = Some(Arc::clone(&retained));
         (config, retained)
     }
+}
+
+/// A quota configured below what the device already retains. Starting
+/// anyway would refuse every write — the ceiling compares against
+/// bytes already held, and the fold gate additionally estimates the
+/// pending set's full image lengths — so the composer diagnoses this
+/// at startup instead of discovering it as a stream of `ENOSPC` at the
+/// first write. Both numbers are named: the quota (an operator-selected
+/// refusal boundary) and the retention it was compared against.
+/// Note the asymmetry this type cannot close: the gate refuses at
+/// count + estimate, so a quota within one image length *above*
+/// retention passes this check yet refuses content writes. Widening
+/// the diagnosis to the estimate is a policy question for a
+/// configuration surface, not for this check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaBelowRetention {
+    /// The configured ceiling, in bytes.
+    pub quota: u64,
+    /// What the mounted store already holds, in bytes.
+    pub retained: u64,
+}
+
+impl std::fmt::Display for QuotaBelowRetention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "retained_bytes_quota {} is below current retention {}: \
+             every write would be refused; raise the quota or free retained bytes",
+            self.quota, self.retained
+        )
+    }
+}
+
+impl std::error::Error for QuotaBelowRetention {}
+
+/// What the startup cross-check can report: either the walk of the
+/// mounted store failed (an operational failure, not a diagnosis) or
+/// the quota sits below what the store already holds.
+#[derive(Debug)]
+pub enum QuotaCheckError {
+    /// The retention walk itself failed.
+    Walk(wyrd_format::FsStoreError),
+    /// The quota is below current retention.
+    Below(QuotaBelowRetention),
+}
+
+impl std::fmt::Display for QuotaCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuotaCheckError::Walk(error) => write!(f, "retention walk failed: {error}"),
+            QuotaCheckError::Below(diagnosis) => write!(f, "{diagnosis}"),
+        }
+    }
+}
+
+impl std::error::Error for QuotaCheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            QuotaCheckError::Walk(error) => Some(error),
+            QuotaCheckError::Below(error) => Some(error),
+        }
+    }
+}
+
+/// The composition root's startup cross-check for a configured
+/// retention ceiling: compare the quota against
+/// [`FsObjectStore::retained_bytes`] — the mounted store walk, one
+/// traversal at open, never per commit — before the node starts.
+/// A quota at or above retention is not a diagnosis, but it is not a
+/// clean bill either: the fold gate refuses at count + full image
+/// lengths, so a quota within one image length above retention still
+/// refuses content writes. That narrower gap is stated, not closed,
+/// here — closing it belongs to a configuration surface.
+/// Composers call this when they configure a quota; an unset quota
+/// needs no check. Offline and relay-free: a local-read diagnostic.
+pub fn check_retained_ceiling(quota: u64, store: &FsObjectStore) -> Result<(), QuotaCheckError> {
+    let retained = store.retained_bytes().map_err(QuotaCheckError::Walk)?;
+    if retained > quota {
+        return Err(QuotaCheckError::Below(QuotaBelowRetention {
+            quota,
+            retained,
+        }));
+    }
+    Ok(())
 }
 
 impl Default for LiveConfig {
@@ -2867,3 +2951,7 @@ mod prereq_tests;
 #[cfg(test)]
 #[path = "live/tests_parent_mutation.rs"]
 mod parent_mutation_tests;
+
+#[cfg(test)]
+#[path = "live/tests_quota.rs"]
+mod quota_tests;

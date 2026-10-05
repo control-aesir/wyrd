@@ -6,6 +6,7 @@ use wyrd_format::{ContentId, FetchStatus};
 use wyrd_sync::transport::mailbox::Mailbox;
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use wyrd_core::want::WantRegistry;
@@ -97,6 +98,144 @@ fn a_quota_refused_fsync_reports_enospc_and_poisons_the_handle() {
         .open_at("base.txt")
         .expect("pre-refusal content still serves");
     assert!(backend.release_handle(reader).is_ok());
+
+    stop.store(true, Ordering::Relaxed);
+    loop_handle
+        .join()
+        .unwrap()
+        .expect("loop shuts down cleanly");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A removal below the ceiling re-admits local writes. The device sits
+/// exactly at its quota, so the next commit is refused; a durable
+/// removal (bookkept through `subtract`) moves it back under, and the
+/// same commit is then accepted. This is the shape the retention
+/// issue's verification names: a counter that cannot go down turns
+/// every removal into a phantom refusal.
+///
+/// The subtract here stands in for a removal path: quarantine and
+/// scrub do not exist yet, so no production caller removes bytes.
+/// What this pins is the enforcement arithmetic (the count, not the
+/// disk, is compared); the removal-then-bookkeeping order itself is
+/// pinned at the store level by
+/// `retained_bytes_subtract_matches_durable_removal_across_reopen`.
+#[test]
+fn a_removal_below_the_ceiling_readmits_local_writes() {
+    let (engine, dir, _) = scratch_drive();
+    let baseline = b"exactly at the ceiling";
+    // The ceiling is measured, not assumed: `put_file` retains the
+    // file's chunks plus its trees, and only the shared counter knows
+    // the total. Start unlimited so the baseline lands, then set the
+    // quota to exactly what it charged.
+    let (mut config, retained) = LiveConfig::with_retained_quota(u64::MAX);
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> = WyrdNode::new(
+        engine,
+        MemoryObjectStore::default().with_retained(Arc::clone(&retained)),
+    )
+    .unwrap();
+    // The baseline goes in through the node's own write API, which is
+    // not quota-checked, and charges the shared counter.
+    daemon.put_file("base.txt", baseline).unwrap();
+    let quota = retained.get();
+    config.budgets.retained_bytes_quota = Some(quota);
+    let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
+    let backend = crate::fuse::FuseBackend::shared_with_wants(
+        parts.projection,
+        parts.wants,
+        parts.mutations,
+        parts.open_timeout,
+        &parts.budgets,
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_stop = std::sync::Arc::clone(&stop);
+    let loop_config = wyrd_core::live::LiveConfig {
+        budgets: config.budgets,
+        interval: Duration::from_millis(10),
+        ..wyrd_core::live::LiveConfig::default()
+    };
+    let loop_handle = std::thread::spawn(move || {
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &loop_config,
+            &mut |_, _| {},
+        )
+    });
+
+    // At the ceiling the commit is refused: count plus the fold
+    // gate's image-length estimate is already over, before any byte
+    // is written — the documented at-ceiling behaviour.
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(handle, 0, b"x")
+        .expect("write only buffers");
+    assert_eq!(
+        backend.commit_handle(handle),
+        Err(fuser::Errno::ENOSPC),
+        "at the ceiling even a no-new-bytes commit is refused"
+    );
+
+    // The removal path's bookkeeping moves the count back under, and
+    // a commit that retains nothing new is admitted: rewriting the
+    // file's current bytes addresses content the store already holds,
+    // so the count does not move. Unlike a real full disk, the ceiling
+    // compares the count, not the write.
+    //
+    // Headroom must cover the fold gate's conservative estimate, not
+    // just the count: the gate adds full image lengths before the
+    // commit's first write (`enforce_retained_quota_with`), so even a
+    // no-op rewrite is refused unless count + its length fits. The
+    // estimate over-counts by construction — dedup still retains
+    // nothing — which is what the count assertion below distinguishes
+    // from a real charge.
+    let reader = backend.open_at("base.txt").unwrap();
+    let current = backend.read_handle(reader, 0, 4096).unwrap();
+    backend.release_handle(reader).unwrap();
+    retained.subtract(current.len() as u64 + 1);
+    let under_ceiling = retained.get();
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(handle, 0, &current)
+        .expect("write only buffers");
+    backend
+        .commit_handle(handle)
+        .expect("a nothing-new commit below the ceiling is admitted");
+    assert_eq!(
+        retained.get(),
+        under_ceiling,
+        "a no-op rewrite charges nothing: the pin is the count, not the admission"
+    );
+
+    // New bytes are admitted too — count plus estimate still fits —
+    // and the admitted commit takes the count back over. The next
+    // commit is refused, so the effective ceiling is the quota plus
+    // the admitted fold's tree bytes.
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(handle, 0, b"x")
+        .expect("write only buffers");
+    backend
+        .commit_handle(handle)
+        .expect("below the ceiling new bytes are admitted");
+    assert!(
+        retained.get() > quota,
+        "the admitted fold carried the count over quota by its tree bytes"
+    );
+
+    // The count is over quota, so the *next* commit is refused. The
+    // overshoot is one admitted fold's tree bytes, then refusal resumes.
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(handle, 0, b"y")
+        .expect("write only buffers");
+    assert_eq!(
+        backend.commit_handle(handle),
+        Err(fuser::Errno::ENOSPC),
+        "the overshoot is one admitted fold, then refusal resumes"
+    );
 
     stop.store(true, Ordering::Relaxed);
     loop_handle

@@ -436,6 +436,50 @@ impl Vault {
         std::sync::Arc::clone(&self.mirror)
     }
 
+    /// Bytes of sealed representations on disk, counted without
+    /// touching anything. The observational half of retention
+    /// reporting alongside the fact log: the vault is resident but
+    /// unenforced, so `cache policy` shows this next to the
+    /// quota-enforced object-store count rather than folding it in.
+    /// Import scratch files (`.tmp-*`, a crashed import's debris) are
+    /// excluded — they are not servable representations — and a missing
+    /// vault directory counts as zero.
+    pub fn resident_bytes(&self) -> Result<u64, VaultError> {
+        let mut total = 0u64;
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(VaultError::Io(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(VaultError::Io)?;
+            // One stat per entry: `metadata` answers both questions —
+            // kind and length. `DirEntry::metadata` does not traverse
+            // symlinks, so a symlink inside the vault directory is
+            // excluded from the observational count rather than
+            // followed out of the measured tree. A file that vanishes
+            // first was never ours to count; any other listing failure
+            // is operational.
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(VaultError::Io(error)),
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().starts_with(b".tmp-"))
+            {
+                continue;
+            }
+            total += metadata.len();
+        }
+        Ok(total)
+    }
+
     /// Import sealed bytes: the file name is the bytes' own transport
     /// root, so the address handed out is exactly what the transfer
     /// verifies against. Importing an already-held root is a no-op —

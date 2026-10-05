@@ -1121,6 +1121,13 @@ impl Engine {
         self.store.current()
     }
 
+    /// Bytes of fact-log commit files on disk. Observational only —
+    /// the fact log is resident but unenforced — for the retention
+    /// breakdown `cache policy` renders.
+    pub fn fact_log_bytes(&self) -> Result<u64, EngineError> {
+        Ok(self.store.committed_bytes()?)
+    }
+
     /// Replay durable runtime facts for presentation layers. The returned
     /// state is a snapshot; fetch execution remains owned by the engine.
     pub fn runtime_state(&self) -> Result<super::RuntimeState, EngineError> {

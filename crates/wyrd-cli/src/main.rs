@@ -24,7 +24,9 @@ use wyrd_core::status::{observe, SyncStatus};
 use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
-use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LiveNode, LoopError, Supervisor, WyrdNode};
+use wyrd_daemon::{
+    FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor, WyrdNode,
+};
 use wyrd_format::FsObjectStore;
 use wyrd_format::{
     DeviceEncryptionKey, DeviceId, MembershipTransition, ObjectStore, SnapshotId, TransitionId,
@@ -455,6 +457,8 @@ pub(crate) enum CliError {
     WyrdNode(#[from] wyrd_daemon::NodeError),
     #[error("object store failed: {0}")]
     Store(String),
+    #[error("retention quota misconfigured: {0}")]
+    Quota(#[from] wyrd_core::live::QuotaCheckError),
     #[error("mailbox failed: {0}")]
     Mailbox(#[from] wyrd_sync::transport::mailbox::MailboxError),
     #[error("live sync failed: {0}")]
@@ -758,6 +762,22 @@ fn install_shutdown_handler() -> Result<(), CliError> {
     // handler the process dies on signal exactly as before.
     Ok(())
 }
+/// The startup retention cross-check, shared by every composer that
+/// starts a live node in this binary (`mount`, `sync_now`): a quota
+/// below what the mounted store already holds would refuse every
+/// write, so refuse to start with both numbers instead of discovering
+/// it per write. Unset quotas skip the walk entirely. One helper so
+/// the next live-node composer inherits the check instead of the
+/// omission. Composers that never start a live loop (`export`, policy
+/// commands) correctly do not call it: with no loop there is no
+/// `ENOSPC` stream to pre-empt.
+fn check_startup_retention(config: &LiveConfig, store: &FsObjectStore) -> Result<(), CliError> {
+    if let Some(quota) = config.budgets.retained_bytes_quota {
+        wyrd_core::live::check_retained_ceiling(quota, store)?;
+    }
+    Ok(())
+}
+
 fn mount(
     drive_dir: PathBuf,
     mountpoint: PathBuf,
@@ -781,13 +801,17 @@ fn mount(
     tracing::info!(stage = "start", log = %log_path.display(), "mount diagnostics initialized");
 
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
-    let mut daemon = WyrdNode::new(
-        engine,
-        FsObjectStore::open(drive_dir.clone())
-            .map_err(|error| CliError::Store(error.to_string()))?,
-    )?;
-    daemon.refresh_live_heads()?;
-
+    // Operational policy in one place: the loop and the serving
+    // backend share this config's budgets, wired into both halves
+    // by `into_live` below. Constructed through `for_local_sync`
+    // (never `Default` directly) so headless sync shares these exact
+    // budgets and ceilings — several are correctness boundaries, and
+    // a mount-only default must never silently diverge them. One
+    // value from here to `into_live`, so the startup check below and
+    // the loop compare against the same numbers.
+    let config = LiveConfig::for_local_sync();
+    let store = FsObjectStore::open(drive_dir.clone())
+        .map_err(|error| CliError::Store(error.to_string()))?;
     // Fail fast on macOS before binding any endpoint: a missing
     // macFUSE runtime can never mount, and every later stage would
     // report the same opaque failure.
@@ -798,6 +822,14 @@ fn mount(
     }
     #[cfg(target_os = "macos")]
     tracing::info!(stage = "preflight", "macOS FUSE preflight passed");
+    // The startup cross-check runs after platform preflight and before
+    // composition: a quota below what the mounted store already holds
+    // would refuse every write, so starting is refused with both
+    // numbers instead. Unset quotas skip the walk — and the binary
+    // ships none, so this fires only for future configuration surfaces.
+    check_startup_retention(&config, &store)?;
+    let mut daemon = WyrdNode::new(engine, store)?;
+    daemon.refresh_live_heads()?;
 
     // Serving: a real-iroh endpoint over the drive's durable vault, so
     // peers holding an announcement route can fetch what this drive
@@ -812,13 +844,8 @@ fn mount(
     eprintln!("serving over iroh: {serving_id}");
     tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
 
-    // Operational policy in one place: the loop and the serving
-    // backend share this config's budgets, wired into both halves
-    // by `into_live` below. Constructed through `for_local_sync`
-    // (never `Default` directly) so headless sync shares these exact
-    // budgets and ceilings — several are correctness boundaries, and
-    // a mount-only default must never silently diverge them.
-    let config = LiveConfig::for_local_sync();
+    // The loop and the serving backend share the config's budgets
+    // through `into_live` below.
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // Flush the serving endpoint before announcing its address, so the
     // first seal carries a route peers can already dial. The loop owns
@@ -1278,7 +1305,27 @@ fn cache(
         CacheAction::Policy => {
             let (engine, view) = node.parts();
             let census = residency_census(engine, view, "")?;
-            print!("{}", cache_policy_render(&census));
+            // Three walks at report time, never cached: the enforced
+            // object-store count plus the two observational dimensions.
+            let retained_content = view
+                .store_read()
+                .map_err(|error| CliError::Store(error.to_string()))?
+                .retained_bytes()
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            // One budgets read for the whole report: the quota line and
+            // the budget lines below must come from the same value, or
+            // the report can disagree with itself.
+            let budgets = LiveConfig::for_local_sync().budgets;
+            let accounting = RetentionAccounting {
+                retained_content,
+                fact_log: engine.fact_log_bytes()?,
+                sync_vault: engine
+                    .vault()
+                    .resident_bytes()
+                    .map_err(|error| CliError::Store(error.to_string()))?,
+                quota: budgets.retained_bytes_quota,
+            };
+            print!("{}", cache_policy_render(&census, &accounting, &budgets));
             Ok(())
         }
     }
@@ -1356,13 +1403,16 @@ fn cache_quadrant_summary(census: &ResidencyCensus) -> String {
 /// calls effective is what the daemon enforces, not a parallel
 /// copy. Only the retention- and fetch-relevant bounds print here;
 /// the full table lives in `docs/resource-limits.md`.
-fn cache_policy_render(census: &ResidencyCensus) -> String {
+fn cache_policy_render(
+    census: &ResidencyCensus,
+    accounting: &RetentionAccounting,
+    budgets: &ResourceBudgets,
+) -> String {
     let pinned_files = census.quadrant(RetentionPolicy::Pinned, LocalPresence::Present)
         + census.quadrant(RetentionPolicy::Pinned, LocalPresence::Absent);
     // Per identity, deduplicated across files that share chunks: a
     // chunk pinned through two paths is one promise, not two.
     let pinned_chunks = census.pinned_chunk_union().len();
-    let budgets = LiveConfig::for_local_sync().budgets;
     let mut out = format!(
         "cache policy (reachable content)\npinned files: {pinned_files}\npinned chunks: {pinned_chunks}\n",
     );
@@ -1381,7 +1431,7 @@ fn cache_policy_render(census: &ResidencyCensus) -> String {
         }
     }
     out.push_str("budgets (effective):\n");
-    match budgets.retained_bytes_quota {
+    match accounting.quota {
         Some(quota) => out.push_str(&format!("  retained_bytes_quota: {quota}\n")),
         None => out.push_str("  retained_bytes_quota: unlimited\n"),
     }
@@ -1389,7 +1439,64 @@ fn cache_policy_render(census: &ResidencyCensus) -> String {
         "  max_admit_per_pass: {}\n  max_pending_wants: {}\n",
         budgets.max_admit_per_pass, budgets.max_pending_wants,
     ));
+    // The retention breakdown: one row per resident dimension, each
+    // labelled with whether it backs enforcement or merely observes.
+    // `retained content` is the enforcement quantity — the number the
+    // ceiling is compared against. The fact log and the sync vault
+    // are resident but unenforced (auxiliary growth): folding them
+    // into the enforced number would silently widen what a refusal
+    // rejects, so they report separately and the total is labelled
+    // observational. See the retained / resident / auxiliary terms in
+    // `docs/storage-growth.md`.
+    let total = accounting
+        .retained_content
+        .saturating_add(accounting.fact_log)
+        .saturating_add(accounting.sync_vault);
+    out.push_str("retention accounting (bytes):\n");
+    out.push_str(&format!(
+        "  retained content: {} (quota-enforced)\n",
+        accounting.retained_content
+    ));
+    out.push_str(&format!(
+        "  fact log: {} (observational)\n",
+        accounting.fact_log
+    ));
+    out.push_str(&format!(
+        "  sync vault: {} (observational)\n",
+        accounting.sync_vault
+    ));
+    out.push_str(&format!("  total accounted: {total} (observational)\n"));
+    // No implicit ceiling: with no configured quota the report advises
+    // one instead of applying one. The recommendation is explicitly
+    // advisory and non-authoritative — a starting point for the
+    // operator's decision, never a default by another name. A quota is
+    // an operator-selected refusal boundary, not an implicit product
+    // policy: anything at or below current retention refuses every
+    // write, so the advice starts there.
+    if accounting.quota.is_none() {
+        out.push_str(&format!(
+            "  advisory ceiling (non-authoritative): no lower than {} \
+             (current retention); no default is applied\n",
+            accounting.retained_content
+        ));
+    }
     out
+}
+
+/// Measured byte dimensions behind `cache policy`'s retention
+/// breakdown: the enforcement quantity plus the two resident-but-
+/// unenforced dimensions. Measured at report time from the mounted
+/// store, the fact log, and the vault — three walks, never cached,
+/// so the report cannot disagree with the disk.
+struct RetentionAccounting {
+    /// Object-store bytes: the quota-enforced quantity.
+    retained_content: u64,
+    /// Fact-log commit bytes: resident, observational.
+    fact_log: u64,
+    /// Sealed vault representations: resident, observational.
+    sync_vault: u64,
+    /// The effective quota, if one is configured.
+    quota: Option<u64>,
 }
 
 /// Safety cap on one headless run: a peer that keeps intake
@@ -1949,13 +2056,16 @@ fn sync_now(
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
-    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> = WyrdNode::new(
-        engine,
-        FsObjectStore::open(drive_dir.clone())
-            .map_err(|error| CliError::Store(error.to_string()))?,
-    )?;
-    daemon.refresh_live_heads()?;
     let config = LiveConfig::for_local_sync();
+    let store = FsObjectStore::open(drive_dir.clone())
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    // Same startup cross-check as mount: headless runs compose a live
+    // node too, so a misconfigured quota must fail here rather than
+    // in the first write.
+    check_startup_retention(&config, &store)?;
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store)?;
+    daemon.refresh_live_heads()?;
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // The headless consumer has no presentation backend: the live
     // parts (projection handle, wants, mutations) are owned but

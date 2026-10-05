@@ -220,7 +220,8 @@ semantics, and who bears the cost.
 Open question 1 below is decided here; the question list keeps it as
 the pointer. A serving member or a vault **may decline to admit what
 an authorized member authored (A), or decline to serve, advertise, or
-hold as residency what it already holds (B)**. The refusal right is an authorization
+hold as residency what it already holds (B)**. The refusal right is an
+authorization
 change (`trust.md` T18), not a resource limit: membership implies the
 right to read, never the duty to retain.
 
@@ -250,8 +251,9 @@ residency refusal withholds discharge without touching the commit. A
 peer holding received content has no step 6 to withhold — announcements
 are the author's, and v0 has no replication serving
 (`transport/routes.rs`: routes publish only from announcements'
-`node_addr`). Its gate is its own mirror admission: the vault-to-mirror write-through
-on `Vault::import` and the boot rebuild admit
+`node_addr`). Its gate is its own mirror admission: the
+vault-to-mirror write-through on `Vault::import` and the boot rebuild
+admit
 only residency the ceiling allows, and the serving maps offer only
 recorded-as-servable state (`VaultSource::from_state`: "Only recorded
 state serves"). Obligations 1–2 are enforced there, not at an
@@ -384,6 +386,12 @@ decrement. Once A is enforced that is a correctness bug — a scrubbed
 or quarantined object keeps its charge forever, so the store would
 eventually refuse everything it is offered. A decrement, or an
 authoritative recomputation, lands with A's enforcement, not after it.
+B carries two prerequisites of its own, alongside A's decrement: a
+counter that sees vault bytes (body and manifests are retained but
+untallied today, so the peer-side ceiling has nothing to consult on
+those legs), and durable refusal state the boot rebuild can re-derive
+(the rebuild cannot distinguish "refused for residency" from "never
+seen" without it).
 
 **Acceptance criteria** (for the implementation follow-up, which this
 contract unblocks rather than contains):

@@ -126,12 +126,19 @@ single snapshot and nothing about how many snapshots exist.
 No debounce or autosave timer exists in the code. Snapshots are created
 by POSIX boundaries on the authoring device:
 
-- `write` only buffers; a snapshot is created by `flush`, `fsync`, or
-  `release` on a dirty handle. A committing boundary on a **clean**
-  handle performs no snapshot, so idle flushes are free.
-- `O_SYNC` / `O_DSYNC` deliberately forfeit coalescing: each successful
-  `write` is its own durable snapshot. This is the amplification peak,
-  and it is opt-in per handle by the application.
+- `write` only buffers; a snapshot is created by the DG-1
+  commit-forcing events (`docs/write-path.md`, DG-1 table):
+  dirty-handle `flush` or `release`, `fsync` on a path with pending
+  data, and the other listed forcing events fold the whole pending
+  set into one snapshot. An `fsync` on a path with no pending data
+  anywhere performs no snapshot, and a clean, read, or
+  never-wrote `flush`/`release` never forces on another handle's
+  behalf, so idle closes are free for two independent reasons.
+- `O_SYNC` / `O_DSYNC` never wait for a later boundary: each successful
+  `write` is durable before returning, in its own durable snapshot
+  shared with any pending set (`docs/write-path.md`, DG-1 table). This
+  is the amplification peak, and it is opt-in per handle by the
+  application.
 - Each namespace operation addressed by **path** (`create`, `unlink`,
   `mkdir`, `rmdir`, `rename`, `chmod`, `truncate`) submits a mutation
   and commits one snapshot per *effective* operation — a truncate to

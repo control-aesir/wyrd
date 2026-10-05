@@ -51,7 +51,7 @@ write(fd, off, data)   ┌──► WritableHandle
                        │    ├── base snapshot + file identity
                        │    ├── buffered overlay
                        │    └── dirty
-                       │         │ flush / fsync / release
+                       │         │ forcing event (DG-1 table below)
 create/mkdir/rename ───┘         ▼
 truncate/unlink ...      bounded MutationQueue (FIFO, total order)
                                  │
@@ -65,6 +65,188 @@ truncate/unlink ...      bounded MutationQueue (FIFO, total order)
                               5 flush serving residency
                               6 discharge the announcement obligation
 ```
+
+## Mutation/commit boundary table (DG-1, normative)
+
+Decision OD-1 (record at the bottom of this document): coalescing
+policy **A, independent of the POSIX mutation unit, with dirty-handle
+release as a forcing event**. Given an arbitrary sequence of POSIX
+mutations, the system commits exactly one snapshot per commit-forcing
+event — not one per mutation — and the pending state between commits
+is never durable, never servable, and never announceable.
+
+```text
+POSIX operation sequence
+        ↓
+pending mutation set          (Working: volatile, memory-only;
+                               never durable, never servable, never announceable)
+        ↓
+commit-forcing event?         (the table below)
+        ↓
+snapshot boundary              (one snapshot per forcing event, folding all pending)
+        ↓
+durability level               (Working | Committed | Published — local axis only;
+                               the level encoding is owned by DG-2 and referenced here)
+        ↓
+servable?                      (only ever yes past the snapshot boundary + serving residency)
+        ↓
+announceable?                  (only ever yes past serving residency)
+```
+
+| Event | Pending empty | Pending non-empty | Snapshots | Yield |
+|---|---|---|---|---|
+| Buffered `write` / handle `truncate` / handle `set-exec` (non-`O_SYNC`) | Accumulate | Accumulate; never forces | 0 | Working |
+| `fsync` / `fdatasync` on a handle whose path has pending data anywhere | n/a (this handle's buffer may itself be a pending member) | Fold all pending into one snapshot | 0–1 | Committed → Published via the pipeline; 0 only when no member survives (rule 6) |
+| `fsync` / `fdatasync` on a handle whose path has no pending data anywhere | No-op; commits nothing | No-op | 0 | Unchanged |
+| `flush` on a **dirty** handle (this handle holds its own buffer) | n/a | Fold all pending into one snapshot | 0–1 | Committed → Published via the pipeline; 0 only when no member survives (rule 6) |
+| `flush` on a clean or read handle (including the kernel-injected close-time flush) | No-op; never forces on another handle's behalf | No-op | 0 | Unchanged |
+| `release` / `close` of a **dirty** handle (this handle holds its own buffer) | n/a | Fold all pending into one snapshot, best-effort | 0–1 | Committed → Published; errors often discarded by callers; 0 only when no member survives (rule 6) |
+| `release` / `close` of a clean or read handle | No-op; never forces on another handle's behalf | No-op | 0 | Unchanged |
+| `O_SYNC` / `O_DSYNC` `write` | Its own durable snapshot, shared with any pending set | Fold pending + this write into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| Effective namespace op (`mkdir`, `unlink`, `rmdir`, `rename`, path-addressed `truncate` / `set-exec`) | Its own snapshot | Fold pending + self into one snapshot, synchronously before return | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| No-op submission (`rename` to the same path, `truncate` to the current size, `set-exec` to the recorded mode, the `O_TRUNC` follow-up fh-less `setattr(size=0)`) | Submits nothing | Submits nothing; forces nothing | 0 | Unchanged |
+| `create` / `O_TRUNC`-open | Commits an empty file / truncation, folding any pending set | Fold pending + self into one snapshot; the returned handle binds the just-committed identity | 0–1 | Committed → Published; 0 only when no member survives (rule 6) |
+| Refused namespace forcer (pre-submit) | Submits nothing | Forces nothing | 0 | Unchanged; no other handle is displaced |
+| Refused namespace forcer (precondition fails during application — refused `create`, `mkdir` on an existing name, `unlink` of an absent path or of a directory, `rmdir` of a non-empty directory or a file, no-replace `rename`) | Failed member | Never forces and never displaces earlier members; failed forcer aborts the fold with nothing committed (rule 6) | 0 | Unchanged; no other handle is displaced |
+| Daemon shutdown / `destroy` (SIGINT/SIGTERM, unmount) | No pending set exists | Fold all pending into one snapshot, best-effort per path | 0–1 | Existing teardown semantics, coalesced |
+| Explicit checkpoint (reserved) | No-op | Fold all pending into one snapshot | 0–1 | API/CLI surface defined in the implementation; the name is reserved here |
+| Elapsed time alone | Never forces | Never forces | 0 | No bounded idle window in v0.3 (rejected below) |
+
+Rules:
+
+1. **Fold, don't sequence.** A forcing event commits the whole pending
+   set plus itself as a single snapshot, not pending-as-one plus
+   self-as-another. `fsync` on one handle therefore makes other
+   handles' pending data durable too — extra durability, never less,
+   except through rule 2's tie-break (a losing member's buffer is
+   discarded rather than committed, and the loser can be destroyed by
+   an unrelated third party's fold when the forcer has no member on
+   the tied path) or rule 6's failed-member path (a failed member is
+   discarded, and a failed forcer aborts the fold with nothing
+   committed). Apart from those two paths, the folded data is
+   durable at the boundary, so serving and announcing it with the
+   snapshot is safe.
+2. **Stale and conflict checks are per member, at commit.** Members
+   are ordered first-in-first-buffered (FIFO by buffering time), which
+   is deterministic. Same-path concurrent edits fail closed for the
+   conflicting member (its handle goes terminal `EIO`); different-path
+   edits rebase onto the current head and still fold into the one
+   snapshot. On a same-path tie the forcing member wins whenever the
+   forcing event carries privilege — `fsync`/`fdatasync`, `flush` on
+   a dirty handle, `O_SYNC` write, effective namespace op,
+   dirty-handle `release`, `create`/`O_TRUNC`-open, and the explicit
+   checkpoint all carry it — but only a forcing member that survives
+   its own preconditions carries it: a member's own namespace
+   preconditions are evaluated before the tie-break, so a refused
+   `create` never displaces an earlier-buffered member and leaves it
+   untouched. An explicit durability call that survives never loses
+   its own bytes to an earlier-buffered member; the earlier member
+   goes terminal instead. A truncating `open` therefore keeps
+   today's commit outcome with earlier loss: the truncate wins its
+   path tie and any dirty handle on that path goes terminal `EIO`
+   at the fold — where today it would keep buffering and only go
+   stale at its own later commit — rather than the open failing
+   because another handle held unflushed bytes. If the fold
+   itself cannot be authored (conflicted drive, store failure), the
+   open fails with the existing binding-rule errno (`EIO`/`ESTALE`)
+   and nothing commits — there is no half-truncated state for the
+   returned handle to bind. Shutdown/`destroy` carries no privilege
+   (no caller to honor; best-effort, errors logged), so a shutdown
+   fold breaks ties earliest-buffered. When the forcer has no member
+   on the tied path, the earliest-buffered member wins. Either way
+   the inverted case is explicit: the losing member's handle is
+   terminal `EIO` at the fold, before it ever makes its own forcing
+   call. More than one eligible live head refuses the whole fold
+   (`ConflictedHeads`); nothing commits.
+3. **`flush` ≡ `fsync` stays the reportable persistence point for the
+   calling handle's own data** and `O_SYNC` stays commit-per-write;
+   coalescing applies only to demand that does not explicitly require
+   synchronous durability. For `fsync`/`fdatasync`, "clean" is a
+   per-path property: a boundary on a handle whose path has no
+   pending data anywhere commits nothing and forces nothing, which
+   keeps idle syncs on untouched paths free while preserving the
+   per-inode `fsync` contract — an `fsync` on any descriptor of a
+   path with pending data makes that path's data durable. For
+   `flush` and `release`/`close`, "clean" is a per-handle property:
+   only a handle holding its own buffer forces, and a clean or read
+   close — including the kernel-injected close-time `flush`, which
+   `fuser` does not require to flush pending writes — never forces
+   on another handle's behalf. The `flush` ≡ `fsync` equivalence
+   covers the caller's own bytes and must not pull the close path in
+   with it.
+4. **No idle-window commit in v0.3.** A timer in the durability path
+   would be a silent post-timeout commit, contradicting the queue's
+   synchronous contract below (a caller stays blocked until the loop
+   completes its request; nothing commits after the caller returns),
+   and POSIX requires `fsync` itself to be the synchronous durability
+   point rather than a timer the caller never invoked. Revisit only
+   with explicit durability semantics.
+5. **Pending is Working, never more.** The pending set is volatile
+   memory: it populates no cache keyed on durable revision, appears
+   in no manifest, satisfies no projection or transport serving
+   request, and creates no announcement obligation. (The writing
+   handle's own overlay still gives read-your-writes.) A crash loses
+   exactly the pending set; that loss is the contract, not a
+   violation. The `Working | Committed | Published` labels are
+   descriptive here; DG-2 owns the level encoding and API contract.
+6. **Fold failures are per member, except the fold-fatal classes.**
+   When the forcing member survives, surviving members still commit
+   into the one snapshot; each failed member reports its own errno
+   to its own waiter and its handle goes terminal. The forcing
+   caller receives the errno of its own member — an `O_SYNC` write
+   is never failed by an unrelated member's staleness, and a
+   namespace op reports only its own outcome. At
+   shutdown/`destroy` the same rule holds best-effort per path:
+   committed members stay committed, and per-path losses are logged
+   rather than reported. A failed member never forces: pre-submit
+   refusals (unsupported flags, read-only mount, `ENOTDIR`/`EIO`/
+   `EMFILE` at open, `ESTALE` from the parent claim or capture)
+   submit nothing and force nothing, and a member whose namespace
+   precondition fails during fold application (the `create` arm's
+   `EEXIST` and `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided
+   inside application at `live.rs:1437`/`:1439`/`:1441-1442`/
+   `:1444-1446`, never at admission; the clause is generic over
+   every namespace mutation — `mkdir`, `unlink`, `rename` preconditions
+   fail the same way)
+   reports its own errno without forcing. If the forcing member
+   itself is the one that fails, the fold aborts with nothing
+   committed — a failed syscall never makes another member's pending
+   bytes durable. A fold-fatal refusal raised before the commit
+   begins — the pre-commit quota (`live.rs:1406`) and
+   `ConflictedHeads` (`live.rs:1431-1434`) — leaves members
+   retryable and non-terminal, as does a failed forcing member; a
+   `StaleHandle` is terminal, and so is a store, authoring, or
+   fact-commit failure wherever it occurs (the stale/`EIO` rule
+   below handles the stale case; post-durable stage failures are
+   covered below). A fold with no surviving member authors nothing:
+   no empty snapshot, no dangling announcement obligation.
+   Fold-fatal (whole-fold, unattributable to one member):
+   `ConflictedHeads` (refuses the entire fold, nothing commits);
+   store, authoring, or fact-commit failure; the pre-commit
+   retained-bytes quota, which under folding covers the aggregate of
+   the whole pending set before the commit's first write; and a
+   failed forcing member.
+   Post-durable stage failures (publication, serving residency) are
+   likewise not member-attributable: the commit already succeeded, so
+   monotonicity fixes the outcome and the caller learns nothing.
+7. **Folded handles advance atomically with the snapshot.** Every
+   member whose data committed has its base advanced to the committed
+   identity and its dirty bit and budget cleared as part of the same
+   commit — otherwise its next commit would go stale against bytes it
+   already committed. The fold is orchestrated in `wyrd-core`, but the
+   per-handle post-commit transition executes in the handle owner
+   (today the daemon FUSE backend's `WriteHandle`); the implementation
+   must not split base-advance from the commit it belonged to.
+8. **What improves.** Folding removes one snapshot per folded forcing
+   event, so the win is proportional to forcing events avoided per
+   logical save: `fsync`+`rename` save sequences go from two snapshots
+   to one, and several simultaneously dirty handles commit once
+   instead of once each. A single `fsync` per save with one dirty
+   handle — the plain debounce-save loop — commits one snapshot
+   before and after, so the headline workload is unchanged until the
+   implementation batches across saves; likewise open/write/close
+   churn still commits per cycle because `release` forces. The
+   observability baseline must measure these shapes separately.
 
 ## Writable handles
 
@@ -440,12 +622,20 @@ after serving is retried the obligation is discharged.
 | `fsync` | Commits the handle. Success means the commit is device-local durable. |
 | `release` | Commits best-effort; the error is often discarded by applications; always drops the handle and buffer. |
 
-`flush` and `fsync` are **semantically equivalent** for Wyrd's durability
-guarantee: there is no cached-but-not-durable commit state — the commit
-boundary *is* the durability boundary. They differ only in how
-applications observe the result: `flush` runs on every `close` and its
-error is frequently ignored, so `fsync` is the reportable persistence
-point. A committing boundary on a **clean** handle performs no snapshot.
+`flush` and `fsync` are **semantically equivalent** for the calling
+handle's own data: there is no cached-but-not-durable commit state —
+the commit boundary *is* the durability boundary. They differ in
+which events force — `fsync`/`fdatasync` fold on a per-path test
+while `flush` forces only on the calling handle's own buffer — and
+only in how applications observe the result: `flush` runs on every
+`close` and its error is frequently ignored, so `fsync` is the
+reportable persistence point. An `fsync`/`fdatasync` on a handle
+whose path has no pending data anywhere performs no snapshot and
+forces nothing, while a `flush` or `release`/`close` forces only
+when the calling handle itself is dirty — a clean close-time
+`flush` never forces on another handle's behalf (DG-1 table). A
+forcing boundary folds the whole pending set, not just the calling
+handle.
 
 Because `release` is best-effort and drops the buffer, an application
 that never calls `flush`/`fsync` can lose acknowledged writes. This is
@@ -469,10 +659,11 @@ mount the kernel releases every open file before destroy runs, so
 writes; `destroy` is the net for handles whose release-time commit
 failed.
 
-`O_SYNC`/`O_DSYNC` deliberately sacrifice write coalescing: because the
-unit of commit is the snapshot, each successful `write` on such a handle
-is its **own durable snapshot** (a committing boundary per syscall). That
-is expensive and correct by construction.
+`O_SYNC`/`O_DSYNC` never wait for a later boundary: each successful
+`write` on such a handle is durable before returning. Under DG-1 the
+write folds any pending set plus itself into one snapshot (a
+committing boundary per syscall, shared when other handles have
+pending data). That is expensive and correct by construction.
 
 ### Error timing
 
@@ -495,13 +686,17 @@ Write-time and commit-time failures are distinct surfaces:
 
 ## Namespace operations
 
-Each operation is one snapshot unless stated otherwise. `sqlite`-style
-multi-step tooling is unaffected: each committed state is a complete,
-valid filesystem.
+Snapshot boundaries are governed by the DG-1 table above: *effective*
+namespace operations are forcing events that fold pending plus self
+into one snapshot, while a submission that resolves to no change
+(`rename` to the same path, `truncate` to the current size, `set-exec`
+to the recorded mode) submits nothing and forces nothing.
+`sqlite`-style multi-step tooling is unaffected: each committed state
+is a complete, valid filesystem.
 
 | Operation | Semantics (v0) |
 |---|---|
-| `create` | Creates an empty regular file as its own snapshot **and** returns a handle based on the resulting snapshot, as one daemon operation (no window between them). The empty-file snapshot is a complete, independently valid state: a crash before the first content commit leaves it, and a peer may observe it. `O_EXCL` → `EEXIST`. |
+| `create` | Commits an empty regular file, folding any pending set, **and** returns a handle based on the resulting snapshot, as one daemon operation (no window between them). The empty-file snapshot is a complete, independently valid state: a crash before the first content commit leaves it, and a peer may observe it. `O_EXCL` → `EEXIST`. A refusal decided before submit submits and forces nothing; a precondition that fails during application is a failed member that never forces, and a failed forcer aborts the fold (DG-1 table). |
 | `write` | Buffer only; committed by `flush`/`fsync`/`release`. |
 | `mkdir` | Creates an empty directory. Does **not** create intermediates: `mkdir a/b/c` is `ENOENT` when `a/b` is absent. `EEXIST` when the name exists. (The mount does not inherit `WyrdNode::put_file`'s intermediate-creation convenience.) |
 | `unlink` | Removes a file or symlink entry; `EISDIR` on a directory; `ENOENT` when absent. |
@@ -558,11 +753,11 @@ merely implementation properties.
 | Flag | Semantics |
 |---|---|
 | `O_RDONLY` / `O_WRONLY` / `O_RDWR` | Access mode; a write handle is required for `write`/`truncate`. |
-| `O_CREAT` | Create the file if absent (its own empty-file snapshot, per `create`). |
+| `O_CREAT` | Create the file if absent (commits an empty file, folding any pending set, per `create`). |
 | `O_EXCL` | With `O_CREAT`, `EEXIST` if the name exists. |
 | `O_APPEND` | Appends at the current end at commit time (see handles); the target must remain a regular file. |
 | `O_TRUNC` | The truncation commits **during open** and the handle starts clean on the empty base. It must: the kernel delivers `O_TRUNC` as open plus a separate fh-less `setattr`, so a handle carrying the pre-truncate base would go stale before its first commit. The commit is bound to the identity the open observed, and the handle binds exactly the identity the loop committed: a same-path replacement that lands before the commit fails the open (`EIO`), and one that lands between the commit and the open's capture fails it `ESTALE`. The follow-up fh-less `setattr(size=0)` is the one part that stays path-addressed, like any other `setattr`: it is a no-op here because the truncation already committed — provided the stat succeeds, since a vanished path fails the lookup instead of submitting. A concurrent change *after* open still stales the handle (`EIO`); a path truncate that lands while the opening handle is still clean re-pins it instead (the handle holds nothing to lose). |
-| `O_SYNC` / `O_DSYNC` | Accepted; every write is its own durable snapshot (see flush/fsync). |
+| `O_SYNC` / `O_DSYNC` | Accepted; every write is durable before returning, in its own durable snapshot shared with any pending set (see flush/fsync). |
 | `O_DIRECT`, `O_PATH` | `EOPNOTSUPP` (not representable). |
 
 ## Conflicted drives
@@ -681,14 +876,21 @@ The write state machine lives in the daemon and sync crates; FUSE stays
 an adapter:
 
 ```text
-wyrd-fuse        POSIX translation only
-                     ↓
-wyrd-core        WritableHandle, MutationQueue, commit orchestration,
-                 stale checks, publication
-                     ↓
-wyrd-sync        immutable tree mutation, snapshot authoring,
-                 durable commit, announcement obligation
+presentation     wyrd-fuse (POSIX translation only)
+                     ↓ reads the shared view; never authors
+node             wyrd-core (MutationQueue, fold orchestration,
+                 commit sequencing, stale checks, publication)
+                     ↓ authors into
+store            wyrd-sync (immutable tree mutation, snapshot
+                 authoring, durable commit, announcement obligation)
 ```
+
+Separately, the daemon backend owns the per-handle `WriteHandle`
+state (buffers, base advance, budget release) and supplies the
+post-commit transition as a handle-owner callback upward into the
+orchestrated commit (rule 7). `wyrd-daemon` depends on `wyrd-core`,
+never the reverse; `wyrd-fuse` depends on `wyrd-format` and
+`wyrd-namespace` only and never calls into the node.
 
 Stale checks, snapshot creation, tree mutation, and commit sequencing
 must not be implemented inside FUSE callbacks.
@@ -699,7 +901,8 @@ must not be implemented inside FUSE callbacks.
   file locks, `mmap` writes, or `O_DIRECT`.
 - No byte-range merging between handles: same-file stale handles fail
   (the append exception aside), and there is no three-way content merge.
-- No write coalescing across handles.
+- Write coalescing across handles follows the DG-1 boundary table
+  above (one snapshot per forcing event, folding all pending).
 - No automatic peer repair and no GC: superseded objects, manifests, and
   heads are retained append-only.
 - No cross-device moves.
@@ -714,7 +917,40 @@ Each row locks a decided invariant.
 **Lost-update boundary**
 
 - **Stale writable handle**: A and B open one file; B commits; A commits
-  → A gets `EIO`, B's content remains, no third snapshot.
+  → A gets `EIO`, B's content remains, no third snapshot. (Pre-fold
+  mechanism: separate commits. Under DG-1, A goes terminal at B's
+  fold, so "A commits" never happens — same outcome, earlier loss.)
+- **Fold inverted case**: A and B hold dirty buffers on one file; B
+  forces (`fsync`) → B wins the tie, B's bytes are durable on return,
+  A's handle is terminal `EIO` before A ever calls. The explicit
+  durability caller never loses to an earlier-buffered member.
+- **Fold release tie-break**: A and B hold dirty buffers on one file;
+  B closes → B's dirty release carries privilege, B wins, A's handle
+  is terminal `EIO`.
+- **Fold create tie-break**: A holds a dirty buffer on `P`;
+  `open(P, O_TRUNC)` → the truncate carries privilege, the open
+  succeeds and binds the just-committed identity, A's handle is
+  terminal `EIO`. If the fold cannot be authored the open fails
+  (`EIO`/`ESTALE`) with nothing committed.
+- **Fold refused create**: A holds a dirty buffer on `P`;
+  `create(P, O_CREAT|O_EXCL)` → `EEXIST` — or `create(Q, …)` while A
+  holds `P`, same outcome on any path. The refusal is a failed
+  member that never forces and never displaces A: nothing commits, A
+  still buffers and commits later.
+- **Fold failed forcer**: A holds a dirty buffer on `P`; the forcing
+  member fails (fold-fatal quota, conflicted heads — the refused
+  `create` case is pinned by the row above). No snapshot is
+  authored, no announcement obligation is created, and A's handle is
+  not terminal — A still buffers, and commits later once the
+  persistent condition (conflict resolved, quota relieved) no
+  longer aborts the fold.
+- **Pre-submit refusal**: submits nothing and forces nothing, on any
+  path, whether or not other handles hold pending data.
+- **Fold refused namespace forcer**: any namespace forcer (`mkdir`
+  on an existing name, `unlink` of a directory, no-replace `rename`
+  onto an existing name) refused in application is a failed member
+  that never forces; if it is the forcing member the fold aborts
+  with nothing committed and other members stay retryable.
 - **Concurrent partial writes**: A edits range 0, B edits range 100 (both
   from one base) → exactly one commits; the other is stale, never a
   silent overwrite.
@@ -754,10 +990,14 @@ Each row locks a decided invariant.
   read sees the overlay; the tree is unchanged until `flush`.
 - **Single commit per flush**: N writes + one `flush` → one snapshot; a
   clean second `flush` commits nothing.
+- **Close-time flush forces nothing for others**: a `flush` or
+  `release` on a handle that never wrote commits nothing, even when
+  another handle holds pending data on the same path; `fsync` on
+  that path does commit it.
 - **flush ≡ fsync durability**: a file survives a simulated restart
   after either; it may be lost after `write` without a commit boundary.
-- **`O_SYNC` per write**: each successful `write` produces its own
-  durable snapshot before returning.
+- **`O_SYNC` per write**: each successful `write` is durable before
+  returning, in its own durable snapshot shared with any pending set.
 - **`O_TRUNC`**: the truncation is visible to other opens immediately
   (it commits during open) and applies only to the file the open
   observed — a same-path replacement that lands first fails the open
@@ -769,6 +1009,20 @@ Each row locks a decided invariant.
 - **Failed commit is terminal**: after a stale/`EIO` commit the overlay is
   dropped; a second commit on the handle is refused rather than
   retrying the old buffer.
+- **DG-1 fold (named to `wyrd-contracts`, implementation-gated)**:
+  N writes across M handles and paths, plus effective namespace
+  operations, inside one window produce **one** snapshot whose tree
+  equals the final coherent state; `fsync` on a path with pending data
+  forces the fold; `O_SYNC` stays durable per write; a committing
+  boundary on a path with no pending data anywhere commits nothing;
+  same-path concurrent members fail closed while different-path
+  members rebase into the same snapshot; a multi-head drive refuses
+  the fold with the documented errno; failure after the durable stage
+  leaves the same durable state as before the attempt.
+- **DG-1 negatives (named to `wyrd-contracts`, implementation-gated)**:
+  the pending set populates no cache keyed on durable revision;
+  appears in no manifest; satisfies no projection or transport
+  serving request; creates no announcement obligation.
 
 **POSIX surface**
 
@@ -817,3 +1071,20 @@ Each row locks a decided invariant.
 - A mutation that would produce an over-limit tree/manifest is refused
   (`EFBIG`) and never committed: the mount cannot bypass
   `check_tree`/`check_manifest`.
+
+## Decision record (OD-1 / DG-1)
+
+Decided: coalescing policy **A, independent of the POSIX mutation
+unit, with dirty-handle release as a forcing event**. The rejected
+alternative was **B, one snapshot per POSIX mutation** (today's
+behaviour), which leaves the fixed per-snapshot overhead term in
+`docs/storage-growth.md` unbounded. Release closes the window
+because otherwise open/write/close churn defeats most of the
+coalescing and the storage-growth term stays proportional to file
+count rather than save events. No bounded idle window in v0.3: a
+timer would commit without a caller-invoked durability boundary.
+Namespace operations are folding forcing events; submissions that
+resolve to no change submit and force nothing. Full options,
+reasoning, and decider in `nostr:nevent1qqsgsh7jz4em9k8mzu9v46dyrsgpcvqlrm4ematxz3lra4r8zuyenwspz9mhxue69uhkwunpwdczuap49eehgu8xt8t`
+(republish of
+`nostr:nevent1qqspp78nadn9vyghn7hak7guydzxwquvy4av83qxc6hha476ky2lhlgpz9mhxue69uhkwunpwdczuap49eehgkxrkd3`).

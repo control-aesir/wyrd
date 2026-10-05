@@ -34,6 +34,15 @@ version say exactly what changed.
   baseline) plus per-area `cargo fast-*` shortcuts in
   `.cargo/config.toml`. The existing default profile is now documented
   as the PR gate; no test was added, removed, or modified.
+- Normative DG-4 retention/refusal contract in `docs/storage-growth.md`
+  with the authorization half as `docs/trust.md` T18: serving members and
+  vaults may decline to retain what an authorized member authored, at two
+  enforcement points (pre-admission gate on the receive path; residency
+  refusal after durability, before announcement). Eviction and
+  unbounded-growth-as-contract are refused for v0.3. Decision only; neither
+  ceiling is enforced yet and no behavior changes. Enforcement, the
+  `RetainedBytes` decrement prerequisite, and the acceptance tests are the
+  implementation follow-up gated on this artefact.
 
 ## [0.2.0-alpha]
 

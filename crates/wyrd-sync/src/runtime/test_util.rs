@@ -82,7 +82,6 @@ static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(unix)]
 impl UmaskGuard {
-    #[cfg(unix)]
     #[allow(unsafe_code)]
     pub(crate) fn set(mask: u32) -> Self {
         let lock = UMASK_LOCK.lock().unwrap();

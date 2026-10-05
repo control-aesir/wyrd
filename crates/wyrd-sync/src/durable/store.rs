@@ -6,7 +6,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,12 +105,12 @@ pub(crate) const SECRET_FILE_MODE: u32 = 0o600;
 /// id, public by construction. The `open` mode is a ceiling masked by
 /// the umask, so a strict umask lands a stricter file — never a
 /// looser one.
-pub(crate) const DRIVE_FILE_MODE: u32 = 0o644;
+const DRIVE_FILE_MODE: u32 = 0o644;
 /// Owner-only mode for drive state directories. Unix-only in
 /// practice (every use sits in a `#[cfg(unix)]` arm); referenced on
 /// all platforms so the contract reads in one place.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) const DRIVE_DIR_MODE: u32 = 0o700;
+const DRIVE_DIR_MODE: u32 = 0o700;
 
 /// Create the atomic-write temp file with an explicit Unix mode, so a
 /// crash between creation and rename never leaves a world-readable
@@ -153,7 +153,7 @@ pub(crate) fn create_mode_temp(
 /// Unix `mode`, see [`create_mode_temp`]) + `fsync` + rename +
 /// directory `fsync`. The rename preserves the temp's mode, so no
 /// post-rename chmod — and no chmod-failure-after-rename outcome —
-/// exists. custody and identity files flow through here; operational
+/// exists. Custody and identity files flow through here; operational
 /// state (`CURRENT`, commits) keeps flowing through [`atomic_write`]:
 /// creation hardens, opening never chmods.
 pub(crate) fn atomic_write_mode(
@@ -171,14 +171,16 @@ pub(crate) fn atomic_write_mode(
     fsync_dir(dir)
 }
 
-/// Create a drive state directory, restricting the leaf to
-/// owner-only (`0o700`) when this call established it, so the result
-/// never depends on the process umask. Freshness comes from the create
-/// call itself (`AlreadyExists` means a concurrent creator won), not
-/// from a preceding stat, so no check-then-act gap exists. A
-/// pre-existing directory is left untouched, and parents above the
-/// leaf are the operator's business and keep their modes: creation
-/// hardens, opening never chmods. Non-Unix falls back to plain
+/// Create a drive state directory, created at owner-only (`0o700`)
+/// when this call establishes it, so the result never depends on the
+/// process umask. The mode is set on the create call itself
+/// (`DirBuilder::mode`), not chmod'ed after: no window exists where
+/// the leaf sits at the umask mode. Freshness comes from the create
+/// call (`AlreadyExists` means a concurrent creator won), not from a
+/// preceding stat, so no check-then-act gap exists. A pre-existing
+/// directory is left untouched, and parents above the leaf are the
+/// operator's business and keep their modes: creation hardens,
+/// opening never chmods. Non-Unix falls back to plain
 /// `create_dir_all` (see `docs/cli.md`).
 pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
@@ -188,11 +190,10 @@ pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
         if path.is_dir() {
             return Ok(());
         }
-        match fs::create_dir(path) {
-            Ok(()) => {
-                fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
-                return Ok(());
-            }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(DRIVE_DIR_MODE);
+        match builder.create(path) {
+            Ok(()) => return Ok(()),
             // A concurrent creator won the leaf — but `AlreadyExists`
             // is also a regular file or dangling symlink, so confirm
             // it is a directory and fail at the call that names it
@@ -206,11 +207,11 @@ pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        // Parents were missing: create the chain, then restrict the
-        // leaf. A concurrent creator winning the leaf in the gap keeps
-        // the lock-held fresh-DRIVE restriction (drive dirs) as the
-        // backstop — and this call only ever narrows modes, never
-        // widens them.
+        // Parents were missing: create the chain at the operator's
+        // modes, then restrict the leaf. A concurrent creator winning
+        // the leaf in the gap keeps the lock-held fresh-DRIVE
+        // restriction (drive dirs) as the backstop — and this call only
+        // ever narrows modes, never widens them.
         fs::create_dir_all(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
         Ok(())

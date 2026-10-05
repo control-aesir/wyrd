@@ -128,6 +128,15 @@ Releases are not required to write every format they read:
     rather than skipping, so tag allocation is checked against the
     full set, not against the last value.
 
+    Reconciliation retirement follows the same pattern. The
+    `*Reconciled` facts the forget contract (`sync-and-peers.md`
+    DG-3) retires obligations with are new record tags — one per
+    obligation class — each naming the obligation and the recipient
+    statement it retired against, allocated against the full tag set
+    like `0x16`. An old node skips them and keeps the obligation
+    pending, which is the safe direction: it retries what a new
+    node has retired, rather than forgetting what it never proved.
+
     The tag boundary is pinned by
     `the_replacement_tag_is_a_clean_upgrade_boundary`: `0x16` sits
     outside the enumerated pre-replacement set, a commit carrying a

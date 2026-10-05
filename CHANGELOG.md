@@ -29,6 +29,15 @@ version say exactly what changed.
 
 ### Added
 
+- Normative DG-3 control-message recovery / forget contract in
+  `docs/sync-and-peers.md`: retire an obligation only on durable
+  evidence the recipient's state subsumes it (per-class predicates),
+  recipient-originated reconciliation pull, bounded-retention
+  assumption, seven normative acceptance scenarios. Qualifies the
+  "relay retains every unacked envelope" sentence in
+  `docs/crash-consistency.md` and records the `*Reconciled` fact-tag
+  pattern in `docs/upgrade-contract.md`. Decision only; no behavior
+  change. Implementation is gated on this artefact.
 - Normative DG-1 mutation/commit boundary table in `docs/write-path.md`:
   one snapshot per commit-forcing event (folding all pending), dirty-handle
   release as a forcing event, namespace operations as folding forcing events,

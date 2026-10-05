@@ -539,15 +539,21 @@ property, and it is the strongest practical argument for open question 1:
 until peers have a refusal right, a local quota is a lever a remote member
 can pull.
 
-**The overshoot is one whole commit.** The check compares bytes already
-retained, so a commit that starts one byte under the quota is admitted
-and can take the total to `quota + N` for whatever that commit retains. On
-the author path `N` is the handle's buffered image plus the tree nodes
-rebuilt on the changed path: 64 MiB of write buffer
-(`MAX_WRITE_BUFFER_BYTES`) plus namespace-sized nodes, which are the
-separate step-1 row in the fixed-cost table above and do not scale with
-the write. On the fetch path nothing bounds `N` at all. No commit is ever
-refused *for crossing* the ceiling — only once it is already over.
+**The overshoot is one whole commit.** The fold gate compares bytes
+already retained plus a conservative estimate of the pending set's new
+retention — full image lengths, while dedup and chunking only reduce
+what the store keeps — before the commit's first write
+(`docs/write-path.md`, rule 6). A fold that fits the estimate is
+admitted and can take the total to `quota + N` for whatever that fold
+actually retains, so the overshoot is bounded by less than the
+estimate, never by an unbounded backlog. On the author path `N` is the
+handle's buffered image plus the tree nodes rebuilt on the changed
+path: 64 MiB of write buffer (`MAX_WRITE_BUFFER_BYTES`) plus
+namespace-sized nodes, which are the separate step-1 row in the
+fixed-cost table above and do not scale with the write. On the fetch
+path nothing bounds `N` at all. A commit is refused when count plus
+estimate is already over — which, because the estimate over-counts,
+includes rewrites that would retain nothing new.
 
 **And it is one-way absent a removal path.** Nothing lowers the count
 except a durable removal bookkept through `RetainedBytes::subtract`:
@@ -562,7 +568,9 @@ take a local write, and raising the quota is the only remedy short of
 a removal. At the ceiling every local mutation is refused, including
 ones that would retain nothing new — unlike a real full disk, where a
 zero-byte write still succeeds. A device back under its ceiling by way
-of a removal accepts writes again, including zero-byte-retaining ones.
+of a removal accepts writes again — with room for the fold estimate,
+not just the count: a rewrite needs count plus its full image length
+to fit, even when dedup means it retains nothing.
 
 **A refusal costs the open handle its buffer.** The commit takes the
 handle's buffered image before submitting, so an `ENOSPC` at `fsync`
@@ -612,13 +620,15 @@ handles, not just the write in hand.
       named there, not a new protocol surface — there is no wire refusal
       signal in v0.3 — and until it is enforced the interference stands
       as documented, leaving the quota to local-write protection only.
-    - **In-flight accounting.** Documented, not implemented. The check
-      compares bytes already retained, so the effective ceiling is the
-      quota plus whatever the next admitted commit retains — one whole
-      commit of overshoot, and no commit is ever refused *for crossing*
-      the ceiling, only once already over. Reserving the in-flight
-      delta up front would require predicting a commit's retention
-      before step 1 runs; the overshoot bound is pinned by
+    - **In-flight accounting.** Documented, not implemented. The fold
+      gate compares bytes already retained plus a conservative
+      estimate of the pending set (full image lengths), so the
+      effective ceiling is the quota plus whatever the next admitted
+      fold actually retains — one whole commit of overshoot, bounded by
+      less than the estimate. Up-front reservation in the strict sense
+      would require predicting exact retention before step 1 runs; the
+      estimate is the prediction, deliberately over-counting. The
+      overshoot bound is pinned by
       `a_removal_below_the_ceiling_readmits_local_writes` (at-ceiling
       refusal, then admission, overshoot, and refusal again).
     - **A startup cross-check.** Settled. `check_retained_ceiling`

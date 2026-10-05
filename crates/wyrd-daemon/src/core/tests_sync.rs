@@ -164,8 +164,9 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
         )
     });
 
-    // At the ceiling the commit is refused, including one that would
-    // retain nothing new — the documented at-ceiling behaviour.
+    // At the ceiling the commit is refused: count plus the fold
+    // gate's image-length estimate is already over, before any byte
+    // is written — the documented at-ceiling behaviour.
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, b"x")
@@ -181,11 +182,19 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     // file's current bytes addresses content the store already holds,
     // so the count does not move. Unlike a real full disk, the ceiling
     // compares the count, not the write.
-    retained.subtract(1);
-    let under_ceiling = retained.get();
+    //
+    // Headroom must cover the fold gate's conservative estimate, not
+    // just the count: the gate adds full image lengths before the
+    // commit's first write (`enforce_retained_quota_with`), so even a
+    // no-op rewrite is refused unless count + its length fits. The
+    // estimate over-counts by construction — dedup still retains
+    // nothing — which is what the count assertion below distinguishes
+    // from a real charge.
     let reader = backend.open_at("base.txt").unwrap();
     let current = backend.read_handle(reader, 0, 4096).unwrap();
     backend.release_handle(reader).unwrap();
+    retained.subtract(current.len() as u64 + 1);
+    let under_ceiling = retained.get();
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, &current)
@@ -199,11 +208,10 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
         "a no-op rewrite charges nothing: the pin is the count, not the admission"
     );
 
-    // New bytes are admitted too — the device is still under its
-    // ceiling — and the admitted commit takes it back over: no commit
-    // is ever refused for crossing the ceiling, only once already
-    // over. The next commit is refused, so the effective ceiling is
-    // the quota plus one admitted commit.
+    // New bytes are admitted too — count plus estimate still fits —
+    // and the admitted commit takes the count back over. The next
+    // commit is refused, so the effective ceiling is the quota plus
+    // one admitted fold, bounded by less than its estimate.
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, b"x")
@@ -213,9 +221,8 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
         .expect("below the ceiling new bytes are admitted");
 
     // The admitted commit retained new bytes, so the device is back
-    // over its ceiling — and the *next* commit is refused. No commit is
-    // ever refused for crossing the ceiling, only once already over:
-    // the effective ceiling is the quota plus one admitted commit.
+    // over its ceiling — and the *next* commit is refused. The
+    // overshoot is one admitted fold, then refusal resumes.
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, b"y")

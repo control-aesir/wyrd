@@ -4,9 +4,10 @@
 # outright. Use `cargo nextest run` (or `cargo t`) instead.
 [alias]
 t = "nextest run"
-# Local-lane shortcuts: cheap deterministic tests for one stack area.
-# Each maps to the crate closure that area's edits can actually affect
-# (wyrd-contracts is excluded everywhere here; it is PR-gate evidence).
+# Local-lane shortcuts: cheap deterministic tests for one stack area at
+# a time. Each alias selects the crates named: a deliberate per-crate
+# shortcut, not the reverse-dependency closure (a wyrd-sync edit can
+# reach wyrd-core/wyrd-daemon/wyrd-cli, which fast-sync does not run).
 # `fast-all` is the whole workspace under the local profile; the PR gate
 # stays `cargo nextest run` (default profile) plus `--profile slow` on
 # master CI.

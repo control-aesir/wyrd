@@ -69,9 +69,9 @@ impl ReconciliationEvidence {
     /// capability epoch is contained in the other evidence. The
     /// conservative direction — a stored statement that claims more
     /// than the base facts hold is an over-claim, and over-claims
-    /// retire what was never evidenced. Load refuses them (see
-    /// `DurableStore::load`); under-claims stay committable and cost
-    /// only retransmission.
+    /// retire what was never evidenced. Load drops them with a
+    /// warning (see `DurableStore::load`); under-claims stay
+    /// committable and cost only retransmission.
     pub fn is_subset_of(&self, other: &ReconciliationEvidence) -> bool {
         self.transitions.is_subset(&other.transitions)
             && self.snapshots.is_subset(&other.snapshots)

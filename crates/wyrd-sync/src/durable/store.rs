@@ -9,7 +9,8 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use wyrd_format::{DeviceId, DriveId};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -72,11 +73,22 @@ pub struct DurableStore {
     /// tests prove one snapshot per pass instead of one per pair.
     #[cfg(test)]
     rebuilds: AtomicU64,
+    /// First-seen latch for the over-claim warning in `load`: the
+    /// bucket is rebuilt from disk on every call and `load` sits
+    /// behind the convergence loop, so a persistent bad record must
+    /// warn loudly once and debug after — never once per iteration.
+    overclaim_warned: AtomicBool,
 }
 
 /// Crate-visible for the raw-commit test seam alongside `atomic_write`.
 pub(crate) fn commit_name(seq: u64) -> String {
     format!("{seq:016x}.commit")
+}
+
+/// Hex for log lines that must name an identity (digests have no
+/// Display; decimal byte lists are not diagnosable).
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
@@ -315,6 +327,7 @@ impl DurableStore {
             _lock: lock,
             #[cfg(test)]
             rebuilds: AtomicU64::new(0),
+            overclaim_warned: AtomicBool::new(false),
         })
     }
 
@@ -600,14 +613,26 @@ impl DurableStore {
             return Ok(facts);
         }
         let derived = ReconciliationView::derive(&facts);
-        let stated = facts.reconciliation_views.len();
-        facts
-            .reconciliation_views
-            .retain(|view| view.is_subset_of(derived.evidence()));
-        let dropped = stated - facts.reconciliation_views.len();
-        if dropped > 0 {
+        let views = std::mem::take(&mut facts.reconciliation_views);
+        let mut dropped = Vec::new();
+        for view in views {
+            if view.is_subset_of(derived.evidence()) {
+                facts.reconciliation_views.push(view);
+            } else {
+                dropped.push(view.digest());
+            }
+        }
+        facts.dropped_reconciliation_views = dropped.len();
+        // First-seen latch: the same record re-decodes on every load
+        // behind the convergence loop, so warn loudly once and stay
+        // quiet after. The digests name the offending statements (a
+        // failure carries its identity); the count on `LoadedFacts`
+        // carries the signal to callers.
+        if !dropped.is_empty() && !self.overclaim_warned.swap(true, Ordering::SeqCst) {
+            let digests: Vec<String> = dropped.iter().map(hex32).collect();
             tracing::warn!(
-                dropped,
+                dropped = dropped.len(),
+                statements = ?digests,
                 "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
             );
         }

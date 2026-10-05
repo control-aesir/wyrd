@@ -27,7 +27,12 @@ visible iff `seq <= CURRENT`; replay verifies the hash chain over
 `1..=CURRENT`. A torn commit returns `Ok` with nothing durable.
 Pinned by `crash_matrix_never_hybrid` (all eight stages: reopen sees
 the before-state XOR the full batch, never a hybrid) and
-`orphan_files_are_ignored` (`durable/tests.rs`).
+`orphan_files_are_ignored` (`durable/tests.rs`). One tag is not
+verbatim: a stated reconciliation view (`0x18`) whose evidence is not
+a per-class subset of the tip derivation is dropped at load with a
+warning instead of replayed — the claim fails closed while the store
+stays open — so the replayed projection can be narrower than the
+committed log by exactly the refused statements.
 
 ## Membership authoring
 

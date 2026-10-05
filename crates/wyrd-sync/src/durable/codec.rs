@@ -429,7 +429,8 @@ pub(super) fn encode_fact(
 /// Encode a stated reconciliation view to its record bytes:
 /// counted sections in sorted-set order, so two views over the same
 /// evidence encode byte-identically. Crate-visible: the stated-view
-/// digest (local audit identity) hashes these exact bytes.
+/// digest (local audit identity) hashes the ceiling-free canonical
+/// bytes below, never this ceiling-checked record.
 ///
 /// Each section is bounded by `MAX_RECORDS_PER_COMMIT`, mirroring the
 /// commit's record ceiling: a statement larger than the largest
@@ -464,6 +465,12 @@ pub(super) fn encode_reconciliation_view(
 /// shared encoding behind both the record and the digest. Total —
 /// truncation would be a different encoding, not a bounded one.
 pub(super) fn encode_reconciliation_view_canonical(view: &ReconciliationEvidence) -> Vec<u8> {
+    // The one implicit bound in the "total" encoding: below it the
+    // cast is exact, and 2^32 entries would be 137 GiB of ids in a
+    // single set — unreachable, but stated rather than silent.
+    debug_assert!(view.transitions.len() <= u32::MAX as usize);
+    debug_assert!(view.snapshots.len() <= u32::MAX as usize);
+    debug_assert!(view.capabilities.len() <= u32::MAX as usize);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(view.transitions.len() as u32).to_le_bytes());
     for id in &view.transitions {

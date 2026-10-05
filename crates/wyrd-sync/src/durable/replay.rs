@@ -89,6 +89,13 @@ pub struct LoadedFacts {
     /// ([`ReconciliationView`](super::ReconciliationView)) ignores
     /// this bucket, so stating a view never changes the derived view.
     pub reconciliation_views: Vec<ReconciliationEvidence>,
+    /// Statements load dropped: committed but not a per-class subset
+    /// of the tip derivation, so refused as evidence and never
+    /// replayed. The programmatic signal for a refused statement —
+    /// without it, an older statement and a dropped one are
+    /// indistinguishable to 21b, which would silently under-claim
+    /// forever. The log names the digests; this names the count.
+    pub dropped_reconciliation_views: usize,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 

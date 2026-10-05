@@ -1652,6 +1652,10 @@ fn reconciliation_view_replays_to_the_same_view() {
         expected.evidence(),
         "derivation is stable across stating the view"
     );
+    assert_eq!(
+        loaded.dropped_reconciliation_views, 0,
+        "an honest statement is never dropped"
+    );
 }
 
 /// A torn view commit leaves the previous view, never a partial one:
@@ -1817,6 +1821,10 @@ fn reconciliation_over_claim_is_dropped_not_loaded() {
         "the honest statement replays; the over-claim never reaches the bucket"
     );
     assert_eq!(
+        loaded.dropped_reconciliation_views, 1,
+        "the drop is visible to callers, so 21b can account for the refused statement"
+    );
+    assert_eq!(
         loaded
             .latest_stated_view()
             .expect("a view was stated")
@@ -1944,9 +1952,8 @@ fn reconciliation_section_ceilings_hold_both_sides() {
     use crate::durable::codec::encode_fact;
     let mut huge = ReconciliationEvidence::default();
     for n in 0..MAX_RECORDS_PER_COMMIT + 1 {
-        let mut id = [0u8; 32];
-        id[0..8].copy_from_slice(&(n as u64).to_le_bytes());
-        huge.transitions.insert(TransitionId::from_bytes(id));
+        huge.transitions
+            .insert(TransitionId::from_bytes(id_of(n as u64)));
     }
     let error = encode_fact(&[0u8; 32], &drive(), &Fact::ReconciliationView(huge)).unwrap_err();
     assert!(
@@ -2009,9 +2016,8 @@ fn reconciliation_digest_holds_above_the_section_ceiling() {
     use super::codec::MAX_RECORDS_PER_COMMIT;
     let mut huge = ReconciliationEvidence::default();
     for n in 0..MAX_RECORDS_PER_COMMIT + 1 {
-        let mut id = [0u8; 32];
-        id[0..8].copy_from_slice(&(n as u64).to_le_bytes());
-        huge.transitions.insert(TransitionId::from_bytes(id));
+        huge.transitions
+            .insert(TransitionId::from_bytes(id_of(n as u64)));
     }
     let digest = huge.digest();
     let mut smaller = huge.clone();

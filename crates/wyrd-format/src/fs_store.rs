@@ -56,10 +56,18 @@ pub enum FsStoreError {
     /// The store is not writable by this process.
     #[error("store not writable: {0}")]
     PermissionDenied(String),
-    #[error("identity mismatch: expected {expected}, derived {derived}")]
-    IdentityMismatch { expected: String, derived: String },
-    #[error("stored bytes do not hash back to their address {expected}")]
-    Corrupt { expected: String },
+    /// Stored bytes do not match the address they were read from: a
+    /// foreign preimage on `insert_verified`, bitrot under the live
+    /// name on `get`. Carries no identity by decision (see the
+    /// no-identity exception in `docs/error-conventions.md`): a
+    /// `Display`/`Debug` impl cannot know which trust position
+    /// renders it, so there is nothing to redact here.
+    #[error("identity mismatch: stored bytes do not match their address")]
+    IdentityMismatch,
+    /// Stored bytes do not hash back to their address. Same
+    /// no-identity rule as [`FsStoreError::IdentityMismatch`].
+    #[error("stored bytes do not hash back to their address")]
+    Corrupt,
 }
 
 impl StoreError for FsStoreError {
@@ -67,9 +75,9 @@ impl StoreError for FsStoreError {
         match self {
             FsStoreError::StorageFull(_) => StoreFailure::StorageFull,
             FsStoreError::PermissionDenied(_) => StoreFailure::PermissionDenied,
-            FsStoreError::Io(_)
-            | FsStoreError::IdentityMismatch { .. }
-            | FsStoreError::Corrupt { .. } => StoreFailure::Transient,
+            FsStoreError::Io(_) | FsStoreError::IdentityMismatch | FsStoreError::Corrupt => {
+                StoreFailure::Transient
+            }
         }
     }
 }
@@ -81,13 +89,6 @@ impl FsStoreError {
             StoreFailure::StorageFull => FsStoreError::StorageFull(detail),
             StoreFailure::PermissionDenied => FsStoreError::PermissionDenied(detail),
             StoreFailure::Transient => FsStoreError::Io(detail),
-        }
-    }
-
-    fn mismatch(expected: &ContentId, derived: &ContentId) -> Self {
-        FsStoreError::IdentityMismatch {
-            expected: expected.to_string(),
-            derived: derived.to_string(),
         }
     }
 }
@@ -374,7 +375,7 @@ impl ObjectStore for FsObjectStore {
     ) -> Result<(), Self::Error> {
         let derived = ContentId::derive(kind, data);
         if &derived != expected {
-            return Err(FsStoreError::mismatch(expected, &derived));
+            return Err(FsStoreError::IdentityMismatch);
         }
         self.insert(kind, data)?;
         Ok(())
@@ -389,9 +390,7 @@ impl ObjectStore for FsObjectStore {
         // address. Bitrot under the live name fails closed here, never
         // served to a caller.
         if ContentId::derive(kind, &bytes) != *id {
-            return Err(FsStoreError::Corrupt {
-                expected: id.to_string(),
-            });
+            return Err(FsStoreError::Corrupt);
         }
         Ok(Some(bytes))
     }
@@ -604,10 +603,73 @@ mod tests {
             .insert_verified(ObjectKind::Chunk, &expected, b"these bytes")
             .unwrap_err();
         assert!(
-            matches!(err, FsStoreError::IdentityMismatch { .. }),
+            matches!(err, FsStoreError::IdentityMismatch),
             "unexpected error: {err:?}"
         );
         assert!(!store.has(&expected).unwrap());
+        remove_scratch(&dir);
+    }
+
+    /// A 64-hex run in a rendered line is a leaked identity: every id
+    /// type renders as 64 lowercase hex, so any run that long in an
+    /// operator-visible string is a secret on the wrong surface,
+    /// whatever its kind.
+    fn contains_hex_run(text: &str) -> bool {
+        let mut run = 0;
+        for byte in text.bytes() {
+            if byte.is_ascii_hexdigit() {
+                run += 1;
+                if run >= 64 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    /// Error rendering never stringifies ContentIds: the identity
+    /// violations carry no identity (concealment is absence), so no
+    /// `Debug` or `Display` of a real failure can name the object it
+    /// refused. Fails if either variant ever carries an id again —
+    /// which is the point.
+    #[test]
+    fn error_rendering_does_not_stringify_content_ids() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = ContentId::derive(ObjectKind::Chunk, b"bitrot target");
+        store.insert(ObjectKind::Chunk, b"bitrot target").unwrap();
+        // Bitrot under the live name: the next read fails closed.
+        fs::write(
+            store.path_for(ObjectKind::Chunk, &id),
+            b"tampered bytes here",
+        )
+        .unwrap();
+        let corrupt = store.get(&id).unwrap_err();
+        assert!(
+            matches!(corrupt, FsStoreError::Corrupt),
+            "unexpected error: {corrupt:?}"
+        );
+        for rendered in [format!("{corrupt}"), format!("{corrupt:?}")] {
+            assert!(
+                !contains_hex_run(&rendered),
+                "corrupt error names its object: {rendered}"
+            );
+        }
+        let mismatch = store
+            .insert_verified(ObjectKind::Chunk, &id, b"foreign preimage")
+            .unwrap_err();
+        assert!(
+            matches!(mismatch, FsStoreError::IdentityMismatch),
+            "unexpected error: {mismatch:?}"
+        );
+        for rendered in [format!("{mismatch}"), format!("{mismatch:?}")] {
+            assert!(
+                !contains_hex_run(&rendered),
+                "mismatch error names its object: {rendered}"
+            );
+        }
         remove_scratch(&dir);
     }
 
@@ -761,7 +823,7 @@ mod tests {
         fs::write(store.path_for(ObjectKind::Chunk, &id), b"tampered").unwrap();
         let err = store.get(&id).unwrap_err();
         assert!(
-            matches!(err, FsStoreError::Corrupt { .. }),
+            matches!(err, FsStoreError::Corrupt),
             "unexpected error: {err:?}"
         );
         remove_scratch(&dir);

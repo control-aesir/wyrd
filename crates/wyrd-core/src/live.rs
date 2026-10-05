@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
 use crate::mutation::{
-    FileIdentity, FoldDisposition, FoldForcerOutcome, FoldMember, MutationBatch, MutationError,
-    MutationKind, MutationOutcome, MutationQueue,
+    CommitSource, FileIdentity, FoldDisposition, FoldForcerOutcome, FoldMember, MutationBatch,
+    MutationError, MutationKind, MutationOutcome, MutationQueue, WriteStats,
 };
 use crate::projection::{Projection, SharedProjection};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
@@ -162,6 +162,10 @@ pub struct SyncReport {
     pub fetched: ExecuteReport,
     /// Whether the pass published a new projection generation.
     pub published: bool,
+    /// Outbound sends the pass's publication committed (announcements
+    /// and mailbox deliveries): counted here instead of dropped into
+    /// the debug log so run totals can attribute sync load per pass.
+    pub sent: usize,
     /// The served generation after the pass (bumped exactly when
     /// `published`).
     pub generation: u64,
@@ -1322,6 +1326,7 @@ where
                 drained,
                 fetched,
                 published: false,
+                sent: 0,
                 generation,
                 pending_heads,
             });
@@ -1363,6 +1368,7 @@ where
                 drained,
                 fetched,
                 published: false,
+                sent,
                 generation,
                 pending_heads,
             });
@@ -1437,6 +1443,7 @@ where
             drained,
             fetched,
             published: true,
+            sent,
             generation: generation + 1,
             pending_heads,
         })
@@ -1554,6 +1561,8 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
+                    CommitSource::from(kind),
+                    &self.mutations,
                 )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(outcome)
@@ -1573,6 +1582,8 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
+                    CommitSource::from(kind),
+                    &self.mutations,
                 )?;
                 Ok(outcome)
             }
@@ -1589,6 +1600,8 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
+                    CommitSource::from(kind),
+                    &self.mutations,
                 )?;
                 Ok(outcome)
             }
@@ -1607,6 +1620,8 @@ where
                         &*self.store.read().map_err(|_| MutationError::Lock)?,
                         root,
                         &heads,
+                        CommitSource::from(kind),
+                        &self.mutations,
                     )?;
                 }
                 Ok(outcome)
@@ -1620,6 +1635,8 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
+                    CommitSource::from(kind),
+                    &self.mutations,
                 )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(outcome)
@@ -1633,6 +1650,8 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
+                    CommitSource::from(kind),
+                    &self.mutations,
                 )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
                 Ok(outcome)
@@ -1648,6 +1667,8 @@ where
                         &*self.store.read().map_err(|_| MutationError::Lock)?,
                         root,
                         &heads,
+                        CommitSource::from(kind),
+                        &self.mutations,
                     )?;
                     self.invalidate_parent_for_namespace_mutation(kind);
                 }
@@ -1664,6 +1685,8 @@ where
                         &*self.store.read().map_err(|_| MutationError::Lock)?,
                         root,
                         &heads,
+                        CommitSource::from(kind),
+                        &self.mutations,
                     )?;
                 }
                 // The identity the mutation landed on, so an
@@ -2260,7 +2283,16 @@ where
         // surviving member changed the tree.
         if evolving != start {
             let store = self.store.read().map_err(|_| MutationError::Lock)?;
-            Self::author_traced(&mut self.engine, &*store, evolving, &heads)?;
+            Self::author_traced(
+                &mut self.engine,
+                &*store,
+                evolving,
+                &heads,
+                // The seam's own class: a fold has members, not one
+                // kind to project, so the literal stays.
+                CommitSource::Fold,
+                &self.mutations,
+            )?;
             for kind in &applied_namespaces {
                 self.invalidate_parent_for_namespace_mutation(kind);
             }
@@ -2312,12 +2344,14 @@ where
         store: &S,
         root: ContentId,
         heads: &[AuthorizedSnapshot],
+        source: CommitSource,
+        queue: &MutationQueue,
     ) -> Result<AuthorizedSnapshot, MutationError>
     where
         S: ObjectStore,
         S::Error: std::fmt::Debug,
     {
-        engine.author_snapshot(store, root).map_err(|error| {
+        let snapshot = engine.author_snapshot(store, root).map_err(|error| {
             tracing::debug!(error = ?error, "mutation authoring refused");
             match error {
                 EngineError::ChunkUnavailable(chunk) => MutationError::NeedContent {
@@ -2326,7 +2360,11 @@ where
                 },
                 error => authoring_error(error),
             }
-        })
+        })?;
+        // The single choke point every authored snapshot passes, so
+        // the operator count is exact by construction.
+        queue.note_snapshot(source);
+        Ok(snapshot)
     }
 
     /// Evaluate the current eligible heads against an optional pin:
@@ -2869,6 +2907,13 @@ where
     /// teardown joins).
     pub fn mutations(&self) -> &Arc<MutationQueue> {
         &self.mutations
+    }
+
+    /// Point-in-time copy of the lifetime write-path totals for the
+    /// operator surface: snapshot rate, source breakdown,
+    /// admission-to-commit latency. Counters only, safe to render.
+    pub fn write_stats(&self) -> WriteStats {
+        self.mutations.write_stats()
     }
 
     /// The demand registry backends register through: the loop

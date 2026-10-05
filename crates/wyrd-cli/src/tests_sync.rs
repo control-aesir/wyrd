@@ -1,8 +1,10 @@
 use super::tests_harness::{write_secret, TempDir};
 use super::*;
+use wyrd_core::mutation::{FoldMember, MutationKind};
 use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
+use wyrd_sync::runtime::{DrainReport, ExecuteReport};
 use wyrd_sync::transport::mailbox::{
     Delivery, DeliveryId, Disposition, MailboxEnvelope, MailboxError, SendReport,
 };
@@ -498,16 +500,27 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         accepted: 0,
         duplicates: 0,
         deferred: 0,
+        deferred_unseen: 0,
+        deferred_status_blocked: 0,
+        deferred_shed: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        transport_errors: 0,
+        deadlines: 0,
+        missing: 0,
+        invalid: 0,
+        unavailable_keys: 0,
+        local_failures: 0,
+        sent: 0,
         outcome,
         pending: 0,
         unfetchable_heads: 0,
         mailbox,
+        write: WriteStats::default(),
     }
 }
 
@@ -701,16 +714,27 @@ fn run_outcome_maps_to_success_or_incomplete() {
         accepted: 0,
         duplicates: 0,
         deferred: 0,
+        deferred_unseen: 0,
+        deferred_status_blocked: 0,
+        deferred_shed: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        transport_errors: 0,
+        deadlines: 0,
+        missing: 0,
+        invalid: 0,
+        unavailable_keys: 0,
+        local_failures: 0,
+        sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
+        write: WriteStats::default(),
     };
     assert!(run_outcome_error(&quiet).is_ok());
     let stalled = SyncRunReport {
@@ -718,16 +742,27 @@ fn run_outcome_maps_to_success_or_incomplete() {
         accepted: 0,
         duplicates: 0,
         deferred: 0,
+        deferred_unseen: 0,
+        deferred_status_blocked: 0,
+        deferred_shed: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        transport_errors: 0,
+        deadlines: 0,
+        missing: 0,
+        invalid: 0,
+        unavailable_keys: 0,
+        local_failures: 0,
+        sent: 0,
         outcome: RunOutcome::RemoteStalled,
         pending: 0,
         unfetchable_heads: 1,
         mailbox: Some(fixture_mailbox()),
+        write: WriteStats::default(),
     };
     assert!(run_outcome_error(&stalled).is_ok());
     let capped = SyncRunReport {
@@ -735,16 +770,27 @@ fn run_outcome_maps_to_success_or_incomplete() {
         accepted: 0,
         duplicates: 0,
         deferred: 0,
+        deferred_unseen: 0,
+        deferred_status_blocked: 0,
+        deferred_shed: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        transport_errors: 0,
+        deadlines: 0,
+        missing: 0,
+        invalid: 0,
+        unavailable_keys: 0,
+        local_failures: 0,
+        sent: 0,
         outcome: RunOutcome::PassLimit,
         pending: 4,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
+        write: WriteStats::default(),
     };
     let error = run_outcome_error(&capped).unwrap_err();
     assert!(
@@ -972,4 +1018,384 @@ fn sync_now_with_relay_and_offline_is_a_usage_error() {
         message.contains("--offline") && message.contains("--relay"),
         "refusal names the contradictory combination: {message}"
     );
+}
+
+/// Every counter the report carries accumulates across every pass —
+/// including the quiet-confirmation pass, which is a real pass with
+/// real intake, not a free re-read. Twelve synthetic passes with
+/// distinct per-pass values pin the whole accumulator: a counter
+/// added to the struct but forgotten here fails this test by
+/// construction.
+#[test]
+fn sync_run_report_accumulates_every_pass_not_just_the_last() {
+    let mut report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    for _ in 0..12 {
+        report.accumulate(&SyncReport {
+            drained: DrainReport {
+                accepted: 1,
+                duplicates: 2,
+                deferred: 3,
+                deferred_unseen: 1,
+                deferred_status_blocked: 1,
+                deferred_shed: 1,
+                skipped: 4,
+                discarded: 5,
+            },
+            fetched: ExecuteReport {
+                manifests: 6,
+                snapshot_bodies: 7,
+                objects: 8,
+                unfulfilled: 9,
+                transport_errors: 10,
+                deadlines: 11,
+                missing: 12,
+                invalid: 13,
+                unavailable_keys: 14,
+                local_failures: 15,
+            },
+            published: true,
+            sent: 16,
+            generation: 1,
+            pending_heads: 0,
+        });
+    }
+    assert_eq!(report.passes, 3 + 12, "the fixture's 3 plus 12: {report:?}");
+    assert_eq!(report.accepted, 12);
+    assert_eq!(report.duplicates, 24);
+    assert_eq!(report.deferred, 36);
+    assert_eq!(report.deferred_unseen, 12);
+    assert_eq!(report.deferred_status_blocked, 12);
+    assert_eq!(report.deferred_shed, 12);
+    assert_eq!(report.skipped, 48);
+    assert_eq!(report.discarded, 60);
+    assert_eq!(report.manifests, 72);
+    assert_eq!(report.snapshot_bodies, 84);
+    assert_eq!(report.objects, 96);
+    assert_eq!(report.unfulfilled, 108);
+    assert_eq!(report.transport_errors, 120);
+    assert_eq!(report.deadlines, 132);
+    assert_eq!(report.missing, 144);
+    assert_eq!(report.invalid, 156);
+    assert_eq!(report.unavailable_keys, 168);
+    assert_eq!(report.local_failures, 180);
+    assert_eq!(report.sent, 192);
+}
+
+/// A scripted writer produces commits from known sources while a
+/// headless run observes: the run's report names each source's
+/// share, and the render prints the snapshot rate beside them.
+#[test]
+fn sync_now_reports_snapshot_rate_and_commit_source_breakdown() {
+    let temp = TempDir::new();
+    let dir = temp.0.join("drive");
+    std::fs::create_dir_all(&dir).unwrap();
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let engine = Engine::create(dir.clone(), "test-pass", identity).unwrap();
+    let store = MemoryObjectStore::default();
+    let node: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
+        .unwrap();
+    drop(parts);
+    let queue = std::sync::Arc::clone(live.mutations());
+    let mut bulk = Some(MemoryBulkSource::default());
+    let report = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let mut mailbox = NoopMailbox;
+            drive_quiet(&mut live, &mut mailbox, &mut bulk, None)
+        });
+        queue
+            .submit(MutationKind::Mkdir { path: "w1".into() })
+            .expect("first writer commit serves");
+        queue
+            .submit(MutationKind::Mkdir { path: "w2".into() })
+            .expect("second writer commit serves");
+        queue
+            .submit(MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::Mkdir { path: "w3".into() },
+                        forcer: true,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir { path: "w4".into() },
+                        forcer: false,
+                    },
+                ],
+            })
+            .expect("the writer fold commits as one snapshot");
+        handle.join().unwrap().expect("the run converges")
+    });
+    assert_eq!(report.outcome, RunOutcome::Quiet);
+    assert_eq!(
+        report.write.snapshots, 3,
+        "writer commits: {:?}",
+        report.write
+    );
+    assert_eq!(
+        report.write.mkdir, 2,
+        "two direct commits: {:?}",
+        report.write
+    );
+    assert_eq!(report.write.fold, 1, "one fold commit: {:?}", report.write);
+    assert!(
+        report.write.snapshots_per_minute() > 0.0,
+        "a rate over a nonzero run: {:?}",
+        report.write
+    );
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("write path: 3 snapshots"),
+        "the report counts the writer's snapshots: {rendered}"
+    );
+    assert!(
+        rendered.contains("mkdir 2") && rendered.contains("fold 1"),
+        "the report names each source's share: {rendered}"
+    );
+    assert!(rendered.contains("per min"), "{rendered}");
+}
+
+/// The commit seam's latency reaches the rendered line: the seam
+/// itself is bracketed at the queue level
+/// (`completion_accounting_brackets_injected_wait`), so this pins
+/// the report-to-render wiring with a known sample.
+#[test]
+fn sync_now_reports_admission_to_durable_commit_latency() {
+    let mut report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    report.write = WriteStats {
+        snapshots: 1,
+        commits: 1,
+        failures: 0,
+        commit_latency_us_sum: 120_000,
+        commit_latency_us_max: 120_000,
+        commit_file: 1,
+        ..Default::default()
+    };
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("admission-to-commit mean 120000us max 120000us over 1 commits"),
+        "the known sample renders exactly: {rendered}"
+    );
+}
+
+/// The write-path section renders unconditionally, including the
+/// all-zero case: zeros are honest evidence of no writes by that
+/// invocation, and a failures-only run (nothing authored) must still
+/// show its refusal count rather than hide the whole section.
+#[test]
+fn write_path_section_renders_zeros_without_writes() {
+    let report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("write path: 0 snapshots"),
+        "zero snapshots render as zero: {rendered}"
+    );
+    assert!(
+        rendered.contains("over 0 commits (0 failures)"),
+        "zero commits and failures render too: {rendered}"
+    );
+    let mut refused = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    refused.write = WriteStats {
+        failures: 3,
+        ..Default::default()
+    };
+    let rendered = sync_now_render(&refused);
+    assert!(
+        rendered.contains("over 0 commits (3 failures)"),
+        "a failures-only run shows its refusals: {rendered}"
+    );
+}
+
+/// The relay pressure counters reach the operator surface:
+/// saturation recoveries print on the mailbox line (singular and
+/// plural), and a zero count stays silent like the other clauses.
+#[test]
+fn relay_health_counters_reach_the_operator_surface() {
+    let silent = MailboxHealth {
+        saturation_recoveries: 0,
+        ..fixture_blind()
+    };
+    assert!(
+        !mailbox_line(&silent).contains("saturation"),
+        "zero recoveries stay silent: {}",
+        mailbox_line(&silent)
+    );
+    let one = MailboxHealth {
+        saturation_recoveries: 1,
+        ..fixture_blind()
+    };
+    assert!(
+        mailbox_line(&one).contains("1 saturation recovery during the run"),
+        "singular recovery prints: {}",
+        mailbox_line(&one)
+    );
+    let many = MailboxHealth {
+        saturation_recoveries: 2,
+        ..fixture_blind()
+    };
+    assert!(
+        mailbox_line(&many).contains("2 saturation recoveries during the run"),
+        "plural recoveries print: {}",
+        mailbox_line(&many)
+    );
+}
+
+/// A 64-hex run in a rendered line is a leaked identity: every id
+/// type renders as 64 lowercase hex, so any run that long in an
+/// operator line is a secret on the wrong surface, whatever its
+/// kind. Shared by the negative privacy tests below.
+fn contains_hex_run(text: &str) -> bool {
+    let mut run = 0;
+    for byte in text.bytes() {
+        if byte.is_ascii_hexdigit() {
+            run += 1;
+            if run >= 64 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// Adversarial drive for the negative privacy tests: file names
+/// shaped like the secrets the surface must never print — a
+/// ContentId-shaped 64-hex name, a plain distinctive name, and
+/// secret file bytes — authored, run through `drive_quiet`, and
+/// rendered through the whole `sync now` surface. Returns the
+/// rendered report plus the strings that must not appear in it.
+fn adversarial_render() -> (String, String, String, Vec<u8>) {
+    let hexname = "ab".repeat(32);
+    let plain = "plain-sneaky-name".to_string();
+    let secret = b"top-secret-payload-bytes".to_vec();
+    let temp = TempDir::new();
+    let dir = temp.0.join("drive");
+    std::fs::create_dir_all(&dir).unwrap();
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let device_hex = identity.device_id().to_string();
+    let mut engine = Engine::create(dir.clone(), "test-pass", identity).unwrap();
+    let mut bytes = MemoryObjectStore::default();
+    let chunk = bytes.insert(ObjectKind::Chunk, &secret).unwrap();
+    let root = Tree::from_entries(vec![
+        Entry::file(&hexname, secret.len() as u64, false, vec![chunk]).unwrap(),
+        Entry::file(&plain, 1, false, vec![chunk]).unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut bytes)
+    .unwrap();
+    engine.author_snapshot(&bytes, root).unwrap();
+    // The view store holds nothing: the closure is not local, so the
+    // run stalls remote — the report still renders every line under
+    // test.
+    let node: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
+        .unwrap();
+    drop(parts);
+    let mut bulk = Some(MemoryBulkSource::default());
+    let mut report = drive_quiet(&mut live, &mut NoopMailbox, &mut bulk, None).unwrap();
+    report.mailbox = Some(fixture_mailbox());
+    let rendered = sync_now_render(&report);
+    (rendered, hexname, device_hex, secret)
+}
+
+/// No ContentId reaches a rendered run-report line: the drive holds
+/// a ContentId-shaped name and real chunk ids, and the new lines
+/// (write path, deferral split, relay counters) are counts only.
+#[test]
+fn sync_now_output_contains_no_content_ids() {
+    let (rendered, hexname, _, _) = adversarial_render();
+    assert!(
+        !rendered.contains(&hexname),
+        "the ContentId-shaped name never renders: {rendered}"
+    );
+    assert!(
+        !contains_hex_run(&rendered),
+        "no 64-hex run anywhere in the report: {rendered}"
+    );
+}
+
+/// No filesystem path reaches a rendered run-report line: variant
+/// classes and counts, never the names they counted.
+#[test]
+fn sync_now_output_contains_no_paths() {
+    let (rendered, hexname, _, _) = adversarial_render();
+    assert!(
+        !rendered.contains(&hexname) && !rendered.contains("plain-sneaky-name"),
+        "drive names never render: {rendered}"
+    );
+}
+
+/// No membership data reaches a rendered run-report line: neither
+/// the owner's device id nor any transition the run observed.
+#[test]
+fn sync_now_output_contains_no_membership_data() {
+    let (rendered, _, device_hex, _) = adversarial_render();
+    assert!(
+        !rendered.contains(&device_hex),
+        "the device id never renders: {rendered}"
+    );
+    assert!(
+        !contains_hex_run(&rendered),
+        "transition ids are 64-hex too: {rendered}"
+    );
+}
+
+/// File bytes never reach a rendered run-report line: the drive's
+/// secret content is counted (one chunk, N bytes somewhere in the
+/// totals) but never quoted.
+#[test]
+fn sync_now_output_contains_no_secret_bytes() {
+    let (rendered, _, _, secret) = adversarial_render();
+    let secret_text = String::from_utf8_lossy(&secret);
+    assert!(
+        !rendered.contains(secret_text.as_ref()),
+        "file bytes never render: {rendered}"
+    );
+}
+
+/// The trust-position statement ships with the surfaces: the docs
+/// the operator reads state that no vault-position surface exists,
+/// so nobody reads a client surface as a vault one. A grep over
+/// the changed doc file — fails if the statement is ever dropped.
+#[test]
+fn vault_trust_position_is_documented_as_unimplemented() {
+    let reference =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/cli.md"))
+            .expect("the CLI reference reads");
+    assert!(
+        reference.contains("No vault-position diagnostics surface exists"),
+        "the statement pins the missing vault surface"
+    );
+    for never in [
+        "ContentIds",
+        "filesystem paths",
+        "file bytes",
+        "DeviceIds",
+        "membership transition ids",
+    ] {
+        assert!(
+            reference.contains(never),
+            "the never-print list names {never}"
+        );
+    }
+}
+
+/// A live-attached mailbox posture for the pressure-counter tests:
+/// connected, so the line reads live and the recovery clause is
+/// the only variable.
+fn fixture_blind() -> MailboxHealth {
+    MailboxHealth {
+        stream_alive: true,
+        connected_relays: 2,
+        total_relays: 2,
+        saturation_recoveries: 0,
+        supervisor_ticks: 0,
+        stream_recovery_attempts: 0,
+        relay_recovery_attempts: 0,
+        closed_subscriptions: 0,
+    }
 }

@@ -1846,3 +1846,96 @@ fn fold_defers_for_remote_content_and_retries_pinned() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Write-path totals over a scripted writer: one snapshot per
+/// commit counted under its source class, the failure kept out of
+/// the snapshot count, and a nonzero rate over the run.
+#[test]
+fn write_stats_count_snapshots_by_source() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("write-stats");
+    let mut node = live_over_fake(engine, store, &[head]);
+    let queue = Arc::clone(node.mutations());
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let mut mailbox = NoopMailbox;
+            node.run_loop(
+                &mut mailbox,
+                None::<&mut wyrd_sync::bulk::MemoryBulkSource>,
+                &stop,
+                &LiveConfig::default(),
+                &mut |_, _| {},
+            )
+        });
+        queue
+            .submit(MutationKind::Mkdir { path: "d".into() })
+            .expect("mkdir commits");
+        queue
+            .submit(MutationKind::AppendFile {
+                path: "f".into(),
+                content: b"!".to_vec(),
+            })
+            .expect("append commits");
+        queue
+            .submit(MutationKind::SetAttrs {
+                path: "f".into(),
+                size: None,
+                executable: Some(true),
+                base: None,
+            })
+            .expect("setattr commits");
+        queue
+            .submit(MutationKind::Rename {
+                from: "f".into(),
+                to: "g".into(),
+                no_replace: false,
+            })
+            .expect("rename commits");
+        queue
+            .submit(MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::Mkdir { path: "d2".into() },
+                        forcer: true,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir { path: "d3".into() },
+                        forcer: false,
+                    },
+                ],
+            })
+            .expect("fold commits as one snapshot");
+        assert!(
+            queue
+                .submit(MutationKind::Unlink {
+                    path: "nope".into()
+                })
+                .is_err(),
+            "unlink of nothing fails"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap().expect("the loop runs");
+    });
+    let stats = queue.write_stats();
+    assert_eq!(stats.snapshots, 5, "one snapshot per commit: {stats:?}");
+    assert_eq!(stats.commits, 5);
+    assert_eq!(stats.failures, 1, "the failed unlink counts: {stats:?}");
+    assert_eq!(stats.mkdir, 1);
+    assert_eq!(stats.append_file, 1);
+    assert_eq!(stats.set_attrs, 1);
+    assert_eq!(stats.rename, 1);
+    assert_eq!(stats.fold, 1, "the fold counts once as a fold: {stats:?}");
+    assert_eq!(stats.create_file, 0);
+    assert_eq!(stats.commit_file, 0);
+    assert_eq!(stats.unlink, 0);
+    assert_eq!(stats.rmdir, 0);
+    assert!(
+        stats.snapshots_per_minute() > 0.0,
+        "a rate over a nonzero run: {stats:?}"
+    );
+    assert!(
+        stats.commit_latency_us_mean() <= stats.commit_latency_us_max,
+        "mean never exceeds max: {stats:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

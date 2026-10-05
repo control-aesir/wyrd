@@ -32,6 +32,7 @@ fn intake_commits_transitions_and_announcements() {
             deferred: 0,
             skipped: 0,
             discarded: 0,
+            ..Default::default()
         }
     );
     assert_eq!(fixture.engine.current(), 3);

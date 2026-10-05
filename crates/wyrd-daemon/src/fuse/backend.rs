@@ -245,7 +245,10 @@ pub(super) fn errno_of(error: &ViewError) -> fuser::Errno {
 /// Request-level debug probe: opcode + latency + reply errno at
 /// `debug` level, enabled by the mount's `--verbose` flag (the
 /// subscriber filter gates it; at the default `info` level each
-/// dispatch costs one enabled-check).
+/// dispatch costs one enabled-check). The queue depth is captured
+/// at dispatch entry: the backlog the operation waited behind, so
+/// `mount.log` carries queue pressure per dispatch without a
+/// metrics pipeline.
 ///
 /// Construct at dispatch entry; wrap each `reply.error(errno)` as
 /// `reply.error(log.fail(errno))`. Success needs no annotation — the
@@ -257,6 +260,7 @@ pub(super) struct RequestLog {
     opcode: &'static str,
     start: Instant,
     pub(super) err: std::cell::Cell<Option<i32>>,
+    pub(super) depth: std::cell::Cell<usize>,
 }
 
 impl RequestLog {
@@ -265,6 +269,7 @@ impl RequestLog {
             opcode,
             start: Instant::now(),
             err: std::cell::Cell::new(None),
+            depth: std::cell::Cell::new(0),
         }
     }
 
@@ -274,15 +279,52 @@ impl RequestLog {
         self.err.set(Some(i32::from(err)));
         err
     }
+
+    /// Record the mutation-queue backlog observed at dispatch entry
+    /// for the drop log. Backend dispatches set this from the live
+    /// queue; bare uses read zero (nothing queued behind).
+    pub(super) fn set_depth(&self, depth: usize) {
+        self.depth.set(depth);
+    }
 }
 
 impl Drop for RequestLog {
     fn drop(&mut self) {
         let latency_us = self.start.elapsed().as_micros() as u64;
+        let queue_depth = self.depth.get();
         match self.err.get() {
-            Some(errno) => tracing::debug!(opcode = self.opcode, errno, latency_us),
-            None => tracing::debug!(opcode = self.opcode, latency_us),
+            Some(errno) => {
+                tracing::debug!(opcode = self.opcode, errno, latency_us, queue_depth)
+            }
+            None => tracing::debug!(opcode = self.opcode, latency_us, queue_depth),
         }
+    }
+}
+
+/// Dispatch-entry probe construction for [`FuseBackend`]
+/// callbacks: the live mutation-queue backlog rides the probe, so
+/// every dispatch line in `mount.log` carries the pressure it ran
+/// under. A backend without a wired queue (bare view tests) reads
+/// zero — no backlog exists there.
+impl<S: ObjectStore, M: Materialization> FuseBackend<S, M>
+where
+    S::Error: std::fmt::Debug,
+{
+    pub(super) fn probe(&self, opcode: &'static str) -> RequestLog {
+        let log = RequestLog::new(opcode);
+        // The backlog read takes the queue lock, so it happens only
+        // when the drop log can fire: at the default `info` level a
+        // dispatch costs one enabled-check and no lock, exactly the
+        // cost model `RequestLog::new` documents.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            log.set_depth(
+                self.mutations
+                    .as_ref()
+                    .map(|queue| queue.queue_depth())
+                    .unwrap_or(0),
+            );
+        }
+        log
     }
 }
 
@@ -2869,7 +2911,7 @@ where
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let _log = RequestLog::new("lookup");
+        let _log = self.probe("lookup");
         let Some(name) = name.to_str() else {
             reply.error(_log.fail(fuser::Errno::ENOENT));
             return;
@@ -2898,7 +2940,7 @@ where
         fh: Option<FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        let _log = RequestLog::new("getattr");
+        let _log = self.probe("getattr");
         match self.getattr_at(ino.0, fh) {
             Ok(attr) => reply.attr(&TTL, &attr),
             Err(error) => reply.error(_log.fail(error)),
@@ -2913,7 +2955,7 @@ where
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        let _log = RequestLog::new("readdir");
+        let _log = self.probe("readdir");
         let all = match self.dir_entries(fh.0) {
             Ok(all) => all,
             Err(error) => {
@@ -2941,7 +2983,7 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        let _log = RequestLog::new("opendir");
+        let _log = self.probe("opendir");
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
@@ -2963,7 +3005,7 @@ where
         _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("releasedir");
+        let _log = self.probe("releasedir");
         match self.release_dir(fh.0) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(_log.fail(error)),
@@ -2971,7 +3013,7 @@ where
     }
 
     fn open(&self, _req: &fuser::Request, ino: INodeNo, flags: OpenFlags, reply: fuser::ReplyOpen) {
-        let _log = RequestLog::new("open");
+        let _log = self.probe("open");
         if unsupported_open_flags(flags.0) {
             reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
             return;
@@ -2996,7 +3038,7 @@ where
     }
 
     fn readlink(&self, _req: &fuser::Request, ino: INodeNo, reply: fuser::ReplyData) {
-        let _log = RequestLog::new("readlink");
+        let _log = self.probe("readlink");
         let error = self.readlink_error_at(ino);
         if error == fuser::Errno::ENOENT {
             self.retire_inode(ino.0);
@@ -3017,7 +3059,7 @@ where
         _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
-        let _log = RequestLog::new("mkdir");
+        let _log = self.probe("mkdir");
         let Some(name) = name.to_str() else {
             reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
@@ -3039,7 +3081,7 @@ where
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        let _log = RequestLog::new("read");
+        let _log = self.probe("read");
         // Reads serve the open-time capture keyed by the handle; the
         // path the descriptor was opened from is never consulted
         // again.
@@ -3059,7 +3101,7 @@ where
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("release");
+        let _log = self.probe("release");
         match self.release_handle(fh) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(_log.fail(error)),
@@ -3080,7 +3122,7 @@ where
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        let _log = RequestLog::new("write");
+        let _log = self.probe("write");
         match self.write_handle(fh, offset, data) {
             Ok(written) => reply.written(written),
             Err(error) => reply.error(_log.fail(error)),
@@ -3099,7 +3141,7 @@ where
         _lock_owner: LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("flush");
+        let _log = self.probe("flush");
         match self.commit_handle(fh) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(_log.fail(error)),
@@ -3119,7 +3161,7 @@ where
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("fsync");
+        let _log = self.probe("fsync");
         match self.fsync_handle(fh) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(_log.fail(error)),
@@ -3138,7 +3180,7 @@ where
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        let _log = RequestLog::new("create");
+        let _log = self.probe("create");
         let Some(name) = name.to_str() else {
             reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
@@ -3162,7 +3204,7 @@ where
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("unlink");
+        let _log = self.probe("unlink");
         let Some(name) = name.to_str() else {
             reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
@@ -3180,7 +3222,7 @@ where
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("rmdir");
+        let _log = self.probe("rmdir");
         let Some(name) = name.to_str() else {
             reply.error(_log.fail(fuser::Errno::EINVAL));
             return;
@@ -3202,7 +3244,7 @@ where
         _target: &std::path::Path,
         reply: fuser::ReplyEntry,
     ) {
-        let _log = RequestLog::new("symlink");
+        let _log = self.probe("symlink");
         reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
@@ -3216,7 +3258,7 @@ where
         _newname: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let _log = RequestLog::new("link");
+        let _log = self.probe("link");
         reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
@@ -3233,7 +3275,7 @@ where
         _position: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("setxattr");
+        let _log = self.probe("setxattr");
         reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
@@ -3245,7 +3287,7 @@ where
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let _log = RequestLog::new("getxattr");
+        let _log = self.probe("getxattr");
         reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
@@ -3256,7 +3298,7 @@ where
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let _log = RequestLog::new("listxattr");
+        let _log = self.probe("listxattr");
         reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
@@ -3267,7 +3309,7 @@ where
         _name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("removexattr");
+        let _log = self.probe("removexattr");
         reply.error(_log.fail(fuser::Errno::EOPNOTSUPP));
     }
 
@@ -3281,7 +3323,7 @@ where
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        let _log = RequestLog::new("rename");
+        let _log = self.probe("rename");
         // Atomic exchange and whiteout are not representable; only
         // plain rename and RENAME_NOREPLACE are served. The
         // RENAME_* constants are Linux-only in both `libc` and
@@ -3334,7 +3376,7 @@ where
         _flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
-        let _log = RequestLog::new("setattr");
+        let _log = self.probe("setattr");
         let path = match self.inode_path(ino.0) {
             Ok(path) => path,
             Err(error) => {
@@ -3355,7 +3397,7 @@ where
     }
 
     fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        let _log = RequestLog::new("statfs");
+        let _log = self.probe("statfs");
         let cap = statfs_capacity();
         reply.statfs(
             cap.blocks,

@@ -688,7 +688,7 @@ fn content_identity_is_payload_based_across_framing() {
     assert_eq!(disk.get(&expected).unwrap().as_deref(), Some(&payload[..]));
     assert!(matches!(
         disk.insert_verified(ObjectKind::Chunk, &expected, &framed),
-        Err(FsStoreError::IdentityMismatch { .. })
+        Err(FsStoreError::IdentityMismatch)
     ));
     // Kind separation rides the context, not the framing; the
     // identity-domain fork property itself is carried by the golden

@@ -32,6 +32,7 @@ fn drain_to_quiescence(relay: &mut MemoryRelay, device: &mut Device) {
                 deferred: 0,
                 skipped: 0,
                 discarded: 0,
+                ..Default::default()
             })
         {
             return;
@@ -108,6 +109,7 @@ fn reversed_arrival_converges_to_the_same_outcome() {
             deferred: 0,
             skipped: 0,
             discarded: 0,
+            ..Default::default()
         },
         "reversal changes nothing for the quiescent device"
     );
@@ -284,6 +286,7 @@ fn large_announcement_history_converges_with_exact_reports() {
                 deferred: 0,
                 skipped: 0,
                 discarded: 0,
+                ..Default::default()
             })
         {
             quiesced = true;

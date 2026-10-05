@@ -278,8 +278,22 @@ pub struct DrainReport {
     pub duplicates: usize,
     /// Messages held for a future transition, plus envelopes shed past
     /// the intake commit budget or sender quota (relay-held for the
-    /// next pass).
+    /// next pass). Always the sum of the three cause counters below:
+    /// readers that predate attribution keep working, and the causes
+    /// say which half needs an operator.
     pub deferred: usize,
+    /// Held on a membership transition this device has never observed
+    /// (OD-17-2 option B): only that transition's own arrival unblocks
+    /// these, so a nonzero count names a fetchable gap.
+    pub deferred_unseen: usize,
+    /// Held on an observed-but-not-yet-authorizing transition
+    /// (pending gap, contest): re-driven on every commit, so this
+    /// count drains by itself and is diagnostic noise as an alarm.
+    pub deferred_status_blocked: usize,
+    /// Shed past the intake commit budget, the sender quota, or the
+    /// pending bound: the relay retains the envelope and the next pass
+    /// revalidates from scratch. Self-resolving, nothing to diagnose.
+    pub deferred_shed: usize,
     /// Envelopes not yet processable (unknown epoch key); left unacked
     /// for redelivery.
     pub skipped: usize,
@@ -351,6 +365,27 @@ pub(super) enum DeferredWait {
     /// analysis is global, so any new transition can change its
     /// standing — the entry re-drives on every commit.
     StatusBlocked(TransitionId),
+}
+
+/// The attributable cause of one deferred message, for
+/// [`DrainReport`]'s cause counters (OD-17-2 option B). The full
+/// [`DeferredWait`] stays `pub(super)` — the wake rule needs the
+/// transition id, but the report only needs the class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredCause {
+    /// Waiting on a transition this device has never observed.
+    Unseen,
+    /// Waiting on an observed-but-not-yet-authorizing transition.
+    StatusBlocked,
+}
+
+impl From<DeferredWait> for DeferredCause {
+    fn from(wait: DeferredWait) -> Self {
+        match wait {
+            DeferredWait::Unseen(_) => DeferredCause::Unseen,
+            DeferredWait::StatusBlocked(_) => DeferredCause::StatusBlocked,
+        }
+    }
 }
 
 /// One held (deferred) control message with its unblocking

@@ -170,6 +170,54 @@ fn status_blocked_wakes_on_any_transition() {
     assert_eq!(facts.announcements.len(), 1);
 }
 
+/// OD-17-2 option B: one drain carrying all three deferral causes
+/// splits them across the three counters, and the total stays their
+/// sum — so readers that predate attribution keep working.
+#[test]
+fn drain_report_splits_deferred_by_cause() {
+    let mut fixture = fixture();
+    let (mut builder, _genesis) = Builder::genesis(10);
+    let child_a = builder.child(vec![Change::Rotate]);
+    let child_b = builder.child(vec![Change::Rotate]);
+    // Child A lands before its parent: observed but Pending, so its
+    // announcements hold status-blocked; child B stays unseen. The
+    // genesis parent is never delivered: nothing here may resolve.
+    let mail = vec![deliver(&fixture, 1, &transition_message(&child_a))];
+    queue(&mut fixture, mail);
+    assert_eq!(drain(&mut fixture).accepted, 1);
+
+    // Fill the pending bound with unseen-bound announcements, then
+    // one status-blocked announcement (held: the bound is exact),
+    // then one more unseen announcement (sheds past the bound).
+    let mut mail = Vec::with_capacity(MAX_PENDING_MESSAGES + 1);
+    for _ in 0..MAX_PENDING_MESSAGES - 1 {
+        mail.push(deliver(
+            &fixture,
+            2,
+            &announcement_for(2, child_b.transition_id()),
+        ));
+    }
+    mail.push(deliver(
+        &fixture,
+        2,
+        &announcement_for(2, child_a.transition_id()),
+    ));
+    mail.push(deliver(
+        &fixture,
+        2,
+        &announcement_for(2, child_b.transition_id()),
+    ));
+    queue(&mut fixture, mail);
+    let report = drain(&mut fixture);
+    assert_eq!(report.deferred_unseen, MAX_PENDING_MESSAGES - 1);
+    assert_eq!(report.deferred_status_blocked, 1);
+    assert_eq!(report.deferred_shed, 1);
+    assert_eq!(
+        report.deferred,
+        report.deferred_unseen + report.deferred_status_blocked + report.deferred_shed
+    );
+}
+
 /// The index selects exactly the entries a commit can unblock: the
 /// unseen bucket for the committed id plus every status-blocked
 /// entry. Parked entries on other unseen ids are never visited.

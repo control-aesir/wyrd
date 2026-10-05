@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use wyrd_format::{DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use zeroize::Zeroizing;
 
-use super::engine::{DeferredWait, DrainReport, Engine, EngineError, PendingEntry};
+use super::engine::{DeferredCause, DeferredWait, DrainReport, Engine, EngineError, PendingEntry};
 use crate::control::{
     verify_announcement, AnnouncementUpdate, CapabilityPayload, ControlError, ControlMessageId,
     IngestReport, Message, SealedControl, SnapshotAnnouncement,
@@ -109,8 +109,9 @@ enum Outcome {
     Duplicate,
     /// Held in the engine's pending map for transition-triggered
     /// re-drive. The relay retains the envelope as the crash backstop
-    /// (pending is volatile), so the drain settles `Retry`.
-    Deferred,
+    /// (pending is volatile), so the drain settles `Retry`. Carries
+    /// the attributable cause for the report's cause counters.
+    Deferred(DeferredCause),
     /// Shed past the pending bound: the engine holds nothing, so the
     /// drain settles `Retry` and the relay retains the envelope.
     RelayHeld,
@@ -152,12 +153,17 @@ pub(super) fn drain(
                 report.duplicates += 1;
                 Disposition::Ack
             }
-            Outcome::Deferred => {
+            Outcome::Deferred(cause) => {
                 report.deferred += 1;
+                match cause {
+                    DeferredCause::Unseen => report.deferred_unseen += 1,
+                    DeferredCause::StatusBlocked => report.deferred_status_blocked += 1,
+                }
                 Disposition::Retry
             }
             Outcome::RelayHeld => {
                 report.deferred += 1;
+                report.deferred_shed += 1;
                 Disposition::Retry
             }
             Outcome::Skipped => {
@@ -284,7 +290,7 @@ fn commit_action(
         }
         Ok(Action::Defer(wait)) => {
             engine.hold_pending(*id, message.clone(), wait);
-            return Ok(Outcome::Deferred);
+            return Ok(Outcome::Deferred(DeferredCause::from(wait)));
         }
         Err(error) => {
             // The pass fails after volatile writes: the transition (if

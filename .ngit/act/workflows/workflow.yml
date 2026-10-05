@@ -215,6 +215,10 @@ jobs:
     # Independent of rust (separate checkout, no shared artifacts), so
     # no `needs`: the jobs run parallel and wall time is the max, not
     # the sum. Wasted nix compute when rust fails fast is accepted.
+    # The timeout bounds the failure-report wait: the reporter gates on
+    # both jobs, so an unbounded nix stall would delay reports without
+    # limit. Healthy runs finish in ~7 min; twenty is pathology cover.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

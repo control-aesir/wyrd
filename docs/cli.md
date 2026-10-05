@@ -318,8 +318,8 @@ sync now
   mutations submitted to this run's in-memory mutation queue:
   mutation-seam commits only (direct engine authoring bypasses the
   traced seam), and headless commands such as `sync now` do not
-  submit mutations, so their write-path statistics are zero. The
-  mailbox line names saturation recoveries beside closed
+  submit mutations, so their write-path statistics are zero.
+  The mailbox line names saturation recoveries beside closed
   subscriptions and recovery attempts.
   At most 32 passes: a peer that keeps intake non-idle forever
   (which a mount absorbs by running forever) trips the cap, which

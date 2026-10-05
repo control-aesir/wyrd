@@ -42,7 +42,8 @@ version say exactly what changed.
   deferred holds by cause (unseen / status-blocked / shed), accumulates
   every fetch counter plus per-pass sends across all passes, and adds a
   write-path section (snapshot rate, per-source share, admission-to-commit
-  latency); the mailbox line names saturation recoveries; `mount.log`
+  latency — process-local; zero for headless runs, which submit no
+  mutations); the mailbox line names saturation recoveries; `mount.log`
   dispatch lines carry the mutation-queue backlog beside the latency.
   Lifetime `WriteStats` accumulate at the mutation seam (counts only,
   never paths). `FsStoreError::Corrupt` and `IdentityMismatch` no longer

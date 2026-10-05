@@ -25,6 +25,9 @@ One page. Read this, then the focused docs:
 - `storage-growth.md` — retention under the append-only, no-GC store:
   the per-device amplification bound, its adversary, the retained-bytes
   quota and what it does not cover, and which bounds wait for GC
+- `retention-constraints.md` — decision: the retention/residency
+  constraints v0.x preserves so future GC stays possible (no GC
+  algorithm, no reclamation protocol)
 - `cli.md` — `wyrd` command reference: subcommands, credential files,
   diagnostics, exit codes
 - `upgrade-contract.md` — **normative** upgrade and migration contract:

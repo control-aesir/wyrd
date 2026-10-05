@@ -307,8 +307,10 @@ sync now
    the same handles across restarts — never a persisted identity
    namespace), the durable queue depth (outstanding outbox pairs
    plus reconciliation gaps, from committed facts only — not the
-   in-memory queue), convergence from durable facts (converged, or
-   what still diverges), and materialization as counts (explicit
+   in-memory queue; staged carries count in the outbox total, on no
+   peer line, and render on their own line when nonzero),
+   convergence from durable facts (converged, or what still
+   diverges), and materialization as counts (explicit
    cached/pinned policies plus locally held objects). Connectivity
    reads `not observed`: status never connects, so it says the
    omission out loud instead of letting silence read as healthy.
@@ -503,9 +505,9 @@ Both are read and hardened by wyrd code, never by clap:
    observation half of the privacy boundary. DeviceIds never reach
    the durable `sync status` surface or the log; `sync now` alone
    names the senders its intake actually heard, because that process
-   connected and the operator holds the keys. (`wyrd heads` and
-   `member list` are separate read surfaces with their own contract
-   — they name authors and members explicitly, and this paragraph
+   connected and the operator holds the keys. (`member list` and
+   `wyrd list` are separate read surfaces with their own contract
+   — they name members and authors explicitly, and this paragraph
    does not cover them.)
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)

@@ -64,7 +64,9 @@ pub struct MailboxView {
 /// restarts over the same state. A handle is not a peer identity
 /// namespace: nothing persists the numbering, and the same peer may
 /// hold a different handle after the state changes. The run surface
-/// names the same peers by `DeviceId`; this surface never does.
+/// names senders by `DeviceId` — a different set answering a
+/// different question (who mailed us); this surface never prints
+/// identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHandle {
     /// 1-based position in the observation's deterministic peer
@@ -93,8 +95,13 @@ pub struct PeerHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QueueDepth {
     /// Still-undischarged outbox pairs: announcements, transitions,
-    /// capabilities, and carries. Who we owe, counted.
+    /// capabilities, and carries. Who we owe, counted. Always the
+    /// sum of the itemized obligations and `carries` below, so the
+    /// renderer projects rather than infers.
     pub outbox: usize,
+    /// Staged namespace carries inside the outbox total: local
+    /// re-authoring work owed to nobody, hence on no peer line.
+    pub carries: usize,
     /// Reconciliation gaps: announced snapshots without a root
     /// manifest, bodies, or child manifests, plus distinct wanted-
     /// but-not-local contents. What we still need, counted per
@@ -163,8 +170,8 @@ pub struct SyncStatus {
     /// peer handles divide. Zero when there is no tip.
     pub known_members: usize,
     /// Opaque per-peer handles over obligation recipients and head
-    /// authors, in deterministic order. Position plus one is the
-    /// rendered handle.
+    /// authors, in deterministic order. Each entry's stored `handle`
+    /// is the rendered `peer-N`.
     pub peers: Vec<PeerHandle>,
     /// Outstanding durable work: owed obligations plus missing
     /// fetches, from committed facts only.
@@ -297,8 +304,10 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
     // including the carry queue the itemized lists do not cover,
     // plus the reconciliation gaps. Committed facts on both sides.
     let reconcile = state.reconcile();
+    let carries = state.pending_carries().len();
     let queue = QueueDepth {
-        outbox: obligations.len() + state.pending_carries().len(),
+        outbox: obligations.len() + carries,
+        carries,
         fetch: reconcile.pending_snapshots.len()
             + reconcile.pending_snapshot_bodies.len()
             + reconcile.pending_manifests.len()
@@ -449,7 +458,7 @@ mod tests {
     /// pairs, and our own device, authoring the live head), so the
     /// status carries exactly two handles in byte order, the pending
     /// counts sum to the owed pairs, and no handle leaks an identity
-    /// — mapping is by position, never by printing.
+    /// — the stored handle is the rendered one, never a printed id.
     #[test]
     fn peer_handles_are_opaque_and_deterministic() {
         let (engine, dir) = scratch_authored();

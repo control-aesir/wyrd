@@ -1895,11 +1895,12 @@ fn sync_status_render(status: &SyncStatus) -> String {
     ));
     // Staged carries are local re-authoring work owed to nobody, so
     // they count in the outbox total but on no peer line above: name
-    // them here so the two can never silently disagree.
-    let carries = queue.outbox.saturating_sub(status.obligations.len());
-    if carries > 0 {
+    // them here so the two can never silently disagree. Projected
+    // from the struct, never inferred.
+    if queue.carries > 0 {
         out.push_str(&format!(
-            "  carries: {carries} staged (counted in outbox)\n"
+            "  carries: {} staged (counted in outbox)\n",
+            queue.carries
         ));
     }
     let convergence = &status.convergence;

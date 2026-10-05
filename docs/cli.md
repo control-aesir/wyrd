@@ -498,21 +498,21 @@ Both are read and hardened by wyrd code, never by clap:
   and enforcement that generalize this statement land separately,
   sequenced after `wyrd vault`, because a boundary needs a vault
   process to be meaningful and none exists. What these surfaces
-   print is counts, latencies, class breakdowns,
-   and pressure against the bounds in `resource-limits.md`. What
-   they never print is ContentIds, filesystem paths, file bytes,
-   or secrets — the observation half of the privacy boundary.
-   Snapshot and membership transition ids do appear on `sync status`:
-   the tip line names the applied head, per-item lines name the owed
-   obligation — that is their job as merge identities, and no
-   DeviceId appears beside them there.
-   DeviceIds never reach the durable `sync status` surface or the
-   log; `sync now` alone names the senders its intake actually
-   heard, because that process connected and the operator holds the
-   keys. (`member list`, `member log`, and `snapshot list` are
-   separate read surfaces with their own contract — they name
-   members and authors explicitly, and this paragraph does not cover
-   them.)
+  print is counts, latencies, class breakdowns,
+  and pressure against the bounds in `resource-limits.md`. What
+  they never print is ContentIds, filesystem paths, file bytes,
+  or secrets — the observation half of the privacy boundary.
+  Snapshot and membership transition ids do appear on `sync status`:
+  the tip line names the applied head, per-item lines name the owed
+  obligation, live-head lines name the held heads — that is their job
+  as merge identities, and no DeviceId appears beside them there.
+  DeviceIds never reach the durable `sync status` surface or the
+  log; `sync now` alone names the senders its intake actually
+  heard, because that process connected and the operator holds the
+  keys. (`member list`, `member log`, and `snapshot list` are
+  separate read surfaces with their own contract — they name
+  members and authors explicitly, and this paragraph does not cover
+  them.)
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

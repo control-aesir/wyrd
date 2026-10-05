@@ -1681,6 +1681,11 @@ fn sync_now_output_contains_no_secret_bytes() {
 /// the operator reads state that no vault-position surface exists,
 /// so nobody reads a client surface as a vault one. A grep over
 /// the changed doc file — fails if the statement is ever dropped.
+/// The never-print list is pinned as one whitespace-normalized
+/// sentence, not per-phrase `contains` checks: phrase checks stay
+/// green when the guarded words drift elsewhere in the file (which
+/// is exactly what happened to two entries), while the sentence
+/// check fails whenever the list changes shape.
 #[test]
 fn vault_trust_position_is_documented_as_unimplemented() {
     let reference =
@@ -1690,18 +1695,13 @@ fn vault_trust_position_is_documented_as_unimplemented() {
         reference.contains("No vault-position diagnostics surface exists"),
         "the statement pins the missing vault surface"
     );
-    for never in [
-        "ContentIds",
-        "filesystem paths",
-        "file bytes",
-        "DeviceIds",
-        "membership transition ids",
-    ] {
-        assert!(
-            reference.contains(never),
-            "the never-print list names {never}"
-        );
-    }
+    let flat = reference.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "What they never print is ContentIds, filesystem paths, file bytes, or secrets"
+        ),
+        "the never-print list keeps its shape"
+    );
 }
 
 /// A live-attached mailbox posture for the pressure-counter tests:

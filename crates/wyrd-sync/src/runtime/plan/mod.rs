@@ -234,6 +234,7 @@ fn execute_inner(
             if !engine.fetch_eligible(&child_key) {
                 continue;
             }
+            engine.note_fetch_attempted(id);
             match super::fetch::child(
                 &engine.drive,
                 bulk,
@@ -289,6 +290,10 @@ fn execute_inner(
             if eligible.is_empty() {
                 continue;
             }
+            // The generation attempted: terminal evaluation may only
+            // complete generations with evidence, so every issued
+            // fetch marks its identity even when the walk fails.
+            engine.note_fetch_attempted(content);
             let attempt = super::fetch::object(
                 &engine.drive,
                 bulk,

@@ -1664,6 +1664,27 @@ fn a_crash_during_store_key_write_leaves_no_readable_temp() {
 
 #[cfg(unix)]
 #[test]
+fn a_stale_temp_is_reclaimed_at_the_hardened_mode() {
+    use super::store::{atomic_write_mode, SECRET_FILE_MODE};
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = UmaskGuard::set(0o000);
+    let dir = TestDir::new("custody-stale-temp");
+    // A loose temp stranded by a pre-fix crash: the next custody
+    // write must remove and re-claim it, not publish it.
+    std::fs::write(dir.path.join("store-key.wrap.tmp"), b"stale").unwrap();
+    std::fs::set_permissions(
+        dir.path.join("store-key.wrap.tmp"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    drop(_guard);
+    atomic_write_mode(&dir.path, "store-key.wrap", b"fresh", SECRET_FILE_MODE).unwrap();
+    assert_eq!(mode_of(&dir.path.join("store-key.wrap")) & 0o077, 0);
+    assert!(!dir.path.join("store-key.wrap.tmp").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn a_loose_mode_existing_drive_still_opens() {
     use std::os::unix::fs::PermissionsExt;
     let _guard = UmaskGuard::set(0o077);

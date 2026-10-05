@@ -190,7 +190,16 @@ pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
                 fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
                 return Ok(());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            // A concurrent creator won the leaf — but `AlreadyExists`
+            // is also a regular file or dangling symlink, so confirm
+            // it is a directory and fail at the call that names it
+            // when it is not.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if path.is_dir() {
+                    return Ok(());
+                }
+                return Err(error);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }

@@ -21,6 +21,12 @@ version say exactly what changed.
 
 ## [Unreleased]
 
+### Changed
+
+- CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
+  is dropped): wall time is the slower job, not the sum. Wasted nix
+  compute when `rust` fails fast is accepted.
+
 ### Added
 
 - Normative DG-1 mutation/commit boundary table in `docs/write-path.md`:

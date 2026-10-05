@@ -212,7 +212,9 @@ jobs:
 
   nix:
     if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
-    needs: rust
+    # Independent of rust (separate checkout, no shared artifacts), so
+    # no `needs`: the jobs run parallel and wall time is the max, not
+    # the sum. Wasted nix compute when rust fails fast is accepted.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

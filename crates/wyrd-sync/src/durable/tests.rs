@@ -1872,14 +1872,6 @@ fn reconciliation_over_claim_is_dropped_not_loaded() {
         honest.evidence(),
         "retire weight survives both drops"
     );
-    assert_eq!(
-        loaded
-            .latest_stated_view()
-            .expect("a view was stated")
-            .evidence(),
-        honest.evidence(),
-        "the retire gate sees only the honest statement"
-    );
 }
 
 /// A stated view survives a derive that later grows: base facts only

@@ -75,8 +75,12 @@ pub struct DurableStore {
     rebuilds: AtomicU64,
     /// First-seen latch for the over-claim warning in `load`: the
     /// bucket is rebuilt from disk on every call and `load` sits
-    /// behind the convergence loop, so a persistent bad record must
-    /// warn loudly once and debug after — never once per iteration.
+    /// behind the convergence loop, so the first dropped statement
+    /// warns loudly once and later loads debug. Per-handle, not
+    /// per-record: a second distinct over-claim on the same handle
+    /// is counted but only ever debug-logged — the latch cannot tell
+    /// "same record again" from "new bad record". Reopening resets
+    /// it, which is the behaviour a daemon restart wants.
     overclaim_warned: AtomicBool,
 }
 
@@ -622,36 +626,39 @@ impl DurableStore {
         }
         let derived = ReconciliationView::derive(&facts);
         let views = std::mem::take(&mut facts.reconciliation_views);
-        let mut dropped = Vec::new();
+        // Eager digests, freed views: a dropped statement's identity
+        // is 32 bytes, not its evidence sets. Retaining the views
+        // until load returns would peak at k× evidence size for k bad
+        // records on every convergence-loop iteration; the count and
+        // the first-seen digests below are all any caller needs.
+        let mut dropped = 0usize;
+        let mut dropped_ids = Vec::new();
+        let latch_open = !self.overclaim_warned.load(Ordering::SeqCst);
         for view in views {
             if view.is_subset_of(derived.evidence()) {
                 facts.reconciliation_views.push(view);
             } else {
-                dropped.push(view);
+                dropped += 1;
+                if latch_open {
+                    dropped_ids.push(hex32(&view.digest()));
+                }
             }
         }
-        facts.dropped_reconciliation_views = dropped.len();
+        facts.dropped_reconciliation_views = dropped;
         // First-seen latch: the same record re-decodes on every load
-        // behind the convergence loop, so warn loudly once and stay
-        // quiet after. The digests name the offending statements (a
-        // failure carries its identity); the count on `LoadedFacts`
-        // carries the signal to callers. Digests compute only on the
-        // warn path — hashing every dropped view on every load would
-        // put megabytes of alloc+hash on the hot path for a diagnostic
-        // nobody reads twice.
-        if !dropped.is_empty() {
-            if !self.overclaim_warned.swap(true, Ordering::SeqCst) {
-                let digests: Vec<String> =
-                    dropped.iter().map(|view| hex32(&view.digest())).collect();
-                tracing::warn!(
-                    dropped = dropped.len(),
-                    statements = ?digests,
-                    "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
+        // behind the convergence loop, so the first drop warns and
+        // later loads debug with a count and no identity.
+        if dropped > 0 {
+            if self.overclaim_warned.swap(true, Ordering::SeqCst) {
+                tracing::debug!(
+                    dropped,
+                    "overstated reconciliation views dropped again (first occurrence warned)"
                 );
             } else {
-                tracing::debug!(
-                    dropped = dropped.len(),
-                    "overstated reconciliation views dropped again (first occurrence warned)"
+                tracing::warn!(
+                    dropped,
+                    statements = ?dropped_ids,
+                    "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
                 );
             }
         }

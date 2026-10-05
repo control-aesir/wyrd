@@ -10,7 +10,7 @@
 //! evidence that reached the sender as an authenticated statement
 //! over durable state. A view derived from live memory proves
 //! nothing, so the retire gate refuses it here — the obligation
-//! invariant (`docs/crash-consistency.md:137-141`) as a negative
+//! invariant (`docs/crash-consistency.md:142-146`) as a negative
 //! test, before any retire path exists to misuse it.
 //!
 //! Scope, decided: the conservativeness rule is the *exact-set*

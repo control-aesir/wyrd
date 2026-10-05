@@ -69,6 +69,17 @@ version say exactly what changed.
   commits, no wire refusal signal, no quota-pressure reclamation).
   Decision only; no behavior change and no format impact. GC
   implementation stays post-v1.
+- Retention accounting follow-through (OD-26, `feat(cli): predictable
+  retention`): `RetainedBytes::subtract` (saturating, removal paths only —
+  quarantine is a decrement only where it actually removes bytes);
+  `check_retained_ceiling` startup diagnosis for a quota below current
+  retention; `wyrd cache policy` reports retained content (quota-enforced),
+  fact log and sync vault (observational) plus an explicitly
+  non-authoritative advisory ceiling when no quota is configured; and a
+  committed measurement showing 100 opens of unavailable content commit
+  1 fact / 1 commit / 4 fsyncs with no amplification. No CLI quota flag,
+  no default ceiling, no enforcement change: fetched bytes, the vault,
+  and the fact log still cross no ceiling.
 
 ### Fixed
 

@@ -187,6 +187,20 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
         .commit_handle(handle)
         .expect("below the ceiling the commit is admitted");
 
+    // The admitted commit retained new bytes, so the device is back
+    // over its ceiling — and the *next* commit is refused. No commit is
+    // ever refused for crossing the ceiling, only once already over:
+    // the effective ceiling is the quota plus one admitted commit.
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(handle, 0, b"y")
+        .expect("write only buffers");
+    assert_eq!(
+        backend.commit_handle(handle),
+        Err(fuser::Errno::ENOSPC),
+        "the overshoot is one admitted commit, then refusal resumes"
+    );
+
     stop.store(true, Ordering::Relaxed);
     loop_handle
         .join()

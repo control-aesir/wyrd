@@ -180,6 +180,7 @@ These two rows describe enforced behavior, not screening:
 |---|---|
 | Repeated failed wants appending unchanged `Fact::Materialization` | Closed. `Engine::set_materialization` / `set_materialization_from` compare durable state first and append nothing when it already equals the target, so a retried want costs no fact and no fsync. Both append sites are guarded (`runtime/engine/mod.rs`), pinned by `repeat_materialization_admission_commits_nothing` — a ten-deep retry storm commits nothing, and a genuine transition commits exactly once |
 | Unbounded serving-mirror import queue | Closed. `MAX_MIRROR_QUEUE_ITEMS` (64) and `MAX_MIRROR_QUEUE_BYTES` (64 MiB) in `serving.rs`; a full queue returns `VaultError::MirrorFull` and keeps the vault file durable. Pinned by `a_full_mirror_queue_applies_backpressure_without_losing_the_vault` and `an_oversize_reservation_fails_before_queueing` |
+| Repeated opens of unavailable content growing the fact log | Measured, no amplification. Workload (`unavailable_content_open_amplification_measurement`): 100 demands for never-local, never-arriving content through `set_materialization`, the engine-visible call every open's want admission funnels into, on a fresh engine. Result: 1 fact, 1 commit file, 4 fsyncs (protocol-derived: commit temp, commits dir, CURRENT temp, drive dir), 115 fact-log bytes, 0 retained-content bytes, and 100 log rebuilds — one replay per demand, CPU with no IO. Non-arrival does not change guard behaviour: the guards compare durable state, not reachability. If this row ever fails, G21 (`fact-log amplification`) owns the fix |
 
 The remaining growth is the commit path itself: bounded per commit,
 unbounded in count.
@@ -498,6 +499,17 @@ one is a place where the number understates what the device holds. The
 fourth thing below is not that: it is what running into the ceiling costs,
 which is a different question and the one an operator meets first.
 
+Three terms keep those questions separate, because one counter
+previously served both jobs. **Retained bytes** is the enforcement
+quantity: what the object store holds and the ceiling is compared
+against. **Resident bytes** is what the device physically holds:
+retained bytes plus everything else on its disk. **Auxiliary growth**
+is the resident-but-unenforced durable state — the fact log and the
+sync vault — reported next to the enforced number, never folded into
+it. `wyrd cache policy` renders all three with their labels; a quota
+is an operator-selected refusal boundary over retained bytes, not an
+implicit product policy over the device.
+
 **Only the mounted write path refuses.** The check sits in the live
 node's commit boundary, ahead of every arm of `apply_mutation`. Four
 writers raise the count with nothing to refuse them: the sync pass
@@ -537,13 +549,20 @@ separate step-1 row in the fixed-cost table above and do not scale with
 the write. On the fetch path nothing bounds `N` at all. No commit is ever
 refused *for crossing* the ceiling — only once it is already over.
 
-**And it is one-way.** Nothing lowers the count: no GC, no eviction, and
-bytes charged by a fetch or by a commit that failed after its inserts stay
-charged forever. A quota set at or below current retention therefore
-leaves the device permanently unable to take a local write, and raising
-the quota is the only remedy. At the ceiling every local mutation is
-refused, including ones that would retain nothing new — unlike a real full
-disk, where a zero-byte write still succeeds.
+**And it is one-way absent a removal path.** Nothing lowers the count
+except a durable removal bookkept through `RetainedBytes::subtract`:
+no GC, no eviction, and bytes charged by a fetch or by a commit that
+failed after its inserts stay charged until a removal path (quarantine,
+scrub) takes them and subtracts them. Reclassifying resident bytes —
+moving them, unpinning them, ceasing to serve them — without removing
+them must not subtract; quarantine is a decrement only where quarantine
+actually removes bytes from the retained set. A quota set at or below
+current retention therefore leaves the device permanently unable to
+take a local write, and raising the quota is the only remedy short of
+a removal. At the ceiling every local mutation is refused, including
+ones that would retain nothing new — unlike a real full disk, where a
+zero-byte write still succeeds. A device back under its ceiling by way
+of a removal accepts writes again, including zero-byte-retaining ones.
 
 **A refusal costs the open handle its buffer.** The commit takes the
 handle's buffered image before submitting, so an `ENOSPC` at `fsync`
@@ -567,42 +586,52 @@ handles, not just the write in hand.
    refusal after durability, before announcement); eviction under
    pressure and unbounded-growth-as-contract are refused for v0.3.
    What remains is implementation: neither ceiling is enforced yet.
-   A waits on the `RetainedBytes` decrement-or-recomputation; B on a
-   receiving peer waits on the counting gap and the durable refusal
-   state above. The question entry stays as the pointer; the contract
-   is the answer.
+   The accounting machinery for it is in place — `RetainedBytes::subtract`
+   exists for the removal paths (quarantine, scrub) with the
+   durable-removal-only discipline, `check_retained_ceiling` diagnoses a
+   quota below current retention at startup, and `wyrd cache policy`
+   reports retained / fact-log / vault bytes separately — but no
+   removal, admission-gate, or residency-refusal caller exists yet.
+   The question entry stays as the pointer; the contract is the answer.
 2. **Quota accounting still open.** The quota's refusal point shipped as
    decided above: before the commit's first write to disk, so a refused
    commit retains nothing. What the implementation leaves open, and
    what a follow-up should settle:
-   - **Counting the other two writers.** `RetainedBytes` covers the
-     object store only. The sync vault retains ciphertext per
-     representation, and the fact log grows per commit, per accepted
-     intake message, and per delivery; both are writers the tally never
-     sees, so the reported total is lower than the bytes this device
-     actually holds.
-   - **Refusing the unrefused paths.** Fetched objects cross the quota
-     with no ceiling in scope, which is what turns a local quota into the
-     interference channel above. Whether a peer may decline to retain is
-     decided in the contract above (open question 1, `trust.md` T18):
-     the fetch-side refusal is local policy at the admission points
-     named there, not a new protocol surface — there is no wire refusal
-     signal in v0.3 — and until it is enforced the interference stands
-     as documented, leaving the quota to local-write protection only.
-   - **In-flight accounting.** The check compares bytes already
-     retained, so the effective ceiling is the quota plus whatever the
-     next admitted commit retains. A stricter reading would reserve the
-     in-flight delta up front.
-   - **A startup cross-check.** `FsObjectStore::retained_bytes` is the
-     composition root's cross-check — a mounted store is an
-     `FsObjectStore`, so that is the one that matters — and nothing
-     calls it yet, so a quota set below current retention is discovered
-     as a stream of `ENOSPC` at the first write rather than as a startup
-     diagnosis.
-   - **Granularity.** The bound is per device. Per drive would bound the
-     *author* across its devices; per member-set would bound a group.
-     The device scope is the conservative choice and is the only one
-     that needs no membership state at the write boundary.
+    - **Counting the other two writers.** Settled as report, not as
+      enforcement (OD-26-B option B). `RetainedBytes` still covers the
+      object store only — widening it would silently widen what a
+      refusal rejects — and `wyrd cache policy` reports the fact log
+      and the sync vault as separate observational rows with an
+      observational total, each labelled, so the gap is explicit
+      instead of a single total known to be low.
+    - **Refusing the unrefused paths.** Fetched objects cross the quota
+      with no ceiling in scope, which is what turns a local quota into the
+      interference channel above. Whether a peer may decline to retain is
+      decided in the contract above (open question 1, `trust.md` T18):
+      the fetch-side refusal is local policy at the admission points
+      named there, not a new protocol surface — there is no wire refusal
+      signal in v0.3 — and until it is enforced the interference stands
+      as documented, leaving the quota to local-write protection only.
+    - **In-flight accounting.** Documented, not implemented. The check
+      compares bytes already retained, so the effective ceiling is the
+      quota plus whatever the next admitted commit retains — one whole
+      commit of overshoot, and no commit is ever refused *for crossing*
+      the ceiling, only once already over. Reserving the in-flight
+      delta up front would require predicting a commit's retention
+      before step 1 runs; the overshoot bound is pinned by
+      `a_removal_below_the_ceiling_readmits_local_writes`' at-ceiling
+      refusal (the same suite that pins the removal side).
+    - **A startup cross-check.** Settled. `check_retained_ceiling`
+      (`wyrd-core`) compares a configured quota against
+      `FsObjectStore::retained_bytes` — one walk at open, never per
+      commit — before the node starts, so a quota below current
+      retention is one named diagnosis with both numbers instead of a
+      stream of `ENOSPC` at the first write. Pinned by
+      `a_quota_below_current_retention_is_diagnosed_at_start`.
+    - **Granularity.** The bound is per device. Per drive would bound the
+      *author* across its devices; per member-set would bound a group.
+      The device scope is the conservative choice and is the only one
+      that needs no membership state at the write boundary.
 
 Tracked by the two follow-ups raised with this document:
 `protocol(storage): decide whether peers and vaults get a retention

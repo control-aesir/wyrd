@@ -314,11 +314,12 @@ enum FoldSubmitForcer {
 /// One submitted fold run: one queue member settling one or more
 /// taken handles. Same-path append sequences merge into their
 /// earliest run, so sequential appends concatenate instead of
-/// contending.
+/// contending. The queue kind lives only in the submitted `members`
+/// (built once, inline); the run keeps the taken positions and the
+/// forcing flag the settle needs.
 struct SubmitMember {
     /// Taken handles behind this run, in buffering order.
     taken: Vec<usize>,
-    kind: MutationKind,
     forcer: bool,
 }
 
@@ -1738,6 +1739,7 @@ where
             _ => None,
         };
         let mut submitted: Vec<SubmitMember> = Vec::with_capacity(taken.len() + 1);
+        let mut members: Vec<FoldMember> = Vec::with_capacity(taken.len() + 1);
         // Open append run per path, by submitted position.
         let mut runs: Vec<(String, usize)> = Vec::new();
         for (index, taken) in taken.iter().enumerate() {
@@ -1745,11 +1747,16 @@ where
             if taken.append {
                 if let Some((_, pos)) = runs.iter().find(|(path, _)| *path == taken.path) {
                     let pos = *pos;
-                    if let MutationKind::AppendFile { content, .. } = &mut submitted[pos].kind {
+                    if let FoldMember {
+                        kind: MutationKind::AppendFile { content, .. },
+                        ..
+                    } = &mut members[pos]
+                    {
                         content.extend_from_slice(&taken.content);
                     }
                     submitted[pos].taken.push(index);
                     submitted[pos].forcer |= is_forcer;
+                    members[pos].forcer |= is_forcer;
                     continue;
                 }
             }
@@ -1759,6 +1766,9 @@ where
             }
             submitted.push(SubmitMember {
                 taken: vec![index],
+                forcer: is_forcer,
+            });
+            members.push(FoldMember {
                 kind: taken_kind(taken),
                 forcer: is_forcer,
             });
@@ -1766,17 +1776,13 @@ where
         if let FoldSubmitForcer::Op(kind) = forcer {
             submitted.push(SubmitMember {
                 taken: Vec::new(),
+                forcer: true,
+            });
+            members.push(FoldMember {
                 kind: kind.clone(),
                 forcer: true,
             });
         }
-        let members = submitted
-            .iter()
-            .map(|submitted| FoldMember {
-                kind: submitted.kind.clone(),
-                forcer: submitted.forcer,
-            })
-            .collect();
         (queue.submit(MutationKind::Fold { members }), submitted)
     }
 
@@ -1922,7 +1928,15 @@ where
     /// stay eligible: delegating to one parks on its settle inside
     /// [`force_handle`](Self::force_handle) instead of returning
     /// before the path is durable.
+    ///
+    /// Idle `fsync` stays O(1): a zero dirty-handle count means no
+    /// handle holds a budget reservation, and a reservation is held
+    /// exactly while its handle is dirty, so there is nothing on any
+    /// path to delegate to.
     fn earliest_dirty_on(&self, path: &str) -> Option<Arc<Mutex<WriteHandle>>> {
+        if self.budget.dirty_handles() == 0 {
+            return None;
+        }
         let arcs: Vec<Arc<Mutex<WriteHandle>>> = {
             let Ok(files) = self.files.lock() else {
                 return None;

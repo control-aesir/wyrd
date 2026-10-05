@@ -88,9 +88,12 @@
 //!
 //! Children: [`store`] owns lifecycle and the crash-safe commit
 //! protocol; [`codec`] owns the commit envelope and fact records;
-//! [`replay`] owns loaded facts and state reconstruction. The stable
-//! boundary re-exported here is [`DurableStore`], [`Fact`],
-//! [`LoadedFacts`], [`Rebuilt`], and [`DurableError`]; the codec stays
+//! [`replay`] owns loaded facts and state reconstruction;
+//! [`reconciliation`] owns the recipient's reconciliation view over
+//! those facts. The stable boundary re-exported here is
+//! [`DurableStore`], [`Fact`], [`LoadedFacts`], [`Rebuilt`],
+//! [`ReconciliationEvidence`], [`ReconciliationView`], and
+//! [`DurableError`]; the codec stays
 //! private until a second persistence backend exists.
 //!
 //! [`MembershipLog`]: crate::membership::MembershipLog
@@ -99,13 +102,18 @@
 //! [`store`]: mod@store
 //! [`codec`]: mod@codec
 //! [`replay`]: mod@replay
+//! [`reconciliation`]: mod@reconciliation
 
 mod codec;
+mod reconciliation;
 mod replay;
 mod store;
 #[cfg(test)]
 mod tests;
 
+pub use reconciliation::{
+    ReconciliationError, ReconciliationEvidence, ReconciliationView, ViewProvenance,
+};
 pub(crate) use replay::build_keyring;
 pub use replay::{LoadedFacts, Rebuilt};
 // Raw-commit test seam (planted-forgery tests): test-only re-exports.
@@ -432,4 +440,14 @@ pub enum Fact {
     /// every fact — pending is derived as queued-minus-done, never by
     /// deletion.
     CarryDone(SnapshotId),
+    /// A stated reconciliation view: the recipient's per-class
+    /// durable evidence (committed transitions, held snapshots,
+    /// installed capability epochs) as the recipient saw it. A
+    /// statement about durable state, not a message receipt — this is
+    /// the fact the recipient's reconciliation statement (21b) is the
+    /// transport representation of, and what the sender's set
+    /// difference (21c) compares against. Committing it changes
+    /// nothing derivable: [`ReconciliationView`] derives from the
+    /// base facts, so a stated view never feeds its own derivation.
+    ReconciliationView(ReconciliationEvidence),
 }

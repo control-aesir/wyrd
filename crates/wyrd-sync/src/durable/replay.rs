@@ -15,7 +15,7 @@ use wyrd_format::{
 };
 
 use super::codec::DecodedFact;
-use super::DurableError;
+use super::{DurableError, ReconciliationEvidence};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::capability::DriveKeyring;
@@ -84,6 +84,11 @@ pub struct LoadedFacts {
     )>,
     pub capability_delivered: Vec<(u64, DeviceId)>,
     pub bootstrap_pending: Vec<Vec<u8>>,
+    /// Stated reconciliation views, in commit order. Statements about
+    /// the base facts, not base facts: derivation
+    /// ([`ReconciliationView`](super::ReconciliationView)) ignores
+    /// this bucket, so stating a view never changes the derived view.
+    pub reconciliation_views: Vec<ReconciliationEvidence>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -210,6 +215,12 @@ impl LoadedFacts {
             }
             DecodedFact::CarryDone(head) => {
                 self.runtime_facts.push(RuntimeFact::CarryDone(head));
+            }
+            DecodedFact::ReconciliationView(view) => {
+                // No RuntimeFact: stating the view changes no runtime
+                // state. The bucket preserves commit order, so the
+                // latest statement is last.
+                self.reconciliation_views.push(view);
             }
         }
     }

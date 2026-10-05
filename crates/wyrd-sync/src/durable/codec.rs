@@ -16,7 +16,7 @@ use wyrd_format::{
     SnapshotId, StorageId, TransitionId,
 };
 
-use super::{DurableError, Fact, SealedCapabilityFactId};
+use super::{DurableError, Fact, ReconciliationEvidence, SealedCapabilityFactId};
 use crate::control::message::{ControlKind, Message};
 use crate::control::{ControlMessageId, SealedControl, SealedRotation, SnapshotAnnouncement};
 use crate::keys::capability::{encoding, Capability};
@@ -72,9 +72,14 @@ const TAG_CARRY_DONE: u8 = 0x15;
 /// the capability-sealed-replaced record, and the tag space is
 /// append-only.
 const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x17;
+/// A stated reconciliation view: u32 LE transition count ‖ 32 bytes
+/// each ‖ u32 LE snapshot count ‖ 32 bytes each ‖ u32 LE capability
+/// count ‖ (device 32 ‖ epoch u64 LE) each. Tag 0x18: 0x17 is the
+/// route-sealed record, and the tag space is append-only.
+const TAG_RECONCILIATION_VIEW: u8 = 0x18;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 23] = [
+const KNOWN_TAGS: [u8; 24] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -98,6 +103,7 @@ const KNOWN_TAGS: [u8; 23] = [
     TAG_CARRY_QUEUED,
     TAG_CARRY_DONE,
     TAG_ANNOUNCEMENT_ROUTE_SEALED,
+    TAG_RECONCILIATION_VIEW,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -414,6 +420,26 @@ pub(super) fn encode_fact(
         }
         Fact::CarryQueued(head) => Ok((TAG_CARRY_QUEUED, head.as_bytes().to_vec())),
         Fact::CarryDone(head) => Ok((TAG_CARRY_DONE, head.as_bytes().to_vec())),
+        Fact::ReconciliationView(view) => {
+            // Sorted-set order is the encoding order: two views over
+            // the same evidence encode byte-identically, so a stated
+            // view has a stable identity to retire against.
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(view.transitions.len() as u32).to_le_bytes());
+            for id in &view.transitions {
+                bytes.extend_from_slice(id.as_bytes());
+            }
+            bytes.extend_from_slice(&(view.snapshots.len() as u32).to_le_bytes());
+            for id in &view.snapshots {
+                bytes.extend_from_slice(id.as_bytes());
+            }
+            bytes.extend_from_slice(&(view.capabilities.len() as u32).to_le_bytes());
+            for (device, epoch) in &view.capabilities {
+                bytes.extend_from_slice(device.as_bytes());
+                bytes.extend_from_slice(&epoch.to_le_bytes());
+            }
+            Ok((TAG_RECONCILIATION_VIEW, bytes))
+        }
     }
 }
 
@@ -734,9 +760,52 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let raw: [u8; 32] = record.try_into().ok()?;
             Some(DecodedFact::CarryDone(SnapshotId::from_bytes(raw)))
         }
+        TAG_RECONCILIATION_VIEW => Some(decode_reconciliation_view(record)?),
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
+}
+
+/// Decode a stated reconciliation view: three counted sets with
+/// exact-length framing. Any count/length mismatch poisons the file
+/// like any malformed known record — a view is evidence, and
+/// evidence never parses approximately.
+fn decode_reconciliation_view(record: &[u8]) -> Option<DecodedFact> {
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = pos.checked_add(n)?;
+        if end > record.len() {
+            return None;
+        }
+        let slice = &record[*pos..end];
+        *pos = end;
+        Some(slice)
+    };
+    let count = |pos: &mut usize| -> Option<usize> {
+        Some(u32::from_le_bytes(take(pos, 4)?.try_into().ok()?) as usize)
+    };
+    let mut view = ReconciliationEvidence::default();
+    let transitions = count(&mut pos)?;
+    for _ in 0..transitions {
+        view.transitions.insert(TransitionId::from_bytes(
+            take(&mut pos, 32)?.try_into().ok()?,
+        ));
+    }
+    let snapshots = count(&mut pos)?;
+    for _ in 0..snapshots {
+        view.snapshots
+            .insert(SnapshotId::from_bytes(take(&mut pos, 32)?.try_into().ok()?));
+    }
+    let capabilities = count(&mut pos)?;
+    for _ in 0..capabilities {
+        let device = DeviceId::from_bytes(take(&mut pos, 32)?.try_into().ok()?);
+        let epoch = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        view.capabilities.insert((device, epoch));
+    }
+    if pos != record.len() {
+        return None;
+    }
+    Some(DecodedFact::ReconciliationView(view))
 }
 
 fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
@@ -823,6 +892,7 @@ pub(super) enum DecodedFact {
     BootstrapPending(Vec<u8>),
     CarryQueued(SnapshotId),
     CarryDone(SnapshotId),
+    ReconciliationView(ReconciliationEvidence),
 }
 
 // Sibling test file under the workspace tests_* naming: #[path] is required

@@ -32,7 +32,7 @@ use wyrd_format::{
     ObjectStore,
 };
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
-use wyrd_sync::durable::{DurableStore, Fact};
+use wyrd_sync::durable::{DurableStore, Fact, ReconciliationView};
 use wyrd_sync::keys::EpochSecret;
 use wyrd_sync::runtime::Engine;
 
@@ -374,6 +374,55 @@ fn upgrade_previous_release_store_replays() {
         fixture_digest(&dir),
         "2abd4973a20cbed7bc9cba9a021daa3bfdf6cdd434d84fc61309d11cd9ad1d67",
         "release fixture bytes are frozen: regenerate via regenerate_release_fixture, never by hand"
+    );
+}
+
+/// The 21a half of the acceptance: a commit carrying the new
+/// reconciliation-view tag replays through the public path. The
+/// delivery path commits the base facts, the derived view is stated
+/// through the public commit API, and a reopen replays the statement
+/// verbatim while derivation stays identical. The older-replay half
+/// is the tag skip this relies on: an old node does not know `0x18`
+/// and skips the record (pinned in wyrd-sync by
+/// `committed_corruption_fails`), so a store containing a stated
+/// view still opens there — it simply derives nothing.
+#[test]
+fn upgrade_reconciliation_view_replays_through_the_public_path() {
+    let mut rig = Rig::new();
+    let admit = rig.admit.clone();
+    rig.enqueue_capability(&admit, &[rig.epoch1.clone(), rig.epoch2.clone()]);
+    let report = rig.drain();
+    assert_eq!(report.accepted, 1, "the fixture capability must commit");
+    let dir = rig.dir.clone();
+    drop(rig.take_engine());
+
+    let evidence = {
+        let store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.reconciliation_views.is_empty(), "no view stated yet");
+        ReconciliationView::derive(&loaded).evidence().clone()
+    };
+    assert!(
+        !evidence.transitions.is_empty() && !evidence.capabilities.is_empty(),
+        "the delivery path leaves real evidence: {evidence:?}"
+    );
+    {
+        let mut store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+        store
+            .commit(&[Fact::ReconciliationView(evidence.clone())])
+            .unwrap();
+    }
+    let store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![evidence.clone()],
+        "the stated view replays verbatim"
+    );
+    assert_eq!(
+        ReconciliationView::derive(&loaded).evidence(),
+        &evidence,
+        "stating the view changed nothing derivable"
     );
 }
 

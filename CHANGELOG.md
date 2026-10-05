@@ -29,6 +29,14 @@ version say exactly what changed.
 
 ### Added
 
+- Reconciliation view fact kind (`0x18`) and replay arm
+  (`21a-reconciliation-fact`): the recipient's per-class durable
+  evidence (committed transitions, held snapshots, installed
+  capability epochs) commits as a stated view and replays verbatim;
+  derivation ignores stated views, torn commits leave the previous
+  view, and retirement on an in-memory-only view is refused. Recorded
+  in `docs/upgrade-contract.md`; no wire behavior yet (21b/21c wire
+  the statement and the retire condition).
 - Normative DG-3 control-message recovery / forget contract in
   `docs/sync-and-peers.md`: retire an obligation only on durable
   evidence the recipient's state subsumes it (per-class predicates),

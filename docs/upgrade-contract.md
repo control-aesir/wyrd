@@ -137,6 +137,16 @@ Releases are not required to write every format they read:
     pending, which is the safe direction: it retries what a new
     node has retired, rather than forgetting what it never proved.
 
+    The stated reconciliation view (`0x18`) is the recipient side of
+    the same pattern: the per-class durable evidence (committed
+    transitions, held snapshots, installed capability epochs) as the
+    recipient saw it, which the recipient's reconciliation statement
+    is the transport representation of. An old node skips the unknown
+    tag and derives nothing — views are statements, never load-bearing
+    for replay, so skipping one loses no state. `0x18` follows `0x17`
+    (the announcement route seal); like `0x16`, it was checked
+    against the full tag set, not the last value.
+
     The tag boundary is pinned by
     `the_replacement_tag_is_a_clean_upgrade_boundary`: `0x16` sits
     outside the enumerated pre-replacement set, a commit carrying a

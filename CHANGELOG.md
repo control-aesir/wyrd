@@ -46,6 +46,14 @@ version say exactly what changed.
   (vault-seeing counter, durable refusal state, `RetainedBytes`
   decrement), and the acceptance tests are the implementation follow-up
   gated on this artefact.
+- Retention constraints v0.x must preserve in
+  `docs/retention-constraints.md`: retention vs residency model, the
+  transition-churn adversary, refusal semantics over the DG-4 A/B bridge,
+  accounting prerequisites as contract, and what v0.3-v0.4 must not
+  introduce (no eviction, no pruning, no rate limiting of durable
+  commits, no wire refusal signal, no quota-pressure reclamation).
+  Decision only; no behavior change and no format impact. GC
+  implementation stays post-v1.
 
 ### Fixed
 

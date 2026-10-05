@@ -58,16 +58,14 @@ pub enum FsStoreError {
     PermissionDenied(String),
     /// Stored bytes do not match the address they were read from: a
     /// foreign preimage on `insert_verified`, bitrot under the live
-    /// name on `get`. Carries no identity by decision
-    /// (`docs/trust.md`: concealment is absence) — a diagnostics
-    /// renderer must never inherit a ContentId from an error path,
-    /// so there is nothing to redact here.
+    /// name on `get`. Carries no identity by decision (see the
+    /// no-identity exception in `docs/error-conventions.md`): a
+    /// `Display`/`Debug` impl cannot know which trust position
+    /// renders it, so there is nothing to redact here.
     #[error("identity mismatch: stored bytes do not match their address")]
     IdentityMismatch,
     /// Stored bytes do not hash back to their address. Same
-    /// no-identity rule as [`FsStoreError::IdentityMismatch`]: a
-    /// diagnostics renderer must never inherit a ContentId from an
-    /// error path, so there is nothing to redact here.
+    /// no-identity rule as [`FsStoreError::IdentityMismatch`].
     #[error("stored bytes do not hash back to their address")]
     Corrupt,
 }

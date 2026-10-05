@@ -1179,20 +1179,31 @@ fn sync_now_reports_admission_to_durable_commit_latency() {
     );
 }
 
-/// The write-path section is absent when nothing authored: three
-/// rows of zeros would read as a measured idle, and quiet should
-/// look quiet.
+/// The write-path section renders unconditionally, including the
+/// all-zero case: zeros are honest evidence of no writes by that
+/// invocation, and a failures-only run (nothing authored) must still
+/// show its refusal count rather than hide the whole section.
 #[test]
-fn write_path_lines_suppressed_without_snapshots() {
+fn write_path_section_renders_zeros_without_writes() {
     let report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
     let rendered = sync_now_render(&report);
     assert!(
-        !rendered.contains("write path:"),
-        "no zero-snapshot section: {rendered}"
+        rendered.contains("write path: 0 snapshots"),
+        "zero snapshots render as zero: {rendered}"
     );
     assert!(
-        !rendered.contains("write sources:") && !rendered.contains("write latency:"),
-        "no zero rows beside it: {rendered}"
+        rendered.contains("over 0 commits (0 failures)"),
+        "zero commits and failures render too: {rendered}"
+    );
+    let mut refused = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    refused.write = WriteStats {
+        failures: 3,
+        ..Default::default()
+    };
+    let rendered = sync_now_render(&refused);
+    assert!(
+        rendered.contains("over 0 commits (3 failures)"),
+        "a failures-only run shows its refusals: {rendered}"
     );
 }
 

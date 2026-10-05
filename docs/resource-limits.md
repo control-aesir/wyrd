@@ -187,10 +187,11 @@ surfaces:
 - `WriteStats` on the mutation queue: queue depth (queued but
   unexecuted, per dispatch in `mount.log` beside the dispatch
   latency), snapshot rate with per-source share, and
-  admission-to-commit latency (mean and max). Mutation-seam commits
-  only: direct engine authoring bypasses the traced seam, so this is
-  the write path's count, not every snapshot the drive produced.
-  Local durability load reads here; sync load reads in the run report — the two must
+  admission-to-commit latency (mean and max). Write-path statistics
+  are process-local and cover only mutations submitted to the run's
+  in-memory queue: mutation-seam commits only, and headless runs
+  submit none, so their section reads zero. Local durability load
+  reads here; sync load reads in the run report — the two must
   never be conflated when a window is measured.
 - `MailboxHealth::saturation_recoveries`: saturation replays issued
   (a rising count means the relay stream is chronically choked).

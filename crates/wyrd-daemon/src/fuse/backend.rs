@@ -316,10 +316,6 @@ where
         // when the drop log can fire: at the default `info` level a
         // dispatch costs one enabled-check and no lock, exactly the
         // cost model `RequestLog::new` documents.
-        // The backlog read takes the queue lock, so it happens only
-        // when the drop log can fire: at the default `info` level a
-        // dispatch costs one enabled-check and no lock, exactly the
-        // cost model `RequestLog::new` documents.
         if tracing::enabled!(tracing::Level::DEBUG) {
             log.set_depth(
                 self.mutations

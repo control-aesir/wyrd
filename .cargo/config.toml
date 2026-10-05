@@ -4,3 +4,16 @@
 # outright. Use `cargo nextest run` (or `cargo t`) instead.
 [alias]
 t = "nextest run"
+# Local-lane shortcuts: cheap deterministic tests for one stack area.
+# Each maps to the crate closure that area's edits can actually affect
+# (wyrd-contracts is excluded everywhere here; it is PR-gate evidence).
+# `fast-all` is the whole workspace under the local profile; the PR gate
+# stays `cargo nextest run` (default profile) plus `--profile slow` on
+# master CI.
+fast-format = "nextest run --profile local -p wyrd-format -p wyrd-namespace"
+fast-fuse = "nextest run --profile local -p wyrd-fuse"
+fast-sync = "nextest run --profile local -p wyrd-sync"
+fast-core = "nextest run --profile local -p wyrd-core"
+fast-daemon = "nextest run --profile local -p wyrd-daemon"
+fast-cli = "nextest run --profile local -p wyrd-cli"
+fast-all = "nextest run --profile local"

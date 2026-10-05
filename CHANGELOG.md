@@ -28,6 +28,12 @@ version say exactly what changed.
   release as a forcing event, namespace operations as folding forcing events,
   no idle-window commit in v0.3. Decision only; no behavior change and no
   format impact. Implementation is gated on this artefact.
+- Local test lane: `[profile.local]` in `.config/nextest.toml` (cheap
+  deterministic tests; excludes the contracts binary, the relay cover,
+  floods, and the individually slowest tests measured in the P0
+  baseline) plus per-area `cargo fast-*` shortcuts in
+  `.cargo/config.toml`. The existing default profile is now documented
+  as the PR gate; no test was added, removed, or modified.
 
 ## [0.2.0-alpha]
 

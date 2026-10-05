@@ -1,10 +1,36 @@
+# Test lanes: the same corpus at three evidence budgets.
+#
+# - `local` is the edit-loop profile: cheap deterministic tests only.
+#   It excludes the contracts binary, relay/iroh transport, restart and
+#   recovery integration, floods and saturation, and the individually
+#   slowest state-machine tests. Use it per package while coding:
+#   `cargo fast-sync`, `cargo fast-core`, etc.
+# - `default` is the PR gate: everything local plus the medium
+#   integration evidence (cross-crate contracts, heterogeneous relay
+#   cover, normal persistence and restart, selected mailbox and iroh
+#   loopback). Branch reviews run this profile.
+# - `slow` is the master-CI supplement: the nine >10s live-relay tests
+#   excluded from `default`. A future `master` profile (everything plus
+#   stress and enlarged proptest budgets) is planned; until then master
+#   CI runs `default` plus `slow`.
+#
+# P0 baseline (Oct-5, M2, contended dev machine): default wall 206s over
+# 1415 tests with ~7x effective parallelism; warm compile negligible.
+# wyrd-sync holds half the tests and most of the slow tail, so the local
+# filter below is shaped by that measurement, not by assumption.
+#
+# Maintenance rule: nextest cannot filter by duration, so tests measured
+# at 9s or more that stay in `default` are named in the local filter.
+# When a test is observed at that cost (or a new slow integration test
+# lands), add its distinctive substring here alongside the PR that
+# introduces it.
+[test-groups]
 # Heavy live-mailbox flood tests are crypto-bound (NIP-59 seal per wrap;
 # consumption floods are additionally fsync-bound at one sync per ack,
 # while poison floods pay no sync per delivery) and each spawns parallel
 # seal workers plus relay/client runtimes. Running them concurrently
 # oversubscribes the machine and they all crawl, so they share one
 # serial group while the rest of the suite keeps full parallelism.
-[test-groups]
 mailbox-flood = { max-threads = 1 }
 mailbox-slow = { max-threads = 1 }
 contracts-serial = { max-threads = 1 }
@@ -13,20 +39,22 @@ contracts-serial = { max-threads = 1 }
 # process). See the override below for why.
 
 # The >10s live-relay integration tests (flood, saturation replay,
-# outage recovery) are excluded from the default profile so local and
-# PR runs stay fast, and included in the `slow` profile the master CI
-# gate runs. They stay ordinary tests, not `#[ignore]`d: the ignore
-# attribute is reserved for tests that need external resources (a public
-# relay, kernel FUSE) or are blocked on future work, which must never
-# run in CI. Substrings are distinctive enough to select exactly these
-# nine without a name-by-name list at each call site.
+# outage recovery) are excluded from the default (PR-gate) profile so PR
+# runs stay fast, and included in the `slow` profile the master CI gate
+# runs. The `local` profile below excludes them too, via its broader
+# transport categories. They stay ordinary tests, not `#[ignore]`d: the
+# ignore attribute is reserved for tests that need external resources (a
+# public relay, kernel FUSE) or are blocked on future work, which must
+# never run in CI. Substrings are distinctive enough to select exactly
+# these nine without a name-by-name list at each call site.
 #
 # Deliberate exception: heterogeneous_relays_cover stays in the default
 # profile. Both its relays are localhost (MiniRelay plus an in-process
 # real relay), so it needs no external resource, and it is the only
 # default-gate coverage of the cross-implementation path — the slow
 # profile covers the fake-only sibling instead. About 30s of wall time
-# buys that standing evidence on every local and PR run.
+# buys that standing evidence on every PR run. It is excluded from
+# `local`, where relay coverage is out of budget by design.
 [profile.default]
 default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover))"
 # Nextest's LEAK verdict fires when a test's stdout/stderr pipes stay
@@ -46,6 +74,37 @@ default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_
 # it costs nothing on clean runs since the wait only bites when the
 # pipes are still open. See the leaky-verdict issue for the pin
 # evidence (four blamed innocents across wyrd-cli and wyrd-core).
+leak-timeout = "5s"
+
+# The local edit-loop profile: cheap deterministic tests only. Profiles
+# do not inherit filters, so the nine slow tests excluded from `default`
+# above are restated here. Beyond them, local additionally excludes:
+#
+# - the whole contracts binary (cross-crate composition; PR evidence),
+# - the standing heterogeneous relay cover (PR evidence),
+# - the mailbox flood/saturation families that stay in `default`
+#   (unacked_bound, useless_flood),
+# - the spam/resilience pair that dominates the default tail
+#   (sustained_spam 48s, per_sender_quota 31s; the only two `~spam`
+#   tests, so the substring has no fast collateral),
+# - individually measured slow state-machine tests (>=9.5s in the Oct-5
+#   P0 run): deep_tree_authoring, large_announcement_history,
+#   merge_plan_refuses_more_heads, deep_tip_classifies,
+#   seen_store_evicts, repeated_compaction_cycles,
+#   budgeted_walk_reaches_live, the three replacement_commit_is_atomic
+#   crash-stage tests, same_mailbox_acquires_missed,
+#   disconnected_peer_acquires_missed, sliced_run_attempts_live, and
+#   the production-KDF proof (prod_kdf_params, 9.5s; PR covers it).
+#
+# Deliberately NOT excluded: fast serving/announcement/recovery/restart
+# unit tests (about a hundred sub-2s tests). Broad substrings such as
+# `~serving` or `~announc` would sweep those up and hollow out the very
+# signal the edit loop exists for, so slow tests are named, not
+# categorized. The 5-9s tier (convergence, lifecycle, membership and
+# authorization properties) stays for the same reason: local keeps its
+# semantic value and the per-package wall reflects it honestly.
+[profile.local]
+default-filter = "not (package(wyrd-contracts) or test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover) or test(~heterogeneous) or test(~unacked_bound) or test(~useless_flood) or test(~spam) or test(~deep_tree_authoring) or test(~large_announcement_history) or test(~merge_plan_refuses_more_heads) or test(~deep_tip_classifies) or test(~seen_store_evicts) or test(~repeated_compaction) or test(~budgeted_walk_reaches_live) or test(~replacement_commit_is_atomic) or test(~same_mailbox_acquires_missed) or test(~disconnected_peer_acquires_missed) or test(~sliced_run_attempts_live) or test(~prod_kdf_params))"
 leak-timeout = "5s"
 
 [profile.slow]

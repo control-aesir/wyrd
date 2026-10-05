@@ -57,11 +57,15 @@ to. The README carries the vision; `docs/` carries the current design contract.
 
 ```
 devenv shell -- cargo check                 # workspace build/validation
-devenv shell -- cargo nextest run           # workspace tests (unit + integration)
+devenv shell -- cargo fast-sync             # local lane: cheap tests, one area
+devenv shell -- cargo fast-core             # (fast-format/fast-fuse/fast-sync/
+devenv shell -- cargo fast-daemon           # fast-core/fast-daemon/fast-cli/
+devenv shell -- cargo fast-all              # fast-all for the whole workspace)
+devenv shell -- cargo nextest run           # PR gate (default profile)
 devenv shell -- cargo test --workspace --doc  # doctests; nextest skips these
 devenv shell -- cargo nextest run --profile slow
                                             # >10s live-relay tests; excluded from
-                                            # regular runs, gated on master CI
+                                            # the PR gate, run by master CI
 devenv shell -- cargo test -p wyrd-cli      # CLI suite (argument parsing, exit codes)
 devenv shell                # enter the dev environment (rust, git-hooks)
 ```

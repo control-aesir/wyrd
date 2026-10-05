@@ -57,8 +57,12 @@ is defined over a **retry generation / failure epoch**:
   generation X*, never new evidence;
 - terminal when the current generation has accumulated enough failure
   evidence that every currently eligible candidate is exhausted;
-- the generation changes when new candidates arrive or the retry
-  policy reopens cooled ones.
+- the generation changes when a new waiter reopens a completed
+  terminal. Cooldown expiry and newly arrived candidates restore
+  eligibility — attempts resume under the background plan — but
+  they do not rotate the generation on their own: rotating without
+  demand would republish a verdict nobody is reading every cooldown
+  cycle (OD-11-2). A completed generation never reopens by itself.
 
 This keeps two states distinct that must not be conflated:
 

@@ -591,8 +591,11 @@ pub(super) enum FetchKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalState {
     /// The completed attempt generation. Reported as
-    /// `FetchStatus::Unavailable(generation)`; strictly monotonic per
-    /// identity while the engine lives.
+    /// `FetchStatus::Unavailable(generation)`; monotonic per
+    /// identity while the identity stays demanded. An identity that
+    /// goes undemanded (fulfilled, unpinned) drops its tracking, so
+    /// a later demand restarts at 1 — the number scopes one demand
+    /// episode, not the engine's life.
     pub generation: u64,
     /// True only when every exhausted representation cooled on
     /// verification rejection (`Invalid`). Any transport, budget, or
@@ -1828,9 +1831,17 @@ impl Engine {
 
     /// Re-evaluate identity-level terminal fetch state after a fetch
     /// run. Call after every `execute_plan` / `execute_plan_sliced`
-    /// before reading terminal status: the evaluation is a pure
-    /// function of the run's ledger state plus a fresh reconcile, so
-    /// it lags the run by nothing and commits nothing.
+    /// before reading terminal status: the evaluation is a function
+    /// of the run's ledger state plus a fresh reconcile, so it lags
+    /// the run by nothing and commits nothing. Returns the rebuilt
+    /// runtime the evaluation reconciled, so callers building a
+    /// projection off the same state skip a second replay.
+    ///
+    /// Not pure: reconciling expires lapsed cooldowns (via
+    /// `fetch_eligible`), which clears their ledgers as a side
+    /// effect. Expiry only ever moves representations from cooled to
+    /// eligible, never the reverse, so repeated evaluation without
+    /// an intervening run is still idempotent.
     ///
     /// The model is OD-11-1 option A: per-identity generations fed by
     /// representation-level ledgers. An identity is terminal when it
@@ -1841,8 +1852,11 @@ impl Engine {
     /// terminality — they are not evidence about the representation.
     /// Snapshot bodies and roots are a different identity space and
     /// never participate: only object and child-manifest storage keys
-    /// feed an identity's generation.
-    pub fn evaluate_terminal(&mut self) -> Result<(), EngineError> {
+    /// feed an identity's generation. Root-manifest and snapshot-body
+    /// waiters therefore still block to the deadline (see the
+    /// tracking issue's follow-up line); their strikes and cooldowns
+    /// keep working exactly as before.
+    pub fn evaluate_terminal(&mut self) -> Result<RuntimeState, EngineError> {
         let rebuilt = self.store.rebuild(self.device)?;
         let runtime = rebuilt.runtime;
         let plan = runtime.reconcile();
@@ -1892,20 +1906,21 @@ impl Engine {
             let exhausted = keys.iter().all(|key| {
                 self.fetch_cool_until.contains_key(key) && !self.fetch_budget_cooled.contains(key)
             });
-            if self.fetch_terminal.contains_key(id) {
-                if !exhausted {
-                    // Eligibility restored — new candidates arrived or
-                    // a cooldown lapsed. The completed generation stays
-                    // completed; a new one opens rather than reviving
-                    // the old. The bump happens only from terminal, so
-                    // a candidate arriving mid-attempt never advances
-                    // the counter on its own.
-                    let generation = self.fetch_generations.get(id).copied().unwrap_or(0) + 1;
-                    self.fetch_terminal.remove(id);
-                    self.fetch_generations.insert(*id, generation);
-                    self.fetch_attempted.remove(id);
-                }
-            } else if exhausted && self.fetch_attempted.contains(id) {
+            // A completed generation never reopens on its own:
+            // cooldown expiry and newly arrived candidates make
+            // representations eligible again (the background plan
+            // keeps attempting under the durable policy, so recovery
+            // needs no waiter), but the verdict stands until a new
+            // waiter reopens the attempt as a new generation or
+            // fulfillment dissolves it. Rotating generations without
+            // demand would republish a verdict nobody is reading every
+            // cooldown cycle, against the OD-11-2 resource invariant
+            // (no waiter, no fetch work). Candidates that fulfill
+            // clear through the demanded/local arms instead.
+            if !self.fetch_terminal.contains_key(id)
+                && exhausted
+                && self.fetch_attempted.contains(id)
+            {
                 let generation = self.fetch_generations.entry(*id).or_insert(1);
                 let corrupt = keys
                     .iter()
@@ -1929,7 +1944,7 @@ impl Engine {
         self.fetch_generations.retain(|id, _| live.contains(id));
         self.fetch_terminal.retain(|id, _| live.contains(id));
         self.fetch_attempted.retain(|id| live.contains(id));
-        Ok(())
+        Ok(runtime)
     }
 
     /// The settled terminal verdict for one identity: `Unavailable`
@@ -1961,8 +1976,8 @@ impl Engine {
 
     /// The current attempt generation for one demanded identity, if
     /// the engine tracks one. Generations open at 1 on first demand
-    /// and advance monotonically: a completed terminal never reopens
-    /// under the same number.
+    /// and advance monotonically while the identity stays demanded:
+    /// a completed terminal never reopens under the same number.
     pub fn generation(&self, id: &ContentId) -> Option<u64> {
         self.fetch_generations.get(id).copied()
     }

@@ -137,9 +137,12 @@ where
     /// Refresh materialization facts after intake or fetch execution. Snapshot
     /// heads are supplied separately because announcements do not carry trees.
     pub fn refresh_materialization(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
-        self.engine.evaluate_terminal()?;
+        // One rebuild serves both: the evaluation reconciles a fresh
+        // runtime anyway, so the projection builds off it instead of
+        // replaying twice.
+        let runtime = self.engine.evaluate_terminal()?;
         self.view.set_materialization(RuntimeMaterialization {
-            runtime: self.engine.runtime_state()?,
+            runtime,
             terminal: self.engine.terminal_snapshot(),
         });
         Ok(())

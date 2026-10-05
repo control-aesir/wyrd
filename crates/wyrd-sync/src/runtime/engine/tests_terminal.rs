@@ -513,9 +513,15 @@ fn corrupt_stays_attached_to_the_representation_that_produced_it() {
 }
 
 #[test]
-fn generation_advances_when_a_cooled_representation_is_reopened() {
-    // Cooldown expiry opens a new generation rather than reviving the
-    // old one — but only forward, and only from a completed terminal.
+fn cooled_expiry_does_not_rotate_generations_without_demand() {
+    // Finding 1's regression pin: a completed generation never
+    // reopens on its own. Past the cooldown the representations are
+    // eligible again and the background plan resumes attempting
+    // (recovery needs no waiter), but the verdict stands at
+    // generation 1 — no rotation, no republication-worthy change —
+    // until a new waiter reopens the attempt or fulfillment
+    // dissolves it. Rotating here would republish a verdict nobody
+    // is reading every cooldown cycle, against OD-11-2.
     let mut fixture = fixture();
     let device = fixture.recipient;
     let (mut builder, genesis) = Builder::genesis(10);
@@ -564,30 +570,36 @@ fn generation_advances_when_a_cooled_representation_is_reopened() {
         32,
     );
     assert_eq!(fixture.engine.generation(&published.content), Some(1));
-    // Past the cooldown the representations are eligible again: the
-    // completed generation stays completed and a new one opens. The
-    // new generation has no attempts yet, so it is not terminal —
-    // expiry alone is eligibility, never evidence.
-    let mut advanced = false;
-    for _ in 0..(FETCH_COOLDOWN_PASSES + 2) {
-        fixture
+    // Past the cooldown the representations are eligible again and
+    // the background plan resumes attempting — but the completed
+    // generation stands: expiry is eligibility, never evidence, and
+    // never a rotation without demand.
+    let mut saw_reattempt = false;
+    for _ in 0..(FETCH_COOLDOWN_PASSES + FETCH_MAX_STRIKES as u64 + 2) {
+        let report = fixture
             .engine
             .execute_plan(&mut directed, &mut objects)
             .unwrap();
         fixture.engine.evaluate_terminal().unwrap();
-        if fixture.engine.generation(&published.content) == Some(2) {
-            advanced = true;
-            assert_eq!(
-                fixture.engine.terminal_status(&published.content),
-                None,
-                "the new generation opens un-terminal"
-            );
-            break;
+        if report.transport_errors > 0 {
+            saw_reattempt = true;
         }
+        assert_eq!(
+            fixture.engine.terminal_status(&published.content),
+            Some(FetchStatus::Unavailable(1)),
+            "the verdict stands past expiry: still generation 1"
+        );
+        assert_eq!(
+            fixture.engine.generation(&published.content),
+            Some(1),
+            "no rotation without demand"
+        );
     }
-    assert!(advanced, "cooldown expiry opens a new generation");
-    // Fresh attempts fail again: the new generation completes
-    // terminally, monotonically after the first.
+    assert!(saw_reattempt, "the background plan resumes attempting");
+    // A new waiter reopens the attempt as generation 2, which then
+    // completes terminally on the fresh evidence.
+    fixture.engine.reopen_generation(&published.content);
+    assert_eq!(fixture.engine.generation(&published.content), Some(2));
     drive_to_terminal(
         &mut fixture,
         &mut directed,

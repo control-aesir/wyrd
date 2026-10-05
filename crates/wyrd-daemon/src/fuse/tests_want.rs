@@ -287,6 +287,7 @@ struct TerminalMaterialization {
     chunk: ContentId,
     polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     flip_after: usize,
+    verdict: wyrd_format::FetchStatus,
 }
 
 impl wyrd_fuse::Materialization for TerminalMaterialization {
@@ -294,7 +295,7 @@ impl wyrd_fuse::Materialization for TerminalMaterialization {
         if id == &self.chunk {
             let polls = self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if polls > self.flip_after {
-                return wyrd_format::FetchStatus::Unavailable(1);
+                return self.verdict;
             }
         }
         wyrd_format::FetchStatus::RemoteOnly
@@ -309,6 +310,19 @@ impl wyrd_fuse::Materialization for TerminalMaterialization {
 /// deadline — the two must differ exactly here.
 #[test]
 fn terminal_unavailable_open_fails_fast_with_eio() {
+    terminal_verdict_fails_fast_with_eio(wyrd_format::FetchStatus::Unavailable(1));
+}
+
+/// The corrupt mirror: identity-level corruption evidence completes
+/// the waiter with bounded `EIO` exactly like unavailability — a
+/// reader that already registered must not burn the whole deadline
+/// on a verdict that can never change (finding 2's daemon half).
+#[test]
+fn terminal_corrupt_open_fails_fast_with_eio() {
+    terminal_verdict_fails_fast_with_eio(wyrd_format::FetchStatus::Corrupt);
+}
+
+fn terminal_verdict_fails_fast_with_eio(verdict: wyrd_format::FetchStatus) {
     let open_timeout = Duration::from_secs(20);
     // The tree is held so the open resolves; only the chunk is
     // terminal — the same staging as `withheld_backend`, with the
@@ -332,6 +346,7 @@ fn terminal_unavailable_open_fails_fast_with_eio() {
                 chunk,
                 polls: Arc::clone(&polls),
                 flip_after: 3,
+                verdict,
             },
             heads(vec![snapshot_of(root)]),
         ),

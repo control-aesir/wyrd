@@ -1193,11 +1193,16 @@ where
             (&self.wants, &first)
         {
             let wants = Arc::clone(registry);
-            // Success completes; terminal unavailability completes
-            // with the verdict (the final retry below surfaces it as
-            // EIO). Any other failure keeps waiting: the fetch may
-            // still land before the deadline.
-            let retry = || matches!(attempt(), Ok(_) | Err((ViewError::Unavailable, _)));
+            // Success completes; either terminal verdict completes
+            // with itself (the final retry below surfaces it as EIO).
+            // Any other failure keeps waiting: the fetch may still
+            // land before the deadline.
+            let retry = || {
+                matches!(
+                    attempt(),
+                    Ok(_) | Err((ViewError::Unavailable, _)) | Err((ViewError::Corrupt, _))
+                )
+            };
             match wait_for_materialization(&wants, *content, self.open_timeout, retry) {
                 Ok(()) => {
                     return map(attempt());

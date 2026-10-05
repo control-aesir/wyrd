@@ -227,16 +227,19 @@ fn a_new_waiter_after_terminal_starts_a_new_generation() {
         "the terminal pass retired the identity"
     );
     // Passes without a new waiter change nothing observable: the
-    // verdict stands (later passes may rotate generations past
-    // cooldown expiry, but nothing fulfills over dead routes).
-    for _ in 0..4 {
+    // verdict stands at generation 1 past cooldown expiry and past
+    // the background plan's resumed attempts — no rotation without
+    // demand (a full cooldown plus a full strike cycle with nobody
+    // reading).
+    for _ in 0..16 {
         live.sync_once(&mut loaded.rig.relay, Some(&mut dead))
             .unwrap();
+        assert_eq!(
+            view_status(&parts, &chunk),
+            FetchStatus::Unavailable(1),
+            "no waiter, no rotation: the verdict stands"
+        );
     }
-    assert!(
-        matches!(view_status(&parts, &chunk), FetchStatus::Unavailable(_)),
-        "no waiter, no healing: the verdict stands"
-    );
     // The new waiter reopens the attempt: pending, then re-admitted.
     parts.wants.register(chunk).unwrap();
     live.sync_once(&mut loaded.rig.relay, Some(&mut dead))

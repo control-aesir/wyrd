@@ -76,10 +76,10 @@ const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x17;
 /// each ‖ u32 LE snapshot count ‖ 32 bytes each ‖ u32 LE capability
 /// count ‖ (device 32 ‖ epoch u64 LE) each. Tag 0x18: 0x17 is the
 /// route-sealed record, and the tag space is append-only.
-const TAG_RECONCILIATION_VIEW: u8 = 0x18;
+pub(super) const TAG_RECONCILIATION_VIEW: u8 = 0x18;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-const KNOWN_TAGS: [u8; 24] = [
+pub(super) const KNOWN_TAGS: [u8; 24] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -421,26 +421,59 @@ pub(super) fn encode_fact(
         Fact::CarryQueued(head) => Ok((TAG_CARRY_QUEUED, head.as_bytes().to_vec())),
         Fact::CarryDone(head) => Ok((TAG_CARRY_DONE, head.as_bytes().to_vec())),
         Fact::ReconciliationView(view) => {
-            // Sorted-set order is the encoding order: two views over
-            // the same evidence encode byte-identically, so a stated
-            // view has a stable identity to retire against.
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&(view.transitions.len() as u32).to_le_bytes());
-            for id in &view.transitions {
-                bytes.extend_from_slice(id.as_bytes());
-            }
-            bytes.extend_from_slice(&(view.snapshots.len() as u32).to_le_bytes());
-            for id in &view.snapshots {
-                bytes.extend_from_slice(id.as_bytes());
-            }
-            bytes.extend_from_slice(&(view.capabilities.len() as u32).to_le_bytes());
-            for (device, epoch) in &view.capabilities {
-                bytes.extend_from_slice(device.as_bytes());
-                bytes.extend_from_slice(&epoch.to_le_bytes());
-            }
-            Ok((TAG_RECONCILIATION_VIEW, bytes))
+            Ok((TAG_RECONCILIATION_VIEW, encode_reconciliation_view(view)?))
         }
     }
+}
+
+/// Encode a stated reconciliation view to its record bytes:
+/// counted sections in sorted-set order, so two views over the same
+/// evidence encode byte-identically. Crate-visible: the stated-view
+/// digest (local audit identity) hashes these exact bytes.
+///
+/// Each section is bounded by `MAX_RECORDS_PER_COMMIT`, mirroring the
+/// commit's record ceiling: a statement larger than the largest
+/// committable batch belongs to 21b's chunked statements, and the
+/// bound keeps decode allocation proportional before integrity is
+/// verified. Refused here, durably, rather than wedging the store
+/// with a view no reopen could read (decode enforces the same
+/// ceiling).
+pub(super) fn encode_reconciliation_view(
+    view: &ReconciliationEvidence,
+) -> Result<Vec<u8>, DurableError> {
+    let mut bytes = Vec::new();
+    push_evidence_section(&mut bytes, "transitions", view.transitions.len())?;
+    for id in &view.transitions {
+        bytes.extend_from_slice(id.as_bytes());
+    }
+    push_evidence_section(&mut bytes, "snapshots", view.snapshots.len())?;
+    for id in &view.snapshots {
+        bytes.extend_from_slice(id.as_bytes());
+    }
+    push_evidence_section(&mut bytes, "capabilities", view.capabilities.len())?;
+    for (device, epoch) in &view.capabilities {
+        bytes.extend_from_slice(device.as_bytes());
+        bytes.extend_from_slice(&epoch.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// One counted section header: the count, bounded before any entry
+/// is written.
+fn push_evidence_section(
+    bytes: &mut Vec<u8>,
+    section: &'static str,
+    count: usize,
+) -> Result<(), DurableError> {
+    if count > MAX_RECORDS_PER_COMMIT {
+        return Err(DurableError::OversizedView {
+            section,
+            count,
+            max: MAX_RECORDS_PER_COMMIT,
+        });
+    }
+    bytes.extend_from_slice(&(count as u32).to_le_bytes());
+    Ok(())
 }
 
 /// Decode and verify one commit file, returning the decoded facts and
@@ -769,7 +802,10 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
 /// Decode a stated reconciliation view: three counted sets with
 /// exact-length framing. Any count/length mismatch poisons the file
 /// like any malformed known record — a view is evidence, and
-/// evidence never parses approximately.
+/// evidence never parses approximately. Each section count is
+/// bounded by the same ceiling the encoder enforces, so a tampered
+/// local commit cannot force unbounded allocation before the trailer
+/// hash is verified.
 fn decode_reconciliation_view(record: &[u8]) -> Option<DecodedFact> {
     let mut pos = 0usize;
     let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
@@ -782,7 +818,11 @@ fn decode_reconciliation_view(record: &[u8]) -> Option<DecodedFact> {
         Some(slice)
     };
     let count = |pos: &mut usize| -> Option<usize> {
-        Some(u32::from_le_bytes(take(pos, 4)?.try_into().ok()?) as usize)
+        let n = u32::from_le_bytes(take(pos, 4)?.try_into().ok()?) as usize;
+        if n > MAX_RECORDS_PER_COMMIT {
+            return None;
+        }
+        Some(n)
     };
     let mut view = ReconciliationEvidence::default();
     let transitions = count(&mut pos)?;

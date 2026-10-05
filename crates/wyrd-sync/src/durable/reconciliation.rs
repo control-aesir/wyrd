@@ -41,15 +41,49 @@ pub enum ViewProvenance {
     Memory,
 }
 
-/// A reconciliation view: evidence plus its provenance. Views
-/// constructed by [`ReconciliationView::derive`] are memory
-/// projections; only [`ReconciliationView::from_durable`] — fed by a
-/// committed fact — carries retirement weight.
+/// A reconciliation view: evidence plus its provenance. There are
+/// exactly two constructors, and only replay mints durability (see
+/// [`LoadedFacts::latest_stated_view`](super::LoadedFacts::latest_stated_view)):
+/// [`ReconciliationView::derive`] builds memory projections, which
+/// the retire gate refuses. Provenance is never caller-supplied, so
+/// no caller can launder a live projection into evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconciliationView {
     evidence: ReconciliationEvidence,
     provenance: ViewProvenance,
 }
+
+impl ReconciliationEvidence {
+    /// Per-class subset: every stated transition, snapshot, and
+    /// capability epoch is contained in the other evidence. The
+    /// conservative direction — a stored statement that claims more
+    /// than the base facts hold is an over-claim, and over-claims
+    /// retire what was never evidenced. Load refuses them (see
+    /// `DurableStore::load`); under-claims stay committable and cost
+    /// only retransmission.
+    pub fn is_subset_of(&self, other: &ReconciliationEvidence) -> bool {
+        self.transitions.is_subset(&other.transitions)
+            && self.snapshots.is_subset(&other.snapshots)
+            && self.capabilities.is_subset(&other.capabilities)
+    }
+
+    /// The local content identity of this evidence: domain-separated
+    /// BLAKE3 over the canonical record bytes. An audit and
+    /// supersession handle for stored statements — what a later
+    /// statement supersedes, and what a `*Reconciled` fact's local
+    /// anchor can name. It is not the authenticated reconciliation
+    /// statement identity the forget contract requires retirement to
+    /// reference: that identity belongs to the wire statement (21b),
+    /// never to these bytes.
+    pub fn digest(&self) -> [u8; 32] {
+        let bytes = super::codec::encode_reconciliation_view(self)
+            .expect("in-memory evidence always encodes: no store key involved");
+        blake3::derive_key(RECONCILIATION_VIEW_CONTEXT, &bytes)
+    }
+}
+
+/// Domain context for the stated-view identity.
+const RECONCILIATION_VIEW_CONTEXT: &str = "wyrd reconciliation view v1";
 
 /// Retirement refused before it can happen: the evidence was never
 /// committed durably.
@@ -90,9 +124,11 @@ impl ReconciliationView {
         }
     }
 
-    /// Wrap evidence that arrived as a committed fact. Durable
-    /// provenance: the only views the retire gate accepts.
-    pub fn from_durable(evidence: ReconciliationEvidence) -> Self {
+    /// Wrap evidence that arrived as a replayed fact. Crate-visible
+    /// so only replay mints it, through
+    /// [`LoadedFacts::latest_stated_view`](super::LoadedFacts::latest_stated_view):
+    /// the only views the retire gate accepts.
+    pub(crate) fn from_replayed(evidence: ReconciliationEvidence) -> Self {
         ReconciliationView {
             evidence,
             provenance: ViewProvenance::Durable,

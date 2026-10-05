@@ -195,6 +195,25 @@ pub enum DurableError {
         "commit of {bytes} bytes exceeds the per-commit ceiling of {max} bytes; split the batch and retry"
     )]
     CommitTooLarge { bytes: u64, max: u64 },
+    /// One reconciliation-view section holds more entries than load
+    /// accepts (`MAX_RECORDS_PER_COMMIT`): refused before writing, so
+    /// the store never advances CURRENT onto a view no reopen could
+    /// read. State a narrower view (21b chunks statements) and retry.
+    #[error(
+        "reconciliation view {section} section of {count} entries exceeds the per-section ceiling of {max} entries; state a narrower view and retry"
+    )]
+    OversizedView {
+        section: &'static str,
+        count: usize,
+        max: usize,
+    },
+    /// A stated reconciliation view claims evidence the committed
+    /// base facts do not contain: an over-claim, which would retire
+    /// what was never evidenced. Failed at load, like any malformed
+    /// known record — evidence never parses approximately, and an
+    /// under-claim (a committed subset) stays loadable.
+    #[error("a stated reconciliation view is not a subset of the committed base facts")]
+    InconsistentReconciliationView,
 }
 
 // --- facts -----------------------------------------------------------------

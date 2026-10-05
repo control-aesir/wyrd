@@ -15,7 +15,7 @@ use wyrd_format::{
 };
 
 use super::codec::DecodedFact;
-use super::{DurableError, ReconciliationEvidence};
+use super::{DurableError, ReconciliationEvidence, ReconciliationView};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::capability::DriveKeyring;
@@ -93,6 +93,17 @@ pub struct LoadedFacts {
 }
 
 impl LoadedFacts {
+    /// The latest stated reconciliation view, if any statement was
+    /// committed. The single place that mints durable provenance:
+    /// the evidence comes from the replayed bucket, never from a
+    /// caller, so retirement weight cannot be constructed around the
+    /// commit protocol.
+    pub fn latest_stated_view(&self) -> Option<ReconciliationView> {
+        self.reconciliation_views
+            .last()
+            .map(|evidence| ReconciliationView::from_replayed(evidence.clone()))
+    }
+
     pub(super) fn push(&mut self, fact: DecodedFact) {
         match fact {
             DecodedFact::Transition(t) => self.transitions.push(t),

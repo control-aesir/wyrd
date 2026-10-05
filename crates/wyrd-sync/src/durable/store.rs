@@ -19,7 +19,7 @@ use super::codec::{
     STORE_KEY_AAD,
 };
 use super::replay::{self, LoadedFacts, Rebuilt};
-use super::{DurableError, Fact};
+use super::{DurableError, Fact, ReconciliationView};
 use crate::keys::keystore::{kdf_key, KeystoreError, KDF_SALT_LEN};
 use crate::keys::{aead, random_bytes};
 
@@ -582,6 +582,20 @@ impl DurableStore {
         }
         if prev_hash != tip_hash {
             return Err(DurableError::CorruptCurrent);
+        }
+        // Over-claims fail the load: a stated view that is not a
+        // per-class subset of the committed base facts claims
+        // evidence the store does not hold, and the retire gate must
+        // never see it. Base facts only accumulate (append-only, no
+        // GC), so an honestly stated view is always a subset of the
+        // tip derivation — this refuses forgeries, never history.
+        let derived = ReconciliationView::derive(&facts);
+        if !facts
+            .reconciliation_views
+            .iter()
+            .all(|stated| stated.is_subset_of(derived.evidence()))
+        {
+            return Err(DurableError::InconsistentReconciliationView);
         }
         Ok(facts)
     }

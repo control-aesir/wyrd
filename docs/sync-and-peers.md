@@ -135,24 +135,33 @@ mechanism rather than an add-on:
 > durable recipient state demonstrates that the obligation is
 > already subsumed.
 
-- **Announcement (snapshot S → R):** R's durable state references S —
-  R authored a snapshot with S in its ancestry, or R's reconciliation
-  statement lists S as durably held.
-- **Transition (T → R):** R's log contains T. A successor whose
-  ancestry includes T is an admissible conservative implementation
-  predicate — the recipient validates the chain through T to hold
-  the successor — but it is a predicate, not the definition: class
-  predicates below must be proven equivalent to, or conservative
-  with respect to, the normative set comparison.
+- **Announcement (snapshot S → R):** R's durable state either
+  contains a snapshot whose ancestry includes S, or contains
+  whatever durable holding fact the reconciliation statement
+  projects as "S held". The statement is the transport
+  representation of that fact, never equivalent to the fact
+  itself.
+- **Transition (T → R):** R has durably committed T, or has
+  durably committed a successor whose validated ancestry contains
+  T. The successor case is a valid proof predicate, not a
+  heuristic — validating the chain through T requires T — with
+  one hard requirement: it must be incapable of a false positive.
 - **Capability (epoch-E wrap → R):** R's committed capability set
-  contains the wrap's install, as reported in R's reconciliation
-  statement. Knowledge alone never suffices — a known epoch without
-  its secret authorizes nothing until the capability arrives.
+  contains the wrap's install, as projected by R's reconciliation
+  statement from that committed set. Knowledge alone never
+  suffices — a known epoch without its secret authorizes nothing
+  until the capability arrives.
 
 Retirement commits a new sender-side durable fact, one kind per
 obligation class (`AnnouncementReconciled`,
 `TransitionReconciled`, `CapabilityReconciled`): each names the
-obligation and the recipient statement it retired against. Pending
+obligation identity, the recipient identity, and the authenticated
+reconciliation statement identity (statement digest/version, plus
+epoch/domain where the class requires it) it retired against, so
+the retirement replays and audits. The wire format of the
+statement is not solved here; the contract requires only that
+"retired against" reference an authenticated durable-evidence
+identity, never a bare message id. Pending
 derives as queued minus (delivered ∪ reconciled), and the
 per-class covered predicates treat all three sets as covered.
 Redefining `*Delivered` instead is rejected: it would silently change
@@ -160,14 +169,32 @@ what every existing peer reads. The new-kind form costs a fact-tag
 allocation per class (checked against the full tag set, as `0x16`
 was) and an `upgrade-contract.md` entry, and is honest.
 
-The normative safety rule: an obligation is retired only if the
-recipient's reconciliation view demonstrates that the obligation's
-effect is already represented in the recipient's durable state, and
-the full set-difference comparison is the reference implementation
-of that statement. Optimizations may reduce what is retransmitted,
-but may not enlarge what is considered reconciled: full-comparison
-says reconciled while the optimization says not merely retransmits
-(safe); the reverse is irreversible loss.
+Two differences, different names. Sender-side pending is
+`pending = sender obligations − sender completion facts`
+(delivered ∪ reconciled): it drives the send loop.
+Reconciliation computes
+`missing = sender obligations − recipient durable-state evidence`:
+it drives retirement. Formally, for obligation class C and
+recipient R, let `O_C(R)` be the sender's durable outstanding
+obligations for R and `H_C(R)` the reconciliation view projected
+from R's durable state. An obligation `o ∈ O_C(R)` may be retired
+iff `o ∈ H_C(R)`; the normative reconciliation result is
+`O_C(R) \ H_C(R)`, and every element remaining in that difference
+remains outstanding. Confusing the two retires obligations the
+recipient never evidenced.
+
+### Reconciliation safety invariant
+
+> Optimizations may reduce what is retransmitted, but may not
+> enlarge what is considered reconciled.
+
+Full-comparison says reconciled while the optimization says not
+merely retransmits (safe); the reverse is irreversible loss.
+Class predicates above are admissible only as proven-equivalent or
+conservative predicates, never as the definition. This is the
+single most important implementation constraint in this decision,
+and the acceptance tests pin it: no test may retire an obligation
+the reference comparison would keep.
 
 The sender's pending/reconciled state is durable independently of
 the recipient's advertised view. Monotonicity is `pending →
@@ -190,12 +217,14 @@ progress.
 
 ### Retention assumption
 
-Bounded: relays may expire anything at any time, and nothing in this
-contract depends on otherwise. This assumption cannot be invalidated
-by a relay operator, and it survives the retention-refusal decision
-(DG-4) landing with more permissiveness than assumed — the protocol
-contract takes no moving dependency on an unresolved implementation
-decision. Bounded retention does not mean bounded obligation
+Bounded: relay retention may be arbitrarily short, and nothing in
+this contract depends on otherwise. Retained envelopes are
+opportunistic recovery, never the correctness basis. This
+assumption cannot be invalidated by a relay operator, and it
+survives the retention-refusal decision (DG-4) landing with more
+permissiveness than assumed — the protocol contract takes no
+moving dependency on an unresolved implementation decision.
+Bounded retention does not mean bounded obligation
 lifetime: the obligation may remain pending indefinitely; what is
 bounded is the lifetime of any particular relay copy. Relay
 retention is a transport cache; durable reconciliation is the
@@ -208,9 +237,14 @@ that doc's qualified sentence.
 ### Reconciliation (the pull)
 
 The sender learns R's durable state through a recipient-originated
-reconciliation statement: R states what it durably holds, the sender
-sends what is missing. The statement is signed, over durable state
-only, idempotent under redelivery (set-membership comparison, so
+reconciliation statement: R supplies an authenticated
+reconciliation view derived from its durable state, the sender
+compares that view against its obligations, and sends what remains
+missing. Pull is not "give me your entire state" — it is "give me
+enough authenticated projection of your state to reconcile this
+class", which leaves room for chunking and pagination when
+resource limits demand it. The statement is signed, over durable
+state only, idempotent under redelivery (set-membership comparison, so
 reconciling twice retires nothing new), and answered under a budget —
 a recipient query must not oblige an unbounded response, and that
 budget interacts with the resource-limits work rather than being
@@ -252,9 +286,11 @@ gate.
 2. **Recipient crash after accepting, before durably committing.**
    No fact was committed, so the recipient's state proves nothing;
    if the relay still holds the envelope, at-least-once redelivery
-   covers it, otherwise the recipient must ask. This case rejects
-   message-shaped receipts: a receipt sent before the durable
-   commit attests a message the recipient does not have.
+   covers it (opportunistic, not correctness), otherwise the next
+   reconciliation exchange must recover it — the recipient need
+   not know that this particular envelope was lost. This case
+   rejects message-shaped receipts: a receipt sent before the
+   durable commit attests a message the recipient does not have.
 3. **Relay retention expiry.** No acknowledgement can be produced
    or delivered. The recipient's durable state is the evidence and
    the relay is irrelevant; reconciling after expiry behaves

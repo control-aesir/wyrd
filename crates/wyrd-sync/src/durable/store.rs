@@ -323,6 +323,35 @@ impl DurableStore {
         self.current
     }
 
+    /// Bytes of commit files on disk, counted without touching
+    /// anything. The observational half of retention reporting: the
+    /// fact log is resident but unenforced, so `cache policy` shows
+    /// this next to the quota-enforced object-store count rather than
+    /// folding it in. Read-only like
+    /// [`wyrd_format::FsObjectStore::retained_bytes`]: temp files
+    /// (`.tmp`, a crashed commit's debris) are excluded, and a missing
+    /// commits directory counts as zero.
+    pub fn committed_bytes(&self) -> Result<u64, DurableError> {
+        let mut total = 0u64;
+        let entries = match fs::read_dir(self.commits_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(DurableError::Io(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(DurableError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
+            total += entry.metadata().map_err(DurableError::Io)?.len();
+        }
+        Ok(total)
+    }
+
     /// Test-only: release the advisory lock without dropping the store,
     /// modeling an abrupt process death (a restart test's fresh engine
     /// opens the directory while the parked old engine is still in

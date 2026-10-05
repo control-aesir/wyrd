@@ -1278,7 +1278,23 @@ fn cache(
         CacheAction::Policy => {
             let (engine, view) = node.parts();
             let census = residency_census(engine, view, "")?;
-            print!("{}", cache_policy_render(&census));
+            // Three walks at report time, never cached: the enforced
+            // object-store count plus the two observational dimensions.
+            let retained_content = view
+                .store_read()
+                .map_err(|error| CliError::Store(error.to_string()))?
+                .retained_bytes()
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            let accounting = RetentionAccounting {
+                retained_content,
+                fact_log: engine.fact_log_bytes()?,
+                sync_vault: engine
+                    .vault()
+                    .resident_bytes()
+                    .map_err(|error| CliError::Store(error.to_string()))?,
+                quota: LiveConfig::for_local_sync().budgets.retained_bytes_quota,
+            };
+            print!("{}", cache_policy_render(&census, &accounting));
             Ok(())
         }
     }
@@ -1356,7 +1372,7 @@ fn cache_quadrant_summary(census: &ResidencyCensus) -> String {
 /// calls effective is what the daemon enforces, not a parallel
 /// copy. Only the retention- and fetch-relevant bounds print here;
 /// the full table lives in `docs/resource-limits.md`.
-fn cache_policy_render(census: &ResidencyCensus) -> String {
+fn cache_policy_render(census: &ResidencyCensus, accounting: &RetentionAccounting) -> String {
     let pinned_files = census.quadrant(RetentionPolicy::Pinned, LocalPresence::Present)
         + census.quadrant(RetentionPolicy::Pinned, LocalPresence::Absent);
     // Per identity, deduplicated across files that share chunks: a
@@ -1381,7 +1397,7 @@ fn cache_policy_render(census: &ResidencyCensus) -> String {
         }
     }
     out.push_str("budgets (effective):\n");
-    match budgets.retained_bytes_quota {
+    match accounting.quota {
         Some(quota) => out.push_str(&format!("  retained_bytes_quota: {quota}\n")),
         None => out.push_str("  retained_bytes_quota: unlimited\n"),
     }
@@ -1389,7 +1405,64 @@ fn cache_policy_render(census: &ResidencyCensus) -> String {
         "  max_admit_per_pass: {}\n  max_pending_wants: {}\n",
         budgets.max_admit_per_pass, budgets.max_pending_wants,
     ));
+    // The retention breakdown: one row per resident dimension, each
+    // labelled with whether it backs enforcement or merely observes.
+    // `retained content` is the enforcement quantity — the number the
+    // ceiling is compared against. The fact log and the sync vault
+    // are resident but unenforced (auxiliary growth): folding them
+    // into the enforced number would silently widen what a refusal
+    // rejects, so they report separately and the total is labelled
+    // observational. See the retained / resident / auxiliary terms in
+    // `docs/storage-growth.md`.
+    let total = accounting
+        .retained_content
+        .saturating_add(accounting.fact_log)
+        .saturating_add(accounting.sync_vault);
+    out.push_str("retention accounting (bytes):\n");
+    out.push_str(&format!(
+        "  retained content: {} (quota-enforced)\n",
+        accounting.retained_content
+    ));
+    out.push_str(&format!(
+        "  fact log: {} (observational)\n",
+        accounting.fact_log
+    ));
+    out.push_str(&format!(
+        "  sync vault: {} (observational)\n",
+        accounting.sync_vault
+    ));
+    out.push_str(&format!("  total accounted: {total} (observational)\n"));
+    // No implicit ceiling: with no configured quota the report advises
+    // one instead of applying one. The recommendation is explicitly
+    // advisory and non-authoritative — a starting point for the
+    // operator's decision, never a default by another name. A quota is
+    // an operator-selected refusal boundary, not an implicit product
+    // policy: anything at or below current retention refuses every
+    // write, so the advice starts there.
+    if accounting.quota.is_none() {
+        out.push_str(&format!(
+            "  advisory ceiling (non-authoritative): no lower than {} \
+             (current retention); no default is applied\n",
+            accounting.retained_content
+        ));
+    }
     out
+}
+
+/// Measured byte dimensions behind `cache policy`'s retention
+/// breakdown: the enforcement quantity plus the two resident-but-
+/// unenforced dimensions. Measured at report time from the mounted
+/// store, the fact log, and the vault — three walks, never cached,
+/// so the report cannot disagree with the disk.
+struct RetentionAccounting {
+    /// Object-store bytes: the quota-enforced quantity.
+    retained_content: u64,
+    /// Fact-log commit bytes: resident, observational.
+    fact_log: u64,
+    /// Sealed vault representations: resident, observational.
+    sync_vault: u64,
+    /// The effective quota, if one is configured.
+    quota: Option<u64>,
 }
 
 /// Safety cap on one headless run: a peer that keeps intake

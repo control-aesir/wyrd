@@ -502,9 +502,10 @@ Both are read and hardened by wyrd code, never by clap:
    and pressure against the bounds in `resource-limits.md`. What
    they never print is ContentIds, filesystem paths, file bytes,
    or secrets — the observation half of the privacy boundary.
-   Snapshot and membership transition ids do appear on `sync status`,
-   as per-item keys naming the owed obligation: that is their job as
-   merge identities, and no DeviceId appears beside them there.
+   Snapshot and membership transition ids do appear on `sync status`:
+   the tip line names the applied head, per-item lines name the owed
+   obligation — that is their job as merge identities, and no
+   DeviceId appears beside them there.
    DeviceIds never reach the durable `sync status` surface or the
    log; `sync now` alone names the senders its intake actually
    heard, because that process connected and the operator holds the

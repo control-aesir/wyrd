@@ -56,7 +56,8 @@ contracts-serial = { max-threads = 1 }
 # default-gate coverage of the cross-implementation path — the slow
 # profile covers the fake-only sibling instead. About 30s of wall time
 # buys that standing evidence on every PR run. It is excluded from
-# `local`, where relay coverage is out of budget by design.
+# `local`, where multi-relay integration cover is out of budget by
+# design (single-relay and iroh unit tests stay; see below).
 [profile.default]
 default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover))"
 # Nextest's LEAK verdict fires when a test's stdout/stderr pipes stay
@@ -89,8 +90,8 @@ leak-timeout = "5s"
 # - the spam/resilience pair that dominates the default tail
 #   (sustained_spam 48s, per_sender_quota 31s; the only two `~spam`
 #   tests, so the substring has no fast collateral),
-# - individually measured slow state-machine tests (>=9.5s in the Oct-5
-#   P0 run): deep_tree_authoring, large_announcement_history,
+# - individually measured slow state-machine tests (at or above 9s in
+#   the Oct-5 P0 run): deep_tree_authoring, large_announcement_history,
 #   merge_plan_refuses_more_heads, deep_tip_classifies,
 #   seen_store_evicts, repeated_compaction_cycles,
 #   budgeted_walk_reaches_live, the three replacement_commit_is_atomic

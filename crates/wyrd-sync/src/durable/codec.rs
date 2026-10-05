@@ -437,43 +437,48 @@ pub(super) fn encode_fact(
 /// bound keeps decode allocation proportional before integrity is
 /// verified. Refused here, durably, rather than wedging the store
 /// with a view no reopen could read (decode enforces the same
-/// ceiling).
+/// ceiling). The ceiling is a property of the *record*, not of the
+/// evidence: hashing and comparison use the unbounded canonical
+/// bytes below, so no public API can panic on a legitimately large
+/// drive.
 pub(super) fn encode_reconciliation_view(
     view: &ReconciliationEvidence,
 ) -> Result<Vec<u8>, DurableError> {
+    for (section, count) in [
+        ("transitions", view.transitions.len()),
+        ("snapshots", view.snapshots.len()),
+        ("capabilities", view.capabilities.len()),
+    ] {
+        if count > MAX_RECORDS_PER_COMMIT {
+            return Err(DurableError::OversizedView {
+                section,
+                count,
+                max: MAX_RECORDS_PER_COMMIT,
+            });
+        }
+    }
+    Ok(encode_reconciliation_view_canonical(view))
+}
+
+/// The canonical evidence bytes, without any commit ceiling: the
+/// shared encoding behind both the record and the digest. Total —
+/// truncation would be a different encoding, not a bounded one.
+pub(super) fn encode_reconciliation_view_canonical(view: &ReconciliationEvidence) -> Vec<u8> {
     let mut bytes = Vec::new();
-    push_evidence_section(&mut bytes, "transitions", view.transitions.len())?;
+    bytes.extend_from_slice(&(view.transitions.len() as u32).to_le_bytes());
     for id in &view.transitions {
         bytes.extend_from_slice(id.as_bytes());
     }
-    push_evidence_section(&mut bytes, "snapshots", view.snapshots.len())?;
+    bytes.extend_from_slice(&(view.snapshots.len() as u32).to_le_bytes());
     for id in &view.snapshots {
         bytes.extend_from_slice(id.as_bytes());
     }
-    push_evidence_section(&mut bytes, "capabilities", view.capabilities.len())?;
+    bytes.extend_from_slice(&(view.capabilities.len() as u32).to_le_bytes());
     for (device, epoch) in &view.capabilities {
         bytes.extend_from_slice(device.as_bytes());
         bytes.extend_from_slice(&epoch.to_le_bytes());
     }
-    Ok(bytes)
-}
-
-/// One counted section header: the count, bounded before any entry
-/// is written.
-fn push_evidence_section(
-    bytes: &mut Vec<u8>,
-    section: &'static str,
-    count: usize,
-) -> Result<(), DurableError> {
-    if count > MAX_RECORDS_PER_COMMIT {
-        return Err(DurableError::OversizedView {
-            section,
-            count,
-            max: MAX_RECORDS_PER_COMMIT,
-        });
-    }
-    bytes.extend_from_slice(&(count as u32).to_le_bytes());
-    Ok(())
+    bytes
 }
 
 /// Decode and verify one commit file, returning the decoded facts and

@@ -1779,13 +1779,14 @@ fn commit_fit_boundaries_still_hold_for_reconciliation_facts() {
     assert_eq!(store.current(), 0, "the rejected batch advances nothing");
 }
 
-/// An over-claim fails the load: a stated view naming a transition
-/// the base facts never committed is not evidence, and the retire
-/// gate must never see it. Under-claims (committed subsets) stay
-/// loadable — only the irreversible direction refuses.
+/// An over-claim is dropped, never loaded: committing a statement
+/// naming a transition the base facts never committed must not brick
+/// the store. The claim fails closed (it never reaches the bucket,
+/// so the retire gate cannot see it) while the store stays open —
+/// through the public commit path, which is the hazard: no raw seam
+/// is needed to write what load must then survive.
 #[test]
-fn reconciliation_over_claim_fails_the_load() {
-    use super::codec::{encode_reconciliation_view, TAG_RECONCILIATION_VIEW};
+fn reconciliation_over_claim_is_dropped_not_loaded() {
     let dir = TestDir::new("reconciliation-overclaim");
     let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     store.commit(&evidence_base()).unwrap();
@@ -1795,9 +1796,9 @@ fn reconciliation_over_claim_fails_the_load() {
         .commit(&[Fact::ReconciliationView(honest.evidence().clone())])
         .unwrap();
     assert_eq!(store.current(), 2);
-    // Plant: the same evidence plus a transition that was never
-    // committed, chained after the tip with CURRENT re-anchored.
-    let tip = store.tip_hash_for_test();
+    // The over-claim goes through the same public commit a buggy or
+    // hostile writer would use: it commits (the store takes the
+    // bytes), and the reopen drops it.
     let mut over = honest.evidence().clone();
     over.transitions
         .insert(TransitionId::from_bytes([0xFF; 32]));
@@ -1805,18 +1806,63 @@ fn reconciliation_over_claim_fails_the_load() {
         !over.is_subset_of(honest.evidence()),
         "the fixture really over-claims"
     );
-    let record = encode_reconciliation_view(&over).unwrap();
-    let (tagged, hash) = encode_commit(&drive(), 3, &tip, &[(TAG_RECONCILIATION_VIEW, record)]);
-    fs::write(dir.path.join("commits").join(commit_name(3)), &tagged).unwrap();
-    let mut current = 3u64.to_le_bytes().to_vec();
-    current.extend_from_slice(&hash);
-    atomic_write(&dir.path, "CURRENT", &current).unwrap();
-    // One handle: load() replays from disk on each call.
-    let load = || store.load();
-    assert!(matches!(
-        load(),
-        Err(DurableError::InconsistentReconciliationView)
-    ));
+    store.commit(&[Fact::ReconciliationView(over)]).unwrap();
+    assert_eq!(store.current(), 3);
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![honest.evidence().clone()],
+        "the honest statement replays; the over-claim never reaches the bucket"
+    );
+    assert_eq!(
+        loaded
+            .latest_stated_view()
+            .expect("a view was stated")
+            .evidence(),
+        honest.evidence(),
+        "the retire gate sees only the honest statement"
+    );
+}
+
+/// A stated view survives a derive that later grows: base facts only
+/// accumulate, so a statement that was a subset when committed stays
+/// a subset at every later tip — history never invalidates evidence.
+#[test]
+fn reconciliation_stated_view_survives_widened_derive() {
+    let (_, child) = chain();
+    let dir = TestDir::new("reconciliation-widen");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let stated = ReconciliationView::derive(&store.load().unwrap());
+    store
+        .commit(&[Fact::ReconciliationView(stated.evidence().clone())])
+        .unwrap();
+    // The evidence widens after the statement: a second held
+    // snapshot lands with no new statement alongside it.
+    let second = SnapshotAnnouncement {
+        snapshot: SnapshotId::from_bytes([2; 32]),
+        ..announcement(&child)
+    };
+    store.commit(&[Fact::Announcement(second.clone())]).unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![stated.evidence().clone()],
+        "the earlier statement replays under the wider derive"
+    );
+    let widened = ReconciliationView::derive(&loaded);
+    assert!(
+        stated.evidence().is_subset_of(widened.evidence()),
+        "the statement stays conservative as history grows"
+    );
+    assert!(
+        widened.evidence().snapshots.contains(&second.snapshot),
+        "and the derive really did widen"
+    );
 }
 
 /// The `0x18` record layout, byte for byte: u32 LE transition count
@@ -1953,6 +1999,36 @@ fn reconciliation_digest_matches_known_answer() {
     let mut other = evidence.clone();
     other.snapshots.insert(SnapshotId::from_bytes([0x04; 32]));
     assert_ne!(other.digest(), evidence.digest());
+}
+
+/// Hashing holds past the commit ceiling: the digest hashes the
+/// canonical bytes, never the ceiling-checked record, so evidence no
+/// single commit may state still identifies.
+#[test]
+fn reconciliation_digest_holds_above_the_section_ceiling() {
+    use super::codec::MAX_RECORDS_PER_COMMIT;
+    let mut huge = ReconciliationEvidence::default();
+    for n in 0..MAX_RECORDS_PER_COMMIT + 1 {
+        let mut id = [0u8; 32];
+        id[0..8].copy_from_slice(&(n as u64).to_le_bytes());
+        huge.transitions.insert(TransitionId::from_bytes(id));
+    }
+    let digest = huge.digest();
+    let mut smaller = huge.clone();
+    smaller
+        .transitions
+        .remove(&TransitionId::from_bytes(id_of(0)));
+    assert_ne!(
+        smaller.digest(),
+        digest,
+        "even above the ceiling, distinct evidence digests distinctly"
+    );
+}
+
+fn id_of(n: u64) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0..8].copy_from_slice(&n.to_le_bytes());
+    id
 }
 
 /// A populated view counts bytes toward the commit like any record:

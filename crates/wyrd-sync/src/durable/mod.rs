@@ -207,13 +207,6 @@ pub enum DurableError {
         count: usize,
         max: usize,
     },
-    /// A stated reconciliation view claims evidence the committed
-    /// base facts do not contain: an over-claim, which would retire
-    /// what was never evidenced. Failed at load, like any malformed
-    /// known record — evidence never parses approximately, and an
-    /// under-claim (a committed subset) stays loadable.
-    #[error("a stated reconciliation view is not a subset of the committed base facts")]
-    InconsistentReconciliationView,
 }
 
 // --- facts -----------------------------------------------------------------
@@ -468,5 +461,8 @@ pub enum Fact {
     /// difference (21c) compares against. Committing it changes
     /// nothing derivable: [`ReconciliationView`] derives from the
     /// base facts, so a stated view never feeds its own derivation.
+    /// A statement that over-claims — not a per-class subset of the
+    /// base facts — is dropped at load with a warning, never
+    /// replayed: the claim fails closed while the store stays open.
     ReconciliationView(ReconciliationEvidence),
 }

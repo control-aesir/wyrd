@@ -583,19 +583,33 @@ impl DurableStore {
         if prev_hash != tip_hash {
             return Err(DurableError::CorruptCurrent);
         }
-        // Over-claims fail the load: a stated view that is not a
-        // per-class subset of the committed base facts claims
-        // evidence the store does not hold, and the retire gate must
-        // never see it. Base facts only accumulate (append-only, no
-        // GC), so an honestly stated view is always a subset of the
-        // tip derivation — this refuses forgeries, never history.
+        // Over-claims are dropped, never loaded: a stated view that
+        // is not a per-class subset of the committed base facts
+        // claims evidence the store does not hold, so it is refused
+        // as *evidence* — it never reaches the bucket, and the retire
+        // gate cannot see it — while the store itself stays open.
+        // Failing the load here would let one public commit brick the
+        // store, with load() as the root of rebuild()/resync() and no
+        // repair path; this fails the claim closed instead. Base
+        // facts only accumulate (append-only, no GC), so an honestly
+        // stated view is always a subset of the tip derivation — the
+        // drop only fires on statements no honest writer produces.
+        // Nothing stated yet is the common case (no production writer
+        // in 21a): skip the derivation entirely.
+        if facts.reconciliation_views.is_empty() {
+            return Ok(facts);
+        }
         let derived = ReconciliationView::derive(&facts);
-        if !facts
+        let stated = facts.reconciliation_views.len();
+        facts
             .reconciliation_views
-            .iter()
-            .all(|stated| stated.is_subset_of(derived.evidence()))
-        {
-            return Err(DurableError::InconsistentReconciliationView);
+            .retain(|view| view.is_subset_of(derived.evidence()));
+        let dropped = stated - facts.reconciliation_views.len();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
+            );
         }
         Ok(facts)
     }

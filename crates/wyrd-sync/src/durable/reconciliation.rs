@@ -12,6 +12,17 @@
 //! nothing, so the retire gate refuses it here — the obligation
 //! invariant (`docs/crash-consistency.md:137-141`) as a negative
 //! test, before any retire path exists to misuse it.
+//!
+//! Scope, decided: the conservativeness rule is the *exact-set*
+//! projection. A stored statement counts as evidence iff it is a
+//! per-class subset of what `derive` computes over the same base
+//! facts — nothing more. DG-3 admits ancestry-widened proof
+//! predicates (a successor whose validated ancestry contains T), but
+//! those live in 21c's comparison logic, not in stored statements: a
+//! future predicate change must not reinterpret what an old `0x18`
+//! record claimed. A statement outside today's projection is
+//! dropped at load, never reinterpreted — widening the admissible
+//! predicates versions the projection alongside the record.
 
 use std::collections::BTreeSet;
 
@@ -74,10 +85,12 @@ impl ReconciliationEvidence {
     /// anchor can name. It is not the authenticated reconciliation
     /// statement identity the forget contract requires retirement to
     /// reference: that identity belongs to the wire statement (21b),
-    /// never to these bytes.
+    /// never to these bytes. The digest hashes the unbounded
+    /// canonical bytes, never the ceiling-checked record: hashing
+    /// must hold for evidence of any size, including what no single
+    /// commit may state.
     pub fn digest(&self) -> [u8; 32] {
-        let bytes = super::codec::encode_reconciliation_view(self)
-            .expect("in-memory evidence always encodes: no store key involved");
+        let bytes = super::codec::encode_reconciliation_view_canonical(self);
         blake3::derive_key(RECONCILIATION_VIEW_CONTEXT, &bytes)
     }
 }
@@ -124,11 +137,14 @@ impl ReconciliationView {
         }
     }
 
-    /// Wrap evidence that arrived as a replayed fact. Crate-visible
-    /// so only replay mints it, through
+    /// Wrap evidence that arrived as a replayed fact. Visible only
+    /// inside `durable`, so only replay mints it, through
     /// [`LoadedFacts::latest_stated_view`](super::LoadedFacts::latest_stated_view):
-    /// the only views the retire gate accepts.
-    pub(crate) fn from_replayed(evidence: ReconciliationEvidence) -> Self {
+    /// the only views the retire gate accepts. Confined this far
+    /// because 21c's retire path lives elsewhere in `wyrd-sync`, and
+    /// one visibility step is all that separates "the replayed
+    /// bucket" from "any module".
+    pub(super) fn from_replayed(evidence: ReconciliationEvidence) -> Self {
         ReconciliationView {
             evidence,
             provenance: ViewProvenance::Durable,

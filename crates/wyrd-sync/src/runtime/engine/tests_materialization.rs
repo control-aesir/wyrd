@@ -135,3 +135,63 @@ fn batched_materializations_commit_once() {
         assert_eq!(runtime.materialization(id), MaterializationState::Pinned);
     }
 }
+
+/// OD-26-D option B measurement: repeated opens of unavailable
+/// content. Workload: one hundred demands (`set_materialization` to
+/// `Cached` — the engine-visible call every open's want admission
+/// funnels into) for content that never arrives and is never local.
+/// Non-arrival must not change the guard behaviour: the guards compare
+/// durable state, not reachability, so only the first demand is a
+/// genuine transition and the remaining ninety-nine commit nothing.
+///
+/// Reported per open: facts appended, commits, fsyncs, and log
+/// rebuilds. Fsyncs are protocol-derived, not counted: one complete
+/// commit performs exactly four (commit temp, commits dir, CURRENT
+/// temp, drive dir — see `DurableStore::commit_until`), so fsyncs =
+/// 4 × commits. Rebuilds are counted: every demand replays the log
+/// to compare, which is the actual per-open cost and is CPU, not IO.
+///
+/// The committed result lives in `docs/storage-growth.md` next to
+/// the G21 question, with the workload, initial state, and build that
+/// produced it. A measurement showing no amplification is a valid
+/// outcome and closes the question; a measurement showing
+/// amplification hands G21 a number. No fix is authorised here either
+/// way: if these assertions ever fail, G21 owns the fix.
+#[test]
+fn unavailable_content_open_amplification_measurement() {
+    const OPENS: u64 = 100;
+    let dir = TestDir::new("materialization-unavailable-opens");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    // Never inserted anywhere, never fetched: the demand side of
+    // content no peer will serve.
+    let content = ContentId::derive(ObjectKind::Chunk, b"unavailable content");
+
+    let committed_before = engine.current();
+    let bytes_before = engine.fact_log_bytes().unwrap();
+    let rebuilds_before = engine.store.rebuild_count();
+    for _ in 0..OPENS {
+        engine
+            .set_materialization(content, MaterializationState::Cached)
+            .unwrap();
+    }
+    let commits = engine.current() - committed_before;
+    let bytes = engine.fact_log_bytes().unwrap() - bytes_before;
+    let rebuilds = engine.store.rebuild_count() - rebuilds_before;
+
+    assert_eq!(
+        commits, 1,
+        "one genuine transition (RemoteOnly -> Cached), ninety-nine no-ops"
+    );
+    assert!(
+        bytes > 0,
+        "the genuine transition is durable on disk, not just counted"
+    );
+    // Projection, not assertion, for the derived and counted costs:
+    // four fsyncs for the one commit, one replay per demand.
+    eprintln!(
+        "MEASUREMENT unavailable-opens: opens={OPENS} facts=1 commits={commits} \
+         fsyncs={} fact_log_bytes={bytes} rebuilds={rebuilds}",
+        commits * 4,
+    );
+}

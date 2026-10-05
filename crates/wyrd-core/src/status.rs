@@ -9,11 +9,13 @@
 //! committed facts. Status never connects a mailbox, never drains,
 //! never sends, and never touches the seen log.
 
+use std::collections::BTreeSet;
+
 use wyrd_format::{DeviceId, SnapshotId};
 use wyrd_sync::{
     authorization::Classification,
     membership::KnownState,
-    runtime::{Engine, EngineError, OutboxTotals},
+    runtime::{Engine, EngineError, MaterializationSummary, OutboxTotals},
 };
 
 use crate::live::PendingObligations;
@@ -54,6 +56,81 @@ pub struct MailboxView {
     pub configured_relays: usize,
 }
 
+/// One peer as the durable surface sees it (OD-17-4 option A): an
+/// opaque handle over a peer identity the status legitimately knows
+/// — an obligation recipient or a live-head author from committed
+/// facts. The rendered handle is the 1-based position in this
+/// vector's deterministic (byte) order, stable for the rendering and
+/// identical across restarts over the same state. It is not a peer
+/// identity namespace: nothing persists the numbering, and the same
+/// peer may hold a different handle after the state changes. The
+/// run surface names the same peers by `DeviceId`; this surface
+/// never does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHandle {
+    /// The peer this handle stands for. In-process only: renderers
+    /// map it to `peer-N` and never print it.
+    pub peer: DeviceId,
+    /// Still-undischarged outbox pairs naming this peer. Zero for a
+    /// head author nobody owes anything to.
+    pub pending: usize,
+}
+
+/// Backlog as a durable projection (OD-17-3 option C): the number of
+/// currently outstanding durable work items, not the number of
+/// entries resident in the process's mutation or want queue. Both
+/// inputs are committed facts, so the projection is identical before
+/// and after a restart over the same state — exactly what the
+/// restart-equivalence predicate requires. A live gauge would answer
+/// a different question ("what is queued in memory right now") and
+/// cannot serve here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueDepth {
+    /// Still-undischarged outbox pairs: announcements, transitions,
+    /// capabilities, and carries. Who we owe, counted.
+    pub outbox: usize,
+    /// Reconciliation gaps: announced snapshots without a root
+    /// manifest, bodies, or child manifests, plus distinct wanted-
+    /// but-not-local contents. What we still need, counted per
+    /// missing artifact (a snapshot missing both its body and its
+    /// root manifest needs two fetches, so it counts twice).
+    pub fetch: usize,
+}
+
+impl QueueDepth {
+    /// Total outstanding durable work items across both halves.
+    pub fn total(&self) -> usize {
+        self.outbox + self.fetch
+    }
+
+    /// True when nothing is owed and nothing is missing: the
+    /// backlog half of convergence.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Convergence from durable facts: whether the node has anything
+/// left it could do, plus the heads that keep it from saying so.
+/// Pending heads may still resolve (bytes, routes, or capabilities
+/// outstanding); unfetchable heads are authorization-rejected —
+/// terminal damage, not pending work — and are reported, never spun
+/// on. Distinct from terminal fetch state (a separate issue's
+/// state): rejection here is an authorization verdict, not a fetch
+/// outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvergenceState {
+    /// True when the outbox is empty, the fetch projection is empty,
+    /// no head awaits closure, and none is rejected. A node with
+    /// rejected heads is diverged: something is wrong, even though
+    /// no local action remains.
+    pub converged: bool,
+    /// Heads classified pending: closure outstanding.
+    pub pending_heads: usize,
+    /// Heads classified rejected: terminally unauthorizable.
+    pub unfetchable_heads: usize,
+}
+
 /// Structured sync status: outbox obligations with their
 /// queued/delivered/pending split, the membership tip against held
 /// secrets, live heads with classification, and mailbox posture.
@@ -76,6 +153,36 @@ pub struct SyncStatus {
     pub head_classes: HeadClasses,
     /// Mailbox posture (configuration only, never liveness).
     pub mailbox: MailboxView,
+    /// Known members at the tip, by count only: the denominator the
+    /// peer handles divide. Zero when there is no tip.
+    pub known_members: usize,
+    /// Opaque per-peer handles over obligation recipients and head
+    /// authors, in deterministic order. Position plus one is the
+    /// rendered handle.
+    pub peers: Vec<PeerHandle>,
+    /// Outstanding durable work: owed obligations plus missing
+    /// fetches, from committed facts only.
+    pub queue: QueueDepth,
+    /// Whether the node has converged, from durable facts.
+    pub convergence: ConvergenceState,
+    /// Materialization as counts: explicit residency policies plus
+    /// locally held objects.
+    pub materialization: MaterializationSummary,
+}
+
+impl SyncStatus {
+    /// Opaque handle for a peer identity: the 1-based position in the
+    /// deterministic peer order, or 0 when the identity is absent.
+    /// Zero is unreachable by construction — [`observe`] derives
+    /// peers from every identity the status carries — so it stays
+    /// opaque rather than leaking the id it failed to map.
+    pub fn peer_handle(&self, peer: &DeviceId) -> usize {
+        self.peers
+            .iter()
+            .position(|entry| entry.peer == *peer)
+            .map(|index| index + 1)
+            .unwrap_or(0)
+    }
 }
 
 /// Observe sync status from durable state. Reads committed facts
@@ -104,7 +211,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
                 author: snapshot.author,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
     let mut head_classes = HeadClasses::default();
     for head in engine.snapshot_heads()? {
         match head.classification {
@@ -117,6 +224,82 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
             Classification::Rejected(_) => head_classes.rejected += 1,
         }
     }
+    // Opaque handles over every identity the status carries:
+    // obligation recipients plus head authors, deduplicated and
+    // ordered by bytes so the numbering is deterministic — the same
+    // state always renders the same handles, across restarts too.
+    let mut peer_set = BTreeSet::new();
+    let recipients = obligations
+        .announcements
+        .iter()
+        .map(|(_, recipient)| recipient)
+        .chain(
+            obligations
+                .transitions
+                .iter()
+                .map(|(_, recipient)| recipient),
+        )
+        .chain(
+            obligations
+                .capabilities
+                .iter()
+                .map(|(_, recipient)| recipient),
+        );
+    for recipient in recipients {
+        peer_set.insert(*recipient);
+    }
+    for head in &live_heads {
+        peer_set.insert(head.author);
+    }
+    let peers = peer_set
+        .into_iter()
+        .map(|peer| {
+            let pending = obligations
+                .announcements
+                .iter()
+                .map(|(_, recipient)| recipient)
+                .chain(
+                    obligations
+                        .transitions
+                        .iter()
+                        .map(|(_, recipient)| recipient),
+                )
+                .chain(
+                    obligations
+                        .capabilities
+                        .iter()
+                        .map(|(_, recipient)| recipient),
+                )
+                .filter(|recipient| **recipient == peer)
+                .count();
+            PeerHandle { peer, pending }
+        })
+        .collect::<Vec<_>>();
+    let known_members = match &tip {
+        Some(known) => engine
+            .membership_log()
+            .members_of(&known.transition_id)
+            .map(|members| members.len())
+            .unwrap_or(0),
+        None => 0,
+    };
+    // The durable backlog (OD-17-3 option C): owed obligations
+    // including the carry queue the itemized lists do not cover,
+    // plus the reconciliation gaps. Committed facts on both sides.
+    let reconcile = state.reconcile();
+    let queue = QueueDepth {
+        outbox: obligations.len() + state.pending_carries().len(),
+        fetch: reconcile.pending_snapshots.len()
+            + reconcile.pending_snapshot_bodies.len()
+            + reconcile.pending_manifests.len()
+            + reconcile.pending_objects.len(),
+    };
+    let convergence = ConvergenceState {
+        converged: queue.is_empty() && head_classes.pending == 0 && head_classes.rejected == 0,
+        pending_heads: head_classes.pending,
+        unfetchable_heads: head_classes.rejected,
+    };
+    let materialization = state.materialization_summary();
     Ok(SyncStatus {
         tip,
         held_epochs,
@@ -125,6 +308,11 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         live_heads,
         head_classes,
         mailbox: MailboxView { configured_relays },
+        known_members,
+        peers,
+        queue,
+        convergence,
+        materialization,
     })
 }
 
@@ -134,19 +322,33 @@ mod tests {
     use wyrd_format::{Entry, ObjectKind, ObjectStore, Tree};
     use wyrd_sync::keys::DeviceIdentitySecret;
 
+    /// Scratch-drive uniquifier: wall-clock nanos collide across
+    /// parallel tests on coarse clocks, so every scratch dir takes
+    /// the next sequence number instead.
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn scratch_dir(prefix: &str) -> std::path::PathBuf {
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "wyrd-core-status-{prefix}-{}-{}",
+            std::process::id(),
+            seq
+        ))
+    }
+
     /// A scratch two-member engine with one file authored: admitting
     /// the second device queues transition, capability, and
     /// announcement obligations to it.
     fn scratch_authored() -> (Engine, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "wyrd-core-status-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
         let identity = DeviceIdentitySecret::generate().unwrap();
+        scratch_authored_with(identity)
+    }
+
+    /// The same scratch state under a caller-chosen identity, so a
+    /// test can reopen the drive with the identical secret.
+    fn scratch_authored_with(identity: DeviceIdentitySecret) -> (Engine, std::path::PathBuf) {
+        let dir = scratch_dir("authored");
+        std::fs::create_dir_all(&dir).unwrap();
         let mut engine = Engine::create(dir.clone(), "core-test-pass", identity).unwrap();
         // Bytes live in the drive's own store: the admission carry
         // re-authors the head at the new epoch from these objects, so
@@ -177,13 +379,7 @@ mod tests {
     /// held, nothing owed, no heads until the first snapshot.
     #[test]
     fn fresh_drive_status_is_genesis_with_empty_outbox() {
-        let dir = std::env::temp_dir().join(format!(
-            "wyrd-core-status-fresh-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = scratch_dir("fresh");
         std::fs::create_dir_all(&dir).unwrap();
         let identity = DeviceIdentitySecret::generate().unwrap();
         let engine = Engine::create(dir.clone(), "core-test-pass", identity).unwrap();
@@ -228,6 +424,65 @@ mod tests {
     fn observation_is_repeatable() {
         let (engine, dir) = scratch_authored();
         assert_eq!(observe(&engine, 0).unwrap(), observe(&engine, 0).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Peer handles are opaque and deterministic: the admission
+    /// fixture names two identities (the admitted peer, owed four
+    /// pairs, and our own device, authoring the live head), so the
+    /// status carries exactly two handles in byte order, the pending
+    /// counts sum to the owed pairs, and no handle leaks an identity
+    /// — mapping is by position, never by printing.
+    #[test]
+    fn peer_handles_are_opaque_and_deterministic() {
+        let (engine, dir) = scratch_authored();
+        let status = observe(&engine, 0).unwrap();
+        assert_eq!(status.peers.len(), 2, "recipient plus author");
+        assert_eq!(status.known_members, 2, "owner plus admitted peer");
+        let pending: usize = status.peers.iter().map(|entry| entry.pending).sum();
+        assert_eq!(pending, status.obligations.len());
+        assert_eq!(pending, 4);
+        // Byte order, 1-based handles, every carried identity mapped.
+        let mut ordered: Vec<DeviceId> = status.peers.iter().map(|entry| entry.peer).collect();
+        ordered.sort();
+        let peers: Vec<DeviceId> = status.peers.iter().map(|entry| entry.peer).collect();
+        assert_eq!(peers, ordered);
+        for (index, entry) in status.peers.iter().enumerate() {
+            assert_eq!(status.peer_handle(&entry.peer), index + 1);
+        }
+        assert_eq!(
+            status.peer_handle(&DeviceId::from_bytes([0xFF; 32])),
+            0,
+            "unknown identities map to the opaque zero, never printed"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The whole projection is restart-equivalent (OD-17-3 option
+    /// C's gate): reopening over the same committed facts observes
+    /// the identical status — same queue depth, same handles, same
+    /// convergence. The admission fixture owes a nonzero backlog, so
+    /// the equality is not a vacuous all-empty comparison.
+    #[test]
+    fn queue_depth_is_a_durable_projection() {
+        let identity = DeviceIdentitySecret::from_bytes([0xC0; 32]).unwrap();
+        let (engine, dir) = scratch_authored_with(identity);
+        let before = observe(&engine, 0).unwrap();
+        assert_eq!(before.queue.outbox, 4, "the fixture owes a backlog");
+        assert!(
+            !before.convergence.converged,
+            "owed obligations diverge: {before:?}"
+        );
+        drop(engine);
+        let reopened = Engine::open_keystore(
+            dir.clone(),
+            "core-test-pass",
+            DeviceIdentitySecret::from_bytes([0xC0; 32]).unwrap(),
+        )
+        .unwrap();
+        let after = observe(&reopened, 0).unwrap();
+        assert_eq!(before, after);
+        drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

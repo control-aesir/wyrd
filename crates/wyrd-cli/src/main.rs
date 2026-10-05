@@ -1579,6 +1579,13 @@ struct SyncRunReport {
     local_failures: usize,
     /// Outbound sends committed by per-pass publication.
     sent: usize,
+    /// Distinct peers named by intake envelopes this run (OD-17-4
+    /// option B): the union of every pass's observed senders, in
+    /// ascending byte order. Rendered here with full `DeviceId`s —
+    /// this process connected and the operator holds the keys — and
+    /// never on the durable surface, which has no live peer set to
+    /// report.
+    peers_observed: Vec<DeviceId>,
     outcome: RunOutcome,
     pending: usize,
     /// Heads known but not locally closable at the last pass: a
@@ -1625,6 +1632,15 @@ impl SyncRunReport {
         self.local_failures += pass.fetched.local_failures;
         self.sent += pass.sent;
         self.unfetchable_heads = pass.pending_heads;
+        // Union, not append: the same peer heard on twelve passes is
+        // one observed peer. Sorted so reruns over the same traffic
+        // render identically.
+        for peer in &pass.drained.peers_observed {
+            if !self.peers_observed.contains(peer) {
+                self.peers_observed.push(*peer);
+            }
+        }
+        self.peers_observed.sort();
     }
 }
 
@@ -1726,6 +1742,7 @@ where
         pending: 0,
         unfetchable_heads: 0,
         mailbox: None,
+        peers_observed: Vec::new(),
         write: WriteStats::default(),
     };
     // Consecutive zero-progress passes with pending heads and an
@@ -1844,12 +1861,52 @@ fn sync_status_render(status: &SyncStatus) -> String {
     } else {
         out.push_str(&format!("live heads: {}\n", status.live_heads.len()));
         for head in &status.live_heads {
+            // Opaque handle, never the author id: this surface names
+            // peers by position (OD-17-4 option A). The handle always
+            // resolves — observe() derives peers from every identity
+            // the status carries — and zero stays opaque rather than
+            // leaking the id a broken invariant failed to map.
             out.push_str(&format!(
-                "  {} epoch {} author {}\n",
-                head.id, head.epoch, head.author
+                "  {} epoch {} author peer-{}\n",
+                head.id,
+                head.epoch,
+                status.peer_handle(&head.author),
             ));
         }
     }
+    out.push_str(&format!(
+        "peers: {} known ({} members)\n",
+        status.peers.len(),
+        status.known_members,
+    ));
+    for (index, entry) in status.peers.iter().enumerate() {
+        out.push_str(&format!(
+            "  peer-{}: {} pending\n",
+            index + 1,
+            entry.pending
+        ));
+    }
+    let queue = &status.queue;
+    out.push_str(&format!(
+        "queue: {} outstanding ({} outbox, {} fetch)\n",
+        queue.total(),
+        queue.outbox,
+        queue.fetch,
+    ));
+    let convergence = &status.convergence;
+    if convergence.converged {
+        out.push_str("convergence: converged\n");
+    } else {
+        out.push_str(&format!(
+            "convergence: not converged ({} outbox, {} fetch, {} heads pending, {} unfetchable)\n",
+            queue.outbox, queue.fetch, convergence.pending_heads, convergence.unfetchable_heads,
+        ));
+    }
+    let materialization = &status.materialization;
+    out.push_str(&format!(
+        "materialization: {} cached, {} pinned, {} local objects\n",
+        materialization.cached, materialization.pinned, materialization.local_objects,
+    ));
     let classes = &status.head_classes;
     out.push_str(&format!(
         "heads classified: {} eligible, {} canonical-history, {} superseded, {} stranded, {} voided, {} pending, {} rejected\n",
@@ -1869,6 +1926,11 @@ fn sync_status_render(status: &SyncStatus) -> String {
             status.mailbox.configured_relays
         ));
     }
+    // OD-17-5 option B: status never connects, so it says so. "Not
+    // observed" names the deliberate omission — this command performs
+    // no liveness observation — where "unknown" would suggest a
+    // failed attempt. Silence would read as healthy.
+    out.push_str("connectivity: not observed (this command does not connect)\n");
     out
 }
 
@@ -2008,6 +2070,21 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         write.commits,
         write.failures,
     ));
+    // Peers heard this run (OD-17-4 option B): full identities,
+    // because this process connected and the operator holds the
+    // keys. The durable surface reports the same peers as opaque
+    // handles; the two never share a representation.
+    if report.peers_observed.is_empty() {
+        out.push_str("peers observed: none\n");
+    } else {
+        out.push_str(&format!(
+            "peers observed: {}\n",
+            report.peers_observed.len()
+        ));
+        for peer in &report.peers_observed {
+            out.push_str(&format!("  peer {peer}\n"));
+        }
+    }
     match report.outcome {
         // A degraded or unobserved mailbox downgrades both quiet
         // verdicts: the local state converged, but intake may have

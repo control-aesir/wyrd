@@ -299,9 +299,19 @@ sync now
   owner-bootstrap resume facts (an interrupted genesis, the
   self-capability install), so "never mutates" means no intake, no
   send, no seen log, and no outbox or materialization mutation —
-  not zero writes in every corner; and the store lock is exclusive,
-  so status needs the drive un-mounted and fails closed with the
-  lock error while a mount holds it.
+   not zero writes in every corner; and the store lock is exclusive,
+   so status needs the drive un-mounted and fails closed with the
+   lock error while a mount holds it. Four projections join the
+   read: peers as opaque handles (`peer-1`, `peer-2`, stable for the
+   rendering, derived deterministically so the same state renders
+   the same handles across restarts — never a persisted identity
+   namespace), the durable queue depth (outstanding outbox pairs
+   plus reconciliation gaps, from committed facts only — not the
+   in-memory queue), convergence from durable facts (converged, or
+   what still diverges), and materialization as counts (explicit
+   cached/pinned policies plus locally held objects). Connectivity
+   reads `not observed`: status never connects, so it says the
+   omission out loud instead of letting silence read as healthy.
 - `now`: runs the mount's sync machinery (drain, deliver,
   announce, fetch through `sync_once`) with the mount's live
   budgets and no FUSE session: vaults and NAS replicas converge
@@ -343,10 +353,15 @@ sync now
   first drain, so a quiet verdict parks a short settle window
   (arrival short-circuits it) and confirms with a second pass.
   A head whose closure is not local is a remote
-  condition, not local work: after one grace pass it stops the run
-  as quiet with an explicit `N unfetchable heads` count instead of
-  burning the cap. Zero-progress passes park the settle window too,
-  so dead churn waits on the relay instead of spinning.
+   condition, not local work: after one grace pass it stops the run
+   as quiet with an explicit `N unfetchable heads` count instead of
+   burning the cap. Zero-progress passes park the settle window too,
+   so dead churn waits on the relay instead of spinning. A
+   `peers observed` section names the distinct senders whose
+   envelopes the run processed, by full `DeviceId`: this process
+   connected and the operator holds the keys, so the run surface may
+   say who it heard — the durable surface reports the same peers as
+   opaque handles, and the two never share a representation.
 - `--relay <url>` (repeatable, shared parsing with `mount`): with
    none given, `now` refuses with a usage error unless `--offline`
    is passed — a relay-less run exits 0 with an idle intake, which
@@ -478,11 +493,14 @@ Both are read and hardened by wyrd code, never by clap:
   and enforcement that generalize this statement land separately,
   sequenced after `wyrd vault`, because a boundary needs a vault
   process to be meaningful and none exists. What these surfaces
-  print is counts, latencies, class breakdowns,
-  and pressure against the bounds in `resource-limits.md`. What
-  they never print is ContentIds, filesystem paths, file bytes,
-  DeviceIds, membership transition ids, or secrets — the
-  observation half of the privacy boundary.
+   print is counts, latencies, class breakdowns,
+   and pressure against the bounds in `resource-limits.md`. What
+   they never print is ContentIds, filesystem paths, file bytes,
+   membership transition ids, or secrets — the
+   observation half of the privacy boundary. DeviceIds never reach
+   the durable surface or the log; `sync now` alone names the peers
+   its intake actually heard, because that process connected and the
+   operator holds the keys.
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

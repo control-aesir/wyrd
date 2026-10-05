@@ -290,6 +290,120 @@ fn sync_status_after_invite_shows_pending_obligations() {
     assert!(rendered.contains("live heads:"), "{rendered}");
 }
 
+/// PR 2 surfaces on one render: opaque peer handles over the
+/// admitted peer and the authoring device, the durable queue depth,
+/// convergence, materialization counts, and the explicit
+/// not-observed connectivity line. Same admission state as the
+/// obligation test above.
+#[test]
+fn sync_status_reports_peer_queue_convergence_materialization() {
+    let fixture = Fixture::new();
+    {
+        let mut engine = fixture.open();
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        let chunk = store
+            .insert(ObjectKind::Chunk, b"sync-status-bytes")
+            .unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 17, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+    }
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let encryption = DeviceEncryptionSecret::generate().unwrap();
+    let invitation = fixture._temp.0.join("invitation");
+    command(vec![
+        "member".into(),
+        fixture.drive.display().to_string(),
+        "--identity-file".into(),
+        fixture.identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        fixture.passphrase_file.display().to_string(),
+        "invite".into(),
+        peer.device_id().to_string(),
+        encryption.encryption_key().to_string(),
+        invitation.display().to_string(),
+    ])
+    .unwrap();
+    let engine = fixture.open();
+    let status = observe(&engine, 0).unwrap();
+    let rendered = sync_status_render(&status);
+    assert!(
+        rendered.contains("peers: 2 known (2 members)"),
+        "admitted peer plus authoring device: {rendered}"
+    );
+    assert!(rendered.contains("peer-1:"), "{rendered}");
+    assert!(rendered.contains("peer-2:"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("queue: {} outstanding", status.queue.total())),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("convergence: not converged"),
+        "owed obligations diverge: {rendered}"
+    );
+    assert!(rendered.contains("materialization:"), "{rendered}");
+    assert!(
+        rendered.contains("connectivity: not observed (this command does not connect)"),
+        "{rendered}"
+    );
+    // The author line names a handle, never the id.
+    assert!(rendered.contains("author peer-"), "{rendered}");
+    drop(engine);
+}
+
+/// No membership data reaches the durable surface (OD-17-4 option
+/// A): neither the admitted peer's id nor the owner's own id —
+/// author of the live head — appears anywhere in the render. Scoped
+/// to the exact adversarial hexes, not a bare hex-run detector:
+/// snapshot and transition ids still render on this surface by
+/// pre-existing design, and a generic detector cannot tell them
+/// apart from device ids.
+#[test]
+fn sync_status_output_contains_no_membership_data() {
+    let fixture = Fixture::new();
+    {
+        let mut engine = fixture.open();
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        let chunk = store
+            .insert(ObjectKind::Chunk, b"sync-status-bytes")
+            .unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 17, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+    }
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let encryption = DeviceEncryptionSecret::generate().unwrap();
+    let invitation = fixture._temp.0.join("invitation");
+    command(vec![
+        "member".into(),
+        fixture.drive.display().to_string(),
+        "--identity-file".into(),
+        fixture.identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        fixture.passphrase_file.display().to_string(),
+        "invite".into(),
+        peer.device_id().to_string(),
+        encryption.encryption_key().to_string(),
+        invitation.display().to_string(),
+    ])
+    .unwrap();
+    let engine = fixture.open();
+    let rendered = sync_status_render(&observe(&engine, 0).unwrap());
+    assert!(
+        !rendered.contains(&peer.device_id().to_string()),
+        "the admitted peer's id never renders: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&engine.device().to_string()),
+        "the owner's id never renders, not even as head author: {rendered}"
+    );
+    drop(engine);
+}
+
 /// The bounded loop converges a real obligation chain: admission
 /// queues transition, capability, and announcements; the first pass
 /// publishes, the delivered markers schedule one confirmatory
@@ -520,6 +634,7 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         pending: 0,
         unfetchable_heads: 0,
         mailbox,
+        peers_observed: Vec::new(),
         write: WriteStats::default(),
     }
 }
@@ -734,6 +849,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         pending: 0,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
+        peers_observed: Vec::new(),
         write: WriteStats::default(),
     };
     assert!(run_outcome_error(&quiet).is_ok());
@@ -762,6 +878,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         pending: 0,
         unfetchable_heads: 1,
         mailbox: Some(fixture_mailbox()),
+        peers_observed: Vec::new(),
         write: WriteStats::default(),
     };
     assert!(run_outcome_error(&stalled).is_ok());
@@ -790,6 +907,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         pending: 4,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
+        peers_observed: Vec::new(),
         write: WriteStats::default(),
     };
     let error = run_outcome_error(&capped).unwrap_err();
@@ -904,6 +1022,96 @@ fn headless_sync_now_converges_a_joined_device_to_current_heads() {
         sync_status_render(&status)
     );
     assert_eq!(status.live_heads[0].id, carried_id);
+}
+
+/// The same run, two surfaces, the documented difference (OD-17-4):
+/// B's headless run hears A's catch-up mail, so the run report names
+/// A by `DeviceId` — while B's own durable status renders every peer
+/// (A included) as an opaque `peer-N` handle and never prints the
+/// id. One two-device run pins both halves against each other.
+#[test]
+fn sync_now_reports_device_ids_that_status_renders_as_handles() {
+    let temp = TempDir::new();
+    let dir_a = temp.0.join("drive-a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    // Deterministic A identity: the test recomputes the device id
+    // after moving the secret into the engine.
+    let identity_a = DeviceIdentitySecret::from_bytes([0xA1; 32]).unwrap();
+    let device_a = identity_a.device_id();
+    let mut engine_a = Engine::create(dir_a.clone(), "test-pass", identity_a).unwrap();
+    let mut store_a = FsObjectStore::open(dir_a.clone()).unwrap();
+    let chunk = store_a
+        .insert(ObjectKind::Chunk, b"composed-bytes")
+        .unwrap();
+    let root = Tree::from_entries(vec![Entry::file("f", 14, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut store_a)
+        .unwrap();
+    engine_a.author_snapshot(&store_a, root).unwrap();
+    let identity_b = DeviceIdentitySecret::from_bytes([0x55; 32]).unwrap();
+    let identity_b_file = temp.0.join("identity-b");
+    write_secret(&identity_b_file, [0x55; 32]);
+    let dir_b = temp.0.join("drive-b");
+    let pairing = Engine::pairing_request(&dir_b, "test-pass", &identity_b).unwrap();
+    engine_a.stage_carry_heads().unwrap();
+    let outcome = engine_a
+        .admit_device(pairing.device, pairing.encryption_key)
+        .unwrap();
+    engine_a
+        .carry_pending(&FsObjectStore::open(dir_a.clone()).unwrap())
+        .unwrap();
+    let outbound = {
+        let mut recorder = RecordingMailbox::new();
+        engine_a.deliver_pending(&mut recorder).unwrap();
+        engine_a.announce_pending(&mut recorder, None).unwrap();
+        recorder.sent
+    };
+    assert!(!outbound.is_empty(), "admission owes B catch-up");
+    let engine_b =
+        Engine::join(dir_b.clone(), "test-pass", identity_b, &outcome.invitation).unwrap();
+    let node: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine_b, MemoryObjectStore::default()).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
+        .unwrap();
+    drop(parts);
+    let state_a = engine_a.runtime_state().unwrap();
+    let mut bulk =
+        Some(wyrd_sync::serving::VaultSource::from_state(&state_a, engine_a.vault()).unwrap());
+    drop(state_a);
+    let mut delayed = DelayedMailbox::new(outbound, Duration::from_millis(100));
+    let report = drive_quiet(
+        &mut live,
+        &mut delayed,
+        &mut bulk,
+        Some(Duration::from_millis(500)),
+    )
+    .unwrap();
+    assert!(report.accepted > 0, "A's mail landed: {report:?}");
+    assert!(
+        report.peers_observed.contains(&device_a),
+        "the run names the heard peer: {report:?}"
+    );
+    let now_rendered = sync_now_render(&report);
+    assert!(
+        now_rendered.contains(&device_a.to_string()),
+        "the run surface prints the heard id: {now_rendered}"
+    );
+    drop(live);
+    // The durable surface over the same drive: handles, never ids.
+    let reopened =
+        Engine::open_keystore(dir_b, "test-pass", read_identity(&identity_b_file).unwrap())
+            .unwrap();
+    let status = observe(&reopened, 0).unwrap();
+    let status_rendered = sync_status_render(&status);
+    assert!(
+        status_rendered.contains("peer-"),
+        "peers render as handles: {status_rendered}"
+    );
+    assert!(
+        !status_rendered.contains(&device_a.to_string()),
+        "the same id the run printed never renders here: {status_rendered}"
+    );
 }
 
 /// The settle window exists for mail that is still in flight when
@@ -1025,11 +1233,16 @@ fn sync_now_with_relay_and_offline_is_a_usage_error() {
 /// real intake, not a free re-read. Twelve synthetic passes with
 /// distinct per-pass values pin the whole accumulator: a counter
 /// added to the struct but forgotten here fails this test by
-/// construction.
+/// construction. Observed peers union instead of summing: the same
+/// peer heard on twelve passes is one observed peer, and the union
+/// stays sorted so reruns render identically.
 #[test]
 fn sync_run_report_accumulates_every_pass_not_just_the_last() {
+    use wyrd_format::DeviceId;
+    let peer_a = DeviceId::from_bytes([0xA0; 32]);
+    let peer_b = DeviceId::from_bytes([0xB0; 32]);
     let mut report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
-    for _ in 0..12 {
+    for pass in 0..12 {
         report.accumulate(&SyncReport {
             drained: DrainReport {
                 accepted: 1,
@@ -1040,6 +1253,13 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
                 deferred_shed: 1,
                 skipped: 4,
                 discarded: 5,
+                // Alternating senders with overlap: every pass names
+                // A, even passes also name B.
+                peers_observed: if pass % 2 == 0 {
+                    vec![peer_b, peer_a]
+                } else {
+                    vec![peer_a]
+                },
             },
             fetched: ExecuteReport {
                 manifests: 6,
@@ -1079,6 +1299,11 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
     assert_eq!(report.unavailable_keys, 168);
     assert_eq!(report.local_failures, 180);
     assert_eq!(report.sent, 192);
+    assert_eq!(
+        report.peers_observed,
+        vec![peer_a, peer_b],
+        "union, deduplicated and sorted: {report:?}"
+    );
 }
 
 /// A scripted writer produces commits from known sources while a
@@ -1304,7 +1529,11 @@ fn adversarial_render() -> (String, String, String, Vec<u8>) {
 
 /// No ContentId reaches a rendered run-report line: the drive holds
 /// a ContentId-shaped name and real chunk ids, and the new lines
-/// (write path, deferral split, relay counters) are counts only.
+/// (write path, deferral split, relay counters) are counts only. The
+/// peers-observed section is the one deliberate exception — it names
+/// `DeviceId`s — so the hex-run detector runs over the report with
+/// those lines scrubbed: a 64-hex run anywhere else is still a leak,
+/// whatever its kind.
 #[test]
 fn sync_now_output_contains_no_content_ids() {
     let (rendered, hexname, _, _) = adversarial_render();
@@ -1312,9 +1541,14 @@ fn sync_now_output_contains_no_content_ids() {
         !rendered.contains(&hexname),
         "the ContentId-shaped name never renders: {rendered}"
     );
+    let scrubbed: Vec<&str> = rendered
+        .lines()
+        .filter(|line| !line.starts_with("  peer "))
+        .collect();
+    let scrubbed = scrubbed.join("\n");
     assert!(
-        !contains_hex_run(&rendered),
-        "no 64-hex run anywhere in the report: {rendered}"
+        !contains_hex_run(&scrubbed),
+        "no 64-hex run outside the peers-observed lines: {rendered}"
     );
 }
 
@@ -1329,18 +1563,21 @@ fn sync_now_output_contains_no_paths() {
     );
 }
 
-/// No membership data reaches a rendered run-report line: neither
-/// the owner's device id nor any transition the run observed.
+/// The run surface never fabricates peers (OD-17-4 option B's
+/// boundary): with a mailbox that delivers nothing, no device id
+/// appears — observed peers render, unobserved ones are never
+/// invented. The positive half lives in
+/// `sync_now_reports_device_ids_that_status_renders_as_handles`.
 #[test]
-fn sync_now_output_contains_no_membership_data() {
+fn sync_now_fabricates_no_unobserved_peers() {
     let (rendered, _, device_hex, _) = adversarial_render();
     assert!(
         !rendered.contains(&device_hex),
-        "the device id never renders: {rendered}"
+        "no peer is named without being heard: {rendered}"
     );
     assert!(
-        !contains_hex_run(&rendered),
-        "transition ids are 64-hex too: {rendered}"
+        rendered.contains("peers observed: none"),
+        "the empty peer set says so: {rendered}"
     );
 }
 

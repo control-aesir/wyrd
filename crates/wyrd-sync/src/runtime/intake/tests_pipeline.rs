@@ -32,6 +32,7 @@ fn intake_commits_transitions_and_announcements() {
             deferred: 0,
             skipped: 0,
             discarded: 0,
+            peers_observed: vec![fixture.sender_sk.device_id()],
             ..Default::default()
         }
     );

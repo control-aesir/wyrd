@@ -43,11 +43,21 @@ version say exactly what changed.
   every fetch counter plus per-pass sends across all passes, and adds a
   write-path section (snapshot rate, per-source share, admission-to-commit
   latency — process-local; zero for headless runs, which submit no
-  mutations); the mailbox line names saturation recoveries; `mount.log`
-  dispatch lines carry the mutation-queue backlog beside the latency.
-  Lifetime `WriteStats` accumulate at the mutation seam (counts only,
-  never paths). `FsStoreError::Corrupt` and `IdentityMismatch` no longer
-  carry the object identity (concealment is absence).
+   mutations); the mailbox line names saturation recoveries; `mount.log`
+   dispatch lines carry the mutation-queue backlog beside the latency.
+   Lifetime `WriteStats` accumulate at the mutation seam (counts only,
+   never paths). `FsStoreError::Corrupt` and `IdentityMismatch` no longer
+   carry the object identity (concealment is absence).
+ - Observability PR 2 (the four missing projections): `sync status`
+   names peers as opaque handles (`peer-N`, stable for the rendering —
+   never a persisted namespace), reports the durable queue depth
+   (outstanding outbox pairs plus reconciliation gaps, from committed
+   facts only), convergence from durable facts, and materialization as
+   counts; connectivity reads `not observed` because status never
+   connects. `sync now` names the peers its intake actually heard, by
+   full `DeviceId` — the run connected and the operator holds the
+   keys. Deferral-cause attribution is pinned stable across redelivery
+   and restart.
 - Normative DG-1 mutation/commit boundary table in `docs/write-path.md`:
   one snapshot per commit-forcing event (folding all pending), dirty-handle
   release as a forcing event, namespace operations as folding forcing events,

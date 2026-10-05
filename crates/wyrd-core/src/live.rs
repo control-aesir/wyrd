@@ -155,7 +155,11 @@ pub enum LiveError {
 /// the fetch report (`Default` — all zeros — when no bulk source was
 /// provided and nothing could be fetched), plus whether the pass
 /// published a new serving generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+//
+// Not `Copy`: the drained intake report carries the observed peer
+// set (OD-17-4), which is heap-allocated. Pass reports move by value
+// or by reference; nothing relied on implicit duplication.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncReport {
     /// Control-plane intake: accepted, duplicates, deferred, skipped,
     /// discarded.

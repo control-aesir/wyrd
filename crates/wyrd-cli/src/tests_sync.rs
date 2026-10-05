@@ -269,11 +269,19 @@ fn sync_status_counts_staged_carries_in_the_queue_total() {
         status.queue.outbox, 1,
         "the staged carry, and only it: {status:?}"
     );
+    assert_eq!(status.queue.carries, 1, "the carry term itself: {status:?}");
     let rendered = sync_status_render(&status);
     assert!(
         rendered.contains("carries: 1 staged (counted in outbox)"),
         "{rendered}"
     );
+    // Restart-equivalence at nonzero carries: the staged carry is a
+    // committed fact, so reopening observes the identical queue —
+    // the carries term is restart-stable, not just zero-stable.
+    drop(engine);
+    let reopened = fixture.open();
+    let after = observe(&reopened, 0).unwrap();
+    assert_eq!(status, after, "same committed facts, same status");
 }
 
 /// Relays on a status command only label the mailbox line: still no

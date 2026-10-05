@@ -505,10 +505,10 @@ Both are read and hardened by wyrd code, never by clap:
    observation half of the privacy boundary. DeviceIds never reach
    the durable `sync status` surface or the log; `sync now` alone
    names the senders its intake actually heard, because that process
-   connected and the operator holds the keys. (`member list` and
-   `wyrd list` are separate read surfaces with their own contract
-   — they name members and authors explicitly, and this paragraph
-   does not cover them.)
+   connected and the operator holds the keys. (`member list`,
+   `member log`, and `snapshot list` are separate read surfaces with
+   their own contract — they name members and authors explicitly, and
+   this paragraph does not cover them.)
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

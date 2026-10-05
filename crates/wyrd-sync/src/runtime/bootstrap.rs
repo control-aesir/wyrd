@@ -48,8 +48,8 @@ use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTran
 use super::engine::{Engine, EngineError};
 use crate::control::bootstrap::{open_bootstrap, SealedBootstrap};
 use crate::durable::{
-    atomic_write_mode, ensure_owner_only_dir, fsync_dir, restrict_dir_owner_only,
-    AuthorizedCapability, DurableError, DurableStore, Fact, SECRET_FILE_MODE,
+    atomic_write_mode, ensure_owner_only_dir, fsync_dir, AuthorizedCapability, DurableError,
+    DurableStore, Fact, SECRET_FILE_MODE,
 };
 use crate::keys::capability::{Capability, DriveKeyring, WrappedCapability};
 use crate::keys::keystore::{
@@ -720,10 +720,6 @@ pub(super) fn pairing_request(
     ensure_owner_only_dir(dir)?;
     let device = identity.device_id();
     let path = dir.join(PAIRING_FILE);
-    // Staging establishes fresh custody state in this directory, so it
-    // becomes a custody directory now even when it pre-existed. A
-    // re-run over an already-staged file changes nothing on disk.
-    let staging_fresh = !path.exists();
     let secret = match std::fs::read(&path) {
         Ok(staged) => unwrap_pairing_secret(&staged, passphrase)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -754,9 +750,13 @@ pub(super) fn pairing_request(
         }
         Err(error) => return Err(EngineError::Io(error)),
     };
-    if staging_fresh {
-        restrict_dir_owner_only(dir)?;
-    }
+    // No directory restriction here: this call stages into whatever
+    // directory it is given — including an established drive's — and
+    // an established directory's mode is never this call's business.
+    // Fresh staging directories are restricted at creation by
+    // `ensure_owner_only_dir` above, and fresh drive state by the
+    // store open; both key on what they created, not on what this
+    // call staged.
     Ok(PairingRequest {
         device,
         encryption_key: secret.encryption_key(),

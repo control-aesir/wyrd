@@ -118,9 +118,7 @@ pub(crate) use store::fsync_dir;
 #[allow(unused_imports)]
 pub(crate) use store::CrashStage;
 pub use store::DurableStore;
-pub(crate) use store::{
-    atomic_write_mode, ensure_owner_only_dir, restrict_dir_owner_only, SECRET_FILE_MODE,
-};
+pub(crate) use store::{atomic_write_mode, ensure_owner_only_dir, SECRET_FILE_MODE};
 
 use thiserror::Error;
 use wyrd_format::{

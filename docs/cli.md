@@ -427,8 +427,13 @@ Both are read and hardened by wyrd code, never by clap:
 - Drive custody files are created owner-only on Unix regardless of
   umask: `store-key.wrap`, `keystore`, `pairing.secret`, and `LOCK` at
   `0o600`, the drive directory at `0o700`, `DRIVE` at no wider than
-  `0o644`. Pre-existing files and established drives keep their modes.
-  Non-Unix platforms get no mode guarantee.
+  `0o644`. Modes are never loosened and never chmod'ed in place: a
+  replaced custody file takes the hardened mode, and establishing
+  fresh drive state restricts the directory it is given. Pre-existing
+  files and established drives are otherwise untouched — inspect a
+  pre-fix drive with `stat` (e.g. `stat -c '%a %n'` on Linux,
+  `stat -f '%Lp %N'` on macOS) and repair by hand. Non-Unix platforms
+  get no mode guarantee.
 
 ## Diagnostics and exit codes
 

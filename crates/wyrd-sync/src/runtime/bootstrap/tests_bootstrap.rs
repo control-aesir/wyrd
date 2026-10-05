@@ -1052,3 +1052,24 @@ fn a_lost_pairing_race_leaves_the_winners_file_at_the_hardened_mode() {
         "the winner's file is owner-only under umask 000"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn pairing_request_leaves_an_established_drive_directory_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = UmaskGuard::set(0o077);
+    let dir = TestDir::new("custody-pairing-established");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    drop(create(dir.path.clone(), "test-pass", identity).unwrap());
+    drop(_guard);
+    // A pre-fix drive whose directory is still group-readable: staging
+    // a pairing secret must change no directory mode.
+    std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    pairing_request(&dir.path, "test-pass", &newcomer).unwrap();
+    assert_eq!(
+        mode_of(&dir.path) & 0o777,
+        0o755,
+        "pairing-request touches no directory mode"
+    );
+}

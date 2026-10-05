@@ -61,6 +61,78 @@ fn insecure_credential_permissions_are_rejected() {
     assert!(matches!(error, CliError::Credential { .. }));
 }
 
+#[cfg(unix)]
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Process-umask guard for the init test below: umask is
+/// process-global, so setters serialize on `UMASK_LOCK` and the mask
+/// is restored on drop, even on panic. Unix-only.
+#[cfg(unix)]
+struct UmaskGuard {
+    previous: u32,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_umask(mask: u32) -> UmaskGuard {
+    let lock = UMASK_LOCK.lock().unwrap();
+    // SAFETY: umask takes no pointers and only sets the calling
+    // process's file-mode creation mask; UMASK_LOCK serializes every
+    // setter in this binary, and Drop restores unconditionally.
+    let previous = unsafe { libc::umask(mask as libc::mode_t) } as u32;
+    UmaskGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: restores the mask captured at construction; see `set_umask`.
+        unsafe { libc::umask(self.previous as libc::mode_t) };
+    }
+}
+
+/// `wyrd init` under a permissive umask produces owner-only custody
+/// state: the user-visible end of the permission-hardening contract.
+/// Unix-only.
+#[cfg(unix)]
+#[test]
+fn init_under_a_permissive_umask_produces_owner_only_custody() {
+    use std::os::unix::fs::PermissionsExt;
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+
+    let _guard = set_umask(0o000);
+    command(vec![
+        "init".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap();
+    drop(_guard);
+
+    assert_eq!(mode_of(&drive.join("store-key.wrap")) & 0o077, 0);
+    assert_eq!(mode_of(&drive.join("keystore")) & 0o077, 0);
+    assert_eq!(mode_of(&drive.join("LOCK")) & 0o077, 0);
+    assert_eq!(mode_of(&drive) & 0o077, 0);
+    assert_eq!(mode_of(&drive.join("DRIVE")) & 0o022, 0);
+}
+
 #[test]
 fn missing_options_are_usage_errors() {
     let error = command(vec!["init".into(), "/tmp/drive".into()]).unwrap_err();

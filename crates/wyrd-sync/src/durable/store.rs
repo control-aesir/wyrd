@@ -111,27 +111,39 @@ pub(crate) const DRIVE_DIR_MODE: u32 = 0o700;
 
 /// Create the atomic-write temp file with an explicit Unix mode, so a
 /// crash between creation and rename never leaves a world-readable
-/// temp holding custody bytes. A stale temp from a pre-fix run carries
-/// its old loose mode through the rename, so it is removed first:
-/// creation is single-writer (the store lock), and stale temps are
-/// never read. Non-Unix falls back to `File::create`: the mode
-/// guarantee is Unix-only (see `docs/cli.md`).
+/// temp holding custody bytes. The mode applies at creation only, so
+/// the name is claimed (`create_new`) rather than truncated: reusing
+/// a stale temp would carry its old loose mode through the rename. On
+/// a lost race the stale file is removed once and the claim retried,
+/// and a second failure propagates — the mode invariant is enforced,
+/// not assumed. Creation is single-writer (the store lock), so a retry
+/// meets a crashed predecessor's temp, never a live competitor.
+/// Non-Unix falls back to `File::create_new`: the mode guarantee is
+/// Unix-only (see `docs/cli.md`).
 pub(crate) fn create_mode_temp(
     dir: &Path,
     name: &str,
     #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
 ) -> std::io::Result<File> {
     let tmp = dir.join(format!("{name}.tmp"));
-    let _ = fs::remove_file(&tmp);
     #[cfg(unix)]
-    return std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&tmp);
+    let claim = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+    };
     #[cfg(not(unix))]
-    return File::create(&tmp);
+    let claim = || File::create_new(&tmp);
+    match claim() {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp)?;
+            claim()
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Durably create-or-replace one custody file: temp (at an explicit
@@ -157,20 +169,40 @@ pub(crate) fn atomic_write_mode(
 }
 
 /// Create a drive state directory, restricting the leaf to
-/// owner-only (`0o700`) when this call created it, so the result never
-/// depends on the process umask. A pre-existing directory is left
-/// untouched, and parents above the leaf are the operator's business
-/// and keep their modes: creation hardens, opening never chmods.
-/// Non-Unix falls back to plain `create_dir_all` (see `docs/cli.md`).
+/// owner-only (`0o700`) when this call established it, so the result
+/// never depends on the process umask. Freshness comes from the create
+/// call itself (`AlreadyExists` means a concurrent creator won), not
+/// from a preceding stat, so no check-then-act gap exists. A
+/// pre-existing directory is left untouched, and parents above the
+/// leaf are the operator's business and keep their modes: creation
+/// hardens, opening never chmods. Non-Unix falls back to plain
+/// `create_dir_all` (see `docs/cli.md`).
 pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    return fs::create_dir_all(path);
     #[cfg(unix)]
-    let fresh = !path.exists();
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    if fresh {
+    {
+        if path.is_dir() {
+            return Ok(());
+        }
+        match fs::create_dir(path) {
+            Ok(()) => {
+                fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Parents were missing: create the chain, then restrict the
+        // leaf. A concurrent creator winning the leaf in the gap keeps
+        // the lock-held fresh-DRIVE restriction (drive dirs) as the
+        // backstop — and this call only ever narrows modes, never
+        // widens them.
+        fs::create_dir_all(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Restrict a drive state directory to owner-only, whatever its

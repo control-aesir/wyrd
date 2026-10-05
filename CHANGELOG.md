@@ -40,9 +40,11 @@ version say exactly what changed.
 - Drive custody files are created with explicit restrictive modes on
   Unix, independent of the process umask: `store-key.wrap`, `keystore`,
   `pairing.secret`, and `LOCK` at `0o600`, the drive directory (and
-  `commits/`) at `0o700`, `DRIVE` at no wider than `0o644`. Pre-existing
-  files and established drives keep their modes: creation hardens,
-  opening never chmods.
+  `commits/`) at `0o700`, `DRIVE` at no wider than `0o644`. Modes are
+  never loosened and never chmod'ed in place — a replaced custody file
+  takes the hardened mode — and pre-existing files and established
+  drives are otherwise untouched (inspect a pre-fix drive with `stat`,
+  repair by hand).
 
 ## [0.2.0-alpha]
 

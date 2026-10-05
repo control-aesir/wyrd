@@ -65,6 +65,12 @@ impl Drop for TestDir {
 /// Set the process umask for the guarded span, serializing against
 /// every other umask-touching test in this binary: umask is
 /// process-global and the harness runs tests on threads. Unix-only.
+///
+/// Sound under `cargo nextest run` (one process per test) and, by the
+/// lock, against every other setter in this binary — but an unrelated
+/// test creating files in another thread still observes the lowered
+/// mask while the guard lives, so keep the guarded span to the
+/// creation calls and assert after the guard drops.
 #[cfg(unix)]
 pub(crate) struct UmaskGuard {
     previous: u32,

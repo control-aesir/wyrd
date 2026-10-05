@@ -619,15 +619,16 @@ handles, not just the write in hand.
       the ceiling, only once already over. Reserving the in-flight
       delta up front would require predicting a commit's retention
       before step 1 runs; the overshoot bound is pinned by
-      `a_removal_below_the_ceiling_readmits_local_writes`' at-ceiling
-      refusal (the same suite that pins the removal side).
+      `a_removal_below_the_ceiling_readmits_local_writes` (at-ceiling
+      refusal, then admission, overshoot, and refusal again).
     - **A startup cross-check.** Settled. `check_retained_ceiling`
       (`wyrd-core`) compares a configured quota against
       `FsObjectStore::retained_bytes` — one walk at open, never per
       commit — before the node starts, so a quota below current
       retention is one named diagnosis with both numbers instead of a
-      stream of `ENOSPC` at the first write. Pinned by
-      `a_quota_below_current_retention_is_diagnosed_at_start`.
+      stream of `ENOSPC` at the first write. Both binary composers
+      (`mount` and `sync_now`) call it through one shared helper.
+      Pinned by `a_quota_below_current_retention_is_diagnosed_at_start`.
     - **Granularity.** The bound is per device. Per drive would bound the
       *author* across its devices; per member-set would bound a group.
       The device scope is the conservative choice and is the only one

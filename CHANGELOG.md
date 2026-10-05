@@ -77,7 +77,8 @@ version say exactly what changed.
   fact log and sync vault (observational) plus an explicitly
   non-authoritative advisory ceiling when no quota is configured; and a
   committed measurement showing 100 opens of unavailable content commit
-  1 fact / 1 commit / 4 fsyncs with no amplification. No CLI quota flag,
+  1 fact in 1 commit file with no amplification (4 fsyncs per commit is
+  derived from the commit protocol, not counted). No CLI quota flag,
   no default ceiling, no enforcement change: fetched bytes, the vault,
   and the fact log still cross no ceiling.
 

@@ -762,6 +762,19 @@ fn install_shutdown_handler() -> Result<(), CliError> {
     // handler the process dies on signal exactly as before.
     Ok(())
 }
+/// The startup retention cross-check, shared by every node-starting
+/// composer in this binary: a quota below what the mounted store
+/// already holds would refuse every write, so refuse to start with
+/// both numbers instead of discovering it per write. Unset quotas
+/// skip the walk entirely. One helper so the next composer inherits
+/// the check instead of the omission.
+fn check_startup_retention(config: &LiveConfig, store: &FsObjectStore) -> Result<(), CliError> {
+    if let Some(quota) = config.budgets.retained_bytes_quota {
+        wyrd_core::live::check_retained_ceiling(quota, store)?;
+    }
+    Ok(())
+}
+
 fn mount(
     drive_dir: PathBuf,
     mountpoint: PathBuf,
@@ -785,19 +798,17 @@ fn mount(
     tracing::info!(stage = "start", log = %log_path.display(), "mount diagnostics initialized");
 
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
+    // Operational policy in one place: the loop and the serving
+    // backend share this config's budgets, wired into both halves
+    // by `into_live` below. Constructed through `for_local_sync`
+    // (never `Default` directly) so headless sync shares these exact
+    // budgets and ceilings — several are correctness boundaries, and
+    // a mount-only default must never silently diverge them. One
+    // value from here to `into_live`, so the startup check below and
+    // the loop compare against the same numbers.
+    let config = LiveConfig::for_local_sync();
     let store = FsObjectStore::open(drive_dir.clone())
         .map_err(|error| CliError::Store(error.to_string()))?;
-    // The startup cross-check runs before composition: a quota below
-    // what the mounted store already holds would refuse every write,
-    // so starting is refused with both numbers instead. Unset quotas
-    // need no check — and the binary ships none, so this fires only
-    // for embedders and future configuration surfaces.
-    if let Some(quota) = LiveConfig::for_local_sync().budgets.retained_bytes_quota {
-        wyrd_core::live::check_retained_ceiling(quota, &store)?;
-    }
-    let mut daemon = WyrdNode::new(engine, store)?;
-    daemon.refresh_live_heads()?;
-
     // Fail fast on macOS before binding any endpoint: a missing
     // macFUSE runtime can never mount, and every later stage would
     // report the same opaque failure.
@@ -808,6 +819,14 @@ fn mount(
     }
     #[cfg(target_os = "macos")]
     tracing::info!(stage = "preflight", "macOS FUSE preflight passed");
+    // The startup cross-check runs after platform preflight and before
+    // composition: a quota below what the mounted store already holds
+    // would refuse every write, so starting is refused with both
+    // numbers instead. Unset quotas skip the walk — and the binary
+    // ships none, so this fires only for future configuration surfaces.
+    check_startup_retention(&config, &store)?;
+    let mut daemon = WyrdNode::new(engine, store)?;
+    daemon.refresh_live_heads()?;
 
     // Serving: a real-iroh endpoint over the drive's durable vault, so
     // peers holding an announcement route can fetch what this drive
@@ -824,11 +843,9 @@ fn mount(
 
     // Operational policy in one place: the loop and the serving
     // backend share this config's budgets, wired into both halves
-    // by `into_live` below. Constructed through `for_local_sync`
-    // (never `Default` directly) so headless sync shares these exact
-    // budgets and ceilings — several are correctness boundaries, and
-    // a mount-only default must never silently diverge them.
-    let config = LiveConfig::for_local_sync();
+    // by `into_live` below. (Constructed above through `for_local_sync`,
+    // never `Default` directly, so headless sync shares these exact
+    // budgets and ceilings.)
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // Flush the serving endpoint before announcing its address, so the
     // first seal carries a route peers can already dial. The loop owns
@@ -2039,13 +2056,16 @@ fn sync_now(
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
-    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> = WyrdNode::new(
-        engine,
-        FsObjectStore::open(drive_dir.clone())
-            .map_err(|error| CliError::Store(error.to_string()))?,
-    )?;
-    daemon.refresh_live_heads()?;
     let config = LiveConfig::for_local_sync();
+    let store = FsObjectStore::open(drive_dir.clone())
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    // Same startup cross-check as mount: headless runs compose a live
+    // node too, so a misconfigured quota must fail here rather than
+    // in the first write.
+    check_startup_retention(&config, &store)?;
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store)?;
+    daemon.refresh_live_heads()?;
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // The headless consumer has no presentation backend: the live
     // parts (projection handle, wants, mutations) are owned but

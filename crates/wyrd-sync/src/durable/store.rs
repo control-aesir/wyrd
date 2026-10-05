@@ -340,22 +340,22 @@ impl DurableStore {
         };
         for entry in entries {
             let entry = entry.map_err(DurableError::Io)?;
-            // One stat per entry: `file_type` comes free with the
-            // listing, so only regular files pay for `metadata`. A
-            // file that vanishes between the two was never ours to
-            // count — skip it, like the missing directory above.
-            if !entry.file_type().map_err(DurableError::Io)?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "tmp") {
-                continue;
-            }
-            match entry.metadata() {
-                Ok(metadata) => total += metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // One stat per entry: `metadata` answers both questions —
+            // kind and length — and follows symlinks, like the walk
+            // this replaced. A file that vanishes first was never ours
+            // to count; any other listing failure is operational.
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(DurableError::Io(error)),
+            };
+            if !metadata.is_file() {
+                continue;
             }
+            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
+            total += metadata.len();
         }
         Ok(total)
     }

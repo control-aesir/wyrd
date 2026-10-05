@@ -182,6 +182,7 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     // so the count does not move. Unlike a real full disk, the ceiling
     // compares the count, not the write.
     retained.subtract(1);
+    let under_ceiling = retained.get();
     let reader = backend.open_at("base.txt").unwrap();
     let current = backend.read_handle(reader, 0, 4096).unwrap();
     backend.release_handle(reader).unwrap();
@@ -192,6 +193,11 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     backend
         .commit_handle(handle)
         .expect("a nothing-new commit below the ceiling is admitted");
+    assert_eq!(
+        retained.get(),
+        under_ceiling,
+        "a no-op rewrite charges nothing: the pin is the count, not the admission"
+    );
 
     // New bytes are admitted too — the device is still under its
     // ceiling — and the admitted commit takes it back over: no commit

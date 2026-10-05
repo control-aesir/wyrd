@@ -671,10 +671,8 @@ fn replayed_empty_to_filled_merge_keeps_transport_represented() {
 
 /// One commit is one commit file: CURRENT advances by exactly one and
 /// the fact-log byte count grows by exactly the file the commit wrote.
-/// This pins the premise the unavailable-open measurement derives its
-/// fsync figure from (four fsyncs per commit, per the `commit_until`
-/// protocol sequence) — if the protocol ever writes more or fewer
-/// files per commit, this fails first.
+/// This pins the one-commit-one-file premise the unavailable-open
+/// measurement's fsync derivation rests on. It does not count fsyncs.
 #[test]
 fn one_commit_writes_one_commit_file() {
     let dir = TestDir::new("commit-file-count");

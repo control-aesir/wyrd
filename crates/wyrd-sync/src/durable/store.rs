@@ -341,9 +341,12 @@ impl DurableStore {
         for entry in entries {
             let entry = entry.map_err(DurableError::Io)?;
             // One stat per entry: `metadata` answers both questions —
-            // kind and length — and follows symlinks, like the walk
-            // this replaced. A file that vanishes first was never ours
-            // to count; any other listing failure is operational.
+            // kind and length. `DirEntry::metadata` does not traverse
+            // symlinks, so a symlink inside the commits directory is
+            // excluded from the observational count rather than
+            // followed out of the measured tree. A file that vanishes
+            // first was never ours to count; any other listing failure
+            // is operational.
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

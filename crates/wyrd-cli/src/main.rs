@@ -762,12 +762,15 @@ fn install_shutdown_handler() -> Result<(), CliError> {
     // handler the process dies on signal exactly as before.
     Ok(())
 }
-/// The startup retention cross-check, shared by every node-starting
-/// composer in this binary: a quota below what the mounted store
-/// already holds would refuse every write, so refuse to start with
-/// both numbers instead of discovering it per write. Unset quotas
-/// skip the walk entirely. One helper so the next composer inherits
-/// the check instead of the omission.
+/// The startup retention cross-check, shared by every composer that
+/// starts a live node in this binary (`mount`, `sync_now`): a quota
+/// below what the mounted store already holds would refuse every
+/// write, so refuse to start with both numbers instead of discovering
+/// it per write. Unset quotas skip the walk entirely. One helper so
+/// the next live-node composer inherits the check instead of the
+/// omission. Composers that never start a live loop (`export`, policy
+/// commands) correctly do not call it: with no loop there is no
+/// `ENOSPC` stream to pre-empt.
 fn check_startup_retention(config: &LiveConfig, store: &FsObjectStore) -> Result<(), CliError> {
     if let Some(quota) = config.budgets.retained_bytes_quota {
         wyrd_core::live::check_retained_ceiling(quota, store)?;
@@ -841,11 +844,8 @@ fn mount(
     eprintln!("serving over iroh: {serving_id}");
     tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
 
-    // Operational policy in one place: the loop and the serving
-    // backend share this config's budgets, wired into both halves
-    // by `into_live` below. (Constructed above through `for_local_sync`,
-    // never `Default` directly, so headless sync shares these exact
-    // budgets and ceilings.)
+    // The loop and the serving backend share the config's budgets
+    // through `into_live` below.
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     // Flush the serving endpoint before announcing its address, so the
     // first seal carries a route peers can already dial. The loop owns

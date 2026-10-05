@@ -1617,6 +1617,11 @@ fn drive_id_file_is_not_group_or_world_writable() {
 #[cfg(unix)]
 #[test]
 fn a_fresh_drive_directory_is_owner_only() {
+    // End-state pin: `TestDir` pre-creates the directory, so the
+    // helper takes its early return here and the `0o700` comes from
+    // the fresh-`DRIVE` backstop. The helper's own create path is
+    // pinned by `ensure_owner_only_dir_creates_at_owner_only` below;
+    // the CLI test pins the whole `init` path.
     for mask in [0o000, 0o077] {
         let dir = open_fresh_store("custody-dir", mask);
         assert_eq!(mode_of(&dir.path) & 0o077, 0, "drive dir, umask {mask:03o}");
@@ -1626,6 +1631,20 @@ fn a_fresh_drive_directory_is_owner_only() {
             "commits dir, umask {mask:03o}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_owner_only_dir_creates_at_owner_only() {
+    use super::store::ensure_owner_only_dir;
+    let _guard = UmaskGuard::set(0o000);
+    let dir = TestDir::new("custody-helper");
+    // A path `TestDir` has not created: the helper takes its create
+    // path (`DirBuilder::mode`), not the early return.
+    let fresh = dir.path.join("fresh");
+    ensure_owner_only_dir(&fresh).unwrap();
+    drop(_guard);
+    assert_eq!(mode_of(&fresh) & 0o077, 0);
 }
 
 #[cfg(unix)]

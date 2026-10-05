@@ -40,12 +40,14 @@ version say exactly what changed.
 - Drive custody files are created with explicit restrictive modes on
   Unix, independent of the process umask: `store-key.wrap`, `keystore`,
   `pairing.secret`, and `LOCK` at `0o600`, the drive directory (and
-  `commits/`) at `0o700`, `DRIVE` at no wider than `0o644`. Modes are
-  never loosened — a replaced custody file takes the hardened mode —
-  and only directories this call creates are restricted, except that
-  establishing fresh drive state restricts the directory it is given;
-  pre-existing files, directories, and established drives are otherwise
-  untouched (inspect a pre-fix drive with `stat`, repair by hand).
+  `commits/`) at no wider than `0o700`, `DRIVE` at no wider than
+  `0o644`. Modes are never loosened — a replaced custody file takes
+  the hardened mode — and only the leaf directory this call creates is
+  restricted, except that establishing fresh drive state restricts the
+  directory it is given (missing parents above the leaf keep the
+  operator's modes); pre-existing files, directories, and established
+  drives are otherwise untouched (inspect a pre-fix drive with `stat`,
+  repair by hand).
 
 ## [0.2.0-alpha]
 

@@ -171,12 +171,14 @@ pub(crate) fn atomic_write_mode(
     fsync_dir(dir)
 }
 
-/// Create a drive state directory, created at owner-only (`0o700`)
-/// when this call establishes it, so the result never depends on the
-/// process umask. The mode is set on the create call itself
-/// (`DirBuilder::mode`), not chmod'ed after: no window exists where
-/// the leaf sits at the umask mode. Freshness comes from the create
-/// call (`AlreadyExists` means a concurrent creator won), not from a
+/// Create a drive state directory at no wider than owner-only
+/// (`0o700`) when this call establishes the leaf, so the result never
+/// exceeds the contract whatever the process umask. The mode is set on
+/// the create call itself (`DirBuilder::mode`), not chmod'ed after: no
+/// window exists where the leaf sits at the umask mode. Like every
+/// `open` mode it is a ceiling masked by the umask — an
+/// owner-masking umask lands a stricter leaf, never a looser one.
+/// Freshness comes from the create call itself (`AlreadyExists` means a concurrent creator won), not from a
 /// preceding stat, so no check-then-act gap exists. A pre-existing
 /// directory is left untouched, and parents above the leaf are the
 /// operator's business and keep their modes: creation hardens,

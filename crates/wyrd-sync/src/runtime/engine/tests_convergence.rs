@@ -127,6 +127,7 @@ fn repeated_restarts_are_idempotent() {
                 deferred: 0,
                 skipped: 0,
                 discarded: 0,
+                ..Default::default()
             }
         );
         let plan = execute_side(&mut pair.bulk, &mut pair.a);

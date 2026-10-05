@@ -126,6 +126,125 @@ fn request_log_records_the_reply_errno() {
     assert_eq!(clean.err.get(), None);
 }
 
+/// A capturing subscriber for probe-line assertions: records each
+/// event's fields as `name=value` pairs with no formatting
+/// dependency — `tracing-subscriber` stays out of the crate, so the
+/// debug probe cannot smuggle in the metrics pipeline it reports
+/// pressure against.
+#[derive(Clone, Default)]
+struct Capture {
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+struct FieldNames {
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for FieldNames {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields.push(format!("{}={value:?}", field.name()));
+    }
+}
+
+impl tracing::Subscriber for Capture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = FieldNames { fields: Vec::new() };
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(visitor.fields.join(" "));
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Every probe line carries the queue backlog observed at dispatch
+/// entry beside the dispatch wait: `mount.log` shows pressure per
+/// dispatch, and the crate gains no dependency to do it.
+#[test]
+fn mount_log_reports_queue_depth_and_wait_time_without_a_new_dependency() {
+    let capture = Capture::default();
+    let events = std::sync::Arc::clone(&capture.events);
+    tracing::subscriber::with_default(capture, || {
+        let log = RequestLog::new("fsync");
+        log.set_depth(3);
+        drop(log);
+        let failed = RequestLog::new("flush");
+        failed.set_depth(0);
+        let _ = failed.fail(fuser::Errno::EIO);
+    });
+    let guard = events.lock().unwrap();
+    let lines = guard.clone();
+    drop(guard);
+    assert_eq!(lines.len(), 2, "both dispatches log: {lines:?}");
+    assert!(
+        lines[0].contains("opcode=\"fsync\"")
+            && lines[0].contains("queue_depth=3")
+            && lines[0].contains("latency_us="),
+        "depth and wait ride the clean line: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("errno=") && lines[1].contains("queue_depth=0"),
+        "depth rides the failed line too: {}",
+        lines[1]
+    );
+
+    // `docs/resource-limits.md` decides no metrics pipeline in v0:
+    // the probe reports through `tracing` (already a dependency),
+    // so pin the dependency set — a metrics crate here fails loud.
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("the crate manifest reads");
+    let mut in_deps = false;
+    let mut deps = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_deps = line == "[dependencies]";
+            continue;
+        }
+        if !in_deps || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let key = line
+            .split(['.', '=', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        deps.push(key);
+    }
+    deps.sort();
+    assert_eq!(
+        deps,
+        vec![
+            "fuser",
+            "libc",
+            "thiserror",
+            "tracing",
+            "wyrd-core",
+            "wyrd-format",
+            "wyrd-fuse",
+            "wyrd-sync",
+        ],
+        "no metrics pipeline dependency may land beside the probe"
+    );
+}
+
 /// The open table is a lock like any other: poison fails the
 /// operation with EIO instead of panicking a kernel callback.
 #[test]

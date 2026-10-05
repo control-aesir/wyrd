@@ -271,6 +271,119 @@ pub enum FoldDisposition {
     Restored,
 }
 
+/// The attributable source class of one authored snapshot: the
+/// mutation variant that produced it. A [`MutationKind::Fold`] counts
+/// once as `Fold` — the fold is the commit, and its members never
+/// author alone. Path-free by construction: variant classes, never
+/// paths, so the operator surface can render them without inheriting
+/// the `Debug` impls' path rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitSource {
+    Mkdir,
+    CreateFile,
+    CommitFile,
+    AppendFile,
+    Unlink,
+    Rmdir,
+    Rename,
+    SetAttrs,
+    Fold,
+}
+
+impl From<&MutationKind> for CommitSource {
+    fn from(kind: &MutationKind) -> Self {
+        match kind {
+            MutationKind::Mkdir { .. } => CommitSource::Mkdir,
+            MutationKind::CreateFile { .. } => CommitSource::CreateFile,
+            MutationKind::CommitFile { .. } => CommitSource::CommitFile,
+            MutationKind::AppendFile { .. } => CommitSource::AppendFile,
+            MutationKind::Unlink { .. } => CommitSource::Unlink,
+            MutationKind::Rmdir { .. } => CommitSource::Rmdir,
+            MutationKind::Rename { .. } => CommitSource::Rename,
+            MutationKind::SetAttrs { .. } => CommitSource::SetAttrs,
+            MutationKind::Fold { .. } => CommitSource::Fold,
+        }
+    }
+}
+
+/// Lifetime write-path totals for the operator surface: snapshot
+/// rate and source breakdown, admission-to-commit latency. Plain
+/// data under the queue lock — the loop updates it on completion
+/// and authoring, supervisors and `sync now` read a copy. Counters
+/// only, never paths or content: nothing rendered from here can
+/// leak what a snapshot carries.
+#[derive(Debug, Clone)]
+pub struct WriteStats {
+    /// Snapshots authored through the traced seam, all sources.
+    pub snapshots: u64,
+    /// Submissions completed successfully. Not all author: a no-op
+    /// setattr or an empty append completes without a snapshot, so
+    /// this and `snapshots` are separate counters by design.
+    pub commits: u64,
+    /// Submissions completed as failures, all causes.
+    pub failures: u64,
+    /// Admission-to-completion latency over committed submissions,
+    /// in microseconds: the caller was blocked for this long.
+    pub commit_latency_us_sum: u64,
+    /// Slowest committed submission, in microseconds.
+    pub commit_latency_us_max: u64,
+    /// Per-source snapshot counts, in [`CommitSource`] order below.
+    pub mkdir: u64,
+    pub create_file: u64,
+    pub commit_file: u64,
+    pub append_file: u64,
+    pub unlink: u64,
+    pub rmdir: u64,
+    pub rename: u64,
+    pub set_attrs: u64,
+    pub fold: u64,
+    /// Queue creation: the rate denominator.
+    pub started: Instant,
+}
+
+impl WriteStats {
+    /// Snapshots per minute over the queue's lifetime. Zero until the
+    /// first snapshot — a rate over no time is not a number.
+    pub fn snapshots_per_minute(&self) -> f64 {
+        let minutes = self.started.elapsed().as_secs_f64() / 60.0;
+        if self.snapshots == 0 || minutes <= 0.0 {
+            return 0.0;
+        }
+        self.snapshots as f64 / minutes
+    }
+
+    /// Mean admission-to-commit latency over committed submissions,
+    /// in microseconds. Zero when nothing committed.
+    pub fn commit_latency_us_mean(&self) -> u64 {
+        if self.commits == 0 {
+            return 0;
+        }
+        self.commit_latency_us_sum / self.commits
+    }
+}
+
+impl Default for WriteStats {
+    fn default() -> Self {
+        WriteStats {
+            snapshots: 0,
+            commits: 0,
+            failures: 0,
+            commit_latency_us_sum: 0,
+            commit_latency_us_max: 0,
+            mkdir: 0,
+            create_file: 0,
+            commit_file: 0,
+            append_file: 0,
+            unlink: 0,
+            rmdir: 0,
+            rename: 0,
+            set_attrs: 0,
+            fold: 0,
+            started: Instant::now(),
+        }
+    }
+}
+
 /// Idle-wait slice for the loop while nothing is happening: the wait
 /// wakes immediately on submission, so this only bounds how long a
 /// set stop flag takes to observe.
@@ -667,6 +780,10 @@ struct QueueState {
     /// Admitted-but-incomplete, including executing requests: the bound
     /// covers every request whose caller is still blocked.
     outstanding: usize,
+    /// Lifetime write-path totals (see [`WriteStats`]): updated on
+    /// completion and authoring under this same lock, so the operator
+    /// surface reads a consistent copy with no extra locking.
+    stats: WriteStats,
     /// Closed by [`MutationQueue::shutdown`]: the loop will never drain
     /// again, so new submissions fail fast instead of queueing behind it.
     closed: bool,
@@ -918,12 +1035,25 @@ impl MutationQueue {
         self.poke_waker();
     }
 
-    /// Complete one taken request: record the outcome, release its
-    /// admission slot, wake the blocked submitter. [`MutationBatch`]
-    /// calls this; direct callers should prefer the batch guard.
+    /// Complete one taken request: record the outcome, account it in
+    /// the lifetime write totals, release its admission slot, wake the
+    /// blocked submitter. [`MutationBatch`] calls this; direct callers
+    /// should prefer the batch guard.
     fn complete(&self, queued: QueuedMutation, result: Result<MutationOutcome, MutationError>) {
+        // Admission-to-completion latency: the caller was blocked
+        // since `submitted`. Commits only — a failure never reached
+        // durability, so its wait is not commit latency.
+        let latency_us = queued.submitted.elapsed().as_micros() as u64;
+        let committed = result.is_ok();
         let mut state = self.lock_state();
         state.outstanding = state.outstanding.saturating_sub(1);
+        if committed {
+            state.stats.commits += 1;
+            state.stats.commit_latency_us_sum += latency_us;
+            state.stats.commit_latency_us_max = state.stats.commit_latency_us_max.max(latency_us);
+        } else {
+            state.stats.failures += 1;
+        }
         drop(state);
         queued.reply.complete(result);
     }
@@ -989,6 +1119,40 @@ impl MutationQueue {
     /// admitted-but-incomplete requests.
     pub fn outstanding(&self) -> usize {
         self.lock_state().outstanding
+    }
+
+    /// Introspection for the operator surface: queued-but-unexecuted
+    /// requests (pending plus held), the backlog a caller waits
+    /// behind. Point-in-time; the loop drains it continuously.
+    pub fn queue_depth(&self) -> usize {
+        let state = self.lock_state();
+        state.pending.len() + state.deferred.len()
+    }
+
+    /// Point-in-time copy of the lifetime write-path totals for the
+    /// operator surface (`sync now`, supervisors). Counters only.
+    pub fn write_stats(&self) -> WriteStats {
+        self.lock_state().stats.clone()
+    }
+
+    /// Record one authored snapshot under its source class. The live
+    /// loop calls this from the traced authoring seam — the single
+    /// choke point every snapshot passes — so the count is exact:
+    /// no-op completions and failed submissions never reach here.
+    pub(crate) fn note_snapshot(&self, source: CommitSource) {
+        let mut state = self.lock_state();
+        state.stats.snapshots += 1;
+        match source {
+            CommitSource::Mkdir => state.stats.mkdir += 1,
+            CommitSource::CreateFile => state.stats.create_file += 1,
+            CommitSource::CommitFile => state.stats.commit_file += 1,
+            CommitSource::AppendFile => state.stats.append_file += 1,
+            CommitSource::Unlink => state.stats.unlink += 1,
+            CommitSource::Rmdir => state.stats.rmdir += 1,
+            CommitSource::Rename => state.stats.rename += 1,
+            CommitSource::SetAttrs => state.stats.set_attrs += 1,
+            CommitSource::Fold => state.stats.fold += 1,
+        }
     }
 
     /// The earliest prerequisite deadline among outstanding

@@ -38,6 +38,15 @@ version say exactly what changed.
   `docs/crash-consistency.md` and records the `*Reconciled` fact-tag
   pattern in `docs/upgrade-contract.md`. Decision only; no behavior
   change. Implementation is gated on this artefact.
+- Observability PR 1 (expose what is computed): `sync now` splits
+  deferred holds by cause (unseen / status-blocked / shed), accumulates
+  every fetch counter plus per-pass sends across all passes, and adds a
+  write-path section (snapshot rate, per-source share, admission-to-commit
+  latency); the mailbox line names saturation recoveries; `mount.log`
+  dispatch lines carry the mutation-queue backlog beside the latency.
+  Lifetime `WriteStats` accumulate at the mutation seam (counts only,
+  never paths). `FsStoreError::Corrupt` and `IdentityMismatch` no longer
+  carry the object identity (concealment is absence).
 - Normative DG-1 mutation/commit boundary table in `docs/write-path.md`:
   one snapshot per commit-forcing event (folding all pending), dirty-handle
   release as a forcing event, namespace operations as folding forcing events,

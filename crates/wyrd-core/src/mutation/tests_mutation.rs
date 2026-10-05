@@ -840,3 +840,77 @@ fn queue_works_without_a_waker() {
     batch.finish();
     assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
 }
+
+/// Completion accounting: a commit brackets its injected
+/// admission-to-completion wait, a failure counts without latency,
+/// and the depth gauge reads the backlog while blocked.
+#[test]
+fn completion_accounting_brackets_injected_wait() {
+    let queue = Arc::new(MutationQueue::default());
+    let submitter = {
+        let queue = Arc::clone(&queue);
+        std::thread::spawn(move || queue.submit(mkdir("docs")))
+    };
+    // Blocked behind the loop's drain: the backlog is visible.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while queue.queue_depth() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the submission never queued"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(queue.queue_depth(), 1);
+    // The injected wait: admission happened ~100 ms ago by the time
+    // the loop completes this request.
+    std::thread::sleep(Duration::from_millis(100));
+    let mut batch = queue.take_batch();
+    batch.record(0, Ok(MutationOutcome::Done));
+    batch.finish();
+    assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+    assert_eq!(queue.queue_depth(), 0, "completion drains the gauge");
+    let stats = queue.write_stats();
+    assert_eq!(stats.commits, 1);
+    assert_eq!(stats.failures, 0);
+    assert!(
+        stats.commit_latency_us_sum >= 100_000,
+        "latency brackets the injected wait: {}",
+        stats.commit_latency_us_sum
+    );
+    assert!(
+        stats.commit_latency_us_sum < 5_000_000,
+        "latency is the wait, not wall clock: {}",
+        stats.commit_latency_us_sum
+    );
+    assert_eq!(stats.commit_latency_us_max, stats.commit_latency_us_sum);
+    assert_eq!(
+        stats.commit_latency_us_mean(),
+        stats.commit_latency_us_sum,
+        "one sample: mean is the sample"
+    );
+}
+
+/// A failed submission counts without latency: the failure never
+/// reached durability, so its wait is not commit latency.
+#[test]
+fn failed_completion_counts_without_latency() {
+    let queue = Arc::new(MutationQueue::default());
+    let submitter = {
+        let queue = Arc::clone(&queue);
+        std::thread::spawn(move || queue.submit(mkdir("docs")))
+    };
+    let mut batch = take_batch_blocking(&queue);
+    std::thread::sleep(Duration::from_millis(50));
+    batch.record(0, Err(MutationError::AlreadyExists("docs".into())));
+    batch.finish();
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::AlreadyExists("docs".into()))
+    );
+    let stats = queue.write_stats();
+    assert_eq!(stats.commits, 0);
+    assert_eq!(stats.failures, 1);
+    assert_eq!(stats.snapshots, 0, "nothing authored on failure");
+    assert_eq!(stats.commit_latency_us_sum, 0);
+    assert_eq!(stats.commit_latency_us_max, 0);
+}

@@ -16,6 +16,7 @@ use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::{LiveMailbox, MailboxHealth};
+use wyrd_core::mutation::WriteStats;
 use wyrd_core::policy::{
     evict_subtree, pin_subtree, residency_census, unpin_subtree, LocalPresence, ResidencyCensus,
     RetentionPolicy,
@@ -25,7 +26,8 @@ use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{
-    FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor, WyrdNode,
+    FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor,
+    SyncReport, WyrdNode,
 };
 use wyrd_format::FsObjectStore;
 use wyrd_format::{
@@ -1556,12 +1558,27 @@ struct SyncRunReport {
     accepted: usize,
     duplicates: usize,
     deferred: usize,
+    deferred_unseen: usize,
+    deferred_status_blocked: usize,
+    deferred_shed: usize,
     skipped: usize,
     discarded: usize,
     manifests: usize,
     snapshot_bodies: usize,
     objects: usize,
     unfulfilled: usize,
+    /// Fetch-attempt diagnostics, accumulated like the rest: stored
+    /// for the surface that renders them (`14-fetch-failure-
+    /// diagnostics` owns the class renderer — this report must not
+    /// print them, or the two collide here).
+    transport_errors: usize,
+    deadlines: usize,
+    missing: usize,
+    invalid: usize,
+    unavailable_keys: usize,
+    local_failures: usize,
+    /// Outbound sends committed by per-pass publication.
+    sent: usize,
     outcome: RunOutcome,
     pending: usize,
     /// Heads known but not locally closable at the last pass: a
@@ -1576,6 +1593,39 @@ struct SyncRunReport {
     /// so a future path that forgets the snapshot inherits an
     /// unverified run, not a fabricated success.
     mailbox: Option<MailboxHealth>,
+    /// Lifetime write-path totals read off the node after the run:
+    /// snapshot rate, source breakdown, admission-to-commit latency.
+    write: WriteStats,
+}
+
+impl SyncRunReport {
+    /// Fold one pass into the run totals: every counter the report
+    /// carries, every pass including the quiet-confirmation one. The
+    /// two call sites (the main loop and the confirm pass) share
+    /// this so a counter added here cannot be forgotten there.
+    fn accumulate(&mut self, pass: &SyncReport) {
+        self.passes += 1;
+        self.accepted += pass.drained.accepted;
+        self.duplicates += pass.drained.duplicates;
+        self.deferred += pass.drained.deferred;
+        self.deferred_unseen += pass.drained.deferred_unseen;
+        self.deferred_status_blocked += pass.drained.deferred_status_blocked;
+        self.deferred_shed += pass.drained.deferred_shed;
+        self.skipped += pass.drained.skipped;
+        self.discarded += pass.drained.discarded;
+        self.manifests += pass.fetched.manifests;
+        self.snapshot_bodies += pass.fetched.snapshot_bodies;
+        self.objects += pass.fetched.objects;
+        self.unfulfilled += pass.fetched.unfulfilled;
+        self.transport_errors += pass.fetched.transport_errors;
+        self.deadlines += pass.fetched.deadlines;
+        self.missing += pass.fetched.missing;
+        self.invalid += pass.fetched.invalid;
+        self.unavailable_keys += pass.fetched.unavailable_keys;
+        self.local_failures += pass.fetched.local_failures;
+        self.sent += pass.sent;
+        self.unfetchable_heads = pass.pending_heads;
+    }
 }
 
 /// True when no stopping verdict can rest on this snapshot. A
@@ -1656,16 +1706,27 @@ where
         accepted: 0,
         duplicates: 0,
         deferred: 0,
+        deferred_unseen: 0,
+        deferred_status_blocked: 0,
+        deferred_shed: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        transport_errors: 0,
+        deadlines: 0,
+        missing: 0,
+        invalid: 0,
+        unavailable_keys: 0,
+        local_failures: 0,
+        sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,
         unfetchable_heads: 0,
         mailbox: None,
+        write: WriteStats::default(),
     };
     // Consecutive zero-progress passes with pending heads and an
     // empty outbox: the first is grace, the second stops the run.
@@ -1678,17 +1739,7 @@ where
     };
     loop {
         let pass = live.sync_once(mailbox, bulk.as_mut())?;
-        report.passes += 1;
-        report.accepted += pass.drained.accepted;
-        report.duplicates += pass.drained.duplicates;
-        report.deferred += pass.drained.deferred;
-        report.skipped += pass.drained.skipped;
-        report.discarded += pass.drained.discarded;
-        report.manifests += pass.fetched.manifests;
-        report.snapshot_bodies += pass.fetched.snapshot_bodies;
-        report.objects += pass.fetched.objects;
-        report.unfulfilled += pass.fetched.unfulfilled;
-        report.unfetchable_heads = pass.pending_heads;
+        report.accumulate(&pass);
         let progressed = pass.drained.accepted > 0
             || pass.fetched.manifests > 0
             || pass.fetched.snapshot_bodies > 0
@@ -1699,17 +1750,7 @@ where
             // shows up here instead of being missed by the exit.
             park(live);
             let confirm = live.sync_once(mailbox, bulk.as_mut())?;
-            report.passes += 1;
-            report.accepted += confirm.drained.accepted;
-            report.duplicates += confirm.drained.duplicates;
-            report.deferred += confirm.drained.deferred;
-            report.skipped += confirm.drained.skipped;
-            report.discarded += confirm.drained.discarded;
-            report.manifests += confirm.fetched.manifests;
-            report.snapshot_bodies += confirm.fetched.snapshot_bodies;
-            report.objects += confirm.fetched.objects;
-            report.unfulfilled += confirm.fetched.unfulfilled;
-            report.unfetchable_heads = confirm.pending_heads;
+            report.accumulate(&confirm);
             if live.is_quiet(&confirm)? {
                 report.outcome = RunOutcome::Quiet;
                 break;
@@ -1734,6 +1775,10 @@ where
         }
     }
     report.pending = live.pending_obligations()?.len();
+    // Lifetime write-path totals: the run's own passes above carry
+    // sync load; this carries the local durability load the run
+    // observed, so the report distinguishes the two.
+    report.write = live.write_stats();
     Ok(report)
 }
 
@@ -1845,8 +1890,9 @@ fn mailbox_line(health: &MailboxHealth) -> String {
     }
     let closed = health.closed_subscriptions;
     let attempts = recovery_attempts(health);
+    let recoveries = health.saturation_recoveries;
     format!(
-        "mailbox: {} ({} of {} relays connected{}{})\n",
+        "mailbox: {} ({} of {} relays connected{}{}{})\n",
         if mailbox_degraded(health) {
             "degraded"
         } else {
@@ -1868,6 +1914,14 @@ fn mailbox_line(health: &MailboxHealth) -> String {
             format!(
                 ", {attempts} recovery attempt{} during the run",
                 if attempts == 1 { "" } else { "s" }
+            )
+        },
+        if recoveries == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {recoveries} saturation recover{} during the run",
+                if recoveries == 1 { "y" } else { "ies" }
             )
         },
     )
@@ -1897,20 +1951,53 @@ fn degraded_reason(mailbox: Option<MailboxHealth>) -> String {
 /// the rendering without capturing stdout.
 fn sync_now_render(report: &SyncRunReport) -> String {
     let mut out = format!(
-        "sync now: {} passes, intake {} accepted ({} duplicates, {} deferred, {} skipped, {} discarded), fetch {} manifests, {} bodies, {} objects ({} unfulfilled), {} obligations pending, {} unfetchable heads\n",
+        "sync now: {} passes, intake {} accepted ({} duplicates, {} deferred [{} unseen, {} status-blocked, {} shed], {} skipped, {} discarded), fetch {} manifests, {} bodies, {} objects ({} unfulfilled), publish {} sends, {} obligations pending, {} unfetchable heads\n",
         report.passes,
         report.accepted,
         report.duplicates,
         report.deferred,
+        report.deferred_unseen,
+        report.deferred_status_blocked,
+        report.deferred_shed,
         report.skipped,
         report.discarded,
         report.manifests,
         report.snapshot_bodies,
         report.objects,
         report.unfulfilled,
+        report.sent,
         report.pending,
         report.unfetchable_heads,
     );
+    // Local durability load beside sync load: the run's passes above
+    // say what the network did; these lines say what the disk did.
+    // Sources are variant classes, never paths — the `Debug` impls
+    // render paths, and this surface must not inherit that.
+    let write = &report.write;
+    out.push_str(&format!(
+        "write path: {} snapshots ({:.1} per min)\n",
+        write.snapshots,
+        write.snapshots_per_minute(),
+    ));
+    out.push_str(&format!(
+        "write sources: mkdir {} create-file {} commit-file {} append-file {} unlink {} rmdir {} rename {} set-attrs {} fold {}\n",
+        write.mkdir,
+        write.create_file,
+        write.commit_file,
+        write.append_file,
+        write.unlink,
+        write.rmdir,
+        write.rename,
+        write.set_attrs,
+        write.fold,
+    ));
+    out.push_str(&format!(
+        "write latency: admission-to-commit mean {}us max {}us over {} commits ({} failures)\n",
+        write.commit_latency_us_mean(),
+        write.commit_latency_us_max,
+        write.commits,
+        write.failures,
+    ));
     match report.outcome {
         // A degraded or unobserved mailbox downgrades both quiet
         // verdicts: the local state converged, but intake may have

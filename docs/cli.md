@@ -307,6 +307,15 @@ sync now
   budgets and no FUSE session: vaults and NAS replicas converge
   without mounting. Stops on the first quiet pass and prints pass
   and intake/fetch totals with the obligations still pending.
+  The intake clause splits deferred holds by cause (`unseen`,
+  `status-blocked`, `shed`), the fetch clause counts sends, and a
+  `write path` section reports the local durability load beside the
+  sync load: snapshots authored with their per-minute rate, the
+  per-source share (mkdir, create-file, commit-file, append-file,
+  unlink, rmdir, rename, set-attrs, fold — variant classes, never
+  paths), and admission-to-commit latency (mean and max). The
+  mailbox line names saturation recoveries beside closed
+  subscriptions and recovery attempts.
   At most 32 passes: a peer that keeps intake non-idle forever
   (which a mount absorbs by running forever) trips the cap, which
   reports `stopped: pass limit (32) reached; sync may be
@@ -455,6 +464,20 @@ Both are read and hardened by wyrd code, never by clap:
 - `mount` initializes structured diagnostics first: events to stderr
   plus `drive_dir/mount.log`, truncated per mount (one mount, one
   log — no rotation code). Init, export, member, and device log nothing to disk.
+  Every dispatch line carries the opcode, its reply errno, its
+  latency, and the mutation-queue backlog observed at dispatch
+  entry — queue pressure per dispatch, no metrics pipeline.
+- Trust position of these surfaces: `sync status`, `sync now`, and
+  `mount.log` speak for a client holding its own keys, never for a
+  vault. No vault-position diagnostics surface exists: the matrix
+  and enforcement that generalize this statement land separately,
+  sequenced after `wyrd vault`, because a boundary needs a vault
+  process to be meaningful and none exists. What these surfaces
+  print is counts, latencies, class breakdowns,
+  and pressure against the bounds in `resource-limits.md`. What
+  they never print is ContentIds, filesystem paths, file bytes,
+  DeviceIds, membership transition ids, or secrets — the
+  observation half of the privacy boundary.
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

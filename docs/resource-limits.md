@@ -179,6 +179,17 @@ surfaces:
 
 - `SyncReport` / `ExecuteReport`: per-pass admitted wants, committed
   objects, `unfulfilled`, `local_failures`, `transport_errors`.
+- `DrainReport`'s deferred-cause split (`deferred_unseen`,
+  `deferred_status_blocked`, `deferred_shed`): membership waits
+  name a fetchable gap, status-blocked waits drain by themselves,
+  shed waits are budget pacing — one "deferred" total cannot tell
+  them apart, and only the first ever needs an operator.
+- `WriteStats` on the mutation queue: queue depth (queued but
+  unexecuted, per dispatch in `mount.log` beside the dispatch
+  latency), snapshot rate with per-source share, and
+  admission-to-commit latency (mean and max). Local durability load
+  reads here; sync load reads in the run report — the two must
+  never be conflated when a window is measured.
 - `MailboxHealth::saturation_recoveries`: saturation replays issued
   (a rising count means the relay stream is chronically choked).
 - `MailboxHealth::closed_subscriptions`: relay-sent subscription

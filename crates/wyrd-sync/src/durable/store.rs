@@ -106,7 +106,10 @@ pub(crate) const SECRET_FILE_MODE: u32 = 0o600;
 /// the umask, so a strict umask lands a stricter file — never a
 /// looser one.
 pub(crate) const DRIVE_FILE_MODE: u32 = 0o644;
-/// Owner-only mode for drive state directories.
+/// Owner-only mode for drive state directories. Unix-only in
+/// practice (every use sits in a `#[cfg(unix)]` arm); referenced on
+/// all platforms so the contract reads in one place.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const DRIVE_DIR_MODE: u32 = 0o700;
 
 /// Create the atomic-write temp file with an explicit Unix mode, so a
@@ -220,7 +223,9 @@ pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
 /// it a custody directory. Never called when opening an established
 /// drive, so pre-fix drives keep their modes. Non-Unix: no-op (see
 /// `docs/cli.md`).
-pub(crate) fn restrict_dir_owner_only(path: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_dir_owner_only(
+    #[cfg_attr(not(unix), allow(unused_variables))] path: &Path,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
     Ok(())

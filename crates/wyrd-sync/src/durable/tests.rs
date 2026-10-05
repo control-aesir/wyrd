@@ -1692,8 +1692,11 @@ fn a_non_directory_at_commits_fails_open_early() {
     let dir = TestDir::new("custody-commits-file");
     std::fs::write(dir.path.join("commits"), b"not a directory").unwrap();
     assert!(
-        DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).is_err(),
-        "a file at commits/ refuses the open"
+        matches!(
+            DurableStore::open(dir.path.clone(), drive(), PASSPHRASE),
+            Err(DurableError::Io(_))
+        ),
+        "a file at commits/ refuses the open at the naming call"
     );
 }
 

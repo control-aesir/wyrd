@@ -403,7 +403,10 @@ retention promise and reports as `REMOTE_ONLY` policy.
   growth), each labelled, plus an observational total. With no quota
   configured the block ends in an explicitly non-authoritative
   advisory ceiling ("no lower than current retention"); a quota is
-  an operator-selected refusal boundary, never an implicit default.
+  an operator-selected refusal boundary, never an implicit default. The
+  report names the local quota only: the refusal ceiling and the
+  receive-side ceiling required by `docs/retention-constraints.md:147-149`
+  have no value to report until the receive-path admission gate lands.
 
 Conflicted paths refuse every mutating policy command: resolve
 first, or address one version through the existing `path@N`

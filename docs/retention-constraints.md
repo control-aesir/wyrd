@@ -14,24 +14,32 @@ the authorization half of refusal lives in `trust.md` T18; the DG-4
 retention/refusal contract lives in `storage-growth.md`. This document
 is the normative v0.x decision derived from that analysis: what v0.x
 promises, what it refuses to promise, and what it must not silently
-introduce. Where the two disagree on v0.x constraints, this document
-wins; where they disagree on mechanism cost or adversary shape,
-`storage-growth.md` wins.
+introduce. `storage-growth.md` remains the quantitative and adversarial
+analysis; this document governs the resulting v0.x constraints.
 
 ## Retention vs residency
 
 Two quantities, two enforcement points, never merged:
 
 * **Retention (bytes admitted):** what this device holds in its local
-  immutable store. Bounded by a pre-admission gate that covers every
-  path adding bytes to the store: locally authored commits (already
-  bounded on the mounted write path by `retained_bytes_quota`,
-  `storage-growth.md`) and fetched representations (the DG-4 A gate,
-  unimplemented). The store cannot un-hold bytes, so only refusing
-  before admission bounds disk.
-* **Residency (what is promised):** what this device claims, serves,
-  and advertises as servable. Bounded by a residency refusal after
-  durability. Refusing residency changes promises, never stored bytes.
+  immutable store. The v0.x bound is a pre-admission gate: refuse before
+  the bytes become irreversible, since the store cannot un-hold them.
+  What each path enforces today differs. The mounted write path checks
+  `retained_bytes_quota` (`>=` already-retained, before the commit's
+  first write, `LiveNode::enforce_retained_quota`): it bounds the
+  object-store plaintext dimension only, admits one commit of overshoot,
+  and leaves vault ciphertext, snapshot bodies, sealed manifests, and
+  the fact log untallied. The receive path has no gate yet (the DG-4 A
+  gate is decided, unimplemented), so fetched bytes charge the same
+  accountant with no ceiling in scope. The v0.x constraint is that
+  every path adding durable bytes converges on this gate; the
+  implementation status per path is in `storage-growth.md`.
+* **Residency (what is promised):** what this device claims it will
+  retain, serve, mirror, or otherwise make available to peers.
+  Bounded by a residency refusal after durability. Refusing residency
+  changes promises, never stored bytes. Physical storage remains
+  retention; residency is a policy and contract state over
+  already-retained material.
 
 DG-4 (`storage-growth.md`) splits the refusal right along exactly this
 line:
@@ -40,14 +48,20 @@ line:
   would exceed the local retention bound, whether locally authored or
   fetched. For fetched representations refusal occurs before local
   storage: refused bytes are never stored and charged nowhere on this
-  device. Local mutation admission remains governed by the same
-  retention accounting (the mounted-path `retained_bytes_quota`
-  enforcement point, `storage-growth.md`).
+  device. Local mutation admission is governed by the same accounting
+  direction (the mounted-path `retained_bytes_quota` check,
+  `storage-growth.md`); until the receive-path A gate is enforced, a
+  remote author can still spend a peer's local-write headroom, and the
+  quota bounds the object-store plaintext dimension only (vault,
+  body, manifest, and fact-log bytes untallied; one commit of
+  overshoot).
 * **B — residency refusal:** after durable local acceptance, decline to
   make those bytes eligible for serving, mirroring, or new retention
   promises under local policy. The bytes remain stored and charged;
   refusal does not erase or un-charge them. Mirror work, promises, and
-  serving are withheld.
+  serving are withheld. B is not a second storage-admission gate: it
+  never undoes A's admission decision and never reduces the
+  retained-byte charge.
 
 ## Adversary
 
@@ -87,9 +101,9 @@ bound one commit. They do not bound the count of commits.
 4. **Reclamation needs a separate authority.** Quorum, grace period,
    offline-vault acknowledgement, and human confirmation belong to the
    future GC design. Nothing in v0.x mints that authority early.
-5. **Remote admission is charged locally.** Whatever crosses the
-   admission gate counts against the admitting device's retention
-   budget, on the legs the accountant sees.
+5. **Remote admission is charged locally.** Every representation
+  admitted into durable local storage is charged against the admitting
+  device's retention budget, on the legs the accountant sees.
 6. **v0.3 refusal is local and has no wire representation.** No
   v0.3 control-plane refusal signal: a "peer X declined your content"
   message is an enumeration channel. Refusal is operator-visible locally
@@ -120,8 +134,16 @@ on them:
   future path can remove or cease charging stored bytes. GC is not
   introduced by this prerequisite.
 * A vault-seeing counter beside mirror accounting in `wyrd-sync`,
-  since body and manifest bytes land retained but untallied today.
-* Durable refusal state the boot rebuild can consult.
+  recording the retained body and manifest bytes observed through
+  vault replication so those untallied bytes participate in local
+  accounting. It lives beside mirror accounting where ciphertext
+  already lives, not as a widened `wyrd-format` `RetainedBytes`,
+  which the plaintext-world split reserves for plaintext accounting.
+* Durable refusal state the boot rebuild can consult. The state must
+  identify the refused retention/promise unit sufficiently for the
+  rebuild to preserve the same refusal decision — this document does
+  not fix the unit (content, representation, snapshot, or otherwise);
+  the implementation follow-up does.
 * `wyrd cache policy` reports the ceiling that caused a refusal,
   alongside the reachable-content census and effective budgets, with
   local quota and receive-side ceilings shown as distinct numbers.
@@ -148,11 +170,10 @@ on them:
 Product default remains unset (unlimited) for compatibility, so
 existing deployments behave as before. Wyrd-operated dogfood
 deployments explicitly configure ceilings during v0.3-v0.4 and observe
-actual growth: namespace-churn
-accumulation rate, structural-overhead share, replication
-amplification, refusal-boundary usability, and accounting
-comprehensibility. That evidence, not speculation, sizes the eventual
-reclamation policy.
+actual growth: namespace-churn accumulation rate, structural-overhead
+share, replication amplification, refusal-boundary usability, and
+accounting comprehensibility. That evidence, not speculation, sizes the
+eventual reclamation policy.
 
 ## Compatibility impact
 

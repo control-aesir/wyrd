@@ -137,7 +137,8 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     // The baseline goes in through the node's own write API, which is
     // not quota-checked, and charges the shared counter.
     daemon.put_file("base.txt", baseline).unwrap();
-    config.budgets.retained_bytes_quota = Some(retained.get());
+    let quota = retained.get();
+    config.budgets.retained_bytes_quota = Some(quota);
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
     let backend = crate::fuse::FuseBackend::shared_with_wants(
         parts.projection,
@@ -211,7 +212,7 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     // New bytes are admitted too — count plus estimate still fits —
     // and the admitted commit takes the count back over. The next
     // commit is refused, so the effective ceiling is the quota plus
-    // one admitted fold, bounded by less than its estimate.
+    // the admitted fold's tree bytes.
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, b"x")
@@ -219,10 +220,13 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     backend
         .commit_handle(handle)
         .expect("below the ceiling new bytes are admitted");
+    assert!(
+        retained.get() > quota,
+        "the admitted fold carried the count over quota by its tree bytes"
+    );
 
-    // The admitted commit retained new bytes, so the device is back
-    // over its ceiling — and the *next* commit is refused. The
-    // overshoot is one admitted fold, then refusal resumes.
+    // The count is over quota, so the *next* commit is refused. The
+    // overshoot is one admitted fold's tree bytes, then refusal resumes.
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, b"y")
@@ -230,7 +234,7 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     assert_eq!(
         backend.commit_handle(handle),
         Err(fuser::Errno::ENOSPC),
-        "the overshoot is one admitted commit, then refusal resumes"
+        "the overshoot is one admitted fold, then refusal resumes"
     );
 
     stop.store(true, Ordering::Relaxed);

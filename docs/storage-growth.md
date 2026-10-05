@@ -539,17 +539,17 @@ property, and it is the strongest practical argument for open question 1:
 until peers have a refusal right, a local quota is a lever a remote member
 can pull.
 
-**The overshoot is one whole commit.** The fold gate compares bytes
+**The overshoot is bounded by the tree nodes.** The fold gate compares bytes
 already retained plus a conservative estimate of the pending set's new
 retention — full image lengths, while dedup and chunking only reduce
 what the store keeps — before the commit's first write
-(`docs/write-path.md`, rule 6). A fold that fits the estimate is
-admitted and can take the total to `quota + N` for whatever that fold
-actually retains, so the overshoot is bounded by less than the
-estimate, never by an unbounded backlog. On the author path `N` is the
-handle's buffered image plus the tree nodes rebuilt on the changed
-path: 64 MiB of write buffer (`MAX_WRITE_BUFFER_BYTES`) plus
-namespace-sized nodes, which are the separate step-1 row in the
+(`docs/write-path.md`, rule 6). An admitted fold satisfies
+count + estimate < quota, so it lands strictly *below* the quota by the
+estimate's over-count margin; the only way back over is the rebuilt
+tree nodes the estimate deliberately omits (below its precision, by
+design). The estimate covers the handle's buffered image — up to 64 MiB
+of write buffer (`MAX_WRITE_BUFFER_BYTES`) — while the tree nodes
+rebuilt on the changed path are the separate step-1 row in the
 fixed-cost table above and do not scale with the write. On the fetch
 path nothing bounds `N` at all. A commit is refused when count plus
 estimate is already over — which, because the estimate over-counts,
@@ -565,7 +565,10 @@ them must not subtract; quarantine is a decrement only where quarantine
 actually removes bytes from the retained set. A quota set at or below
 current retention therefore leaves the device permanently unable to
 take a local write, and raising the quota is the only remedy short of
-a removal. At the ceiling every local mutation is refused, including
+a removal — and the refusal set is wider than that sentence: the fold
+gate refuses at count plus full image lengths, so a quota within one
+image length *above* retention still refuses content writes. At the
+ceiling every local mutation is refused, including
 ones that would retain nothing new — unlike a real full disk, where a
 zero-byte write still succeeds. A device back under its ceiling by way
 of a removal accepts writes again — with room for the fold estimate,
@@ -623,22 +626,27 @@ handles, not just the write in hand.
     - **In-flight accounting.** Documented, not implemented. The fold
       gate compares bytes already retained plus a conservative
       estimate of the pending set (full image lengths), so the
-      effective ceiling is the quota plus whatever the next admitted
-      fold actually retains — one whole commit of overshoot, bounded by
-      less than the estimate. Up-front reservation in the strict sense
-      would require predicting exact retention before step 1 runs; the
-      estimate is the prediction, deliberately over-counting. The
-      overshoot bound is pinned by
-      `a_removal_below_the_ceiling_readmits_local_writes` (at-ceiling
-      refusal, then admission, overshoot, and refusal again).
-    - **A startup cross-check.** Settled. `check_retained_ceiling`
-      (`wyrd-core`) compares a configured quota against
-      `FsObjectStore::retained_bytes` — one walk at open, never per
-      commit — before the node starts, so a quota below current
+      effective ceiling is the quota plus the admitted fold's rebuilt
+      tree nodes — the only bytes that can carry the count over, since
+      the fold lands strictly below quota by the estimate's margin.
+      Up-front reservation in the strict sense would require predicting
+      exact retention before step 1 runs; the estimate is the
+      prediction, deliberately over-counting. The overshoot bound is
+      pinned by `a_removal_below_the_ceiling_readmits_local_writes`
+      (at-ceiling refusal, then admission, overshoot past quota by
+      tree bytes, and refusal again).
+    - **A startup cross-check.** Settled, with a stated boundary.
+      `check_retained_ceiling` (`wyrd-core`) compares a configured quota
+      against `FsObjectStore::retained_bytes` — one walk at open, never
+      per commit — before the node starts, so a quota below current
       retention is one named diagnosis with both numbers instead of a
       stream of `ENOSPC` at the first write. Both binary composers
       (`mount` and `sync_now`) call it through one shared helper.
-      Pinned by `a_quota_below_current_retention_is_diagnosed_at_start`.
+      The diagnosis covers `retained > quota` only: a quota within one
+      image length above retention passes the check yet refuses content
+      writes at the fold gate. Widening it belongs to a configuration
+      surface. Pinned by
+      `a_quota_below_current_retention_is_diagnosed_at_start`.
     - **Granularity.** The bound is per device. Per drive would bound the
       *author* across its devices; per member-set would bound a group.
       The device scope is the conservative choice and is the only one

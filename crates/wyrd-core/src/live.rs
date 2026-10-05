@@ -316,10 +316,16 @@ impl LiveConfig {
 
 /// A quota configured below what the device already retains. Starting
 /// anyway would refuse every write — the ceiling compares against
-/// bytes already held — so the composer diagnoses this at startup
-/// instead of discovering it as a stream of `ENOSPC` at the first
-/// write. Both numbers are named: the quota (an operator-selected
+/// bytes already held, and the fold gate additionally estimates the
+/// pending set's full image lengths — so the composer diagnoses this
+/// at startup instead of discovering it as a stream of `ENOSPC` at the
+/// first write. Both numbers are named: the quota (an operator-selected
 /// refusal boundary) and the retention it was compared against.
+/// Note the asymmetry this type cannot close: the gate refuses at
+/// count + estimate, so a quota within one image length *above*
+/// retention passes this check yet refuses content writes. Widening
+/// the diagnosis to the estimate is a policy question for a
+/// configuration surface, not for this check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotaBelowRetention {
     /// The configured ceiling, in bytes.
@@ -374,8 +380,11 @@ impl std::error::Error for QuotaCheckError {
 /// retention ceiling: compare the quota against
 /// [`FsObjectStore::retained_bytes`] — the mounted store walk, one
 /// traversal at open, never per commit — before the node starts.
-/// A quota at or above retention is not a diagnosis: the next write
-/// past it may still be refused, and that is the ceiling working.
+/// A quota at or above retention is not a diagnosis, but it is not a
+/// clean bill either: the fold gate refuses at count + full image
+/// lengths, so a quota within one image length above retention still
+/// refuses content writes. That narrower gap is stated, not closed,
+/// here — closing it belongs to a configuration surface.
 /// Composers call this when they configure a quota; an unset quota
 /// needs no check. Offline and relay-free: a local-read diagnostic.
 pub fn check_retained_ceiling(quota: u64, store: &FsObjectStore) -> Result<(), QuotaCheckError> {

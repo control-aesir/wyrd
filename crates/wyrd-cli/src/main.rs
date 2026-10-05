@@ -24,7 +24,9 @@ use wyrd_core::status::{observe, SyncStatus};
 use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
-use wyrd_daemon::{FailureClass, LiveConfig, LiveError, LiveNode, LoopError, Supervisor, WyrdNode};
+use wyrd_daemon::{
+    FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor, WyrdNode,
+};
 use wyrd_format::FsObjectStore;
 use wyrd_format::{
     DeviceEncryptionKey, DeviceId, MembershipTransition, ObjectStore, SnapshotId, TransitionId,
@@ -455,6 +457,8 @@ pub(crate) enum CliError {
     WyrdNode(#[from] wyrd_daemon::NodeError),
     #[error("object store failed: {0}")]
     Store(String),
+    #[error("retention quota misconfigured: {0}")]
+    Quota(#[from] wyrd_core::live::QuotaCheckError),
     #[error("mailbox failed: {0}")]
     Mailbox(#[from] wyrd_sync::transport::mailbox::MailboxError),
     #[error("live sync failed: {0}")]
@@ -781,11 +785,17 @@ fn mount(
     tracing::info!(stage = "start", log = %log_path.display(), "mount diagnostics initialized");
 
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
-    let mut daemon = WyrdNode::new(
-        engine,
-        FsObjectStore::open(drive_dir.clone())
-            .map_err(|error| CliError::Store(error.to_string()))?,
-    )?;
+    let store = FsObjectStore::open(drive_dir.clone())
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    // The startup cross-check runs before composition: a quota below
+    // what the mounted store already holds would refuse every write,
+    // so starting is refused with both numbers instead. Unset quotas
+    // need no check — and the binary ships none, so this fires only
+    // for embedders and future configuration surfaces.
+    if let Some(quota) = LiveConfig::for_local_sync().budgets.retained_bytes_quota {
+        wyrd_core::live::check_retained_ceiling(quota, &store)?;
+    }
+    let mut daemon = WyrdNode::new(engine, store)?;
     daemon.refresh_live_heads()?;
 
     // Fail fast on macOS before binding any endpoint: a missing
@@ -1285,6 +1295,10 @@ fn cache(
                 .map_err(|error| CliError::Store(error.to_string()))?
                 .retained_bytes()
                 .map_err(|error| CliError::Store(error.to_string()))?;
+            // One budgets read for the whole report: the quota line and
+            // the budget lines below must come from the same value, or
+            // the report can disagree with itself.
+            let budgets = LiveConfig::for_local_sync().budgets;
             let accounting = RetentionAccounting {
                 retained_content,
                 fact_log: engine.fact_log_bytes()?,
@@ -1292,9 +1306,9 @@ fn cache(
                     .vault()
                     .resident_bytes()
                     .map_err(|error| CliError::Store(error.to_string()))?,
-                quota: LiveConfig::for_local_sync().budgets.retained_bytes_quota,
+                quota: budgets.retained_bytes_quota,
             };
-            print!("{}", cache_policy_render(&census, &accounting));
+            print!("{}", cache_policy_render(&census, &accounting, &budgets));
             Ok(())
         }
     }
@@ -1372,13 +1386,16 @@ fn cache_quadrant_summary(census: &ResidencyCensus) -> String {
 /// calls effective is what the daemon enforces, not a parallel
 /// copy. Only the retention- and fetch-relevant bounds print here;
 /// the full table lives in `docs/resource-limits.md`.
-fn cache_policy_render(census: &ResidencyCensus, accounting: &RetentionAccounting) -> String {
+fn cache_policy_render(
+    census: &ResidencyCensus,
+    accounting: &RetentionAccounting,
+    budgets: &ResourceBudgets,
+) -> String {
     let pinned_files = census.quadrant(RetentionPolicy::Pinned, LocalPresence::Present)
         + census.quadrant(RetentionPolicy::Pinned, LocalPresence::Absent);
     // Per identity, deduplicated across files that share chunks: a
     // chunk pinned through two paths is one promise, not two.
     let pinned_chunks = census.pinned_chunk_union().len();
-    let budgets = LiveConfig::for_local_sync().budgets;
     let mut out = format!(
         "cache policy (reachable content)\npinned files: {pinned_files}\npinned chunks: {pinned_chunks}\n",
     );

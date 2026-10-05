@@ -164,7 +164,8 @@ fn policy_renderers_name_counts_and_quadrants() {
         sync_vault: 124,
         quota: None,
     };
-    let rendered = cache_policy_render(&census, &accounting);
+    let budgets = LiveConfig::for_local_sync().budgets;
+    let rendered = cache_policy_render(&census, &accounting, &budgets);
     assert!(rendered.contains("pinned files: 1"));
     assert!(rendered.contains("retained_bytes_quota: unlimited"));
     // OD-26-B option B: the report names each dimension and labels

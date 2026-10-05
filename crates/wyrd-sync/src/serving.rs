@@ -453,17 +453,25 @@ impl Vault {
         };
         for entry in entries {
             let entry = entry.map_err(VaultError::Io)?;
-            let path = entry.path();
-            if !path.is_file() {
+            // One stat per entry: `file_type` comes free with the
+            // listing, so only regular files pay for `metadata`. A
+            // file that vanishes between the two was never ours to
+            // count — skip it, like the missing directory above.
+            if !entry.file_type().map_err(VaultError::Io)?.is_file() {
                 continue;
             }
+            let path = entry.path();
             if path
                 .file_name()
                 .is_some_and(|name| name.as_encoded_bytes().starts_with(b".tmp-"))
             {
                 continue;
             }
-            total += entry.metadata().map_err(VaultError::Io)?.len();
+            match entry.metadata() {
+                Ok(metadata) => total += metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(VaultError::Io(error)),
+            }
         }
         Ok(total)
     }

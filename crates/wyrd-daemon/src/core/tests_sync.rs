@@ -177,15 +177,34 @@ fn a_removal_below_the_ceiling_readmits_local_writes() {
     );
 
     // The removal path's bookkeeping moves the count back under, and
-    // the same write is then admitted.
+    // a commit that retains nothing new is admitted: rewriting the
+    // file's current bytes addresses content the store already holds,
+    // so the count does not move. Unlike a real full disk, the ceiling
+    // compares the count, not the write.
     retained.subtract(1);
+    let reader = backend.open_at("base.txt").unwrap();
+    let current = backend.read_handle(reader, 0, 4096).unwrap();
+    backend.release_handle(reader).unwrap();
+    let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
+    backend
+        .write_handle(handle, 0, &current)
+        .expect("write only buffers");
+    backend
+        .commit_handle(handle)
+        .expect("a nothing-new commit below the ceiling is admitted");
+
+    // New bytes are admitted too — the device is still under its
+    // ceiling — and the admitted commit takes it back over: no commit
+    // is ever refused for crossing the ceiling, only once already
+    // over. The next commit is refused, so the effective ceiling is
+    // the quota plus one admitted commit.
     let handle = backend.open_write("base.txt", libc::O_RDWR).unwrap();
     backend
         .write_handle(handle, 0, b"x")
         .expect("write only buffers");
     backend
         .commit_handle(handle)
-        .expect("below the ceiling the commit is admitted");
+        .expect("below the ceiling new bytes are admitted");
 
     // The admitted commit retained new bytes, so the device is back
     // over its ceiling — and the *next* commit is refused. No commit is

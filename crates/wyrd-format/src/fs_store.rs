@@ -463,6 +463,45 @@ mod tests {
         remove_scratch(&dir);
     }
 
+    /// The conservation invariant: a durable removal (bytes actually
+    /// gone from disk, as quarantine or scrub will leave them) followed
+    /// by [`RetainedBytes::subtract`] agrees with what a reopen seeds.
+    /// The store is append-only, so the test performs the removal
+    /// itself, the way a removal path would before calling subtract —
+    /// a subtract without the removal would count bytes the disk still
+    /// holds, and a removal without the subtract would over-count.
+    #[test]
+    fn retained_bytes_subtract_matches_durable_removal_across_reopen() {
+        let dir = scratch_dir();
+        let retained = RetainedBytes::new();
+        let mut store = FsObjectStore::open_with(dir.clone(), Some(Arc::clone(&retained))).unwrap();
+
+        let kept = b"bytes that stay";
+        let removed = b"bytes a removal path takes";
+        store.insert(ObjectKind::Chunk, kept).unwrap();
+        let removed_id = store.insert(ObjectKind::Chunk, removed).unwrap();
+        let seeded = retained.get();
+        assert_eq!(seeded, (kept.len() + removed.len()) as u64);
+
+        // The durable removal first, the bookkeeping second: this order
+        // is the whole contract. Crash between them and the count is
+        // pessimistic (safe); the reverse order would be optimistic.
+        let (_, removed_path) = store.find(&removed_id).expect("inserted object is found");
+        fs::remove_file(&removed_path).unwrap();
+        retained.subtract(removed.len() as u64);
+        assert_eq!(retained.get(), kept.len() as u64);
+
+        // A restart must seed exactly what the session counted: the
+        // ceiling neither resets nor inherits a phantom removal.
+        drop(store);
+        let reopened = RetainedBytes::new();
+        let store = FsObjectStore::open_with(dir.clone(), Some(Arc::clone(&reopened))).unwrap();
+        assert_eq!(reopened.get(), kept.len() as u64);
+        assert_eq!(reopened.get(), retained.get());
+        drop(store);
+        remove_scratch(&dir);
+    }
+
     /// Every `.tmp` file under the store (a crashed writer's debris).
     fn temp_files(dir: &Path) -> Vec<PathBuf> {
         let mut temps = Vec::new();

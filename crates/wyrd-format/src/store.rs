@@ -128,9 +128,9 @@ pub enum FetchStatus {
     Corrupt,
 }
 
-/// Monotonic count of the bytes one device *retains* in its object
-/// store, shared between the store that writes and the node that
-/// enforces a ceiling on it.
+/// Monotonic-plus-removals count of the bytes one device *retains* in
+/// its object store, shared between the store that writes and the node
+/// that enforces a ceiling on it.
 ///
 /// This exists because the store is append-only with no GC, so the only
 /// thing a device can bound about its own growth is how much it already
@@ -139,6 +139,27 @@ pub enum FetchStatus {
 /// tracks *retained* bytes, not bytes written: re-presenting content
 /// the store already holds adds nothing, so a session that re-authors
 /// unchanged subtrees does not climb toward the ceiling on its own.
+///
+/// The count is the *enforcement* quantity: the ceiling is compared
+/// against it. It is deliberately not the device's total resident
+/// bytes (the vault and the fact log are resident but unenforced) —
+/// see the retained / resident / auxiliary terms in
+/// `docs/storage-growth.md`. One counter serves one job.
+///
+/// Removals lower the count, additions raise it, and the two sides are
+/// symmetric only in arithmetic, never in authority:
+/// - [`Self::add`] charges bytes a commit newly retains.
+/// - [`Self::subtract`] corrects the count when bytes *durably leave*
+///   the retained set. The callers are removal paths (quarantine,
+///   scrub) and nothing else: a decrement must correspond to an actual
+///   durable removal, never merely to a logical decision to stop
+///   retaining something. Reclassifying resident bytes (moving them,
+///   unpinning them, ceasing to serve them) without removing them
+///   must not subtract. Audit with `rg -n '\.subtract\(' crates/`.
+/// - The count never drops below what a reopen would seed from the
+///   store: after a restart the count equals the seed, during life it
+///   equals previous additions minus durable removals. A subtract that
+///   would underflow saturates at zero rather than wrapping.
 ///
 /// A reopened drive must not restart the count at zero, or the ceiling
 /// resets on every restart. Stores therefore seed the counter from what
@@ -157,6 +178,19 @@ impl RetainedBytes {
     /// Charge bytes that were not previously held.
     pub fn add(&self, bytes: u64) {
         self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Correct the count for bytes that durably left the retained set.
+    /// Removal paths only (quarantine, scrub) — see the type docs.
+    /// Saturates at zero: a removal reported twice (a crash between
+    /// removal and bookkeeping) must not wrap the count to `u64::MAX`
+    /// and refuse every future write.
+    pub fn subtract(&self, bytes: u64) {
+        self.0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .expect("saturating closure never fails");
     }
 
     /// Bytes currently charged.
@@ -385,6 +419,22 @@ mod tests {
         assert_eq!(id, chunk_id(b"abc"));
         assert!(store.has(&id).unwrap());
         assert_eq!(store.get(&id).unwrap().as_deref(), Some(b"abc".as_slice()));
+    }
+
+    /// A double-subtract of the same removal drives the count to zero,
+    /// not to `u64::MAX`: the decrement is a durable-removal correction,
+    /// and wrapping would turn a repeated correction into a refusal of
+    /// every future write.
+    #[test]
+    fn retained_bytes_subtract_saturates_at_zero() {
+        let retained = RetainedBytes::new();
+        retained.add(100);
+        retained.subtract(40);
+        assert_eq!(retained.get(), 60);
+        // The same removal reported twice (quarantine retried after a
+        // crash between removal and bookkeeping) must not wrap.
+        retained.subtract(100);
+        assert_eq!(retained.get(), 0);
     }
 
     #[test]

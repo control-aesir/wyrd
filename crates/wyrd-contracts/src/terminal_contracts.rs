@@ -174,9 +174,19 @@ fn terminal_generation_completes_every_waiter_of_the_identity() {
             waiters.push(scope.spawn(move || {
                 wait_for_materialization(&wants, chunk, Duration::from_secs(20), || {
                     // The production probe's shape: success or a
-                    // terminal verdict completes, anything else waits.
+                    // terminal verdict completes, anything else waits —
+                    // and a terminal observation notes reopen demand,
+                    // mirroring the FUSE demand path, so the waiter's
+                    // retry finds a new generation.
                     let status = projection.read().unwrap().view().status(&chunk);
-                    matches!(status, FetchStatus::Available | FetchStatus::Unavailable(_))
+                    match status {
+                        FetchStatus::Available => true,
+                        FetchStatus::Unavailable(_) => {
+                            wants.note_reopen_demand(&chunk);
+                            true
+                        }
+                        _ => false,
+                    }
                 })
             }));
         }
@@ -240,13 +250,36 @@ fn a_new_waiter_after_terminal_starts_a_new_generation() {
             "no waiter, no rotation: the verdict stands"
         );
     }
-    // The new waiter reopens the attempt: pending, then re-admitted.
+    // The new waiter reopens the attempt — mirroring exactly what
+    // the FUSE demand path does on a terminal-first read: register
+    // the demand, then note it for the generation sweep.
     parts.wants.register(chunk).unwrap();
     live.sync_once(&mut loaded.rig.relay, Some(&mut dead))
         .unwrap();
+    // Admitted (pending was real) but not reopened: registration
+    // alone carries no generation rotation. The terminal stands and
+    // the settlement sweep retires the admitted mark again — the
+    // pin for note necessity below.
     assert!(
-        parts.wants.is_admitted(&chunk),
-        "the retry re-admits onto the durable policy"
+        !parts.wants.is_admitted(&chunk),
+        "registration without a note retires against the standing verdict"
+    );
+    assert_eq!(
+        view_status(&parts, &chunk),
+        FetchStatus::Unavailable(1),
+        "no note, no reopen"
+    );
+    parts.wants.note_reopen_demand(&chunk);
+    live.sync_once(&mut loaded.rig.relay, Some(&mut dead))
+        .unwrap();
+    assert_eq!(
+        view_status(&parts, &chunk),
+        FetchStatus::Fetching,
+        "the note reopened generation 2: the verdict cleared with nothing admitted"
+    );
+    assert!(
+        !parts.wants.is_admitted(&chunk),
+        "reopen needs no admission: the durable policy already holds the demand"
     );
     // The routes heal: the new generation attempts again and lands
     // verified bytes — quarantined, re-wanted, fetched, Available.

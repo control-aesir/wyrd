@@ -90,7 +90,11 @@ establishes every representation bad.
 
 State-driven retry replaces deadline-driven retry: the EIO is a
 bounded result of one failed generation, not durable poison. A new
-waiter reopens the attempt as a new generation. Flaky networks cause
+waiter reopens the attempt as a new generation. The demand reaches
+the loop as a sticky note, not as a blocked waiter: a waiter never
+blocks on a verdict that already exists, so terminal reads record
+reopen demand and fail fast, and the next pass rotates the
+generation for the retry. Flaky networks cause
 EIOs, but each is bounded and recoverable — no EIO-storm-to-permanent
 path exists by construction.
 

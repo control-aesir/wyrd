@@ -323,7 +323,73 @@ fn terminal_corrupt_open_fails_fast_with_eio() {
 }
 
 fn terminal_verdict_fails_fast_with_eio(verdict: wyrd_format::FetchStatus) {
-    let open_timeout = Duration::from_secs(20);
+    let (backend, registry, polls, _chunk) = terminal_backend(Duration::from_secs(20), 3, verdict);
+    let handle = backend
+        .open_at("f.txt")
+        .expect("the tree is held, so open serves");
+    let started = Instant::now();
+    assert_eq!(
+        backend.read_handle(handle, 0, 8),
+        Err(fuser::Errno::EIO),
+        "a terminal identity fails the read with EIO"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the verdict releases the waiter instead of consuming the deadline"
+    );
+    assert!(
+        polls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the waiter blocked across polls before the verdict landed"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "completion released the demand"
+    );
+}
+
+/// A terminal verdict on first touch notes reopen demand and fails
+/// fast: the reader never blocks (the verdict already exists), but
+/// its demand survives the fast-fail as a sticky note so the next
+/// pass reopens the generation. Without the note the verdict would
+/// be permanent from the reader's side — the self-sealing finding.
+#[test]
+fn terminal_first_touch_notes_reopen_demand() {
+    let (backend, registry, _polls, chunk) = terminal_backend(
+        Duration::from_secs(20),
+        0,
+        wyrd_format::FetchStatus::Unavailable(1),
+    );
+    let handle = backend
+        .open_at("f.txt")
+        .expect("the tree is held, so open serves");
+    assert_eq!(
+        backend.read_handle(handle, 0, 8),
+        Err(fuser::Errno::EIO),
+        "a terminal identity fails the read with EIO"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "no waiter ever blocked: nothing pending to release"
+    );
+    assert_eq!(
+        registry.take_reopen_notes(),
+        vec![chunk],
+        "the fast-fail left reopen demand for the next pass"
+    );
+}
+
+type TerminalFixture = (
+    FuseBackend<SharedStore<MemoryObjectStore>, TerminalMaterialization>,
+    Arc<WantRegistry>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    ContentId,
+);
+
+fn terminal_backend(
+    open_timeout: Duration,
+    flip_after: usize,
+    verdict: wyrd_format::FetchStatus,
+) -> TerminalFixture {
     // The tree is held so the open resolves; only the chunk is
     // terminal — the same staging as `withheld_backend`, with the
     // verdict in place of the withheld bytes.
@@ -335,9 +401,10 @@ fn terminal_verdict_fails_fast_with_eio(verdict: wyrd_format::FetchStatus) {
         .insert_into(&mut store)
         .unwrap();
     let store = Arc::new(RwLock::new(store));
-    // The verdict lands after three polls: the first attempt
-    // registers the want as not-materialized, then the waiter blocks
-    // across the flip instead of the deadline.
+    // The verdict lands after `flip_after` polls: with 3 the first
+    // attempt registers the want as not-materialized, then the
+    // waiter blocks across the flip instead of the deadline; with 0
+    // the first touch is already terminal.
     let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let projection = Arc::new(RwLock::new(Arc::new(Projection::initial(
         DriveView::new(
@@ -345,7 +412,7 @@ fn terminal_verdict_fails_fast_with_eio(verdict: wyrd_format::FetchStatus) {
             TerminalMaterialization {
                 chunk,
                 polls: Arc::clone(&polls),
-                flip_after: 3,
+                flip_after,
                 verdict,
             },
             heads(vec![snapshot_of(root)]),
@@ -361,25 +428,5 @@ fn terminal_verdict_fails_fast_with_eio(verdict: wyrd_format::FetchStatus) {
         open_timeout,
         &budgets,
     );
-    let handle = backend
-        .open_at("f.txt")
-        .expect("the tree is held, so open serves");
-    let started = Instant::now();
-    assert_eq!(
-        backend.read_handle(handle, 0, 8),
-        Err(fuser::Errno::EIO),
-        "a terminal identity fails the read with EIO"
-    );
-    assert!(
-        started.elapsed() < open_timeout / 2,
-        "the verdict releases the waiter instead of consuming the deadline"
-    );
-    assert!(
-        polls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "the waiter blocked across polls before the verdict landed"
-    );
-    assert!(
-        registry.peek_pending().is_empty(),
-        "completion released the demand"
-    );
+    (backend, registry, polls, chunk)
 }

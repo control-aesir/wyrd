@@ -1167,16 +1167,19 @@ where
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
-        // Generation rotation on new demand (OD-11-2): every
-        // still-pending want for a terminal identity opens a new
-        // generation before admission. Pending at pass start means
-        // registered since the last pass — a new waiter — because
-        // the terminal retired the admitted entry last pass; the
-        // reopen fires exactly once per demand, and never for a
-        // generation that has not completed. Admission below then
-        // carries the new generation's demand into the engine.
-        for want in self.wants.peek_pending() {
-            self.engine.reopen_generation(&want);
+        // Generation rotation on observed demand (OD-11-2): every
+        // identity noted since the last pass whose generation
+        // completed terminal reopens as a new one. Notes arrive from
+        // terminal reads — first touch and mid-wait observation —
+        // and outlive the waiter that carried them, which is what
+        // makes a retrying reader re-demandable: a waiter never
+        // blocks on a verdict that already exists, so pending alone
+        // could never carry its demand to the next pass. Reopen is a
+        // no-op for anything not terminal, so the sweep never
+        // disturbs live fetches. Admission below then carries the new
+        // generation's demand into the engine.
+        for id in self.wants.take_reopen_notes() {
+            self.engine.reopen_generation(&id);
         }
         // Admit outstanding backend demand ahead of fetching, atomically
         // from the registry's perspective: only durably committed
@@ -1246,9 +1249,6 @@ where
             elapsed_ms = phase.elapsed().as_millis(),
             "pass phase fetch done"
         );
-        // Terminal evaluation: the run's ledger state settles into
-        // identity-level verdicts for the settlement sweep below.
-        self.engine.evaluate_terminal()?;
         // Apply mounted mutations in admission order (the queue's total
         // order): each is evaluated against the state its predecessor
         // committed, never against what the syscall saw. Submitters block
@@ -1299,8 +1299,13 @@ where
         // fetch whose demand died — the engine's durable `Cached`
         // policy keeps retrying independently of the registry, so a
         // permanently unavailable identity never permanently consumes
-        // capacity.
-        let completed_runtime = self.engine.runtime_state()?;
+        // capacity. The evaluation runs after mutation application so
+        // the sweep settles against post-mutation state, and its
+        // rebuilt runtime feeds the sweep directly instead of paying
+        // a second replay. (The mutation path above therefore reads
+        // last pass's terminal verdicts — pass-granular like every
+        // other projection in the loop, and self-correcting on retry.)
+        let completed_runtime = self.engine.evaluate_terminal()?;
         let terminal = self.engine.terminal_snapshot();
         self.wants.retire_where(|content, waiters| {
             completed_runtime.status(content) == FetchStatus::Available

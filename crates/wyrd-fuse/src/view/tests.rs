@@ -299,7 +299,12 @@ fn unavailable_content_fails_cleanly() {
 
     // Lookup succeeds (trees are local); reads fail by status.
     let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();
-    assert_eq!(view.read(&gone, 0, 8), Err(ViewError::Unavailable));
+    assert_eq!(
+        view.read(&gone, 0, 8),
+        Err(ViewError::Unavailable {
+            content: missing_chunk
+        })
+    );
     let bad = view.open(&view.lookup("bad.txt").unwrap()).unwrap();
     assert_eq!(view.read(&bad, 0, 7), Err(ViewError::Corrupt));
     // No status entry means remote-only: the daemon would fetch.
@@ -319,7 +324,10 @@ fn missing_tree_maps_through_fetch_status() {
         FakeMaterialization::with(vec![(absent, FetchStatus::Unavailable(1))]),
         heads(vec![snapshot(absent)]),
     );
-    assert_eq!(view.lookup("anything"), Err(ViewError::Unavailable));
+    assert_eq!(
+        view.lookup("anything"),
+        Err(ViewError::Unavailable { content: absent })
+    );
 
     let store = MemoryObjectStore::default();
     let view = DriveView::new(
@@ -860,7 +868,10 @@ fn zero_length_reads_serve_nothing() {
     );
     let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();
     assert_eq!(view.read(&gone, 0, 0).unwrap(), b"");
-    assert_eq!(view.read(&gone, 0, 8), Err(ViewError::Unavailable));
+    assert_eq!(
+        view.read(&gone, 0, 8),
+        Err(ViewError::Unavailable { content: missing })
+    );
 }
 
 #[test]

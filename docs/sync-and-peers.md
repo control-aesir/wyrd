@@ -514,7 +514,9 @@ the completed generation number attached. `Corrupt` projects only
 when every exhausted representation cooled on verification
 rejection. Neither survives a restart — both are memory-only attempt
 state (`docs/peer-repair.md` Part 1). A new waiter reopens the
-attempt as a new generation. The translation to POSIX errors
+attempt as a new generation: the demand rides a sticky reopen note
+(the waiter itself never blocks on an existing verdict), drained by
+each pass's generation sweep. The translation to POSIX errors
 happens only at the boundary: opening a non-local path blocks on
 fetch with visible progress, serves the read once verified and
 cached, and fails with `EIO` when no representation serves and the object

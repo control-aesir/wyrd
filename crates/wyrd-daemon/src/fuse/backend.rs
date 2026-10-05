@@ -236,7 +236,7 @@ pub(super) fn errno_of(error: &ViewError) -> fuser::Errno {
         ViewError::Store(StoreFailure::PermissionDenied, _) => fuser::Errno::EACCES,
         ViewError::Conflict
         | ViewError::NotMaterialized { .. }
-        | ViewError::Unavailable
+        | ViewError::Unavailable { .. }
         | ViewError::Corrupt
         | ViewError::Store(_, _) => fuser::Errno::EIO,
     }
@@ -1180,7 +1180,9 @@ where
     /// retry once. A terminally unavailable identity completes the
     /// waiter immediately: `Unavailable(generation)` is a verdict, not
     /// a maybe, so the bounded `EIO` lands now instead of at the
-    /// deadline. Anything else (or no demand wiring) keeps the
+    /// deadline — while the reopen note it leaves makes the identity
+    /// re-demandable on the next pass instead of permanently
+    /// terminal. Anything else (or no demand wiring) keeps the
     /// instant-errno behavior. This is the only place FUSE expresses
     /// demand — the engine stays the single synchronization authority.
     fn with_demand<T>(
@@ -1193,15 +1195,22 @@ where
             (&self.wants, &first)
         {
             let wants = Arc::clone(registry);
-            // Success completes; either terminal verdict completes
-            // with itself (the final retry below surfaces it as EIO).
-            // Any other failure keeps waiting: the fetch may still
-            // land before the deadline.
-            let retry = || {
-                matches!(
-                    attempt(),
-                    Ok(_) | Err((ViewError::Unavailable, _)) | Err((ViewError::Corrupt, _))
-                )
+            // Success completes; terminal verdicts complete with
+            // themselves (the final retry below surfaces them as
+            // EIO) and note reopen demand, so a reader blocked
+            // across the verdict still reopens the generation for
+            // its retry. Corrupt notes nothing: its repair is
+            // quarantine's job, not rewant's. Any other failure
+            // keeps waiting: the fetch may still land before the
+            // deadline.
+            let retry = || match attempt() {
+                Ok(_) => true,
+                Err((ViewError::Unavailable { content }, _)) => {
+                    wants.note_reopen_demand(&content);
+                    true
+                }
+                Err((ViewError::Corrupt, _)) => true,
+                Err(_) => false,
             };
             match wait_for_materialization(&wants, *content, self.open_timeout, retry) {
                 Ok(()) => {
@@ -1214,6 +1223,17 @@ where
                     return Err(fuser::Errno::EIO);
                 }
             }
+        }
+        if let (Some(registry), Err((ViewError::Unavailable { content }, _))) =
+            (&self.wants, &first)
+        {
+            // Terminal verdict on first touch: note reopen demand for
+            // the next pass's generation sweep and fail fast. No
+            // waiter blocks on a verdict that already exists, and no
+            // register/release cycle is owed — the note alone is the
+            // demand. Returns the boundary EIO, never a wait.
+            registry.note_reopen_demand(content);
+            return map(first);
         }
         map(first)
     }

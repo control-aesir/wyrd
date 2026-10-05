@@ -70,6 +70,15 @@ struct RegistryState {
     /// leaves, the demand dies — nothing fetches for a nobody. An
     /// admitted fetch outlives its waiters.
     waiting: BTreeMap<ContentId, usize>,
+    /// Sticky reopen demand since the last loop sweep: identities a
+    /// reader observed terminal, noted for generation rotation.
+    /// Unlike `pending`, a note survives its waiter — the waiter
+    /// completes immediately on a verdict that already exists, but
+    /// the demand must outlive it or no pass would ever reopen the
+    /// generation. Drained unconditionally once per pass, so the set
+    /// never grows past one pass interval's arrivals; capped at the
+    /// admission bound like everything else the registry carries.
+    reopen_notes: BTreeSet<ContentId>,
 }
 
 impl RegistryState {
@@ -235,6 +244,39 @@ impl WantRegistry {
             .lock()
             .map(|state| state.waiting.get(content).copied().unwrap_or(0))
             .unwrap_or(0)
+    }
+
+    /// Note reopen demand for a terminal identity: the next loop
+    /// sweep rotates its completed generation. Called when a reader
+    /// observes a terminal verdict — on first touch and on mid-wait
+    /// completion — so the demand outlives the waiter that carried
+    /// it (a waiter never blocks on a verdict that already exists).
+    /// Idempotent and waiter-free: repeated observations collapse to
+    /// one note, and nothing here touches admission or waiter
+    /// counts. Capped at the admission bound; overflow drops the
+    /// note (the retrying reader re-notes).
+    pub fn note_reopen_demand(&self, content: &ContentId) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.reopen_notes.len() >= self.limit {
+            return;
+        }
+        state.reopen_notes.insert(*content);
+    }
+
+    /// Drain the reopen notes for the loop's generation sweep.
+    /// Unconditional: every pass consumes whatever arrived since the
+    /// last one, so the set stays bounded by one pass interval. A
+    /// poisoned lock yields nothing — the noting readers retry and
+    /// re-note.
+    pub fn take_reopen_notes(&self) -> Vec<ContentId> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut state.reopen_notes)
+            .into_iter()
+            .collect()
     }
 }
 

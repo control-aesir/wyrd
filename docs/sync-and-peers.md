@@ -121,14 +121,29 @@ and an obligation no relay accepted stayed pending indefinitely.
 The sender may retire an obligation for recipient R **only on durable
 evidence that R's durable state subsumes the message**. "Subsumes" is
 per obligation class, and always about R's *state*, never about a
-message R claims to have seen:
+message R claims to have seen. Recipient durable state is evidence,
+not acknowledgement of the specific envelope: the sender never asks
+whether message M was "received"; it asks whether R's current
+durable facts imply that replaying M cannot add anything. That is
+what makes the scheme robust against duplicates and divergent
+reconnects — and what makes the pull below the natural acquisition
+mechanism rather than an add-on:
+
+> No sender obligation is retired because a message was delivered,
+> because a relay says it was delivered, or because a narrow
+> heuristic says it probably arrived. It is retired only because
+> durable recipient state demonstrates that the obligation is
+> already subsumed.
 
 - **Announcement (snapshot S → R):** R's durable state references S —
   R authored a snapshot with S in its ancestry, or R's reconciliation
   statement lists S as durably held.
-- **Transition (T → R):** R's log contains T, or contains a successor
-  whose ancestry includes T. Ancestry inclusion counts because the
-  recipient validates the chain through T to hold the successor.
+- **Transition (T → R):** R's log contains T. A successor whose
+  ancestry includes T is an admissible conservative implementation
+  predicate — the recipient validates the chain through T to hold
+  the successor — but it is a predicate, not the definition: class
+  predicates below must be proven equivalent to, or conservative
+  with respect to, the normative set comparison.
 - **Capability (epoch-E wrap → R):** R's committed capability set
   contains the wrap's install, as reported in R's reconciliation
   statement. Knowledge alone never suffices — a known epoch without
@@ -144,6 +159,23 @@ Redefining `*Delivered` instead is rejected: it would silently change
 what every existing peer reads. The new-kind form costs a fact-tag
 allocation per class (checked against the full tag set, as `0x16`
 was) and an `upgrade-contract.md` entry, and is honest.
+
+The normative safety rule: an obligation is retired only if the
+recipient's reconciliation view demonstrates that the obligation's
+effect is already represented in the recipient's durable state, and
+the full set-difference comparison is the reference implementation
+of that statement. Optimizations may reduce what is retransmitted,
+but may not enlarge what is considered reconciled: full-comparison
+says reconciled while the optimization says not merely retransmits
+(safe); the reverse is irreversible loss.
+
+The sender's pending/reconciled state is durable independently of
+the recipient's advertised view. Monotonicity is `pending →
+reconciliation observed → reconciled committed → no longer
+pending`, with no transition that can make an unproven obligation
+disappear: a crash between observing reconciliation and committing
+the reconciled fact resurrects the obligation (harmless
+retransmission); the reverse ordering would lose it.
 
 ### Explicitly not evidence
 
@@ -161,7 +193,14 @@ progress.
 Bounded: relays may expire anything at any time, and nothing in this
 contract depends on otherwise. This assumption cannot be invalidated
 by a relay operator, and it survives the retention-refusal decision
-(DG-4) landing with more permissiveness than assumed. Stated cost:
+(DG-4) landing with more permissiveness than assumed — the protocol
+contract takes no moving dependency on an unresolved implementation
+decision. Bounded retention does not mean bounded obligation
+lifetime: the obligation may remain pending indefinitely; what is
+bounded is the lifetime of any particular relay copy. Relay
+retention is a transport cache; durable reconciliation is the
+correctness evidence — the relay is never a durable participant in
+the protocol. Stated cost:
 the send pipeline's "the relay retains every unacked envelope"
 (`crash-consistency.md`) is an expectation, not a guarantee — see
 that doc's qualified sentence.
@@ -179,6 +218,25 @@ solved here. The pull covers what push cannot: relay retention is
 irrelevant to a recipient that asks. This same primitive serves the
 late-joiner case (superseded-epoch snapshot ids): "the recipient
 does not know what it missed" gets one design, not two.
+
+The reconciliation view is a projection of durable facts, not
+itself another authoritative store:
+
+```text
+recipient durable state
+        ↓
+reconciliation view
+        ↓
+set difference against sender obligation
+        ↓
+retransmit / retire
+```
+
+The wire format of the view may be optimized later without changing
+retirement semantics, provided the projection stays conservative —
+it may omit what the full comparison would use (causing
+retransmission), never assert subsumption the durable facts do not
+support.
 
 ### Acceptance scenarios (normative)
 

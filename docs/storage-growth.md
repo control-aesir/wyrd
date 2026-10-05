@@ -240,7 +240,7 @@ physical.
 
 | | Quantity | Enforcement point | Bounds | Status |
 |---|---|---|---|---|
-| **A — storage admission** | bytes admitted to the local immutable store | at fetched-representation admission on the fetch path: the `Vault::import` calls in the `runtime/fetch/mod.rs` root, child, and object legs, where an import failure is already a local refusal (`FetchOutcome::Local`), never a committed advertisement. Refused bytes are never stored by this device at all | disk | decided, unimplemented — the receive path is unbounded today |
+| **A — storage admission** | bytes admitted to the local immutable store | at fetched-representation admission: the `Vault::import` calls in the `runtime/fetch/mod.rs` root, child, and object legs plus the snapshot-body import in the plan layer (`runtime/plan/mod.rs`), where an import failure is already a local refusal (`FetchOutcome::Local`), never a committed advertisement. Refused bytes are never stored by this device at all | disk | decided, unimplemented — the receive path is unbounded today |
 | **B — provider residency** | objects/bytes held as *servable*, i.e. advertised as residency | two faces (see below): on the authoring device, after local durability before announcement (`write-path.md` steps 5–6: servable at 5, obligation discharged at 6); on a peer holding received content, at its own serving-mirror admission and serving maps. The bytes are already in this device's store — the refusal is about residency, not storage: durably accepted bytes the peer declines to make resident/servable under current local policy | what this peer promises | decided, unimplemented — today's mirror bounds are transient backpressure, not policy |
 
 **B has two faces because only authors announce.** On the authoring
@@ -260,7 +260,10 @@ announcement barrier the peer does not have.
 The gate covers the full structural closure the peer pulls — snapshot
 body, root and child manifests, tree nodes — not only file-content
 chunks: that closure is the amplification, and a chunk-only gate would
-pass every acceptance criterion below while missing the adversary.
+pass every acceptance criterion below while missing the adversary. On
+the object leg the gate precedes both writes — the ciphertext import
+and the plaintext object-store insert — since only the insert charges
+the accountant, so refused bytes reach neither.
 
 The rejected options stay rejected for v0.3:
 
@@ -561,10 +564,11 @@ handles, not just the write in hand.
    - **Refusing the unrefused paths.** Fetched objects cross the quota
      with no ceiling in scope, which is what turns a local quota into the
      interference channel above. Whether a peer may decline to retain is
-     open question 1 and a `trust.md` decision; until it is made, the
-     honest options are a fetch-side refusal (new protocol surface) or
-     documenting the interference and leaving the quota to local-write
-     protection only.
+     decided in the contract above (open question 1, `trust.md` T18):
+     the fetch-side refusal is local policy at the admission points
+     named there, not a new protocol surface — there is no wire refusal
+     signal in v0.3 — and until it is enforced the interference stands
+     as documented, leaving the quota to local-write protection only.
    - **In-flight accounting.** The check compares bytes already
      retained, so the effective ceiling is the quota plus whatever the
      next admitted commit retains. A stricter reading would reserve the

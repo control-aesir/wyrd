@@ -341,6 +341,78 @@ fn stale_forcer_aborts_fold_leaves_pending_retryable() {
     teardown(drive);
 }
 
+/// An append forcer wins its path tie even though it overwrites
+/// nothing: privilege attaches to contention, not to overwriting. The
+/// earlier-buffered full-content member goes terminal, and the one
+/// snapshot carries the appended sequence alone.
+#[test]
+fn append_forcer_wins_its_path_tie() {
+    let drive = setup();
+    create_empty(&drive, "a.txt");
+    let h1 = overwrite(&drive, "a.txt", b"FULL");
+    let h2 = drive
+        .backend
+        .open_write("a.txt", libc::O_WRONLY | libc::O_APPEND)
+        .unwrap();
+    drive.backend.write_handle(h2, 0, b"tail").unwrap();
+
+    let before = generation(&drive);
+    drive.backend.commit_handle(h2).unwrap();
+    assert_eq!(
+        generation(&drive) - before,
+        1,
+        "the tie still folds into one snapshot"
+    );
+    assert_eq!(
+        read_all(&drive, "a.txt"),
+        b"tail",
+        "the append forcer wins; the loser's full image is discarded, never merged"
+    );
+    assert_eq!(
+        drive.backend.commit_handle(h1),
+        Err(fuser::Errno::EIO),
+        "the losing member's handle is terminal at the fold"
+    );
+
+    drive.backend.release_handle(h1).unwrap();
+    drive.backend.release_handle(h2).unwrap();
+    teardown(drive);
+}
+
+/// An exec-only `chmod` carries forcing privilege: it folds the
+/// pending set plus itself into one snapshot, and a same-path dirty
+/// writer loses the tie and goes terminal — the same outcome as
+/// before folding, where the writer would have gone stale at its own
+/// later commit.
+#[test]
+fn chmod_forcer_wins_its_path_tie() {
+    let drive = setup();
+    let (fh, ino, _) = drive.backend.create_at(1, "a.txt", libc::O_RDWR).unwrap();
+    drive.backend.release_handle(fh).unwrap();
+    let ha = overwrite(&drive, "a.txt", b"DATA");
+
+    let before = generation(&drive);
+    drive.backend.set_exec_at(ino, true).unwrap();
+    assert_eq!(
+        generation(&drive) - before,
+        1,
+        "the chmod folds pending plus itself into one snapshot"
+    );
+    assert_eq!(
+        read_all(&drive, "a.txt"),
+        b"",
+        "the losing writer's bytes never land"
+    );
+    assert_eq!(
+        drive.backend.commit_handle(ha),
+        Err(fuser::Errno::EIO),
+        "the losing writer's handle is terminal at the fold"
+    );
+
+    drive.backend.release_handle(ha).unwrap();
+    teardown(drive);
+}
+
 /// A tie on a path the forcer does not touch breaks earliest-buffered:
 /// two non-forcing members on one path fold to the first one's bytes,
 /// and the later member's handle goes terminal.

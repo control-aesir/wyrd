@@ -1807,9 +1807,10 @@ where
 
     /// The paths one member contends on: a same-path tie is decided
     /// per path. A rename contends only on its destination (which it
-    /// replaces); its source end composes with buffered writes in FIFO
-    /// order — the write lands, then the rename moves it — instead of
-    /// terminally discarding them.
+    /// replaces). Its source end is not a contention point here: the
+    /// daemon excludes source-end writers from a rename fold before
+    /// submission, so they stay pending and resolve at their own
+    /// boundary instead of joining the rebinding.
     fn member_paths(kind: &MutationKind) -> Vec<&str> {
         match kind {
             MutationKind::Mkdir { path }
@@ -1820,31 +1821,6 @@ where
             | MutationKind::Rmdir { path }
             | MutationKind::SetAttrs { path, .. } => vec![path.as_str()],
             MutationKind::Rename { to, .. } => vec![to.as_str()],
-            MutationKind::Fold { .. } => vec![],
-        }
-    }
-
-    /// The paths one member overwrites: a tie needs at least two
-    /// overwriters on the same path. Pure appends never overwrite —
-    /// sequential appends concatenate — and neither does an exec-only
-    /// `setattr` or a rename's source end (it moves content, it does
-    /// not replace it).
-    fn overwrite_paths(kind: &MutationKind) -> Vec<&str> {
-        match kind {
-            MutationKind::Mkdir { path }
-            | MutationKind::CreateFile { path, .. }
-            | MutationKind::CommitFile { path, .. }
-            | MutationKind::Unlink { path }
-            | MutationKind::Rmdir { path } => vec![path.as_str()],
-            MutationKind::SetAttrs { path, size, .. } => {
-                if size.is_some() {
-                    vec![path.as_str()]
-                } else {
-                    vec![]
-                }
-            }
-            MutationKind::Rename { to, .. } => vec![to.as_str()],
-            MutationKind::AppendFile { .. } => vec![],
             MutationKind::Fold { .. } => vec![],
         }
     }
@@ -2040,19 +2016,19 @@ where
                 return Ok(Self::abort_fold(members, forcer, cause));
             }
         }
-        // A surviving forcer wins every path it overwrites; other
-        // paths keep every contender, and a member applies only if it
-        // wins every path it touches: a rename cannot half-apply, and
-        // an append beside a path winner is discarded rather than
-        // silently overwritten. Same-path appends never reach a tie
-        // here — the daemon merges them into their earliest run — so
-        // multiple append contenders on one path are a malformed
-        // submission and fail closed on all but the earliest.
+        // A surviving forcer wins every path it touches; any other
+        // contender there goes terminal. Paths without the forcer go
+        // to the earliest-buffered contender (contenders arrive in
+        // FIFO order). A member applies only if it wins every path it
+        // touches: a rename cannot half-apply, and a member beside a
+        // path winner is discarded rather than silently overwritten.
+        // Same-path appends never reach a tie through the daemon —
+        // it merges them into their earliest run — so multiple append
+        // contenders on one path are a malformed submission and fail
+        // closed on all but the earliest.
         let mut applies = vec![false; members.len()];
         {
             let mut contenders: std::collections::BTreeMap<&str, Vec<usize>> =
-                std::collections::BTreeMap::new();
-            let mut overwriters: std::collections::BTreeMap<&str, Vec<usize>> =
                 std::collections::BTreeMap::new();
             for (index, member) in members.iter().enumerate() {
                 if !candidate[index] {
@@ -2061,30 +2037,13 @@ where
                 for path in Self::member_paths(&member.kind) {
                     contenders.entry(path).or_default().push(index);
                 }
-                for path in Self::overwrite_paths(&member.kind) {
-                    overwriters.entry(path).or_default().push(index);
-                }
             }
             let mut path_winners: std::collections::BTreeMap<&str, usize> =
                 std::collections::BTreeMap::new();
             for (path, contenders) in &contenders {
-                let overwriters = overwriters.get(path).map(Vec::as_slice).unwrap_or(&[]);
-                if overwriters.is_empty() {
-                    // No overwrite conflict on this path: a lone
-                    // contender applies, while multiple pure appends
-                    // are a submitter bug (the daemon merges them) and
-                    // fail closed on all but the earliest rather than
-                    // silently dropping all but the last.
-                    if contenders.len() == 1 {
-                        path_winners.insert(path, contenders[0]);
-                    } else if let Some(earliest) = contenders.first() {
-                        path_winners.insert(path, *earliest);
-                    }
-                    continue;
-                }
                 let winner = match forcer {
-                    Some(index) if overwriters.contains(&index) => index,
-                    _ => overwriters[0],
+                    Some(index) if contenders.contains(&index) => index,
+                    _ => contenders[0],
                 };
                 path_winners.insert(path, winner);
             }
@@ -2189,7 +2148,11 @@ where
             // members carry the real dispositions.
             (None, _) => FoldForcerOutcome::Applied(Box::new(MutationOutcome::Done)),
             (Some(_), Some(outcome)) => FoldForcerOutcome::Applied(Box::new(outcome)),
-            // The forcer always applies or aborts above; unreachable.
+            // The forcer wins every path it touches, so it always
+            // applies (or aborts the fold above when its own
+            // application fails): reaching here without its outcome
+            // means an internal invariant broke, and failing closed
+            // is the only safe answer after a possible authoring.
             (Some(_), None) => return Err(MutationError::Engine),
         };
         Ok(MutationOutcome::Fold {

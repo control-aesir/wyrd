@@ -115,11 +115,13 @@ loss?** The resend half is solved — sealed bytes persist before the
 first send and every retry is byte-identical. The forget half is this
 section: until it, `*Delivered` meant relay-accepted and nothing more,
 and an obligation no relay accepted stayed pending indefinitely.
+This section is the DG-3 gate artefact; it records the decision of
+open discussion OD-2.
 
 ### The forget condition
 
 The sender may retire an obligation for recipient R **only on durable
-evidence that R's durable state subsumes the message**. "Subsumes" is
+evidence that R's durable state subsumes the obligation's effect**. "Subsumes" is
 per obligation class, and always about R's *state*, never about a
 message R claims to have seen. Recipient durable state is evidence,
 not acknowledgement of the specific envelope: the sender never asks

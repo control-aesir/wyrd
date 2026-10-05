@@ -308,6 +308,10 @@ jobs:
 
   reporter:
     if: failure() && github.event_name == 'pull_request'
+    # Gated on both jobs completing: since rust and nix run parallel,
+    # a fast rust failure still waits out the slow nix job before the
+    # report lands. Accepted — parallel wall time is worth slower
+    # failure feedback.
     needs: [rust, nix]
     runs-on: ubuntu-latest
     # Same pathology cover as the draft job: healthy runs finish fast.
@@ -339,8 +343,8 @@ jobs:
 
       # Collect the per-job logs uploaded with `if: always()`. /tmp is
       # per-job, so failed-gate logs only reach this job via artifacts.
-      # Pattern matches rust-log + nix-log; a missing sibling (e.g. nix
-      # skipped because rust failed) still matches the other.
+      # Pattern matches rust-log + nix-log; a missing sibling (e.g. a
+      # cancelled job that never uploaded) still matches the other.
       - name: Download job logs
         uses: actions/download-artifact@v4
         with:

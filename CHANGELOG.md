@@ -39,8 +39,9 @@ version say exactly what changed.
   vaults may decline to retain what an authorized member authored, at two
   enforcement points (pre-admission gate on the receive path; residency
   refusal after durability, before announcement). Eviction and
-  unbounded-growth-as-contract are refused for v0.3. Decision only; neither
-  ceiling is enforced yet and no behavior changes. Enforcement, the
+  unbounded-growth-as-contract are refused for v0.3. Decision only;
+  neither ceiling is enforced yet, no behavior change, and no format
+  impact. Enforcement, the
   `RetainedBytes` decrement prerequisite, and the acceptance tests are the
   implementation follow-up gated on this artefact.
 

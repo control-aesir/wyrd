@@ -424,6 +424,11 @@ Both are read and hardened by wyrd code, never by clap:
   other (Unix). Credential handling is Unix-only.
 - Secrets never reach logs, error text, or diagnostics — stages, ids,
   errnos, and latencies only.
+- Drive custody files are created owner-only on Unix regardless of
+  umask: `store-key.wrap`, `keystore`, `pairing.secret`, and `LOCK` at
+  `0o600`, the drive directory at `0o700`, `DRIVE` at no wider than
+  `0o644`. Pre-existing files and established drives keep their modes.
+  Non-Unix platforms get no mode guarantee.
 
 ## Diagnostics and exit codes
 

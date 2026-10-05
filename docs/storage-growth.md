@@ -219,11 +219,10 @@ semantics, and who bears the cost.
 
 Open question 1 below is decided here; the question list keeps it as
 the pointer. A serving member or a vault **may decline to admit what
-an authorized member authored (A), or decline to serve, advertise, or
-hold as residency what it already holds (B)**. The refusal right is an
-authorization
-change (`trust.md` T18), not a resource limit: membership implies the
-right to read, never the duty to retain.
+an authorized member authored (A), or decline to serve, advertise,
+or hold as residency what it already holds (B)**. The refusal right
+is an authorization change (`trust.md` T18), not a resource limit:
+membership implies the right to read, never the duty to retain.
 
 The decision splits the old option 1 by enforcement point and takes
 both halves. Every option as first stated was framed at the serving
@@ -272,7 +271,9 @@ chunks: that closure is the amplification, and a chunk-only gate would
 pass every acceptance criterion below while missing the adversary. On
 the object leg the gate precedes both writes — the ciphertext import
 and the plaintext object-store insert — since only the insert charges
-the accountant, so refused bytes reach neither.
+the accountant, so refused bytes reach neither. Gate position decides
+what is refused; what the ceiling can consult is decided by the
+counter gap above.
 
 The rejected options stay rejected for v0.3:
 
@@ -386,12 +387,13 @@ eventually refuse everything it is offered. A decrement, or an
 authoritative recomputation, lands with A's enforcement, not after it.
 B carries two prerequisites of its own, alongside A's decrement: a
 counter that sees vault bytes — beside the mirror accounting in
-`wyrd-sync`, or as a widened `wyrd-format` `RetainedBytes`; the
-follow-up decides — since body and manifests are retained but
-untallied today, so the peer-side ceiling has nothing to consult on
-those legs), and durable refusal state the boot rebuild can consult
-(the rebuild cannot distinguish "refused for residency" from "never
-seen" without it).
+`wyrd-sync`, where ciphertext already lives, rather than as a widened
+`wyrd-format` `RetainedBytes`, which the plaintext-world split reserves
+for plaintext accounting; the follow-up confirms the home — since body
+and manifests are retained but untallied today, so the peer-side ceiling
+has nothing to consult on those legs; and durable refusal state the
+boot rebuild can consult (the rebuild cannot distinguish "refused for
+residency" from "never seen" without it).
 
 **Acceptance criteria** (for the implementation follow-up, which this
 contract unblocks rather than contains):
@@ -564,11 +566,11 @@ handles, not just the write in hand.
    pre-admission gate on the receive path; B: provider-residency
    refusal after durability, before announcement); eviction under
    pressure and unbounded-growth-as-contract are refused for v0.3.
-   What remains is implementation: neither ceiling is enforced yet,
-   and enforcement waits on the accounting prerequisites recorded in
-   the contract (vault-seeing counter, durable refusal state,
-   `RetainedBytes` decrement-or-recomputation). The question entry stays
-   as the pointer; the contract is the answer.
+   What remains is implementation: neither ceiling is enforced yet.
+   A waits on the `RetainedBytes` decrement-or-recomputation; B on a
+   receiving peer waits on the counting gap and the durable refusal
+   state above. The question entry stays as the pointer; the contract
+   is the answer.
 2. **Quota accounting still open.** The quota's refusal point shipped as
    decided above: before the commit's first write to disk, so a refused
    commit retains nothing. What the implementation leaves open, and
@@ -608,5 +610,6 @@ refusal right` (open question 1, now decided by the contract above;
 its enforcement is the implementation follow-up) and `feat(storage):
 per-device retained-bytes quota at the commit durability boundary`
 (open question 2). The quota issue's title predates the refusal point
-being settled above and names the durability boundary; the title is not the decision —
+being settled above and names the durability boundary; the title is not
+the decision —
 read that issue together with this section before implementing it.

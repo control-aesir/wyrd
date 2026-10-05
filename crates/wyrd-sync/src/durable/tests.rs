@@ -1677,10 +1677,24 @@ fn a_stale_temp_is_reclaimed_at_the_hardened_mode() {
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    drop(_guard);
     atomic_write_mode(&dir.path, "store-key.wrap", b"fresh", SECRET_FILE_MODE).unwrap();
+    drop(_guard);
     assert_eq!(mode_of(&dir.path.join("store-key.wrap")) & 0o077, 0);
     assert!(!dir.path.join("store-key.wrap.tmp").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_directory_at_commits_fails_open_early() {
+    // The `AlreadyExists` arm of directory creation must not report
+    // success for a regular file: the open refuses at the call that
+    // names the path, not at the first commit through it.
+    let dir = TestDir::new("custody-commits-file");
+    std::fs::write(dir.path.join("commits"), b"not a directory").unwrap();
+    assert!(
+        DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).is_err(),
+        "a file at commits/ refuses the open"
+    );
 }
 
 #[cfg(unix)]

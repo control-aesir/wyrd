@@ -42,10 +42,10 @@ version say exactly what changed.
   `pairing.secret`, and `LOCK` at `0o600`, the drive directory (and
   `commits/`) at `0o700`, `DRIVE` at no wider than `0o644`. Modes are
   never loosened — a replaced custody file takes the hardened mode —
-  and the single in-place chmod is restricting a directory at the
-  moment fresh drive state is established in it; pre-existing files,
-  directories, and established drives are otherwise untouched (inspect
-  a pre-fix drive with `stat`, repair by hand).
+  and only directories this call creates are restricted, except that
+  establishing fresh drive state restricts the directory it is given;
+  pre-existing files, directories, and established drives are otherwise
+  untouched (inspect a pre-fix drive with `stat`, repair by hand).
 
 ## [0.2.0-alpha]
 

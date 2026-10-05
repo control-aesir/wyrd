@@ -428,11 +428,10 @@ Both are read and hardened by wyrd code, never by clap:
   umask: `store-key.wrap`, `keystore`, `pairing.secret`, and `LOCK` at
   `0o600`, the drive directory at `0o700`, `DRIVE` at no wider than
   `0o644`. Modes are never loosened: a replaced custody file takes the
-  hardened mode through the rename, and the single in-place chmod is
-  restricting a directory at the moment fresh drive state is
-  established in it. A pre-existing directory keeps its mode — only
-  directories this call creates are restricted. Pre-existing files and
-  established drives are otherwise untouched — inspect a pre-fix drive
+  hardened mode through the rename. Only directories this call creates
+  are restricted, except that establishing fresh drive state restricts
+  the directory it is given. Pre-existing files and established drives
+  are otherwise untouched — inspect a pre-fix drive
   with `stat` (e.g. `stat -c '%a %n'` on Linux, `stat -f '%Lp %N'` on
   macOS) and repair by hand. Non-Unix platforms get no mode guarantee.
 

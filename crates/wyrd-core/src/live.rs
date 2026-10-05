@@ -1303,8 +1303,10 @@ where
         // the sweep settles against post-mutation state, and its
         // rebuilt runtime feeds the sweep directly instead of paying
         // a second replay. (The mutation path above therefore reads
-        // last pass's terminal verdicts — pass-granular like every
-        // other projection in the loop, and self-correcting on retry.)
+        // last pass's terminal verdicts: a mutation blocked on an
+        // identity that went terminal this pass defers as NeedContent
+        // and re-arms its want, then fails closed as Transient next
+        // pass — a one-pass delay in classification, never a skip.)
         let completed_runtime = self.engine.evaluate_terminal()?;
         let terminal = self.engine.terminal_snapshot();
         self.wants.retire_where(|content, waiters| {

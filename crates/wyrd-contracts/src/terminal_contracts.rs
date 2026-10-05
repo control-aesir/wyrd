@@ -206,6 +206,16 @@ fn terminal_generation_completes_every_waiter_of_the_identity() {
         FetchStatus::Unavailable(1),
         "nothing healed: the verdict stood while waiters released"
     );
+    // The mid-wait composition: the probes' notes reopen generation
+    // 2 on the next pass, so the waiters' retries would find a fresh
+    // attempt instead of the verdict they just observed.
+    live.sync_once(&mut loaded.rig.relay, Some(&mut dead))
+        .unwrap();
+    assert_eq!(
+        view_status(&parts, &chunk),
+        FetchStatus::Fetching,
+        "observed demand rotated the generation after completion"
+    );
     assert!(
         !parts.wants.is_admitted(&chunk),
         "the terminal identity retired from admission with waiters outstanding"

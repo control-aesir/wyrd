@@ -95,11 +95,12 @@ version say exactly what changed.
   by the representation-level strike ledgers and completes a
   generation when every representation is cooled on failure evidence
   (attempted generations only — never on budget backoff, absence,
-  missing keys, or local refusals). The corrupt verdict is reserved
+  missing keys, or local refusals). The corrupt   verdict is reserved
   for all-invalid evidence. Terminal generations complete their
   waiters with bounded `EIO`, retire from want admission, reopen as a
-  new generation on the next waiter, and publish through the serving
-  projection via the revision gate. Memory-only throughout: no
+  new generation on observed demand (sticky reopen notes — a waiter
+  never blocks on an existing verdict), and publish through the
+  serving projection via the revision gate. Memory-only throughout: no
   durable fact, nothing survives reopen. No format impact and no
   protocol change; quarantine, scrub, and diagnostics are the
   following children.

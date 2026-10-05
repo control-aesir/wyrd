@@ -1987,6 +1987,13 @@ impl Engine {
     /// demand fetches instead of observing the old terminal. No-op
     /// unless the identity is terminal — a non-terminal generation
     /// continues, never restarts.
+    ///
+    /// The reopen inherits the standing cooldown: representations
+    /// cooled under the completed generation stay cooled, so the new
+    /// generation projects `Fetching` (eligible again only as
+    /// cooldowns lapse) rather than fast-failing. A retry therefore
+    /// blocks boundedly instead of observing a verdict — the verdict
+    /// reforms only on fresh post-cooldown evidence.
     pub fn reopen_generation(&mut self, id: &ContentId) {
         if self.fetch_terminal.remove(id).is_some() {
             let next = self.fetch_generations.get(id).copied().unwrap_or(0) + 1;

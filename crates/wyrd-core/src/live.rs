@@ -1929,7 +1929,11 @@ where
     /// The aborted-fold outcome: the forcer reports its own cause and
     /// every non-forcing member is restored to pending, retryable on
     /// its own forcing event. Nothing was authored, so in-memory
-    /// applications are simply dropped.
+    /// applications are simply dropped. Every caller passes a real
+    /// forcer — the shutdown path refuses whole folds with `Err`
+    /// instead of aborting, since it has no future pass to restore
+    /// toward — so the `None` case below only shapes the member list,
+    /// never a submitted fold.
     fn abort_fold(
         members: &[FoldMember],
         forcer: Option<usize>,

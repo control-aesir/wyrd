@@ -164,6 +164,9 @@ impl WriteBudget {
     /// Release transient fold-submission memory. Called by the
     /// lease's [`Drop`]; the saturating arithmetic keeps a logic
     /// error in lease scope from taking the aggregate negative.
+    /// A refused reservation constructs no lease and changes nothing,
+    /// so the refusal path restores images against exactly the budget
+    /// it found.
     fn release_fold(&self, bytes: usize) {
         if let Ok(mut state) = self.state.lock() {
             state.total = state.total.saturating_sub(bytes);

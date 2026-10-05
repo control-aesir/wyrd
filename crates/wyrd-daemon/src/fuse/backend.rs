@@ -360,13 +360,16 @@ fn taken_kind(taken: &TakenMember) -> MutationKind {
 }
 
 /// The applied outcome behind a winning disposition, for settling a
-/// taken handle onto its committed state.
-fn disposition_outcome(disposition: &FoldDisposition) -> MutationOutcome {
+/// taken handle onto its committed state. Called only for applied
+/// dispositions — the caller discriminates first — so a failed or
+/// restored disposition here is a contract break and fails closed as
+/// `None` instead of inventing a success to settle onto.
+fn disposition_outcome(disposition: &FoldDisposition) -> Option<MutationOutcome> {
     match disposition {
-        FoldDisposition::Committed(identity) => MutationOutcome::Committed(identity.clone()),
-        FoldDisposition::Created(identity) => MutationOutcome::Created(identity.clone()),
-        FoldDisposition::Done => MutationOutcome::Done,
-        FoldDisposition::Failed(_) | FoldDisposition::Restored => MutationOutcome::Done,
+        FoldDisposition::Committed(identity) => Some(MutationOutcome::Committed(identity.clone())),
+        FoldDisposition::Created(identity) => Some(MutationOutcome::Created(identity.clone())),
+        FoldDisposition::Done => Some(MutationOutcome::Done),
+        FoldDisposition::Failed(_) | FoldDisposition::Restored => None,
     }
 }
 
@@ -1783,6 +1786,18 @@ where
                 forcer: true,
             });
         }
+        // The engine settles by position and reads privilege off the
+        // queue member, while the daemon reads it off the run: the two
+        // bits must agree, and the merge arm above is the only place
+        // that writes both.
+        debug_assert_eq!(
+            submitted.iter().map(|run| run.forcer).collect::<Vec<_>>(),
+            members
+                .iter()
+                .map(|member| member.forcer)
+                .collect::<Vec<_>>(),
+            "submitter and queue views of fold privilege agree"
+        );
         (queue.submit(MutationKind::Fold { members }), submitted)
     }
 
@@ -1811,17 +1826,30 @@ where
                 .collect::<Vec<_>>()
         };
         // Settle every taken handle behind one submitted run from the
-        // run's disposition.
+        // run's disposition. Every handle settles — no short-circuit —
+        // and the run counts as committed only when all of them do.
         let settle_run =
             |taken: &[TakenMember], run: &SubmitMember, disposition: &FoldDisposition| {
-                let mut committed = false;
+                let mut committed = true;
                 for index in &run.taken {
                     let taken = &taken[*index];
-                    committed = match disposition {
+                    let settled = match disposition {
                         FoldDisposition::Committed(_)
                         | FoldDisposition::Created(_)
                         | FoldDisposition::Done => {
-                            settle_applied(self, taken, &disposition_outcome(disposition)).is_ok()
+                            match disposition_outcome(disposition) {
+                                Some(outcome) => settle_applied(self, taken, &outcome).is_ok(),
+                                // Unreachable: discriminated above, but
+                                // a contract break must fail the handle
+                                // rather than settle it onto nothing.
+                                None => {
+                                    tracing::error!(
+                                        "settle got a non-applied disposition on the applied path"
+                                    );
+                                    settle_failed(self, taken);
+                                    false
+                                }
+                            }
                         }
                         FoldDisposition::Failed(_) => {
                             settle_failed(self, taken);
@@ -1832,6 +1860,7 @@ where
                             false
                         }
                     };
+                    committed &= settled;
                 }
                 committed
             };

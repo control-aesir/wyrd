@@ -1024,6 +1024,52 @@ fn destroy_commits_dirty_write_handles_while_queue_live() {
     );
 }
 
+/// A fold refused by the transient lease reports `ENOSPC` with the
+/// handle still dirty: the taken image goes back, the budget total is
+/// exactly the handle reservation again, and no submission ever
+/// reaches the queue. The drainer stands by so a regression that
+/// submits anyway fails on assertions instead of blocking forever.
+#[test]
+fn fold_lease_refusal_restores_the_taken_image() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    // Room for the 100-byte image, but not for its submission copy
+    // on top: 100 reserved, 100 more refused.
+    backend.budget = Arc::new(WriteBudget::with_limits(1024, 150, 8));
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, &[b'a'; 100]).unwrap();
+    assert_eq!(backend.budget.total(), 100);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    assert_eq!(
+        backend.commit_handle(fh),
+        Err(fuser::Errno::ENOSPC),
+        "memory pressure refuses the fold like any budget"
+    );
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a refused fold submits nothing"
+    );
+    assert_eq!(
+        backend.budget.total(),
+        100,
+        "the restored image keeps exactly its handle reservation"
+    );
+    // Still dirty and usable: pressure is retryable, not terminal.
+    backend.write_handle(fh, 0, b"b").unwrap();
+    assert_eq!(
+        backend.commit_handle(fh),
+        Err(fuser::Errno::ENOSPC),
+        "the retry meets the same pressure, not a poisoned handle"
+    );
+    backend.release_handle(fh).unwrap();
+}
+
 /// A dirty handle with no buffered image fails its commit closed
 /// instead of authoring an empty prefix as a successful write: the
 /// image boundary is structural, not incidental. Unreachable through

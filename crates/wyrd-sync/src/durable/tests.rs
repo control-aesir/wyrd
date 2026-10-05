@@ -1837,8 +1837,11 @@ fn reconciliation_over_claim_is_dropped_not_loaded() {
         "and the same drop count"
     );
     // The latch scope, pinned: a second *distinct* over-claim on the
-    // same handle is counted but only ever debug-logged — the bucket
-    // still holds just the honest statement, and the count grows.
+    // same handle is counted but only ever debug-logged — the latch
+    // fired on the first load above, so this load takes the post-latch
+    // arm (no reopen: reopening would reset the latch and re-warn).
+    // The bucket still holds just the honest statement, and the count
+    // grows.
     let mut store = store;
     let mut second_over = honest.evidence().clone();
     second_over
@@ -1851,8 +1854,6 @@ fn reconciliation_over_claim_is_dropped_not_loaded() {
     store
         .commit(&[Fact::ReconciliationView(second_over)])
         .unwrap();
-    drop(store);
-    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     let twice = store.load().unwrap();
     assert_eq!(
         twice.reconciliation_views,
@@ -1862,6 +1863,14 @@ fn reconciliation_over_claim_is_dropped_not_loaded() {
     assert_eq!(
         twice.dropped_reconciliation_views, 2,
         "the count covers every refused statement, first warn or not"
+    );
+    assert_eq!(
+        twice
+            .latest_stated_view()
+            .expect("a view was stated")
+            .evidence(),
+        honest.evidence(),
+        "retire weight survives both drops"
     );
     assert_eq!(
         loaded

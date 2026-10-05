@@ -236,8 +236,7 @@ pre-admission gate bounds disk, while only a residency refusal bounds
 what the peer claims and serves. The two quantities need different
 points, and they are one decision because neither works without the
 other: a pre-admission gate is the only thing that bounds disk, and a
-residency refusal with no admission gate behind it bounds nothing
-physical.
+residency refusal with no admission gate behind it bounds nothing physical.
 
 | | Quantity | Enforcement point | Bounds | Status |
 |---|---|---|---|---|
@@ -251,9 +250,8 @@ residency refusal withholds discharge without touching the commit. A
 peer holding received content has no step 6 to withhold — announcements
 are the author's, and v0 has no replication serving
 (`transport/routes.rs`: routes publish only from announcements'
-`node_addr`). Its gate is its own mirror admission: the
-vault-to-mirror write-through on `Vault::import` and the boot rebuild
-admit
+`node_addr`). Its gate is its own mirror admission: the vault-to-mirror
+write-through on `Vault::import`, and the boot rebuild, admit
 only residency the ceiling allows, and the serving maps offer only
 recorded-as-servable state (`VaultSource::from_state`: "Only recorded
 state serves"). Obligations 1–2 are enforced there, not at an
@@ -305,8 +303,8 @@ under current local policy." Three negative obligations, each needing
 a negative test in the implementation follow-up:
 
 1. A refused offer creates **no provider claim**: the refusing peer
-   does not record, project, or report itself as a provider for that
-   identity.
+   does not record, project, or report itself
+   as a provider for that identity.
 2. A refused offer satisfies **no serving request**: it must not
    appear as a route that resolves.
 3. A refused offer advances **no announcement**: no announcement may
@@ -345,14 +343,14 @@ and its own fsync and announcement cost. The two halves split on what
 the refuser already holds:
 
 - A — nothing stored, nothing paid: refused bytes are never admitted,
-  so the refuser's disk is untouched and the bytes are charged nowhere
-  on it.
+  so the refuser's disk is untouched and the bytes are
+  charged nowhere on it.
 - B — stored and charged permanently, not advertised: the bytes are
   already in the refuser's append-only store with no GC to reclaim
   them, so they stay charged to its retained bytes; what the refuser
   does not bear is the residency — no mirror work, no promise, no
-  serving. An implementer counts B-refused bytes as retained, not as
-  absent.
+  serving. An implementer counts B-refused bytes
+  as retained, not as absent.
 
 In both halves the availability of refused content rests with the
 author and the peers that did accept it — which is why the refusal can
@@ -361,7 +359,7 @@ nor censor a member (what a member is entitled to read stays readable
 from a holder).
 
 **Compatibility impact.** None on the persistent format and none on
-the wire in v0.3: a refusal creates no durable fact and no protocol
+the wire in v0.3: a refusal creates no durable `Fact` and no protocol
 message, so drives written before this contract open unchanged and
 peers that never refuse interoperate byte-for-byte with peers that do.
 Ceilings default to unset (unlimited), so existing deployments behave
@@ -387,9 +385,11 @@ or quarantined object keeps its charge forever, so the store would
 eventually refuse everything it is offered. A decrement, or an
 authoritative recomputation, lands with A's enforcement, not after it.
 B carries two prerequisites of its own, alongside A's decrement: a
-counter that sees vault bytes (body and manifests are retained but
+counter that sees vault bytes — beside the mirror accounting in
+`wyrd-sync`, or as a widened `wyrd-format` `RetainedBytes`; the
+follow-up decides — since body and manifests are retained but
 untallied today, so the peer-side ceiling has nothing to consult on
-those legs), and durable refusal state the boot rebuild can re-derive
+those legs), and durable refusal state the boot rebuild can consult
 (the rebuild cannot distinguish "refused for residency" from "never
 seen" without it).
 
@@ -565,8 +565,9 @@ handles, not just the write in hand.
    refusal after durability, before announcement); eviction under
    pressure and unbounded-growth-as-contract are refused for v0.3.
    What remains is implementation: neither ceiling is enforced yet,
-   and A's enforcement waits on the `RetainedBytes`
-   decrement-or-recomputation prerequisite. The question entry stays
+   and enforcement waits on the accounting prerequisites recorded in
+   the contract (vault-seeing counter, durable refusal state,
+   `RetainedBytes` decrement-or-recomputation). The question entry stays
    as the pointer; the contract is the answer.
 2. **Quota accounting still open.** The quota's refusal point shipped as
    decided above: before the commit's first write to disk, so a refused

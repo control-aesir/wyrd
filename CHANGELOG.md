@@ -42,8 +42,9 @@ version say exactly what changed.
   authoring device, mirror admission and serving maps on a receiving
   peer). Eviction and unbounded-growth-as-contract are refused for v0.3.
   Decision only; neither ceiling is enforced yet, no behavior change, and
-  no format impact. Enforcement, the `RetainedBytes` decrement
-  prerequisite, and the acceptance tests are the implementation follow-up
+  no format impact. Enforcement, the accounting prerequisites
+  (vault-seeing counter, durable refusal state, `RetainedBytes`
+  decrement), and the acceptance tests are the implementation follow-up
   gated on this artefact.
 
 ## [0.2.0-alpha]

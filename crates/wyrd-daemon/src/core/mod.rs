@@ -8,6 +8,8 @@
 #[cfg(test)]
 mod tests_backend;
 #[cfg(test)]
+mod tests_coalescing;
+#[cfg(test)]
 mod tests_composition;
 #[cfg(test)]
 mod tests_handles;

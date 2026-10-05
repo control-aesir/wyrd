@@ -42,6 +42,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Parent create tokens (distinct retained paths) | `max_parent_tokens` (4096) | new parent capture fails closed; `ESTALE` at the FUSE boundary |
 | Write buffer per dirty handle | `write_per_handle_bytes` (64 MiB) | reservation refused; `ENOSPC`, handle unchanged |
 | Write buffers aggregate | `write_aggregate_bytes` (256 MiB) | reservation refused; `ENOSPC` |
+| Fold submission copies (transient, ~1× the taken bytes) | `write_aggregate_bytes` (same 256 MiB) | fold refused before submitting; `ENOSPC` on the forcing call, all taken images restored |
 | Dirty (buffered) handles | `write_dirty_handles` (64) | new dirty handle refused; `ENOSPC` |
 | Open file handles (read + write) | `max_open_handles` (4096) | open refused; `EMFILE` |
 | Open-capture bytes aggregate (read chunk lists + writable capture-plus-base) | `max_open_capture_bytes` (256 MiB) | open refused; `ENOSPC`. Checked at open; a handle's retention may grow toward the ingest chunk ceiling afterwards |

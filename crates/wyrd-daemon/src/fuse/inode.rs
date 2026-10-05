@@ -180,7 +180,11 @@ impl Handle {
 /// with a commit and no two commits can overlap. A successful commit
 /// advances `base` to the committed identity, drops the image, and makes
 /// the handle clean; a failed commit is terminal (`failed`), discarding
-/// the image and mapping every later operation to `EIO`.
+/// the image and mapping every later operation to `EIO`. A commit is
+/// usually a fold: the forcing boundary takes every dirty handle's
+/// image (plus its own operation) into one snapshot, then settles each
+/// taken handle from its disposition — re-pinned, failed, or restored
+/// to pending when an aborted fold leaves it untouched.
 pub(super) struct WriteHandle {
     pub(super) path: String,
     pub(super) ino: Option<u64>,
@@ -202,6 +206,15 @@ pub(super) struct WriteHandle {
     /// The image differs from `base` (or `O_TRUNC` started it empty), so
     /// the next committing boundary authors a snapshot.
     pub(super) dirty: bool,
+    /// First-in-first-buffered order: stamped when the handle turns
+    /// dirty, kept across later writes, so a fold applies members in
+    /// buffering order (`docs/write-path.md`, DG-1 rule 2).
+    pub(super) dirty_seq: u64,
+    /// A fold holds this handle's taken image: writers wait on the
+    /// backend's fold signal until the fold settles the handle, so no
+    /// write is lost between the take and the re-pin and no write
+    /// returns durable before its fold commits.
+    pub(super) inflight: Option<u64>,
     /// A failed commit discarded the overlay; the handle is unusable.
     pub(super) failed: bool,
     /// `O_SYNC`/`O_DSYNC`: each successful write is its own commit.

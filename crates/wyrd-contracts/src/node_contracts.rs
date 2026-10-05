@@ -19,7 +19,10 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use wyrd_core::live::LiveConfig;
-use wyrd_core::mutation::{MutationError, MutationKind, MutationOutcome};
+use wyrd_core::mutation::{
+    FileIdentity, FoldDisposition, FoldForcerOutcome, FoldMember, MutationError, MutationKind,
+    MutationOutcome,
+};
 use wyrd_core::node::WyrdNode;
 use wyrd_core::view::{
     Attr, DirEntry, Head, NamespaceView, Node, OpenFile, RuntimeMaterialization, ViewError,
@@ -451,4 +454,149 @@ where
     });
 
     drop(parts);
+}
+
+/// Contract 45: one commit-forcing event's whole pending set plus
+/// itself authors a single snapshot (`docs/write-path.md`, DG-1). Two
+/// content members across two paths plus a namespace forcer fold into
+/// one snapshot whose tree equals the final coherent state, and the
+/// served generation advances by exactly one. Submitted straight
+/// through the queue — no presentation backend builds the fold — so
+/// this pins the loop's fold contract; the daemon's gathering (which
+/// handles fold into submissions) is pinned at the mount boundary
+/// in `wyrd-daemon`.
+#[test]
+fn fold_commits_one_snapshot_for_many_members() {
+    let dir = headless_dir("contract-fold");
+    let engine = Engine::create(
+        dir.clone(),
+        "headless-test-pass",
+        DeviceIdentitySecret::generate().unwrap(),
+    )
+    .unwrap();
+
+    let mut node: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    node.put_file("a.txt", b"a").unwrap();
+    node.put_file("b.txt", b"b").unwrap();
+    let base_a = match node.view().lookup("a.txt").expect("a.txt resolves") {
+        Node::File {
+            size,
+            executable,
+            chunks,
+        } => FileIdentity::new(size, executable, chunks),
+        other => panic!("a.txt is a file, saw {other:?}"),
+    };
+
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
+    let slot = Arc::clone(&parts.projection);
+    let queue = Arc::clone(&parts.mutations);
+    let before = slot.read().unwrap().generation();
+    let stop = Arc::new(AtomicBool::new(false));
+    let config = LiveConfig {
+        interval: Duration::from_millis(10),
+        ..LiveConfig::default()
+    };
+
+    std::thread::scope(|scope| {
+        let loop_stop = Arc::clone(&stop);
+        let handle = scope.spawn(move || {
+            let mut mailbox = SilentMailbox;
+            live.run_loop(
+                &mut mailbox,
+                None::<&mut MemoryBulkSource>,
+                &loop_stop,
+                &config,
+                &mut |_, _| {},
+            )
+        });
+
+        let outcome = queue
+            .submit(MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::CommitFile {
+                            path: "a.txt".to_string(),
+                            base: base_a,
+                            executable: false,
+                            content: b"A2".to_vec(),
+                        },
+                        forcer: false,
+                    },
+                    FoldMember {
+                        kind: MutationKind::AppendFile {
+                            path: "b.txt".to_string(),
+                            content: b"+b".to_vec(),
+                        },
+                        forcer: false,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir {
+                            path: "c-dir".to_string(),
+                        },
+                        forcer: true,
+                    },
+                ],
+            })
+            .expect("a fold submits");
+        match outcome {
+            MutationOutcome::Fold {
+                forcer: FoldForcerOutcome::Applied(forcer),
+                members,
+            } => {
+                assert!(
+                    matches!(*forcer, MutationOutcome::Done),
+                    "the namespace forcer reports its own outcome: {forcer:?}"
+                );
+                assert_eq!(
+                    members.len(),
+                    2,
+                    "one disposition per non-forcing member: {members:?}"
+                );
+                assert!(
+                    members
+                        .iter()
+                        .all(|member| matches!(member, FoldDisposition::Committed(_))),
+                    "both content members commit into the one snapshot: {members:?}"
+                );
+            }
+            other => panic!("a fold answers with a fold outcome, saw {other:?}"),
+        }
+
+        // The fold authors one snapshot: the served generation advances
+        // by exactly one, and the tree equals the final coherent state.
+        let mut published = false;
+        for _ in 0..500 {
+            if slot.read().unwrap().generation() == before + 1 {
+                published = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "one forcing event publishes one generation");
+        let projection = slot.read().unwrap();
+        let view = projection.view();
+        let a = view.lookup("a.txt").expect("a.txt resolves");
+        let file_a = view.open_file(&a).expect("a.txt opens");
+        assert_eq!(view.read(&file_a, 0, 64).unwrap(), b"A2");
+        let b = view.lookup("b.txt").expect("b.txt resolves");
+        let file_b = view.open_file(&b).expect("b.txt opens");
+        assert_eq!(view.read(&file_b, 0, 64).unwrap(), b"b+b");
+        assert!(
+            view.lookup("c-dir").is_ok(),
+            "the namespace member lands in the same snapshot"
+        );
+        drop(projection);
+
+        stop.store(true, Ordering::Relaxed);
+        handle
+            .join()
+            .unwrap()
+            .expect("loop shuts down cleanly headless");
+    });
+
+    drop(parts);
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -1669,3 +1669,180 @@ fn headless_loop_converges_a_new_device_to_current_heads() {
     std::fs::remove_dir_all(dir_a).unwrap();
     std::fs::remove_dir_all(dir_b).unwrap();
 }
+
+/// A fold refused at the aggregate quota restores every member: the
+/// gate covers the whole pending set before the commit's first write,
+/// retryable rather than terminal like a refused single commit never
+/// is.
+#[test]
+fn fold_at_the_ceiling_restores_every_member() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("fold-quota");
+    let (config, retained) = LiveConfig::with_retained_quota(0);
+    let store = store.with_retained(Arc::clone(&retained));
+    let mut node = live_over_configured(engine, store, &[head], &config);
+    let revision = node.engine.current();
+    let outcome = node
+        .apply_mutation(
+            &MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::CommitFile {
+                            path: "f".into(),
+                            base: FileIdentity::new(11, false, Vec::new()),
+                            executable: false,
+                            content: b"second".to_vec(),
+                        },
+                        forcer: false,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir { path: "d".into() },
+                        forcer: true,
+                    },
+                ],
+            },
+            None,
+        )
+        .expect("a quota-refused fold still answers");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Failed(MutationError::Store(StoreFailure::StorageFull)),
+            members,
+        } => assert_eq!(
+            members,
+            vec![FoldDisposition::Restored],
+            "the surviving member stays retryable"
+        ),
+        other => panic!("a quota-refused fold aborts, saw {other:?}"),
+    }
+    assert_eq!(
+        node.engine.current(),
+        revision,
+        "a quota-refused fold authors nothing"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A lone-forcer fold commits exactly like the single mutation it
+/// carries: the same outcome, one snapshot, one new head.
+#[test]
+fn lone_forcer_fold_matches_its_single_mutation() {
+    let (engine, dir, store, _chunk, root, head) = scratch_file_drive("fold-lone");
+    let mut node = live_over_fake(engine, store, &[head]);
+    let revision = node.engine.current();
+    let outcome = node
+        .apply_mutation(
+            &MutationKind::Fold {
+                members: vec![FoldMember {
+                    kind: MutationKind::Mkdir { path: "d".into() },
+                    forcer: true,
+                }],
+            },
+            None,
+        )
+        .expect("a lone forcer folds");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(outcome),
+            members,
+        } => {
+            assert!(
+                matches!(*outcome, MutationOutcome::Done),
+                "the forcer reports its own outcome: {outcome:?}"
+            );
+            assert!(members.is_empty(), "no other member, no disposition");
+        }
+        other => panic!("a lone forcer applies, saw {other:?}"),
+    }
+    assert_eq!(
+        node.engine.current(),
+        revision + 1,
+        "one forcing event authors one snapshot"
+    );
+    let tree = node.live_heads_traced().unwrap()[0].snapshot().tree;
+    assert_ne!(tree, root, "the snapshot carries the mutation");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A fold whose member needs remote content defers the whole fold:
+/// nothing applies, nothing authors, and the pinned retry applies
+/// the entire fold as one snapshot once the content lands.
+#[test]
+fn fold_defers_for_remote_content_and_retries_pinned() {
+    let (engine, dir, mut store, chunk, root, head) = scratch_file_drive("fold-need");
+    // The tree resolves; the chunk does not.
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let base = head.snapshot().snapshot_id();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let revision = node.engine.current();
+    let fold = MutationKind::Fold {
+        members: vec![
+            FoldMember {
+                kind: MutationKind::AppendFile {
+                    path: "f".into(),
+                    content: b"more".to_vec(),
+                },
+                forcer: false,
+            },
+            FoldMember {
+                kind: MutationKind::Mkdir { path: "d".into() },
+                forcer: true,
+            },
+        ],
+    };
+    // The append member names the missing chunk: the whole fold
+    // defers for a pinned retry, like any single mutation.
+    let error = node.apply_mutation(&fold, None).unwrap_err();
+    assert_eq!(
+        error,
+        MutationError::NeedContent {
+            chunk,
+            base: Some(base),
+        }
+    );
+    assert_eq!(
+        node.engine.current(),
+        revision,
+        "a deferred fold authors nothing"
+    );
+    // The content lands (same bytes, same identity); the pinned retry
+    // applies the entire fold as one snapshot.
+    node.store
+        .write()
+        .unwrap()
+        .insert(ObjectKind::Chunk, b"remote-base")
+        .unwrap();
+    let outcome = node
+        .apply_mutation(&fold, Some(base))
+        .expect("the pinned retry applies");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(forcer),
+            members,
+        } => {
+            assert!(
+                matches!(*forcer, MutationOutcome::Done),
+                "the namespace forcer reports its own outcome: {forcer:?}"
+            );
+            assert_eq!(
+                members.len(),
+                1,
+                "one disposition for the non-forcing member: {members:?}"
+            );
+            assert!(
+                matches!(members[0], FoldDisposition::Committed(_)),
+                "the append member commits into the one snapshot: {members:?}"
+            );
+        }
+        other => panic!("a pinned retry applies the whole fold, saw {other:?}"),
+    }
+    assert_eq!(
+        node.engine.current(),
+        revision + 1,
+        "the retry authors exactly one snapshot"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

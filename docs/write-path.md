@@ -173,7 +173,11 @@ Rules:
    `fuser` does not require to flush pending writes — never forces
    on another handle's behalf. The `flush` ≡ `fsync` equivalence
    covers the caller's own bytes and must not pull the close path in
-   with it.
+   with it. A memberless `fsync` — a clean handle forcing through the
+   path's earliest dirty handle — reports the delegate fold's outcome,
+   including its errno on failure: the path did not become durable,
+   so a success would be a lie, and the clean caller has no member of
+   its own whose errno could take precedence.
 4. **No idle-window commit in v0.3.** A timer in the durability path
    would be a silent post-timeout commit, contradicting the queue's
    synchronous contract below (a caller stays blocked until the loop
@@ -204,16 +208,16 @@ Rules:
    submit nothing and force nothing, and a member whose namespace
    precondition fails during fold application (the `create` arm's
    `EEXIST` and `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided
-   inside application at `live.rs:1437`/`:1439`/`:1441-1442`/
-   `:1444-1446`, never at admission; the clause is generic over
+   inside application at `live.rs:1621`/`:1623`/`:1625-1626`/
+   `:1628-1629`, never at admission; the clause is generic over
    every namespace mutation — `mkdir`, `unlink`, `rename` preconditions
    fail the same way)
    reports its own errno without forcing. If the forcing member
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
    bytes durable. A fold-fatal refusal raised before the commit
-   begins — the pre-commit quota (`live.rs:1406`) and
-   `ConflictedHeads` (`live.rs:1431-1434`) — leaves members
+   begins — the pre-commit quota (`live.rs:1455`, `live.rs:2020-2025`
+   under folding) and `ConflictedHeads` (`live.rs:2004-2019`) — leaves members
    retryable and non-terminal, as does a failed forcing member; a
    `StaleHandle` is terminal, and so is a store, authoring, or
    fact-commit failure wherever it occurs (the stale/`EIO` rule
@@ -486,11 +490,13 @@ state visible when the FUSE syscall began.
 A directory rename rebinds the moved directory's own inode on both
 mounts, and fresh path lookups under the new prefix work immediately.
 Pre-opened handles to *descendants* keep addressing the old path: the
-v0 inode table rebinds the exact source mapping only, so a descendant
-handle opened before the rename goes `ENOENT` on its next path
-operation instead of silently following the subtree. Following renamed
-subtrees through open handles is a presentation-layer feature v0 does
-not claim.
+v0 inode table rebinds the exact source mapping only. Under folding a
+descendant handle's buffered bytes are applied pre-rename and ride the
+subtree to the new path — a deterministic outcome, not an ordering
+race — but the handle itself cannot follow: its post-commit re-pin
+fails, so the handle goes terminal `EIO` on its next operation rather
+than serving the moved bytes. Following renamed subtrees through open
+handles is a presentation-layer feature v0 does not claim.
 
 ## The commit pipeline and durability ordering
 
@@ -677,7 +683,9 @@ Write-time and commit-time failures are distinct surfaces:
   `release`): `EIO` for a stale handle, a conflicted drive, or a
   store/authoring/durability failure; `EFBIG` when the resulting file or
   tree exceeds a protocol ingest ceiling; `ENOSPC` when a protocol object
-  budget is exceeded. A `write` that succeeded never implies the later
+  budget is exceeded, or when the fold's own transient submission memory
+  would exceed the write aggregate (all taken images restored, handles
+  unchanged and retryable). A `write` that succeeded never implies the later
   commit will. (A configured per-device retained-bytes quota reports
   `ENOSPC` here, reusing this reporting path unchanged. The check runs
   before the commit's first write to disk, not at the durability
@@ -806,6 +814,7 @@ create tokens, open handles, demand admission, disk classification) are normativ
 | `write_per_handle_bytes` per dirty handle (default 64 MiB) | `ENOSPC` |
 | `write_aggregate_bytes` aggregate across handles (default 256 MiB) | `ENOSPC` |
 | `write_dirty_handles` (default 64) | `ENOSPC` |
+| fold submission copies (transient, ~1× the taken bytes above the handle reservations) | `ENOSPC` on the forcing call with all taken images restored |
 | `max_pending_mutations` (default 4096, including the executing one) | `EAGAIN` |
 | `max_parent_tokens` (default 4096 distinct parent paths) | `ESTALE` |
 
@@ -1019,10 +1028,13 @@ Each row locks a decided invariant.
   members rebase into the same snapshot; a multi-head drive refuses
   the fold with the documented errno; failure after the durable stage
   leaves the same durable state as before the attempt.
-- **DG-1 negatives (named to `wyrd-contracts`, implementation-gated)**:
+- **DG-1 negatives (daemon composition tests, implementation-gated)**:
   the pending set populates no cache keyed on durable revision;
   appears in no manifest; satisfies no projection or transport
-  serving request; creates no announcement obligation.
+  serving request; creates no announcement obligation. The pending set
+  exists only in the daemon's handle overlays, so these are pinned
+  where it lives — the daemon's composition tests over the live loop —
+  while the fold shape above is pinned at the loop contract.
 
 **POSIX surface**
 

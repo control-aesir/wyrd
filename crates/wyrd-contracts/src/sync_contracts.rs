@@ -56,6 +56,113 @@ where
     )
 }
 
+/// A control plane that never speaks: no announcements, no sends, so
+/// the loop idles on pacing alone and every observed change is local.
+struct NoopMailbox;
+
+impl Mailbox for NoopMailbox {
+    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+        Ok(SendReport { accepted: 1 })
+    }
+
+    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+        Ok(None)
+    }
+
+    fn settle(&mut self, _id: DeliveryId, _d: Disposition) -> Result<(), MailboxError> {
+        Ok(())
+    }
+}
+
+/// A drive with two eligible live heads: two independent root
+/// snapshots at the same epoch and membership, both fetched and
+/// installed, so the merged root serves both trees. Shared fixture
+/// for the conflicted-drive contracts below.
+fn conflicted_drive() -> (
+    Loaded,
+    WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>>,
+) {
+    use wyrd_sync::runtime::MaterializationState;
+
+    let mut loaded = Loaded::new("a.txt", b"a");
+    loaded.publish_body_and_announcement(None);
+    loaded.publish_all();
+
+    // A second, independent sibling snapshot: both are roots at the
+    // same epoch and membership, so both classify as eligible heads.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"b").unwrap();
+    let tree =
+        Tree::from_entries(vec![Entry::file("b.txt", 1, false, vec![chunk]).unwrap()]).unwrap();
+    let tree_id = tree.insert_into(&mut scratch).unwrap();
+    let second = signed_snapshot(
+        Vec::new(),
+        tree_id,
+        &loaded.rig.owner,
+        loaded.rig.admit_id,
+        2,
+        1_001,
+    );
+    let second_content = seal_flat_drive(
+        &drive(),
+        &loaded.rig.epoch2,
+        2,
+        &second.snapshot_id(),
+        &[("b.txt", b"b")],
+    );
+    let body = second.encode();
+    loaded
+        .bulk
+        .publish_snapshot(second.snapshot_id(), body.clone());
+    loaded
+        .bulk
+        .publish_root(second.snapshot_id(), second_content.root.clone());
+    for (storage, sealed) in &second_content.objects {
+        loaded.bulk.publish_sealed(*storage, sealed.clone());
+    }
+    loaded.rig.enqueue_announcement(
+        second.snapshot_id(),
+        loaded.rig.admit_id,
+        2,
+        AnnouncedRoots {
+            body_root: wyrd_format::BaoRoot::from_bytes(*blake3::hash(&body).as_bytes()),
+            root_manifest: second_content.manifest_id,
+            root_transport: wyrd_format::BaoRoot::from_bytes(
+                *blake3::hash(&second_content.root.sealed).as_bytes(),
+            ),
+        },
+        None,
+    );
+
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    for id in &second_content.content_ids {
+        engine
+            .set_materialization(*id, MaterializationState::Cached)
+            .unwrap();
+    }
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
+    daemon.drain(&mut loaded.rig.relay).unwrap();
+    daemon.execute_plan(&mut loaded.bulk).unwrap();
+    daemon.refresh_live_heads().unwrap();
+
+    // Both roots contribute children to the merged root directory,
+    // proving the drive has two eligible heads.
+    let root = daemon.view().lookup("").unwrap();
+    let names: Vec<String> = daemon
+        .view()
+        .readdir(&root)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert!(names.contains(&"a.txt".to_string()), "{names:?}");
+    assert!(names.contains(&"b.txt".to_string()), "{names:?}");
+
+    (loaded, daemon)
+}
+
 /// One head per verified body; a broken signature never becomes
 /// durable, never classified, and never mounts (architecture.md
 /// invariant 3). Possession alone mounts nothing: with no installed
@@ -1761,96 +1868,7 @@ fn conflicted_drive_rejects_mounted_writes() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use wyrd_sync::runtime::MaterializationState;
-
-    struct NoopMailbox;
-    impl Mailbox for NoopMailbox {
-        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
-            Ok(SendReport { accepted: 1 })
-        }
-        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
-            Ok(None)
-        }
-        fn settle(&mut self, _id: DeliveryId, _d: Disposition) -> Result<(), MailboxError> {
-            Ok(())
-        }
-    }
-
-    let mut loaded = Loaded::new("a.txt", b"a");
-    loaded.publish_body_and_announcement(None);
-    loaded.publish_all();
-
-    // A second, independent sibling snapshot: both are roots at the
-    // same epoch and membership, so both classify as eligible heads.
-    let mut scratch = MemoryObjectStore::default();
-    let chunk = scratch.insert(ObjectKind::Chunk, b"b").unwrap();
-    let tree =
-        Tree::from_entries(vec![Entry::file("b.txt", 1, false, vec![chunk]).unwrap()]).unwrap();
-    let tree_id = tree.insert_into(&mut scratch).unwrap();
-    let second = signed_snapshot(
-        Vec::new(),
-        tree_id,
-        &loaded.rig.owner,
-        loaded.rig.admit_id,
-        2,
-        1_001,
-    );
-    let second_content = seal_flat_drive(
-        &drive(),
-        &loaded.rig.epoch2,
-        2,
-        &second.snapshot_id(),
-        &[("b.txt", b"b")],
-    );
-    let body = second.encode();
-    loaded
-        .bulk
-        .publish_snapshot(second.snapshot_id(), body.clone());
-    loaded
-        .bulk
-        .publish_root(second.snapshot_id(), second_content.root.clone());
-    for (storage, sealed) in &second_content.objects {
-        loaded.bulk.publish_sealed(*storage, sealed.clone());
-    }
-    loaded.rig.enqueue_announcement(
-        second.snapshot_id(),
-        loaded.rig.admit_id,
-        2,
-        AnnouncedRoots {
-            body_root: wyrd_format::BaoRoot::from_bytes(*blake3::hash(&body).as_bytes()),
-            root_manifest: second_content.manifest_id,
-            root_transport: wyrd_format::BaoRoot::from_bytes(
-                *blake3::hash(&second_content.root.sealed).as_bytes(),
-            ),
-        },
-        None,
-    );
-
-    let mut engine = loaded.rig.take_engine();
-    loaded.want_all(&mut engine);
-    for id in &second_content.content_ids {
-        engine
-            .set_materialization(*id, MaterializationState::Cached)
-            .unwrap();
-    }
-    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
-        WyrdNode::new(engine, loaded.objects.clone()).unwrap();
-    daemon.drain(&mut loaded.rig.relay).unwrap();
-    daemon.execute_plan(&mut loaded.bulk).unwrap();
-    daemon.refresh_live_heads().unwrap();
-
-    // Both roots contribute children to the merged root directory,
-    // proving the drive has two eligible heads.
-    let root = daemon.view().lookup("").unwrap();
-    let names: Vec<String> = daemon
-        .view()
-        .readdir(&root)
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect();
-    assert!(names.contains(&"a.txt".to_string()), "{names:?}");
-    assert!(names.contains(&"b.txt".to_string()), "{names:?}");
+    let (loaded, daemon) = conflicted_drive();
 
     let (live, parts) = daemon
         .into_live(Duration::from_secs(5), &LiveConfig::default())
@@ -1909,6 +1927,96 @@ fn conflicted_drive_rejects_mounted_writes() {
         "a conflicted mutation authors no snapshot"
     );
 
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+    loaded.rig.teardown();
+}
+
+/// Contract 46: a conflicted drive refuses a fold with members and
+/// restores them: the whole fold aborts with `ConflictedHeads`,
+/// nothing commits, and every non-forcing member is restored
+/// retryable (`docs/write-path.md`, DG-1 rule 6). Submitted straight
+/// through the queue — no backend can even open a handle on a
+/// conflicted drive, so this pins the loop's refusal; the daemon
+/// putting restored images back into dirty handles is pinned at the
+/// mount boundary in `wyrd-daemon`.
+#[test]
+fn conflicted_drive_restores_fold_members_retryable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use wyrd_core::mutation::{
+        FileIdentity, FoldDisposition, FoldForcerOutcome, FoldMember, MutationError, MutationKind,
+        MutationOutcome,
+    };
+
+    let (loaded, daemon) = conflicted_drive();
+
+    let (live, parts) = daemon
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
+    let queue = Arc::clone(&parts.mutations);
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        let mut live = live;
+        let mut mailbox = NoopMailbox;
+        live.run_loop(
+            &mut mailbox,
+            None::<&mut MemoryBulkSource>,
+            &loop_stop,
+            &LiveConfig {
+                interval: Duration::from_millis(10),
+                error_base_delay: Duration::from_millis(5),
+                error_max_delay: Duration::from_millis(20),
+                max_consecutive_errors: 10,
+                budgets: ResourceBudgets::default(),
+                max_mutation_wait: Duration::from_secs(30),
+                serving_flush_budget: Duration::from_secs(5),
+                fetch_pass_budget: Duration::from_secs(10),
+                retained_bytes: None,
+            },
+            &mut |_, _| {},
+        )
+    });
+
+    // The member bases are never evaluated: the head gate refuses
+    // the fold before candidacy, so they are arbitrary.
+    let outcome = queue
+        .submit(MutationKind::Fold {
+            members: vec![
+                FoldMember {
+                    kind: MutationKind::CommitFile {
+                        path: "a.txt".to_string(),
+                        base: FileIdentity::new(1, false, Vec::new()),
+                        executable: false,
+                        content: b"pending".to_vec(),
+                    },
+                    forcer: false,
+                },
+                FoldMember {
+                    kind: MutationKind::Mkdir {
+                        path: "dir".to_string(),
+                    },
+                    forcer: true,
+                },
+            ],
+        })
+        .expect("a refused fold still answers");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Failed(MutationError::Conflicted { heads: 2 }),
+            members,
+        } => assert_eq!(
+            members,
+            vec![FoldDisposition::Restored],
+            "the non-forcing member stays retryable"
+        ),
+        other => panic!("a conflicted fold aborts with its members restored, saw {other:?}"),
+    }
+
+    drop(parts);
     stop.store(true, Ordering::Relaxed);
     handle.join().unwrap().unwrap();
     loaded.rig.teardown();

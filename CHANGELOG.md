@@ -40,6 +40,15 @@ version say exactly what changed.
   baseline) plus per-area `cargo fast-*` shortcuts in
   `.cargo/config.toml`. The existing default profile is now documented
   as the PR gate; no test was added, removed, or modified.
+- DG-1 pending-set coalescing: buffered writes across handles and paths
+  accumulate in the daemon's handle overlays, and a commit-forcing event
+  folds the whole pending set plus itself into one snapshot
+  (`MutationKind::Fold`, per-member dispositions, same-path tie-break with
+  forcer privilege, aborted folds restore members to pending). Same-path
+  append sequences concatenate in buffering order. The debounce-save
+  workload commits one snapshot per save (50 to 10 across the committed
+  workload test) with byte-identical final content. No format impact:
+  only when the snapshot boundary fires changes, not what a snapshot is.
 - Normative DG-4 retention/refusal contract in `docs/storage-growth.md`
   with the authorization half as `docs/trust.md` T18: serving members and
   vaults may decline to retain what an authorized member authored, at the

@@ -85,8 +85,13 @@ where
     /// imports through. The store is shared: the engine imports
     /// verified bytes, the view serves them.
     pub fn new(engine: Engine, store: V::Store) -> Result<Self, NodeError> {
+        let terminal = engine.terminal_snapshot();
         let runtime = engine.runtime_state()?;
-        let view = V::open(store, RuntimeMaterialization { runtime }, Vec::new());
+        let view = V::open(
+            store,
+            RuntimeMaterialization { runtime, terminal },
+            Vec::new(),
+        );
         Ok(WyrdNode { engine, view })
     }
 
@@ -132,8 +137,10 @@ where
     /// Refresh materialization facts after intake or fetch execution. Snapshot
     /// heads are supplied separately because announcements do not carry trees.
     pub fn refresh_materialization(&mut self) -> Result<(), wyrd_sync::runtime::EngineError> {
+        self.engine.evaluate_terminal()?;
         self.view.set_materialization(RuntimeMaterialization {
             runtime: self.engine.runtime_state()?,
+            terminal: self.engine.terminal_snapshot(),
         });
         Ok(())
     }

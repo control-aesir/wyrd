@@ -218,6 +218,17 @@
 //!     nothing commits, the forcing handle goes terminal like any
 //!     refused commit, and every other buffered handle stays dirty and
 //!     usable (`docs/write-path.md`, DG-1 rule 6).
+//! 47. `terminal_generation_completes_every_waiter_of_the_identity` —
+//!     three waiters registered while fetching all release on terminal
+//!     with bounded `EIO`, and the terminal identity retires from
+//!     admission even with its waiters outstanding
+//!     (`docs/peer-repair.md`, waiter invariant).
+//! 48. `a_new_waiter_after_terminal_starts_a_new_generation` —
+//!     register, drive to terminal, re-register: the identity
+//!     re-enters as pending, is re-admitted, and the second
+//!     generation fulfills verified once routes heal — while the
+//!     verdict stands until the new waiter arrives
+//!     (`docs/peer-repair.md:78-84`).
 
 #[cfg(test)]
 mod egress_contracts;
@@ -239,6 +250,8 @@ mod serving_contracts;
 mod support;
 #[cfg(test)]
 mod sync_contracts;
+#[cfg(test)]
+mod terminal_contracts;
 #[cfg(test)]
 mod upgrade_contracts;
 #[cfg(test)]

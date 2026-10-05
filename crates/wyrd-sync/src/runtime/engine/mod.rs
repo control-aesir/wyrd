@@ -1938,13 +1938,19 @@ impl Engine {
     /// `None` means the identity is not terminal — still fetching,
     /// already available, or never demanded.
     pub fn terminal_status(&self, id: &ContentId) -> Option<FetchStatus> {
-        self.fetch_terminal.get(id).map(|terminal| {
+        self.terminal_state(id).map(|terminal| {
             if terminal.corrupt {
                 FetchStatus::Corrupt
             } else {
                 FetchStatus::Unavailable(terminal.generation)
             }
         })
+    }
+
+    /// The completed terminal record for one identity, if the
+    /// engine tracks one. The verdict form of [`Engine::terminal_status`].
+    pub fn terminal_state(&self, id: &ContentId) -> Option<TerminalState> {
+        self.fetch_terminal.get(id).copied()
     }
 
     /// Snapshot the whole terminal map for projections built after

@@ -1,6 +1,9 @@
 # Peer Repair: design note
 
 Status: v0.2 defers dedicated repair (this issue's sanctioned path).
+Part 1 shipped in v0.3: generation-scoped terminal fetch state with
+waiter completion (`Unavailable(generation)` plus reopen-on-new-waiter;
+quarantine, scrub, and diagnostics are the following children).
 The v0.2 ship is fetch-walk fallback across recorded representations
 with post-fetch verification, fail-closed, bounded `EIO` on exhaustion.
 This note records the design the deferral points at, and the protocol
@@ -32,8 +35,11 @@ Backoff: 3 strikes → 8-pass cooldown for `Invalid`/`Transport`,
 separate burn ledger for budget deaths, `Missing` never strikes
 (`runtime/engine/mod.rs:533-534,1602-1648`). Strike ledgers are
 in-memory by decision ("cheaper to reason about than persisting
-grudges"). `FetchStatus::Corrupt`/`Unavailable` are vocabulary only:
-`status()` never returns them (`runtime/state.rs:178-189`).
+grudges"). `FetchStatus::Corrupt` is still vocabulary only;
+`Unavailable(generation)` projects live once the engine's terminal
+evaluation completes a generation with every representation
+exhausted (`runtime/engine/mod.rs`: `evaluate_terminal`), overlaid
+onto the durable status by the node's materialization projection.
 
 ## Part 1 — device-local repair loop (v0.3 core, no protocol change)
 

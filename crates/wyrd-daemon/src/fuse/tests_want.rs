@@ -278,3 +278,93 @@ fn manifest_chain_open_fails_bounded_eio_while_tree_unmaterialized() {
         "the served open registers no demand"
     );
 }
+
+/// A materialization whose verdict flips mid-wait: the chunk
+/// reads remote-only for the first polls, then completes generation
+/// 1 as unavailable. Stands in for the live loop publishing the
+/// engine's terminal snapshot while a waiter blocks.
+struct TerminalMaterialization {
+    chunk: ContentId,
+    polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    flip_after: usize,
+}
+
+impl wyrd_fuse::Materialization for TerminalMaterialization {
+    fn status(&self, id: &ContentId) -> wyrd_format::FetchStatus {
+        if id == &self.chunk {
+            let polls = self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if polls > self.flip_after {
+                return wyrd_format::FetchStatus::Unavailable(1);
+            }
+        }
+        wyrd_format::FetchStatus::RemoteOnly
+    }
+}
+
+/// A terminally unavailable open fails fast with EIO instead of
+/// waiting out the deadline: `Unavailable(generation)` is a
+/// verdict, not a maybe, so the waiter releases on observation.
+/// The mirror of the manifest-chain test above, which pins that an
+/// unmaterialized (still-fetching) open waits out the whole
+/// deadline — the two must differ exactly here.
+#[test]
+fn terminal_unavailable_open_fails_fast_with_eio() {
+    let open_timeout = Duration::from_secs(20);
+    // The tree is held so the open resolves; only the chunk is
+    // terminal — the same staging as `withheld_backend`, with the
+    // verdict in place of the withheld bytes.
+    let mut scratch = MemoryObjectStore::default();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"streamed").unwrap();
+    let mut store = MemoryObjectStore::default();
+    let root = Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let store = Arc::new(RwLock::new(store));
+    // The verdict lands after three polls: the first attempt
+    // registers the want as not-materialized, then the waiter blocks
+    // across the flip instead of the deadline.
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let projection = Arc::new(RwLock::new(Arc::new(Projection::initial(
+        DriveView::new(
+            SharedStore::from(Arc::clone(&store)),
+            TerminalMaterialization {
+                chunk,
+                polls: Arc::clone(&polls),
+                flip_after: 3,
+            },
+            heads(vec![snapshot_of(root)]),
+        ),
+        0,
+    ))));
+    let registry = Arc::new(WantRegistry::default());
+    let budgets = ResourceBudgets::default();
+    let backend = FuseBackend::shared_with_wants(
+        Arc::clone(&projection),
+        Arc::clone(&registry),
+        Arc::new(MutationQueue::default()),
+        open_timeout,
+        &budgets,
+    );
+    let handle = backend
+        .open_at("f.txt")
+        .expect("the tree is held, so open serves");
+    let started = Instant::now();
+    assert_eq!(
+        backend.read_handle(handle, 0, 8),
+        Err(fuser::Errno::EIO),
+        "a terminal identity fails the read with EIO"
+    );
+    assert!(
+        started.elapsed() < open_timeout / 2,
+        "the verdict releases the waiter instead of consuming the deadline"
+    );
+    assert!(
+        polls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the waiter blocked across polls before the verdict landed"
+    );
+    assert!(
+        registry.peek_pending().is_empty(),
+        "completion released the demand"
+    );
+}

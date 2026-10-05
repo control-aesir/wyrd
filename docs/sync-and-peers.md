@@ -504,16 +504,22 @@ the filesystem layer never knows iroh exists. Internally the fetch state
 machine is richer than the POSIX boundary it maps to:
 
 ```
-RemoteOnly → Fetching → Available | Unavailable | Corrupt
+RemoteOnly → Fetching → Available | Unavailable(generation) | Corrupt
 ```
 
-In v0.2 only the first three project live (`status()` never returns
-`Unavailable` or `Corrupt`): the last two are defined vocabulary for
-the repair work, not observed states. The translation to POSIX errors
+The first three project live from durable state; `Unavailable` also
+projects live once the engine's terminal evaluation completes a
+generation: every representation cooled on failure evidence, with
+the completed generation number attached. `Corrupt` projects only
+when every exhausted representation cooled on verification
+rejection. Neither survives a restart — both are memory-only attempt
+state (`docs/peer-repair.md` Part 1). A new waiter reopens the
+attempt as a new generation. The translation to POSIX errors
 happens only at the boundary: opening a non-local path blocks on
 fetch with visible progress, serves the read once verified and
 cached, and fails with `EIO` when no representation serves and the object
-is not cached. Corrupt or unreachable representations fall back to the
+is not cached. A terminal generation completes its waiters with that
+bounded `EIO` instead of the full deadline. Corrupt or unreachable representations fall back to the
 next recorded representation inside the fetch walk — and, within one
 representation, its transport root before its storage address —
 hash/AEAD-verified, never committed on mismatch. There is no scrub

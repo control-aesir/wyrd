@@ -1177,7 +1177,10 @@ where
 
     /// Run `attempt`; when it fails on a not-materialized identity and
     /// demand is wired, register the want and block bounded on it, then
-    /// retry once. Anything else (or no demand wiring) keeps the
+    /// retry once. A terminally unavailable identity completes the
+    /// waiter immediately: `Unavailable(generation)` is a verdict, not
+    /// a maybe, so the bounded `EIO` lands now instead of at the
+    /// deadline. Anything else (or no demand wiring) keeps the
     /// instant-errno behavior. This is the only place FUSE expresses
     /// demand — the engine stays the single synchronization authority.
     fn with_demand<T>(
@@ -1190,7 +1193,11 @@ where
             (&self.wants, &first)
         {
             let wants = Arc::clone(registry);
-            let retry = || attempt().is_ok();
+            // Success completes; terminal unavailability completes
+            // with the verdict (the final retry below surfaces it as
+            // EIO). Any other failure keeps waiting: the fetch may
+            // still land before the deadline.
+            let retry = || matches!(attempt(), Ok(_) | Err((ViewError::Unavailable, _)));
             match wait_for_materialization(&wants, *content, self.open_timeout, retry) {
                 Ok(()) => {
                     return map(attempt());

@@ -439,7 +439,7 @@ fn corrupt_stays_attached_to_the_representation_that_produced_it() {
     // establish identity-level corruption while another
     // representation still serves (peer-repair.md:72-74).
     let mut fixture = fixture();
-    let (content, storage_a, root_a, _storage_b, _root_b, mut directed) =
+    let (content, storage_a, _root_a, _storage_b, _root_b, mut directed) =
         two_representation_setup(&mut fixture);
     // Representation A serves corrupt bytes; B is absent for now
     // (eligible, never evidence).
@@ -666,6 +666,171 @@ fn terminal_generation_writes_no_durable_fact() {
         fixture.engine.current(),
         sequence,
         "terminal completion commits nothing durable"
+    );
+}
+
+#[test]
+fn all_invalid_representations_project_corrupt() {
+    // The corrupt half of the asymmetry (peer-repair.md:72-74): when
+    // every exhausted representation cooled on verification
+    // rejection, the identity-level verdict is Corrupt — the only
+    // path that mints it. Hard acceptance criterion 2, first half.
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        admission.epoch,
+        &epoch_secret,
+        admission.epoch,
+        body.snapshot_id(),
+        b"corrupt probe",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    // Corrupt bytes on the storage route, transport absent so the
+    // storage fallback is what verification rejects.
+    bulk.publish_sealed(published.object_storage, vec![0xFF; 64]);
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    let mut directed = DirectedBulk {
+        inner: bulk,
+        dead_storage: BTreeSet::new(),
+        dead_roots: BTreeSet::new(),
+        missing_storage: BTreeSet::new(),
+        missing_roots: BTreeSet::from([published.object_transport]),
+    };
+    drive_to_terminal(
+        &mut fixture,
+        &mut directed,
+        &mut objects,
+        &published.content,
+        32,
+    );
+    assert_eq!(
+        fixture.engine.terminal_status(&published.content),
+        Some(FetchStatus::Corrupt),
+        "all-invalid evidence establishes identity-level corruption"
+    );
+    assert!(
+        fixture
+            .engine
+            .fetch_invalid_cooled
+            .contains(&FetchKey::Storage(published.object_storage)),
+        "the verdict came from verification rejection, not transport"
+    );
+}
+
+#[test]
+fn flaky_network_never_accumulates_into_a_permanent_eio() {
+    // Peer-repair.md:81-85 as a test: alternating transport failure
+    // and success reaches Available, and no state survives that would
+    // prevent it — there is no EIO-storm-to-permanent path.
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        admission.epoch,
+        &epoch_secret,
+        admission.epoch,
+        body.snapshot_id(),
+        b"flaky probe",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    let mut directed = DirectedBulk {
+        inner: bulk,
+        dead_storage: BTreeSet::from([published.object_storage]),
+        dead_roots: BTreeSet::from([published.object_transport]),
+        missing_storage: BTreeSet::new(),
+        missing_roots: BTreeSet::new(),
+    };
+    // Two transport failures: evidence accrues but the threshold is
+    // not reached, so nothing is terminal yet.
+    for _ in 0..(FETCH_MAX_STRIKES - 1) {
+        fixture
+            .engine
+            .execute_plan(&mut directed, &mut objects)
+            .unwrap();
+        fixture.engine.evaluate_terminal().unwrap();
+    }
+    assert_eq!(
+        fixture.engine.terminal_status(&published.content),
+        None,
+        "sub-threshold failure is still fetching"
+    );
+    // The network heals mid-generation: fulfillment dissolves the
+    // banked evidence and the identity is available.
+    directed.dead_storage.clear();
+    directed.dead_roots.clear();
+    let mut landed = false;
+    for _ in 0..4 {
+        let report = fixture
+            .engine
+            .execute_plan(&mut directed, &mut objects)
+            .unwrap();
+        fixture.engine.evaluate_terminal().unwrap();
+        if report.objects > 0 {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed, "healing before the threshold fulfills");
+    assert_eq!(
+        fixture.engine.terminal_status(&published.content),
+        None,
+        "fulfillment leaves no terminal residue"
+    );
+    assert!(
+        !fixture
+            .engine
+            .fetch_strikes
+            .contains_key(&FetchKey::Storage(published.object_storage)),
+        "fulfillment clears the banked strikes"
+    );
+    assert_eq!(
+        fixture.engine.generation(&published.content),
+        None,
+        "a fulfilled identity stops being tracked"
     );
 }
 

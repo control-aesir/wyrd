@@ -186,13 +186,18 @@ impl WantRegistry {
     }
 
     /// Loop-side settlement sweep: retire admitted identities the probe
-    /// reports settled — materialized (success) or failed with no
-    /// waiter left. An admitted fetch whose demand died must not hold
-    /// a slot indefinitely: the engine's durable `Cached` policy keeps
-    /// retrying it independently of the registry, and a later FUSE
-    /// demand re-registers transiently. The probe receives the waiter
-    /// count; an identity with active waiters never retires, so
-    /// waiters keep coalescing onto the fetch.
+    /// reports settled — materialized (success), terminally exhausted
+    /// (the generation completed; waiters observe the verdict through
+    /// the view and release), or failed with no waiter left. A
+    /// terminal identity retires even with waiters outstanding: the
+    /// fetch those waiters coalesced onto is over, so keeping the
+    /// admitted mark would report fetching for a verdict. An admitted
+    /// fetch whose demand died must not hold a slot indefinitely: the
+    /// engine's durable `Cached` policy keeps retrying it
+    /// independently of the registry, and a later FUSE demand
+    /// re-registers transiently. The probe receives the waiter
+    /// count; a non-terminal identity with active waiters never
+    /// retires, so waiters keep coalescing onto the fetch.
     pub fn retire_where(&self, settled: impl Fn(&ContentId, usize) -> bool) {
         let Ok(mut state) = self.state.lock() else {
             return;

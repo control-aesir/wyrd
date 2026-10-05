@@ -37,15 +37,14 @@ version say exactly what changed.
 - Normative DG-4 retention/refusal contract in `docs/storage-growth.md`
   with the authorization half as `docs/trust.md` T18: serving members and
   vaults may decline to retain what an authorized member authored, at the
-  enforcement points the contract names (pre-admission gate on the receive
-  path; residency refusal after durability, before announcement on the
-  authoring device, at mirror admission and serving maps on a receiving
-  peer). Eviction and
-  unbounded-growth-as-contract are refused for v0.3. Decision only;
-  neither ceiling is enforced yet, no behavior change, and no format
-  impact. Enforcement, the
-  `RetainedBytes` decrement prerequisite, and the acceptance tests are the
-  implementation follow-up gated on this artefact.
+  enforcement points the contract names (receive-path pre-admission gate;
+  residency refusal after durability — announcement barrier on the
+  authoring device, mirror admission and serving maps on a receiving
+  peer). Eviction and unbounded-growth-as-contract are refused for v0.3.
+  Decision only; neither ceiling is enforced yet, no behavior change, and
+  no format impact. Enforcement, the `RetainedBytes` decrement
+  prerequisite, and the acceptance tests are the implementation follow-up
+  gated on this artefact.
 
 ## [0.2.0-alpha]
 

@@ -219,8 +219,8 @@ semantics, and who bears the cost.
 
 Open question 1 below is decided here; the question list keeps it as
 the pointer. A serving member or a vault **may decline to admit what
-an authorized member authored (A), or decline to serve and advertise
-what it already holds (B)**. The refusal right is an authorization
+an authorized member authored (A), or decline to serve, advertise, or
+hold as residency what it already holds (B)**. The refusal right is an authorization
 change (`trust.md` T18), not a resource limit: membership implies the
 right to read, never the duty to retain.
 
@@ -258,8 +258,13 @@ state serves"). Obligations 1–2 are enforced there, not at an
 announcement barrier the peer does not have. A B refusal at the mirror
 gate is non-fatal to the fetch leg: unlike an import failure, it
 neither aborts the leg nor rolls back the already-durable vault file —
-the bytes stand charged as retained-but-not-servable, and only the
-serving record is withheld.
+only the serving record is withheld. The "charged" half holds where
+the accountant sees the bytes, which today is the object leg alone
+(only the plaintext insert charges `RetainedBytes`): body and manifest
+bytes land in the vault retained but untallied, so the peer-side
+ceiling cannot be evaluated on those legs until the counting gap is
+closed, and no boot-time re-derivation can read them without the
+durable refusal state the follow-up provides.
 
 The gate covers the full structural closure the peer pulls — snapshot
 body, root and child manifests, tree nodes — not only file-content

@@ -59,20 +59,26 @@ pub struct MailboxView {
 /// One peer as the durable surface sees it (OD-17-4 option A): an
 /// opaque handle over a peer identity the status legitimately knows
 /// — an obligation recipient or a live-head author from committed
-/// facts. The rendered handle is the 1-based position in this
-/// vector's deterministic (byte) order, stable for the rendering and
-/// identical across restarts over the same state. It is not a peer
-/// identity namespace: nothing persists the numbering, and the same
-/// peer may hold a different handle after the state changes. The
-/// run surface names the same peers by `DeviceId`; this surface
-/// never does.
+/// facts. Handles are assigned in deterministic (byte) order at
+/// observation, stable for the rendering and identical across
+/// restarts over the same state. A handle is not a peer identity
+/// namespace: nothing persists the numbering, and the same peer may
+/// hold a different handle after the state changes. The run surface
+/// names the same peers by `DeviceId`; this surface never does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHandle {
+    /// 1-based position in the observation's deterministic peer
+    /// order: the rendered `peer-N`. Assigned once in [`observe`],
+    /// so the struct and every renderer agree by construction.
+    pub handle: usize,
     /// The peer this handle stands for. In-process only: renderers
     /// map it to `peer-N` and never print it.
     pub peer: DeviceId,
     /// Still-undischarged outbox pairs naming this peer. Zero for a
-    /// head author nobody owes anything to.
+    /// head author nobody owes anything to. Covers the three
+    /// itemized obligation classes only — staged carries are local
+    /// re-authoring work owed to nobody, so they count in
+    /// [`QueueDepth::outbox`] but on no peer line.
     pub pending: usize,
 }
 
@@ -171,16 +177,15 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
-    /// Opaque handle for a peer identity: the 1-based position in the
-    /// deterministic peer order, or 0 when the identity is absent.
-    /// Zero is unreachable by construction — [`observe`] derives
-    /// peers from every identity the status carries — so it stays
-    /// opaque rather than leaking the id it failed to map.
+    /// Opaque handle for a peer identity, or 0 when the identity is
+    /// absent. Zero is unreachable by construction — [`observe`]
+    /// derives peers from every identity the status carries — so it
+    /// stays opaque rather than leaking the id it failed to map.
     pub fn peer_handle(&self, peer: &DeviceId) -> usize {
         self.peers
             .iter()
-            .position(|entry| entry.peer == *peer)
-            .map(|index| index + 1)
+            .find(|entry| entry.peer == *peer)
+            .map(|entry| entry.handle)
             .unwrap_or(0)
     }
 }
@@ -253,7 +258,8 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
     }
     let peers = peer_set
         .into_iter()
-        .map(|peer| {
+        .enumerate()
+        .map(|(index, peer)| {
             let pending = obligations
                 .announcements
                 .iter()
@@ -272,7 +278,11 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
                 )
                 .filter(|recipient| **recipient == peer)
                 .count();
-            PeerHandle { peer, pending }
+            PeerHandle {
+                handle: index + 1,
+                peer,
+                pending,
+            }
         })
         .collect::<Vec<_>>();
     let known_members = match &tip {
@@ -391,6 +401,13 @@ mod tests {
         assert_eq!(status.totals, OutboxTotals::default());
         assert!(status.live_heads.is_empty());
         assert_eq!(status.mailbox.configured_relays, 0);
+        // No obligations and no heads, so no handles — while the
+        // genesis tip still names its sole member. Handles and
+        // members are different denominators by design.
+        assert!(status.peers.is_empty());
+        assert_eq!(status.known_members, 1);
+        assert!(status.queue.is_empty());
+        assert!(status.convergence.converged);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -443,11 +460,14 @@ mod tests {
         assert_eq!(pending, status.obligations.len());
         assert_eq!(pending, 4);
         // Byte order, 1-based handles, every carried identity mapped.
+        // Handles are assigned once in observe(); the loop below
+        // proves the struct and the renderer agree by construction.
         let mut ordered: Vec<DeviceId> = status.peers.iter().map(|entry| entry.peer).collect();
         ordered.sort();
         let peers: Vec<DeviceId> = status.peers.iter().map(|entry| entry.peer).collect();
         assert_eq!(peers, ordered);
         for (index, entry) in status.peers.iter().enumerate() {
+            assert_eq!(entry.handle, index + 1);
             assert_eq!(status.peer_handle(&entry.peer), index + 1);
         }
         assert_eq!(

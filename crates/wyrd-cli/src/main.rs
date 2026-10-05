@@ -1579,12 +1579,13 @@ struct SyncRunReport {
     local_failures: usize,
     /// Outbound sends committed by per-pass publication.
     sent: usize,
-    /// Distinct peers named by intake envelopes this run (OD-17-4
+    /// Distinct senders named by intake envelopes this run (OD-17-4
     /// option B): the union of every pass's observed senders, in
-    /// ascending byte order. Rendered here with full `DeviceId`s —
-    /// this process connected and the operator holds the keys — and
-    /// never on the durable surface, which has no live peer set to
-    /// report.
+    /// ascending byte order. A sender is any key that mailed us,
+    /// member or not — this is a sender list, never a membership
+    /// roster. Rendered here with full `DeviceId`s — this process
+    /// connected and the operator holds the keys — and never on the
+    /// durable surface, which has no live peer set to report.
     peers_observed: Vec<DeviceId>,
     outcome: RunOutcome,
     pending: usize,
@@ -1879,11 +1880,10 @@ fn sync_status_render(status: &SyncStatus) -> String {
         status.peers.len(),
         status.known_members,
     ));
-    for (index, entry) in status.peers.iter().enumerate() {
+    for entry in &status.peers {
         out.push_str(&format!(
             "  peer-{}: {} pending\n",
-            index + 1,
-            entry.pending
+            entry.handle, entry.pending
         ));
     }
     let queue = &status.queue;
@@ -1893,6 +1893,15 @@ fn sync_status_render(status: &SyncStatus) -> String {
         queue.outbox,
         queue.fetch,
     ));
+    // Staged carries are local re-authoring work owed to nobody, so
+    // they count in the outbox total but on no peer line above: name
+    // them here so the two can never silently disagree.
+    let carries = queue.outbox.saturating_sub(status.obligations.len());
+    if carries > 0 {
+        out.push_str(&format!(
+            "  carries: {carries} staged (counted in outbox)\n"
+        ));
+    }
     let convergence = &status.convergence;
     if convergence.converged {
         out.push_str("convergence: converged\n");
@@ -2070,19 +2079,23 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         write.commits,
         write.failures,
     ));
-    // Peers heard this run (OD-17-4 option B): full identities,
+    // Senders heard this run (OD-17-4 option B): full identities,
     // because this process connected and the operator holds the
-    // keys. The durable surface reports the same peers as opaque
-    // handles; the two never share a representation.
+    // keys — with the transport-named caveat that an envelope sender
+    // is any Nostr key that mailed us, member or not, so this is a
+    // sender list, never a membership roster. The durable surface
+    // reports obligation peers as opaque handles; the two answer
+    // different questions (who mailed us vs who we owe) and never
+    // share a representation.
     if report.peers_observed.is_empty() {
-        out.push_str("peers observed: none\n");
+        out.push_str("senders observed: none\n");
     } else {
         out.push_str(&format!(
-            "peers observed: {}\n",
+            "senders observed: {}\n",
             report.peers_observed.len()
         ));
         for peer in &report.peers_observed {
-            out.push_str(&format!("  peer {peer}\n"));
+            out.push_str(&format!("  sender {peer}\n"));
         }
     }
     match report.outcome {

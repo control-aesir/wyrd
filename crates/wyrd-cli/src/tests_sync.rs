@@ -210,6 +210,70 @@ fn sync_status_reports_genesis_and_idle_mailbox() {
         rendered.contains("mailbox: idle (no --relay given)"),
         "{rendered}"
     );
+    assert!(
+        rendered.contains("convergence: converged"),
+        "nothing owed, nothing missing, no pending or rejected heads: {rendered}"
+    );
+}
+
+/// Acceptance: `sync_status_states_that_connectivity_was_not_observed`
+/// (OD-17-5 option B). Relays configured, nothing probed: the
+/// mailbox line names the count and a separate line states the
+/// omission — "not observed", never "unknown", and no seen-store
+/// side effect.
+#[test]
+fn sync_status_states_that_connectivity_was_not_observed() {
+    let fixture = Fixture::new();
+    let engine = fixture.open();
+    let rendered = sync_status_render(&observe(&engine, 2).unwrap());
+    assert!(
+        rendered.contains("mailbox: 2 relays configured"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("connectivity: not observed (this command does not connect)"),
+        "{rendered}"
+    );
+    assert!(
+        !fixture.drive.join("mailbox.seen").exists(),
+        "stating the omission probes nothing"
+    );
+}
+
+/// Staged carries count in the queue total but on no peer line:
+/// carry work is local re-authoring owed to nobody. Author and
+/// stage, admit nobody — the outbox holds one carry, zero
+/// obligations, and the render names the carry separately so the
+/// peer lines (summing to zero) never silently disagree with the
+/// queue total (one).
+#[test]
+fn sync_status_counts_staged_carries_in_the_queue_total() {
+    let fixture = Fixture::new();
+    {
+        let mut engine = fixture.open();
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        let chunk = store
+            .insert(ObjectKind::Chunk, b"sync-status-bytes")
+            .unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 17, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+        engine.stage_carry_heads().unwrap();
+    }
+    let engine = fixture.open();
+    let status = observe(&engine, 0).unwrap();
+    assert!(status.obligations.is_empty());
+    assert_eq!(
+        status.queue.outbox, 1,
+        "the staged carry, and only it: {status:?}"
+    );
+    let rendered = sync_status_render(&status);
+    assert!(
+        rendered.contains("carries: 1 staged (counted in outbox)"),
+        "{rendered}"
+    );
 }
 
 /// Relays on a status command only label the mailbox line: still no
@@ -294,7 +358,11 @@ fn sync_status_after_invite_shows_pending_obligations() {
 /// admitted peer and the authoring device, the durable queue depth,
 /// convergence, materialization counts, and the explicit
 /// not-observed connectivity line. Same admission state as the
-/// obligation test above.
+/// obligation test above. Acceptance traceability: this is the
+/// consolidated form of `sync_status_reports_convergence_state`
+/// (converged/diverged wording asserted here and on the genesis
+/// drive), the peer-handle half of the two-surface peer test below,
+/// and the materialization counts.
 #[test]
 fn sync_status_reports_peer_queue_convergence_materialization() {
     let fixture = Fixture::new();
@@ -1029,6 +1097,11 @@ fn headless_sync_now_converges_a_joined_device_to_current_heads() {
 /// A by `DeviceId` — while B's own durable status renders every peer
 /// (A included) as an opaque `peer-N` handle and never prints the
 /// id. One two-device run pins both halves against each other.
+/// Acceptance: `sync_now_reports_device_ids_for_peers` plus the
+/// status half. (`sync_now_names_peers_by_stable_handle` has no
+/// analog by design — the run surface names senders by id and never
+/// uses handles, so there is nothing stable-handle shaped to assert
+/// on it.)
 #[test]
 fn sync_now_reports_device_ids_that_status_renders_as_handles() {
     let temp = TempDir::new();
@@ -1543,12 +1616,12 @@ fn sync_now_output_contains_no_content_ids() {
     );
     let scrubbed: Vec<&str> = rendered
         .lines()
-        .filter(|line| !line.starts_with("  peer "))
+        .filter(|line| !line.starts_with("  sender "))
         .collect();
     let scrubbed = scrubbed.join("\n");
     assert!(
         !contains_hex_run(&scrubbed),
-        "no 64-hex run outside the peers-observed lines: {rendered}"
+        "no 64-hex run outside the senders-observed lines: {rendered}"
     );
 }
 
@@ -1576,8 +1649,8 @@ fn sync_now_fabricates_no_unobserved_peers() {
         "no peer is named without being heard: {rendered}"
     );
     assert!(
-        rendered.contains("peers observed: none"),
-        "the empty peer set says so: {rendered}"
+        rendered.contains("senders observed: none"),
+        "the empty sender set says so: {rendered}"
     );
 }
 

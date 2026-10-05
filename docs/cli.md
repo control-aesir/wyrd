@@ -357,11 +357,14 @@ sync now
    as quiet with an explicit `N unfetchable heads` count instead of
    burning the cap. Zero-progress passes park the settle window too,
    so dead churn waits on the relay instead of spinning. A
-   `peers observed` section names the distinct senders whose
+   `senders observed` section names the distinct senders whose
    envelopes the run processed, by full `DeviceId`: this process
    connected and the operator holds the keys, so the run surface may
-   say who it heard — the durable surface reports the same peers as
-   opaque handles, and the two never share a representation.
+   say who it heard. A sender is any key that mailed us, member or
+   not — this is a sender list, never a membership roster. The two
+   surfaces answer different questions (who mailed us vs who we owe
+   and who authored our heads) and never share a representation:
+   the durable surface reports obligation peers as opaque handles.
 - `--relay <url>` (repeatable, shared parsing with `mount`): with
    none given, `now` refuses with a usage error unless `--offline`
    is passed — a relay-less run exits 0 with an idle intake, which
@@ -498,9 +501,12 @@ Both are read and hardened by wyrd code, never by clap:
    they never print is ContentIds, filesystem paths, file bytes,
    membership transition ids, or secrets — the
    observation half of the privacy boundary. DeviceIds never reach
-   the durable surface or the log; `sync now` alone names the peers
-   its intake actually heard, because that process connected and the
-   operator holds the keys.
+   the durable `sync status` surface or the log; `sync now` alone
+   names the senders its intake actually heard, because that process
+   connected and the operator holds the keys. (`wyrd heads` and
+   `member list` are separate read surfaces with their own contract
+   — they name authors and members explicitly, and this paragraph
+   does not cover them.)
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

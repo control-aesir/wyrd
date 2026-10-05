@@ -25,6 +25,22 @@ already carry `thiserror` as a workspace dependency.
   transport text, object-store backends). Prefer a typed variant
   everywhere else.
 
+## The exception: no identity where rendering cannot be scoped
+
+`FsStoreError::IdentityMismatch` and `FsStoreError::Corrupt` carry no
+identity — not even typed. A `Display`/`Debug` impl has no way to know
+which trust position renders it, so an identity payload on these
+variants would leak through every `format!("{error:?}")` between the
+store and an operator surface (`mount.log` debug lines included).
+Concealment is absence: there is nothing to redact downstream, and no
+future caller can reintroduce the leak by rendering the error.
+
+The cost is real: on bitrot the operator gets "stored bytes do not
+hash back to their address" with no address and no way to locate the
+object. A client-side repair or verify command that names the object
+on demand would restore that without reopening the general error
+path — a follow-up, not a reason to restore the payload.
+
 ## Fail closed, then restore
 
 Authorization and classification failures are errors that abort the

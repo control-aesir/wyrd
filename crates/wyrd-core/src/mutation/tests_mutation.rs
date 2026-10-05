@@ -914,3 +914,31 @@ fn failed_completion_counts_without_latency() {
     assert_eq!(stats.commit_latency_us_sum, 0);
     assert_eq!(stats.commit_latency_us_max, 0);
 }
+
+/// A held entry stays visible in the gauge: deferral is the
+/// head-of-line-blocking case the queue exists to bound, so the
+/// pressure surface reports held work, not just pending work.
+#[test]
+fn held_entries_count_in_queue_depth() {
+    use wyrd_format::SnapshotId;
+
+    let queue = Arc::new(MutationQueue::default());
+    let submitter = {
+        let queue = Arc::clone(&queue);
+        std::thread::spawn(move || queue.submit(mkdir("docs")))
+    };
+    {
+        let mut batch = take_batch_blocking(&queue);
+        assert_eq!(queue.queue_depth(), 0, "taken work leaves the gauge");
+        batch.defer(0, SnapshotId::from_bytes([0xB0; 32]));
+        batch.finish();
+    }
+    assert_eq!(queue.queue_depth(), 1, "held work still backlogs");
+    {
+        let mut batch = take_batch_blocking(&queue);
+        batch.record(0, Ok(MutationOutcome::Done));
+        batch.finish();
+    }
+    assert_eq!(queue.queue_depth(), 0, "completion drains the gauge");
+    assert_eq!(submitter.join().unwrap(), Ok(MutationOutcome::Done));
+}

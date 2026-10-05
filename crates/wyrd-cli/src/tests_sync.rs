@@ -1179,6 +1179,23 @@ fn sync_now_reports_admission_to_durable_commit_latency() {
     );
 }
 
+/// The write-path section is absent when nothing authored: three
+/// rows of zeros would read as a measured idle, and quiet should
+/// look quiet.
+#[test]
+fn write_path_lines_suppressed_without_snapshots() {
+    let report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    let rendered = sync_now_render(&report);
+    assert!(
+        !rendered.contains("write path:"),
+        "no zero-snapshot section: {rendered}"
+    );
+    assert!(
+        !rendered.contains("write sources:") && !rendered.contains("write latency:"),
+        "no zero rows beside it: {rendered}"
+    );
+}
+
 /// The relay pressure counters reach the operator surface:
 /// saturation recoveries print on the mailbox line (singular and
 /// plural), and a zero count stays silent like the other clauses.

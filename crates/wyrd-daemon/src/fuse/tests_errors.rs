@@ -1,11 +1,13 @@
 use super::backend::{errno_of, mutation_errno, RequestLog};
 use super::tests_harness::{backend, evolving_backend};
 
+use std::sync::Arc;
+
 use fuser::FileHandle;
 
 use wyrd_fuse::ViewError;
 
-use wyrd_core::mutation::MutationError;
+use wyrd_core::mutation::{MutationError, MutationKind, MutationOutcome, MutationQueue};
 
 use wyrd_format::{ContentId, StoreFailure};
 
@@ -124,6 +126,73 @@ fn request_log_records_the_reply_errno() {
 
     let clean = RequestLog::new("statfs");
     assert_eq!(clean.err.get(), None);
+}
+
+/// A subscriber that disables everything: the shape of the
+/// mount's default `info` filter from the probe's point of view —
+/// `tracing::enabled!(DEBUG)` is false under it.
+struct Disabled;
+
+impl tracing::Subscriber for Disabled {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The probe reads the queue backlog only when the drop log can
+/// fire: under a disabled subscriber the lock is never taken even
+/// with a nonzero backlog, so reads at the default level cost one
+/// enabled-check and nothing else.
+#[test]
+fn probe_skips_the_queue_lock_below_debug() {
+    let mut backend = backend();
+    let queue = Arc::new(MutationQueue::default());
+    let submitter = {
+        let queue = Arc::clone(&queue);
+        std::thread::spawn(move || {
+            queue.submit(MutationKind::Mkdir {
+                path: "queued".into(),
+            })
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while queue.queue_depth() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the submission never queued"
+        );
+        std::thread::yield_now();
+    }
+    backend.mutations = Some(Arc::clone(&queue));
+
+    tracing::subscriber::with_default(Disabled, || {
+        let log = backend.probe("read");
+        assert_eq!(log.depth.get(), 0, "no backlog read where no log can fire");
+    });
+    let capture = Capture::default();
+    tracing::subscriber::with_default(capture, || {
+        let log = backend.probe("read");
+        assert_eq!(log.depth.get(), 1, "the parked backlog is visible");
+    });
+
+    let mut batch = queue.take_batch();
+    batch.record(0, Ok(MutationOutcome::Done));
+    batch.finish();
+    assert!(submitter.join().is_ok());
 }
 
 /// A capturing subscriber for probe-line assertions: records each

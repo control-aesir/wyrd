@@ -300,6 +300,9 @@ fn sustained_spam_commits_bounded_facts_per_pass_and_converges() {
     // the next pass — paced, never dropped.
     assert_eq!(report.accepted, 512);
     assert_eq!(report.deferred, 51);
+    assert_eq!(report.deferred_shed, 51, "budget shed is shed");
+    assert_eq!(report.deferred_unseen, 0);
+    assert_eq!(report.deferred_status_blocked, 0);
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.announcements.len(), 509);
     // Nothing was lost: the next pass converges everything deferred.
@@ -356,6 +359,9 @@ fn per_sender_quota_keeps_one_spammer_from_starving_others() {
     // never starved.
     assert_eq!(report.accepted, 133);
     assert_eq!(report.deferred, 72);
+    assert_eq!(report.deferred_shed, 72, "quota shed is shed");
+    assert_eq!(report.deferred_unseen, 0);
+    assert_eq!(report.deferred_status_blocked, 0);
     let facts = fixture.engine.store.load().expect("loads");
     assert_eq!(facts.announcements.len(), 133);
     for id in &honest_ids {

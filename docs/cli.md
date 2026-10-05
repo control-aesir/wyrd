@@ -310,10 +310,13 @@ sync now
   The intake clause splits deferred holds by cause (`unseen`,
   `status-blocked`, `shed`), the fetch clause counts sends, and a
   `write path` section reports the local durability load beside the
-  sync load: snapshots authored with their per-minute rate, the
+  sync load: mutation-seam snapshots authored with their per-minute rate, the
   per-source share (mkdir, create-file, commit-file, append-file,
   unlink, rmdir, rename, set-attrs, fold — variant classes, never
-  paths), and admission-to-commit latency (mean and max). The
+  paths), and admission-to-commit latency (mean and max). Mutation-seam
+  only: direct engine authoring (intake commits) bypasses the traced
+  seam the counter sits on, so the count is the write path's, not
+  every snapshot the drive produced. The
   mailbox line names saturation recoveries beside closed
   subscriptions and recovery attempts.
   At most 32 passes: a peer that keeps intake non-idle forever

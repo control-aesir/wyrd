@@ -260,7 +260,7 @@ pub(super) struct RequestLog {
     opcode: &'static str,
     start: Instant,
     pub(super) err: std::cell::Cell<Option<i32>>,
-    depth: std::cell::Cell<usize>,
+    pub(super) depth: std::cell::Cell<usize>,
 }
 
 impl RequestLog {
@@ -310,14 +310,24 @@ impl<S: ObjectStore, M: Materialization> FuseBackend<S, M>
 where
     S::Error: std::fmt::Debug,
 {
-    fn probe(&self, opcode: &'static str) -> RequestLog {
+    pub(super) fn probe(&self, opcode: &'static str) -> RequestLog {
         let log = RequestLog::new(opcode);
-        log.set_depth(
-            self.mutations
-                .as_ref()
-                .map(|queue| queue.queue_depth())
-                .unwrap_or(0),
-        );
+        // The backlog read takes the queue lock, so it happens only
+        // when the drop log can fire: at the default `info` level a
+        // dispatch costs one enabled-check and no lock, exactly the
+        // cost model `RequestLog::new` documents.
+        // The backlog read takes the queue lock, so it happens only
+        // when the drop log can fire: at the default `info` level a
+        // dispatch costs one enabled-check and no lock, exactly the
+        // cost model `RequestLog::new` documents.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            log.set_depth(
+                self.mutations
+                    .as_ref()
+                    .map(|queue| queue.queue_depth())
+                    .unwrap_or(0),
+            );
+        }
         log
     }
 }

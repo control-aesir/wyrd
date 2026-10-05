@@ -1972,32 +1972,40 @@ fn sync_now_render(report: &SyncRunReport) -> String {
     // Local durability load beside sync load: the run's passes above
     // say what the network did; these lines say what the disk did.
     // Sources are variant classes, never paths — the `Debug` impls
-    // render paths, and this surface must not inherit that.
+    // render paths, and this surface must not inherit that. The
+    // section is absent when nothing authored: three rows of zeros
+    // would read as a measured idle, and quiet should look quiet.
+    // The rate's denominator is the queue lifetime (run length for
+    // `sync now`, process lifetime on a mount), printed beside the
+    // rate so a lifetime average is never misread as a recent one.
     let write = &report.write;
-    out.push_str(&format!(
-        "write path: {} snapshots ({:.1} per min)\n",
-        write.snapshots,
-        write.snapshots_per_minute(),
-    ));
-    out.push_str(&format!(
-        "write sources: mkdir {} create-file {} commit-file {} append-file {} unlink {} rmdir {} rename {} set-attrs {} fold {}\n",
-        write.mkdir,
-        write.create_file,
-        write.commit_file,
-        write.append_file,
-        write.unlink,
-        write.rmdir,
-        write.rename,
-        write.set_attrs,
-        write.fold,
-    ));
-    out.push_str(&format!(
-        "write latency: admission-to-commit mean {}us max {}us over {} commits ({} failures)\n",
-        write.commit_latency_us_mean(),
-        write.commit_latency_us_max,
-        write.commits,
-        write.failures,
-    ));
+    if write.snapshots > 0 {
+        out.push_str(&format!(
+            "write path: {} snapshots ({:.1} per min over {:.1}s)\n",
+            write.snapshots,
+            write.snapshots_per_minute(),
+            write.started.elapsed().as_secs_f64(),
+        ));
+        out.push_str(&format!(
+            "write sources: mkdir {} create-file {} commit-file {} append-file {} unlink {} rmdir {} rename {} set-attrs {} fold {}\n",
+            write.mkdir,
+            write.create_file,
+            write.commit_file,
+            write.append_file,
+            write.unlink,
+            write.rmdir,
+            write.rename,
+            write.set_attrs,
+            write.fold,
+        ));
+        out.push_str(&format!(
+            "write latency: admission-to-commit mean {}us max {}us over {} commits ({} failures)\n",
+            write.commit_latency_us_mean(),
+            write.commit_latency_us_max,
+            write.commits,
+            write.failures,
+        ));
+    }
     match report.outcome {
         // A degraded or unobserved mailbox downgrades both quiet
         // verdicts: the local state converged, but intake may have

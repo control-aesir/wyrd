@@ -1561,7 +1561,7 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
-                    CommitSource::Mkdir,
+                    CommitSource::from(kind),
                     &self.mutations,
                 )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
@@ -1582,7 +1582,7 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
-                    CommitSource::CreateFile,
+                    CommitSource::from(kind),
                     &self.mutations,
                 )?;
                 Ok(outcome)
@@ -1600,7 +1600,7 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
-                    CommitSource::CommitFile,
+                    CommitSource::from(kind),
                     &self.mutations,
                 )?;
                 Ok(outcome)
@@ -1620,7 +1620,7 @@ where
                         &*self.store.read().map_err(|_| MutationError::Lock)?,
                         root,
                         &heads,
-                        CommitSource::AppendFile,
+                        CommitSource::from(kind),
                         &self.mutations,
                     )?;
                 }
@@ -1635,7 +1635,7 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
-                    CommitSource::Unlink,
+                    CommitSource::from(kind),
                     &self.mutations,
                 )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
@@ -1650,7 +1650,7 @@ where
                     &*self.store.read().map_err(|_| MutationError::Lock)?,
                     root,
                     &heads,
-                    CommitSource::Rmdir,
+                    CommitSource::from(kind),
                     &self.mutations,
                 )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
@@ -1667,7 +1667,7 @@ where
                         &*self.store.read().map_err(|_| MutationError::Lock)?,
                         root,
                         &heads,
-                        CommitSource::Rename,
+                        CommitSource::from(kind),
                         &self.mutations,
                     )?;
                     self.invalidate_parent_for_namespace_mutation(kind);
@@ -1685,7 +1685,7 @@ where
                         &*self.store.read().map_err(|_| MutationError::Lock)?,
                         root,
                         &heads,
-                        CommitSource::SetAttrs,
+                        CommitSource::from(kind),
                         &self.mutations,
                     )?;
                 }
@@ -2288,6 +2288,8 @@ where
                 &*store,
                 evolving,
                 &heads,
+                // The seam's own class: a fold has members, not one
+                // kind to project, so the literal stays.
                 CommitSource::Fold,
                 &self.mutations,
             )?;

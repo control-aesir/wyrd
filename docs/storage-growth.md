@@ -210,16 +210,229 @@ availability is explicitly called out as "not a confidentiality break" —
 but nothing lets a peer or vault decline to retain what an authorized
 member authored. One member can force unbounded growth on every other
 member and on every vault, at a cost to the attacker that is one signing
-key and a tight loop. Adding a peer refusal right would change the
-authorization contract, so it is recorded as an open question below
-rather than decided here.
+key and a tight loop. The refusal right is decided in the Retention
+and refusal contract below (an authorization change, `trust.md` T18),
+which names the bound, its two enforcement points, its refusal
+semantics, and who bears the cost.
+
+## Retention and refusal contract (decided, DG-4)
+
+Open question 1 below is decided here; the question list keeps it as
+the pointer. A serving member or a vault **may decline to admit what
+an authorized member authored (A), or decline to serve, advertise,
+or hold as residency what it already holds (B)**. The refusal right
+is an authorization change (`trust.md` T18), not a resource limit:
+membership implies the right to read, never the duty to retain.
+
+The decision splits the old option 1 by enforcement point and takes
+both halves. Every option as first stated was framed at the serving
+boundary, which is the error this split corrects: a refusal taken at
+the serving boundary happens **after** the bytes are already in the
+append-only local store, so it bounds what a peer **promises**, not
+what it **stores**. Physical bytes and provider residency are
+different things — the store cannot un-hold bytes, so only a
+pre-admission gate bounds disk, while only a residency refusal bounds
+what the peer claims and serves. The two quantities need different
+points, and they are one decision because neither works without the
+other: a pre-admission gate is the only thing that bounds disk, and a
+residency refusal with no admission gate behind it bounds nothing physical.
+
+| | Quantity | Enforcement point | Bounds | Status |
+|---|---|---|---|---|
+| **A — storage admission** | bytes admitted to the local immutable store | at fetched-representation admission: the `Vault::import` calls in the `runtime/fetch/mod.rs` root, child, and object legs plus the snapshot-body import in the plan layer (`runtime/plan/mod.rs`), where an import failure is already a local refusal (`FetchOutcome::Local`), never a committed advertisement. Refused bytes are never stored by this device at all | disk | decided, unimplemented — the receive path is unbounded today |
+| **B — provider residency** | objects/bytes held as *servable*, i.e. advertised as residency | two faces (see below): on the authoring device, after local durability before announcement (`write-path.md` steps 5–6: servable at 5, obligation discharged at 6); on a peer holding received content, at its own serving-mirror admission and serving maps. The bytes are already in this device's store — the refusal is about residency, not storage: durably accepted bytes the peer declines to make resident/servable under current local policy | what this peer promises | decided, unimplemented — today's mirror bounds are transient backpressure, not policy |
+
+**B has two faces because only authors announce.** On the authoring
+device the point is the steps 5–6 barrier: the announcement obligation
+stays recorded and ineligible until serving residency is flushed, so a
+residency refusal withholds discharge without touching the commit. A
+peer holding received content has no step 6 to withhold — announcements
+are the author's, and v0 has no replication serving
+(`transport/routes.rs`: routes publish only from announcements'
+`node_addr`). Its gate is its own mirror admission: the vault-to-mirror
+write-through on `Vault::import`, and the boot rebuild, admit
+only residency the ceiling allows, and the serving maps offer only
+recorded-as-servable state (`VaultSource::from_state`: "Only recorded
+state serves"). Obligations 1–2 are enforced there, not at an
+announcement barrier the peer does not have. A B refusal at the mirror
+gate is non-fatal to the fetch leg: unlike an import failure, it
+neither aborts the leg nor rolls back the already-durable vault file —
+only the serving record is withheld. The "charged" half holds where
+the accountant sees the bytes, which today is the object leg alone
+(only the plaintext insert charges `RetainedBytes`): body and manifest
+bytes land in the vault retained but untallied, so the peer-side
+ceiling cannot be evaluated on those legs until the counting gap is
+closed, and no boot-time re-derivation can read them without the
+durable refusal state the follow-up provides.
+
+The gate covers the full structural closure the peer pulls — snapshot
+body, root and child manifests, tree nodes — not only file-content
+chunks: that closure is the amplification, and a chunk-only gate would
+pass every acceptance criterion below while missing the adversary. On
+the object leg the gate precedes both writes — the ciphertext import
+and the plaintext object-store insert — since only the insert charges
+the accountant, so refused bytes reach neither. Gate position decides
+what is refused; what the ceiling can consult is decided by the
+counter gap above.
+
+The rejected options stay rejected for v0.3:
+
+- **Eviction under pressure is refused.** Eviction creates a second
+  question — "was this object merely locally evicted, or is this peer
+  still a provider?" — which infects provider knowledge, repair,
+  availability, pinning, and eventually GC. Accept-or-refuse has no
+  such ambiguity, and eviction trades against the recovery property
+  that motivates the append-only store.
+- **Unbounded growth is refused as the contract.** Acceptable as an
+  implementation policy for a trusted local store; not as the
+  universal meaning of "peer" or "vault". A mitigation with a GC-tied
+  expiry belongs to the GC design, not to this contract.
+
+**The bound** is a per-device retained-byte ceiling: what is capped is
+retained bytes on one device, at device granularity, and what it is
+*not* is per-drive, per-member-set, or per-promise accounting — the
+device scope is the conservative choice and the only one that needs no
+membership state at the write boundary. The ceiling's number is
+operational (like every budget in `resource-limits.md`); the *right*
+to refuse at it is authorization (T18).
+
+**Refusal semantics.** A retention refusal must never masquerade as
+successful replication, and it cannot invalidate already-durable local
+content. In particular B is not "received it and then lost it": it is
+"durably accepted bytes this peer declines to make resident/servable
+under current local policy." Three negative obligations, each needing
+a negative test in the implementation follow-up:
+
+1. A refused offer creates **no provider claim**: the refusing peer
+   does not record, project, or report itself
+   as a provider for that identity.
+2. A refused offer satisfies **no serving request**: it must not
+   appear as a route that resolves.
+3. A refused offer advances **no announcement**: no announcement may
+   carry a `node_addr` whose serving residency does not hold the
+   announced representation — the barrier's existing job
+   (`write-path.md` step 5; the `ServingBarrier` trait in
+   `crates/wyrd-core/src/live.rs`), true of a refusal as of a slow
+   mirror. The author's commit stands regardless: later-stage failure
+   never rolls back earlier durable state, so refusing to
+   retain or advertise does not un-commit the author's snapshot.
+
+And the converse, which is the semantic invariant tying the other
+three together and what makes the refusal safe to grant: a refusal
+must also not *look* like content loss. "This peer did not
+retain your object" and "your object is gone" are different statements,
+and the operator surface must not conflate them, or the refusal right
+becomes indistinguishable from corruption. After a refusal no other
+node may infer "this provider had the content and subsequently lost
+it": the refusing device's own state says, in effect, "this content
+was refused for residency under local policy" — never damage, never
+absence. Refused content therefore never enters loss/repair paths as
+lost; retention policy cannot contaminate the existing loss semantics.
+No refusal is reported as a transient fetch failure, a quiet absence,
+or a successful replication.
+There is no control-plane refusal signal in v0.3: a retention refusal
+is a local policy outcome, not a peer-visible protocol event. A "peer
+X declined your content" message is an enumeration channel and a
+pressure surface, and building it in the milestone that grants the
+right is backwards. Refusal is local and silent on the wire; the
+operator reads it locally — the implementation reports the ceiling
+that caused a refusal from `wyrd cache policy`, alongside the
+reachable-content census and effective budgets it already shows.
+
+**Who bears the cost.** The author bears its own disk (the local quota)
+and its own fsync and announcement cost. The two halves split on what
+the refuser already holds:
+
+- A — nothing stored, nothing paid: refused bytes are never admitted,
+  so the refuser's disk is untouched and the bytes are
+  charged nowhere on it.
+- B — stored and charged permanently, not advertised: the bytes are
+  already in the refuser's append-only store with no GC to reclaim
+  them, so they stay charged to its retained bytes; what the refuser
+  does not bear is the residency — no mirror work, no promise, no
+  serving. An implementer counts B-refused bytes
+  as retained, not as absent.
+
+In both halves the availability of refused content rests with the
+author and the peers that did accept it — which is why the refusal can
+never strand an author (the author's commit and obligation are intact)
+nor censor a member (what a member is entitled to read stays readable
+from a holder).
+
+**Compatibility impact.** None on the persistent format and none on
+the wire in v0.3: a refusal creates no durable `Fact` and no protocol
+message, so drives written before this contract open unchanged and
+peers that never refuse interoperate byte-for-byte with peers that do.
+Ceilings default to unset (unlimited), so existing deployments behave
+exactly as before until an operator opts in. The contract constrains
+the follow-up's mechanism, not today's bytes.
+
+**Interaction with the local quota.** The per-device
+`retained_bytes_quota` and a serving-boundary ceiling are different
+ceilings and must not be conflated in `wyrd cache policy`'s output: the
+quota bounds the author's own commits before their first write
+(`LiveNode::enforce_retained_quota`, ahead of every arm of
+`apply_mutation` in `crates/wyrd-core/src/live.rs`); the refusal
+ceilings bound what a device accepts from others and what it promises
+to serve. Until the receive path enforces A, the interference channel
+stands as documented: a remote author can spend a peer's local-write
+headroom by authoring content, because fetched bytes charge the
+accountant with no ceiling in scope.
+
+**Prerequisite, not follow-up.** `RetainedBytes`
+(`crates/wyrd-format/src/store.rs`) has `add` and `get` and no
+decrement. Once A is enforced that is a correctness bug — a scrubbed
+or quarantined object keeps its charge forever, so the store would
+eventually refuse everything it is offered. A decrement, or an
+authoritative recomputation, lands with A's enforcement, not after it.
+B carries two prerequisites of its own, alongside A's decrement: a
+counter that sees vault bytes — beside the mirror accounting in
+`wyrd-sync`, where ciphertext already lives, rather than as a widened
+`wyrd-format` `RetainedBytes`, which the plaintext-world split reserves
+for plaintext accounting; the follow-up confirms the home — since body
+and manifests are retained but untallied today, so the peer-side ceiling
+has nothing to consult on those legs; and durable refusal state the
+boot rebuild can consult (the rebuild cannot distinguish "refused for
+residency" from "never seen" without it).
+
+**Acceptance criteria** (for the implementation follow-up, which this
+contract unblocks rather than contains):
+
+- `a_serving_refusal_creates_no_provider_claim`: at its ceiling, a
+  peer declines an offer; no route resolves, no status output names it
+  a provider, no announcement carries a dialable address for it. On a
+  peer holding received content, the refused representation additionally
+  never reaches its serving mirror or its serving maps.
+- `a_serving_refusal_leaves_the_author_commit_intact`: the author's
+  snapshot is durable, its heads advanced, its outbox discharged —
+  steps 1–4 and 6 unaffected.
+- `a_serving_refusal_never_advances_an_announcement`: with the
+  barrier installed and residency refused, the obligation stays
+  recorded and ineligible — the ceiling case of the backpressure shape
+  `a_full_mirror_queue_applies_backpressure_without_losing_the_vault`
+  already pins.
+- `a_refusal_is_not_reported_as_content_loss`: the operator surface
+  distinguishes "declined at the ceiling" from "unavailable" and from
+  "corrupt", and the refusing device records the refusal as local
+  policy — refused content never enters loss/repair paths as lost.
+- The local-quota interaction: a device with both ceilings reports two
+  distinct numbers, and the local ceiling's handle semantics (buffer
+  lost, `EIO` thereafter) are unchanged.
+- `wyrd cache policy` shows the ceiling that caused a refusal.
+
+**Dependents unblocked.** The control-message reconciliation decision
+takes its requirements against this model without waiting for the
+accounting implementation; what a vault role promises is downstream of
+it; the retention accounting itself (open question 2) is downstream
+implementation, Ring 3.
 
 ## Pre-GC bounds: what could be enforced
 
-One bound here is implemented: the per-device retained-bytes quota. The
-rest are the record of which candidates were screened out, so the GC
-design starts from a settled list rather than re-testing rejected
-options.
+One bound here is implemented: the per-device retained-bytes quota. Two
+more are decided but not yet enforced (the A and B refusal ceilings
+above). The rest are the record of which candidates were screened out,
+so the GC design starts from a settled list rather than re-testing
+rejected options.
 
 Enforcement must not contradict the durability contract. Three of the
 obvious candidates fail that test, and the fourth is deferred:
@@ -235,7 +448,7 @@ obvious candidates fail that test, and the fourth is deferred:
   observed and reported.
 - **Vault pinning limits are not screened separately**, because any form
   of them — a cap on what a vault will hold for one drive — *is* the
-  retention refusal right below, wearing a different name. It inherits
+  retention refusal right above, wearing a different name. It inherits
   that decision rather than pre-empting it.
 
 One candidate survives, and it is the only pre-GC bound that reuses an
@@ -347,17 +560,18 @@ handles, not just the write in hand.
 ## Open questions
 
 1. **Do serving members and vaults get a retention refusal right?**
-   This is the only pre-GC bound that limits the *author*, and it is a
-   `trust.md` authorization change, not a resource-limit change:
-   membership currently implies unbounded retention. The eager
-   structural pull is what makes this sharp — a peer cannot opt out of
-   retaining the manifests and tree nodes of every announcement it
-   accepts, and it has no way to express "materialize the content but
-   not the shape". Options are a per-drive byte ceiling with `ENOSPC` at
-   the serving boundary, an eviction-under-pressure rule (which trades
-   against the recovery property that motivates the append-only store),
-   or accepting unbounded peer growth until GC. Not decided here.
-2. **Quota accounting still open.** The refusal point shipped as
+   **Decided: yes** — see the Retention and refusal contract above,
+   and `trust.md` T18 for the authorization half. The contract splits
+   the old option 1 by enforcement point and takes both halves (A:
+   pre-admission gate on the receive path; B: provider-residency
+   refusal after durability, before announcement); eviction under
+   pressure and unbounded-growth-as-contract are refused for v0.3.
+   What remains is implementation: neither ceiling is enforced yet.
+   A waits on the `RetainedBytes` decrement-or-recomputation; B on a
+   receiving peer waits on the counting gap and the durable refusal
+   state above. The question entry stays as the pointer; the contract
+   is the answer.
+2. **Quota accounting still open.** The quota's refusal point shipped as
    decided above: before the commit's first write to disk, so a refused
    commit retains nothing. What the implementation leaves open, and
    what a follow-up should settle:
@@ -370,10 +584,11 @@ handles, not just the write in hand.
    - **Refusing the unrefused paths.** Fetched objects cross the quota
      with no ceiling in scope, which is what turns a local quota into the
      interference channel above. Whether a peer may decline to retain is
-     open question 1 and a `trust.md` decision; until it is made, the
-     honest options are a fetch-side refusal (new protocol surface) or
-     documenting the interference and leaving the quota to local-write
-     protection only.
+     decided in the contract above (open question 1, `trust.md` T18):
+     the fetch-side refusal is local policy at the admission points
+     named there, not a new protocol surface — there is no wire refusal
+     signal in v0.3 — and until it is enforced the interference stands
+     as documented, leaving the quota to local-write protection only.
    - **In-flight accounting.** The check compares bytes already
      retained, so the effective ceiling is the quota plus whatever the
      next admitted commit retains. A stricter reading would reserve the
@@ -391,8 +606,10 @@ handles, not just the write in hand.
 
 Tracked by the two follow-ups raised with this document:
 `protocol(storage): decide whether peers and vaults get a retention
-refusal right` (open question 1) and `feat(storage): per-device
-retained-bytes quota at the commit durability boundary` (open question
-2). The quota issue's title predates the refusal point being settled
-above and names the durability boundary; the title is not the decision —
+refusal right` (open question 1, now decided by the contract above;
+its enforcement is the implementation follow-up) and `feat(storage):
+per-device retained-bytes quota at the commit durability boundary`
+(open question 2). The quota issue's title predates the refusal point
+being settled above and names the durability boundary; the title is not
+the decision —
 read that issue together with this section before implementing it.

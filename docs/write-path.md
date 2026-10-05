@@ -486,11 +486,13 @@ state visible when the FUSE syscall began.
 A directory rename rebinds the moved directory's own inode on both
 mounts, and fresh path lookups under the new prefix work immediately.
 Pre-opened handles to *descendants* keep addressing the old path: the
-v0 inode table rebinds the exact source mapping only, so a descendant
-handle opened before the rename goes `ENOENT` on its next path
-operation instead of silently following the subtree. Following renamed
-subtrees through open handles is a presentation-layer feature v0 does
-not claim.
+v0 inode table rebinds the exact source mapping only. Under folding a
+descendant handle's buffered bytes are applied pre-rename and ride the
+subtree to the new path — a deterministic outcome, not an ordering
+race — but the handle itself cannot follow: its post-commit re-pin
+fails, so the handle goes terminal `EIO` on its next operation rather
+than serving the moved bytes. Following renamed subtrees through open
+handles is a presentation-layer feature v0 does not claim.
 
 ## The commit pipeline and durability ordering
 

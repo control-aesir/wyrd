@@ -213,6 +213,11 @@
 //!     commit-forcing event's whole pending set plus itself authors a
 //!     single snapshot whose tree equals the final coherent state
 //!     (`docs/write-path.md`, DG-1).
+//! 46. `conflicted_drive_restores_fold_members_retryable` — a
+//!     conflicted drive refuses a fold with members and restores them:
+//!     nothing commits, the forcing handle goes terminal like any
+//!     refused commit, and every other buffered handle stays dirty and
+//!     usable (`docs/write-path.md`, DG-1 rule 6).
 
 #[cfg(test)]
 mod egress_contracts;

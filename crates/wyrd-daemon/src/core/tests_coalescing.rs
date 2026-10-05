@@ -206,10 +206,12 @@ fn debounce_save_workload_commits_one_snapshot_per_save() {
     teardown(drive);
 }
 
-/// `fsync` on a handle whose path has no pending data anywhere is a
-/// no-op that commits nothing, while a dirty handle still forces.
+/// `flush` is per-handle while `fsync` is per-path (DG-1 rule 3): a
+/// clean handle's `flush` never forces on another handle's behalf,
+/// but its `fsync` folds the path's pending data durable. And an
+/// `fsync` on a path with no pending data anywhere commits nothing.
 #[test]
-fn fsync_without_pending_data_commits_nothing() {
+fn flush_is_per_handle_while_fsync_is_per_path() {
     let drive = setup();
     create_empty(&drive, "a.txt");
     let ha = overwrite(&drive, "a.txt", b"AAA");
@@ -220,16 +222,26 @@ fn fsync_without_pending_data_commits_nothing() {
     assert_eq!(
         generation(&drive) - before,
         0,
-        "a clean handle never forces on another handle's behalf"
+        "a clean handle's flush never forces on another handle's behalf"
     );
 
-    drive.backend.commit_handle(ha).unwrap();
+    drive.backend.fsync_handle(hb).unwrap();
     assert_eq!(
         generation(&drive) - before,
         1,
-        "the dirty handle still forces its own snapshot"
+        "a clean handle's fsync folds its path's pending data durable"
     );
     assert_eq!(read_all(&drive, "a.txt"), b"AAA");
+
+    // Everything is committed now: a further fsync on the path
+    // commits nothing.
+    drive.backend.fsync_handle(hb).unwrap();
+    drive.backend.fsync_handle(ha).unwrap();
+    assert_eq!(
+        generation(&drive) - before,
+        1,
+        "an fsync on a path with no pending data anywhere commits nothing"
+    );
 
     drive.backend.release_handle(ha).unwrap();
     drive.backend.release_handle(hb).unwrap();
@@ -517,6 +529,31 @@ fn release_of_a_dirty_handle_folds_other_pending_writes() {
         "the folded handle is clean: its own forcing call is a no-op"
     );
     drive.backend.release_handle(hb).unwrap();
+    teardown(drive);
+}
+
+/// Releasing a dirty append handle folds like any dirty close: the
+/// buffered append sequence commits onto the current end in its own
+/// snapshot.
+#[test]
+fn release_of_a_dirty_append_handle_commits_its_sequence() {
+    let drive = setup();
+    create_empty(&drive, "a.txt");
+    let ha = drive
+        .backend
+        .open_write("a.txt", libc::O_WRONLY | libc::O_APPEND)
+        .unwrap();
+    drive.backend.write_handle(ha, 0, b"tail").unwrap();
+
+    let before = generation(&drive);
+    drive.backend.release_handle(ha).unwrap();
+    assert_eq!(
+        generation(&drive) - before,
+        1,
+        "a dirty append close commits its sequence"
+    );
+    assert_eq!(read_all(&drive, "a.txt"), b"tail");
+
     teardown(drive);
 }
 

@@ -1377,12 +1377,24 @@ where
     /// commit retains — one commit's worth, not zero, and nothing on the
     /// fetch path to bound it.
     fn enforce_retained_quota(&self) -> Result<(), MutationError> {
+        self.enforce_retained_quota_with(0)
+    }
+
+    /// The retention ceiling with a conservative estimate of incoming
+    /// bytes added: a fold's gate covers the aggregate of the whole
+    /// pending set before the commit's first write
+    /// (`docs/write-path.md`, rule 6), not just the bytes already
+    /// retained. The estimate over-counts by construction — full
+    /// content lengths, while dedup and chunking only reduce what the
+    /// store keeps — so a fold admitted here can still only overshoot
+    /// by less than the estimate, never by an unbounded backlog.
+    fn enforce_retained_quota_with(&self, estimate: u64) -> Result<(), MutationError> {
         let (Some(limit), Some(retained)) =
             (self.budgets.retained_bytes_quota, &self.retained_bytes)
         else {
             return Ok(());
         };
-        if retained.get() >= limit {
+        if retained.get().saturating_add(estimate) >= limit {
             // StorageFull is the classification that already means "full
             // disk" to every reader of this store, and it reaches the
             // mount as ENOSPC — so a quota reads as the smaller disk it
@@ -1390,6 +1402,23 @@ where
             return Err(MutationError::Store(StoreFailure::StorageFull));
         }
         Ok(())
+    }
+
+    /// Conservative new-retention estimate for one fold member: full
+    /// content lengths for content rewrites, the target size for a
+    /// truncating `setattr`, zero for namespace operations and creates
+    /// (tree-node bytes are below the estimate's precision, matching
+    /// the single-mutation path, which estimates nothing at all).
+    fn member_retention_estimate(kind: &MutationKind) -> u64 {
+        match kind {
+            MutationKind::CommitFile { content, .. } | MutationKind::AppendFile { content, .. } => {
+                content.len() as u64
+            }
+            MutationKind::SetAttrs {
+                size: Some(target), ..
+            } => *target,
+            _ => 0,
+        }
     }
 
     /// An empty tree for headless authoring: the same bootstrap the
@@ -1988,7 +2017,12 @@ where
                 None => return Err(MutationError::Conflicted { heads: heads.len() }),
             }
         }
-        if let Err(error) = self.enforce_retained_quota() {
+        if let Err(error) = self.enforce_retained_quota_with(
+            members
+                .iter()
+                .map(|member| Self::member_retention_estimate(&member.kind))
+                .fold(0u64, |sum, estimate| sum.saturating_add(estimate)),
+        ) {
             // The aggregate gate covers the whole pending set before
             // the commit's first write: forced members stay retryable,
             // unforced members fail — a shutdown drain cannot restore.

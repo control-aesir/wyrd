@@ -139,6 +139,37 @@ impl WriteBudget {
         }
     }
 
+    /// Reserve transient fold-submission memory: a fold of B buffered
+    /// bytes holds ~2B while the submission is in flight (the taken
+    /// images plus their queue-kind clones, plus one restore clone per
+    /// restored member at settle). Only the aggregate bound applies —
+    /// a fold has no per-handle key — so this is the honest
+    /// counterpart to [`reserve`](Self::reserve) for memory the
+    /// handles' own reservations do not cover. Refusal leaves the
+    /// budget unchanged; the caller restores the taken images and
+    /// reports the pressure instead of submitting unaccounted.
+    pub fn reserve_fold(&self, bytes: usize) -> Result<FoldLease<'_>, BudgetError> {
+        let mut state = self.lock()?;
+        let adjusted = state.total.saturating_add(bytes);
+        if adjusted > self.aggregate {
+            return Err(BudgetError::Aggregate);
+        }
+        state.total = adjusted;
+        Ok(FoldLease {
+            budget: self,
+            bytes,
+        })
+    }
+
+    /// Release transient fold-submission memory. Called by the
+    /// lease's [`Drop`]; the saturating arithmetic keeps a logic
+    /// error in lease scope from taking the aggregate negative.
+    fn release_fold(&self, bytes: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.total = state.total.saturating_sub(bytes);
+        }
+    }
+
     /// Introspection for providers and tests: the aggregate buffered bytes.
     pub fn total(&self) -> usize {
         self.lock().map(|state| state.total).unwrap_or(0)
@@ -152,6 +183,22 @@ impl WriteBudget {
 
     fn lock(&self) -> Result<MutexGuard<'_, BudgetState>, BudgetError> {
         self.state.lock().map_err(|_| BudgetError::Lock)
+    }
+}
+
+/// A transient fold-submission reservation: releases its bytes back
+/// to the [`WriteBudget`] aggregate on drop, so no settle path can
+/// leak the accounting. The backend holds it across the submit and
+/// the settle; creating it is the only way to hold accounted fold
+/// memory.
+pub struct FoldLease<'a> {
+    budget: &'a WriteBudget,
+    bytes: usize,
+}
+
+impl Drop for FoldLease<'_> {
+    fn drop(&mut self) {
+        self.budget.release_fold(self.bytes);
     }
 }
 

@@ -1762,3 +1762,87 @@ fn lone_forcer_fold_matches_its_single_mutation() {
     assert_ne!(tree, root, "the snapshot carries the mutation");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A fold whose member needs remote content defers the whole fold:
+/// nothing applies, nothing authors, and the pinned retry applies
+/// the entire fold as one snapshot once the content lands.
+#[test]
+fn fold_defers_for_remote_content_and_retries_pinned() {
+    let (engine, dir, mut store, chunk, root, head) = scratch_file_drive("fold-need");
+    // The tree resolves; the chunk does not.
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let base = head.snapshot().snapshot_id();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let revision = node.engine.current();
+    let fold = MutationKind::Fold {
+        members: vec![
+            FoldMember {
+                kind: MutationKind::AppendFile {
+                    path: "f".into(),
+                    content: b"more".to_vec(),
+                },
+                forcer: false,
+            },
+            FoldMember {
+                kind: MutationKind::Mkdir { path: "d".into() },
+                forcer: true,
+            },
+        ],
+    };
+    // The append member names the missing chunk: the whole fold
+    // defers for a pinned retry, like any single mutation.
+    let error = node.apply_mutation(&fold, None).unwrap_err();
+    assert_eq!(
+        error,
+        MutationError::NeedContent {
+            chunk,
+            base: Some(base),
+        }
+    );
+    assert_eq!(
+        node.engine.current(),
+        revision,
+        "a deferred fold authors nothing"
+    );
+    // The content lands (same bytes, same identity); the pinned retry
+    // applies the entire fold as one snapshot.
+    node.store
+        .write()
+        .unwrap()
+        .insert(ObjectKind::Chunk, b"remote-base")
+        .unwrap();
+    let outcome = node
+        .apply_mutation(&fold, Some(base))
+        .expect("the pinned retry applies");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(forcer),
+            members,
+        } => {
+            assert!(
+                matches!(*forcer, MutationOutcome::Done),
+                "the namespace forcer reports its own outcome: {forcer:?}"
+            );
+            assert_eq!(
+                members.len(),
+                1,
+                "one disposition for the non-forcing member: {members:?}"
+            );
+            assert!(
+                matches!(members[0], FoldDisposition::Committed(_)),
+                "the append member commits into the one snapshot: {members:?}"
+            );
+        }
+        other => panic!("a pinned retry applies the whole fold, saw {other:?}"),
+    }
+    assert_eq!(
+        node.engine.current(),
+        revision + 1,
+        "the retry authors exactly one snapshot"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

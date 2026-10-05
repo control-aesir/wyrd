@@ -255,7 +255,11 @@ on `Vault::import` and the boot rebuild admit
 only residency the ceiling allows, and the serving maps offer only
 recorded-as-servable state (`VaultSource::from_state`: "Only recorded
 state serves"). Obligations 1–2 are enforced there, not at an
-announcement barrier the peer does not have.
+announcement barrier the peer does not have. A B refusal at the mirror
+gate is non-fatal to the fetch leg: unlike an import failure, it
+neither aborts the leg nor rolls back the already-durable vault file —
+the bytes stand charged as retained-but-not-servable, and only the
+serving record is withheld.
 
 The gate covers the full structural closure the peer pulls — snapshot
 body, root and child manifests, tree nodes — not only file-content

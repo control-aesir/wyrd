@@ -27,7 +27,7 @@ fn an_interrupted_bootstrap_resumes_on_open() {
     );
     {
         let _store = DurableStore::open(dir.path.clone(), drive, "test-pass").unwrap();
-        atomic_write(&dir.path, KEYSTORE_FILE, &custody).unwrap();
+        atomic_write_mode(&dir.path, KEYSTORE_FILE, &custody, SECRET_FILE_MODE).unwrap();
     }
 
     // Opening resumes and completes the deterministic genesis.
@@ -973,5 +973,103 @@ fn open_with_a_directory_named_keystore_writes_nothing() {
     assert!(
         !dir.path.join("store-key.wrap").exists(),
         "the refused open mints no store key"
+    );
+}
+
+// --- custody file modes ------------------------------------------------------
+// Unix-only: POSIX modes are the guarantee under test.
+
+#[cfg(unix)]
+use crate::runtime::test_util::{file_mode as mode_of, UmaskGuard};
+
+#[cfg(unix)]
+#[test]
+fn keystore_is_not_group_or_world_readable() {
+    let mut modes = Vec::new();
+    for mask in [0o000, 0o077] {
+        let _guard = UmaskGuard::set(mask);
+        let dir = TestDir::new("custody-keystore-mode");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        drop(create(dir.path.clone(), "test-pass", identity).unwrap());
+        drop(_guard);
+        let mode = mode_of(&dir.path.join(KEYSTORE_FILE));
+        assert_eq!(mode & 0o077, 0, "umask {mask:03o}: {mode:03o}");
+        modes.push(mode);
+    }
+    assert_eq!(modes[0], modes[1], "the mode is chosen, not umask-derived");
+}
+
+#[cfg(unix)]
+#[test]
+fn pairing_secret_is_not_group_or_world_readable() {
+    let mut modes = Vec::new();
+    for mask in [0o000, 0o077] {
+        let _guard = UmaskGuard::set(mask);
+        let dir = TestDir::new("custody-pairing-mode");
+        let identity = DeviceIdentitySecret::generate().unwrap();
+        pairing_request(&dir.path, "test-pass", &identity).unwrap();
+        drop(_guard);
+        let mode = mode_of(&dir.path.join(PAIRING_FILE));
+        assert_eq!(mode & 0o077, 0, "umask {mask:03o}: {mode:03o}");
+        modes.push(mode);
+    }
+    assert_eq!(modes[0], modes[1], "the mode is chosen, not umask-derived");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lost_pairing_race_leaves_the_winners_file_at_the_hardened_mode() {
+    use std::sync::Barrier;
+    let _guard = UmaskGuard::set(0o000);
+    let dir = TestDir::new("custody-pairing-race");
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    // Two concurrent stagings race the same `create_new`: exactly one
+    // wins and the loser reuses the winner's wrap. Either order must
+    // land an owner-only file.
+    let run = |dir: std::path::PathBuf, barrier: std::sync::Arc<Barrier>| {
+        std::thread::spawn(move || {
+            barrier.wait();
+            let identity = DeviceIdentitySecret::generate().unwrap();
+            for _ in 0..1000 {
+                match pairing_request(&dir, "test-pass", &identity) {
+                    Ok(request) => return request,
+                    // The winner may still be writing its wrap: retry
+                    // until the staged file is complete.
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+            panic!("pairing_request never completed against a finished winner");
+        })
+    };
+    let first = run(dir.path.clone(), barrier.clone());
+    let second = run(dir.path.clone(), barrier);
+    let (a, b) = (first.join().unwrap(), second.join().unwrap());
+    drop(_guard);
+    assert_ne!(a.device, b.device, "the two racers are distinct devices");
+    assert_eq!(
+        mode_of(&dir.path.join(PAIRING_FILE)) & 0o077,
+        0,
+        "the winner's file is owner-only under umask 000"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pairing_request_leaves_an_established_drive_directory_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = UmaskGuard::set(0o077);
+    let dir = TestDir::new("custody-pairing-established");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    drop(create(dir.path.clone(), "test-pass", identity).unwrap());
+    drop(_guard);
+    // A pre-fix drive whose directory is still group-readable: staging
+    // a pairing secret must change no directory mode.
+    std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    pairing_request(&dir.path, "test-pass", &newcomer).unwrap();
+    assert_eq!(
+        mode_of(&dir.path) & 0o777,
+        0o755,
+        "pairing-request touches no directory mode"
     );
 }

@@ -35,6 +35,8 @@
 //! [`Engine::author_snapshot`](super::engine::Engine::author_snapshot).
 
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -46,7 +48,8 @@ use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, DriveId, MembershipTran
 use super::engine::{Engine, EngineError};
 use crate::control::bootstrap::{open_bootstrap, SealedBootstrap};
 use crate::durable::{
-    atomic_write, fsync_dir, AuthorizedCapability, DurableError, DurableStore, Fact,
+    atomic_write_mode, ensure_owner_only_dir, fsync_dir, AuthorizedCapability, DurableError,
+    DurableStore, Fact, SECRET_FILE_MODE,
 };
 use crate::keys::capability::{Capability, DriveKeyring, WrappedCapability};
 use crate::keys::keystore::{
@@ -103,7 +106,7 @@ pub(super) fn create(
     );
 
     let dir_created = !dir.exists();
-    std::fs::create_dir_all(&dir)?;
+    ensure_owner_only_dir(&dir)?;
 
     // Acquire exclusive ownership before writing any drive or custody
     // state. This is the authoritative concurrency guard: the `DRIVE`
@@ -124,7 +127,7 @@ pub(super) fn create(
         // authoring can escrow each fresh epoch secret at mint time
         // (T13). Member engines never hold it.
         engine.root = Some(root);
-        atomic_write(&dir, KEYSTORE_FILE, &custody)?;
+        atomic_write_mode(&dir, KEYSTORE_FILE, &custody, SECRET_FILE_MODE)?;
         engine.commit_facts(&[Fact::Transition(genesis.clone())])?;
         engine.resync()?;
         engine.add_epoch_key(1, Zeroizing::new(epoch.control_key(&drive, 1)));
@@ -680,8 +683,13 @@ pub(super) fn write_member_custody(
     device: &DeviceId,
     wrapped: &WrappedSecret,
 ) -> Result<(), EngineError> {
-    atomic_write(dir, KEYSTORE_FILE, &encode_member_custody(device, wrapped))
-        .map_err(EngineError::Io)
+    atomic_write_mode(
+        dir,
+        KEYSTORE_FILE,
+        &encode_member_custody(device, wrapped),
+        SECRET_FILE_MODE,
+    )
+    .map_err(EngineError::Io)
 }
 
 /// A newcomer's pairing material: the device id plus the encryption
@@ -709,7 +717,7 @@ pub(super) fn pairing_request(
     passphrase: &str,
     identity: &DeviceIdentitySecret,
 ) -> Result<PairingRequest, EngineError> {
-    std::fs::create_dir_all(dir)?;
+    ensure_owner_only_dir(dir)?;
     let device = identity.device_id();
     let path = dir.join(PAIRING_FILE);
     let secret = match std::fs::read(&path) {
@@ -717,11 +725,15 @@ pub(super) fn pairing_request(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let fresh = DeviceEncryptionSecret::generate()?;
             let wrapped = wrap_device_secret(fresh.as_bytes(), passphrase)?;
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            // `create_new` is race safety (the loser reuses the
+            // winner's wrap); the explicit mode is custody safety (the
+            // file holds a passphrase-wrapped secret whatever the
+            // umask). An existing staged file keeps its mode.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(SECRET_FILE_MODE);
+            match opts.open(&path) {
                 Ok(mut file) => {
                     file.write_all(wrapped.as_bytes())?;
                     file.sync_all()?;
@@ -738,6 +750,13 @@ pub(super) fn pairing_request(
         }
         Err(error) => return Err(EngineError::Io(error)),
     };
+    // No directory restriction here: this call stages into whatever
+    // directory it is given — including an established drive's — and
+    // an established directory's mode is never this call's business.
+    // Fresh staging directories are restricted at creation by
+    // `ensure_owner_only_dir` above, and fresh drive state by the
+    // store open; both key on what they created, not on what this
+    // call staged.
     Ok(PairingRequest {
         device,
         encryption_key: secret.encryption_key(),

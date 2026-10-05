@@ -424,6 +424,20 @@ Both are read and hardened by wyrd code, never by clap:
   other (Unix). Credential handling is Unix-only.
 - Secrets never reach logs, error text, or diagnostics — stages, ids,
   errnos, and latencies only.
+- Drive custody files are created owner-only on Unix regardless of
+  umask: `store-key.wrap`, `keystore`, `pairing.secret`, and `LOCK` at
+  `0o600`, the drive directory leaf and `commits/` at no wider than
+  `0o700`, `DRIVE` at no wider than `0o644`. Modes are never loosened:
+  a replaced custody file takes the hardened mode through the rename.
+  Only the leaf directory this call creates is restricted, except that
+  establishing fresh drive state restricts the directory it is given;
+  missing parents above the leaf keep the operator's modes. Subdirectories
+  created later for operational state (`escrow/`, `vault/`, `serve/`)
+  stay umask-derived — contained by the `0o700` parent on fresh drives
+  — and are a separate hardening issue. Pre-existing files and
+  established drives are otherwise untouched — inspect a pre-fix drive
+  with `stat` (e.g. `stat -c '%a %n'` on Linux, `stat -f '%Lp %N'` on
+  macOS) and repair by hand. Non-Unix platforms get no mode guarantee.
 
 ## Diagnostics and exit codes
 

@@ -45,6 +45,8 @@ insecure-fast-kdf = []
 
 [dev-dependencies]
 proptest.workspace = true
+# umask control for the custody-permission tests (Unix-only).
+libc.workspace = true
 
 [lints]
 workspace = true

@@ -5,6 +5,8 @@
 
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,6 +96,144 @@ pub(crate) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Res
     fsync_dir(dir)
 }
 
+/// Owner-only file mode for custody secrets (`store-key.wrap`,
+/// `keystore`, `pairing.secret`) and the store lock: no group or other
+/// access, independent of the process umask.
+pub(crate) const SECRET_FILE_MODE: u32 = 0o600;
+/// Mode for the public drive-identity file: no wider than `0o644`
+/// (readable by all, writable by the owner only). `DRIVE` is the drive
+/// id, public by construction. The `open` mode is a ceiling masked by
+/// the umask, so a strict umask lands a stricter file — never a
+/// looser one.
+const DRIVE_FILE_MODE: u32 = 0o644;
+/// Owner-only mode for drive state directories. Unix-only in
+/// practice (every use sits in a `#[cfg(unix)]` arm); referenced on
+/// all platforms so the contract reads in one place.
+#[cfg_attr(not(unix), allow(dead_code))]
+const DRIVE_DIR_MODE: u32 = 0o700;
+
+/// Create the atomic-write temp file with an explicit Unix mode, so a
+/// crash between creation and rename never leaves a world-readable
+/// temp holding custody bytes. The mode applies at creation only, so
+/// the name is claimed (`create_new`) rather than truncated: reusing
+/// a stale temp would carry its old loose mode through the rename. On
+/// a lost race the stale file is removed once and the claim retried,
+/// and a second failure propagates — the mode invariant is enforced,
+/// not assumed. Creation is single-writer (the store lock), so a retry
+/// meets a crashed predecessor's temp, never a live competitor.
+/// Non-Unix falls back to `File::create_new`: the mode guarantee is
+/// Unix-only (see `docs/cli.md`).
+pub(crate) fn create_mode_temp(
+    dir: &Path,
+    name: &str,
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
+) -> std::io::Result<File> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    #[cfg(unix)]
+    let claim = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+    };
+    #[cfg(not(unix))]
+    let claim = || File::create_new(&tmp);
+    match claim() {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp)?;
+            claim()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Durably create-or-replace one custody file: temp (at an explicit
+/// Unix `mode`, see [`create_mode_temp`]) + `fsync` + rename +
+/// directory `fsync`. The rename preserves the temp's mode, so no
+/// post-rename chmod — and no chmod-failure-after-rename outcome —
+/// exists. Custody and identity files flow through here; operational
+/// state (`CURRENT`, commits) keeps flowing through [`atomic_write`]:
+/// creation hardens, opening never chmods.
+pub(crate) fn atomic_write_mode(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> std::io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut f = create_mode_temp(dir, name, mode)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, dir.join(name))?;
+    fsync_dir(dir)
+}
+
+/// Create a drive state directory at no wider than owner-only
+/// (`0o700`) when this call establishes the leaf, so the result never
+/// exceeds the contract whatever the process umask. The mode is set on
+/// the create call itself (`DirBuilder::mode`), not chmod'ed after: no
+/// window exists where the leaf sits at the umask mode. Like every
+/// `open` mode it is a ceiling masked by the umask — an
+/// owner-masking umask lands a stricter leaf, never a looser one.
+/// Freshness comes from the create call itself (`AlreadyExists` means a concurrent creator won), not from a
+/// preceding stat, so no check-then-act gap exists. A pre-existing
+/// directory is left untouched, and parents above the leaf are the
+/// operator's business and keep their modes: creation hardens,
+/// opening never chmods. Non-Unix falls back to plain
+/// `create_dir_all` (see `docs/cli.md`).
+pub(crate) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    return fs::create_dir_all(path);
+    #[cfg(unix)]
+    {
+        if path.is_dir() {
+            return Ok(());
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(DRIVE_DIR_MODE);
+        match builder.create(path) {
+            Ok(()) => return Ok(()),
+            // A concurrent creator won the leaf — but `AlreadyExists`
+            // is also a regular file or dangling symlink, so confirm
+            // it is a directory and fail at the call that names it
+            // when it is not.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if path.is_dir() {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Parents were missing: create the chain at the operator's
+        // modes, then restrict the leaf. A concurrent creator winning
+        // the leaf in the gap keeps the lock-held fresh-DRIVE
+        // restriction (drive dirs) as the backstop — and this call only
+        // ever narrows modes, never widens them.
+        fs::create_dir_all(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
+        Ok(())
+    }
+}
+
+/// Restrict a drive state directory to owner-only, whatever its
+/// current mode. Called only when establishing fresh drive state in
+/// it — initializing into a pre-existing empty directory still makes
+/// it a custody directory. Never called when opening an established
+/// drive, so pre-fix drives keep their modes. Non-Unix: no-op (see
+/// `docs/cli.md`).
+pub(crate) fn restrict_dir_owner_only(
+    #[cfg_attr(not(unix), allow(unused_variables))] path: &Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(DRIVE_DIR_MODE))?;
+    Ok(())
+}
+
 impl DurableStore {
     /// The drive directory the store lives in.
     pub(crate) fn dir(&self) -> &Path {
@@ -108,8 +248,14 @@ impl DurableStore {
     /// the store key, read CURRENT. Missing CURRENT means a fresh store.
     /// The CURRENT marker is trusted on open and verified on load.
     pub fn open(dir: PathBuf, drive: DriveId, passphrase: &str) -> Result<Self, DurableError> {
+        // Drive state directories are owner-only from creation, never
+        // the umask's business. Leaves this call created are restricted
+        // here; fresh drive state in a pre-existing directory is
+        // restricted at the DRIVE write below. Opening an established
+        // drive never chmods.
+        ensure_owner_only_dir(&dir)?;
         let commits = dir.join("commits");
-        fs::create_dir_all(&commits)?;
+        ensure_owner_only_dir(&commits)?;
         // Exclusive ownership before any store state is read or written
         // (the directory itself is created idempotently above). The lock
         // is a kernel-held flock on LOCK: it dies with this process, so
@@ -118,12 +264,19 @@ impl DurableStore {
         // cooperating callers — every open runs through here; the
         // commit chain still detects damage from non-cooperating
         // writers, it never serialized them.
-        let lock = File::options()
+        //
+        // LOCK is created owner-only: a world-writable lock lets another
+        // local user interfere with the exclusive-ownership guarantee
+        // this open exists to provide. An existing lock keeps its mode.
+        let mut lock_opts = File::options();
+        lock_opts
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(dir.join("LOCK"))?;
+            .truncate(false);
+        #[cfg(unix)]
+        lock_opts.mode(SECRET_FILE_MODE);
+        let lock = lock_opts.open(dir.join("LOCK"))?;
         match lock.try_lock() {
             Ok(()) => {}
             // Definite contention: another holder owns the directory.
@@ -132,10 +285,17 @@ impl DurableStore {
             Err(std::fs::TryLockError::Error(error)) => return Err(DurableError::Io(error)),
         }
         // Drive identity, written once: a store directory never changes drives.
+        // A missing DRIVE means fresh drive state is being established
+        // in this directory — it becomes a custody directory now even
+        // when it pre-existed (init into an existing empty dir), so
+        // restrict it. An existing DRIVE means an established drive
+        // whose modes are never touched.
         let drive_path = dir.join("DRIVE");
         match fs::read(&drive_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                atomic_write(&dir, "DRIVE", drive.as_bytes())?;
+                restrict_dir_owner_only(&dir)?;
+                restrict_dir_owner_only(&commits)?;
+                atomic_write_mode(&dir, "DRIVE", drive.as_bytes(), DRIVE_FILE_MODE)?;
             }
             Ok(bytes) => {
                 if bytes.len() != 32 || bytes != drive.as_bytes() {
@@ -188,7 +348,7 @@ impl DurableStore {
                 bytes.extend_from_slice(&salt);
                 bytes.extend_from_slice(&nonce);
                 bytes.extend_from_slice(&ct);
-                atomic_write(dir, "store-key.wrap", &bytes)?;
+                atomic_write_mode(dir, "store-key.wrap", &bytes, SECRET_FILE_MODE)?;
                 Ok(StoreKey(raw))
             }
             Ok(bytes) => {

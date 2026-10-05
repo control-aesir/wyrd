@@ -62,6 +62,56 @@ impl Drop for TestDir {
     }
 }
 
+/// Set the process umask for the guarded span, serializing against
+/// every other umask-touching test in this binary: umask is
+/// process-global and the harness runs tests on threads. Unix-only.
+///
+/// Sound under `cargo nextest run` (one process per test) and, by the
+/// lock, against every other setter in this binary — but an unrelated
+/// test creating files in another thread still observes the lowered
+/// mask while the guard lives, so keep the guarded span to the
+/// creation calls and assert after the guard drops.
+#[cfg(unix)]
+pub(crate) struct UmaskGuard {
+    previous: u32,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+impl UmaskGuard {
+    #[allow(unsafe_code)]
+    pub(crate) fn set(mask: u32) -> Self {
+        let lock = UMASK_LOCK.lock().unwrap();
+        // SAFETY: umask takes no pointers and only sets the calling
+        // process's file-mode creation mask; UMASK_LOCK serializes
+        // every setter in this binary, and Drop restores unconditionally.
+        let previous = unsafe { libc::umask(mask as libc::mode_t) } as u32;
+        UmaskGuard {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: restores the mask captured at construction; see `set`.
+        unsafe { libc::umask(self.previous as libc::mode_t) };
+    }
+}
+
+/// The low nine permission bits of a path. Unix-only.
+#[cfg(unix)]
+pub(crate) fn file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
 pub(crate) struct Fixture {
     pub(crate) dir: TestDir,
     pub(crate) engine: Engine,

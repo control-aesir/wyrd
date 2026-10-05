@@ -5305,6 +5305,7 @@ dependencies = [
  "hkdf",
  "iroh",
  "iroh-blobs",
+ "libc",
  "n0-future",
  "nostr",
  "proptest",

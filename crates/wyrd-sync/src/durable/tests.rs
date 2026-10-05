@@ -1824,6 +1824,18 @@ fn reconciliation_over_claim_is_dropped_not_loaded() {
         loaded.dropped_reconciliation_views, 1,
         "the drop is visible to callers, so 21b can account for the refused statement"
     );
+    // A second load replays identically: the drop is stable, not a
+    // first-open accident, and the latch (warn once) has nothing new
+    // to say about it.
+    let reloaded = store.load().unwrap();
+    assert_eq!(
+        reloaded.reconciliation_views, loaded.reconciliation_views,
+        "repeated loads replay the same bucket"
+    );
+    assert_eq!(
+        reloaded.dropped_reconciliation_views, 1,
+        "and the same drop count"
+    );
     assert_eq!(
         loaded
             .latest_stated_view()

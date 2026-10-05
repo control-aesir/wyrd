@@ -86,9 +86,17 @@ pub(crate) fn commit_name(seq: u64) -> String {
 }
 
 /// Hex for log lines that must name an identity (digests have no
-/// Display; decimal byte lists are not diagnosable).
+/// Display; decimal byte lists are not diagnosable). One pass, one
+/// allocation — this runs on the warn path, but there is no reason
+/// to format per byte.
 fn hex32(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+    }
+    out
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
@@ -619,7 +627,7 @@ impl DurableStore {
             if view.is_subset_of(derived.evidence()) {
                 facts.reconciliation_views.push(view);
             } else {
-                dropped.push(view.digest());
+                dropped.push(view);
             }
         }
         facts.dropped_reconciliation_views = dropped.len();
@@ -627,14 +635,25 @@ impl DurableStore {
         // behind the convergence loop, so warn loudly once and stay
         // quiet after. The digests name the offending statements (a
         // failure carries its identity); the count on `LoadedFacts`
-        // carries the signal to callers.
-        if !dropped.is_empty() && !self.overclaim_warned.swap(true, Ordering::SeqCst) {
-            let digests: Vec<String> = dropped.iter().map(hex32).collect();
-            tracing::warn!(
-                dropped = dropped.len(),
-                statements = ?digests,
-                "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
-            );
+        // carries the signal to callers. Digests compute only on the
+        // warn path — hashing every dropped view on every load would
+        // put megabytes of alloc+hash on the hot path for a diagnostic
+        // nobody reads twice.
+        if !dropped.is_empty() {
+            if !self.overclaim_warned.swap(true, Ordering::SeqCst) {
+                let digests: Vec<String> =
+                    dropped.iter().map(|view| hex32(&view.digest())).collect();
+                tracing::warn!(
+                    dropped = dropped.len(),
+                    statements = ?digests,
+                    "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
+                );
+            } else {
+                tracing::debug!(
+                    dropped = dropped.len(),
+                    "overstated reconciliation views dropped again (first occurrence warned)"
+                );
+            }
         }
         Ok(facts)
     }

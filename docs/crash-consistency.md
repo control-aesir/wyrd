@@ -96,10 +96,12 @@ the author's own restart and serve to peers afterwards. Pinned by
 
 Queued obligations ride the authoring batch; sealing and delivery
 marks (`AnnouncementSealed/Delivered`, transition/capability
-sealed+delivered) commit as their own facts. The relay retains every
-unacked envelope, so a crash mid-loop resends only the unacked with
-identical sealed bytes, and a crash between commit and first send
-resumes without re-authoring. Pinned by
+sealed+delivered) commit as their own facts. The relay is expected to
+retain every unacked envelope — but retention is bounded and assumed
+so (see the forget contract in `sync-and-peers.md`), making this an
+expectation, not a guarantee — so a crash mid-loop resends only the
+unacked with identical sealed bytes, and a crash between commit and
+first send resumes without re-authoring. Pinned by
 `partial_send_then_restart_resends_only_the_unacked` and
 `crash_before_announce_resumes_without_reauthoring`
 (`engine/tests_drain.rs`).

@@ -1019,10 +1019,13 @@ Each row locks a decided invariant.
   members rebase into the same snapshot; a multi-head drive refuses
   the fold with the documented errno; failure after the durable stage
   leaves the same durable state as before the attempt.
-- **DG-1 negatives (named to `wyrd-contracts`, implementation-gated)**:
+- **DG-1 negatives (daemon composition tests, implementation-gated)**:
   the pending set populates no cache keyed on durable revision;
   appears in no manifest; satisfies no projection or transport
-  serving request; creates no announcement obligation.
+  serving request; creates no announcement obligation. The pending set
+  exists only in the daemon's handle overlays, so these are pinned
+  where it lives — the daemon's composition tests over the live loop —
+  while the fold shape above is pinned at the loop contract.
 
 **POSIX surface**
 

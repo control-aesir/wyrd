@@ -29,7 +29,8 @@ use std::time::Duration;
 
 use crate::budgets::ResourceBudgets;
 use crate::mutation::{
-    FileIdentity, MutationBatch, MutationError, MutationKind, MutationOutcome, MutationQueue,
+    FileIdentity, FoldDisposition, FoldForcerOutcome, FoldMember, MutationBatch, MutationError,
+    MutationKind, MutationOutcome, MutationQueue,
 };
 use crate::projection::{Projection, SharedProjection};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
@@ -1391,6 +1392,18 @@ where
         Ok(())
     }
 
+    /// An empty tree for headless authoring: the same bootstrap the
+    /// first `put_file` performs. Single-mutation and fold
+    /// application resolve their headless base through here, so the
+    /// initial root is built exactly once.
+    fn boot_tree(&self) -> Result<ContentId, MutationError> {
+        let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+        Tree::from_entries(Vec::new())
+            .map_err(|_| MutationError::Store(StoreFailure::Transient))?
+            .insert_into(&mut *store)
+            .map_err(|error| MutationError::Store(error.failure()))
+    }
+
     /// Apply one mutation to the current single live head and author a
     /// snapshot over the result. The base is read fresh (the previous
     /// mutation's committed state, under the queue's total order); a
@@ -1403,37 +1416,179 @@ where
         kind: &MutationKind,
         pinned: Option<SnapshotId>,
     ) -> Result<MutationOutcome, MutationError> {
+        // A fold carries its own quota refusal: the aggregate gate
+        // fails the forcer and restores the members (retryable),
+        // never a terminal error, so it must not pass through the
+        // single-mutation quota below.
+        if let MutationKind::Fold { members } = kind {
+            return self.apply_fold(members, pinned);
+        }
         self.enforce_retained_quota()?;
         match kind {
+            // Folds route through `apply_fold` above; this backstop
+            // keeps the match total if one ever reaches here.
+            MutationKind::Fold { .. } => Err(MutationError::Engine),
             MutationKind::Mkdir { path } => {
                 let heads = self.eval_heads(pinned, path)?;
-                self.demand_path_trees(&heads, path)?;
-                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let base = match heads.as_slice() {
-                    [] => None,
-                    [head] => Some(head.snapshot().tree),
+                let tree = match heads.as_slice() {
+                    [] => self.boot_tree()?,
+                    [head] => head.snapshot().tree,
                     _ => return Err(MutationError::Conflicted { heads: heads.len() }),
                 };
-                let base = match base {
-                    Some(tree) => tree,
-                    None => Tree::from_entries(Vec::new())
-                        .map_err(|_| MutationError::Store(StoreFailure::Transient))?
-                        .insert_into(&mut *store)
-                        .map_err(|error| MutationError::Store(error.failure()))?,
-                };
-                let root = wyrd_format::mutation::mkdir(&mut *store, base, path)
-                    .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                Self::author_traced(
+                    &mut self.engine,
+                    &*self.store.read().map_err(|_| MutationError::Lock)?,
+                    root,
+                    &heads,
+                )?;
                 self.invalidate_parent_for_namespace_mutation(kind);
-                Ok(MutationOutcome::Done)
+                Ok(outcome)
             }
-            MutationKind::CreateFile { path, parent } => {
+            MutationKind::CreateFile { path, .. } => {
                 let heads = self.eval_heads(pinned, path)?;
                 if heads.len() > 1 {
                     return Err(MutationError::Conflicted { heads: heads.len() });
                 }
+                let tree = match heads.first() {
+                    Some(head) => head.snapshot().tree,
+                    None => self.boot_tree()?,
+                };
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                Self::author_traced(
+                    &mut self.engine,
+                    &*self.store.read().map_err(|_| MutationError::Lock)?,
+                    root,
+                    &heads,
+                )?;
+                Ok(outcome)
+            }
+            MutationKind::CommitFile { path, .. } => {
+                let heads = self.eval_heads(pinned, path)?;
+                let tree = match heads.as_slice() {
+                    [] => return Err(MutationError::Stale(path.clone())),
+                    [head] => head.snapshot().tree,
+                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+                };
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                Self::author_traced(
+                    &mut self.engine,
+                    &*self.store.read().map_err(|_| MutationError::Lock)?,
+                    root,
+                    &heads,
+                )?;
+                Ok(outcome)
+            }
+            MutationKind::AppendFile { path, .. } => {
+                let heads = self.eval_heads(pinned, path)?;
+                let tree = match heads.as_slice() {
+                    [head] => head.snapshot().tree,
+                    [] => return Err(MutationError::Stale(path.clone())),
+                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
+                };
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                // An empty append changes nothing: no snapshot, like today.
+                if root != tree {
+                    Self::author_traced(
+                        &mut self.engine,
+                        &*self.store.read().map_err(|_| MutationError::Lock)?,
+                        root,
+                        &heads,
+                    )?;
+                }
+                Ok(outcome)
+            }
+            MutationKind::Unlink { path } => {
+                let heads = self.eval_heads(pinned, path)?;
+                let tree = self.single_tree(&heads, path)?;
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                Self::author_traced(
+                    &mut self.engine,
+                    &*self.store.read().map_err(|_| MutationError::Lock)?,
+                    root,
+                    &heads,
+                )?;
+                self.invalidate_parent_for_namespace_mutation(kind);
+                Ok(outcome)
+            }
+            MutationKind::Rmdir { path } => {
+                let heads = self.eval_heads(pinned, path)?;
+                let tree = self.single_tree(&heads, path)?;
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                Self::author_traced(
+                    &mut self.engine,
+                    &*self.store.read().map_err(|_| MutationError::Lock)?,
+                    root,
+                    &heads,
+                )?;
+                self.invalidate_parent_for_namespace_mutation(kind);
+                Ok(outcome)
+            }
+            MutationKind::Rename { from, .. } => {
+                let heads = self.eval_heads(pinned, from)?;
+                let tree = self.single_tree(&heads, from)?;
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                // Same-path rename is a no-op: no snapshot, like today.
+                if root != tree {
+                    Self::author_traced(
+                        &mut self.engine,
+                        &*self.store.read().map_err(|_| MutationError::Lock)?,
+                        root,
+                        &heads,
+                    )?;
+                    self.invalidate_parent_for_namespace_mutation(kind);
+                }
+                Ok(outcome)
+            }
+            MutationKind::SetAttrs { path, .. } => {
+                let heads = self.eval_heads(pinned, path)?;
+                let tree = self.single_tree(&heads, path)?;
+                let (root, outcome) = self.build_root(kind, &heads, tree)?;
+                // A no-change setattr authors nothing, like today.
+                if root != tree {
+                    Self::author_traced(
+                        &mut self.engine,
+                        &*self.store.read().map_err(|_| MutationError::Lock)?,
+                        root,
+                        &heads,
+                    )?;
+                }
+                // The identity the mutation landed on, so an
+                // identity-bound caller (the `O_TRUNC` open) binds its
+                // captures to exactly what was committed: carried in
+                // the outcome by `build_root`, as before.
+                Ok(outcome)
+            }
+        }
+    }
+
+    /// Apply one non-fold mutation onto `tree` without authoring: every
+    /// precondition check and format mutation the single-mutation path
+    /// performs, shared by it and the fold so both apply identical
+    /// semantics. Checks read the durable `heads` — a fold winner's
+    /// path is untouched by earlier winners (one winner per path, ties
+    /// resolved before application), so the durable read stays valid;
+    /// only the format mutation itself lands on the evolving `tree`.
+    /// Returns the new root plus the outcome the mutation would have
+    /// reported alone. Authoring and parent invalidation stay with the
+    /// caller: a fold authors once for all its winners.
+    fn build_root(
+        &self,
+        kind: &MutationKind,
+        heads: &[AuthorizedSnapshot],
+        tree: ContentId,
+    ) -> Result<(ContentId, MutationOutcome), MutationError> {
+        match kind {
+            MutationKind::Mkdir { path } => {
+                self.demand_path_trees(heads, path)?;
+                let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
+                let root = wyrd_format::mutation::mkdir(&mut *store, tree, path)
+                    .map_err(MutationError::from_format)?;
+                Ok((root, MutationOutcome::Done))
+            }
+            MutationKind::CreateFile { path, parent } => {
                 let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
-                match self.current_node(&heads, parent_path)? {
+                match self.current_node(heads, parent_path)? {
                     None => return Err(MutationError::NotFound(parent_path.to_string())),
                     Some(Node::Dir { .. } | Node::MergedDir { .. }) => {}
                     Some(_) => return Err(MutationError::NotADirectory(parent_path.to_string())),
@@ -1441,29 +1596,19 @@ where
                 if !self.mutations.validate_parent(parent_path, *parent) {
                     return Err(MutationError::StaleParent(parent_path.to_string()));
                 }
-                if self.current_node(&heads, path)?.is_some() {
+                if self.current_node(heads, path)?.is_some() {
                     return Err(MutationError::AlreadyExists(path.clone()));
                 }
-                let base = heads.first().map(|head| head.snapshot().tree);
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let base = match base {
-                    Some(tree) => tree,
-                    None => Tree::from_entries(Vec::new())
-                        .map_err(|_| MutationError::Store(StoreFailure::Transient))?
-                        .insert_into(&mut *store)
-                        .map_err(|error| MutationError::Store(error.failure()))?,
-                };
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, 0, false, Vec::new())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
-                let root = wyrd_format::mutation::put_strict(&mut *store, base, path, entry)
+                let root = wyrd_format::mutation::put_strict(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                Ok(MutationOutcome::Created(FileIdentity::new(
-                    0,
-                    false,
-                    Vec::new(),
-                )))
+                Ok((
+                    root,
+                    MutationOutcome::Created(FileIdentity::new(0, false, Vec::new())),
+                ))
             }
             MutationKind::CommitFile {
                 path,
@@ -1471,17 +1616,11 @@ where
                 executable,
                 content,
             } => {
-                let heads = self.eval_heads(pinned, path)?;
-                let tree = match heads.as_slice() {
-                    [] => return Err(MutationError::Stale(path.clone())),
-                    [head] => head.snapshot().tree,
-                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
-                };
                 // The stale-handle boundary: commit only if the path still
                 // carries exactly the identity this handle opened against.
                 // A content change, kind change, or removal fails closed
                 // with no merge and no snapshot.
-                match self.current_node(&heads, path)? {
+                match self.current_node(heads, path)? {
                     Some(Node::File {
                         size,
                         executable,
@@ -1501,23 +1640,17 @@ where
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                Ok(MutationOutcome::Committed(FileIdentity::new(
-                    content.len() as u64,
-                    *executable,
-                    chunks,
-                )))
+                Ok((
+                    root,
+                    MutationOutcome::Committed(FileIdentity::new(
+                        content.len() as u64,
+                        *executable,
+                        chunks,
+                    )),
+                ))
             }
             MutationKind::AppendFile { path, content } => {
-                let heads = self.eval_heads(pinned, path)?;
-                // Append never creates or resurrects: a headless drive or
-                // a missing/repurposed path is stale, not `ENOENT`.
-                let tree = match heads.as_slice() {
-                    [head] => head.snapshot().tree,
-                    [] => return Err(MutationError::Stale(path.clone())),
-                    _ => return Err(MutationError::Conflicted { heads: heads.len() }),
-                };
-                let executable = match self.current_node(&heads, path)? {
+                let executable = match self.current_node(heads, path)? {
                     Some(Node::File {
                         size, executable, ..
                     }) => {
@@ -1532,7 +1665,7 @@ where
                     _ => return Err(MutationError::Stale(path.clone())),
                 };
                 let mut image = self.read_current_file_prefix(
-                    &heads,
+                    heads,
                     path,
                     crate::session::MAX_WRITE_BUFFER_BYTES as u64,
                 )?;
@@ -1546,19 +1679,19 @@ where
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
                 if root == tree {
-                    return Ok(MutationOutcome::Done);
+                    return Ok((root, MutationOutcome::Done));
                 }
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                Ok(MutationOutcome::Committed(FileIdentity::new(
-                    image.len() as u64,
-                    executable,
-                    chunks,
-                )))
+                Ok((
+                    root,
+                    MutationOutcome::Committed(FileIdentity::new(
+                        image.len() as u64,
+                        executable,
+                        chunks,
+                    )),
+                ))
             }
             MutationKind::Unlink { path } => {
-                let heads = self.eval_heads(pinned, path)?;
-                let tree = self.single_tree(&heads, path)?;
-                match self.current_node(&heads, path)? {
+                match self.current_node(heads, path)? {
                     Some(Node::Dir { .. } | Node::MergedDir { .. }) => {
                         return Err(MutationError::IsDirectory(path.clone()));
                     }
@@ -1568,43 +1701,29 @@ where
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.invalidate_parent_for_namespace_mutation(kind);
-                Ok(MutationOutcome::Done)
+                Ok((root, MutationOutcome::Done))
             }
             MutationKind::Rmdir { path } => {
-                let heads = self.eval_heads(pinned, path)?;
-                let tree = self.single_tree(&heads, path)?;
-                self.demand_path_trees(&heads, path)?;
+                self.demand_path_trees(heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
                     .map_err(MutationError::from_format)?;
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.invalidate_parent_for_namespace_mutation(kind);
-                Ok(MutationOutcome::Done)
+                Ok((root, MutationOutcome::Done))
             }
             MutationKind::Rename {
                 from,
                 to,
                 no_replace,
             } => {
-                let heads = self.eval_heads(pinned, from)?;
-                let tree = self.single_tree(&heads, from)?;
-                self.demand_path_trees(&heads, from)?;
-                self.demand_path_trees(&heads, to)?;
-                if *no_replace && self.current_node(&heads, to)?.is_some() {
+                self.demand_path_trees(heads, from)?;
+                self.demand_path_trees(heads, to)?;
+                if *no_replace && self.current_node(heads, to)?.is_some() {
                     return Err(MutationError::AlreadyExists(to.clone()));
                 }
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rename(&mut *store, tree, from, to)
                     .map_err(MutationError::from_format)?;
-                if root == tree {
-                    // Same-path rename is a no-op: no snapshot.
-                    return Ok(MutationOutcome::Done);
-                }
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                self.invalidate_parent_for_namespace_mutation(kind);
-                Ok(MutationOutcome::Done)
+                Ok((root, MutationOutcome::Done))
             }
             MutationKind::SetAttrs {
                 path,
@@ -1612,9 +1731,7 @@ where
                 executable,
                 base,
             } => {
-                let heads = self.eval_heads(pinned, path)?;
-                let tree = self.single_tree(&heads, path)?;
-                let (current_size, current_exec, chunks) = match self.current_node(&heads, path)? {
+                let (current_size, current_exec, chunks) = match self.current_node(heads, path)? {
                     Some(Node::File {
                         size,
                         executable,
@@ -1625,7 +1742,7 @@ where
                     Some(_) if size.is_some() => {
                         return Err(MutationError::IsDirectory(path.clone()));
                     }
-                    Some(_) => return Ok(MutationOutcome::Done),
+                    Some(_) => return Ok((tree, MutationOutcome::Done)),
                     None => return Err(MutationError::NotFound(path.clone())),
                 };
                 // The identity guard, checked before anything is
@@ -1653,13 +1770,13 @@ where
                     None => current_size,
                 };
                 if size.is_none() && want_exec == current_exec {
-                    return Ok(MutationOutcome::Done);
+                    return Ok((tree, MutationOutcome::Done));
                 }
                 let new_chunks = match size {
                     None => chunks,
                     Some(target) => {
                         let read_len = current_size.min(*target);
-                        let mut image = self.read_current_file_prefix(&heads, path, read_len)?;
+                        let mut image = self.read_current_file_prefix(heads, path, read_len)?;
                         let target = usize::try_from(*target)
                             .map_err(|_| MutationError::TooLarge(*target))?;
                         image.resize(target, 0);
@@ -1675,17 +1792,415 @@ where
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
                     .map_err(MutationError::from_format)?;
                 if root == tree {
-                    return Ok(MutationOutcome::Done);
+                    return Ok((root, MutationOutcome::Done));
                 }
-                Self::author_traced(&mut self.engine, &*store, root, &heads)?;
-                // The identity the mutation landed on, so an
-                // identity-bound caller (the `O_TRUNC` open) binds its
-                // captures to exactly what was committed.
-                Ok(MutationOutcome::Committed(FileIdentity::new(
-                    new_size, want_exec, new_chunks,
-                )))
+                Ok((
+                    root,
+                    MutationOutcome::Committed(FileIdentity::new(new_size, want_exec, new_chunks)),
+                ))
+            }
+            // A fold never nests: the submitter guarantees it, and this
+            // backstop fails closed if one ever arrives.
+            MutationKind::Fold { .. } => Err(MutationError::Engine),
+        }
+    }
+
+    /// The paths one member contends on: a same-path tie is decided
+    /// per path. A rename contends only on its destination (which it
+    /// replaces); its source end composes with buffered writes in FIFO
+    /// order — the write lands, then the rename moves it — instead of
+    /// terminally discarding them.
+    fn member_paths(kind: &MutationKind) -> Vec<&str> {
+        match kind {
+            MutationKind::Mkdir { path }
+            | MutationKind::CreateFile { path, .. }
+            | MutationKind::CommitFile { path, .. }
+            | MutationKind::AppendFile { path, .. }
+            | MutationKind::Unlink { path }
+            | MutationKind::Rmdir { path }
+            | MutationKind::SetAttrs { path, .. } => vec![path.as_str()],
+            MutationKind::Rename { to, .. } => vec![to.as_str()],
+            MutationKind::Fold { .. } => vec![],
+        }
+    }
+
+    /// The paths one member overwrites: a tie needs at least two
+    /// overwriters on the same path. Pure appends never overwrite —
+    /// sequential appends concatenate — and neither does an exec-only
+    /// `setattr` or a rename's source end (it moves content, it does
+    /// not replace it).
+    fn overwrite_paths(kind: &MutationKind) -> Vec<&str> {
+        match kind {
+            MutationKind::Mkdir { path }
+            | MutationKind::CreateFile { path, .. }
+            | MutationKind::CommitFile { path, .. }
+            | MutationKind::Unlink { path }
+            | MutationKind::Rmdir { path } => vec![path.as_str()],
+            MutationKind::SetAttrs { path, size, .. } => {
+                if size.is_some() {
+                    vec![path.as_str()]
+                } else {
+                    vec![]
+                }
+            }
+            MutationKind::Rename { to, .. } => vec![to.as_str()],
+            MutationKind::AppendFile { .. } => vec![],
+            MutationKind::Fold { .. } => vec![],
+        }
+    }
+
+    /// Whether one member survives its own preconditions against the
+    /// durable heads: content members need their base identity (or,
+    /// for append, a regular file) still there; namespace members are
+    /// decided inside application and stay tentatively live here. A
+    /// `NeedContent` prerequisite propagates: the whole fold defers
+    /// like any single mutation. `Ok` means candidate; `Err` is the
+    /// member's own terminal cause.
+    fn member_survives(
+        &self,
+        kind: &MutationKind,
+        heads: &[AuthorizedSnapshot],
+    ) -> Result<(), MutationError> {
+        match kind {
+            MutationKind::CommitFile { path, base, .. } => match self.current_node(heads, path)? {
+                Some(Node::File {
+                    size,
+                    executable,
+                    chunks,
+                }) => {
+                    if FileIdentity::new(size, executable, chunks) != *base {
+                        return Err(MutationError::Stale(path.clone()));
+                    }
+                    Ok(())
+                }
+                _ => Err(MutationError::Stale(path.clone())),
+            },
+            MutationKind::AppendFile { path, .. } => match self.current_node(heads, path)? {
+                Some(Node::File { .. }) => Ok(()),
+                _ => Err(MutationError::Stale(path.clone())),
+            },
+            MutationKind::SetAttrs {
+                path,
+                size,
+                executable: _,
+                base,
+            } => {
+                let (current_size, current_exec, chunks) = match self.current_node(heads, path)? {
+                    Some(Node::File {
+                        size,
+                        executable,
+                        chunks,
+                    }) => (size, executable, chunks),
+                    Some(_) if size.is_some() => {
+                        return Err(MutationError::IsDirectory(path.clone()));
+                    }
+                    Some(_) => return Ok(()),
+                    None => return Err(MutationError::NotFound(path.clone())),
+                };
+                if let Some(base) = base {
+                    if FileIdentity::new(current_size, current_exec, chunks) != *base {
+                        return Err(MutationError::Stale(path.clone()));
+                    }
+                }
+                Ok(())
+            }
+            // Namespace members (and creates) evaluate inside
+            // application: a refusal there aborts (forcer) or fails
+            // (member) with its own errno.
+            _ => Ok(()),
+        }
+    }
+
+    /// A systemic failure stops the fold: store, authoring, and lock
+    /// failures are terminal for every taken member (the daemon marks
+    /// them all failed), while member-logic failures stay per member.
+    fn fold_is_systemic(error: &MutationError) -> bool {
+        matches!(
+            error,
+            MutationError::Store(_) | MutationError::Lock | MutationError::Engine
+        )
+    }
+
+    /// The aborted-fold outcome: the forcer reports its own cause and
+    /// every non-forcing member is restored to pending, retryable on
+    /// its own forcing event. Nothing was authored, so in-memory
+    /// applications are simply dropped.
+    fn abort_fold(
+        members: &[FoldMember],
+        forcer: Option<usize>,
+        cause: MutationError,
+    ) -> MutationOutcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Failed(cause),
+            members: members
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != forcer)
+                .map(|_| FoldDisposition::Restored)
+                .collect(),
+        }
+    }
+
+    /// Apply one commit-forcing event's whole pending set plus itself
+    /// as a single snapshot (`docs/write-path.md`, DG-1 table).
+    /// Members arrive first-in-first-buffered; at most one carries
+    /// the forcer's privilege, and a shutdown fold carries none.
+    ///
+    /// Phase A resolves same-path ties against the durable heads: a
+    /// surviving forcer wins its paths, otherwise the
+    /// earliest-buffered survivor wins and every loser goes terminal.
+    /// Phase B applies the winners in order onto one evolving tree
+    /// through [`build_root`](Self::build_root) — the same checks the
+    /// single-mutation path runs — and phase C authors once. A failed
+    /// forcer aborts with nothing committed and every other member
+    /// restored; a fold with no surviving member authors nothing.
+    /// Store, authoring, and lock failures are terminal for all
+    /// taken members (`Err`); everything else is per member.
+    fn apply_fold(
+        &mut self,
+        members: &[FoldMember],
+        pinned: Option<SnapshotId>,
+    ) -> Result<MutationOutcome, MutationError> {
+        // Structural validation: an empty fold, more than one
+        // forcer, or a nested fold is a malformed submission and fails
+        // everything closed, terminal like any serviced-but-failed
+        // mutation. Zero forcers is the shutdown fold.
+        let mut forcer: Option<usize> = None;
+        for (index, member) in members.iter().enumerate() {
+            if matches!(member.kind, MutationKind::Fold { .. }) {
+                return Err(MutationError::Engine);
+            }
+            if member.forcer {
+                if forcer.is_some() {
+                    return Err(MutationError::Engine);
+                }
+                forcer = Some(index);
             }
         }
+        if members.is_empty() {
+            return Err(MutationError::Engine);
+        }
+        let forcer_path = forcer
+            .map(|index| {
+                Self::member_paths(&members[index].kind)
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let heads = self.live_heads_traced()?;
+        if let Some(base) = pinned {
+            match heads.as_slice() {
+                [head] if head.snapshot().snapshot_id() == base => {}
+                _ => return Err(MutationError::Stale(forcer_path)),
+            }
+        }
+        if heads.len() > 1 {
+            // More than one eligible live head refuses the whole fold.
+            // A forced fold restores its members, retryable; an
+            // unforced one (shutdown) has no future pass to restore
+            // toward, so the refusal is terminal for every member.
+            match forcer {
+                Some(_) => {
+                    return Ok(Self::abort_fold(
+                        members,
+                        forcer,
+                        MutationError::Conflicted { heads: heads.len() },
+                    ));
+                }
+                None => return Err(MutationError::Conflicted { heads: heads.len() }),
+            }
+        }
+        if let Err(error) = self.enforce_retained_quota() {
+            // The aggregate gate covers the whole pending set before
+            // the commit's first write: forced members stay retryable,
+            // unforced members fail — a shutdown drain cannot restore.
+            match forcer {
+                Some(_) => return Ok(Self::abort_fold(members, forcer, error)),
+                None => return Err(error),
+            }
+        }
+        // Phase A: candidacy, then per-path tie resolution.
+        let mut candidate = vec![false; members.len()];
+        let mut causes: Vec<Option<MutationError>> = vec![None; members.len()];
+        for (index, member) in members.iter().enumerate() {
+            match self.member_survives(&member.kind, &heads) {
+                Ok(()) => candidate[index] = true,
+                Err(error) => causes[index] = Some(error),
+            }
+        }
+        if let Some(index) = forcer {
+            if !candidate[index] {
+                // Only a forcing member that survives its own
+                // preconditions carries privilege: a refused forcer
+                // aborts the fold with nothing committed and leaves
+                // the rest untouched.
+                let cause = causes[index].take().unwrap_or(MutationError::Engine);
+                return Ok(Self::abort_fold(members, forcer, cause));
+            }
+        }
+        // A surviving forcer wins every path it overwrites; other
+        // paths keep every contender, and a member applies only if it
+        // wins every path it touches: a rename cannot half-apply, and
+        // an append beside a path winner is discarded rather than
+        // silently overwritten. Same-path appends never reach a tie
+        // here — the daemon merges them into their earliest run — so
+        // multiple append contenders on one path are a malformed
+        // submission and fail closed on all but the earliest.
+        let mut applies = vec![false; members.len()];
+        {
+            let mut contenders: std::collections::BTreeMap<&str, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            let mut overwriters: std::collections::BTreeMap<&str, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (index, member) in members.iter().enumerate() {
+                if !candidate[index] {
+                    continue;
+                }
+                for path in Self::member_paths(&member.kind) {
+                    contenders.entry(path).or_default().push(index);
+                }
+                for path in Self::overwrite_paths(&member.kind) {
+                    overwriters.entry(path).or_default().push(index);
+                }
+            }
+            let mut path_winners: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for (path, contenders) in &contenders {
+                let overwriters = overwriters.get(path).map(Vec::as_slice).unwrap_or(&[]);
+                if overwriters.is_empty() {
+                    // No overwrite conflict on this path: a lone
+                    // contender applies, while multiple pure appends
+                    // are a submitter bug (the daemon merges them) and
+                    // fail closed on all but the earliest rather than
+                    // silently dropping all but the last.
+                    if contenders.len() == 1 {
+                        path_winners.insert(path, contenders[0]);
+                    } else if let Some(earliest) = contenders.first() {
+                        path_winners.insert(path, *earliest);
+                    }
+                    continue;
+                }
+                let winner = match forcer {
+                    Some(index) if overwriters.contains(&index) => index,
+                    _ => overwriters[0],
+                };
+                path_winners.insert(path, winner);
+            }
+            for (index, member) in members.iter().enumerate() {
+                if !candidate[index] {
+                    continue;
+                }
+                applies[index] = Self::member_paths(&member.kind)
+                    .iter()
+                    .all(|path| path_winners.get(path) == Some(&index));
+            }
+        }
+        // Losers fail closed with their path's cause.
+        let mut dispositions: Vec<Option<FoldDisposition>> = vec![None; members.len()];
+        for (index, member) in members.iter().enumerate() {
+            if candidate[index] && !applies[index] {
+                let path = Self::member_paths(&member.kind)
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .to_string();
+                dispositions[index] = Some(FoldDisposition::Failed(MutationError::Stale(path)));
+            } else if !candidate[index] && Some(index) != forcer {
+                dispositions[index] = Some(FoldDisposition::Failed(
+                    causes[index].take().unwrap_or(MutationError::Engine),
+                ));
+            }
+        }
+        // Phase B: apply the winners in FIFO order onto one tree.
+        let mut evolving = match heads.as_slice() {
+            [] => self.boot_tree()?,
+            [head] => head.snapshot().tree,
+            // Refused above; unreachable.
+            _ => return Err(MutationError::Engine),
+        };
+        let start = evolving;
+        let mut applied_namespaces: Vec<MutationKind> = Vec::new();
+        let mut forcer_outcome: Option<MutationOutcome> = None;
+        for (index, member) in members.iter().enumerate() {
+            if !applies[index] {
+                continue;
+            }
+            match self.build_root(&member.kind, &heads, evolving) {
+                Ok((root, outcome)) => {
+                    if root != evolving
+                        && matches!(
+                            member.kind,
+                            MutationKind::Mkdir { .. }
+                                | MutationKind::Unlink { .. }
+                                | MutationKind::Rmdir { .. }
+                                | MutationKind::Rename { .. }
+                        )
+                    {
+                        applied_namespaces.push(member.kind.clone());
+                    }
+                    evolving = root;
+                    dispositions[index] = Some(match outcome.clone() {
+                        MutationOutcome::Done => FoldDisposition::Done,
+                        MutationOutcome::Committed(identity) => {
+                            FoldDisposition::Committed(identity)
+                        }
+                        MutationOutcome::Created(identity) => FoldDisposition::Created(identity),
+                        MutationOutcome::Fold { .. } => {
+                            FoldDisposition::Failed(MutationError::Engine)
+                        }
+                    });
+                    if Some(index) == forcer {
+                        forcer_outcome = Some(outcome);
+                    }
+                }
+                Err(error)
+                    if matches!(error, MutationError::NeedContent { .. })
+                        || Self::fold_is_systemic(&error) =>
+                {
+                    // A missing prerequisite defers the whole fold for
+                    // a pinned retry; a systemic failure is terminal
+                    // for every taken member.
+                    return Err(error);
+                }
+                Err(error) => {
+                    if Some(index) == forcer {
+                        // The forcing member itself failed: the fold
+                        // aborts with nothing committed and every other
+                        // member restored.
+                        return Ok(Self::abort_fold(members, forcer, error));
+                    }
+                    dispositions[index] = Some(FoldDisposition::Failed(error));
+                }
+            }
+        }
+        // Phase C: one snapshot for the whole fold — or none when no
+        // surviving member changed the tree.
+        if evolving != start {
+            let store = self.store.read().map_err(|_| MutationError::Lock)?;
+            Self::author_traced(&mut self.engine, &*store, evolving, &heads)?;
+            for kind in &applied_namespaces {
+                self.invalidate_parent_for_namespace_mutation(kind);
+            }
+        }
+        let forcer_outcome = match (forcer, forcer_outcome) {
+            // No forcer (shutdown): the fold is its own boundary; the
+            // members carry the real dispositions.
+            (None, _) => FoldForcerOutcome::Applied(Box::new(MutationOutcome::Done)),
+            (Some(_), Some(outcome)) => FoldForcerOutcome::Applied(Box::new(outcome)),
+            // The forcer always applies or aborts above; unreachable.
+            (Some(_), None) => return Err(MutationError::Engine),
+        };
+        Ok(MutationOutcome::Fold {
+            forcer: forcer_outcome,
+            members: dispositions
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != forcer)
+                .map(|(_, disposition)| disposition.unwrap_or(FoldDisposition::Restored))
+                .collect(),
+        })
     }
 
     /// The pin for a demand-deferred mutation: the single head this
@@ -1794,6 +2309,9 @@ where
             | MutationKind::CommitFile { .. }
             | MutationKind::AppendFile { .. }
             | MutationKind::SetAttrs { .. } => {}
+            // A fold's namespace members invalidate individually after
+            // authoring; the fold itself invalidates nothing.
+            MutationKind::Fold { .. } => {}
         }
     }
 

@@ -230,6 +230,45 @@ pub enum MutationOutcome {
     Created(FileIdentity),
     /// A committed file image, with its durable identity.
     Committed(FileIdentity),
+    /// A folded commit: the forcing member's own outcome plus one
+    /// disposition per non-forcing member, positional over the
+    /// submitted member order. The daemon settles each taken handle
+    /// from its disposition and reports the forcer's outcome to the
+    /// forcing syscall exactly as if it had submitted alone.
+    Fold {
+        forcer: FoldForcerOutcome,
+        members: Vec<FoldDisposition>,
+    },
+}
+
+/// What the fold's forcing member came to: its applied outcome, or
+/// its own failure — which aborts the fold with nothing committed
+/// and restores every other member to pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldForcerOutcome {
+    /// The forcer applied: its outcome, as if submitted alone.
+    Applied(Box<MutationOutcome>),
+    /// The forcer failed on its own cause: nothing committed.
+    Failed(MutationError),
+}
+
+/// What a folded non-forcing member came to. Winners carry the same
+/// outcome their mutation would have reported alone; losers carry
+/// their own errno cause; restored members were untouched by an
+/// aborted fold and stay pending for their own forcing event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldDisposition {
+    /// The member applied and committed: new identity, as `Committed`.
+    Committed(FileIdentity),
+    /// The member applied with no content to hand back, as `Done`.
+    Done,
+    /// The member created its file, as `Created`.
+    Created(FileIdentity),
+    /// The member failed on its own cause: its handle goes terminal.
+    Failed(MutationError),
+    /// An aborted fold left the member untouched: the daemon puts its
+    /// image back and it stays dirty and retryable.
+    Restored,
 }
 
 /// Idle-wait slice for the loop while nothing is happening: the wait
@@ -415,6 +454,27 @@ pub enum MutationKind {
         executable: Option<bool>,
         base: Option<FileIdentity>,
     },
+    /// One commit-forcing event's whole pending set plus itself,
+    /// applied as a single snapshot (`docs/write-path.md`, DG-1
+    /// table). Members are ordered first-in-first-buffered; exactly
+    /// one member carries `forcer: true` and lends the fold its
+    /// privilege (a same-path tie) and its abort rule (a failed
+    /// forcer commits nothing) — except the shutdown fold, whose
+    /// members are all non-forcing and fail per member, best-effort.
+    /// A `Fold` never nests: a member whose kind is itself a `Fold`
+    /// fails the whole submission closed.
+    Fold { members: Vec<FoldMember> },
+}
+
+/// One folded member: a non-`Fold` operation plus whether it is the
+/// commit-forcing event that owns the fold.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FoldMember {
+    /// The operation to apply. Never [`MutationKind::Fold`].
+    pub kind: MutationKind,
+    /// The forcing member: wins same-path ties it survives, and its
+    /// failure aborts the fold with nothing committed.
+    pub forcer: bool,
 }
 
 /// Diagnostic rendering for [`MutationKind`] redacts file content:
@@ -473,7 +533,21 @@ impl std::fmt::Debug for MutationKind {
                 .field("executable", executable)
                 .field("base", base)
                 .finish(),
+            MutationKind::Fold { members } => {
+                f.debug_struct("Fold").field("members", members).finish()
+            }
         }
+    }
+}
+
+/// Diagnostic rendering for [`FoldMember`] redacts like its kind:
+/// the forcing flag renders, member content never does.
+impl std::fmt::Debug for FoldMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FoldMember")
+            .field("kind", &self.kind)
+            .field("forcer", &self.forcer)
+            .finish()
     }
 }
 

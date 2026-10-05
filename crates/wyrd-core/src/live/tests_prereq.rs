@@ -1669,3 +1669,96 @@ fn headless_loop_converges_a_new_device_to_current_heads() {
     std::fs::remove_dir_all(dir_a).unwrap();
     std::fs::remove_dir_all(dir_b).unwrap();
 }
+
+/// A fold refused at the aggregate quota restores every member: the
+/// gate covers the whole pending set before the commit's first write,
+/// retryable rather than terminal like a refused single commit never
+/// is.
+#[test]
+fn fold_at_the_ceiling_restores_every_member() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("fold-quota");
+    let (config, retained) = LiveConfig::with_retained_quota(0);
+    let store = store.with_retained(Arc::clone(&retained));
+    let mut node = live_over_configured(engine, store, &[head], &config);
+    let revision = node.engine.current();
+    let outcome = node
+        .apply_mutation(
+            &MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::CommitFile {
+                            path: "f".into(),
+                            base: FileIdentity::new(11, false, Vec::new()),
+                            executable: false,
+                            content: b"second".to_vec(),
+                        },
+                        forcer: false,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir { path: "d".into() },
+                        forcer: true,
+                    },
+                ],
+            },
+            None,
+        )
+        .expect("a quota-refused fold still answers");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Failed(MutationError::Store(StoreFailure::StorageFull)),
+            members,
+        } => assert_eq!(
+            members,
+            vec![FoldDisposition::Restored],
+            "the surviving member stays retryable"
+        ),
+        other => panic!("a quota-refused fold aborts, saw {other:?}"),
+    }
+    assert_eq!(
+        node.engine.current(),
+        revision,
+        "a quota-refused fold authors nothing"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A lone-forcer fold commits exactly like the single mutation it
+/// carries: the same outcome, one snapshot, one new head.
+#[test]
+fn lone_forcer_fold_matches_its_single_mutation() {
+    let (engine, dir, store, _chunk, root, head) = scratch_file_drive("fold-lone");
+    let mut node = live_over_fake(engine, store, &[head]);
+    let revision = node.engine.current();
+    let outcome = node
+        .apply_mutation(
+            &MutationKind::Fold {
+                members: vec![FoldMember {
+                    kind: MutationKind::Mkdir { path: "d".into() },
+                    forcer: true,
+                }],
+            },
+            None,
+        )
+        .expect("a lone forcer folds");
+    match outcome {
+        MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(outcome),
+            members,
+        } => {
+            assert!(
+                matches!(*outcome, MutationOutcome::Done),
+                "the forcer reports its own outcome: {outcome:?}"
+            );
+            assert!(members.is_empty(), "no other member, no disposition");
+        }
+        other => panic!("a lone forcer applies, saw {other:?}"),
+    }
+    assert_eq!(
+        node.engine.current(),
+        revision + 1,
+        "one forcing event authors one snapshot"
+    );
+    let tree = node.live_heads_traced().unwrap()[0].snapshot().tree;
+    assert_ne!(tree, root, "the snapshot carries the mutation");
+    std::fs::remove_dir_all(dir).unwrap();
+}

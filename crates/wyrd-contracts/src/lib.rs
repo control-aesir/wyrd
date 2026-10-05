@@ -209,6 +209,10 @@
 //!     `Classification::Pending(Pendency::UnknownParent)`, and the
 //!     stall heals cleanly once the bytes arrive
 //!     (`docs/fetch-on-open.md`, body-or-manifest unavailable).
+//! 45. `fold_commits_one_snapshot_for_many_members` — one
+//!     commit-forcing event's whole pending set plus itself authors a
+//!     single snapshot whose tree equals the final coherent state
+//!     (`docs/write-path.md`, DG-1).
 
 #[cfg(test)]
 mod egress_contracts;

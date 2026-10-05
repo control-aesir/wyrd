@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use fuser::{FileHandle, INodeNo, LockOwner, OpenFlags};
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use wyrd_format::{ObjectStore, StoreFailure};
@@ -16,7 +17,8 @@ use wyrd_core::budgets::{
     ResourceBudgets, DEFAULT_MAX_OPEN_CAPTURE_BYTES, DEFAULT_MAX_OPEN_HANDLES,
 };
 use wyrd_core::mutation::{
-    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
+    FileIdentity, FoldDisposition, FoldForcerOutcome, FoldMember, MutationError, MutationKind,
+    MutationOutcome, MutationQueue,
 };
 use wyrd_core::projection::Projection;
 use wyrd_core::session::WriteBudget;
@@ -58,6 +60,23 @@ where
     /// The session's write budget: bounds the buffered logical images of
     /// writable handles. Independent of the projection and store locks.
     pub(super) budget: Arc<WriteBudget>,
+    /// Fold coordination: a forcing boundary takes dirty handles'
+    /// images under their own locks (never nested, kernel-handle
+    /// order), submits the fold with no handle lock held, then
+    /// settles each taken handle. A handle whose image is taken
+    /// (`inflight`) parks writers on `fold_wake` until it is settled,
+    /// so no concurrent write is lost or prematurely reported
+    /// durable. Lock order stays table-then-handle: gathering takes
+    /// the table only to clone arcs, drops it, then touches handles
+    /// one at a time.
+    fold_wake: Condvar,
+    /// First-in-first-buffered stamps, handed out when a handle turns
+    /// dirty. Monotonic per backend; ordering only, never identity.
+    fold_seq: AtomicU64,
+    /// Fold identities, one per gather: lets a forcing call tell "my
+    /// bytes were taken by a concurrent fold" (wait for it) from
+    /// "nothing pending" (no-op). Diagnostics only, never semantics.
+    fold_ids: AtomicU64,
     /// Most open file handles at once: read captures pin their
     /// open-time version and writable images pin buffered bytes, so
     /// the table is memory. Past the bound opens fail `EMFILE` — the
@@ -267,6 +286,167 @@ impl Drop for RequestLog {
     }
 }
 
+/// One taken dirty buffer: the fold detached the image under the
+/// handle's lock and parked writers on `fold_wake` until it settles
+/// the handle, so no concurrent write is lost between the take and
+/// the re-pin.
+struct TakenMember {
+    handle: Arc<Mutex<WriteHandle>>,
+    /// First-in-first-buffered order: members apply by this stamp.
+    seq: u64,
+    path: String,
+    base: FileIdentity,
+    executable: bool,
+    append: bool,
+    content: Vec<u8>,
+}
+
+/// What owns a fold's forcing privilege: a dirty handle's own commit
+/// (its taken buffer carries the privilege), a namespace operation's
+/// own syscall, or nothing (shutdown: no privilege, per-member
+/// best-effort, no abort).
+enum FoldSubmitForcer {
+    Handle(Arc<Mutex<WriteHandle>>),
+    Op(MutationKind),
+    None,
+}
+
+/// One submitted fold run: one queue member settling one or more
+/// taken handles. Same-path append sequences merge into their
+/// earliest run, so sequential appends concatenate instead of
+/// contending.
+struct SubmitMember {
+    /// Taken handles behind this run, in buffering order.
+    taken: Vec<usize>,
+    kind: MutationKind,
+    forcer: bool,
+}
+
+/// Which dirty handles one gather leaves pending: namespace
+/// operations rebind the paths they touch, so content buffered for
+/// those paths stays for its own later boundary (resolving stale
+/// like today) instead of entangling its base with the rebinding —
+/// while every other dirty handle folds. A handle whose path no
+/// longer resolves is likewise left alone: it is already stale, and
+/// folding it now would only fail it early. The forcing handle
+/// itself is never filtered: its syscall reports its own outcome.
+struct GatherFilter<'a> {
+    /// Paths the operation rebinds or destroys; writers there stay.
+    skip_paths: &'a [String],
+    /// Leave already-stale (unresolvable) writers pending.
+    exclude_absent: bool,
+    /// The forcing handle: always taken when dirty.
+    own: Option<&'a Arc<Mutex<WriteHandle>>>,
+}
+
+/// The queue kind for one taken buffer: an append sequence commits
+/// onto the current end with no base comparison, anything else
+/// commits its full image against its base.
+fn taken_kind(taken: &TakenMember) -> MutationKind {
+    if taken.append {
+        MutationKind::AppendFile {
+            path: taken.path.clone(),
+            content: taken.content.clone(),
+        }
+    } else {
+        MutationKind::CommitFile {
+            path: taken.path.clone(),
+            base: taken.base.clone(),
+            executable: taken.executable,
+            content: taken.content.clone(),
+        }
+    }
+}
+
+/// The applied outcome behind a winning disposition, for settling a
+/// taken handle onto its committed state.
+fn disposition_outcome(disposition: &FoldDisposition) -> MutationOutcome {
+    match disposition {
+        FoldDisposition::Committed(identity) => MutationOutcome::Committed(identity.clone()),
+        FoldDisposition::Created(identity) => MutationOutcome::Created(identity.clone()),
+        FoldDisposition::Done => MutationOutcome::Done,
+        FoldDisposition::Failed(_) | FoldDisposition::Restored => MutationOutcome::Done,
+    }
+}
+
+/// Settle one taken handle onto its applied outcome: advance the base
+/// to the committed identity, refresh the capture, drop the dirty
+/// mark, and release the budget. A missed capture re-pin degrades to
+/// the stale rule — the base already advanced, so the next commit
+/// fails closed instead of writing stale bytes.
+fn settle_applied<S: ObjectStore, M: Materialization>(
+    backend: &FuseBackend<S, M>,
+    taken: &TakenMember,
+    outcome: &MutationOutcome,
+) -> Result<(), fuser::Errno>
+where
+    S::Error: std::fmt::Debug,
+{
+    // Resolve the capture before taking the handle lock: the
+    // projection is an immutable snapshot, so this nests no locks.
+    let capture = backend.capture_for(&taken.path).ok();
+    let mut write = taken.handle.lock().map_err(|_| fuser::Errno::EIO)?;
+    match outcome {
+        MutationOutcome::Committed(identity) | MutationOutcome::Created(identity) => {
+            write.executable = identity.executable();
+            write.base = identity.clone();
+        }
+        MutationOutcome::Done => {}
+        MutationOutcome::Fold { .. } => {
+            // Applied outcomes are never folds; fail closed and loud.
+            tracing::error!("settle got a fold outcome for an applied member");
+            write.failed = true;
+            write.dirty = false;
+            write.inflight = None;
+            backend.budget.release(write.id);
+            backend.fold_wake.notify_all();
+            return Err(fuser::Errno::EIO);
+        }
+    }
+    if let Some(capture) = capture {
+        write.capture = capture;
+    }
+    write.dirty = false;
+    write.inflight = None;
+    backend.budget.release(write.id);
+    backend.fold_wake.notify_all();
+    Ok(())
+}
+
+/// Settle one taken handle as failed: terminal, overlay discarded,
+/// budget released — like any refused single commit.
+fn settle_failed<S: ObjectStore, M: Materialization>(
+    backend: &FuseBackend<S, M>,
+    taken: &TakenMember,
+) where
+    S::Error: std::fmt::Debug,
+{
+    if let Ok(mut write) = taken.handle.lock() {
+        write.failed = true;
+        write.dirty = false;
+        write.inflight = None;
+        backend.budget.release(write.id);
+    }
+    backend.fold_wake.notify_all();
+}
+
+/// Settle one taken handle as restored: its image goes back and it
+/// stays dirty and retryable for its own forcing event. The budget
+/// was never released, so the reservation still covers the image.
+fn settle_restored<S: ObjectStore, M: Materialization>(
+    backend: &FuseBackend<S, M>,
+    taken: &TakenMember,
+) where
+    S::Error: std::fmt::Debug,
+{
+    if let Ok(mut write) = taken.handle.lock() {
+        write.image = Some(taken.content.clone());
+        write.dirty = true;
+        write.inflight = None;
+    }
+    backend.fold_wake.notify_all();
+}
+
 impl<S: ObjectStore, M: Materialization> FuseBackend<S, M>
 where
     S::Error: std::fmt::Debug,
@@ -291,6 +471,9 @@ where
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
             open_timeout: Duration::ZERO,
+            fold_wake: Condvar::new(),
+            fold_seq: AtomicU64::new(0),
+            fold_ids: AtomicU64::new(0),
             uid,
             gid,
         }
@@ -321,6 +504,9 @@ where
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
             open_timeout: Duration::ZERO,
+            fold_wake: Condvar::new(),
+            fold_seq: AtomicU64::new(0),
+            fold_ids: AtomicU64::new(0),
             uid,
             gid,
         }
@@ -362,6 +548,9 @@ where
             max_open_handles: budgets.max_open_handles,
             max_open_capture_bytes: budgets.max_open_capture_bytes,
             open_timeout,
+            fold_wake: Condvar::new(),
+            fold_seq: AtomicU64::new(0),
+            fold_ids: AtomicU64::new(0),
             uid,
             gid,
         }
@@ -1047,7 +1236,7 @@ where
             // commit. The followup `setattr` short-circuits as a
             // no-op in `set_size_at`.
             Some(
-                match self.submit(MutationKind::SetAttrs {
+                match self.force_op(MutationKind::SetAttrs {
                     path: path.to_string(),
                     size: Some(0),
                     executable: None,
@@ -1059,6 +1248,9 @@ where
                     MutationOutcome::Done => observed,
                     // `SetAttrs` never creates; keeps the match total.
                     MutationOutcome::Created(_) => return Err(fuser::Errno::EIO),
+                    // A fold answers a lone forcer with its own outcome;
+                    // anything else is a contract break, failed closed.
+                    MutationOutcome::Fold { .. } => return Err(fuser::Errno::EIO),
                 },
             )
         } else {
@@ -1097,6 +1289,8 @@ where
             image: None,
             append,
             dirty: false,
+            dirty_seq: 0,
+            inflight: None,
             failed: false,
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
@@ -1144,15 +1338,10 @@ where
         // either consumes the promise (`insert_reserved`) or returns
         // it (`release_slot`).
         self.reserve_slot()?;
-        let identity = match mutations
-            .submit(MutationKind::CreateFile {
-                path: child_path.clone(),
-                parent,
-            })
-            .map_err(|error| {
-                log_refused(&error);
-                mutation_errno(&error)
-            }) {
+        let identity = match self.force_op(MutationKind::CreateFile {
+            path: child_path.clone(),
+            parent,
+        }) {
             Ok(MutationOutcome::Created(identity)) => identity,
             Ok(outcome) => {
                 self.release_slot();
@@ -1196,6 +1385,8 @@ where
             image: None,
             append: flags & libc::O_APPEND != 0,
             dirty: false,
+            dirty_seq: 0,
+            inflight: None,
             failed: false,
             sync: flags & (libc::O_SYNC | libc::O_DSYNC) != 0,
             id,
@@ -1239,6 +1430,9 @@ where
             return Err(fuser::Errno::EBADF);
         };
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        // A fold may hold this handle's image: park until it settles,
+        // then buffer onto the settled state.
+        write = self.wait_inflight(write)?;
         if write.failed {
             return Err(fuser::Errno::EIO);
         }
@@ -1256,9 +1450,15 @@ where
             }
             image.extend_from_slice(data);
             write.image = Some(image);
-            write.dirty = true;
-            if write.sync {
-                self.commit_locked(&mut write)?;
+            self.mark_dirty(&mut write);
+            let sync = write.sync;
+            drop(write);
+            if sync {
+                // The write-plus-commit is one durability step, not one
+                // atomic snapshot: a concurrent write may join the fold
+                // (extra durability, never less), and a concurrent fold
+                // that takes these bytes first is awaited inside.
+                self.force_handle(&handle)?;
             }
             return Ok(data.len() as u32);
         }
@@ -1315,112 +1515,462 @@ where
                 write.image = Some(image);
             }
         }
-        write.dirty = true;
+        self.mark_dirty(&mut write);
         let sync = write.sync;
-        if sync {
-            // Commit under the same guard: the write-plus-commit is
-            // one atomic step, so no concurrent write can join this
-            // snapshot and each accepted O_SYNC write is its own.
-            self.commit_locked(&mut write)?;
-        }
         drop(write);
+        if sync {
+            // The write-plus-commit is one durability step, not one
+            // atomic snapshot: a concurrent write may join the fold
+            // (extra durability, never less), and a concurrent fold
+            // that takes these bytes first is awaited inside.
+            self.force_handle(&handle)?;
+        }
         Ok(data.len() as u32)
     }
 
-    /// Commit a dirty writable handle: submit its full image, advance
-    /// the handle's base to the committed identity, drop the image, and
-    /// release its budget. A clean handle commits nothing. A failed
-    /// commit is terminal: the overlay is discarded and every later
-    /// operation returns `EIO`.
+    /// Commit a dirty writable handle through a fold: the handle's own
+    /// buffered image plus every other dirty handle's image commit as
+    /// one snapshot, and the handle re-pins onto the committed
+    /// identity. A clean handle commits nothing (but still waits out a
+    /// concurrent fold holding its image, so `fsync` never returns
+    /// before its bytes are durable). A failed commit is terminal: the
+    /// overlay is discarded and every later operation returns `EIO`.
     pub fn commit_handle(&self, fh: FileHandle) -> Result<(), fuser::Errno> {
         match self.handle_of(fh)? {
             Handle::Read(_) => Ok(()),
-            Handle::Write(handle) => self.commit_write_handle(&handle),
+            Handle::Write(handle) => self.force_handle(&handle),
         }
     }
 
-    /// Commit a writable handle held directly (the release path has
-    /// already removed it from the table).
-    fn commit_write_handle(&self, handle: &Arc<Mutex<WriteHandle>>) -> Result<(), fuser::Errno> {
-        let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
-        self.commit_locked(&mut write)
-    }
-
-    /// The commit transition under an already-held handle guard. Keeping
-    /// it separate from the locking wrapper lets `O_SYNC` writes commit
-    /// without releasing and re-acquiring the lock (which would let a
-    /// concurrent write join the snapshot).
-    fn commit_locked(&self, write: &mut WriteHandle) -> Result<(), fuser::Errno> {
-        if write.failed {
-            return Err(fuser::Errno::EIO);
-        }
+    /// Stamp a clean handle dirty: the first-in-first-buffered order
+    /// is the first buffering time, so later writes keep the original
+    /// stamp and a re-pinned handle starts over.
+    fn mark_dirty(&self, write: &mut WriteHandle) {
         if !write.dirty {
-            return Ok(());
+            write.dirty_seq = self.fold_seq.fetch_add(1, Ordering::Relaxed);
         }
-        let mutations = self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?;
-        // A dirty handle always carries its buffered image: every
-        // `dirty = true` assignment pairs with `image = Some(..)`. If
-        // the image is ever absent here, fail the commit closed
-        // rather than authoring an empty prefix as a successful
-        // write. Terminal like any other refused commit, and the
-        // budget release is idempotent.
-        let content = match write.image.take() {
-            Some(image) => image,
-            None => {
-                write.failed = true;
-                write.dirty = false;
-                self.budget.release(write.id);
-                return Err(fuser::Errno::EIO);
+        write.dirty = true;
+    }
+
+    /// Park until no fold holds this handle's image. The waiter owns
+    /// no other lock, and the fold thread never waits while holding a
+    /// handle lock, so the park always ends.
+    fn wait_inflight<'a>(
+        &self,
+        mut write: MutexGuard<'a, WriteHandle>,
+    ) -> Result<MutexGuard<'a, WriteHandle>, fuser::Errno> {
+        while write.inflight.is_some() {
+            write = self.fold_wake.wait(write).map_err(|_| fuser::Errno::EIO)?;
+        }
+        Ok(write)
+    }
+
+    /// Take every dirty handle's image for one fold, minus the
+    /// filter's exclusions: the table is only held to clone arcs,
+    /// then each handle is locked alone (pointer order, never
+    /// nested) and its image detached with the fold's identity.
+    /// Skips clean, failed, already-taken, filtered, and imageless
+    /// handles — the imageless one fails closed on the spot, like the
+    /// old single-handle commit did. Returns the taken members in
+    /// first-in-first-buffered order.
+    fn gather_taken(
+        &self,
+        extra: &[Arc<Mutex<WriteHandle>>],
+        filter: &GatherFilter<'_>,
+    ) -> Result<Vec<TakenMember>, fuser::Errno> {
+        let fold_id = self.fold_ids.fetch_add(1, Ordering::Relaxed);
+        let mut arcs: Vec<Arc<Mutex<WriteHandle>>> = {
+            let files = self.files.lock().map_err(|_| fuser::Errno::EIO)?;
+            files
+                .by_handle
+                .values()
+                .filter_map(|handle| match handle {
+                    Handle::Write(write) => Some(Arc::clone(write)),
+                    Handle::Read(_) => None,
+                })
+                .collect()
+        };
+        for handle in extra {
+            if !arcs.iter().any(|known| Arc::ptr_eq(known, handle)) {
+                arcs.push(Arc::clone(handle));
             }
-        };
-        let path = write.path.clone();
-        let outcome = if write.append {
-            // Append: the sequence commits onto the current head's end;
-            // there is no base content comparison.
-            mutations.submit(MutationKind::AppendFile { path, content })
-        } else {
-            let base = write.base.clone();
-            mutations.submit(MutationKind::CommitFile {
-                path,
-                base,
+        }
+        arcs.sort_by_key(|handle| Arc::as_ptr(handle) as usize);
+        let mut taken = Vec::new();
+        for handle in &arcs {
+            let mut write = match handle.lock() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
+            if write.failed || !write.dirty || write.inflight.is_some() {
+                continue;
+            }
+            let is_own = filter.own.is_some_and(|own| Arc::ptr_eq(own, handle));
+            if !is_own {
+                if filter.skip_paths.iter().any(|path| *path == write.path) {
+                    // A namespace operation rebinds these paths; the
+                    // buffered content resolves at its own boundary.
+                    continue;
+                }
+                if filter.exclude_absent && !self.path_resolves(&write.path) {
+                    // Already stale against the served view; folding
+                    // it now would only fail it early.
+                    continue;
+                }
+            }
+            // A dirty handle always carries its buffered image: every
+            // dirty transition pairs with a materialized image. If the
+            // image is ever absent here, fail the handle closed rather
+            // than authoring an empty prefix as a successful write.
+            let content = match write.image.take() {
+                Some(image) => image,
+                None => {
+                    write.failed = true;
+                    write.dirty = false;
+                    self.budget.release(write.id);
+                    continue;
+                }
+            };
+            write.inflight = Some(fold_id);
+            taken.push(TakenMember {
+                handle: Arc::clone(handle),
+                seq: write.dirty_seq,
+                path: write.path.clone(),
+                base: write.base.clone(),
                 executable: write.executable,
+                append: write.append,
                 content,
-            })
+            });
+        }
+        taken.sort_by_key(|taken| taken.seq);
+        Ok(taken)
+    }
+
+    /// Whether `path` resolves in the served view: a writer whose
+    /// path is gone is already stale, whatever its base says. Lookup
+    /// failures other than absence (and a broken projection) include
+    /// rather than exclude — the loop decides those closed.
+    fn path_resolves(&self, path: &str) -> bool {
+        let Ok(projection) = self.projection() else {
+            return true;
         };
-        match outcome {
-            Ok(MutationOutcome::Committed(identity)) => {
-                write.executable = identity.executable();
-                write.base = identity;
-                match self.capture_for(&write.path) {
-                    Ok(capture) => {
-                        write.capture = capture;
-                        write.dirty = false;
-                        self.budget.release(write.id);
-                        Ok(())
+        !matches!(projection.view().lookup(path), Err(ViewError::NotFound))
+    }
+
+    /// The paths one operation rebinds or destroys: writers buffered
+    /// for these stay pending for their own boundary instead of
+    /// folding into the rebinding. A truncating `setattr` rebinds
+    /// nothing — its same-path writers fold and lose the tie, per the
+    /// write-path contract — so it filters no path.
+    fn forcer_skip_paths(kind: &MutationKind) -> Vec<String> {
+        match kind {
+            MutationKind::Mkdir { path }
+            | MutationKind::Unlink { path }
+            | MutationKind::Rmdir { path }
+            | MutationKind::CreateFile { path, .. } => vec![path.clone()],
+            MutationKind::Rename { from, to, .. } => vec![from.clone(), to.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Submit one fold over taken members: the non-forcing members in
+    /// buffering order, then the operation forcer last (it buffered at
+    /// submit time), or the handle forcer inline at its own buffering
+    /// position. Same-path append sequences merge into their earliest
+    /// run in FIFO order — sequential appends concatenate, so one
+    /// member carries their concatenation and every merged handle
+    /// settles from its disposition. Returns the loop's raw outcome
+    /// plus the submitted runs; settling happens in
+    /// [`settle_fold`](Self::settle_fold).
+    fn run_fold(
+        &self,
+        queue: &Arc<MutationQueue>,
+        taken: &[TakenMember],
+        forcer: &FoldSubmitForcer,
+    ) -> (Result<MutationOutcome, MutationError>, Vec<SubmitMember>) {
+        let forcer_taken = match forcer {
+            FoldSubmitForcer::Handle(handle) => taken
+                .iter()
+                .position(|taken| Arc::ptr_eq(&taken.handle, handle)),
+            _ => None,
+        };
+        let mut submitted: Vec<SubmitMember> = Vec::with_capacity(taken.len() + 1);
+        // Open append run per path, by submitted position.
+        let mut runs: Vec<(String, usize)> = Vec::new();
+        for (index, taken) in taken.iter().enumerate() {
+            let is_forcer = Some(index) == forcer_taken;
+            if taken.append {
+                if let Some((_, pos)) = runs.iter().find(|(path, _)| *path == taken.path) {
+                    let pos = *pos;
+                    if let MutationKind::AppendFile { content, .. } = &mut submitted[pos].kind {
+                        content.extend_from_slice(&taken.content);
                     }
-                    Err(error) => {
-                        write.failed = true;
-                        write.dirty = false;
-                        self.budget.release(write.id);
-                        Err(error)
+                    submitted[pos].taken.push(index);
+                    submitted[pos].forcer |= is_forcer;
+                    continue;
+                }
+            }
+            let pos = submitted.len();
+            if taken.append {
+                runs.push((taken.path.clone(), pos));
+            }
+            submitted.push(SubmitMember {
+                taken: vec![index],
+                kind: taken_kind(taken),
+                forcer: is_forcer,
+            });
+        }
+        if let FoldSubmitForcer::Op(kind) = forcer {
+            submitted.push(SubmitMember {
+                taken: Vec::new(),
+                kind: kind.clone(),
+                forcer: true,
+            });
+        }
+        let members = submitted
+            .iter()
+            .map(|submitted| FoldMember {
+                kind: submitted.kind.clone(),
+                forcer: submitted.forcer,
+            })
+            .collect();
+        (queue.submit(MutationKind::Fold { members }), submitted)
+    }
+
+    /// Settle taken handles from the loop's fold outcome: winners
+    /// re-pin onto the committed identity, losers go terminal, and
+    /// restored members get their image back and stay dirty. Merged
+    /// append runs settle every merged handle from the run's
+    /// disposition. A channel failure (the fold never ran) fails every
+    /// taken handle closed like a refused single commit. Returns the
+    /// forcer's outcome for the forcing syscall plus one committed
+    /// flag per taken path, in take order, for best-effort logging.
+    fn settle_fold(
+        &self,
+        taken: &[TakenMember],
+        submitted: &[SubmitMember],
+        forcer: &FoldSubmitForcer,
+        result: Result<MutationOutcome, MutationError>,
+    ) -> (Result<MutationOutcome, fuser::Errno>, Vec<(String, bool)>) {
+        let fail_all = |taken: &[TakenMember]| {
+            for taken in taken {
+                settle_failed(self, taken);
+            }
+            taken
+                .iter()
+                .map(|taken| (taken.path.clone(), false))
+                .collect::<Vec<_>>()
+        };
+        // Settle every taken handle behind one submitted run from the
+        // run's disposition.
+        let settle_run =
+            |taken: &[TakenMember], run: &SubmitMember, disposition: &FoldDisposition| {
+                let mut committed = false;
+                for index in &run.taken {
+                    let taken = &taken[*index];
+                    committed = match disposition {
+                        FoldDisposition::Committed(_)
+                        | FoldDisposition::Created(_)
+                        | FoldDisposition::Done => {
+                            settle_applied(self, taken, &disposition_outcome(disposition)).is_ok()
+                        }
+                        FoldDisposition::Failed(_) => {
+                            settle_failed(self, taken);
+                            false
+                        }
+                        FoldDisposition::Restored => {
+                            settle_restored(self, taken);
+                            false
+                        }
+                    };
+                }
+                committed
+            };
+        match result {
+            Err(error) => {
+                log_refused(&error);
+                let errno = mutation_errno(&error);
+                let summary = fail_all(taken);
+                (Err(errno), summary)
+            }
+            Ok(MutationOutcome::Fold {
+                forcer: forcer_outcome,
+                members,
+            }) => {
+                let expect = submitted.iter().filter(|run| !run.forcer).count();
+                if members.len() != expect {
+                    tracing::error!(
+                        expected = expect,
+                        got = members.len(),
+                        "fold disposition count mismatch; failing every taken handle closed"
+                    );
+                    let summary = fail_all(taken);
+                    return (Err(fuser::Errno::EIO), summary);
+                }
+                let mut member_iter = members.into_iter();
+                let mut summary = Vec::with_capacity(taken.len());
+                for run in submitted {
+                    if run.forcer {
+                        continue;
+                    }
+                    let Some(disposition) = member_iter.next() else {
+                        for index in &run.taken {
+                            settle_failed(self, &taken[*index]);
+                            summary.push((taken[*index].path.clone(), false));
+                        }
+                        continue;
+                    };
+                    let committed = settle_run(taken, run, &disposition);
+                    for index in &run.taken {
+                        summary.push((taken[*index].path.clone(), committed));
+                    }
+                }
+                match (forcer, forcer_outcome) {
+                    (FoldSubmitForcer::Handle(_), FoldForcerOutcome::Applied(outcome)) => {
+                        if let Some(run) = submitted.iter().find(|run| run.forcer) {
+                            // A settle failure already failed the handle
+                            // closed; report it instead of a success the
+                            // handle cannot honor.
+                            let mut settled = true;
+                            for index in &run.taken {
+                                if settle_applied(self, &taken[*index], &outcome).is_err() {
+                                    settled = false;
+                                }
+                            }
+                            if !settled {
+                                return (Err(fuser::Errno::EIO), summary);
+                            }
+                        }
+                        (Ok(*outcome), summary)
+                    }
+                    (FoldSubmitForcer::Handle(_), FoldForcerOutcome::Failed(error)) => {
+                        log_refused(&error);
+                        let errno = mutation_errno(&error);
+                        if let Some(run) = submitted.iter().find(|run| run.forcer) {
+                            for index in &run.taken {
+                                settle_failed(self, &taken[*index]);
+                            }
+                        }
+                        (Err(errno), summary)
+                    }
+                    (_, FoldForcerOutcome::Applied(outcome)) => (Ok(*outcome), summary),
+                    (_, FoldForcerOutcome::Failed(error)) => {
+                        log_refused(&error);
+                        (Err(mutation_errno(&error)), summary)
                     }
                 }
             }
-            Ok(_) => {
-                write.failed = true;
-                write.dirty = false;
-                self.budget.release(write.id);
-                tracing::debug!("commit got non-committed outcome");
-                Err(fuser::Errno::EIO)
-            }
-            Err(error) => {
-                write.failed = true;
-                write.dirty = false;
-                self.budget.release(write.id);
-                log_refused(&error);
-                Err(mutation_errno(&error))
+            Ok(other) => {
+                // The loop answered a fold with a non-fold outcome:
+                // contract break, fail everything closed and loud.
+                tracing::error!(outcome = ?other, "fold answered with a non-fold outcome");
+                let summary = fail_all(taken);
+                (Err(fuser::Errno::EIO), summary)
             }
         }
+    }
+
+    /// Fold a writable handle's own bytes durable: gather its image
+    /// plus every other dirty image, submit one fold, and settle. A
+    /// concurrent fold that takes our image first is awaited, then
+    /// the state is re-read: clean means durable, dirty means ours to
+    /// fold. Mirrors the old single-handle commit's reporting: only a
+    /// committed content outcome succeeds, anything else is terminal.
+    fn force_handle(&self, handle: &Arc<Mutex<WriteHandle>>) -> Result<(), fuser::Errno> {
+        let queue = Arc::clone(self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?);
+        loop {
+            {
+                let write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+                let write = self.wait_inflight(write)?;
+                if write.failed {
+                    return Err(fuser::Errno::EIO);
+                }
+                if !write.dirty {
+                    return Ok(());
+                }
+            }
+            let taken = self.gather_taken(
+                std::slice::from_ref(handle),
+                &GatherFilter {
+                    skip_paths: &[],
+                    exclude_absent: true,
+                    own: Some(handle),
+                },
+            )?;
+            if !taken.iter().any(|taken| Arc::ptr_eq(&taken.handle, handle)) {
+                // A concurrent fold took our image between the check
+                // and the gather; loop back to await it.
+                continue;
+            }
+            let forcer = FoldSubmitForcer::Handle(Arc::clone(handle));
+            let (result, submitted) = self.run_fold(&queue, &taken, &forcer);
+            let (mapped, _) = self.settle_fold(&taken, &submitted, &forcer, result);
+            return match mapped {
+                Ok(MutationOutcome::Committed(_)) => Ok(()),
+                Ok(_) => {
+                    // A content commit that reports anything else
+                    // failed: terminal like any refused commit.
+                    if let Ok(mut write) = handle.lock() {
+                        write.failed = true;
+                        write.dirty = false;
+                        write.inflight = None;
+                        self.budget.release(write.id);
+                    }
+                    self.fold_wake.notify_all();
+                    tracing::debug!("fold got non-committed outcome for a handle commit");
+                    Err(fuser::Errno::EIO)
+                }
+                Err(error) => Err(error),
+            };
+        }
+    }
+
+    /// Fold one operation plus every dirty image into one snapshot:
+    /// the forcing syscall for namespace operations, creates, and
+    /// truncating opens. Returns the forcer's own outcome, exactly as
+    /// if it had submitted alone.
+    fn force_op(&self, kind: MutationKind) -> Result<MutationOutcome, fuser::Errno> {
+        let queue = Arc::clone(self.mutations.as_ref().ok_or(fuser::Errno::EROFS)?);
+        let skip_paths = Self::forcer_skip_paths(&kind);
+        let taken = self.gather_taken(
+            &[],
+            &GatherFilter {
+                skip_paths: &skip_paths,
+                exclude_absent: true,
+                own: None,
+            },
+        )?;
+        let forcer = FoldSubmitForcer::Op(kind);
+        let (result, submitted) = self.run_fold(&queue, &taken, &forcer);
+        let (mapped, _) = self.settle_fold(&taken, &submitted, &forcer, result);
+        mapped
+    }
+
+    /// Fold an explicit handle set with no privilege and no abort:
+    /// the destroy path, best-effort per path. Returns one committed
+    /// flag per taken path, in take order.
+    fn force_explicit(&self, candidates: &[Arc<Mutex<WriteHandle>>]) -> Vec<(String, bool)> {
+        let Some(queue) = self.mutations.as_ref().map(Arc::clone) else {
+            return Vec::new();
+        };
+        let taken = match self.gather_taken(
+            candidates,
+            &GatherFilter {
+                skip_paths: &[],
+                exclude_absent: false,
+                own: None,
+            },
+        ) {
+            Ok(taken) => taken,
+            Err(_) => return Vec::new(),
+        };
+        if taken.is_empty() {
+            return Vec::new();
+        }
+        let forcer = FoldSubmitForcer::None;
+        let (result, submitted) = self.run_fold(&queue, &taken, &forcer);
+        let (_, summary) = self.settle_fold(&taken, &submitted, &forcer, result);
+        summary
     }
 
     /// Resolve `path` in the current projection and re-open it as a
@@ -1438,11 +1988,13 @@ where
             .map_err(|error| errno_of(&error))
     }
 
-    /// Drop an open handle. A writable handle commits best-effort
-    /// first (a `release` error is not observable to the application);
-    /// unknown handles release quietly. The handle is removed from the
-    /// table before the commit so a concurrent lookup cannot race the
-    /// drop.
+    /// Drop an open handle. A writable handle folds best-effort first
+    /// (a `release` error is not observable to the application):
+    /// releasing a dirty handle folds the whole pending set, so one
+    /// close can make other handles' bytes durable too. Unknown
+    /// handles release quietly. The handle is removed from the table
+    /// before the fold so a concurrent lookup cannot race the drop;
+    /// the detached handle still folds as the forcer.
     pub fn release_handle(&self, fh: FileHandle) -> Result<(), fuser::Errno> {
         let removed = {
             let Ok(mut files) = self.files.lock() else {
@@ -1460,7 +2012,7 @@ where
             // paths that share the commit, where the errno itself is
             // the report.
             let previously_failed = handle.lock().map(|write| write.failed).unwrap_or(false);
-            if let Err(error) = self.commit_write_handle(&handle) {
+            if let Err(error) = self.force_handle(&handle) {
                 let path = handle
                     .lock()
                     .map(|write| write.path.clone())
@@ -1695,28 +2247,12 @@ where
     ) -> Result<(u64, fuser::FileAttr), fuser::Errno> {
         let parent_path = self.inode_path(parent_ino)?;
         let child_path = join(&parent_path, name);
-        self.submit(MutationKind::Mkdir {
+        self.force_op(MutationKind::Mkdir {
             path: child_path.clone(),
         })?;
         let (ino, node, _) = self.resolve_inode(&child_path)?;
         let attr = self.attr(ino, &node);
         Ok((ino, attr))
-    }
-
-    /// Submit one mutation to the loop, mapping both channel and
-    /// application failures to the POSIX boundary. Refusals log the
-    /// underlying variant: several distinct failures share `EIO`, and
-    /// the errno alone cannot tell a conflicted drive from an
-    /// unavailable view or a failed authoring.
-    fn submit(&self, kind: MutationKind) -> Result<MutationOutcome, fuser::Errno> {
-        self.mutations
-            .as_ref()
-            .ok_or(fuser::Errno::EROFS)?
-            .submit(kind)
-            .map_err(|error| {
-                log_refused(&error);
-                mutation_errno(&error)
-            })
     }
 
     /// Remove the file or symlink `name` under `parent_ino`.
@@ -1726,7 +2262,7 @@ where
             return Err(fuser::Errno::EROFS);
         }
         let token = self.begin_remove(&path)?;
-        let result = self.submit(MutationKind::Unlink { path: path.clone() });
+        let result = self.force_op(MutationKind::Unlink { path: path.clone() });
         self.finish_remove(&path, token, result.is_ok());
         result.map(|_| ())
     }
@@ -1738,7 +2274,7 @@ where
             return Err(fuser::Errno::EROFS);
         }
         let token = self.begin_remove(&path)?;
-        let result = self.submit(MutationKind::Rmdir { path: path.clone() });
+        let result = self.force_op(MutationKind::Rmdir { path: path.clone() });
         self.finish_remove(&path, token, result.is_ok());
         result.map(|_| ())
     }
@@ -1758,7 +2294,15 @@ where
     ) -> Result<(), fuser::Errno> {
         let from = join(&self.inode_path(parent_ino)?, name);
         let to = join(&self.inode_path(new_parent_ino)?, new_name);
-        self.submit(MutationKind::Rename {
+        if from == to && !no_replace {
+            // A no-op submission submits nothing and forces nothing:
+            // renaming a path onto itself leaves the pending set
+            // untouched for its own later forcing event. With
+            // `no_replace` the same path is a refusal (`EEXIST`),
+            // decided by the loop like any failed forcer.
+            return Ok(());
+        }
+        self.force_op(MutationKind::Rename {
             from: from.clone(),
             to: to.clone(),
             no_replace,
@@ -1798,7 +2342,7 @@ where
         // fails (lock poison, kind change mid-flight) degrades to the
         // stale rule — never to silent content loss.
         let clean = self.clean_handles_on(&path);
-        self.submit(MutationKind::SetAttrs {
+        self.force_op(MutationKind::SetAttrs {
             path: path.clone(),
             size: Some(size),
             executable: None,
@@ -1834,7 +2378,8 @@ where
     /// `base` guard, and `set_size_at` keeps its own `attr_at` because
     /// it needs the stat's size for the same-size no-op and the
     /// clean-handle repin. A vanished path fails at the lookup instead
-    /// of dying in the mutation loop.
+    /// of dying in the mutation loop, and a no-op (size and exec both
+    /// already as requested) submits nothing and forces nothing.
     /// The converted arms are tested through this seam (vanished-path
     /// coverage on `set_exec_at` and the fh-less arm), not per arm:
     /// the arms differ only in how they obtain `path`.
@@ -1848,8 +2393,27 @@ where
             size.is_some() || executable.is_some(),
             "a SetAttrs with neither size nor exec change is a wasted round trip"
         );
-        self.attr_at(path)?;
-        self.submit(MutationKind::SetAttrs {
+        let (_, node, _) = self.resolve_inode(path)?;
+        if let Node::File {
+            size: current_size,
+            executable: current_exec,
+            ..
+        } = &node
+        {
+            let size = size.filter(|size| *size != *current_size);
+            let executable = executable.filter(|executable| *executable != *current_exec);
+            if size.is_none() && executable.is_none() {
+                return Ok(());
+            }
+            self.force_op(MutationKind::SetAttrs {
+                path: path.to_owned(),
+                size,
+                executable,
+                base: None,
+            })?;
+            return Ok(());
+        }
+        self.force_op(MutationKind::SetAttrs {
             path: path.to_owned(),
             size,
             executable,
@@ -1986,6 +2550,7 @@ where
         executable: bool,
     ) -> Result<(), fuser::Errno> {
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        write = self.wait_inflight(write)?;
         if write.path != path {
             return Err(fuser::Errno::EBADF);
         }
@@ -2014,9 +2579,11 @@ where
             }
         }
         write.executable = executable;
-        write.dirty = true;
-        if write.sync {
-            self.commit_locked(&mut write)?;
+        self.mark_dirty(&mut write);
+        let sync = write.sync;
+        drop(write);
+        if sync {
+            self.force_handle(handle)?;
         }
         Ok(())
     }
@@ -2036,6 +2603,7 @@ where
             return Err(fuser::Errno::EFBIG);
         }
         let mut write = handle.lock().map_err(|_| fuser::Errno::EIO)?;
+        write = self.wait_inflight(write)?;
         if write.path != path {
             return Err(fuser::Errno::EBADF);
         }
@@ -2082,9 +2650,11 @@ where
         }
         image.resize(target, 0);
         write.image = Some(image);
-        write.dirty = true;
-        if write.sync {
-            self.commit_locked(&mut write)?;
+        self.mark_dirty(&mut write);
+        let sync = write.sync;
+        drop(write);
+        if sync {
+            self.force_handle(handle)?;
         }
         Ok(())
     }
@@ -2606,25 +3176,25 @@ where
     }
 
     fn destroy(&mut self) {
-        // Unmount: commit dirty writable handles best-effort, then
-        // drop the table so it never leaks across mounts. Removal
-        // precedes each commit (as in `release_handle`) so a
-        // concurrent lookup cannot race the drop. The composer's order
+        // Unmount: fold dirty writable handles best-effort into one
+        // snapshot, then drop the table so it never leaks across
+        // mounts. Removal precedes the fold (as in `release_handle`)
+        // so a concurrent lookup cannot race the drop; the drained
+        // handles fold from the explicit set. The composer's order
         // runs destroy against an open, drained queue — the loop has
-        // returned but its post-return drain executes these commits
-        // like any release-path write — so each attempt resolves with
-        // the drain's next sweep, never by waiting on a loop that will
+        // returned but its post-return drain executes the fold like
+        // any release-path write — so the fold resolves with the
+        // drain's next sweep, never by waiting on a loop that will
         // never drain again. A queue already closed (admission shut
         // after the session join, or the loop-thread panic recovery)
         // refuses fast with `Shutdown` and the loss is logged per
-        // path. Attempts run serially and each is bounded by the
-        // mutation-wait budget (30s): a commit that would hold for
-        // content fails closed in the drain instead of parking, so a
-        // stalled drain cannot hold the session join past one budget
-        // per handle, and the composer's close bounds even that.
-        // Composer precondition: destroy must run after the loop's
-        // return and before the admission close; the session join
-        // between them is what guarantees both.
+        // path. The fold is bounded by the mutation-wait budget (30s):
+        // a fold that would hold for content fails closed in the
+        // drain instead of parking, so a stalled drain cannot hold
+        // the session join, and the composer's close bounds even
+        // that. Composer precondition: destroy must run after the
+        // loop's return and before the admission close; the session
+        // join between them is what guarantees both.
         let removed: Vec<(u64, Handle)> = match self.files.lock() {
             Ok(mut files) => files.by_handle.drain().collect(),
             Err(error) => {
@@ -2632,6 +3202,7 @@ where
                 return;
             }
         };
+        let mut candidates = Vec::new();
         for (id, handle) in removed {
             if let Handle::Write(handle) = handle {
                 let (path, dirty, failed) = match handle.lock() {
@@ -2645,15 +3216,28 @@ where
                 } else if !dirty {
                     tracing::debug!(stage = "session", %path, "destroy dropped a clean handle");
                 } else {
-                    match self.commit_write_handle(&handle) {
-                        Ok(()) => {
-                            tracing::info!(stage = "session", %path, "destroy committed a dirty handle")
-                        }
-                        Err(error) => {
-                            tracing::error!(stage = "session", %path, ?error, "destroy dropped a dirty handle's buffered writes")
-                        }
-                    }
+                    candidates.push(handle);
                 }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        if self.mutations.is_none() {
+            for handle in &candidates {
+                let path = handle
+                    .lock()
+                    .map(|write| write.path.clone())
+                    .unwrap_or_else(|_| "<locked>".to_string());
+                tracing::error!(stage = "session", %path, "destroy dropped a dirty handle's buffered writes: read-only mount");
+            }
+            return;
+        }
+        for (path, committed) in self.force_explicit(&candidates) {
+            if committed {
+                tracing::info!(stage = "session", %path, "destroy committed a dirty handle")
+            } else {
+                tracing::error!(stage = "session", %path, "destroy dropped a dirty handle's buffered writes")
             }
         }
     }

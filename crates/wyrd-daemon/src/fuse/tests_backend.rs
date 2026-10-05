@@ -14,7 +14,8 @@ use wyrd_format::ObjectStore;
 use wyrd_fuse::{DriveView, Node, OpenFile};
 
 use wyrd_core::mutation::{
-    FileIdentity, MutationError, MutationKind, MutationOutcome, MutationQueue,
+    FileIdentity, FoldDisposition, FoldForcerOutcome, MutationError, MutationKind, MutationOutcome,
+    MutationQueue,
 };
 use wyrd_core::session::WriteBudget;
 
@@ -423,7 +424,13 @@ fn pending_unlink_defers_retirement_until_the_removal_commits() {
 
     let mut batch = queue.take_batch();
     assert_eq!(batch.len(), 1);
-    batch.record(0, Ok(MutationOutcome::Done));
+    batch.record(
+        0,
+        Ok(MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(Box::new(MutationOutcome::Done)),
+            members: Vec::new(),
+        }),
+    );
     batch.finish();
     assert_eq!(worker.join().unwrap(), Ok(()));
 
@@ -521,7 +528,7 @@ fn o_trunc_open_refuses_a_same_path_replacement() {
     }
     let mut batch = queue.take_batch();
     assert_eq!(batch.len(), 1);
-    match batch.request(0).kind() {
+    match lone_forcer(batch.request(0).kind()) {
         MutationKind::SetAttrs {
             path,
             size,
@@ -541,8 +548,16 @@ fn o_trunc_open_refuses_a_same_path_replacement() {
     }
 
     // The replacement publishes while the open is still in flight.
+    // The loop refuses the guarded truncation, which aborts the lone
+    // fold with nothing committed.
     publish(&backend, replacement);
-    batch.record(0, Err(MutationError::Stale("f.txt".to_string())));
+    batch.record(
+        0,
+        Ok(MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Failed(MutationError::Stale("f.txt".to_string())),
+            members: Vec::new(),
+        }),
+    );
     batch.finish();
     assert_eq!(
         worker.join().unwrap(),
@@ -587,11 +602,12 @@ fn o_trunc_open_refuses_a_replacement_published_after_the_commit() {
     publish(&backend, replacement);
     batch.record(
         0,
-        Ok(MutationOutcome::Committed(FileIdentity::new(
-            0,
-            false,
-            Vec::new(),
-        ))),
+        Ok(MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(Box::new(MutationOutcome::Committed(
+                FileIdentity::new(0, false, Vec::new()),
+            ))),
+            members: Vec::new(),
+        }),
     );
     batch.finish();
 
@@ -869,11 +885,31 @@ fn failed_truncated_open_releases_its_budget_reservation() {
     backend.destroy();
 }
 
+/// Unwrap a lone-forcer fold submission: every forcing syscall
+/// submits its operation plus the pending set, so a test driving an
+/// isolated operation sees exactly one member carrying the privilege.
+fn lone_forcer(kind: &MutationKind) -> &MutationKind {
+    match kind {
+        MutationKind::Fold { members } => {
+            assert_eq!(members.len(), 1, "an isolated operation folds alone");
+            assert!(
+                members[0].forcer,
+                "the operation carries the fold's privilege"
+            );
+            &members[0].kind
+        }
+        other => panic!("a forcing syscall always submits a fold, saw {other:?}"),
+    }
+}
+
 /// A drainer thread standing in for the live loop: it completes every
 /// taken batch with a canned commit identity and records the submitted
 /// kinds, so destroy-time commits resolve exactly like release-path
 /// commits behind a live loop. Without it a submit would block
-/// forever (see the O_TRUNC test above).
+/// forever (see the O_TRUNC test above). Fold submissions are
+/// answered the way the loop answers them — the forcer applied, every
+/// other member committed — so the backend settles exactly as it
+/// would behind the loop.
 fn spawn_drainer(
     queue: &Arc<MutationQueue>,
     seen: &Arc<Mutex<Vec<MutationKind>>>,
@@ -886,17 +922,39 @@ fn spawn_drainer(
         let mut batch = queue.take_batch();
         let empty = batch.is_empty();
         for index in 0..batch.len() {
-            seen.lock()
-                .unwrap()
-                .push(batch.request(index).kind().clone());
-            batch.record(
-                index,
-                Ok(MutationOutcome::Committed(FileIdentity::new(
-                    5,
-                    false,
-                    Vec::new(),
-                ))),
-            );
+            let kind = batch.request(index).kind().clone();
+            seen.lock().unwrap().push(kind.clone());
+            let outcome = match kind {
+                MutationKind::Fold { members } => {
+                    let forcer_kind = members
+                        .iter()
+                        .find(|member| member.forcer)
+                        .map(|member| member.kind.clone());
+                    let forcer = match forcer_kind {
+                        Some(
+                            MutationKind::CommitFile { .. }
+                            | MutationKind::AppendFile { .. }
+                            | MutationKind::CreateFile { .. }
+                            | MutationKind::SetAttrs { .. },
+                        ) => FoldForcerOutcome::Applied(Box::new(MutationOutcome::Committed(
+                            FileIdentity::new(5, false, Vec::new()),
+                        ))),
+                        _ => FoldForcerOutcome::Applied(Box::new(MutationOutcome::Done)),
+                    };
+                    MutationOutcome::Fold {
+                        forcer,
+                        members: members
+                            .iter()
+                            .filter(|member| !member.forcer)
+                            .map(|_| {
+                                FoldDisposition::Committed(FileIdentity::new(5, false, Vec::new()))
+                            })
+                            .collect(),
+                    }
+                }
+                _ => MutationOutcome::Committed(FileIdentity::new(5, false, Vec::new())),
+            };
+            batch.record(index, Ok(outcome));
         }
         batch.finish();
         if empty && done.load(Ordering::Relaxed) {
@@ -931,15 +989,26 @@ fn destroy_commits_dirty_write_handles_while_queue_live() {
     done.store(true, Ordering::Relaxed);
     drainer.join().expect("drainer exits after destroy");
     match &seen.lock().unwrap()[..] {
-        [MutationKind::CommitFile { path, content, .. }] => {
+        [MutationKind::Fold { members }] => {
             assert_eq!(
-                path, "f.txt",
-                "destroy submits the dirty handle's image, not a synthetic op"
+                members.len(),
+                1,
+                "destroy folds the one dirty handle with no forcer of its own"
             );
-            assert_eq!(
-                content, b"dirty",
-                "destroy submits the full buffered image, never a prefix"
-            );
+            assert!(!members[0].forcer, "a destroy fold carries no privilege");
+            match &members[0].kind {
+                MutationKind::CommitFile { path, content, .. } => {
+                    assert_eq!(
+                        path, "f.txt",
+                        "destroy submits the dirty handle's image, not a synthetic op"
+                    );
+                    assert_eq!(
+                        content, b"dirty",
+                        "destroy submits the full buffered image, never a prefix"
+                    );
+                }
+                other => panic!("destroy must commit exactly the dirty handle, saw {other:?}"),
+            }
         }
         other => panic!("destroy must commit exactly the dirty handle, saw {other:?}"),
     }
@@ -1253,14 +1322,20 @@ fn create_queues_the_observed_parent_identity() {
         }
         let mut batch = queue.take_batch();
         assert_eq!(batch.len(), 1);
-        match batch.request(0).kind() {
+        match lone_forcer(batch.request(0).kind()) {
             MutationKind::CreateFile { path, parent } => {
                 assert_eq!(path, "parent/child");
                 assert_eq!(parent, &expected_parent);
             }
             other => panic!("unexpected mutation: {other:?}"),
         }
-        batch.record(0, Err(MutationError::StaleParent("parent".to_string())));
+        batch.record(
+            0,
+            Ok(MutationOutcome::Fold {
+                forcer: FoldForcerOutcome::Failed(MutationError::StaleParent("parent".to_string())),
+                members: Vec::new(),
+            }),
+        );
         batch.finish();
     });
 

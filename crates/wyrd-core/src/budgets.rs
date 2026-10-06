@@ -40,6 +40,14 @@ use crate::want::MAX_PENDING_WANTS;
 /// everything at once.
 pub const DEFAULT_MAX_ADMIT_PER_PASS: usize = 1024;
 
+/// Most rejected representations repaired per sync pass (diagnosed,
+/// unclaimed, unlinked). Leftover queued rejections wait for the
+/// next pass — never dropped, never silently unrepaired. Sized far
+/// below the admission family (64): each repair commits and fsyncs,
+/// so a drive with many bitrotted chunks converges over passes
+/// instead of stretching one pass by an unbounded amount.
+pub const DEFAULT_MAX_QUARANTINE_PER_PASS: usize = 64;
+
 /// Most open file handles at once (read captures plus writable
 /// images). Refusals are `EMFILE`: the table is per-process, like the
 /// descriptor table the errno names. Sized with the registry family
@@ -85,6 +93,10 @@ pub struct ResourceBudgets {
     pub max_parent_tokens: usize,
     /// Wants admitted per sync pass (see the module note on bytes).
     pub max_admit_per_pass: usize,
+    /// Rejected representations repaired per sync pass (see
+    /// [`DEFAULT_MAX_QUARANTINE_PER_PASS`]). Overflow waits for the
+    /// next pass.
+    pub max_quarantine_per_pass: usize,
     /// Largest logical image one writable handle may buffer (`ENOSPC`
     /// past it).
     pub write_per_handle_bytes: usize,
@@ -133,6 +145,7 @@ impl Default for ResourceBudgets {
             max_pending_mutations: MAX_PENDING_MUTATIONS,
             max_parent_tokens: DEFAULT_MAX_PARENT_TOKENS,
             max_admit_per_pass: DEFAULT_MAX_ADMIT_PER_PASS,
+            max_quarantine_per_pass: DEFAULT_MAX_QUARANTINE_PER_PASS,
             write_per_handle_bytes: MAX_WRITE_BUFFER_BYTES,
             write_aggregate_bytes: MAX_BUFFERED_BYTES,
             write_dirty_handles: MAX_DIRTY_HANDLES,

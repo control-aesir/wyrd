@@ -1713,11 +1713,36 @@ impl Engine {
     /// between the two observes the rejection again and waits on,
     /// never served by, the doomed bytes.
     pub fn record_object_removed(&mut self, content: ContentId) -> Result<bool, EngineError> {
-        if !self.store.rebuild(self.device)?.runtime.is_local(&content) {
-            return Ok(false);
+        Ok(self.record_objects_removed(std::slice::from_ref(&content))? > 0)
+    }
+
+    /// Clear many identities' local-possession claims in one durable
+    /// commit: one rebuild filters already-absent claims, one commit
+    /// appends the genuine removals, so a pass repairing N rejected
+    /// representations pays one replay and one fsync no matter how
+    /// many identities it covers — the same shape as
+    /// [`Engine::set_materializations`], for the same reason (see
+    /// the per-pass quarantine cap: batches stay small). Returns the
+    /// number of facts committed.
+    pub fn record_objects_removed(&mut self, contents: &[ContentId]) -> Result<usize, EngineError> {
+        let runtime = self.store.rebuild(self.device)?.runtime;
+        let mut ids: Vec<ContentId> = contents
+            .iter()
+            .copied()
+            .filter(|id| runtime.is_local(id))
+            .collect();
+        // Sorted and deduped before the commit: the same identity
+        // reported twice (a polling waiter re-submits until the
+        // drain runs) commits one fact, deterministically ordered.
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(0);
         }
-        self.store.commit(&[Fact::ObjectRemoved(content)])?;
-        Ok(true)
+        let facts: Vec<Fact> = ids.into_iter().map(Fact::ObjectRemoved).collect();
+        let committed = facts.len();
+        self.store.commit(&facts)?;
+        Ok(committed)
     }
 
     /// Set the residency policy for many content objects in one

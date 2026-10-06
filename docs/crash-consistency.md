@@ -352,6 +352,23 @@ identities plus duplicates, re-batch commits nothing;
 `pin_survives_restart_and_evict_keeps_bytes`
 (`wyrd-daemon/src/core/tests_policy.rs`).
 
+## Quarantine repair
+
+The drain orders claim-clear before unlink, so a crash lands in
+exactly one of two consistent states: claim and bytes both present
+(nothing happened — the waiter re-reports and the next pass
+repairs), or claim cleared with bytes still on disk (the repair
+converges — a read re-observes the rejection and re-submits, and
+`insert` heals a present-but-unverifiable name). Bytes gone under a
+live claim cannot happen: the unlink never runs before the commit.
+Two bounds, both by process lifetime: the in-memory queue loses a
+diagnostic emitted microseconds before the crash (child 14's
+persistence will close this), and the retained-bytes counter keeps
+charging the unlinked-but-uncleared bytes until `FsObjectStore::open`
+re-seeds from disk. Pinned by `record_objects_removed_batches_many_identities`
+(one batch, duplicates collapse) and the drain's phase order
+(`wyrd-core/src/quarantine.rs`).
+
 ## Unmount teardown
 
 Unmount commits still-dirty handles best-effort before dropping the

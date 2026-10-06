@@ -35,8 +35,11 @@
 //!   fails with [`ViewError::Conflict`]; the version-qualified paths
 //!   (`foo@N`) are the readable surfaces.
 //! - POSIX mapping happens only at the FUSE boundary, outside this
-//!   crate: [`ViewError::Unavailable`] becomes `EIO`, and
-//!   [`ViewError::Corrupt`] triggers scrub/repair before surfacing.
+//!   crate: [`ViewError::Unavailable`] becomes `EIO`,
+//!   [`ViewError::Corrupt`] fails `EIO` with no repair (authored or
+//!   structural damage no refetch can fix), and
+//!   [`ViewError::RejectedRepresentation`] is reported to the loop's
+//!   quarantine drain for discard-and-redemand before surfacing.
 //! - Symlink targets are untrusted member-authored bytes. The view
 //!   never follows a symlink (an intermediate symlink is
 //!   [`ViewError::NotADirectory`]). Mounted FUSE views are non-traversable

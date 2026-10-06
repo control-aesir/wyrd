@@ -135,7 +135,9 @@ Decided for child 12 (OD-12-1 A, OD-12-2 A, SD-1 A):
   a general `ObjectStore::remove`. The implementation distinguishes
   the bad physical bytes, the durable possession claim (cleared via
   the sole `ObjectRemoved` writer), and the demand state, so no
-  stale claim pretends deleted bytes still exist.
+  stale claim pretends deleted bytes still exist. Claim-clear
+  precedes unlink, so a crash converges either way
+  (`docs/crash-consistency.md`, quarantine repair).
 
 ## Part 2 — replication serving (after measurement; v0.7 home)
 

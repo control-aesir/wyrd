@@ -710,3 +710,65 @@ fn quarantined_identity_redemands_on_next_waiter() {
     drop(parts);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Contract 51 (`quarantine_discards_real_bitrotted_bytes`):
+/// contracts 49 and 50 run over `MemoryObjectStore`, which cannot
+/// observe a verification failure and discards unconditionally —
+/// so this one runs the loop over a directory store with genuinely
+/// bitrotted bytes: the drain must verify-then-delete (a
+/// `NowValid` would keep them), and the live file must be gone
+/// from disk afterwards, not just unclaimed.
+#[test]
+fn quarantine_discards_real_bitrotted_bytes_through_the_loop() {
+    use wyrd_core::quarantine::VerificationFailure;
+    use wyrd_format::{FsObjectStore, ObjectKind};
+
+    let dir = headless_dir("contract-bitrot");
+    let engine = Engine::create(
+        dir.clone(),
+        "headless-test-pass",
+        DeviceIdentitySecret::generate().unwrap(),
+    )
+    .unwrap();
+    let mut node: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
+    node.put_file("f.txt", b"eleven bytes").unwrap();
+    let chunk = match node.view().lookup("f.txt").expect("f.txt resolves") {
+        Node::File { chunks, .. } => chunks[0],
+        other => panic!("f.txt is a file, saw {other:?}"),
+    };
+    // Bitrot under the live name, at the documented layout.
+    let hex = chunk.to_string();
+    let bitrotted = dir
+        .join("objects")
+        .join("objects")
+        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::write(&bitrotted, b"tampered!!!!").unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
+    live.quarantine_queue()
+        .submit(VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk,
+        ));
+    let mut mailbox = SilentMailbox;
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(report.quarantined.observed, 1);
+    assert_eq!(report.quarantined.claims_cleared, 1);
+    assert_eq!(
+        report.quarantined.bytes_discarded,
+        b"eleven bytes".len() as u64
+    );
+    assert_eq!(report.quarantined.failures, 0);
+    assert!(
+        !bitrotted.exists(),
+        "the bitrotted file is unlinked from disk"
+    );
+    drop(parts);
+    std::fs::remove_dir_all(dir).unwrap();
+}

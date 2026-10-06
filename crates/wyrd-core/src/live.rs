@@ -1260,12 +1260,14 @@ where
         // generation without waiting another pass. The residency
         // policy is untouched and no waiter is synthesized; the
         // emission closure is the diagnostic channel
-        // `14-fetch-failure-diagnostics` will persist.
+        // `14-fetch-failure-diagnostics` will persist. Capped like
+        // admission: leftovers wait for the next pass.
         let quarantined = drain_quarantine(
             &self.quarantine,
             &self.store,
             self.retained_bytes.as_deref(),
             &mut self.engine,
+            self.budgets.max_quarantine_per_pass,
             &mut |failure| {
                 tracing::warn!(
                     content = ?failure.content(),

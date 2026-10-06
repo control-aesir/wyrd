@@ -18,6 +18,23 @@ fn attempts_settle_into_fetch_status() {
         assert_eq!(outcome.settled(1), FetchStatus::Unavailable(1));
         assert_eq!(outcome.settled(3), FetchStatus::Unavailable(3));
     }
+    // The Local/Deadline split: both look alike at the attempt
+    // boundary (no bytes landed), but a refused local import is
+    // corruption evidence — the bytes verified, so retrying the
+    // network cannot help — while a blown budget slice is provider
+    // evidence of nothing. Only the former settles corrupt.
+    assert_eq!(FetchOutcome::<()>::Local.settled(2), FetchStatus::Corrupt);
+    assert_eq!(
+        FetchOutcome::<()>::Deadline {
+            slice: std::time::Duration::from_millis(10)
+        }
+        .settled(2),
+        FetchStatus::Unavailable(2)
+    );
+    assert_eq!(
+        FetchOutcome::<()>::Store(StoreFailure::Transient).settled(2),
+        FetchStatus::Unavailable(2)
+    );
     for outcome in [FetchOutcome::<()>::Invalid, FetchOutcome::Local] {
         // Verification rejection carries no generation: corrupt stays
         // attached to the representation that produced it.

@@ -172,22 +172,27 @@ pub struct QuarantineReport {
     pub failures: u64,
 }
 
-/// Repair every queued rejection, in identity order. Per item, in
-/// this order, with no fallible step able to reorder them:
+/// Repair queued rejections, at most `max_per_pass` of them —
+/// leftovers wait for the next pass, never dropped. Three phases,
+/// in this order, with no fallible step able to reorder them:
 ///
-/// 1. Emit the diagnostic through `emit` — the record the queue
-///    carried from observation. Emission precedes deletion by
-///    construction: a discard below cannot run for content whose
+/// 1. Emit every drained diagnostic through `emit` — the records the
+///    queue carried from observation. Emission precedes deletion by
+///    construction: no discard below can run for content whose
 ///    failure was not just reported.
-/// 2. Clear the possession claim (no-op when already absent, so a
-///    repeated quarantine commits nothing). Claim first, bytes
-///    second: no pass ever projects a stale `Available` for bytes
-///    already gone, while a reader interleaving between the two
-///    observes the rejection again and waits on — never served
-///    by — the doomed bytes. A commit failure skips the discard:
-///    claim and bytes stay consistent for the next pass.
-/// 3. Discard the bytes (verify-then-delete: a concurrent heal
-///    wins), subtracting what left the disk from the accountant.
+/// 2. Clear the possession claims in one durable commit (no-op for
+///    already-absent claims, so a repeated quarantine commits
+///    nothing). Claims before bytes: no pass ever projects a stale
+///    `Available` for bytes already gone, while a reader
+///    interleaving between the two observes the rejection again and
+///    waits on — never served by — the doomed bytes. A commit
+///    failure aborts the drain with bytes and claims still
+///    consistent for the next pass (the waiter re-reports what is
+///    still bad).
+/// 3. Discard the bytes one by one (verify-then-delete: a concurrent
+///    heal wins), subtracting what left the disk from the
+///    accountant. One bad file never blocks the rest: per-item
+///    failures are counted and skipped.
 ///
 /// The residency policy is never touched, and no waiter is
 /// synthesized: a `Cached` identity with no claim reconciles back
@@ -199,6 +204,7 @@ pub fn drain_quarantine<S>(
     store: &RwLock<S>,
     retained: Option<&RetainedBytes>,
     engine: &mut Engine,
+    max_per_pass: usize,
     emit: &mut impl FnMut(VerificationFailure),
 ) -> Result<QuarantineReport, LiveError>
 where
@@ -206,25 +212,18 @@ where
     S::Error: std::fmt::Debug,
 {
     let mut report = QuarantineReport::default();
-    while let Some(failure) = queue.pop() {
+    let mut pending = Vec::new();
+    while pending.len() < max_per_pass {
+        let Some(failure) = queue.pop() else {
+            break;
+        };
         report.observed += 1;
         emit(failure);
-        match engine.record_object_removed(failure.content()) {
-            Ok(true) => report.claims_cleared += 1,
-            Ok(false) => {}
-            Err(error) => {
-                // Durable trouble: leave bytes and claim together
-                // (consistent, retryable) rather than deleting under
-                // a claim the log still holds.
-                tracing::error!(
-                    error = ?error,
-                    content = ?failure.content(),
-                    "quarantine claim-clear failed; bytes kept for the next pass"
-                );
-                report.failures += 1;
-                continue;
-            }
-        }
+        pending.push(failure);
+    }
+    let ids: Vec<ContentId> = pending.iter().map(VerificationFailure::content).collect();
+    report.claims_cleared += engine.record_objects_removed(&ids)? as u64;
+    for failure in &pending {
         let mut guard = store.write().map_err(|_| LiveError::Lock)?;
         match guard.discard_rejected_representation(&failure.content()) {
             Ok(DiscardOutcome::Discarded(bytes)) => {
@@ -242,8 +241,10 @@ where
             Ok(DiscardOutcome::NowValid) => {
                 // A refetch healed the live name between the
                 // rejection and this drain. The cleared claim
-                // re-drives one redundant fetch; the bytes were
-                // never at risk.
+                // re-drives one redundant fetch (claim-first is the
+                // crash-consistent order: bytes gone under a live
+                // claim would strand a stale `Available` with no
+                // self-heal); the bytes were never at risk.
                 tracing::debug!(
                     content = ?failure.content(),
                     "quarantine found healed bytes; claim re-demands them"
@@ -339,6 +340,7 @@ mod tests {
             &store,
             Some(&retained),
             &mut engine,
+            64,
             &mut |failure| emitted.push(failure),
         )
         .unwrap();
@@ -389,7 +391,7 @@ mod tests {
         ));
         let store = RwLock::new(store);
         let mut emitted = Vec::new();
-        let report = drain_quarantine(&queue, &store, None, &mut engine, &mut |failure| {
+        let report = drain_quarantine(&queue, &store, None, &mut engine, 64, &mut |failure| {
             emitted.push(failure)
         })
         .unwrap();
@@ -452,7 +454,7 @@ mod tests {
         ));
         let store = RwLock::new(FailingStore);
         let mut emitted = Vec::new();
-        let report = drain_quarantine(&queue, &store, None, &mut engine, &mut |failure| {
+        let report = drain_quarantine(&queue, &store, None, &mut engine, 64, &mut |failure| {
             emitted.push(failure)
         })
         .unwrap();
@@ -492,7 +494,7 @@ mod tests {
         ));
         let store = RwLock::new(store);
         let mut emitted = Vec::new();
-        let report = drain_quarantine(&queue, &store, None, &mut engine, &mut |failure| {
+        let report = drain_quarantine(&queue, &store, None, &mut engine, 64, &mut |failure| {
             emitted.push(failure)
         })
         .unwrap();
@@ -506,6 +508,43 @@ mod tests {
             Some(b"healed bytes".to_vec())
         );
         assert!(!engine.runtime_state().unwrap().is_local(&chunk));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The per-pass cap bounds repair work: leftovers stay queued
+    /// for the next pass, never dropped and never silently
+    /// unrepaired.
+    #[test]
+    fn drain_repairs_at_most_the_pass_cap() {
+        let (mut engine, dir) = test_engine("cap");
+        let mut store = MemoryObjectStore::default();
+        let ids: Vec<ContentId> = (0u8..3)
+            .map(|byte| store.insert(ObjectKind::Chunk, &[byte]).unwrap())
+            .collect();
+        let queue = QuarantineQueue::default();
+        for id in &ids {
+            queue.submit(VerificationFailure::content_hash_mismatch(
+                *id,
+                ObjectKind::Chunk,
+            ));
+        }
+        let store = RwLock::new(store);
+        let mut emitted = Vec::new();
+        let report = drain_quarantine(&queue, &store, None, &mut engine, 2, &mut |failure| {
+            emitted.push(failure)
+        })
+        .unwrap();
+
+        assert_eq!(report.observed, 2);
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(queue.len(), 1);
+        let report = drain_quarantine(&queue, &store, None, &mut engine, 2, &mut |failure| {
+            emitted.push(failure)
+        })
+        .unwrap();
+        assert_eq!(report.observed, 1);
+        assert!(queue.is_empty());
+        assert_eq!(emitted.len(), 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

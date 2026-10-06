@@ -102,12 +102,40 @@ path exists by construction.
 ### Scrub without tombstones
 
 A verified-corrupt *local artifact* (cache/materialization state) is
-quarantined or removed locally, then the immutable identity is
-re-wanted and fetched verified again. This deletes no Wyrd object
-from logical history, so the append-only model needs no tombstone and
-no new durable-fact kind. The distinction is explicit: if the thing
-being deleted is itself durable replicated state, that is a different
+removed locally, then the immutable identity is re-wanted and
+fetched verified again. This deletes no Wyrd object from logical
+history, so the append-only model needs no tombstone and no new
+durable-fact kind. The distinction is explicit: if the thing being
+deleted is itself durable replicated state, that is a different
 problem and out of scope for this design.
+
+Decided for child 12 (OD-12-1 A, OD-12-2 A, SD-1 A):
+
+- **Remove, not quarantine-in-place** (OD-12-1 A): verification has
+  established the bytes must not be admitted as usable content, so
+  keeping them preserves forensic evidence, not content — and the
+  failure path must not consume the resource the retention quota
+  protects. There is no quarantine namespace and no bound to tend.
+- **Re-want only on the next waiter** (OD-12-2 A): corruption makes
+  the current representation ineligible; demand makes the identity
+  eligible for a fresh generation. No synthetic waiter, no
+  background repair walk. Terminology is *rejected representation /
+  repair-on-demand*: after deletion no durable state blocks a later
+  waiter from starting generation N+1.
+- **Client-plane only** (SD-1 A): the sealed serving vault already
+  fails closed on root mismatch, so it is untouched — absence there
+  is not more correct than masked corruption, and a client-plane
+  repair must not mutate serving capacity as a side effect.
+- **Diagnostic before delete**: the diagnostic record identifying
+  the representation and the verification failure is emitted before
+  the bytes are discarded, as an explicit sequencing contract the
+  drain enforces structurally (child 14 owns the record in full).
+- **Deletion stays narrow**: only a representation just verified
+  invalid may be deleted, through a narrowly named discard — never
+  a general `ObjectStore::remove`. The implementation distinguishes
+  the bad physical bytes, the durable possession claim (cleared via
+  the sole `ObjectRemoved` writer), and the demand state, so no
+  stale claim pretends deleted bytes still exist.
 
 ## Part 2 — replication serving (after measurement; v0.7 home)
 

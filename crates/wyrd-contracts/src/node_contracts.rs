@@ -602,3 +602,111 @@ fn fold_commits_one_snapshot_for_many_members() {
     drop(parts);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Contract 49 (`quarantine_drain_repairs_through_the_loop`): a
+/// submitted verification failure is diagnosed, unlinked, and
+/// unclaimed by one loop pass — bytes gone, claim gone, `Cached`
+/// policy intact — and the repair is reported in the pass report,
+/// not repeated on the next pass. The observation half (which bytes
+/// may be named) is pinned at the view boundary in `wyrd-fuse` and
+/// the discard half in `wyrd-core`; this pins the loop's half over
+/// public APIs: submit, pass, repaired.
+#[test]
+fn quarantine_drain_repairs_through_the_loop() {
+    use wyrd_core::quarantine::VerificationFailure;
+    use wyrd_format::ObjectKind;
+
+    let dir = headless_dir("contract-quarantine");
+    let engine = Engine::create(
+        dir.clone(),
+        "headless-test-pass",
+        DeviceIdentitySecret::generate().unwrap(),
+    )
+    .unwrap();
+    let mut node: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    node.put_file("f.txt", b"eleven bytes").unwrap();
+    let chunk = match node.view().lookup("f.txt").expect("f.txt resolves") {
+        Node::File { chunks, .. } => chunks[0],
+        other => panic!("f.txt is a file, saw {other:?}"),
+    };
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
+    live.quarantine_queue()
+        .submit(VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk,
+        ));
+    let mut mailbox = SilentMailbox;
+    let report = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(report.quarantined.observed, 1);
+    assert_eq!(report.quarantined.claims_cleared, 1);
+    assert_eq!(
+        report.quarantined.bytes_discarded,
+        b"eleven bytes".len() as u64
+    );
+    assert_eq!(report.quarantined.failures, 0);
+    // Nothing requeued, nothing repaired twice.
+    let idle = live
+        .sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(idle.quarantined.observed, 0);
+    drop(parts);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Contract 50 (`quarantined_identity_redemands_on_next_waiter`):
+/// after the drain, the cleared claim with its intact `Cached`
+/// policy reconciles back to pending, so the next waiter's pass
+/// plans a fresh fetch instead of settling remote-only. No waiter
+/// is synthesized: without one the identity stays unplanned.
+/// (`RemoteOnly` content never pends, so the attempt itself proves
+/// the policy survived the claim-clearing.)
+#[test]
+fn quarantined_identity_redemands_on_next_waiter() {
+    use wyrd_core::quarantine::VerificationFailure;
+    use wyrd_format::ObjectKind;
+
+    let dir = headless_dir("contract-redemand");
+    let engine = Engine::create(
+        dir.clone(),
+        "headless-test-pass",
+        DeviceIdentitySecret::generate().unwrap(),
+    )
+    .unwrap();
+    let mut node: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    node.put_file("f.txt", b"eleven bytes").unwrap();
+    let chunk = match node.view().lookup("f.txt").expect("f.txt resolves") {
+        Node::File { chunks, .. } => chunks[0],
+        other => panic!("f.txt is a file, saw {other:?}"),
+    };
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(5), &LiveConfig::default())
+        .unwrap();
+    live.quarantine_queue()
+        .submit(VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk,
+        ));
+    let mut mailbox = SilentMailbox;
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    // The waiter returns: admission carries the demand and the
+    // pass plans a fresh fetch for the unclaimed identity, even
+    // with an empty bulk source to attempt it against.
+    parts.wants.register(chunk).unwrap();
+    let bulk = &mut MemoryBulkSource::default();
+    let redemand = live.sync_once(&mut mailbox, Some(bulk)).unwrap();
+    // The empty bulk has no representation to serve, so the
+    // re-planned identity lands as unfulfilled + missing — the
+    // point is that it was planned at all: a `RemoteOnly`
+    // identity with no claim and no policy would never appear.
+    assert_eq!(redemand.fetched.unfulfilled, 1);
+    assert_eq!(redemand.fetched.missing, 1);
+    drop(parts);
+    std::fs::remove_dir_all(dir).unwrap();
+}

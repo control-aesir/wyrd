@@ -747,6 +747,13 @@ pub struct Engine {
     /// `runtime::reconcile`). Marked only on acceptance, so an
     /// offline attempt never quiets the next trigger.
     pub(super) last_requested_digest: Option<[u8; 32]>,
+    /// Sequence plus derived digest of the last full trigger
+    /// evaluation: the replay-skip gate (see `runtime::reconcile`).
+    /// A gap-only repeat on the same sequence re-derives the same
+    /// digest by construction, so a marked digest short-circuits to
+    /// `AlreadyStated` without another full load. Edges and unmarked
+    /// digests always evaluate fully.
+    pub(super) last_trigger_eval: Option<(u64, [u8; 32])>,
 }
 
 impl Engine {
@@ -811,6 +818,7 @@ impl Engine {
             crash_stage: None,
             reconnect_latched: false,
             last_requested_digest: None,
+            last_trigger_eval: None,
         };
         engine.resync()?;
         engine.restore_epoch_keys()?;

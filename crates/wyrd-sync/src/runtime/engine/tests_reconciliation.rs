@@ -187,6 +187,13 @@ fn parked_deferral_is_a_gap_that_sends() {
             accepted: 2,
         }
     );
+    // The evaluation records its sequence: a gap-only repeat on a
+    // static store short-circuits without another full replay.
+    let seq = pair.a.engine.current();
+    assert!(
+        matches!(pair.a.engine.last_trigger_eval, Some((s, _)) if s == seq),
+        "the evaluation books its sequence for the replay-skip gate"
+    );
 }
 
 /// Coalescing: an edge and a gap in the same evaluation produce one

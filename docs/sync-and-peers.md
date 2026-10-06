@@ -255,6 +255,17 @@ irrelevant to a recipient that asks. This same primitive serves the
 late-joiner case (superseded-epoch snapshot ids): "the recipient
 does not know what it missed" gets one design, not two.
 
+A relay acceptance behind a request marks only that the bytes left,
+never that the peer opened them: a sender that has rotated past the
+requester's newest held epoch answers `UnknownEpoch` and skips for
+redelivery, indefinitely, while the requester treats the acceptance
+as asked. "Asked and understood" versus "asked and permanently
+skipped" are therefore different states, and only the recipient's
+next statement — covering the re-sent obligations, or not —
+distinguishes them. Diagnostics (21d) must render the distinction;
+the request path itself stays an accelerator, never the sole path,
+so the ambiguity costs retransmission, never loss.
+
 The reconciliation view is a projection of durable facts, not
 itself another authoritative store:
 

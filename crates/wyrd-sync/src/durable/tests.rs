@@ -2208,10 +2208,11 @@ fn populated_reconciliation_view_counts_bytes_toward_the_commit() {
 /// The view tag is a clean upgrade boundary: `0x18` sits outside the
 /// enumerated pre-view set, and the tag table holds no duplicates —
 /// a duplicate compiles and misdecodes, the exact hazard the `0x16`
-/// boundary test cites.
+/// boundary test cites. The received-request tag gets the same pin:
+/// `0x19` is a value, not just a member.
 #[test]
 fn reconciliation_tag_is_a_clean_upgrade_boundary() {
-    use super::codec::{KNOWN_TAGS, TAG_RECONCILIATION_VIEW};
+    use super::codec::{KNOWN_TAGS, TAG_RECONCILIATION_REQUEST, TAG_RECONCILIATION_VIEW};
     let pre_view_tags = [
         0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
         0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
@@ -2222,6 +2223,14 @@ fn reconciliation_tag_is_a_clean_upgrade_boundary() {
     );
     assert_eq!(
         TAG_RECONCILIATION_VIEW, 0x18,
+        "the tag is pinned: a different value is a different format"
+    );
+    assert!(
+        !pre_view_tags.contains(&TAG_RECONCILIATION_REQUEST),
+        "the request tag must be new, or an old reader would decode it as another fact"
+    );
+    assert_eq!(
+        TAG_RECONCILIATION_REQUEST, 0x19,
         "the tag is pinned: a different value is a different format"
     );
     let mut sorted = KNOWN_TAGS.to_vec();

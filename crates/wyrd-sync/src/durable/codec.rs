@@ -81,7 +81,8 @@ pub(super) const TAG_RECONCILIATION_VIEW: u8 = 0x18;
 /// stated-view body above. Tag 0x19: the tag space is append-only.
 /// Same per-section ceiling as the stated view — one evidence layout
 /// across the wire statement, the stated record, and this record.
-const TAG_RECONCILIATION_REQUEST: u8 = 0x19;
+/// Crate-visible for the tag-boundary pin below.
+pub(super) const TAG_RECONCILIATION_REQUEST: u8 = 0x19;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
 pub(super) const KNOWN_TAGS: [u8; 25] = [

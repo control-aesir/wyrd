@@ -108,11 +108,16 @@ impl Engine {
     }
 
     /// Evaluate the trigger once: gap, reconnect edge, or both (one
-    /// request either way), else quiet. The gap signal is the parked
-    /// deferral queue — every held entry names a transition absent
-    /// from the durable log or a blocked standing, so the signal is
-    /// durable-grounded even though the queue itself is volatile
-    /// (the relay retains every held envelope). A frozen drive
+    /// request either way), else quiet. The gap signal today is the
+    /// parked deferral queue — every held entry names a transition
+    /// absent from the durable log or a blocked standing, so the
+    /// signal is durable-grounded even though the queue itself is
+    /// volatile (the relay retains every held envelope). OD-21-4's
+    /// second gap source, the unfetchable head, is not wired: fetch
+    /// produces no durable verdict to trigger on, and a drive whose
+    /// only gap is an unfetchable head does not probe. That is
+    /// deferred, not dropped — the predicate gains a disjunct when
+    /// the producer exists. A frozen drive
     /// short-circuits to [`ReconciliationOutcome::Frozen`] before any
     /// seal or send, with the edge left latched.
     pub fn maybe_request_reconciliation(
@@ -126,9 +131,24 @@ impl Engine {
         if self.log.frozen_at().is_some() {
             return Ok(ReconciliationOutcome::Frozen);
         }
+        // Gap-only repeat on a static store: derivation is a pure
+        // function of the facts, so an unchanged sequence re-derives
+        // the recorded digest — and a marked digest means the full
+        // path would AlreadyState. Skip the replay; the outcome is
+        // identical. Edges always evaluate (a probe is owed after
+        // every reconnect), and unmarked digests always evaluate
+        // (offline attempts must retry, oversize views must re-seal).
+        if !self.reconnect_latched {
+            if let Some((eval_seq, eval_digest)) = self.last_trigger_eval {
+                if eval_seq == self.current() && self.last_requested_digest == Some(eval_digest) {
+                    return Ok(ReconciliationOutcome::AlreadyStated);
+                }
+            }
+        }
         let reconnected = std::mem::replace(&mut self.reconnect_latched, false);
         let facts = self.store.load()?;
         let view = ReconciliationView::derive(&facts);
+        self.last_trigger_eval = Some((self.current(), view.evidence().digest()));
         let evidence_bytes = encode_reconciliation_view_canonical(view.evidence());
         self.request_once(mailbox, view, evidence_bytes, reconnected)
     }

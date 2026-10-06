@@ -448,6 +448,10 @@ fn upgrade_reconciliation_request_replays_through_the_public_path() {
         let loaded = store.load().unwrap();
         ReconciliationView::derive(&loaded).evidence().clone()
     };
+    assert!(
+        !evidence.transitions.is_empty() && !evidence.capabilities.is_empty(),
+        "the delivery path leaves real evidence: {evidence:?}"
+    );
     let requester = DeviceId::from_bytes([0x31; 32]);
     {
         let mut store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();

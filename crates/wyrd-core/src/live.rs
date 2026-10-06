@@ -1182,14 +1182,20 @@ where
         // plus the drain's gap signal, evaluated once per pass. The
         // edge is counter movement, never level — the first pass
         // counts as a session start — and the engine latch coalesces
-        // edges that arrive between evaluations. The outcome is
-        // dropped here (the loop stays free of reporting
+        // edges that arrive between evaluations. Mailbox failures
+        // absorb like every other send in this pass (see `publish`):
+        // a dead transport stalls the probe, never the loop. The
+        // outcome is dropped here (the loop stays free of reporting
         // dependencies); 21d surfaces it.
         let reconnects = mailbox.reconnects();
         if self.last_mailbox_reconnects.replace(reconnects) != Some(reconnects) {
             self.engine.note_reconnected();
         }
-        self.engine.maybe_request_reconciliation(mailbox)?;
+        match self.engine.maybe_request_reconciliation(mailbox) {
+            Ok(_) => {}
+            Err(EngineError::Mailbox(_)) => {}
+            Err(other) => return Err(LiveError::Engine(other)),
+        }
         // Generation rotation on observed demand (OD-11-2): every
         // identity noted since the last pass whose generation
         // completed terminal reopens as a new one. Notes arrive from

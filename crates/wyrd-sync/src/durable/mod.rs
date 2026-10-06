@@ -485,6 +485,11 @@ pub enum Fact {
     /// cannot validate another device's holdings against its own
     /// log — divergent histories are the case being reconciled —
     /// so intake validates structure and agreement only, and 21c's
-    /// comparison decides what the evidence proves.
+    /// comparison decides what the evidence proves. The statement
+    /// epoch rides the wire envelope only: whether 21c needs it
+    /// durably (DG-3 names epoch/domain "where the class requires
+    /// it") is 21c's design decision — records are immutable, so a
+    /// yes means a new fact kind or a versioned layout, and this
+    /// comment is where that decision starts.
     ReconciliationRequestReceived(DeviceId, ReconciliationEvidence),
 }

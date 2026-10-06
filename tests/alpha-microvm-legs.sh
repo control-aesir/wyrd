@@ -132,6 +132,12 @@ leg_fetch_owner() {
   poll_until 240 test -f "$E2E_ROOT/member-probed-done" \
     || die "member never finished the dead-route probes"
   pass "owner stayed down while the member probed the dead route"
+  # The bitrot block runs three deadline-bounded reads plus its
+  # asserts after the probes: stay down until it signals
+  # completion, or the remount below heals its later reads
+  # mid-block and the fail-closed asserts race the recovery.
+  poll_until 500 test -f "$E2E_ROOT/member-bitrot-done" \
+    || die "member never finished the bitrot block"
   # Recovery setup: remount on a fresh endpoint (new iroh identity
   # over the same drive) and write a new file BEFORE the member
   # authors anything: the member converges this head first, so the
@@ -325,6 +331,11 @@ leg_fetch_member() {
   [[ ! -e "$cold_chunk" ]] \
     || die "bitrotted chunk file still on disk after the quarantine drain"
   pass "bitrotted read fails closed, serves nothing, names the rejection"
+  # Rendezvous: the owner remounts only after this block is fully
+  # done. Without it the returned owner would heal reads 2-3
+  # mid-block (repair-on-demand working as designed) and the
+  # fail-closed asserts above would race the recovery they precede.
+  touch "$E2E_ROOT/member-bitrot-done"
   # The owner is back on a fresh endpoint with a new route (see
   # owner leg). Converge its head BEFORE authoring: the scratch and
   # the delete below must extend the post-restart lineage, and the

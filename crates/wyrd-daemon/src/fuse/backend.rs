@@ -22,31 +22,36 @@ use wyrd_core::mutation::{
 };
 use wyrd_core::projection::Projection;
 use wyrd_core::quarantine::{QuarantineQueue, VerificationFailure};
+use wyrd_core::scrub::{ScrubObservation, ScrubQueue};
 
-/// How long an observed rejection keeps a later boundary verdict
+/// How long a reported repair keeps a later boundary verdict
 /// from completing its waiter. The window covers the repair the
 /// observation started — drain, unclaim, re-pend, refetch — while
 /// the served projection still shows the pre-repair state (claim
-/// present, bytes doomed, then bytes absent with a stale `Available`
-/// until a publishable head re-installs). Past the window the
-/// waiter falls back to the verdict it sees. Bounded by the wait's
-/// own deadline in practice: no wait outlives `open_timeout`, so
-/// the window can only delay, never hang, a genuinely terminal EIO.
+/// present with doomed bytes for rejections, then bytes absent
+/// with a stale `Available` for both, until a publishable head
+/// re-installs). Past the window the waiter falls back to the
+/// verdict it sees. Bounded by the wait's own deadline in
+/// practice: no wait outlives `open_timeout`, so the window can
+/// only delay, never hang, a genuinely terminal EIO.
 const REPAIR_OBSERVATION_TTL: Duration = Duration::from_secs(30);
 
-/// Identities with an observed-but-possibly-unrepaired rejection:
-/// content id to the last observation time. Written when the
-/// backend reports a rejection, read when a boundary verdict would
-/// otherwise complete a waiter mid-wait or fail a first touch fast.
-/// Entries expire lazily on record (a background sweep would be a
-/// thread for a map that holds only in-flight repairs); the set
-/// stays tiny because only live repairs are ever queried.
+/// In-flight repairs this backend reported: content id to the
+/// last observation time, for verification failures and observed
+/// losses alike. Written when the backend reports either, read
+/// when a boundary verdict would otherwise complete a waiter
+/// mid-wait or fail a first touch fast: while an entry is fresh
+/// the repair may still be in flight behind a stale projection,
+/// so the waiter waits it out. Entries expire lazily on record
+/// (a background sweep would be a thread for a map that holds
+/// only in-flight repairs); the set stays tiny because only live
+/// repairs are ever queried.
 #[derive(Debug, Default)]
-struct RecentRejections {
+struct RecentRepairs {
     seen: Mutex<HashMap<wyrd_format::ContentId, Instant>>,
 }
 
-impl RecentRejections {
+impl RecentRepairs {
     /// Record an observation at `now`, dropping entries older than
     /// the repair window.
     fn note(&self, content: wyrd_format::ContentId, now: Instant) {
@@ -70,15 +75,16 @@ impl RecentRejections {
 }
 
 /// Whether a boundary verdict observed mid-wait completes the
-/// waiter now. A recent rejection means the repair this observation
+/// waiter now. A recent repair means the repair this observation
 /// may belong to is still in flight — the projection lags the
-/// claim-clear and the unlink, and the refetch may land at any
-/// moment — so the waiter keeps waiting for it. Otherwise the
-/// verdict is terminal-on-its-face (a genuine terminal generation,
-/// or an out-of-band loss no repair was ever started for) and
-/// completes boundedly, exactly as before quarantine existed.
-fn complete_waiter_on_terminal(recently_rejected: bool) -> bool {
-    !recently_rejected
+/// claim-clear (and the unlink, for rejections), and the refetch
+/// may land at any moment — so the waiter keeps waiting for it.
+/// Otherwise the verdict is terminal-on-its-face (a genuine
+/// terminal generation, or an out-of-band loss no repair was ever
+/// started for) and completes boundedly, exactly as before
+/// quarantine existed.
+fn complete_waiter_on_terminal(repair_in_flight: bool) -> bool {
+    !repair_in_flight
 }
 use wyrd_core::session::{FoldLease, WriteBudget};
 use wyrd_core::want::{wait_for_materialization, WantRegistry};
@@ -122,13 +128,27 @@ where
     /// keeps the instant-EIO behavior for standalone backends, which
     /// have no loop to repair through.
     quarantine: Option<Arc<QuarantineQueue>>,
+    /// Observed losses this backend reported within the repair
+    /// window: the scrub analogue of the rejection channel below —
+    /// claimed-but-absent identities are submitted here and
+    /// unclaimed by the loop (bytes already gone, nothing to
+    /// discard). `None` keeps the instant-EIO behavior for
+    /// standalone backends, which have no loop to repair through.
+    scrub: Option<Arc<ScrubQueue>>,
     /// Rejections this backend observed (and reported) within the
     /// repair window: while an entry is fresh, a boundary verdict
     /// for the same identity does not complete a waiter — the
     /// repair may still be in flight behind a stale projection.
     /// Independent of the queue (which the drain consumes): this
     /// remembers the observation, not the outstanding work.
-    recent_rejections: RecentRejections,
+    recent_rejections: RecentRepairs,
+    /// Losses this backend observed (and reported) within the same
+    /// window: while an entry is fresh, a boundary verdict for the
+    /// same identity waits out the in-flight unclaim-and-refetch
+    /// instead of failing fast on the stale `Available` projection.
+    /// Separate from the rejection window above so the two causes
+    /// stay distinguishable end to end.
+    recent_losses: RecentRepairs,
     /// The session's write budget: bounds the buffered logical images of
     /// writable handles. Independent of the projection and store locks.
     pub(super) budget: Arc<WriteBudget>,
@@ -311,6 +331,7 @@ pub(super) fn errno_of(error: &ViewError) -> fuser::Errno {
         | ViewError::Unavailable { .. }
         | ViewError::Corrupt
         | ViewError::RejectedRepresentation { .. }
+        | ViewError::LostRepresentation { .. }
         | ViewError::Store(_, _) => fuser::Errno::EIO,
     }
 }
@@ -604,7 +625,9 @@ where
             wants: None,
             mutations: None,
             quarantine: None,
-            recent_rejections: RecentRejections::default(),
+            scrub: None,
+            recent_rejections: RecentRepairs::default(),
+            recent_losses: RecentRepairs::default(),
             budget: Arc::new(WriteBudget::default()),
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
@@ -639,7 +662,9 @@ where
             wants: None,
             mutations: None,
             quarantine: None,
-            recent_rejections: RecentRejections::default(),
+            scrub: None,
+            recent_rejections: RecentRepairs::default(),
+            recent_losses: RecentRepairs::default(),
             budget: Arc::new(WriteBudget::default()),
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
@@ -681,7 +706,9 @@ where
             wants: Some(wants),
             mutations: Some(mutations),
             quarantine: None,
-            recent_rejections: RecentRejections::default(),
+            scrub: None,
+            recent_rejections: RecentRepairs::default(),
+            recent_losses: RecentRepairs::default(),
             budget: Arc::new(WriteBudget::with_limits(
                 budgets.write_per_handle_bytes,
                 budgets.write_aggregate_bytes,
@@ -706,6 +733,15 @@ where
     /// through).
     pub fn set_quarantine(&mut self, quarantine: Arc<QuarantineQueue>) {
         self.quarantine = Some(quarantine);
+    }
+
+    /// Wire the live daemon's scrub channel: observed losses are
+    /// submitted here for the loop's drain. The composer calls this
+    /// alongside `set_quarantine`; tests wire it when they cover
+    /// loss repair, and standalone backends leave it `None`
+    /// (instant EIO, no loop to repair through).
+    pub fn set_scrub(&mut self, scrub: Arc<ScrubQueue>) {
+        self.scrub = Some(scrub);
     }
 
     /// Publish a new generation over the given view without a durable
@@ -1280,7 +1316,12 @@ where
     /// bytes) is reported to the loop's quarantine drain and then
     /// demanded like any other not-local content: the current reader
     /// is the waiter repair-on-demand requires, so the wait below
-    /// heals in the same read when the refetch lands. Anything else
+    /// heals in the same read when the refetch lands. A lost
+    /// representation (claimed-but-absent bytes) is reported to
+    /// the loop's scrub drain and demanded the same way: the
+    /// current reader is the detector the background walk has not
+    /// yet been, so the wait below heals in the same read when
+    /// the refetch lands. Anything else
     /// (or no demand wiring) keeps the instant-errno behavior. This
     /// is the only place FUSE expresses demand — the engine stays
     /// the single synchronization authority.
@@ -1310,6 +1351,26 @@ where
             }
             _ => first,
         };
+        // Repair-on-demand entry for loss: observed-absent bytes are
+        // named to the scrub drain before anything else reads them
+        // again. The error then becomes `NotMaterialized` for the
+        // flow below so the reader waits on the fresh fetch, not on
+        // a stale `Available`. Without demand wiring there is no
+        // loop to repair through, so the loss surfaces as EIO
+        // untouched — and nothing is submitted, so a miswired queue
+        // can never grow without a drain.
+        let first = match (&self.scrub, &self.wants, &first) {
+            (
+                Some(scrub),
+                Some(_),
+                Err((ViewError::LostRepresentation { content, kind }, errno)),
+            ) => {
+                scrub.submit(ScrubObservation::missing(*content, *kind));
+                self.recent_losses.note(*content, Instant::now());
+                Err((ViewError::NotMaterialized { content: *content }, *errno))
+            }
+            _ => first,
+        };
         // A first-touch `Unavailable` with a fresh rejection is the
         // same repair seen one observation later: the claim is
         // cleared (or clearing) and the projection lags, so the
@@ -1324,11 +1385,27 @@ where
             }
             _ => first,
         };
+        // A first-touch `Unavailable` with a fresh loss observation
+        // is the same repair seen one observation later: the stale
+        // claim is cleared (or clearing) and the projection still
+        // says `Available`, so the identity enters the demand flow
+        // and waits out the in-flight refetch like a lost first
+        // read. Without a recent loss this stays the fast
+        // terminal EIO it has always been.
+        let first = match (&self.scrub, &self.wants, &first) {
+            (Some(_), Some(_), Err((ViewError::Unavailable { content }, errno)))
+                if self.recent_losses.contains(content, Instant::now()) =>
+            {
+                Err((ViewError::NotMaterialized { content: *content }, *errno))
+            }
+            _ => first,
+        };
         if let (Some(registry), Err((ViewError::NotMaterialized { content }, _errno))) =
             (&self.wants, &first)
         {
             let wants = Arc::clone(registry);
             let quarantine = self.quarantine.clone();
+            let scrub = self.scrub.clone();
             // Success completes; terminal verdicts complete with
             // themselves (the final retry below surfaces them as
             // EIO) and note reopen demand, so a reader blocked
@@ -1352,7 +1429,8 @@ where
                 Err((ViewError::Unavailable { content }, _)) => {
                     wants.note_reopen_demand(&content);
                     complete_waiter_on_terminal(
-                        self.recent_rejections.contains(&content, Instant::now()),
+                        self.recent_rejections.contains(&content, Instant::now())
+                            || self.recent_losses.contains(&content, Instant::now()),
                     )
                 }
                 Err((ViewError::RejectedRepresentation { content, kind }, _)) => {
@@ -1361,6 +1439,13 @@ where
                             .submit(VerificationFailure::content_hash_mismatch(content, kind));
                     }
                     self.recent_rejections.note(content, Instant::now());
+                    false
+                }
+                Err((ViewError::LostRepresentation { content, kind }, _)) => {
+                    if let Some(scrub) = &scrub {
+                        scrub.submit(ScrubObservation::missing(content, kind));
+                    }
+                    self.recent_losses.note(content, Instant::now());
                     false
                 }
                 Err((ViewError::Corrupt, _)) => true,
@@ -3689,7 +3774,7 @@ where
 }
 
 #[cfg(test)]
-mod tests_recent_rejections {
+mod tests_recent_repairs {
     use super::*;
 
     fn content(byte: u8) -> wyrd_format::ContentId {
@@ -3701,7 +3786,7 @@ mod tests_recent_rejections {
     /// prunes without a sweep thread.
     #[test]
     fn repair_window_covers_observations_until_expiry() {
-        let recent = RecentRejections::default();
+        let recent = RecentRepairs::default();
         let noted = Instant::now();
         recent.note(content(1), noted);
         assert!(recent.contains(&content(1), noted));
@@ -3725,7 +3810,7 @@ mod tests_recent_rejections {
     }
 
     /// The completion rule: only a verdict with no live repair
-    /// behind it completes the waiter. A recent rejection keeps
+    /// behind it completes the waiter. A recent repair keeps
     /// every boundary verdict waiting; without one everything
     /// completes exactly as before quarantine existed.
     #[test]

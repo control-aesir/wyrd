@@ -315,6 +315,37 @@ fn unavailable_content_fails_cleanly() {
     ));
 }
 
+/// Absent bytes under an `Available` projection are out-of-band
+/// loss, not an unreachable peer: the claim says the bytes are
+/// here and they are not, so the read names the lost
+/// representation (with its kind) for the scrub drain instead of
+/// the terminal `Unavailable` shape.
+#[test]
+fn claimed_but_absent_bytes_read_as_loss() {
+    let mut store = MemoryObjectStore::default();
+    let lost_chunk = ContentId::derive(ObjectKind::Chunk, b"vanished");
+    let root = tree_of(
+        &mut store,
+        vec![Entry::file("lost.txt", 8, false, vec![lost_chunk]).unwrap()],
+    );
+    // The chunk is named by the tree but never inserted: the
+    // store holds nothing under it.
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::with(vec![(lost_chunk, FetchStatus::Available)]),
+        heads(vec![snapshot(root)]),
+    );
+
+    let lost = view.open(&view.lookup("lost.txt").unwrap()).unwrap();
+    assert_eq!(
+        view.read(&lost, 0, 8),
+        Err(ViewError::LostRepresentation {
+            content: lost_chunk,
+            kind: ObjectKind::Chunk,
+        })
+    );
+}
+
 /// A store that fails reads by class: named identities fail
 /// verification (bitrot under the live name), others fail
 /// opaquely (a torn data path, never a deletion order).

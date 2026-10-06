@@ -39,7 +39,10 @@
 //!   [`ViewError::Corrupt`] fails `EIO` with no repair (authored or
 //!   structural damage no refetch can fix), and
 //!   [`ViewError::RejectedRepresentation`] is reported to the loop's
-//!   quarantine drain for discard-and-redemand before surfacing.
+//!   quarantine drain for discard-and-redemand before surfacing, and
+//!   a claimed-but-absent read is [`ViewError::LostRepresentation`]
+//!   for the loop's scrub drain (unclaim-and-redemand — the bytes
+//!   are already gone, so there is nothing to discard).
 //! - Symlink targets are untrusted member-authored bytes. The view
 //!   never follows a symlink (an intermediate symlink is
 //!   [`ViewError::NotADirectory`]). Mounted FUSE views are non-traversable

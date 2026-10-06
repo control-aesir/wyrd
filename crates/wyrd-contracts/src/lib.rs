@@ -252,6 +252,13 @@
 //!     and unclaim, re-want, live refetch, verified `Available`,
 //!     and the original waiter served, with no remount or restart
 //!     (OD-12-1 and OD-12-2 together).
+//! 53. `scrubbed_chunk_heals_from_a_live_peer_without_a_waiter` —
+//!     out-of-band loss of fetched bytes heals through the
+//!     background plan with no reader and no waiter anywhere: the
+//!     scrub observes the missing bytes, the drain clears the
+//!     claim, the intact `Cached` policy reconciles back to
+//!     pending, and the live peer serves the fresh fetch back to
+//!     verified `Available` (`docs/peer-repair.md`, child 13).
 
 #[cfg(test)]
 mod egress_contracts;

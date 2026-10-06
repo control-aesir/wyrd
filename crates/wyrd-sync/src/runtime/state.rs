@@ -254,6 +254,25 @@ impl RuntimeState {
         summary
     }
 
+    /// Every content identity named by a locally recorded manifest,
+    /// with the first-seen representation kind, in identity order.
+    /// The presence walk (local scrub) stats exactly this set
+    /// against the store: a claimed identity whose bytes are gone
+    /// is out-of-band loss. Deterministic under replay (manifest
+    /// order, first kind wins), so a rotating cursor over the list
+    /// covers every entry exactly once per sweep. A pure query —
+    /// the walk stats through its own store handle, never through
+    /// this state.
+    pub fn manifest_contents(&self) -> Vec<(ContentId, ObjectKind)> {
+        let mut seen = BTreeMap::new();
+        for record in self.manifests.values() {
+            for entry in record.manifest.entries() {
+                seen.entry(entry.content_id).or_insert(entry.kind);
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     /// The durable materialization state projected into the view boundary.
     pub fn status(&self, id: &ContentId) -> FetchStatus {
         if self.is_local(id) {

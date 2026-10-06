@@ -369,6 +369,27 @@ charging the claimed-cleared-but-still-present bytes until
 (one batch, duplicates collapse) and the drain's phase order
 (`wyrd-core/src/quarantine.rs`).
 
+## Scrub repair
+
+The drain orders re-verify before claim-clear before accountant
+subtract, so a crash lands in exactly one of three consistent
+states: observation lost (memory-only — the next sweep re-stats
+the entry and re-reports), claim cleared with the accountant
+still charging the lost bytes (the repair converges — the plan
+re-drives the fetch, and the reopen walk re-seeds the count from
+the store), or all three durable (repaired). Bytes kept under a
+cleared claim cannot strand: the re-verify runs before the
+commit, so a concurrent heal keeps its claim with no redundant
+fetch. One bound, by process lifetime: the in-memory queue and
+the walk cursor reset on restart (the sweep restarts
+deterministically from the beginning — coverage, never
+freshness, is what a restart loses). Pinned by
+`missing_chunk_clears_claim_and_subtracts_size` (clear plus
+manifest-sized subtract), `healed_bytes_keep_their_claim`
+(re-verify before clear), and
+`probe_covers_entries_in_bounded_slices` (bounded slices plus
+wrap) (`wyrd-core/src/scrub.rs`).
+
 ## Unmount teardown
 
 Unmount commits still-dirty handles best-effort before dropping the

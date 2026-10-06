@@ -15,7 +15,9 @@
 //! `max_quarantine_per_pass` (the claim-clear is one batched
 //! commit per pass, but every repair still pays its own
 //! verify-read and store write lock) — all sized
-//! generously (see each default). The `wyrd` binary itself takes no tuning flags
+//! generously (see each default). `max_scrub_per_pass` joins the
+//! intentional family: the presence walk's bounded stats plus the
+//! scrub drain's batched claim-clear per pass. The `wyrd` binary itself takes no tuning flags
 //! today and runs defaults; these are library-level settings until a
 //! configuration surface lands. The sync-engine bounds
 //! (`MAX_PENDING_MESSAGES`, fetch backoff) stay constants: they are
@@ -52,6 +54,17 @@ pub const DEFAULT_MAX_ADMIT_PER_PASS: usize = 1024;
 /// converges over passes instead of stretching one pass by an
 /// unbounded amount.
 pub const DEFAULT_MAX_QUARANTINE_PER_PASS: usize = 64;
+
+/// Most manifest entries the presence walk stats, and most observed
+/// losses the scrub drain repairs, per sync pass. The walk's stats
+/// are one `has` each (no commit), while the drain's claim-clear is
+/// one batched commit per pass — but the two share one number so a
+/// pass with a full sweep of loss still converges over passes
+/// instead of stretching one pass by an unbounded amount. Sized
+/// with the quarantine family (64): a sweep of a thousand-entry
+/// drive completes in sixteen passes, and the steady-state cost of
+/// a healthy drive is sixty-four stats per pass.
+pub const DEFAULT_MAX_SCRUB_PER_PASS: usize = 64;
 
 /// Most open file handles at once (read captures plus writable
 /// images). Refusals are `EMFILE`: the table is per-process, like the
@@ -102,6 +115,10 @@ pub struct ResourceBudgets {
     /// [`DEFAULT_MAX_QUARANTINE_PER_PASS`]). Overflow waits for the
     /// next pass.
     pub max_quarantine_per_pass: usize,
+    /// Manifest entries statted plus observed losses repaired per
+    /// sync pass (see [`DEFAULT_MAX_SCRUB_PER_PASS`]). Overflow
+    /// waits for the next pass.
+    pub max_scrub_per_pass: usize,
     /// Largest logical image one writable handle may buffer (`ENOSPC`
     /// past it).
     pub write_per_handle_bytes: usize,
@@ -151,6 +168,7 @@ impl Default for ResourceBudgets {
             max_parent_tokens: DEFAULT_MAX_PARENT_TOKENS,
             max_admit_per_pass: DEFAULT_MAX_ADMIT_PER_PASS,
             max_quarantine_per_pass: DEFAULT_MAX_QUARANTINE_PER_PASS,
+            max_scrub_per_pass: DEFAULT_MAX_SCRUB_PER_PASS,
             write_per_handle_bytes: MAX_WRITE_BUFFER_BYTES,
             write_aggregate_bytes: MAX_BUFFERED_BYTES,
             write_dirty_handles: MAX_DIRTY_HANDLES,

@@ -485,3 +485,105 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
     loaded.rig.teardown();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Contract 53 (`scrubbed_chunk_heals_from_a_live_peer_without_a_waiter`):
+/// out-of-band loss of fetched bytes heals with no reader and no
+/// waiter anywhere in the picture. The member holds verified bytes
+/// under a durable claim; host-side surgery deletes the live file
+/// outright (the v0 loss model: bitrot fails closed on read, but a
+/// vanished file never even reaches verification). The loop alone —
+/// no demand, no reopen note — must observe the missing bytes,
+/// clear the stale claim, and re-drive the walk through the live
+/// peer back to verified `Available`, bytes back on disk.
+#[test]
+fn scrubbed_chunk_heals_from_a_live_peer_without_a_waiter() {
+    const BODY: &[u8] = b"healed through scrub";
+    let mut loaded = Loaded::new("scrub.txt", BODY);
+    loaded.publish_all();
+    loaded.publish_body_and_announcement(None);
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let chunk = *loaded
+        .content
+        .content_ids
+        .iter()
+        .find(|id| **id != loaded.content.tree_id)
+        .expect("the fixture carries a chunk beside its tree");
+
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-contracts-scrub-heal-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut available = false;
+    while started.elapsed() < Duration::from_secs(120) {
+        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+            .unwrap();
+        let slot = parts.projection.read().unwrap();
+        if slot.view().status(&chunk) == FetchStatus::Available
+            && slot.view().lookup("scrub.txt").is_ok()
+        {
+            available = true;
+            break;
+        }
+    }
+    assert!(available, "the member fetched the chunk verified");
+
+    // Step 1: host-side surgery — the live file simply vanishes.
+    let hex = chunk.to_string();
+    let live_name = dir
+        .join("objects")
+        .join("objects")
+        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::remove_file(&live_name).unwrap();
+
+    // No reader, no waiter: the loop alone must observe the loss,
+    // unclaim the identity, and refetch it from the live peer.
+    // Deadline-bounded like contract 52: under gate load the same
+    // passes take longer, and a pass budget must never be what
+    // fails the test.
+    let started = std::time::Instant::now();
+    let mut healed = false;
+    let mut scrubbed = 0u64;
+    let mut claims_cleared = 0u64;
+    while started.elapsed() < Duration::from_secs(120) {
+        let pass = live
+            .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+            .unwrap();
+        scrubbed += pass.scrubbed.observed;
+        claims_cleared += pass.scrubbed.claims_cleared;
+        if view_status(&parts, &chunk) == FetchStatus::Available
+            && std::fs::read(&live_name).is_ok_and(|bytes| bytes == BODY)
+        {
+            healed = true;
+            break;
+        }
+    }
+    assert!(
+        healed,
+        "out-of-band loss heals through the background plan with no waiter"
+    );
+    assert!(
+        scrubbed > 0,
+        "the loss was diagnosed through the scrub drain, not silently re-fetched"
+    );
+    assert_eq!(
+        claims_cleared, 1,
+        "exactly one stale claim cleared for one lost identity"
+    );
+    loaded.rig.teardown();
+    std::fs::remove_dir_all(dir).unwrap();
+}

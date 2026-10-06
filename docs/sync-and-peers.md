@@ -604,7 +604,10 @@ kind) to the loop's quarantine drain, which emits the diagnostic,
 discards the bytes, and clears the possession claim — while the
 `Cached` policy and the waiting reader survive, so the same read
 re-demands the identity as a fresh generation
-(`docs/peer-repair.md`, child 12). Corrupt authored structure
+(`docs/peer-repair.md`, child 12). Claimed-but-absent bytes take
+the parallel scrub path: the read names the lost representation
+to the loop's scrub drain, which clears the stale claim without
+discarding (`docs/peer-repair.md`, child 13). Corrupt authored structure
 (undecodable trees, lying sizes) is not rejected bytes and still
 fails `EIO` with no repair. The rest of the repair design —
 generation-scoped terminal state, route-set policy, measurement

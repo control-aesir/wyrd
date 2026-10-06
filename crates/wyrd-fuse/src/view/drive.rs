@@ -377,7 +377,7 @@ where
     fn load_tree(&self, id: &ContentId) -> Result<Tree, ViewError> {
         match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Tree::decode(&bytes).map_err(|_| ViewError::Corrupt),
-            Ok(None) => Err(self.absent(id)),
+            Ok(None) => Err(self.absent(id, ObjectKind::Tree)),
             Err(error) if error.is_verification_failure() => {
                 Err(ViewError::RejectedRepresentation {
                     content: *id,
@@ -395,7 +395,7 @@ where
     ) -> Result<(Option<Tree>, u64), ViewError> {
         let bytes = match self.store_read()?.get(id) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return Err(self.absent(id)),
+            Ok(None) => return Err(self.absent(id, ObjectKind::Tree)),
             Err(error) if error.is_verification_failure() => {
                 return Err(ViewError::RejectedRepresentation {
                     content: *id,
@@ -421,7 +421,7 @@ where
     fn load_chunk(&self, id: &ContentId) -> Result<Vec<u8>, ViewError> {
         match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Ok(bytes),
-            Ok(None) => Err(self.absent(id)),
+            Ok(None) => Err(self.absent(id, ObjectKind::Chunk)),
             Err(error) if error.is_verification_failure() => {
                 Err(ViewError::RejectedRepresentation {
                     content: *id,
@@ -432,17 +432,22 @@ where
         }
     }
 
-    /// Classify content the store does not hold. A provider claiming
-    /// `Available` for absent bytes is stale; failing closed beats
-    /// looping on a fetch that already "succeeded".
-    fn absent(&self, id: &ContentId) -> ViewError {
+    /// Classify content the store does not hold.
+    /// Absent bytes under a non-local projection are ordinary
+    /// demand: `NotMaterialized` blocks on a want, `Unavailable`
+    /// carries a terminal verdict. Absent bytes under an `Available`
+    /// projection are out-of-band loss — the claim says the bytes
+    /// are here and they are not — so they surface as
+    /// [`ViewError::LostRepresentation`] with the representation
+    /// kind, which the daemon reports to the scrub drain instead of
+    /// mistaking for an unreachable peer.
+    fn absent(&self, id: &ContentId, kind: ObjectKind) -> ViewError {
         match self.materialization.status(id) {
             FetchStatus::RemoteOnly | FetchStatus::Fetching => {
                 ViewError::NotMaterialized { content: *id }
             }
-            FetchStatus::Unavailable(_) | FetchStatus::Available => {
-                ViewError::Unavailable { content: *id }
-            }
+            FetchStatus::Available => ViewError::LostRepresentation { content: *id, kind },
+            FetchStatus::Unavailable(_) => ViewError::Unavailable { content: *id },
             FetchStatus::Corrupt => ViewError::Corrupt,
         }
     }

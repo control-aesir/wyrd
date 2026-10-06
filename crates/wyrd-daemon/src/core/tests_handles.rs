@@ -641,13 +641,17 @@ fn path_truncate_reads_only_the_kept_prefix() {
 }
 
 /// Content the engine believes local but the store does not hold fails
-/// closed: the view reports `Unavailable` for the stale-locality claim
-/// (not a fetchable remote), so the append fails EIO on the next pass
-/// instead of registering a want and hanging until the prerequisite
-/// deadline. The engine marks authored closures local and production
-/// always serves the store it authors into; this pins the boundary
-/// when that invariant is broken (a store wiped under a kept engine
-/// directory), so recovery stays a fast error, never a 30s hang.
+/// bounded: the scrub unclaims the stale-locality claim, so the
+/// append waits like any other unfetchable prerequisite
+/// (never-fetched parity) instead of failing fast on a verdict that
+/// no longer exists — then times out rather than hanging forever.
+/// No read waiter is stranded: the mutation's own `NeedContent`
+/// demand drives admission, never a blocked reader. (Pre-scrub this
+/// pinned fast `EIO` with no want registered: loss was irreparable
+/// then, and the register-refuses-local rule short-circuited the
+/// wait. Both premises are gone — the claim clears, the want
+/// admits, and only a peer that never serves keeps the commit from
+/// landing.)
 #[test]
 fn append_to_store_absent_but_engine_local_content_fails_closed() {
     let (mut engine, dir, _) = scratch_drive();
@@ -687,9 +691,16 @@ fn append_to_store_absent_but_engine_local_content_fails_closed() {
         .open_write("remote", libc::O_WRONLY | libc::O_APPEND)
         .unwrap();
     backend.write_handle(fh, 0, b"!").unwrap();
-    // A fast EIO, not a held mutation: no demand exists for content
-    // the engine claims is already local.
-    assert_eq!(backend.commit_handle(fh), Err(fuser::Errno::EIO));
+    // Bounded failure, never a hang: no peer serves the lost base,
+    // so the prerequisite deadline fires. The errno is the
+    // deadline's (`TimedOut`), not a fast `EIO` — the content is
+    // fetchable-in-principle now, merely unserved here.
+    let started = std::time::Instant::now();
+    assert!(backend.commit_handle(fh).is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the commit times out instead of hanging forever"
+    );
     assert_eq!(wants.waiter_count(&chunk), 0);
 
     stop.store(true, Ordering::Relaxed);

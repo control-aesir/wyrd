@@ -149,36 +149,39 @@
 //!
 //! 23. `upgrade_new_encoding_is_new_representation` — re-stored content
 //!     is a no-op under the same ContentId; later writes never touch
-//!     stored objects (invariant 1).
+//!     stored objects (`docs/upgrade-contract.md`, invariant 1).
 //! 24. `upgrade_format_versions_are_carried_on_the_wire` — the commit
-//!     envelope version rides byte 0 of every commit file (invariant
-//!     2, wire half).
+//!     envelope version rides byte 0 of every commit file
+//!     (`docs/upgrade-contract.md`, invariant 2, wire half).
 //! 25. `upgrade_old_objects_stay_readable` — a reopened object store
 //!     serves what it served before, with nothing rewritten
-//!     (invariant 3, same-version form).
+//!     (`docs/upgrade-contract.md`, invariant 3, same-version form).
 //! 26. `upgrade_previous_release_store_replays` — the checked-in
 //!     release fixture opens and replays under the current build:
 //!     a same-build baseline today, genuine cross-release evidence
 //!     once the next cut replays the v0.2.0-alpha bytes under a newer
-//!     build (invariant 3, cross-release form).
+//!     build (`docs/upgrade-contract.md`, invariant 3,
+//!     cross-release form).
 //! 27. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
 //!     recovers committed coverage by replay, stably across restarts
-//!     (invariant 4).
+//!     (`docs/upgrade-contract.md`, invariant 4).
 //! 28. `upgrade_mixed_versions_fail_named` — a forged envelope version
-//!     fails open with `ControlError::UnknownVersion` (invariant 5,
-//!     gate half).
+//!     fails open with `ControlError::UnknownVersion`
+//!     (`docs/upgrade-contract.md`, invariant 5, gate half).
 //! 29. `upgrade_reads_never_mint_authority` — open, load, and
 //!     projection write no history and mint no transitions
-//!     (invariant 6).
+//!     (`docs/upgrade-contract.md`, invariant 6).
 //! 30. `upgrade_old_epoch_material_stays_decryptable` — the fixture's
 //!     epoch-1..2 grant still unwraps under the current build
-//!     (invariant 7).
+//!     (`docs/upgrade-contract.md`, invariant 7).
 //! 31. `upgrade_appends_never_rewrite` — a new commit appends; existing
-//!     files stay byte-identical (invariant 8).
+//!     files stay byte-identical (`docs/upgrade-contract.md`,
+//!     invariant 8).
 //! 32. `upgrade_orphaned_temps_are_ignored` — stale `*.tmp` siblings
 //!     are walked past by open and load; the full crash boundary is
 //!     pinned in wyrd-sync's crash-matrix tests
-//!     (`docs/upgrade-contract.md`, invariant 9, orphaned-temps form).
+//!     (`docs/upgrade-contract.md`, invariant 9; orphan-ignore pinned
+//!     at `docs/crash-consistency.md:29-30`).
 //! 33. `upgrade_unknown_refuses_loudly` — unknown envelope and control
 //!     versions and a flipped commit version refuse with their names
 //!     (`docs/upgrade-contract.md`, invariant 10).

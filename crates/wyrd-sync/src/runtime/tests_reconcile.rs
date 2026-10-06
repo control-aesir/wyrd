@@ -265,3 +265,34 @@ fn set_materialization_returns_previous_value() {
         Some(MaterializationState::Cached)
     );
 }
+
+/// `materialization_summary` counts explicit policies by variant
+/// plus locally held objects: pinned and cached policies counted,
+/// an explicit `RemoteOnly` policy counted nowhere (it is the
+/// default for never-wanted content, so counting it would
+/// undercount by construction), and a held object counted as
+/// possession even with no policy recorded.
+#[test]
+fn materialization_summary_counts_policies_and_held_objects() {
+    let mut state = RuntimeState::new(drive());
+    let pinned = ContentId::from_bytes([1; 32]);
+    let cached = ContentId::from_bytes([2; 32]);
+    let remote = ContentId::from_bytes([3; 32]);
+    let local = ContentId::from_bytes([4; 32]);
+    state.set_materialization(pinned, MaterializationState::Pinned);
+    state.set_materialization(cached, MaterializationState::Cached);
+    state.set_materialization(remote, MaterializationState::RemoteOnly);
+    state.mark_local_object(local);
+    let summary = state.materialization_summary();
+    assert_eq!(summary.pinned, 1, "one explicit pin: {summary:?}");
+    assert_eq!(summary.cached, 1, "one explicit cache: {summary:?}");
+    assert_eq!(summary.local_objects, 1, "one held object: {summary:?}");
+    assert_eq!(
+        summary,
+        MaterializationSummary {
+            pinned: 1,
+            cached: 1,
+            local_objects: 1
+        }
+    );
+}

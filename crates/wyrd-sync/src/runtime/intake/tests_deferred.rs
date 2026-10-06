@@ -5,8 +5,8 @@ use zeroize::Zeroizing;
 
 use crate::membership::test_util::Builder;
 use crate::runtime::test_util::{
-    announcement_for, announcement_msg_with, control_key, deliver, drain, fixture, identity, queue,
-    transition_message,
+    announcement_for, announcement_msg_with, control_key, deliver, deliver_from, drain, fixture,
+    identity, queue, reopen, transition_message,
 };
 
 /// Only the messages waiting on the observed transition wake: two
@@ -280,5 +280,149 @@ fn wake_index_selects_only_unblockable_entries() {
     assert_eq!(
         fixture.engine.pending.waits_in_order(),
         vec![DeferredWait::Unseen(child_b.transition_id())]
+    );
+}
+
+/// Attribution is a deterministic function of durable state plus
+/// the offered mail (the PR 1 round-2 follow-up): redelivering the
+/// same held envelopes attributes identically — same causes, same
+/// named peers — instead of drifting between verdicts.
+#[test]
+fn deferred_cause_split_is_stable_across_redelivery() {
+    let mut fixture = fixture();
+    let (mut builder, _) = Builder::genesis(10);
+    let child_a = builder.child(vec![Change::Rotate]);
+    let child_b = builder.child(vec![Change::Rotate]);
+    let (ann_sk, _) = identity(0x22);
+    let ann_x = announcement_msg_with(
+        &ann_sk,
+        SnapshotId::from_bytes([0xA1; 32]),
+        2,
+        child_a.transition_id(),
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+    );
+    let ann_y = announcement_msg_with(
+        &ann_sk,
+        SnapshotId::from_bytes([0xA2; 32]),
+        3,
+        child_b.transition_id(),
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+    );
+    // Epoch keys for the announcement epochs: the test below
+    // reopens the engine, and the keyring is durable, so both
+    // drains decide on identical key availability.
+    fixture
+        .engine
+        .add_epoch_key(3, Zeroizing::new(control_key(3)));
+    let mail = vec![deliver(&fixture, 2, &ann_x), deliver(&fixture, 3, &ann_y)];
+    queue(&mut fixture, mail);
+    let first = drain(&mut fixture);
+    assert_eq!((first.deferred, first.deferred_unseen), (2, 2));
+    // No new mail: the relay retains the held envelopes, so the
+    // next drain redelivers them on its own.
+    let second = drain(&mut fixture);
+    assert_eq!(
+        (second.deferred, second.deferred_unseen),
+        (first.deferred, first.deferred_unseen),
+        "redelivery attributes identically: {second:?} vs {first:?}"
+    );
+    assert_eq!(second.peers_observed, first.peers_observed);
+}
+
+/// The same attribution survives a restart (the PR 1 round-2
+/// follow-up's second half): the `reopen` helper simulates the
+/// crash — lock released, engine rebuilt over the same directory,
+/// epoch keys 1 and 2 reinstalled — and the re-offered mail
+/// attributes identically. Both announcements use epoch 2, whose
+/// key the reopen reinstalls: mail under a memory-only epoch key
+/// (epoch 3 above) would report skipped after a restart, which is
+/// the key-availability signal, not the deferral signal. The
+/// memory-only relay does not survive — the test re-offers the same
+/// envelopes, which is exactly what a relay redelivery after a
+/// crash looks like.
+#[test]
+fn deferred_cause_split_is_stable_across_restart() {
+    let mut fixture = fixture();
+    let (mut builder, _) = Builder::genesis(10);
+    let child_a = builder.child(vec![Change::Rotate]);
+    let child_b = builder.child(vec![Change::Rotate]);
+    let (ann_sk, _) = identity(0x22);
+    let ann_x = announcement_msg_with(
+        &ann_sk,
+        SnapshotId::from_bytes([0xA1; 32]),
+        2,
+        child_a.transition_id(),
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+    );
+    let ann_y = announcement_msg_with(
+        &ann_sk,
+        SnapshotId::from_bytes([0xA2; 32]),
+        2,
+        child_b.transition_id(),
+        BaoRoot::from_bytes([0x44; 32]),
+        ContentId::from_bytes([0x55; 32]),
+        BaoRoot::from_bytes([0x66; 32]),
+    );
+    let mail = vec![deliver(&fixture, 2, &ann_x), deliver(&fixture, 2, &ann_y)];
+    queue(&mut fixture, mail);
+    let first = drain(&mut fixture);
+    assert_eq!((first.deferred, first.deferred_unseen), (2, 2));
+
+    let mut engine = reopen(&mut fixture);
+    let recipient = fixture.recipient;
+    let mut relay = crate::transport::mailbox::MemoryRelay::default();
+    for envelope in [deliver(&fixture, 2, &ann_x), deliver(&fixture, 2, &ann_y)] {
+        relay.push(envelope);
+    }
+    let mut mailbox = crate::transport::mailbox::MemoryMailbox {
+        relay: &mut relay,
+        owner: recipient,
+    };
+    let second = engine.drain(&mut mailbox).unwrap();
+    assert_eq!(
+        (second.deferred, second.deferred_unseen),
+        (first.deferred, first.deferred_unseen),
+        "restart attributes identically: {second:?} vs {first:?}"
+    );
+    assert_eq!(second.peers_observed, first.peers_observed);
+}
+
+/// The drain names every sender it processed, once each, in byte
+/// order (OD-17-4 option B's source): two envelopes from one sender
+/// plus one from another yield two peers, sorted — duplicates
+/// collapse, order is deterministic, and the set covers accepted
+/// mail, not just stuck mail.
+#[test]
+fn drain_names_distinct_peer_senders_in_byte_order() {
+    let mut fixture = fixture();
+    let (other_sk, _) = identity(0x09);
+    let (mut builder, genesis) = Builder::genesis(10);
+    let child = builder.child(vec![Change::Rotate]);
+    let genesis_msg = transition_message(&genesis);
+    let child_msg = transition_message(&child);
+    let env_a1 = deliver(&fixture, 1, &genesis_msg);
+    let env_a2 = deliver(&fixture, 1, &child_msg);
+    // Same genesis document from the other sender: byte-identical
+    // content redelivered, so the second copy reports duplicate —
+    // and still names its sender.
+    let env_b = deliver_from(&fixture, &other_sk, 1, &genesis_msg);
+    queue(&mut fixture, vec![env_a1, env_a2, env_b]);
+    let report = drain(&mut fixture);
+    assert_eq!(report.accepted, 2);
+    assert_eq!(report.duplicates, 1);
+    let mut expected = vec![fixture.sender_sk.device_id(), other_sk.device_id()];
+    expected.sort();
+    let mut observed = report.peers_observed.clone();
+    observed.sort();
+    assert_eq!(observed, expected, "both senders named once each");
+    assert_eq!(
+        report.peers_observed, expected,
+        "already in byte order, no sorting left to the consumer"
     );
 }

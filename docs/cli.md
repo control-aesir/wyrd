@@ -299,9 +299,21 @@ sync now
   owner-bootstrap resume facts (an interrupted genesis, the
   self-capability install), so "never mutates" means no intake, no
   send, no seen log, and no outbox or materialization mutation —
-  not zero writes in every corner; and the store lock is exclusive,
-  so status needs the drive un-mounted and fails closed with the
-  lock error while a mount holds it.
+   not zero writes in every corner; and the store lock is exclusive,
+   so status needs the drive un-mounted and fails closed with the
+   lock error while a mount holds it. Four projections join the
+   read: peers as opaque handles (`peer-1`, `peer-2`, stable for the
+   rendering, derived deterministically so the same state renders
+   the same handles across restarts — never a persisted identity
+   namespace), the durable queue depth (outstanding outbox pairs
+   plus reconciliation gaps, from committed facts only — not the
+   in-memory queue; staged carries count in the outbox total, on no
+   peer line, and render on their own line when nonzero),
+   convergence from durable facts (converged, or what still
+   diverges), and materialization as counts (explicit
+   cached/pinned policies plus locally held objects). Connectivity
+   reads `not observed`: status never connects, so it says the
+   omission out loud instead of letting silence read as healthy.
 - `now`: runs the mount's sync machinery (drain, deliver,
   announce, fetch through `sync_once`) with the mount's live
   budgets and no FUSE session: vaults and NAS replicas converge
@@ -343,10 +355,18 @@ sync now
   first drain, so a quiet verdict parks a short settle window
   (arrival short-circuits it) and confirms with a second pass.
   A head whose closure is not local is a remote
-  condition, not local work: after one grace pass it stops the run
-  as quiet with an explicit `N unfetchable heads` count instead of
-  burning the cap. Zero-progress passes park the settle window too,
-  so dead churn waits on the relay instead of spinning.
+   condition, not local work: after one grace pass it stops the run
+   as quiet with an explicit `N unfetchable heads` count instead of
+   burning the cap. Zero-progress passes park the settle window too,
+   so dead churn waits on the relay instead of spinning. A
+   `senders observed` section names the distinct senders whose
+   envelopes the run processed, by full `DeviceId`: this process
+   connected and the operator holds the keys, so the run surface may
+   say who it heard. A sender is any key that mailed us, member or
+   not — this is a sender list, never a membership roster. The two
+   surfaces answer different questions (who mailed us vs who we owe
+   and who authored our heads) and never share a representation:
+   the durable surface reports obligation peers as opaque handles.
 - `--relay <url>` (repeatable, shared parsing with `mount`): with
    none given, `now` refuses with a usage error unless `--offline`
    is passed — a relay-less run exits 0 with an idle intake, which
@@ -481,8 +501,18 @@ Both are read and hardened by wyrd code, never by clap:
   print is counts, latencies, class breakdowns,
   and pressure against the bounds in `resource-limits.md`. What
   they never print is ContentIds, filesystem paths, file bytes,
-  DeviceIds, membership transition ids, or secrets — the
-  observation half of the privacy boundary.
+  or secrets — the observation half of the privacy boundary.
+  Snapshot and membership transition ids do appear on `sync status`:
+  the tip line names the applied head, per-item lines name the owed
+  obligation, live-head lines name the held heads — that is their job
+  as merge identities, and no DeviceId appears beside them there.
+  DeviceIds never reach the durable `sync status` surface or the
+  log; `sync now` alone names the senders its intake actually
+  heard, because that process connected and the operator holds the
+  keys. (`member list`, `member log`, and `snapshot list` are
+  separate read surfaces with their own contract — they name
+  members and authors explicitly, and this paragraph does not cover
+  them.)
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

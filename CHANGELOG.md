@@ -48,6 +48,18 @@ version say exactly what changed.
   Lifetime `WriteStats` accumulate at the mutation seam (counts only,
   never paths). `FsStoreError::Corrupt` and `IdentityMismatch` no longer
   carry the object identity (concealment is absence).
+- Observability PR 2 (the four missing projections): `sync status`
+  names peers as opaque handles (`peer-N`, stable for the rendering —
+  never a persisted namespace), reports the durable queue depth
+  (outstanding outbox pairs plus reconciliation gaps, from committed
+  facts only), convergence from durable facts, and materialization as
+  counts; connectivity reads `not observed` because status never
+  connects. Live-head author `DeviceId`s render as handles now, not
+  raw ids. `sync now` names the senders its intake actually heard, by
+  full `DeviceId` — any key that mailed us, member or not. Staged
+  carries count in the queue total and render on their own line, on
+  no peer line. Deferral-cause attribution is pinned stable across
+  redelivery and restart.
 - Normative DG-1 mutation/commit boundary table in `docs/write-path.md`:
   one snapshot per commit-forcing event (folding all pending), dirty-handle
   release as a forcing event, namespace operations as folding forcing events,

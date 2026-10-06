@@ -1,6 +1,6 @@
 //! Control-plane intake and message classification for the runtime engine.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use wyrd_format::{DeviceId, MembershipTransition, SnapshotId, TransitionId};
 use zeroize::Zeroizing;
@@ -133,6 +133,11 @@ pub(super) fn drain(
 ) -> Result<DrainReport, EngineError> {
     let mut report = DrainReport::default();
     let mut budget = IntakeBudget::default();
+    // Distinct senders named on processed envelopes, in ascending
+    // byte order at the end: the run surface's peer set (OD-17-4
+    // option B). Poison never contributes — it has no sender worth
+    // naming.
+    let mut peers = BTreeSet::new();
     // Each handover is offered once per pass: a re-offered id ends the
     // pass with the envelope still unacked, so a pass always terminates
     // even when every envelope is retried.
@@ -144,6 +149,7 @@ pub(super) fn drain(
         if !offered.insert(delivery.id()) {
             break;
         }
+        let sender = delivery.envelope().sender;
         let disposition = match accept_envelope(engine, delivery.envelope(), &mut budget)? {
             Outcome::Accepted => {
                 report.accepted += 1;
@@ -175,8 +181,12 @@ pub(super) fn drain(
                 Disposition::Poison
             }
         };
+        if !matches!(disposition, Disposition::Poison) {
+            peers.insert(sender);
+        }
         mailbox.settle(delivery.id(), disposition)?;
     }
+    report.peers_observed = peers.into_iter().collect();
     Ok(report)
 }
 

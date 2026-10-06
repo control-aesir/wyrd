@@ -102,7 +102,10 @@ pub struct ManifestRecord {
 
 mod state;
 
-pub use state::{OutboxTotals, PendingObjectFetch, RuntimeError, RuntimeReconcile, RuntimeState};
+pub use state::{
+    MaterializationSummary, OutboxTotals, PendingObjectFetch, RuntimeError, RuntimeReconcile,
+    RuntimeState,
+};
 
 #[cfg(test)]
 mod tests_reconcile;

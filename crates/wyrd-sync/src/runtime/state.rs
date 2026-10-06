@@ -42,6 +42,23 @@ pub struct RuntimeReconcile {
     pub pending_objects: BTreeMap<ContentId, Vec<PendingObjectFetch>>,
 }
 
+/// Materialization as counts: the durable residency picture in
+/// three numbers. The policy counts cover explicitly recorded
+/// `Materialization` facts only — content never given a policy is
+/// implicitly `RemoteOnly` (see [`RuntimeState::materialization`])
+/// and is not counted, so `remote_only` is not a field here: it
+/// would undercount by construction. `local_objects` is possession
+/// (verified bytes on disk); the policy counts are intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaterializationSummary {
+    /// Contents explicitly pinned resident.
+    pub pinned: usize,
+    /// Contents explicitly cached (fetchable, evictable).
+    pub cached: usize,
+    /// Verified plaintext objects present in the local store.
+    pub local_objects: usize,
+}
+
 /// Queued vs delivered outbox counts per obligation class, as
 /// observed from durable state. Pending is always queued minus
 /// delivered; the three numbers travel together so status consumers
@@ -172,6 +189,25 @@ impl RuntimeState {
             .get(id)
             .copied()
             .unwrap_or(MaterializationState::RemoteOnly)
+    }
+
+    /// Materialization as counts over the durable maps: explicit
+    /// residency policies by variant plus locally held objects. All
+    /// three inputs are committed facts, so the summary is
+    /// restart-equivalent by construction.
+    pub fn materialization_summary(&self) -> MaterializationSummary {
+        let mut summary = MaterializationSummary {
+            local_objects: self.local_objects.len(),
+            ..MaterializationSummary::default()
+        };
+        for state in self.materialization.values() {
+            match state {
+                MaterializationState::Pinned => summary.pinned += 1,
+                MaterializationState::Cached => summary.cached += 1,
+                MaterializationState::RemoteOnly => {}
+            }
+        }
+        summary
     }
 
     /// The durable materialization state projected into the view boundary.

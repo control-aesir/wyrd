@@ -269,7 +269,7 @@ impl CarryReport {
 }
 
 /// What one [`Engine::drain`] pass did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DrainReport {
     /// Messages processed to a verdict (including memory-only
     /// suppressions, which commit no fact).
@@ -300,6 +300,13 @@ pub struct DrainReport {
     /// Terminal poison consumed without a fact (unopenable outer seal,
     /// undecodable payload); never redelivered.
     pub discarded: usize,
+    /// Distinct senders named on envelopes the pass processed to a
+    /// verdict, in ascending byte order. Relay-held senders are
+    /// transport-named, not seal-authenticated; undecodable poison is
+    /// excluded — it never yields an authenticated sender. The run
+    /// surface renders these (OD-17-4 option B); the durable surface
+    /// never does.
+    pub peers_observed: Vec<DeviceId>,
 }
 
 /// What one [`Engine::execute_plan`] pass committed.

@@ -100,7 +100,7 @@ version say exactly what changed.
   automation keying on exit status sees it. The stall half fires if
   and only if an evaluated statement made zero progress and its
   obligations are still owed at end of run (unresolvable
-  transition, missing sealing key, refused transport); a scoped
+  transition, missing sealing key, a relay that accepts nothing); a scoped
   skip the pass's unscoped delivery then discharges reads zero by
   design. Recorded in `docs/cli.md`, `docs/sync-and-peers.md`.
 - Normative DG-3 control-message recovery / forget contract in

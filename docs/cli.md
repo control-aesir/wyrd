@@ -364,16 +364,20 @@ sync now
   reports a `reconciliation` line with two gauges — received
   statements it never evaluated, plus evaluated-but-stuck ones
   whose requester is still owed ("asked, nothing delivered"). The
-  stall gauge fires if and only if the obligations are still owed
-  at end of run: a scoped skip (sender-side UnknownEpoch) that the
-  pass's unscoped delivery then discharges reads zero — relay
-  acceptance is the v0.2 guarantee, and the sender cannot tell
-  delivered from opened — while an obligation no path can
-  discharge (unresolvable transition, missing sealing key, refused
-  transport) latches it open. An open gap fails the run even when
-  the outbox is quiet, so automation keying on exit status sees
-  it. Zero prints too: the converged case is grepable, not
-  omitted.
+  stall gauge fires if and only if an evaluated statement made zero
+  progress and its obligations are still owed at end of run: a scoped
+  skip (sender-side UnknownEpoch) that the pass's unscoped delivery
+  then discharges reads zero — relay acceptance is the v0.2
+  guarantee, and the sender cannot tell delivered from opened —
+  while an obligation no path can discharge (unresolvable
+  transition, missing sealing key, a relay that accepts nothing)
+  latches it open. Partial progress is the named blind spot: a
+  statement that retired some obligations but could not deliver the
+  remainder records no stall, so the remainder stays pending (and
+  the run still fails at the pass cap) without stall attribution.
+  An open gap fails the run even when the outbox is quiet, so
+  automation keying on exit status sees it. Zero prints too: the
+  converged case is grepable, not omitted.
   A head whose closure is not local is a remote
    condition, not local work: after one grace pass it stops the run
    as quiet with an explicit `N unfetchable heads` count instead of

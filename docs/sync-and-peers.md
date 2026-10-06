@@ -303,19 +303,28 @@ statements received plus transitions and capabilities retired,
 all from committed facts, classes and counts only — and `sync now`
 reports the open gap as two gauges: statements never evaluated,
 plus evaluated-but-stuck ones whose requester is still owed. The
-stall gauge fires if and only if the obligations are still owed at
-end of run — "owed and undeliverable", never a claim about what
-the recipient opened, which the sender cannot distinguish from
-delivered (relay acceptance is the v0.2 guarantee). Concretely: an
+stall gauge fires if and only if an evaluated statement made zero
+progress and its obligations are still owed at end of run — "owed
+and undeliverable", never a claim about what the recipient opened,
+which the sender cannot distinguish from delivered (relay
+acceptance is the v0.2 guarantee). Both halves of the conjunct
+matter: a statement that retired some obligations but could not
+deliver the remainder records no stall, so partial progress leaves
+an undeliverable remainder unnamed by this row — the remainder
+stays pending, so the run still fails at the pass cap, but the
+stall gauge does not attribute it. Concretely: an
 `UnknownEpoch` skip records a stall at evaluation, but the pass's
 unscoped delivery usually discharges the obligation right after
 (relay acceptance commits `Delivered`), so the stall closes behind
 it and reads zero — the sender has nothing left, and the
 recipient's next statement re-opens the conversation if it is still
-behind. What latches the gauge open is the obligation no path can
-discharge — an unresolvable transition, a missing sealing key —
-with the transport refusing alongside: still owed after every
-pass, so the run fails and names it. The stall record itself is
+behind. What latches the gauge open is a zero-progress evaluation
+whose obligations stay owed: an unresolvable transition or a
+missing sealing key (no send path moves them, whatever the relay
+does), or a live obligation for a relay that accepts nothing —
+a send error aborts the pass before anything is evaluated, so only
+zero acceptance reaches the gauge. Still owed after every pass,
+so the run fails and names it. The stall record itself is
 volatile like the answered set; a restart re-derives it from the
 durable request bucket.
 

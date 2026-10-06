@@ -531,12 +531,14 @@ fn evaluated_without_progress_records_a_live_stall() {
     assert_eq!(fx.engine.unanswered_statement_count(), 0);
 }
 
-/// The gauge's true firing condition: the same stall with a refused
-/// transport. Neither the scoped nor the blind send moves the
-/// obligation, so it is still owed at end of run and the stall reads
-/// open — this is the run `sync now` fails.
+/// The gauge's true firing condition: the same stall with a relay
+/// that accepts nothing. Neither the scoped nor the blind send moves
+/// the obligation — a send error would abort the pass before
+/// anything is evaluated, so zero acceptance is the only refusal
+/// shape that reaches the gauge — and it is still owed at end of
+/// run, so the stall reads open: this is the run `sync now` fails.
 #[test]
-fn stall_with_refused_delivery_reads_open() {
+fn stall_with_zero_acceptance_reads_open() {
     let (mut fx, _, child) = world();
     let (_, r) = requester();
     let child_id = child.transition_id();
@@ -568,7 +570,42 @@ fn stall_with_refused_delivery_reads_open() {
     assert_eq!(
         fx.engine.runtime_state().unwrap().pending_transitions(),
         vec![(child_id, r)],
-        "refused sends leave the obligation pending for a later pass"
+        "zero acceptance leaves the obligation pending for a later pass"
+    );
+}
+
+/// The recovery route when the relay was unavailable: a scoped skip
+/// on the first statement, then the peer's next statement carries
+/// the install and the scoped send discharges. Pins the arc the
+/// docs point at — the stall recorded on the first statement closes
+/// behind the second statement's discharge.
+#[test]
+fn install_lands_later_discharges_through_the_scoped_send() {
+    let (mut fx, _, child) = world();
+    let (_, r) = requester();
+    let child_id = child.transition_id();
+    fx.engine
+        .commit_facts(&[Fact::TransitionQueued(child_id, r)])
+        .unwrap();
+    let held1 = ReconciliationEvidence {
+        transitions: BTreeSet::new(),
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::from([(r, 1)]),
+    };
+    state(&mut fx, r, held1);
+    let report = answer(&mut fx);
+    assert_eq!((report.retired, report.sent), (0, 0));
+    assert_eq!(fx.engine.stalled_statement_count().unwrap(), 1);
+    // The epoch-2 install lands in the next statement: the scoped
+    // send moves and the earlier stall closes behind it.
+    let held2 = keyed_evidence(r, &[]);
+    state(&mut fx, r, held2);
+    let report = answer(&mut fx);
+    assert_eq!(report.sent, 1, "keys first, then content");
+    assert_eq!(
+        fx.engine.stalled_statement_count().unwrap(),
+        0,
+        "the discharge closed the earlier stall"
     );
 }
 

@@ -41,6 +41,48 @@ impl Mailbox for RecordingMailbox<'_> {
     }
 }
 
+/// A send failure leaves the trigger armed: the pass reports the
+/// error, the parked gap persists, and the next evaluation with a
+/// working mailbox fires — arming survives the error because the
+/// gap is recomputed every pass, never consumed. (Edges are
+/// consumed even on failure; in production the supervisor's
+/// recovery attempts re-edge, and any parked gap re-arms on its
+/// own.)
+#[test]
+fn send_failure_leaves_the_trigger_armed() {
+    use super::tests_harness::FailingMailbox;
+    let (mut pair, controls, _) = scenario();
+    converge(&mut pair);
+    park_gap(&mut pair, &controls);
+    pair.a.engine.note_reconnected();
+    // Every send fails as broken transport: the evaluation errors,
+    // and nothing is marked.
+    let mut failing = FailingMailbox {
+        sent: 0,
+        fail_after: 0,
+    };
+    assert!(
+        pair.a
+            .engine
+            .maybe_request_reconciliation(&mut failing)
+            .is_err(),
+        "transport failure surfaces to the caller (the loop absorbs it)"
+    );
+    assert_eq!(pair.a.engine.pending_count(), 1, "the gap persists");
+    // The mailbox heals: the still-parked gap fires on the next
+    // evaluation with no new edge.
+    let device = pair.a.device;
+    let mut mailbox = mailbox_for(&mut pair.relay, device);
+    assert_eq!(
+        trigger(&mut pair.a.engine, &mut mailbox),
+        ReconciliationOutcome::Requested {
+            recipients: 2,
+            accepted: 2,
+        },
+        "arming survives the failed fan-out"
+    );
+}
+
 /// A mailbox with no relay behind it: sends report zero acceptance
 /// without blocking. The trigger must attempt, mark nothing, and
 /// retry on the next trigger — never wait, never wedge.

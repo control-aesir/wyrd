@@ -171,7 +171,8 @@ Releases are not required to write every format they read:
     whatever it had pending, which is the safe direction: it retries
     what a new node would answer from evidence, rather than acting
     on a statement it never read. `0x19` follows `0x18`, checked
-    against the full tag set like `0x16`.
+    against the full tag set like `0x16` (pinned by
+    `reconciliation_tag_is_a_clean_upgrade_boundary`).
 
     The wire kind is not a format break: the reconciliation request
     rides a new control kind byte (`0x04`) under the unchanged

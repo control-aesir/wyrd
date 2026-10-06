@@ -102,7 +102,11 @@ impl Engine {
     /// as a fresh opportunity to discover gaps unobservable while
     /// disconnected. The caller reports edges (one per actual
     /// connected session, including session start), never levels —
-    /// a latched edge evaluated twice still yields one request.
+    /// a latched edge evaluated twice still yields one request. The
+    /// latch is consumed even when the send fails: a parked gap
+    /// re-arms the next evaluation on its own, and in production
+    /// the supervisor's recovery attempts re-edge — so a failed
+    /// fan-out never needs the edge held past its evaluation.
     pub fn note_reconnected(&mut self) {
         self.reconnect_latched = true;
     }

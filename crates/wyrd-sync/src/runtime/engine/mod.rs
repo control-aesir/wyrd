@@ -2031,6 +2031,8 @@ mod tests_materialization;
 #[cfg(test)]
 mod tests_properties;
 #[cfg(test)]
+mod tests_restart_equivalence;
+#[cfg(test)]
 mod tests_serving;
 #[cfg(test)]
 mod tests_terminal;

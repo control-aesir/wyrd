@@ -39,6 +39,18 @@ version say exactly what changed.
   load with a warning — the claim fails closed while the store stays
   open. Recorded in `docs/upgrade-contract.md`; no wire behavior yet
   (21b/21c wire the statement and the retire condition).
+- Restart-equivalence relation (DG-5): `docs/crash-consistency.md`
+  gains the normative predicate over durable externally meaningful
+  state as a per-surface table — survives, rebuilt, lost-correctly,
+  or excluded by name — with the surface list as the authority the
+  whole-state snapshot derives from. Serving endpoint identity is
+  excluded by name (residency in, address out); the restart-loss rule
+  for memory-only state not yet written (peer-repair generations) is
+  normative now, rows land with the code. Pinned by ten engine row
+  and crash-stage tests, two status tests, and the want-registry
+  loss test; the single invariant
+  `a_crash_loses_ephemeral_state_but_no_durable_obligation`
+  asserts both halves across a real mid-flight reopen.
 - Normative DG-3 control-message recovery / forget contract in
   `docs/sync-and-peers.md`: retire an obligation only on durable
   evidence the recipient's state subsumes it (per-class predicates),

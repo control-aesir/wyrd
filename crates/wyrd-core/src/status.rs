@@ -453,6 +453,37 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Pending obligations survive the reopen as obligations: the
+    /// admission fixture owes two announcements, one transition, and
+    /// one capability, and the reopened engine owes the same pairs to
+    /// the same recipients with the same queued/delivered split —
+    /// the obligation invariant's replay half at the status row. The
+    /// whole-status equality is the tripwire
+    /// (`queue_depth_is_a_durable_projection`); this test names the
+    /// row the tripwire covers.
+    #[test]
+    fn restart_equivalence_pending_obligations_match() {
+        let identity = DeviceIdentitySecret::from_bytes([0xC1; 32]).unwrap();
+        let (engine, dir) = scratch_authored_with(identity);
+        let before = observe(&engine, 0).unwrap();
+        assert_eq!(before.obligations.announcements.len(), 2);
+        assert_eq!(before.obligations.transitions.len(), 1);
+        assert_eq!(before.obligations.capabilities.len(), 1);
+        assert_eq!(before.obligations.len(), 4, "the fixture owes a backlog");
+        drop(engine);
+        let reopened = Engine::open_keystore(
+            dir.clone(),
+            "core-test-pass",
+            DeviceIdentitySecret::from_bytes([0xC1; 32]).unwrap(),
+        )
+        .unwrap();
+        let after = observe(&reopened, 0).unwrap();
+        assert_eq!(after.obligations, before.obligations);
+        assert_eq!(after.totals, before.totals);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Peer handles are opaque and deterministic: the admission
     /// fixture names two identities (the admitted peer, owed four
     /// pairs, and our own device, authoring the live head), so the

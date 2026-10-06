@@ -322,11 +322,13 @@ behind. What latches the gauge open is a zero-progress evaluation
 whose obligations stay owed: an unresolvable transition or a
 missing sealing key (no send path moves them, whatever the relay
 does), or a live obligation for a relay that accepts nothing —
-a send error aborts the pass before anything is evaluated, so only
-zero acceptance reaches the gauge. Still owed after every pass,
-so the run fails and names it. The stall record itself is
-volatile like the answered set; a restart re-derives it from the
-durable request bucket.
+a send error aborts the pass after any retirements already
+committed but before anything is marked, so the statement is
+re-evaluated next pass (awaiting-answer until then) and only zero
+acceptance flows through to a recorded stall. Still owed after
+every pass, so the run fails and names it. The stall record
+itself is volatile like the answered set; a restart re-derives it
+from the durable request bucket.
 
 ### Acceptance scenarios (normative)
 

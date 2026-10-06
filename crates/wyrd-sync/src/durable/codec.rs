@@ -77,9 +77,14 @@ const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x17;
 /// count ‖ (device 32 ‖ epoch u64 LE) each. Tag 0x18: 0x17 is the
 /// route-sealed record, and the tag space is append-only.
 pub(super) const TAG_RECONCILIATION_VIEW: u8 = 0x18;
+/// A received reconciliation request: requester DeviceId (32) ‖ the
+/// stated-view body above. Tag 0x19: the tag space is append-only.
+/// Same per-section ceiling as the stated view — one evidence layout
+/// across the wire statement, the stated record, and this record.
+const TAG_RECONCILIATION_REQUEST: u8 = 0x19;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-pub(super) const KNOWN_TAGS: [u8; 24] = [
+pub(super) const KNOWN_TAGS: [u8; 25] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -104,6 +109,7 @@ pub(super) const KNOWN_TAGS: [u8; 24] = [
     TAG_CARRY_DONE,
     TAG_ANNOUNCEMENT_ROUTE_SEALED,
     TAG_RECONCILIATION_VIEW,
+    TAG_RECONCILIATION_REQUEST,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -423,6 +429,10 @@ pub(super) fn encode_fact(
         Fact::ReconciliationView(view) => {
             Ok((TAG_RECONCILIATION_VIEW, encode_reconciliation_view(view)?))
         }
+        Fact::ReconciliationRequestReceived(requester, evidence) => Ok((
+            TAG_RECONCILIATION_REQUEST,
+            encode_reconciliation_request(requester, evidence)?,
+        )),
     }
 }
 
@@ -434,12 +444,14 @@ pub(super) fn encode_fact(
 ///
 /// Each section is bounded by `MAX_RECORDS_PER_COMMIT`, mirroring the
 /// commit's record ceiling: a statement larger than the largest
-/// committable batch belongs to 21b's chunked statements, and the
-/// bound keeps decode allocation proportional before integrity is
-/// verified. Refused here, durably, rather than wedging the store
-/// with a view no reopen could read (decode enforces the same
-/// ceiling). The ceiling is a property of the *record*, not of the
-/// evidence: hashing and comparison use the unbounded canonical
+/// committable batch cannot be stated (or received) as one record.
+/// Chunked statements would version the projection alongside the
+/// record (see `reconciliation.rs` on predicate versioning); until
+/// then the bound keeps decode allocation proportional before
+/// integrity is verified. Refused here, durably, rather than wedging
+/// the store with a view no reopen could read (decode enforces the
+/// same ceiling). The ceiling is a property of the *record*, not of
+/// the evidence: hashing and comparison use the unbounded canonical
 /// bytes below, so no public API can panic on a legitimately large
 /// drive.
 pub(super) fn encode_reconciliation_view(
@@ -461,10 +473,26 @@ pub(super) fn encode_reconciliation_view(
     Ok(encode_reconciliation_view_canonical(view))
 }
 
+/// Encode a received reconciliation request: the requester ahead of
+/// the stated-view body. Same ceiling, same layout tail — the intake
+/// arm commits exactly the bytes the wire statement carried, so a
+/// stored request re-encodes to its wire evidence byte-identically.
+fn encode_reconciliation_request(
+    requester: &DeviceId,
+    evidence: &ReconciliationEvidence,
+) -> Result<Vec<u8>, DurableError> {
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(requester.as_bytes());
+    out.extend_from_slice(&encode_reconciliation_view(evidence)?);
+    Ok(out)
+}
+
 /// The canonical evidence bytes, without any commit ceiling: the
-/// shared encoding behind both the record and the digest. Total —
-/// truncation would be a different encoding, not a bounded one.
-pub(super) fn encode_reconciliation_view_canonical(view: &ReconciliationEvidence) -> Vec<u8> {
+/// shared encoding behind the record, the wire statement, and the
+/// digest. Total — truncation would be a different encoding, not a
+/// bounded one. Crate-visible: the send path seals these bytes for
+/// the request, and the statement digest hashes them.
+pub(crate) fn encode_reconciliation_view_canonical(view: &ReconciliationEvidence) -> Vec<u8> {
     // The one implicit bound in the "total" encoding: below it the
     // cast is exact, and 2^32 entries would be 137 GiB of ids in a
     // single set — unreachable, but stated rather than silent.
@@ -806,9 +834,24 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             Some(DecodedFact::CarryDone(SnapshotId::from_bytes(raw)))
         }
         TAG_RECONCILIATION_VIEW => Some(decode_reconciliation_view(record)?),
+        TAG_RECONCILIATION_REQUEST => Some(decode_reconciliation_request(record)?),
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
+}
+
+/// Decode a received reconciliation request: requester ahead of the
+/// stated-view body. A short record is damage, not data — like any
+/// malformed known record it poisons the file.
+fn decode_reconciliation_request(record: &[u8]) -> Option<DecodedFact> {
+    if record.len() < 32 {
+        return None;
+    }
+    let requester = DeviceId::from_bytes(record[0..32].try_into().ok()?);
+    let evidence = decode_reconciliation_evidence(&record[32..])?;
+    Some(DecodedFact::ReconciliationRequestReceived(
+        requester, evidence,
+    ))
 }
 
 /// Decode a stated reconciliation view: three counted sets with
@@ -819,13 +862,26 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
 /// local commit cannot force unbounded allocation before the trailer
 /// hash is verified.
 fn decode_reconciliation_view(record: &[u8]) -> Option<DecodedFact> {
+    Some(DecodedFact::ReconciliationView(
+        decode_reconciliation_evidence(record)?,
+    ))
+}
+
+/// The shared evidence-sets decoder behind the stated-view record,
+/// the received-request record, and the wire statement: counted
+/// sections in sorted-set order with exact-length framing, each
+/// section bounded by the record ceiling. Crate-visible: the intake
+/// arm decodes the request's opaque evidence bytes with exactly the
+/// gate the commit would enforce, so hostile wire bytes cannot size
+/// an allocation the store could never persist.
+pub(crate) fn decode_reconciliation_evidence(bytes: &[u8]) -> Option<ReconciliationEvidence> {
     let mut pos = 0usize;
     let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
         let end = pos.checked_add(n)?;
-        if end > record.len() {
+        if end > bytes.len() {
             return None;
         }
-        let slice = &record[*pos..end];
+        let slice = &bytes[*pos..end];
         *pos = end;
         Some(slice)
     };
@@ -854,10 +910,10 @@ fn decode_reconciliation_view(record: &[u8]) -> Option<DecodedFact> {
         let epoch = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
         view.capabilities.insert((device, epoch));
     }
-    if pos != record.len() {
+    if pos != bytes.len() {
         return None;
     }
-    Some(DecodedFact::ReconciliationView(view))
+    Some(view)
 }
 
 fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
@@ -945,6 +1001,7 @@ pub(super) enum DecodedFact {
     CarryQueued(SnapshotId),
     CarryDone(SnapshotId),
     ReconciliationView(ReconciliationEvidence),
+    ReconciliationRequestReceived(DeviceId, ReconciliationEvidence),
 }
 
 // Sibling test file under the workspace tests_* naming: #[path] is required

@@ -483,6 +483,16 @@ fn note_committed_facts(engine: &mut Engine, facts: &[Fact]) {
         if let Fact::ControlMessage(id) = fact {
             engine.inbox.remember(id);
         }
+        // The received-statement set extends like the seen set: the
+        // commit already wrote the fact, so the live set records the
+        // same (requester, digest) pair resync would rebuild — a
+        // redelivery later in this drain meets Duplicate either way.
+        if let Fact::ReconciliationRequestReceived(requester, evidence) = fact {
+            engine.received_requests.insert((
+                *requester,
+                crate::durable::reconciliation_statement_digest(requester, evidence),
+            ));
+        }
         // The committed-capability projection needs no mirror here:
         // `commit_facts` records every committed capability itself,
         // so rotation deliveries (which never consult the projection)
@@ -658,7 +668,66 @@ fn message_action(
         // distinguishes consumed from never-recorded (see trust.md).
         Message::KeyRotation(_) => Ok(Action::Suppress),
         Message::Capability(payload) => Ok(capability_action(engine, id, payload, sender, budget)),
+        Message::ReconciliationRequest(payload) => {
+            Ok(request_action(engine, id, payload, sender, budget))
+        }
     }
+}
+
+/// Accept a reconciliation request: the recipient-originated pull
+/// statement. Intake commits the statement durably (requester plus
+/// evidence) with the envelope's seen-id fact, inside the same
+/// per-pass budget every other arm charges — a received statement
+/// is one more small fact, never a bypass around the budget
+/// (`docs/resource-limits.md`). Nothing retires here (21c) and no
+/// response is composed here (21c): the commit only preserves the
+/// evidence the set difference will compare against.
+fn request_action(
+    engine: &Engine,
+    id: &ControlMessageId,
+    payload: &crate::control::ReconciliationRequestPayload,
+    sender: DeviceId,
+    budget: &mut IntakeBudget,
+) -> Action {
+    // Redundant-field agreement, mirrored from the capability arm
+    // (T15): the requester names whom the set difference is for, and
+    // the mailbox sender is authenticated transport metadata — the
+    // two must agree. A disagreement is tampering or a broken
+    // sender: suppress memory-only, never defer what can never heal.
+    if payload.requester != sender {
+        return Action::Suppress;
+    }
+    // The evidence bytes are the canonical set encoding the
+    // stated-view record commits: decode under the same per-section
+    // ceiling the record enforces, so hostile wire bytes cannot size
+    // an allocation the store could never persist. Undecodable bytes
+    // are the sender's invalid data — suppress, never park.
+    let evidence = match crate::durable::decode_reconciliation_evidence(&payload.evidence) {
+        Some(evidence) => evidence,
+        None => return Action::Suppress,
+    };
+    // Content dedupe over the wire-statement identity (requester
+    // plus statement digest): a reseal mints a fresh envelope id and
+    // a restart forgets the inbox, so the envelope layer cannot
+    // catch either redelivery shape — the durable received set is
+    // the backstop, and the same statement never writes twice.
+    let statement = (
+        payload.requester,
+        crate::durable::reconciliation_statement_digest(&payload.requester, &evidence),
+    );
+    if engine.received_requests.contains(&statement) {
+        return Action::Duplicate;
+    }
+    // Shed before committing: the verdict commits two facts and no
+    // view is mutated before it, so the envelope can still shed
+    // cleanly and redelivery revalidates against a fresh budget.
+    if !budget.would_admit(sender, 2) {
+        return Action::Shed;
+    }
+    Action::Commit(vec![
+        Fact::ReconciliationRequestReceived(payload.requester, evidence),
+        Fact::ControlMessage(*id),
+    ])
 }
 
 fn capability_action(
@@ -1012,6 +1081,8 @@ mod tests_deferred;
 mod tests_harness;
 #[cfg(test)]
 mod tests_pipeline;
+#[cfg(test)]
+mod tests_reconciliation_request;
 #[cfg(test)]
 mod tests_resilience;
 #[cfg(test)]

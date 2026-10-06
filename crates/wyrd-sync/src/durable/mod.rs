@@ -112,11 +112,13 @@ mod store;
 mod tests;
 
 pub use reconciliation::{
-    ReconciliationError, ReconciliationEvidence, ReconciliationView, ViewProvenance,
+    reconciliation_statement_digest, ReconciliationError, ReconciliationEvidence,
+    ReconciliationView, ViewProvenance,
 };
 pub(crate) use replay::build_keyring;
 pub use replay::{LoadedFacts, Rebuilt};
 // Raw-commit test seam (planted-forgery tests): test-only re-exports.
+pub(crate) use codec::{decode_reconciliation_evidence, encode_reconciliation_view_canonical};
 #[cfg(test)]
 pub(crate) use codec::{encode_commit, TAG_ANNOUNCEMENT_SEALED, TAG_SNAPSHOT_BODY};
 pub(crate) use store::atomic_write;
@@ -455,14 +457,34 @@ pub enum Fact {
     /// A stated reconciliation view: the recipient's per-class
     /// durable evidence (committed transitions, held snapshots,
     /// installed capability epochs) as the recipient saw it. A
-    /// statement about durable state, not a message receipt — this is
-    /// the fact the recipient's reconciliation statement (21b) is the
-    /// transport representation of, and what the sender's set
-    /// difference (21c) compares against. Committing it changes
+    /// statement about durable state, not a message receipt — the
+    /// recipient's reconciliation statement (21b) transports the same
+    /// projection derived live at send time, without committing it:
+    /// the send path never authors facts (spontaneous commits would
+    /// republish the serving generation on unchanged drives), so the
+    /// fact form here is audit committed explicitly, and what the
+    /// sender's set difference (21c) compares against arrives as a
+    /// received request, not from this bucket. Committing it changes
     /// nothing derivable: [`ReconciliationView`] derives from the
     /// base facts, so a stated view never feeds its own derivation.
     /// A statement that over-claims — not a per-class subset of the
     /// base facts — is dropped at load with a warning, never
     /// replayed: the claim fails closed while the store stays open.
     ReconciliationView(ReconciliationEvidence),
+    /// A received reconciliation request: another device's stated
+    /// view, as its wire statement carried it. The recipient-side
+    /// intake commits this on first sight (with the envelope's
+    /// seen-id fact, inside the same per-pass budget), so the
+    /// sender's set difference (21c) compares against durable
+    /// evidence that survives the restart between receipt and
+    /// response. Content-deduplicated on (requester, statement
+    /// digest): redelivery, reseal, and re-request converge to
+    /// `Duplicate` with no new fact, so the transport's bounded
+    /// seen log can evict freely — the durable set is the backstop.
+    /// No subset check at load (unlike the stated view): the sender
+    /// cannot validate another device's holdings against its own
+    /// log — divergent histories are the case being reconciled —
+    /// so intake validates structure and agreement only, and 21c's
+    /// comparison decides what the evidence proves.
+    ReconciliationRequestReceived(DeviceId, ReconciliationEvidence),
 }

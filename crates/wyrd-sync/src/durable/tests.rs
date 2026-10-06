@@ -1,9 +1,9 @@
 use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{
-    AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact,
-    LoadedFacts, ReconciliationError, ReconciliationEvidence, ReconciliationView,
-    SealedCapabilityFactId, ViewProvenance,
+    reconciliation_statement_digest, AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot,
+    CrashStage, DurableError, Fact, LoadedFacts, ReconciliationError, ReconciliationEvidence,
+    ReconciliationView, SealedCapabilityFactId, ViewProvenance,
 };
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
@@ -1655,6 +1655,89 @@ fn reconciliation_view_replays_to_the_same_view() {
     assert_eq!(
         loaded.dropped_reconciliation_views, 0,
         "an honest statement is never dropped"
+    );
+}
+
+/// A received request replays verbatim into its own bucket: the
+/// (requester, evidence) pair survives the reopen, ordered by
+/// commit, without touching the stated-view bucket or the
+/// derivation — receiving changes nothing derivable.
+#[test]
+fn reconciliation_request_replays_to_the_same_statement() {
+    let dir = TestDir::new("reconciliation-request");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let evidence = ReconciliationView::derive(&store.load().unwrap())
+        .evidence()
+        .clone();
+    let requester = DeviceId::from_bytes([0x31; 32]);
+    store
+        .commit(&[Fact::ReconciliationRequestReceived(
+            requester,
+            evidence.clone(),
+        )])
+        .unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_requests,
+        vec![(requester, evidence.clone())],
+        "the received statement replays verbatim"
+    );
+    assert!(
+        loaded.reconciliation_views.is_empty(),
+        "receiving never states"
+    );
+    assert_eq!(
+        ReconciliationView::derive(&loaded).evidence(),
+        &evidence,
+        "receiving changes nothing derivable"
+    );
+}
+
+/// The wire-statement identity is stable content addressing: same
+/// requester plus same evidence digests identically across commits,
+/// while a different requester over identical evidence does not —
+/// so the dedupe key separates statements without confusing
+/// senders.
+#[test]
+fn reconciliation_statement_digest_is_requester_bound_and_stable() {
+    let dir = TestDir::new("reconciliation-statement-digest");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let evidence = ReconciliationView::derive(&store.load().unwrap())
+        .evidence()
+        .clone();
+    let a = DeviceId::from_bytes([0x31; 32]);
+    let b = DeviceId::from_bytes([0x32; 32]);
+    let first = reconciliation_statement_digest(&a, &evidence);
+    assert_eq!(
+        reconciliation_statement_digest(&a, &evidence),
+        first,
+        "same statement, same identity"
+    );
+    assert_ne!(
+        reconciliation_statement_digest(&b, &evidence),
+        first,
+        "same evidence, different requester, different statement"
+    );
+    let mut widened = evidence.clone();
+    widened
+        .transitions
+        .insert(TransitionId::from_bytes([0x99; 32]));
+    assert_ne!(
+        reconciliation_statement_digest(&a, &widened),
+        first,
+        "same requester, different evidence, different statement"
+    );
+    // And it differs from the local audit identity by construction:
+    // one names the statement for retirement, the other the
+    // evidence for audit.
+    assert_ne!(
+        first,
+        evidence.digest(),
+        "statement identity is not the evidence digest"
     );
 }
 

@@ -96,6 +96,13 @@ pub struct LoadedFacts {
     /// indistinguishable to 21b, which would silently under-claim
     /// forever. The log names the digests; this names the count.
     pub dropped_reconciliation_views: usize,
+    /// Received reconciliation requests, in commit order: (requester,
+    /// evidence) pairs intake committed on first sight. No subset
+    /// check at load — intake validated structure and agreement, and
+    /// 21c's comparison decides what the evidence proves. No
+    /// RuntimeFact either: receiving a request changes no runtime
+    /// projection; the response path (21c) reads this bucket.
+    pub reconciliation_requests: Vec<(DeviceId, ReconciliationEvidence)>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -239,6 +246,12 @@ impl LoadedFacts {
                 // state. The bucket preserves commit order, so the
                 // latest statement is last.
                 self.reconciliation_views.push(view);
+            }
+            DecodedFact::ReconciliationRequestReceived(requester, evidence) => {
+                // No RuntimeFact: receiving a request changes no
+                // runtime projection either. Commit order preserved
+                // for the response path's audit trail.
+                self.reconciliation_requests.push((requester, evidence));
             }
         }
     }

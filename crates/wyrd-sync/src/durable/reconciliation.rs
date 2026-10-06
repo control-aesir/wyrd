@@ -98,6 +98,30 @@ impl ReconciliationEvidence {
 /// Domain context for the stated-view identity.
 const RECONCILIATION_VIEW_CONTEXT: &str = "wyrd reconciliation view v1";
 
+/// Domain context for the wire-statement identity: what the forget
+/// contract requires retirement to reference (21c's anchor).
+const RECONCILIATION_STATEMENT_CONTEXT: &str = "wyrd reconciliation statement v1";
+
+/// The wire-statement identity: domain-separated BLAKE3 over the
+/// requester plus the canonical evidence bytes. Stable across
+/// reseals (the seal nonce never enters it) and redeliveries, so it
+/// is the content-dedupe key the envelope id cannot be: the same
+/// statement commits the same fact no matter how many bytes carried
+/// it. Distinct from the stated-view digest on purpose — that one
+/// names local evidence for audit and supersession, this one names
+/// the authenticated statement retirement must reference.
+pub fn reconciliation_statement_digest(
+    requester: &DeviceId,
+    evidence: &ReconciliationEvidence,
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(requester.as_bytes());
+    bytes.extend_from_slice(&super::codec::encode_reconciliation_view_canonical(
+        evidence,
+    ));
+    blake3::derive_key(RECONCILIATION_STATEMENT_CONTEXT, &bytes)
+}
+
 /// Retirement refused before it can happen: the evidence was never
 /// committed durably.
 #[derive(Debug, Error, PartialEq, Eq)]

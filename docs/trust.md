@@ -322,6 +322,7 @@ without a held epoch key.
 | `MembershipTransition` | 0x01 | opaque canonical transition bytes (the membership machine verifies) |
 | `KeyRotation` | 0x02 | the epoch's transition id — new epoch material exists, capability follows as a separate message; hint only (below), addressed to epoch-key holders, confers no authority |
 | `SnapshotAnnouncement` | 0x03 | snapshot id, author, epoch, membership transition id — enough to fetch and classify |
+| `ReconciliationRequest` | 0x04 | requester device id plus the canonical reconciliation-evidence bytes (opaque here, decoded at intake) — the recipient-originated pull statement; pure content, no nonce, so redelivery, reseal, and re-request converge by set membership |
 
 `KeyRotation` is envelope-defined but unhandled in v0: the runtime has
 no rotation handler, so rotation messages are terminal no-ops —

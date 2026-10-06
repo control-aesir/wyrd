@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
 use wyrd_format::{
-    ContentId, FsObjectStore, FsStoreError, MemoryObjectStore, MemoryStoreError, ObjectKind,
-    ObjectStore,
+    ContentId, DeviceId, FsObjectStore, FsStoreError, MemoryObjectStore, MemoryStoreError,
+    ObjectKind, ObjectStore,
 };
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
 use wyrd_sync::durable::{DurableStore, Fact, ReconciliationView};
@@ -423,6 +423,56 @@ fn upgrade_reconciliation_view_replays_through_the_public_path() {
         ReconciliationView::derive(&loaded).evidence(),
         &evidence,
         "stating the view changed nothing derivable"
+    );
+}
+
+/// The 21b half of the acceptance: a commit carrying the received
+/// reconciliation-request tag replays through the public path. The
+/// intake path commits the (requester, evidence) pair through the
+/// public commit API, and a reopen replays the statement verbatim
+/// into its own bucket — never into the stated-view bucket, never
+/// into derivation. Same older-replay half as `0x18`: an old node
+/// skips the unknown `0x19` record and still opens the store.
+#[test]
+fn upgrade_reconciliation_request_replays_through_the_public_path() {
+    let mut rig = Rig::new();
+    let admit = rig.admit.clone();
+    rig.enqueue_capability(&admit, &[rig.epoch1.clone(), rig.epoch2.clone()]);
+    let report = rig.drain();
+    assert_eq!(report.accepted, 1, "the fixture capability must commit");
+    let dir = rig.dir.clone();
+    drop(rig.take_engine());
+
+    let evidence = {
+        let store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+        let loaded = store.load().unwrap();
+        ReconciliationView::derive(&loaded).evidence().clone()
+    };
+    let requester = DeviceId::from_bytes([0x31; 32]);
+    {
+        let mut store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+        store
+            .commit(&[Fact::ReconciliationRequestReceived(
+                requester,
+                evidence.clone(),
+            )])
+            .unwrap();
+    }
+    let store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_requests,
+        vec![(requester, evidence.clone())],
+        "the received statement replays verbatim"
+    );
+    assert!(
+        loaded.reconciliation_views.is_empty(),
+        "receiving never states"
+    );
+    assert_eq!(
+        ReconciliationView::derive(&loaded).evidence(),
+        &evidence,
+        "receiving changed nothing derivable"
     );
 }
 

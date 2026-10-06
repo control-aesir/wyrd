@@ -55,6 +55,24 @@ version say exactly what changed.
   suppression-loss pin, the new status row test alongside the
   pre-existing whole-status tripwire, and the want-registry
   loss test.
+- Reconciliation request message and intake (`21b-reconciliation-request`):
+  the recipient-originated pull statement as a new control kind
+  (`ReconciliationRequest`, `0x04`: requester plus canonical evidence
+  bytes, no nonce so redelivery/reseal/re-request converge by content),
+  a received-request durable fact (`0x19`: requester plus evidence,
+  no subset check — the sender cannot validate another device's
+  holdings), and an intake arm that commits the pair on first sight
+  inside the existing per-pass budget, dedupes on (requester,
+  statement digest) so transport seen-log eviction is safe, suppresses
+  requester≠sender disagreement and undecodable evidence memory-only,
+  and sheds floods relay-held. The send-side trigger (OD-21-4: durable
+  gap or reconnect edge, never a timer, coalesced to one request,
+  volatile already-asked marker, frozen drives silent) derives the
+  view live and fans it out without committing — the send path never
+  authors facts, so triggers advance no sequence; the live loop feeds
+  it the mailbox reconnect edge. Nothing retires yet (21c). Recorded in
+  `docs/upgrade-contract.md`, `docs/object-model.md`,
+  `docs/resource-limits.md`.
 - Normative DG-3 control-message recovery / forget contract in
   `docs/sync-and-peers.md`: retire an obligation only on durable
   evidence the recipient's state subsumes it (per-class predicates),

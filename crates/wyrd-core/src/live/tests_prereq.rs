@@ -12,8 +12,9 @@ use wyrd_sync::keys::DeviceIdentitySecret;
 /// everything it does not hold. Behavior derives from (store,
 /// heads) alone, so `open_shared` needs no out-of-band config:
 /// which prerequisite the mapping sees is a function of which
-/// objects the store holds.
-struct FileView {
+/// objects the store holds. `pub(super)` for the trigger tests,
+/// which compose nodes over the same fake view.
+pub(super) struct FileView {
     store: Arc<RwLock<MemoryObjectStore>>,
     materialization: RuntimeMaterialization,
     heads: Vec<Head>,
@@ -177,7 +178,8 @@ impl NamespaceView for FileView {
 /// A scratch single-member engine with one file (`f`, eleven bytes
 /// in one chunk) authored, plus the store and identities the live
 /// node needs: the chunk, the root tree, and the authored head.
-fn scratch_file_drive(
+/// `pub(super)` for the trigger tests, which compose the same way.
+pub(super) fn scratch_file_drive(
     tag: &str,
 ) -> (
     Engine,
@@ -209,7 +211,8 @@ fn scratch_file_drive(
 
 /// A live node over the fake view: the heads cross as `Head`s like
 /// production, and the store handle is shared like production.
-fn live_over_fake(
+/// `pub(super)` for the trigger tests, which compose the same way.
+pub(super) fn live_over_fake(
     engine: Engine,
     store: MemoryObjectStore,
     heads: &[AuthorizedSnapshot],

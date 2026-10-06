@@ -29,6 +29,9 @@
 //! announcement, epoch mismatched . suppressed memory-only (epochs are immutable)
 //! announcement, immutable fork .. suppressed memory-only, no announcement fact (forks never commit)
 //! announcement, route update .... fresh announcement fact (last accepted route wins)
+//! reconciliation request ....... committed once per (requester, statement):
+//!                                redelivery/reseal/re-request is a no-op
+//! reconciliation, requester≠sender suppressed memory-only (disagreement never heals)
 //! held-message overflow ......... left unacked (pending is bounded; relay retains)
 //! ```
 //!
@@ -670,6 +673,17 @@ pub struct Engine {
     /// still commits: the projection suppresses exact replays, never
     /// new information.
     pub(super) committed_capabilities: BTreeMap<(DeviceId, TransitionId), Capability>,
+    /// Durably received reconciliation statements as (requester,
+    /// statement-digest) pairs: the content-dedupe set the request
+    /// intake arm validates against. A resealed statement mints a
+    /// fresh envelope id and a restart forgets the inbox, so neither
+    /// redelivery shape may write a second fact — the durable set is
+    /// the backstop the transport's bounded, evicting seen log cannot
+    /// be. Hydrated from the received-request bucket at open and
+    /// resync; the request intake arm extends it after every commit
+    /// (the only writer of the fact, via `note_committed_facts`) —
+    /// the projection follows the store, never leads it.
+    pub(super) received_requests: BTreeSet<(DeviceId, [u8; 32])>,
     /// Held (deferred) control messages with their unblocking
     /// dependencies: arrival order plus a dependency index (see
     /// [`PendingQueue`]). A flush batch emits the woken entries in
@@ -721,6 +735,18 @@ pub struct Engine {
     /// `Complete`; the hook is one-shot.
     #[cfg(test)]
     crash_stage: Option<CrashStage>,
+    /// A latched reconnect edge for the reconciliation trigger
+    /// (OD-21-4): set by [`Engine::note_reconnected`], consumed by
+    /// [`Engine::maybe_request_reconciliation`]. Volatile by design —
+    /// a restart re-fires the session-start edge through the normal
+    /// live-loop path, so a lost latch only delays one probe.
+    pub(super) reconnect_latched: bool,
+    /// Digest of the last relay-accepted reconciliation request, if
+    /// any: the trigger's already-asked marker. Volatile by design —
+    /// a restart re-probes once rather than resuming silence (see
+    /// `runtime::reconcile`). Marked only on acceptance, so an
+    /// offline attempt never quiets the next trigger.
+    pub(super) last_requested_digest: Option<[u8; 32]>,
 }
 
 impl Engine {
@@ -769,6 +795,7 @@ impl Engine {
             log: MembershipLog::new(drive),
             announcements: BTreeMap::new(),
             committed_capabilities: BTreeMap::new(),
+            received_requests: BTreeSet::new(),
             pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
@@ -782,6 +809,8 @@ impl Engine {
             fetch_transport_seen: BTreeSet::new(),
             #[cfg(test)]
             crash_stage: None,
+            reconnect_latched: false,
+            last_requested_digest: None,
         };
         engine.resync()?;
         engine.restore_epoch_keys()?;
@@ -1206,6 +1235,20 @@ impl Engine {
             committed_capabilities.insert((c.device, c.transition), c);
         }
         self.committed_capabilities = committed_capabilities;
+        // The received-statement set replays the same way: every
+        // durably received (requester, evidence) pair contributes its
+        // statement digest, so a redelivery after resync meets the
+        // same Duplicate verdict the live set gave.
+        self.received_requests = facts
+            .reconciliation_requests
+            .iter()
+            .map(|(requester, evidence)| {
+                (
+                    *requester,
+                    crate::durable::reconciliation_statement_digest(requester, evidence),
+                )
+            })
+            .collect();
         // Pending-invitation material re-derives the invitation's
         // control keys on every resync: the joined device holds no
         // authorized capability yet, so without this a restart between
@@ -2050,6 +2093,9 @@ mod tests_lifecycle;
 mod tests_materialization;
 #[cfg(test)]
 mod tests_properties;
+#[cfg(test)]
+#[cfg(test)]
+mod tests_reconciliation;
 #[cfg(test)]
 mod tests_restart_equivalence;
 #[cfg(test)]

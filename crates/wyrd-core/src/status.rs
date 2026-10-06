@@ -15,7 +15,7 @@ use wyrd_format::{DeviceId, SnapshotId};
 use wyrd_sync::{
     authorization::Classification,
     membership::KnownState,
-    runtime::{Engine, EngineError, MaterializationSummary, OutboxTotals},
+    runtime::{Engine, EngineError, MaterializationSummary, OutboxTotals, ReconciliationCounters},
 };
 
 use crate::live::PendingObligations;
@@ -176,6 +176,15 @@ pub struct SyncStatus {
     /// Outstanding durable work: owed obligations plus missing
     /// fetches, from committed facts only.
     pub queue: QueueDepth,
+    /// Reconciliation progress, from committed facts only: received
+    /// peer statements plus obligations retired through
+    /// reconciliation rather than relay acceptance. Counts only —
+    /// classes, never identities — so the renderer cannot leak a
+    /// TransitionId or DeviceId through this row. The outstanding
+    /// gap is deliberately absent: answering is a live, volatile
+    /// evaluation, so unanswered and stalled statements are a run
+    /// observation (`sync now`), not a status input.
+    pub reconciliation: ReconciliationCounters,
     /// Whether the node has converged, from durable facts.
     pub convergence: ConvergenceState,
     /// Materialization as counts: explicit residency policies plus
@@ -319,6 +328,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         unfetchable_heads: head_classes.rejected,
     };
     let materialization = state.materialization_summary();
+    let reconciliation = engine.reconciliation_counters()?;
     Ok(SyncStatus {
         tip,
         held_epochs,
@@ -330,6 +340,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         known_members,
         peers,
         queue,
+        reconciliation,
         convergence,
         materialization,
     })
@@ -542,6 +553,36 @@ mod tests {
         .unwrap();
         let after = observe(&reopened, 0).unwrap();
         assert_eq!(before, after);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reconciliation row reads the durable counters: no
+    /// statement received and nothing retired on these fixtures, and
+    /// the row survives the reopen like every other status input.
+    /// Nonzero progress is pinned where the statements live
+    /// (`reconciliation_counters_replay_from_durable_facts`); this
+    /// test pins that `observe` surfaces those counters rather than
+    /// a live guess.
+    #[test]
+    fn reconciliation_row_is_a_durable_projection() {
+        let identity = DeviceIdentitySecret::from_bytes([0xC2; 32]).unwrap();
+        let (engine, dir) = scratch_authored_with(identity);
+        let before = observe(&engine, 0).unwrap();
+        assert_eq!(
+            before.reconciliation,
+            ReconciliationCounters::default(),
+            "no statements flow through these fixtures: {before:?}"
+        );
+        drop(engine);
+        let reopened = Engine::open_keystore(
+            dir.clone(),
+            "core-test-pass",
+            DeviceIdentitySecret::from_bytes([0xC2; 32]).unwrap(),
+        )
+        .unwrap();
+        let after = observe(&reopened, 0).unwrap();
+        assert_eq!(before.reconciliation, after.reconciliation);
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }

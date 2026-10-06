@@ -529,6 +529,79 @@ fn recipient_intakes_the_request_end_to_end() {
     assert!(mailbox.recorded.is_empty());
 }
 
+/// The durable source behind `sync status`' reconciliation row:
+/// received statements are committed facts, so the counters observe
+/// them with no mailbox in play and identically across a restart.
+/// Answering is the volatile half — the live gap `sync now` reports —
+/// so it resets while the counters do not.
+#[test]
+fn reconciliation_counters_replay_from_durable_facts() {
+    let (mut pair, controls, _) = scenario();
+    converge(&mut pair);
+    pair.a.engine.note_reconnected();
+    let a_dev = pair.a.device;
+    let mut mailbox = mailbox_for(&mut pair.relay, a_dev);
+    assert_eq!(
+        trigger(&mut pair.a.engine, &mut mailbox),
+        ReconciliationOutcome::Requested {
+            recipients: 2,
+            accepted: 2,
+        }
+    );
+    drop(mailbox);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
+    let counters = pair
+        .b
+        .engine
+        .reconciliation_counters()
+        .expect("counters rebuild");
+    assert_eq!(counters.statements_received, 1, "B holds A's statement");
+    assert_eq!(counters.transitions_reconciled, 0, "nothing retired yet");
+    assert_eq!(counters.capabilities_reconciled, 0, "nothing retired yet");
+    assert_eq!(
+        pair.b.engine.unanswered_statement_count(),
+        1,
+        "received, not yet answered"
+    );
+    // An answering pass drives the live gauge to zero: the converged
+    // scenario owes nothing, so the statement marks answered as
+    // covered-empty — evaluated, no stall recorded.
+    let b_dev = pair.b.device;
+    let mut mailbox = mailbox_for(&mut pair.relay, b_dev);
+    pair.b
+        .engine
+        .answer_reconciliation(&mut mailbox)
+        .expect("answer pass evaluates");
+    drop(mailbox);
+    assert_eq!(
+        pair.b.engine.unanswered_statement_count(),
+        0,
+        "the answer pass closed the live gap"
+    );
+    assert_eq!(
+        pair.b
+            .engine
+            .stalled_statement_count()
+            .expect("stall gauge reads"),
+        0,
+        "covered-empty is closed, not stuck"
+    );
+    // A restart replays the same facts: the counters are identical
+    // while the volatile answer evaluation resets.
+    restart(&mut pair.b, &controls);
+    let replayed = pair
+        .b
+        .engine
+        .reconciliation_counters()
+        .expect("counters rebuild after restart");
+    assert_eq!(replayed, counters, "same committed facts, same counters");
+    assert_eq!(
+        pair.b.engine.unanswered_statement_count(),
+        1,
+        "answering resets; the statement still awaits its first answer"
+    );
+}
+
 /// A signed sibling of the builder's tip: mirrors the membership
 /// conformance fork fixture (valid children of one canonical
 /// predecessor conflict). Signed with the builder's key so the

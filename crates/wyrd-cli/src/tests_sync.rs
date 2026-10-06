@@ -715,6 +715,8 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         sent: 0,
         outcome,
         pending: 0,
+        reconciliation_outstanding: 0,
+        reconciliation_stalled: 0,
         unfetchable_heads: 0,
         mailbox,
         peers_observed: Vec::new(),
@@ -903,6 +905,141 @@ fn offline_completion_names_its_limits() {
     );
 }
 
+/// `sync_now_names_the_gap_before_it_closes_it`: a run that went
+/// quiet with received statements still unanswered names the
+/// control-plane gap and exits non-zero, so automation sees it —
+/// even though the outbox itself is quiet. The stalled half pins
+/// the harder case: an evaluated-but-skipped peer (asked and
+/// permanently skipped) fails the same way, never as healthy.
+#[test]
+fn sync_now_names_the_gap_before_it_closes_it() {
+    let mut gap = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    gap.reconciliation_outstanding = 2;
+    let error = run_outcome_error(&gap).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CliError::ReconciliationOutstanding {
+                unanswered: 2,
+                stalled: 0
+            }
+        ),
+        "a quiet run with unanswered statements fails as outstanding, got: {error}"
+    );
+    let rendered = sync_now_render(&gap);
+    assert!(
+        rendered.contains("reconciliation: 2 statements awaiting answer, 0 stalled"),
+        "the report names the gap before it closes it: {rendered}"
+    );
+    assert!(
+        !rendered.contains("completed: quiet"),
+        "a run with an open gap never claims completion: {rendered}"
+    );
+    // The stalled twin: evaluated, zero progress, obligation still
+    // owed — the UnknownEpoch shape renders open and fails.
+    let mut stalled = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    stalled.reconciliation_stalled = 1;
+    let error = run_outcome_error(&stalled).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CliError::ReconciliationOutstanding {
+                unanswered: 0,
+                stalled: 1
+            }
+        ),
+        "a quiet run with a stalled statement fails as outstanding, got: {error}"
+    );
+    let rendered = sync_now_render(&stalled);
+    assert!(
+        rendered.contains("reconciliation: 0 statements awaiting answer, 1 stalled"),
+        "the stall half names itself: {rendered}"
+    );
+    assert!(
+        rendered.contains("stopped: quiet locally, 1 stalled reconciliation statements"),
+        "the verdict names the stall, not the mailbox: {rendered}"
+    );
+    assert!(
+        !rendered.contains("completed: quiet"),
+        "a stalled run never claims completion: {rendered}"
+    );
+    // The converged twin succeeds and still prints the row: zero is
+    // the case automation greps for, not an omitted line.
+    let converged = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    assert!(run_outcome_error(&converged).is_ok());
+    assert!(
+        sync_now_render(&converged)
+            .contains("reconciliation: 0 statements awaiting answer, 0 stalled"),
+        "the converged run prints its zero: {}",
+        sync_now_render(&converged),
+    );
+}
+
+/// The stall downgrades the stalled verdict too: quiet with
+/// unfetchable heads plus an open gap stops instead of completing.
+/// And precedence: a capped run reports the cap, not the gap — the
+/// outcome match wins, which is the rerun guidance the operator
+/// needs first.
+#[test]
+fn stalled_gap_downgrades_remote_stalled_and_yields_to_the_cap() {
+    let mut stalled = report_with(RunOutcome::RemoteStalled, Some(fixture_mailbox()));
+    stalled.reconciliation_stalled = 1;
+    stalled.unfetchable_heads = 2;
+    let error = run_outcome_error(&stalled).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CliError::ReconciliationOutstanding {
+                unanswered: 0,
+                stalled: 1
+            }
+        ),
+        "a stalled gap fails even beside unfetchable heads, got: {error}"
+    );
+    let rendered = sync_now_render(&stalled);
+    assert!(
+        !rendered.contains("completed: quiet"),
+        "no completion claim under an open gap: {rendered}"
+    );
+    assert!(
+        rendered.contains("1 stalled reconciliation statements"),
+        "the stopped line names the stall: {rendered}"
+    );
+    let mut capped = report_with(RunOutcome::PassLimit, Some(fixture_mailbox()));
+    capped.passes = MAX_SYNC_NOW_PASSES;
+    capped.reconciliation_stalled = 1;
+    let error = run_outcome_error(&capped).unwrap_err();
+    assert!(
+        matches!(error, CliError::Incomplete { .. }),
+        "the cap outranks the gap: rerun first, then read the gap, got: {error}"
+    );
+}
+
+/// The status reconciliation row names classes and counts, never
+/// identities: the exact line is pinned so a future field cannot
+/// smuggle a TransitionId, DeviceId, or membership content onto
+/// this surface (the 21d privacy boundary).
+#[test]
+fn sync_status_reconciliation_row_names_classes_not_identities() {
+    let fixture = Fixture::new();
+    let engine = fixture.open();
+    let status = observe(&engine, 0).unwrap();
+    assert_eq!(
+        status.reconciliation,
+        wyrd_sync::runtime::ReconciliationCounters::default(),
+        "no statements flow on a fresh drive: {status:?}"
+    );
+    let rendered = sync_status_render(&status);
+    let row = rendered
+        .lines()
+        .find(|line| line.starts_with("reconciliation: "))
+        .expect("the reconciliation row renders: {rendered}");
+    assert_eq!(
+        row, "reconciliation: 0 statements received, 0 transitions + 0 capabilities retired",
+        "classes and counts only: {rendered}"
+    );
+}
+
 /// The outcome maps to the process result: quiet succeeds, a capped
 /// run fails as incomplete with its pass and pending counts.
 #[test]
@@ -934,6 +1071,8 @@ fn run_outcome_maps_to_success_or_incomplete() {
         sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,
+        reconciliation_outstanding: 0,
+        reconciliation_stalled: 0,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
@@ -967,6 +1106,8 @@ fn run_outcome_maps_to_success_or_incomplete() {
         sent: 0,
         outcome: RunOutcome::RemoteStalled,
         pending: 0,
+        reconciliation_outstanding: 0,
+        reconciliation_stalled: 0,
         unfetchable_heads: 1,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
@@ -1000,6 +1141,8 @@ fn run_outcome_maps_to_success_or_incomplete() {
         sent: 0,
         outcome: RunOutcome::PassLimit,
         pending: 4,
+        reconciliation_outstanding: 0,
+        reconciliation_stalled: 0,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),

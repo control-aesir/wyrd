@@ -697,6 +697,20 @@ pub struct Engine {
     /// like the trigger's volatile marker: re-answer work, never
     /// resumed silence.
     pub(super) answered_statements: BTreeSet<(DeviceId, [u8; 32])>,
+    /// Statements evaluated with obligations outstanding but zero
+    /// sends and zero retirements ("asked, nothing delivered"), as
+    /// (requester, statement-digest) pairs: the sender-side
+    /// UnknownEpoch skip is the pre-existing shape — the transition's
+    /// epoch is past everything the statement shows the recipient
+    /// holding, so the envelopes stay pending for the statement that
+    /// carries the capability install. Volatile like the answered set
+    /// and never rebuilt: a restart re-evaluates every statement and
+    /// re-derives the stalls idempotently. Entries are insert-only
+    /// within a lifetime; liveness is decided at read time
+    /// ([`Engine::stalled_statement_count`]), so obligations that
+    /// drain through another path (relay acceptance, a newer
+    /// statement) close the stall without event plumbing.
+    pub(super) stalled_statements: BTreeSet<(DeviceId, [u8; 32])>,
     /// How many received-request bucket entries were answered: the
     /// bucket is append-only in commit order, so each pass scans
     /// only the suffix past this count. Doubles as the answer
@@ -835,6 +849,7 @@ impl Engine {
             committed_capabilities: BTreeMap::new(),
             received_requests: BTreeSet::new(),
             answered_statements: BTreeSet::new(),
+            stalled_statements: BTreeSet::new(),
             answered_upto: 0,
             pending: PendingQueue::default(),
             fetch_run: 0,
@@ -1336,6 +1351,62 @@ impl Engine {
     /// state is a snapshot; fetch execution remains owned by the engine.
     pub fn runtime_state(&self) -> Result<super::RuntimeState, EngineError> {
         Ok(self.store.rebuild(self.device)?.runtime)
+    }
+
+    /// Reconciliation progress rebuilt from committed facts: received
+    /// statements plus per-class retirements. The durable half of the
+    /// operator surface (`sync status`): identical before and after a
+    /// restart over the same state, like every other status input.
+    /// Rebuilt from the store rather than read off the live sets, so
+    /// a process that answered statements in memory but never retired
+    /// them reports the facts, not its volatile evaluation.
+    pub fn reconciliation_counters(&self) -> Result<super::ReconciliationCounters, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let (transitions_reconciled, capabilities_reconciled) = rebuilt.runtime.reconciled_counts();
+        Ok(super::ReconciliationCounters {
+            statements_received: rebuilt.reconciliation_requests.len(),
+            transitions_reconciled,
+            capabilities_reconciled,
+        })
+    }
+
+    /// Received statements this process has not answered yet: the live
+    /// reconciliation gap a run reports and exits on. Volatile by
+    /// design — answering resets on restart and re-answering is
+    /// idempotent — so this is a run observation, never a status
+    /// input. Every answered statement came from a received one, so
+    /// the subtraction is exact; the saturating floor is
+    /// defense-in-depth against a future second writer.
+    pub fn unanswered_statement_count(&self) -> usize {
+        self.received_requests
+            .len()
+            .saturating_sub(self.answered_statements.len())
+    }
+
+    /// Evaluated-but-stuck statements whose requester is still owed:
+    /// "asked, nothing delivered" with a live gap behind it. The set
+    /// is insert-only within a lifetime, so liveness is decided here
+    /// against rebuilt durable state — a stall whose obligations
+    /// drained through another path (relay acceptance, a newer
+    /// statement's retirements) stops counting without event
+    /// plumbing. Rebuilt rather than read off a live projection so
+    /// the gauge agrees with the durable counters by construction;
+    /// read once at end of run, never per pass. Volatile like the
+    /// answered set: a restart re-evaluates and re-derives.
+    pub fn stalled_statement_count(&self) -> Result<usize, EngineError> {
+        // The common path is no stalls: skip the rebuild entirely.
+        // The gauge beside this one is O(1) with no I/O for the same
+        // reason — a diagnostic read must not cost a load cycle when
+        // there is nothing to decide.
+        if self.stalled_statements.is_empty() {
+            return Ok(0);
+        }
+        let state = self.store.rebuild(self.device)?.runtime;
+        Ok(self
+            .stalled_statements
+            .iter()
+            .filter(|(requester, _)| state.has_outstanding_for(requester))
+            .count())
     }
 
     /// The drive's durable sealed-representation vault: the composer

@@ -197,13 +197,25 @@ impl Engine {
             if retired > 0 {
                 dirty = true;
             }
-            report.sent += super::author::deliver_scoped(
+            let sent = super::author::deliver_scoped(
                 self,
                 mailbox,
                 requester,
                 MAX_RESPONSE_SENDS_PER_STATEMENT,
                 newest_held_epoch(evidence, requester),
             )?;
+            report.sent += sent;
+            // "Asked, nothing delivered": obligations were
+            // outstanding for this requester, yet the evaluation
+            // moved none — the sender-side UnknownEpoch skip is the
+            // standing shape. Covered-empty statements never reach
+            // here (the `continue` above), so reaching this arm with
+            // zero progress means stuck, not closed. Recorded for
+            // 21d's stall gauge; liveness is decided at read time,
+            // so no clearing belongs here.
+            if retired == 0 && sent == 0 {
+                self.stalled_statements.insert((*requester, *digest));
+            }
         }
         for (requester, digest, _) in &todo {
             self.answered_statements.insert((*requester, *digest));
@@ -343,9 +355,11 @@ fn covered_capabilities(
 /// back every transition until a capability install arrives, and a
 /// recipient that never evidences an install (invitation-held keys,
 /// unauthorized rotation deliveries) gets its transitions from the
-/// blind pass instead, indistinguishably for correctness. 21d will
-/// want the "scoped nothing" and "nothing to send" cases told
-/// apart; the report counts sends and retirements only.
+/// blind pass instead, indistinguishably for correctness. The
+/// "scoped nothing" (covered-empty: no outstanding obligations, the
+/// statement closes) and "nothing to send" (outstanding, zero
+/// progress: the UnknownEpoch skip) cases are told apart by 21d's
+/// stall record — the former never stalls, the latter does.
 fn newest_held_epoch(evidence: &ReconciliationEvidence, recipient: &DeviceId) -> u64 {
     evidence
         .capabilities

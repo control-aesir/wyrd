@@ -479,6 +479,17 @@ pub(crate) enum CliError {
     /// converged device. Exits non-zero like any other failure.
     #[error("sync incomplete: pass limit ({passes}) reached with {pending} obligations pending")]
     Incomplete { passes: u32, pending: usize },
+    /// A run that went quiet with received reconciliation statements
+    /// still unanswered: a peer asked this device to prove its state
+    /// and the run could not answer — an epoch it never learned, or
+    /// a statement that landed after the last answer pass. The gap is
+    /// control-plane, so the run fails even though the outbox is
+    /// quiet: automation keying on exit status must see it. Exits
+    /// non-zero like any other failure.
+    #[error(
+        "sync incomplete: {unanswered} reconciliation statements awaiting answer, {stalled} stalled"
+    )]
+    ReconciliationOutstanding { unanswered: usize, stalled: usize },
     /// A run that stopped on a quiet local state while the mailbox
     /// could not prove intake worked: no relay connected, a relay
     /// closed our subscription mid-run, or a blind stretch healed
@@ -1600,6 +1611,19 @@ struct SyncRunReport {
     peers_observed: Vec<DeviceId>,
     outcome: RunOutcome,
     pending: usize,
+    /// Received reconciliation statements the run never answered:
+    /// the end-of-run control-plane gap. A live gauge, not a durable
+    /// projection — answering is volatile — captured once after the
+    /// loop beside `pending`, never accumulated per pass. Nonzero
+    /// with a quiet outbox still fails the run: the peer asked and
+    /// this device could not prove its state.
+    reconciliation_outstanding: usize,
+    /// Evaluated-but-stuck statements whose requester is still owed
+    /// ("asked, nothing delivered"): the stall half of the gap beside
+    /// the unanswered half above. Same capture discipline — once at
+    /// the end, never per pass — and the same failure: a permanently
+    /// skipped peer renders as a healthy drive without it.
+    reconciliation_stalled: usize,
     /// Heads known but not locally closable at the last pass: a
     /// remote condition (no route, no bytes, no capability yet),
     /// never local work. Reported, never spun on.
@@ -1762,6 +1786,8 @@ where
         sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,
+        reconciliation_outstanding: 0,
+        reconciliation_stalled: 0,
         unfetchable_heads: 0,
         mailbox: None,
         peers_observed: Vec::new(),
@@ -1814,6 +1840,13 @@ where
         }
     }
     report.pending = live.pending_obligations()?.len();
+    // The control-plane gap beside the obligation backlog: received
+    // statements this run never answered (an epoch it never learned,
+    // or a statement that landed after the last answer pass). Read
+    // once at the end like `pending` — answering is volatile, so a
+    // per-pass accumulation would misread re-evaluation as growth.
+    report.reconciliation_outstanding = live.unanswered_statements();
+    report.reconciliation_stalled = live.stalled_statements()?;
     // Lifetime write-path totals: the run's own passes above carry
     // sync load; this carries the local durability load the run
     // observed, so the report distinguishes the two.
@@ -1878,6 +1911,18 @@ fn sync_status_render(status: &SyncStatus) -> String {
     for (epoch, count) in group_pending(&pending.capabilities) {
         out.push_str(&format!("  epoch {epoch}: {count} pending\n"));
     }
+    // Reconciliation progress as classes and counts only: the row
+    // names no TransitionId, DeviceId, or membership content (the
+    // 21d privacy boundary). The outstanding gap lives on `sync now`
+    // — answering is volatile — so this row reports progress, never
+    // a per-peer backlog.
+    let reconcile = &status.reconciliation;
+    out.push_str(&format!(
+        "reconciliation: {} statements received, {} transitions + {} capabilities retired\n",
+        reconcile.statements_received,
+        reconcile.transitions_reconciled,
+        reconcile.capabilities_reconciled,
+    ));
     if status.live_heads.is_empty() {
         out.push_str("live heads: none\n");
     } else {
@@ -2040,6 +2085,26 @@ fn degraded_reason(mailbox: Option<MailboxHealth>) -> String {
     }
 }
 
+/// The stopped-quiet reason with the reconciliation gap first: an
+/// open gap outranks the mailbox posture because it is the thing
+/// the operator must close — a healthy mailbox beside unanswered
+/// statements still stopped the run. Falls back to the mailbox
+/// reason when the gap is closed, so existing verdicts read
+/// unchanged.
+fn reconciliation_gap_reason(report: &SyncRunReport) -> String {
+    match (
+        report.reconciliation_outstanding,
+        report.reconciliation_stalled,
+    ) {
+        (0, 0) => degraded_reason(report.mailbox),
+        (unanswered, 0) => format!("{unanswered} reconciliation statements awaiting answer"),
+        (0, stalled) => format!("{stalled} stalled reconciliation statements"),
+        (unanswered, stalled) => {
+            format!("{unanswered} reconciliation statements awaiting answer, {stalled} stalled")
+        }
+    }
+}
+
 /// Render a headless run report. Built as a string so tests assert
 /// the rendering without capturing stdout.
 fn sync_now_render(report: &SyncRunReport) -> String {
@@ -2062,6 +2127,15 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         report.pending,
         report.unfetchable_heads,
     );
+    // The control-plane gap beside the obligation backlog: received
+    // reconciliation statements the run never answered, plus
+    // evaluated-but-stuck ones whose requester is still owed. Always
+    // printed (zero is the converged case automation greps for), and
+    // counts only — no statement digests, no requester identities.
+    out.push_str(&format!(
+        "reconciliation: {} statements awaiting answer, {} stalled\n",
+        report.reconciliation_outstanding, report.reconciliation_stalled,
+    ));
     // Local durability load beside sync load: the run's passes above
     // say what the network did; these lines say what the disk did.
     // Sources are variant classes, never paths — the `Debug` impls
@@ -2120,6 +2194,16 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             out.push_str(&format!("  sender {peer}\n"));
         }
     }
+    // An open reconciliation gap downgrades both quiet verdicts
+    // the way a degraded mailbox does: the outbox is quiet but a
+    // peer asked and this run never answered, so the run stopped
+    // instead of completing. Checked before the mailbox arms so a
+    // healthy offline run with a gap cannot claim completion — a
+    // `completed` line beside a non-zero exit would lie to the
+    // automation the exit code serves. Either half of the gap —
+    // never-evaluated or evaluated-but-stuck — downgrades.
+    let reconciliation_open =
+        report.reconciliation_outstanding > 0 || report.reconciliation_stalled > 0;
     match report.outcome {
         // A degraded or unobserved mailbox downgrades both quiet
         // verdicts: the local state converged, but intake may have
@@ -2129,7 +2213,7 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         // success but names its limits: it fetched nothing, so an
         // operator tailing only the last line sees the scope.
         RunOutcome::Quiet => match report.mailbox {
-            Some(health) if !mailbox_degraded(&health) => {
+            Some(health) if !mailbox_degraded(&health) && !reconciliation_open => {
                 out.push_str("completed: quiet");
                 if health.total_relays == 0 {
                     out.push_str(" (offline run: local obligations only)");
@@ -2138,11 +2222,11 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             }
             _ => out.push_str(&format!(
                 "stopped: quiet locally, {}, convergence unverified\n",
-                degraded_reason(report.mailbox),
+                reconciliation_gap_reason(report),
             )),
         },
         RunOutcome::RemoteStalled => match report.mailbox {
-            Some(health) if !mailbox_degraded(&health) => {
+            Some(health) if !mailbox_degraded(&health) && !reconciliation_open => {
                 out.push_str(&format!(
                     "completed: quiet with {} unfetchable heads (known but not local)",
                     report.unfetchable_heads,
@@ -2155,7 +2239,7 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             _ => out.push_str(&format!(
                 "stopped: quiet locally with {} unfetchable heads (known but not local), {}, convergence unverified\n",
                 report.unfetchable_heads,
-                degraded_reason(report.mailbox),
+                reconciliation_gap_reason(report),
             )),
         },
         RunOutcome::PassLimit => {
@@ -2205,7 +2289,19 @@ fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
             passes: report.passes,
             pending: report.pending,
         }),
+    }?;
+    // The quiet outbox does not imply a closed control plane: a peer
+    // may have asked while this run could not answer, or asked and
+    // been permanently skipped. Name that gap with its own error
+    // (rather than folding it into pending) so the message says what
+    // is missing instead of what is owed.
+    if report.reconciliation_outstanding > 0 || report.reconciliation_stalled > 0 {
+        return Err(CliError::ReconciliationOutstanding {
+            unanswered: report.reconciliation_outstanding,
+            stalled: report.reconciliation_stalled,
+        });
     }
+    Ok(())
 }
 
 /// Headless sync over the keystore: `status` observes durable state

@@ -73,6 +73,32 @@ pub struct OutboxTotals {
     pub capabilities_delivered: usize,
 }
 
+/// Reconciliation progress as observed from durable state: how many
+/// peer statements this device has received, and how many obligations
+/// retired through reconciliation rather than relay acceptance. All
+/// three are counts over committed facts — classes, never identities —
+/// so they are safe for the operator surface by construction. The
+/// outstanding gap is deliberately not a field here: answering is a
+/// live, volatile evaluation (`answered_statements` resets on
+/// restart), so received-minus-answered is a run observation, not a
+/// durable projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReconciliationCounters {
+    /// Received reconciliation statements (the durable request
+    /// bucket): peers that asked this device to prove its state. A
+    /// monotone count of facts, not a backlog — a received statement
+    /// stays counted after it is answered and after its obligations
+    /// retire. The open gap is never derived from this field:
+    /// never-evaluated statements are `unanswered_statement_count`,
+    /// evaluated-but-stuck ones are `stalled_statement_count`, and
+    /// both are volatile run observations, not durable projections.
+    pub statements_received: usize,
+    /// Transition obligations retired by reconciliation (21c).
+    pub transitions_reconciled: usize,
+    /// Capability obligations retired by reconciliation (21c).
+    pub capabilities_reconciled: usize,
+}
+
 /// Durably retained runtime sync state: the live view rebuilds from
 /// committed durable facts (transitions, announcements, manifests,
 /// residency mutations) via the fact/replay path, so this struct
@@ -335,6 +361,37 @@ impl RuntimeState {
             capabilities_queued: self.capability_queued.len(),
             capabilities_delivered: self.capability_delivered.len(),
         }
+    }
+
+    /// Obligations retired through reconciliation per class: the pair
+    /// sets are the projection (the triple sets beside them are the
+    /// audit trail naming the proving statement). Counts only, so the
+    /// operator surface never touches identities.
+    pub fn reconciled_counts(&self) -> (usize, usize) {
+        (
+            self.transition_reconciled_pairs.len(),
+            self.capability_reconciled_pairs.len(),
+        )
+    }
+
+    /// Whether transition or capability obligations are still owed to
+    /// one recipient: the liveness half of the stall gauge. A stall
+    /// entry outlives its gap when obligations drain through another
+    /// path (relay acceptance, a newer statement), so the gauge
+    /// counts only stalls whose requester is still owed — the set
+    /// stays insert-only and needs no event plumbing. Scoped to the
+    /// 21c classes: announcements never stall (no retirement set to
+    /// wait on).
+    pub fn has_outstanding_for(&self, recipient: &DeviceId) -> bool {
+        self.transition_queued.iter().any(|pair| {
+            pair.1 == *recipient
+                && !self.transition_delivered.contains(pair)
+                && !self.transition_reconciled_pairs.contains(pair)
+        }) || self.capability_queued.iter().any(|pair| {
+            pair.1 == *recipient
+                && !self.capability_delivered.contains(pair)
+                && !self.capability_reconciled_pairs.contains(pair)
+        })
     }
 
     /// Every still-undischarged obligation, in `(snapshot, recipient)`

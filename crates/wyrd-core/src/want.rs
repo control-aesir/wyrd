@@ -558,4 +558,38 @@ mod tests {
         registry.register(content(5)).unwrap();
         assert_eq!(admit_all(&registry), vec![content(5)]);
     }
+
+    /// Restart loss is expected and harmless: the registry is
+    /// memory-only by design (`docs/crash-consistency.md`, "Restart
+    /// equivalence"), so dropping it — the process-death half of a
+    /// restart — loses every pending demand and every admitted mark,
+    /// and the fresh registry re-demands from nothing. This test pins
+    /// the loss half only. The durable half (the `Cached` policy
+    /// surviving the reopen, which is what a re-opened reader
+    /// re-demands against) is the engine's business, pinned by the
+    /// materialization row; the loop's re-registration path has no
+    /// dedicated pin yet, and this test does not claim it.
+    #[test]
+    fn want_registry_loss_is_expected_and_re_demands_from_durable_state() {
+        let registry = WantRegistry::default();
+        registry.register(content(1)).unwrap();
+        registry.register(content(2)).unwrap();
+        assert_eq!(admit_all(&registry), vec![content(1), content(2)]);
+        assert!(registry.is_admitted(&content(1)));
+        // Process death: the registry is dropped, never serialized.
+        drop(registry);
+        let restarted = WantRegistry::default();
+        assert!(
+            restarted.peek_pending().is_empty(),
+            "no pending demand survives the restart"
+        );
+        assert!(
+            !restarted.is_admitted(&content(1)),
+            "no admitted mark survives the restart"
+        );
+        // The re-opened reader re-demands, and the demand admits
+        // exactly as a first-time demand would.
+        restarted.register(content(1)).unwrap();
+        assert_eq!(admit_all(&restarted), vec![content(1)]);
+    }
 }

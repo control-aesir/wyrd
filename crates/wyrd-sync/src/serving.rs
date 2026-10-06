@@ -1020,7 +1020,27 @@ impl VaultSource {
             sealed,
         })
     }
+
+    /// Test-only: the rebuilt serving maps, for the
+    /// restart-equivalence residency row. Compared across a reopen
+    /// to prove `from_state` reconstructs them from durable state
+    /// rather than carrying memory.
+    #[cfg(test)]
+    pub(crate) fn maps_for_test(&self) -> ServingMaps {
+        (self.roots.clone(), self.bodies.clone(), self.sealed.clone())
+    }
 }
+
+/// The rebuilt serving maps as one comparable value: root
+/// manifests by snapshot, snapshot bodies, and sealed addresses.
+/// Named so the test-only accessor below stays under
+/// `clippy::type_complexity`.
+#[cfg(test)]
+pub(crate) type ServingMaps = (
+    BTreeMap<SnapshotId, (ContentId, BaoRoot)>,
+    BTreeMap<SnapshotId, Vec<u8>>,
+    BTreeMap<StorageId, BaoRoot>,
+);
 
 /// Local vault reads: instantaneous, so the plan's per-attempt cap
 /// has nothing to bound.

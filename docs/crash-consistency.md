@@ -155,6 +155,79 @@ not the fact's origin: a stale-registration replacement names the
 exact sealed fact the new registration retires, and replay resolves
 the chain to the newest bytes either way.
 
+## Restart equivalence
+
+The predicate over the surfaces above: durable externally
+meaningful state before a crash/reopen is equivalent to the state
+after the reopen. The per-surface table below IS the relation —
+not a claim about every question an operator can ask (timestamps,
+diagnostic counters, retry generations, telemetry, and transient
+connection state are excluded precisely because several must
+differ across a restart). The table is authoritative in exactly
+this sense: every row names its observable, its verdict, and the
+strongest pin available — a direct test where one can be written,
+a named derivation where it cannot. The
+whole-state snapshot (`SyncStatus`, observed from committed facts
+only) is the aggregate tripwire over the rows it covers — serving
+residency, the seen-id log, the route table, and suppression
+verdicts have no `SyncStatus` field, and the snapshot says nothing
+about them. Nothing here prevents the snapshot from shrinking;
+what prevents silent shrinkage is that each row carries its own
+pin, and a row whose direct pin stops proving the row fails by
+name. Rows with derivation pins say so in their cells instead of
+pretending a test exists.
+
+Four verdicts, per surface:
+
+- **survives**: byte- or value-identical after reopen.
+- **rebuilt**: reconstructed from durable facts; externally
+  equivalent, not necessarily identical bytes.
+- **lost, correctly**: memory-only by design; the loss is part of
+  the contract, and a test pins the loss so nobody "fixes" it.
+- **excluded**: outside the relation by name; tested elsewhere or
+  not at all.
+
+| Surface | Verdict | Pinned by |
+| --- | --- | --- |
+| Heads (live set, per-head classification) | survives | `restart_equivalence_heads_match` |
+| Durable facts (`seq <= CURRENT` commits) | survives | `restart_equivalence_durable_facts_match` |
+| Membership log and tip | survives | `restart_equivalence_membership_and_control_state_match` |
+| Control state (announcement projection, committed capabilities) | rebuilt | same test; replays through `Engine::resync` (`engine/mod.rs`) |
+| Materialization state (`Cached` / `Pinned` policies, local objects) | survives | `restart_equivalence_materialization_state_matches` |
+| Pending outbox obligations | survives | `restart_equivalence_pending_obligations_match`; replay is the obligation invariant above |
+| Serving residency: vault files (hex-named sealed roots) | survives | `restart_equivalence_serving_residency_matches` compares `vault().roots()` |
+| Serving residency: `VaultSource` maps (roots, bodies, sealed) | rebuilt | `maps_for_test` compared across the reopen in `restart_equivalence_serving_residency_matches`; reconstructed from `RuntimeState` on every `VaultSource::from_state` (`sync/serving.rs`) |
+| Seen-id log (inbox `seen` set, `mailbox.seen` file) | rebuilt | replayed in `resync`; torn tail truncated on open; behaviorally pinned by `redelivery_after_restart_stays_duplicate` (duplicates still recognized after the reopen) |
+| Route table | rebuilt | pure derivation of the announcement projection (`publish_recorded_routes` reads `state.announcement(&snapshot)` per recorded snapshot); the projection equality in the control-state row IS the pin — no independent test constructs an iroh bulk source for this |
+| Want registry (waiter demand, admission cache) | lost, correctly | `want_registry_loss_is_expected_and_re_demands_from_durable_state` pins the loss half; never persisted (`core/want.rs`). The re-demand half (loop re-registers from surviving `Cached`) follows from the materialization row but has no dedicated pin — follow-up with the materialization work, not claimed here |
+| Suppression verdicts | lost, correctly | `suppression_cache_loss_re_derives_the_same_verdict` (warm-cache short-circuit vs post-restart revalidation to the same outcome); also `suppression_revalidates_after_restart`, `redelivery_after_restart_stays_duplicate` |
+| Mutation queue and parent tokens | lost, correctly | session-local by design (`core/mutation.rs`); shutdown completes blocked submitters with `Shutdown` (`shutdown_with_registry_releases_held_wants`, `submit_after_shutdown_fails_fast`) |
+| **Serving endpoint identity/address** | **excluded** | rebound on restart by design; post-restart announcement is convergence, tested separately — never make it durable to satisfy this table |
+| Timestamps, counters, retry generations, telemetry, transient connection state | excluded | must differ; outside the relation |
+
+The restart-loss rule, normative for state that does not exist
+yet (peer-repair generations and evidence when they land): a
+memory-only loss is equivalent only when restart initializes that
+state to its defined fresh-start state AND the resulting
+externally meaningful behavior matches a clean restart. The
+behavior induced by the reset is what is equivalent, not the
+counter value: a fresh generation may permit a new repair
+attempt, but it must not alter durable content, durable
+obligations, or externally meaningful correctness state. No rows
+are written against unlanded implementation; the rows extend when
+the code lands.
+
+The invariant as one assertion,
+`a_crash_loses_ephemeral_state_but_no_durable_obligation`: a real
+reopen across mid-flight state (a pending outbox obligation, pinned
+materialization, a served representation) asserts both halves —
+every in-scope row matches, and no durable obligation was lost.
+The reopen runs through the real protocol at the fact-log crash
+stages: `AfterRenameCommit` must show the before-state with the
+obligation still pending; `AfterRenameCurrent` must replay the
+obligation byte-identically; the temp stages must ignore the
+orphan and still match the before-state.
+
 ## Keystore and custody
 
 The owner record (wrapped root + device secret + epoch-1 escrow)

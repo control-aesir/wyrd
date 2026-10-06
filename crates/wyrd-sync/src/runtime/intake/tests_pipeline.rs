@@ -176,6 +176,52 @@ fn suppression_revalidates_after_restart() {
     assert!(facts.seen.is_empty(), "revalidation writes nothing durable");
 }
 
+/// The suppression cache is lost on restart and the loss
+/// re-derives the same verdict: redelivery against the warm cache
+/// short-circuits with no revalidation (accepted 0, duplicates 64),
+/// while redelivery after a reopen revalidates every message to the
+/// same accepted outcome (accepted 64, duplicates 0) — proving the
+/// cache held the verdict in the first case and the restart dropped
+/// it in the second, with no durable trace in either.
+#[test]
+fn suppression_cache_loss_re_derives_the_same_verdict() {
+    let mut fixture = fixture();
+    let mut mail = Vec::new();
+    for i in 0..64u8 {
+        mail.push(deliver(
+            &fixture,
+            1,
+            &Message::MembershipTransition(TransitionPayload {
+                transition: vec![0x5A, i],
+            }),
+        ));
+    }
+    queue(&mut fixture, mail.clone());
+    assert_eq!(drain(&mut fixture).accepted, 64);
+    // Warm cache: redelivery short-circuits, nothing revalidates.
+    queue(&mut fixture, mail.clone());
+    let cached = drain(&mut fixture);
+    assert_eq!(cached.accepted, 0, "no revalidation on redelivery");
+    assert_eq!(cached.duplicates, 64);
+    // Restart drops the cache: the same redelivery revalidates to
+    // the same accepted outcome.
+    let mut engine = reopen(&mut fixture);
+    queue(&mut fixture, mail);
+    let recipient = fixture.recipient;
+    let mut mailbox = MemoryMailbox {
+        relay: &mut fixture.relay,
+        owner: recipient,
+    };
+    let report = engine.drain(&mut mailbox).unwrap();
+    assert_eq!(
+        report.accepted, 64,
+        "the lost verdict re-derives identically"
+    );
+    assert_eq!(report.duplicates, 0);
+    let facts = engine.store.load().expect("loads");
+    assert!(facts.seen.is_empty(), "revalidation writes nothing durable");
+}
+
 /// KeyRotation is envelope-defined but unhandled in v0: the message
 /// is a terminal no-op — acknowledged with a memory-only verdict,
 /// no durable fact — and redelivery short-circuits while cached.

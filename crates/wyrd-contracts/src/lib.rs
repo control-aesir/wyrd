@@ -229,6 +229,25 @@
 //!     generation fulfills verified once routes heal — while the
 //!     verdict stands until the new waiter arrives
 //!     (`docs/peer-repair.md:78-84`).
+//! 49. `quarantine_drain_repairs_through_the_loop` — a submitted
+//!     verification failure is diagnosed, unlinked, and unclaimed
+//!     by one loop pass, reported in the pass report and never
+//!     repeated (`docs/peer-repair.md`, child 12).
+//! 50. `quarantined_identity_redemands_on_next_waiter` — after the
+//!     drain, the next waiter re-plans the identity as a fresh
+//!     fetch; without one it stays unplanned
+//!     (`docs/peer-repair.md`, OD-12-2 A).
+//! 51. `quarantine_discards_real_bitrotted_bytes_through_the_loop` —
+//!     the loop over a directory store with genuinely bitrotted
+//!     bytes: verify-then-delete unlinks the live file, proving
+//!     the composition contracts 49 and 50 cannot
+//!     (`docs/peer-repair.md`, child 12).
+//! 52. `quarantined_chunk_heals_from_a_live_peer_without_remount` —
+//!     the full repair lifecycle with a real serving peer and the
+//!     real FUSE demand path: bitrot, observed rejection, discard
+//!     and unclaim, re-want, live refetch, verified `Available`,
+//!     and the original waiter served, with no remount or restart
+//!     (OD-12-1 and OD-12-2 together).
 
 #[cfg(test)]
 mod egress_contracts;
